@@ -881,7 +881,8 @@ is_scoped_run=false arm).
   carry the TEXT id verbatim (CurWorkflowRepoID, actions.go:710), the
   four `scoped_workflow_source_repo_id=0` wire pins unchanged, the
   re-baselined matrix pins cite the id-space adaptation, and the runs
-  page's dispatch-banner gate sits on the repo-level arm explicitly. Files:
+  page's dispatch-banner gate sits on the repo-level arm explicitly (the
+  FO wave below lifted that last clause). Files:
   `ui/pages/repo-actions-runs.tsx` + its matrix test.
 - The rerun scoped twin (`view.go:929-936` checkRunRerunAllowed +
   `rerun.go:89-102` validateRerun): `run.IsScopedRun` consults the
@@ -895,13 +896,71 @@ is_scoped_run=false arm).
   `services/actions/rerun.ts`'s validateRerun — the web handler funnels
   through it. Files: `services/actions/rerun.ts` + its test.
 
-**Recorded (NOT staged — each cites why):**
+**Landed (the Wave FO follow-on, 2026-11-03 — K4's last residual, ledger §1.9
+DR-1(c)):**
 
-- The sidebar's scoped-workflow groups (sidebar.tmpl:17-34,
-  `actions.go:296-366` prepareScopedWorkflows) and the scoped dispatch
-  banner (prepareWorkflowDispatchTemplate's `loadScopedWorkflowModel`,
-  actions.go:372-406) — the C10 pages' remaining surface; they need the
-  source-repo parse/cache layer and the scoped engine binding on the page.
+- The scoped dispatch banner (prepareWorkflowDispatchTemplate's isScoped
+  branch, `actions.go:407-423` + loadScopedWorkflowModel `:372-406` →
+  ScopedWorkflowContent `scoped_workflow_cache.go:73-85`) and the sidebar's
+  scoped-workflow groups (sidebar.tmpl:17-34, prepareScopedWorkflows
+  `actions.go:296-366`) — the two surfaces that bullet recorded as NOT
+  staged. THE DERIVED SEMANTICS, by the pin: the banner renders for a
+  writer whose SELECTED workflow declares `workflow_dispatch` where the
+  selection is `(workflow, scoped_workflow_source_repo_id)` — the scoped
+  arm first gates on IsScopedWorkflowOptedOut (:409-417 — a REQUIRED
+  workflow's stale disabled flag never hides the form), then resolves the
+  content from the SOURCE repo's DEFAULT-BRANCH scoped walk
+  (SCOPED_WORKFLOW_DIRS, entry-name match; upstream through the
+  LoadParsedScopedWorkflows cache BOTH consumers read), every failed arm
+  answering the nil-model no-banner; the form POSTs and the
+  dispatch-inputs fetch carry the param (`workflow_dispatch.tmpl:10/:18`'s
+  CurWorkflowRepoID). The groups walk the effective sources
+  (GetEffectiveScopedWorkflowSources `scoped_workflow.go:71-79` — owner 0
+  + the consumer owner; per-source Required = IsWorkflowRequiredInSources
+  `:90-98`, Disabled = IsScopedWorkflowDisabled
+  `repo_unit_actions.go:111-113`), set scopedNames to feed
+  CurWorkflowIsListed (`actions.go:169`) and HasWorkflowsOrRuns
+  (`:139`), and stamp the selected workflow's CurWorkflowScopedRepoID/
+  Disabled/Required overwrite (`:357-359` — the kebab reads the scoped
+  opt-out and a required workflow renders list.tmpl:89-90's disabled class
+  without the data-url; the repo-level active-arm keys on the unset id).
+  Files: `ui/pages/repo-actions-runs.tsx` (the
+  `prepareScopedWorkflowGroups` port — one walk per source feeds groups,
+  scopedNames, AND the banner's content lookup, upstream's cache-hit arm;
+  the route threads the SOURCE-repo engine binding `sourceEngineFor`,
+  OPTIONAL with an absent-default that answers the hidden/empty arms —
+  the walk is never fabricated against the wrong repo's engine) + its
+  matrix test (the DR-1(c) describe: the groups' TEXT-id links and
+  Global/Owner/Required/Disabled labels, the open/active arms, the banner
+  from SOURCE content with the param riding both wire URLs, the
+  opt-out/required/dead-source/absent-file/broken-file/no-dispatch banner
+  matrix, the kebab's scoped overwrite, the HasWorkflowsOrRuns fourth arm,
+  the unthreaded-seam posture).
+- The dispatch-inputs fragment's TEXT-id arm (the K11-flagged numeric
+  `formInt64` contract): `loadWorkflowDispatchInputsFragment` now takes
+  the RAW `scoped_workflow_source_repo_id` text (config.ts's
+  `scopedSourceRepoParam` zero-reduction at the use point) and LANDED the
+  scoped arm the v1 reduction used to 404 — the opt-out/effective gates
+  through config.ts over the `d1` + `consumerOwnerId` inputs, the SOURCE
+  default-branch walk through `sourceEngineFor`, upstream's exact failure
+  shape: EVERY failed arm (unthreaded seam included) renders the
+  template's not-found message over HTTP 200 (prepareWorkflowDispatchTemplate's
+  early returns leave CurWorkflowExists unset), a BROKEN source file
+  answers not-found too (ReadWorkflow's error → nil, `actions.go:401-403`)
+  — unlike the producer, which surfaces the light-validation text — while
+  a valid-but-no-dispatch source file keeps CurWorkflowExists and renders
+  the has_no_workflow_dispatch message; the ErrMsg alert still reads the
+  CONSUMER walk (the `.workflows` range's eq-EntryName arm, near-always
+  null on a scoped id). Files: `ui/pages/repo-actions-dispatch-inputs.tsx`
+  + its test (the threaded arms over real D1).
+- Route hunks (the orchestrator's — index.ts is not this unit's file):
+  (1) the runs-page mount's `loadRepoActionsRunsData` call gains
+  `sourceEngineFor: (fullName) => engineClient(c.env, fullName)`; (2) the
+  dispatch-inputs mount drops the numeric `formInt64` wrapper and passes
+  the raw param plus `d1`/`consumerOwnerId`/`sourceEngineFor` (the module
+  header's HANDOFF snippet is the exact replacement).
+
+**Recorded (NOT staged — each cites why):**
 - The API twin of the runs filter (`shared/action.go:143-146`) — the
   api/routes/repo-actions family's own surface (its in-flight wave's
   files); the page arm above is the wire the frontend uses.

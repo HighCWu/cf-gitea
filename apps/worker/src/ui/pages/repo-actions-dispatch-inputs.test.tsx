@@ -7,13 +7,20 @@
  * validation's ErrMsg arms (invalid YAML, jobs-not-a-mapping, all-needs,
  * all-null-jobs), the act model's dispatch-config shapes (sequence/scalar/
  * mapping/null), the declaration-order inputs, and the template render's
- * field arms (choice/boolean/number/string + required + the submit button).
- * Module-loader tests (the pre-mount house pattern) over a stubbed engine
- * read slice.
+ * field arms (choice/boolean/number/string + required + the submit button),
+ * plus the DR-1(c) scoped arm (the TEXT `scoped_workflow_source_repo_id`
+ * param through the opt-out/effective gates and the SOURCE walk, over real
+ * D1 with the store substrate). Module-loader tests (the pre-mount house
+ * pattern) over a stubbed engine read slice.
  */
 
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:test";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
+import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { saveRepoSettings } from "../../api/services/repo-settings";
+import { saveRepoActionsConfig, type RepoActionsConfig } from "../../services/actions/config";
+import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
 import {
   loadWorkflowDispatchInputsFragment,
   parseWorkflowDispatchInputs,
@@ -23,6 +30,17 @@ import {
 } from "./repo-actions-dispatch-inputs";
 
 const REPO = { id: "repo-demo", ownerNamespace: "alice", slug: "demo", defaultBranch: "main" };
+
+function zeroActionsConfig(): RepoActionsConfig {
+  return {
+    disabledWorkflows: [],
+    disabledScopedWorkflows: {},
+    collaborativeOwnerIds: [],
+    tokenPermissionMode: "permissive",
+    maxTokenPermissions: null,
+    overrideOwnerConfig: false,
+  };
+}
 
 /** The stringContaining escape hatch (the routes.test.ts precedent — the
  *  vitest asymmetric-matcher factories return `any`). */
@@ -192,17 +210,27 @@ describe("renderWorkflowDispatchInputsFragment", () => {
 describe("loadWorkflowDispatchInputsFragment (actions.go:173-204)", () => {
   const base = { repo: REPO };
 
-  it("404s an empty ref and the scoped-source arm's v1 reduction", async () => {
-    await expect(loadWorkflowDispatchInputsFragment({ ...base, reads: stubEngine({}), ref: "", workflow: "ci.yml", scopedWorkflowSourceRepoId: 0 }))
+  it("404s an empty ref (the ONLY 404 — a scoped selection renders the message over 200)", async () => {
+    await expect(loadWorkflowDispatchInputsFragment({ ...base, reads: stubEngine({}), ref: "", workflow: "ci.yml", scopedWorkflowSourceRepoId: "0" }))
       .resolves.toEqual({ status: "not-found" });
-    await expect(
-      loadWorkflowDispatchInputsFragment({ ...base, reads: stubEngine({}), ref: "refs/heads/main", workflow: "ci.yml", scopedWorkflowSourceRepoId: 7 }),
-    ).resolves.toEqual({ status: "not-found" });
+    // The unthreaded seam (no d1/sourceEngineFor): the walk is never
+    // fabricated — the not-found message over 200, upstream's shape for
+    // every failed prepareWorkflowDispatchTemplate arm.
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: stubEngine({}),
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-7",
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain(`Workflow &#39;deploy.yml&#39; not found.`);
   });
 
   it("throws on a non-full-ref shape and an unresolvable ref (the ServerError arms)", async () => {
     await expect(
-      loadWorkflowDispatchInputsFragment({ ...base, reads: stubEngine({}), ref: "main", workflow: "ci.yml", scopedWorkflowSourceRepoId: 0 }),
+      loadWorkflowDispatchInputsFragment({ ...base, reads: stubEngine({}), ref: "main", workflow: "ci.yml", scopedWorkflowSourceRepoId: "0" }),
     ).resolves.toMatchObject({ status: "throw", reason: containing("UnsupportedRefType") });
     await expect(
       loadWorkflowDispatchInputsFragment({
@@ -210,7 +238,7 @@ describe("loadWorkflowDispatchInputsFragment (actions.go:173-204)", () => {
         reads: stubEngine({ commitExists: false }),
         ref: "refs/heads/vanished",
         workflow: "ci.yml",
-        scopedWorkflowSourceRepoId: 0,
+        scopedWorkflowSourceRepoId: "0",
       }),
     ).resolves.toMatchObject({ status: "throw", reason: containing("GetTagCommit/GetBranchCommit") });
   });
@@ -222,7 +250,7 @@ describe("loadWorkflowDispatchInputsFragment (actions.go:173-204)", () => {
       reads: engine,
       ref: "refs/heads/main",
       workflow: "ci.yml",
-      scopedWorkflowSourceRepoId: 0,
+      scopedWorkflowSourceRepoId: "0",
     });
     expect(engine.readRefs).toEqual(["refs/heads/main"]);
     expect(outcome.status).toBe("ok");
@@ -238,7 +266,7 @@ describe("loadWorkflowDispatchInputsFragment (actions.go:173-204)", () => {
       reads: engine,
       ref: "refs/heads/main",
       workflow: "ci.yml",
-      scopedWorkflowSourceRepoId: 0,
+      scopedWorkflowSourceRepoId: "0",
     });
     expect(outcome.status).toBe("ok");
     if (outcome.status !== "ok") return;
@@ -256,7 +284,7 @@ describe("loadWorkflowDispatchInputsFragment (actions.go:173-204)", () => {
       reads: engine,
       ref: "refs/tags/v1.0.0",
       workflow: "plain.yml",
-      scopedWorkflowSourceRepoId: 0,
+      scopedWorkflowSourceRepoId: "0",
     });
     expect(outcome.status).toBe("ok");
     if (outcome.status !== "ok") return;
@@ -274,10 +302,201 @@ describe("loadWorkflowDispatchInputsFragment (actions.go:173-204)", () => {
       reads: engine,
       ref: "refs/heads/main",
       workflow: "broken.yml",
-      scopedWorkflowSourceRepoId: 0,
+      scopedWorkflowSourceRepoId: "0",
     });
     expect(outcome.status).toBe("ok");
     if (outcome.status !== "ok") return;
     expect(outcome.html).toContain("octicon-alert");
+  });
+});
+
+// --- the DR-1(c) scoped arm (prepareWorkflowDispatchTemplate's isScoped
+//     branch over the landed store substrate — real D1, the matrix test's
+//     harness conventions) -----------------------------------------------
+
+const T0 = new Date(1_700_000_000 * 1000);
+
+describe("the DR-1(c) scoped arm: the SOURCE walk over the store gates", () => {
+  const base = { repo: REPO };
+  const sourceContent = `name: Shared Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: Target env
+        default: staging
+jobs:
+  build:
+    steps: [{ run: echo hi }]
+`;
+  const consumerStub = stubEngine({}); // no consumer walk — dir null
+  const sourceEngineFor = () =>
+    stubEngine({ dir: ".gitea/scoped_workflows", entries: [{ name: "deploy.yml", type: "blob" }], content: sourceContent });
+
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+  });
+
+  beforeEach(async () => {
+    for (const table of ["action_scoped_workflow_source", "repo_units", "repo_settings", "repositories", "users"]) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+    await env.DB.prepare(
+      "INSERT INTO users (id, username, username_lower, display_name, created_at) VALUES (1, 'alice', 'alice', 'Alice Doe', unixepoch())",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, is_empty, created_at) VALUES ('repo-1', 'repo-1', 'alice', 1, 'demo', 'main', 'public', 0, unixepoch()), ('repo-9', 'repo-9', 'alice', 1, 'source-nine', 'main', 'public', 0, unixepoch())",
+    ).run();
+    await saveRepoSettings(env.DB, REPO.id, { hasActions: true }, T0); // the actions unit row the config rides
+    await saveRepoActionsConfig(env.DB, REPO.id, zeroActionsConfig());
+    await scopedWorkflowSourcesStore(env.DB).addSource(1, "repo-9");
+  });
+
+  it("resolves the SOURCE content through the effective-source gate (the fields render)", async () => {
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerStub,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-9",
+      sourceEngineFor,
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain('name="env_name"'); // the SOURCE file's declared input
+    expect(outcome.html).not.toContain("not found");
+  });
+
+  it("renders the not-found message when the workflow is opted out (actions.go:409-417)", async () => {
+    await saveRepoActionsConfig(env.DB, REPO.id, {
+      ...zeroActionsConfig(),
+      disabledScopedWorkflows: { "repo-9": ["deploy.yml"] },
+    });
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerStub,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-9",
+      sourceEngineFor,
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain(`Workflow &#39;deploy.yml&#39; not found.`);
+  });
+
+  it("a REQUIRED registration's stale flag never hides the fields (the :409-417 comment)", async () => {
+    await saveRepoActionsConfig(env.DB, REPO.id, {
+      ...zeroActionsConfig(),
+      disabledScopedWorkflows: { "repo-9": ["deploy.yml"] },
+    });
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(1, "repo-9", { "deploy.yml": { required: true, patterns: ["ci/pass"] } });
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerStub,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-9",
+      sourceEngineFor,
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain('name="env_name"');
+  });
+
+  it("renders the not-found message for a non-source id and a broken SOURCE file (ReadWorkflow's nil arms)", async () => {
+    // A source id no registration names.
+    const deadSource = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerStub,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-gone",
+      sourceEngineFor,
+    });
+    expect(deadSource.status).toBe("ok");
+    if (deadSource.status !== "ok") return;
+    expect(deadSource.html).toContain(`Workflow &#39;deploy.yml&#39; not found.`);
+
+    // The SOURCE file present but unparseable — upstream's ReadWorkflow
+    // error → nil → not-found, NOT the invalid-workflow alert.
+    const brokenEngineFor = () =>
+      stubEngine({ dir: ".gitea/scoped_workflows", entries: [{ name: "deploy.yml", type: "blob" }], content: ":::: not yaml [[[" });
+    const broken = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerStub,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-9",
+      sourceEngineFor: brokenEngineFor,
+    });
+    expect(broken.status).toBe("ok");
+    if (broken.status !== "ok") return;
+    expect(broken.html).toContain(`Workflow &#39;deploy.yml&#39; not found.`);
+    expect(broken.html).not.toContain("octicon-alert");
+  });
+
+  it("renders the has-no-dispatch message for a SOURCE file without the trigger (CurWorkflowExists stays true)", async () => {
+    const plainEngineFor = () =>
+      stubEngine({ dir: ".gitea/scoped_workflows", entries: [{ name: "deploy.yml", type: "blob" }], content: "on: push\njobs:\n  a:\n    steps: [{run: x}]\n" });
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerStub,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-9",
+      sourceEngineFor: plainEngineFor,
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain("has no workflow_dispatch event trigger");
+    expect(outcome.html).not.toContain("not found");
+  });
+
+  it("the consumer walk still feeds the ErrMsg alert on an entry-name collision (the .workflows range)", async () => {
+    const consumerWithSameNamedFile = stubEngine({ dir: ".gitea/workflows", entries: [{ name: "deploy.yml", type: "blob" }], content: ":::: broken [[[" });
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerWithSameNamedFile,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "repo-9",
+      sourceEngineFor,
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain("octicon-alert"); // the CONSUMER file's ErrMsg
+    expect(outcome.html).toContain('name="env_name"'); // the SOURCE fields still render
+  });
+
+  it("the zero-param '0' stays the repo-level arm beside the registration (the source walk never runs)", async () => {
+    const consumerMissing = stubEngine({ dir: ".gitea/workflows", entries: [{ name: "other.yml", type: "blob" }], content: sourceContent });
+    const outcome = await loadWorkflowDispatchInputsFragment({
+      ...base,
+      reads: consumerMissing,
+      d1: env.DB,
+      consumerOwnerId: 1,
+      ref: "refs/heads/main",
+      workflow: "deploy.yml",
+      scopedWorkflowSourceRepoId: "0",
+      sourceEngineFor,
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.html).toContain(`Workflow &#39;deploy.yml&#39; not found.`); // the CONSUMER walk's answer
   });
 });

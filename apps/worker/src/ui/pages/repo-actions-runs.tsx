@@ -71,33 +71,59 @@
  *   shell injects).
  * - The dispatch banner + modal (workflow_dispatch.tmpl, the ⑲A4 row)
  *   render when the selected workflow declares `workflow_dispatch` and the
- *   viewer writes the unit; the form POSTs to /actions/run (the
+ *   viewer writes the unit — BOTH arms (prepareWorkflowDispatchTemplate,
+ *   actions.go:400-465): the repo-level arm resolves the file from this
+ *   repo's own default-branch listing; the SCOPED arm (isScoped :=
+ *   curWorkflowRepoID > 0, :407) gates on IsScopedWorkflowOptedOut (:409-417
+ *   — a required workflow's stale flag never hides the form) and resolves
+ *   the content from the SOURCE repo's default-branch scoped walk
+ *   (loadScopedWorkflowModel :372-406 → ScopedWorkflowContent), which is
+ *   the same parsed set prepareScopedWorkflows walks for the sidebar — one
+ *   walk feeds both (upstream shares LoadParsedScopedWorkflows' cache;
+ *   ours shares the loader's per-source content map). A failed scoped arm
+ *   (unresolved source, absent/invalid file) simply leaves the banner
+ *   hidden — upstream's nil-model early return. The form POSTs to
+ *   /actions/run with the FULL filter set including the param (the
  *   orchestrator-owned mount; the producer is services/actions/
  *   workflow-dispatch.ts) and the inputs body re-fetches the LIVE
- *   /actions/workflow-dispatch-inputs fragment on a branch change.
+ *   /actions/workflow-dispatch-inputs fragment on a branch change. The
+ *   SOURCE walks need the route-threaded `sourceEngineFor` binding —
+ *   absent, the scoped arms answer their hidden arms (never fabricated).
  * - The sidebar's Management section (job-queue link, sidebar.tmpl:54-62)
  *   renders (the ⑲A3 row) — the route landed with C6.
- * - Scoped-workflow groups (sidebar.tmpl:17-34) defer with C10 (SPEC-0012
- *   keeps scoped workflows post-M3); the `scoped_workflow_source_repo_id`
- *   param is the TEXT source-repo id — the id-space adaptation of upstream's
- *   FormInt64 (its repositories.id is int64: run.go:58's WorkflowRepoID,
- *   run.go:115's %d link; ours is TEXT, schema.ts's workflow_repo_id) with
- *   config.ts's scopedSourceRepoParam reduction: ""/"0" is the repo-level
- *   arm, exactly upstream's parsed zero. The per-run ROW filter is LANDED
- *   (actions.go:489-491 + ToConds run_list.go:105-110): a listed workflow's
- *   selection constrains is_scoped_run to the arm the param names and, on
- *   the scoped arm, the source id itself; the All-Workflows view and an
- *   other-workflow selection carry no is_scoped_run constraint (upstream
- *   sets the option only under the !slices.Contains arm). The dispatch
- *   banner stays the repo-level arm (prepareWorkflowDispatchTemplate's
- *   isScoped branch — loadScopedWorkflowModel — defers with the C10
- *   sidebar/banner wave).
+ * - Scoped-workflow groups (sidebar.tmpl:17-34, prepareScopedWorkflows
+ *   actions.go:296-366) LANDED with DR-1(c): the effective sources
+ *   (instance 0 + the consumer owner — GetEffectiveScopedWorkflowSources
+ *   scoped_workflow.go:71-79; ours via the sources store's per-owner id-
+ *   ordered lists, instance rows first — upstream orders the merged set by
+ *   row id, our rows carry no cross-owner id, and the only observable
+ *   difference is WHICH of a double-registered source's labels
+ *   FromInstance shows), each source's default-branch walk over
+ *   SCOPED_WORKFLOW_DIRS (the light-parse invalid-file skip standing for
+ *   ParseScopedWorkflows' GetEventsFromContent Warn-skip), per-workflow
+ *   Required = IsWorkflowRequiredInSources (:90-98 — any effective
+ *   registration) and Disabled = IsScopedWorkflowDisabled
+ *   (repo_unit_actions.go:111-113), plus the scopedNames set feeding
+ *   CurWorkflowIsListed (:169) and HasWorkflowsOrRuns (:139).
+ *   The `scoped_workflow_source_repo_id` param is the TEXT source-repo id —
+ *   the id-space adaptation of upstream's FormInt64 (its repositories.id is
+ *   int64: run.go:58's WorkflowRepoID, run.go:115's %d link; ours is TEXT,
+ *   schema.ts's workflow_repo_id) with config.ts's scopedSourceRepoParam
+ *   reduction: ""/"0" is the repo-level arm, exactly upstream's parsed
+ *   zero. The per-run ROW filter is LANDED (actions.go:489-491 + ToConds
+ *   run_list.go:105-110): a listed workflow's selection constrains
+ *   is_scoped_run to the arm the param names and, on the scoped arm, the
+ *   source id itself; the All-Workflows view and an other-workflow
+ *   selection carry no is_scoped_run constraint (upstream sets the option
+ *   only under the !slices.Contains arm).
  * - The workflow DISABLED red label (sidebar.tmpl:12-14) and the
  *   disable/enable kebab item (list.tmpl:88-92) ride the LANDED repo
  *   ActionsConfig store (services/actions/config.ts — the ⑲A5 row); the
  *   POST /disable|/enable routes are the orchestrator-owned mounts. The
- *   scoped `CurWorkflowRequired` disabled-class arm is v1-inert (the
- *   scoped family defers, the flag is never set).
+ *   scoped CurWorkflowDisabled/Required overwrite (actions.go:357-359) is
+ *   landed with the groups: a scoped selection's kebab label reads the
+ *   scoped opt-out and a REQUIRED workflow renders the disabled class
+ *   without the data-url (list.tmpl:89-90).
  * - The row title renders the RenderCommitMessageLinkSubject reduction
  *   (runs_list.tmpl:22, the ⑲A7 row's title clause): the first-line subject
  *   cut + the `title-full-link-hover`/`muted title-full-link` wrapper onto
@@ -136,8 +162,16 @@ import { drizzle } from "drizzle-orm/d1";
 import { renderToString } from "hono/jsx/dom/server";
 import { parse as yamlParse } from "yaml";
 
-import { actionRunJobs, actionRunners, actionRuns, users } from "../../db/schema";
-import { loadRepoActionsConfig, scopedSourceRepoParam } from "../../services/actions/config";
+import { actionRunJobs, actionRunners, actionRuns, repositories, users } from "../../db/schema";
+import {
+  isScopedWorkflowDisabled,
+  isScopedWorkflowOptedOut,
+  loadRepoActionsConfig,
+  scopedSourceRepoParam,
+  type RepoActionsConfig,
+} from "../../services/actions/config";
+import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
+import { SCOPED_WORKFLOW_DIRS } from "../../services/actions/scoped-workflows";
 import {
   ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLED,
@@ -506,6 +540,163 @@ export function workflowInfoFromContent(entryName: string, content: string): Act
 }
 
 // ---------------------------------------------------------------------------
+// The scoped-workflow sidebar groups (prepareScopedWorkflows,
+// actions.go:296-366) — DR-1(c)'s sidebar half. One walk per effective
+// source feeds the groups, the scopedNames set AND the dispatch banner's
+// content lookup (upstream: the LoadParsedScopedWorkflows cache both
+// prepareScopedWorkflows and loadScopedWorkflowModel read).
+// ---------------------------------------------------------------------------
+
+/**
+ * GetEffectiveScopedWorkflowSources (models/actions/scoped_workflow.go:
+ * 71-79) — the instance-level (owner 0) rows plus the consumer owner's
+ * own, ALL kept (the required scan reads every registration for the
+ * source, dedup applies only to the GROUP rendering — upstream's
+ * `seen[source.SourceRepoID]` skip is per-group too). Upstream's single
+ * Find orders the merged set by row id; our rows carry no cross-owner id,
+ * so the merge is instance-rows-then-owner-rows, each id-ordered within
+ * its owner — the only observable difference is WHICH registration's
+ * FromInstance label a double-registered source shows (recorded in the
+ * module header).
+ */
+async function prepareScopedWorkflowGroups(input: {
+  d1: D1Database;
+  repo: RepoRow;
+  actionsConfig: Pick<RepoActionsConfig, "disabledScopedWorkflows">;
+  curWorkflow: string;
+  scopedSourceId: string;
+  sourceEngineFor: ScopedSourceEngineFor | undefined;
+}): Promise<ScopedWorkflowsData> {
+  const empty: ScopedWorkflowsData = {
+    groups: [],
+    scopedNames: new Set<string>(),
+    contentsBySource: new Map<string, Map<string, string>>(),
+    curScopedRepoId: "",
+    curScopedDisabled: false,
+    curScopedRequired: false,
+  };
+  const { d1, repo, actionsConfig, curWorkflow, scopedSourceId, sourceEngineFor } = input;
+  if (sourceEngineFor === undefined) {
+    // The route seam unthreaded — the walks are never fabricated (the
+    // type's doc); the sidebar renders no scoped group.
+    return empty;
+  }
+  const store = scopedWorkflowSourcesStore(d1);
+  const [instanceRows, ownerRows] = await Promise.all([store.listSourcesByOwner(0), store.listSourcesByOwner(repo.ownerId ?? 0)]);
+  const sources = [...instanceRows, ...ownerRows];
+  if (sources.length === 0) {
+    return empty;
+  }
+
+  const db = drizzle(d1);
+  const groups: ScopedWorkflowGroupView[] = [];
+  const scopedNames = new Set<string>();
+  const contentsBySource = new Map<string, Map<string, string>>();
+  let curScopedRepoId = "";
+  let curScopedDisabled = false;
+  let curScopedRequired = false;
+  const seen = new Set<string>();
+  for (const source of sources) {
+    if (seen.has(source.sourceRepoId)) {
+      continue;
+    }
+    seen.add(source.sourceRepoId);
+
+    // GetRepositoryByID (:308-315) — a missing or empty source skips the
+    // group (upstream logs and continues).
+    const sourceRows = await db
+      .select({
+        id: repositories.id,
+        ownerNamespace: repositories.ownerNamespace,
+        slug: repositories.slug,
+        defaultBranch: repositories.defaultBranch,
+        isEmpty: repositories.isEmpty,
+      })
+      .from(repositories)
+      .where(eq(repositories.id, source.sourceRepoId))
+      .limit(1);
+    const sourceRepo = sourceRows[0];
+    if (sourceRepo === undefined || sourceRepo.isEmpty) {
+      continue;
+    }
+
+    // LoadParsedScopedWorkflows' walk (scoped_workflow_cache.go:39-70 →
+    // ParseScopedWorkflows modules/actions/scoped_workflows.go:31-58): the
+    // FIRST existing scoped dir at the source's default branch, every
+    // .yml/.yaml file content-read, invalid files skipped (the
+    // GetEventsFromContent Warn-skip's light-check class — the module
+    // header). A content-read miss drops the whole source (upstream's
+    // GetContentFromEntry error fails the parse and the caller continues).
+    const sourceReads = sourceEngineFor(`${sourceRepo.ownerNamespace}/${sourceRepo.slug}`);
+    const sourceRef = `refs/heads/${sourceRepo.defaultBranch}`;
+    let dir: string | null = null;
+    let entries: Array<{ name: string; type: string }> = [];
+    for (const candidate of SCOPED_WORKFLOW_DIRS) {
+      const tree = await sourceReads.listTree(sourceRef, candidate);
+      if (tree !== null) {
+        dir = candidate;
+        entries = tree.entries;
+        break;
+      }
+    }
+    if (dir === null || entries.length === 0) {
+      continue;
+    }
+    const contents = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.type !== "blob") continue;
+      if (!entry.name.endsWith(".yml") && !entry.name.endsWith(".yaml")) continue;
+      const blob = await sourceReads.readBlob(sourceRef, `${dir}/${entry.name}`);
+      if (blob === null) {
+        // the whole source's parse fails upstream — skip it entirely
+        break;
+      }
+      const content = new TextDecoder().decode(blob.data);
+      const info = workflowInfoFromContent(entry.name, content);
+      if (info.errMsg !== null) {
+        continue; // ParseScopedWorkflows drops the file (the log.Warn arm)
+      }
+      contents.set(entry.name, content);
+      scopedNames.add(entry.name);
+
+      const required = sources.some((s) => s.sourceRepoId === sourceRepo.id && s.workflowConfigs[entry.name]?.required === true);
+      const disabled = isScopedWorkflowDisabled(actionsConfig, sourceRepo.id, entry.name);
+      const isSelected = curWorkflow === entry.name && scopedSourceId === sourceRepo.id;
+      if (isSelected) {
+        // :357-359 — the selected workflow's scoped overwrite.
+        curScopedRepoId = sourceRepo.id;
+        curScopedDisabled = disabled;
+        curScopedRequired = required;
+      }
+      const group = groups.find((g) => g.sourceRepoId === sourceRepo.id);
+      const workflowView = { sourceRepoId: sourceRepo.id, entryName: entry.name, displayName: info.displayName, required, disabled };
+      if (group === undefined) {
+        groups.push({
+          sourceRepoId: sourceRepo.id,
+          sourceRepoName: `${sourceRepo.ownerNamespace}/${sourceRepo.slug}`,
+          sourceRepoShortName: sourceRepo.slug,
+          fromInstance: source.ownerId === 0,
+          isActive: isSelected,
+          workflows: [workflowView],
+        });
+      } else {
+        group.workflows.push(workflowView);
+        if (isSelected) {
+          group.isActive = true; // :361 — keep the selected group expanded
+        }
+      }
+    }
+    if (contents.size > 0) {
+      contentsBySource.set(sourceRepo.id, contents);
+    }
+  }
+  // `len(entries) == 0 → continue` (:330-333) — a source whose files all
+  // failed validation renders no group.
+  const liveGroups = groups.filter((group) => group.workflows.length > 0);
+  return { groups: liveGroups, scopedNames, contentsBySource, curScopedRepoId, curScopedDisabled, curScopedRequired };
+}
+
+// ---------------------------------------------------------------------------
 // The loader (List's prepare* chain over M1a's store)
 // ---------------------------------------------------------------------------
 
@@ -551,6 +742,10 @@ export const repoActionsRunsLocale = {
   status_badge_url: "Badge URL", // "actions.workflow.status_badge_url"
   enable_workflow: "Enable Workflow", // "actions.workflow.enable"
   disable_workflow: "Disable Workflow", // "actions.workflow.disable"
+  // --- the scoped-workflow sidebar groups (sidebar.tmpl:17-34) ---
+  scope_global: "Global", // "actions.workflow.scope_global"
+  scope_owner: "Owner", // "actions.workflow.scope_owner"
+  required: "Required", // "actions.workflow.required"
   // --- the ⑲A4 dispatch banner + modal (workflow_dispatch.tmpl) ---
   has_workflow_dispatch: "This workflow has a workflow_dispatch event trigger.", // "actions.workflow.has_workflow_dispatch"
   run: "Run Workflow", // "actions.workflow.run"
@@ -606,6 +801,61 @@ export interface ActionsRunView {
   errorMessage: string | null;
 }
 
+/** The engine binding the scoped arms' SOURCE walks run through — the
+ *  route threads `(fullName) => engineClient(c.env, fullName)` (the /run
+ *  mount's landed shape, index.ts's dispatch handler). OPTIONAL with a
+ *  deliberate undefined default: absent, every scoped arm answers its
+ *  hidden/empty arm (prepareScopedWorkflows' no-groups and the banner's
+ *  nil-model return) — the walk is never fabricated against the wrong
+ *  repo's engine. */
+export type ScopedSourceEngineFor = (fullName: string) => Pick<EngineClient, "listTree" | "readBlob">;
+
+/** One scoped-workflow sidebar group (ScopedWorkflowSourceGroup +
+ *  ScopedWorkflowInfo, actions.go:283-293's shape). */
+export interface ScopedWorkflowGroupView {
+  sourceRepoId: string;
+  /** The source's FullName ("owner/name") — the summary text for an
+   *  instance-level source and ALWAYS the tooltip (sidebar.tmpl:20). */
+  sourceRepoName: string;
+  /** The source's bare name — the owner-level summary text (the owner is
+   *  always the current owner). */
+  sourceRepoShortName: string;
+  /** Registered at instance level (owner_id = 0) rather than by the owner. */
+  fromInstance: boolean;
+  /** The currently-selected workflow belongs to this source — the group
+   *  renders expanded (sidebar.tmpl:18's `{{if .IsActive}} open{{end}}`). */
+  isActive: boolean;
+  workflows: Array<{
+    sourceRepoId: string;
+    entryName: string;
+    displayName: string;
+    /** IsWorkflowRequiredInSources (:90-98) — any effective registration. */
+    required: boolean;
+    /** IsScopedWorkflowDisabled (repo_unit_actions.go:111-113) — the
+     *  consumer's opt-out flag. */
+    disabled: boolean;
+  }>;
+}
+
+/** prepareScopedWorkflows' full product (actions.go:296-366): the sidebar
+ *  groups, the scopedNames set (CurWorkflowIsListed :169 +
+ *  HasWorkflowsOrRuns :139), the per-source parsed contents (the
+ *  LoadParsedScopedWorkflows cache the dispatch banner re-reads —
+ *  ScopedWorkflowContent scoped_workflow_cache.go:73-85), and the selected
+ *  workflow's scoped overwrite (CurWorkflowScopedRepoID/Disabled/Required
+ *  :357-359 — "" mirrors the unset 0). */
+export interface ScopedWorkflowsData {
+  groups: ScopedWorkflowGroupView[];
+  scopedNames: Set<string>;
+  /** sourceRepoId → (entryName → raw file content) — the valid files only
+   *  (ParseScopedWorkflows' invalid-file skip: upstream's ReadWorkflow
+   *  would fail on them, so the banner's nil arm is the same answer). */
+  contentsBySource: Map<string, Map<string, string>>;
+  curScopedRepoId: string;
+  curScopedDisabled: boolean;
+  curScopedRequired: boolean;
+}
+
 /** The full-page block — everything the shell needs beyond the rows
  *  (prepareOtherWorkflows + prepareFullPageTemplate + the ⑲A4/A5 template
  *  data); null on the fragment arm (upstream renders the fragment template
@@ -633,9 +883,20 @@ export interface RepoActionsRunsPageBlock {
   /** Permission.IsAdmin — AllowDisableOrEnableWorkflow
    *  (actions.go:255); false until the route threads the admin grant. */
   allowDisableOrEnable: boolean;
-  /** CurWorkflowIsListed (actions.go:169's repo-level shape — the scoped
-   *  arm defers with C10). */
+  /** CurWorkflowIsListed (actions.go:169 — the repo-level listed set OR a
+   *  scoped workflow's selection, scopedNames.Contains). */
   curWorkflowIsListed: boolean;
+  // --- the scoped-workflow sidebar groups (prepareScopedWorkflows) ---
+  scopedWorkflowGroups: ScopedWorkflowGroupView[];
+  /** CurWorkflowScopedRepoID (actions.go:358) — the selected workflow's
+   *  SOURCE id when a group carries it, "" otherwise (the unset 0). */
+  curWorkflowScopedRepoId: string;
+  /** CurWorkflowDisabled (actions.go:272's repo-level read, :357's scoped
+   *  overwrite) — the kebab's enable/disable label arm. */
+  curWorkflowScopedDisabled: boolean;
+  /** CurWorkflowRequired (actions.go:359) — the kebab's disabled-class arm
+   *  (list.tmpl:89-90); a required workflow cannot be disabled here. */
+  curWorkflowScopedRequired: boolean;
   // --- the ⑲A4 dispatch template data (prepareWorkflowDispatchTemplate) ---
   /** The selected workflow's declared dispatch inputs — non-null exactly
    *  when the banner renders (list.tmpl:99's .WorkflowDispatchConfig gate:
@@ -682,6 +943,11 @@ export interface RepoActionsRunsInput {
    *  route call site keeps compiling; the route's mount hunk threads the
    *  canAdminRepo grant. */
   isAdmin?: boolean;
+  /** The SOURCE-repo engine binding the scoped arms walk through (the
+   *  sidebar groups' prepareScopedWorkflows + the dispatch banner's
+   *  loadScopedWorkflowModel). OPTIONAL — absent, both arms answer their
+   *  hidden/empty shapes (the route hunk threads it; see the type's doc). */
+  sourceEngineFor?: ScopedSourceEngineFor;
   /** The route clock (seconds) — the running-duration arm + the runner
    *  freshness check; the hand-rolled-clock convention. */
   nowSeconds: number;
@@ -710,7 +976,7 @@ const RUNNER_OFFLINE_SECONDS = 60;
  * complains about the same cost, actions.go:107-109 — fidelity kept).
  */
 export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Promise<RepoActionsRunsData> {
-  const { d1, engine, repo, query, requestUri, canWriteActions, nowSeconds } = input;
+  const { d1, engine, repo, query, requestUri, canWriteActions, nowSeconds, sourceEngineFor } = input;
   const allowDisableOrEnable = input.isAdmin === true;
   const db = drizzle(d1);
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
@@ -960,29 +1226,65 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     // read per full page.
     const actionsConfig = await loadRepoActionsConfig(d1, repo.id);
     const disabledWorkflows = actionsConfig.disabledWorkflows;
-    // CurWorkflowIsListed (actions.go:169's repo-level shape — the scoped
-    // arm defers with C10).
-    const curWorkflowIsListed = query.workflow === "" || workflows.some((wf) => wf.entryName === query.workflow);
 
-    // prepareWorkflowDispatchTemplate (actions.go:400-465) at the v1 stage:
-    // the selected workflow + a writer + the repo-level arm + the enabled
-    // check, then the file's parse — the banner renders only when the
-    // dispatch declaration exists (list.tmpl:99's .WorkflowDispatchConfig
-    // gate). Upstream's isScoped branch (loadScopedWorkflowModel,
-    // actions.go:407/425) is the C10-remaining surface. The parse is the
+    // prepareScopedWorkflows (actions.go:296-366 — upstream's List order
+    // puts it before prepareWorkflowDispatchTemplate): the sidebar groups,
+    // the scopedNames set, and the selected workflow's scoped overwrite.
+    // Upstream caches the parsed source files (LoadParsedScopedWorkflows);
+    // ours keeps the walked contents in a map the banner gate reads (the
+    // cache-hit arm — one walk feeds both consumers).
+    const scoped = await prepareScopedWorkflowGroups({
+      d1,
+      repo,
+      actionsConfig,
+      curWorkflow: query.workflow,
+      scopedSourceId,
+      sourceEngineFor,
+    });
+
+    // CurWorkflowIsListed (actions.go:169): the repo-level listed set OR a
+    // scoped workflow's selection (scopedNames.Contains).
+    const curWorkflowIsListed = query.workflow === "" || workflows.some((wf) => wf.entryName === query.workflow) || scoped.scopedNames.has(query.workflow);
+
+    // prepareWorkflowDispatchTemplate (actions.go:400-465): the selected
+    // workflow + a writer + the enabled check, then the file's parse — the
+    // banner renders only when the dispatch declaration exists
+    // (list.tmpl:99's .WorkflowDispatchConfig gate). The parse is the
     // landed fragment parser (the module header's single-parse note:
     // upstream derives this from the SAME ReadWorkflow pass the sidebar
     // uses; our light name-parse is a separate pass, so the selected file
     // parses twice — one extra yaml read, full page only).
     let workflowDispatch: { inputs: WorkflowDispatchInput[] } | null = null;
-    if (canWriteActions && query.workflow !== "" && scopedSourceId === "" && !disabledWorkflows.includes(query.workflow)) {
-      const selected = workflows.find((wf) => wf.entryName === query.workflow);
-      if (selected !== undefined && selected.errMsg === null) {
-        const content = await readWorkflowContent(engine, repo.defaultBranch, query.workflow);
-        if (content !== null) {
-          const parsed = parseWorkflowDispatchInputs(content);
-          if (parsed.errMsg === null && parsed.dispatch !== null) {
-            workflowDispatch = { inputs: parsed.dispatch.inputs };
+    if (canWriteActions && query.workflow !== "") {
+      if (scopedSourceId === "") {
+        // The repo-level arm (:414-415 else-if — the repo-level disabled
+        // map), the file resolved from this repo's default branch.
+        if (!disabledWorkflows.includes(query.workflow)) {
+          const selected = workflows.find((wf) => wf.entryName === query.workflow);
+          if (selected !== undefined && selected.errMsg === null) {
+            const content = await readWorkflowContent(engine, repo.defaultBranch, query.workflow);
+            if (content !== null) {
+              const parsed = parseWorkflowDispatchInputs(content);
+              if (parsed.errMsg === null && parsed.dispatch !== null) {
+                workflowDispatch = { inputs: parsed.dispatch.inputs };
+              }
+            }
+          }
+        }
+      } else {
+        // The isScoped branch (:407-423): the opt-out gate first (a
+        // required workflow's stale flag never hides the form — :409-417),
+        // then the SOURCE content from the walked parsed set
+        // (loadScopedWorkflowModel :372-406 → ScopedWorkflowContent — a
+        // missing or invalid file answers the nil-model no-banner, exactly
+        // the cache-miss arms).
+        if (!(await isScopedWorkflowOptedOut(d1, actionsConfig, repo.ownerId ?? 0, scopedSourceId, query.workflow))) {
+          const content = scoped.contentsBySource.get(scopedSourceId)?.get(query.workflow);
+          if (content !== undefined) {
+            const parsed = parseWorkflowDispatchInputs(content);
+            if (parsed.errMsg === null && parsed.dispatch !== null) {
+              workflowDispatch = { inputs: parsed.dispatch.inputs };
+            }
           }
         }
       }
@@ -1028,7 +1330,9 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     const runBranches = [...branchNames].sort((a, b) => a.localeCompare(b));
 
     const canWriteCode = canWriteActions; // the code unit is not toggleable in our store (the reduction)
-    const hasWorkflowsOrRuns = workflows.length > 0 || otherWorkflows.length > 0 || total > 0;
+    // HasWorkflowsOrRuns (actions.go:139): the four-way any — a scoped
+    // workflow's existence alone opens the shell (len(scopedNames) > 0).
+    const hasWorkflowsOrRuns = workflows.length > 0 || otherWorkflows.length > 0 || total > 0 || scoped.scopedNames.size > 0;
     // The rendered param (curWorkflowRepoID, actions.go:710): upstream
     // re-renders its PARSED FormInt64 (absent/junk → "0"); ours renders the
     // raw TEXT param verbatim — the parse adaptation — with "" (absent) and
@@ -1049,6 +1353,10 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
       disabledWorkflows,
       allowDisableOrEnable,
       curWorkflowIsListed,
+      scopedWorkflowGroups: scoped.groups,
+      curWorkflowScopedRepoId: scoped.curScopedRepoId,
+      curWorkflowScopedDisabled: scoped.curScopedDisabled,
+      curWorkflowScopedRequired: scoped.curScopedRequired,
       workflowDispatch,
       dispatchBranches,
       dispatchTags,
@@ -1279,9 +1587,9 @@ function filterHref(
   return `${basePath}?${params.toString()}`;
 }
 
-/** The sidebar (sidebar.tmpl:1-62 — the scoped groups defer with C10; the
- *  disabled red labels ride the LANDED ActionsConfig store, and the
- *  Management section is the ⑲A3 row's live job-queue link). */
+/** The sidebar (sidebar.tmpl:1-62 — the scoped groups are the DR-1(c)
+ *  landing; the disabled red labels ride the LANDED ActionsConfig store,
+ *  and the Management section is the ⑲A3 row's live job-queue link). */
 function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) {
   const block = props.data.pageBlock;
   if (block === null) return null;
@@ -1301,7 +1609,7 @@ function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) 
         {block.workflows.map((wf) => (
           <a
             key={wf.entryName}
-            class={props.data.curWorkflow === wf.entryName ? "item flex-text-block active" : "item flex-text-block"}
+            class={props.data.curWorkflow === wf.entryName && block.curWorkflowScopedRepoId === "" ? "item flex-text-block active" : "item flex-text-block"}
             href={filterHref(`${props.repoLink}/actions`, carried, {})}
           >
             <span class="gt-ellipsis" data-tooltip-content={wf.displayName}>
@@ -1316,6 +1624,46 @@ function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) 
               <div class="ui red label tw-shrink-0">{repoActionsRunsLocale.disabled}</div>
             ) : null}
           </a>
+        ))}
+        {/* The scoped-workflow groups (sidebar.tmpl:17-34 — the source
+            repo's name + the scope label on the summary, the per-workflow
+            links carrying the TEXT source id; a required workflow shows
+            the Required label, else the Disabled red one). */}
+        {block.scopedWorkflowGroups.map((group) => (
+          <details key={group.sourceRepoId} class="item scoped-workflow-group" open={group.isActive}>
+            <summary>
+              <span class="gt-ellipsis tw-min-w-0" data-tooltip-content={group.sourceRepoName}>
+                {group.fromInstance ? group.sourceRepoName : group.sourceRepoShortName}
+              </span>
+              <span class="ui label">{group.fromInstance ? repoActionsRunsLocale.scope_global : repoActionsRunsLocale.scope_owner}</span>
+            </summary>
+            {group.workflows.map((wf) => (
+              <a
+                key={wf.entryName}
+                class={
+                  props.data.curWorkflow === wf.entryName && block.curWorkflowScopedRepoId === wf.sourceRepoId
+                    ? "item flex-text-block active"
+                    : "item flex-text-block"
+                }
+                href={`${props.repoLink}/actions?${new URLSearchParams({
+                  workflow: wf.entryName,
+                  scoped_workflow_source_repo_id: wf.sourceRepoId,
+                  actor: String(block.curActor),
+                  status: String(block.curStatus),
+                  branch: block.curBranch,
+                }).toString()}`}
+              >
+                <span class="gt-ellipsis tw-min-w-0" data-tooltip-content={wf.entryName}>
+                  {wf.displayName}
+                </span>
+                {wf.required ? (
+                  <span class="ui label">{repoActionsRunsLocale.required}</span>
+                ) : wf.disabled ? (
+                  <span class="ui red label">{repoActionsRunsLocale.disabled}</span>
+                ) : null}
+              </a>
+            ))}
+          </details>
         ))}
         {block.otherWorkflows.length > 0 ? (
           <details class="item" open={!block.curWorkflowIsListed}>
@@ -1368,6 +1716,16 @@ function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) 
     branch: block.curBranch,
   };
   const basePath = `${props.repoLink}/actions`;
+  // The kebab item's state (list.tmpl:89-90 over actions.go:272's
+  // repo-level read + :357-359's scoped overwrite): a selected scoped
+  // workflow reads the opt-out flag for the label, and a REQUIRED one
+  // renders the disabled class WITHOUT the data-url (it can never be
+  // disabled here).
+  const curWorkflowScopedSelected = block.curWorkflowScopedRepoId !== "";
+  const curWorkflowRequired = curWorkflowScopedSelected && block.curWorkflowScopedRequired;
+  const curWorkflowDisabled = curWorkflowScopedSelected
+    ? block.curWorkflowScopedDisabled
+    : block.disabledWorkflows.includes(props.data.curWorkflow);
   return (
     <div class="ui secondary filter menu flex-text-block tw-m-0">
       {/* Actor (list.tmpl:19-36) — the avatar thumbnails render as the
@@ -1426,9 +1784,8 @@ function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) 
       {/* The kebab button (list.tmpl:79-95 — the ⑲A5 row): the badge-modal
           entry rides the LIVE badge.svg route; the enable/disable item is
           the bundle's link-action POST to the orchestrator-owned
-          /actions/{enable|disable} mount. CurWorkflowRequired is the scoped
-          arm — v1-inert (the module header), so the item is never the
-          disabled class. */}
+          /actions/{enable|disable} mount, its label/state reading the
+          scoped overwrite for a scoped selection (the DR-1(c) arm). */}
       {runsFilterKebabVisible(props.data) ? (
         <button type="button" class="ui jump dropdown btn interact-bg tw-p-2">
           <Icon name="octicon-kebab-horizontal" />
@@ -1440,18 +1797,20 @@ function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) 
             ) : null}
             {showEnableDisableWorkflow(props.data) ? (
               <a
-                class="item link-action"
-                data-url={`${basePath}/${block.disabledWorkflows.includes(props.data.curWorkflow) ? "enable" : "disable"}?${new URLSearchParams({
-                  workflow: props.data.curWorkflow,
-                  scoped_workflow_source_repo_id: block.curWorkflowRepoId,
-                  actor: String(block.curActor),
-                  status: String(block.curStatus),
-                  branch: block.curBranch,
-                }).toString()}`}
+                class={curWorkflowRequired ? "item disabled" : "item link-action"}
+                data-url={
+                  curWorkflowRequired
+                    ? undefined
+                    : `${basePath}/${curWorkflowDisabled ? "enable" : "disable"}?${new URLSearchParams({
+                        workflow: props.data.curWorkflow,
+                        scoped_workflow_source_repo_id: block.curWorkflowRepoId,
+                        actor: String(block.curActor),
+                        status: String(block.curStatus),
+                        branch: block.curBranch,
+                      }).toString()}`
+                }
               >
-                {block.disabledWorkflows.includes(props.data.curWorkflow)
-                  ? repoActionsRunsLocale.enable_workflow
-                  : repoActionsRunsLocale.disable_workflow}
+                {curWorkflowRequired || !curWorkflowDisabled ? repoActionsRunsLocale.disable_workflow : repoActionsRunsLocale.enable_workflow}
               </a>
             ) : null}
           </div>

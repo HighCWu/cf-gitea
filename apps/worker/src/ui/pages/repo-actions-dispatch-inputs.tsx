@@ -54,11 +54,21 @@
  * - The ActionsConfig disabled-workflow check (actions.go:415) rides the
  *   unlanded repo ActionsConfig store — always false here (the C1 module's
  *   same note); the early-return arm is unreachable.
- * - The scoped-workflow arm (`?scoped_workflow_source_repo_id` > 0,
- *   actions.go:409-423 → loadScopedWorkflowModel's source-repo walk) has no
- *   store substrate in v1 (the scoped family is C10/post-M3, isScopedRun is
- *   never written) → ctx.NotFound (404) — the documented reduction, never a
- *   fabricated source walk.
+ * - The scoped-workflow arm (`?scoped_workflow_source_repo_id` naming a
+ *   source, actions.go:407-423 → loadScopedWorkflowModel's source-repo
+ *   walk) LANDED with DR-1(c): the TEXT param rides verbatim
+ *   (config.ts's `scopedSourceRepoParam` — ""/"0" is the repo-level arm,
+ *   upstream FormInt64's parsed zero) and the resolution ported the
+ *   service arms' shape (opted-out gate, effective-source gate, the
+ *   source row, the SOURCE default-branch SCOPED_WORKFLOW_DIRS walk with
+ *   the entry-name match). Upstream renders every failed arm as the
+ *   template's not-found message with HTTP 200 (prepareWorkflowDispatchTemplate
+ *   early-returns leave CurWorkflowExists unset) — a broken SOURCE file
+ *   answers not-found too (ReadWorkflow's error → nil, actions.go:401-403),
+ *   unlike the dispatch producer, which surfaces the light-validation text.
+ *   The route must thread `d1` + `consumerOwnerId` + `sourceEngineFor`
+ *   (the HANDOFF snippet below); with the seam unthreaded the arm answers
+ *   the same not-found message rather than fabricating a walk.
  * - Inputs parse through the landed `yaml` package (YAML 1.2 core — the
  *   `on:` key is the plain string; gopkg.in/yaml.v3's resolution, act's
  *   parser) with `mapAsMap` so input names keep DECLARATION order (JS
@@ -98,18 +108,24 @@
  *       }
  *       const outcome = await loadWorkflowDispatchInputsFragment({
  *         reads: engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+ *         d1: c.env.DB, // the scoped arm's opt-out/effective store reads (config.ts)
+ *         consumerOwnerId: repo.ownerId ?? 0, // the scoped arm's consumer scope
  *         repo,
  *         ref: url.searchParams.get("ref") ?? "",
  *         workflow: url.searchParams.get("workflow") ?? "",
- *         scopedWorkflowSourceRepoId: formInt64(url.searchParams.get("scoped_workflow_source_repo_id")),
+ *         scopedWorkflowSourceRepoId: url.searchParams.get("scoped_workflow_source_repo_id") ?? "", // RAW text — the TEXT id adaptation
+ *         sourceEngineFor: (fullName) => engineClient(c.env, fullName), // the SOURCE repo walk (loadScopedWorkflowModel)
  *       });
  *       if (outcome.status === "not-found") return respond(c.html(renderNotFound(ctx), 404));
  *       if (outcome.status === "throw") throw new Error(outcome.reason); // upstream's ctx.ServerError arm
  *       return respond(c.html(outcome.html, 200));
  *     }
  *
- *    (formInt64: digits parse, junk → 0 — FormInt64's convention, the
- *    runs-list module's note.)
+ *    (the scoped param rides RAW: upstream parses FormInt64 BECAUSE its
+ *    repositories.id is int64 — ours is TEXT, the landed page's adaptation;
+ *    config.ts's scopedSourceRepoParam does the zero-reduction at the use
+ *    point. The numeric formInt64 wrapper this snippet once showed is the
+ *    id-space adaptation's casualty.)
  * 5. Registration (the `/actions` group's block — web.go:1572 registers
  *    beside the group's static literals):
  *    `uiRouter.get("/:owner/:repo/actions/workflow-dispatch-inputs", (c) => repoActionsDispatchInputsRoute(c));`
@@ -121,9 +137,19 @@
  *    authorized GET → the fragment/404/500 by arm).
  */
 
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 import { renderToString } from "hono/jsx/dom/server";
 import { parse as yamlParse } from "yaml";
 
+import { repositories } from "../../db/schema";
+import {
+  isScopedWorkflowOptedOut,
+  isScopedWorkflowSourceEffective,
+  loadRepoActionsConfig,
+  scopedSourceRepoParam,
+} from "../../services/actions/config";
+import { SCOPED_WORKFLOW_DIRS } from "../../services/actions/scoped-workflows";
 import { Icon } from "../shell";
 
 // ---------------------------------------------------------------------------
@@ -405,17 +431,34 @@ export type DispatchInputsRepo = { id: string; ownerNamespace: string; slug: str
 
 export interface WorkflowDispatchInputsInput {
   /** The engine read slice (the structural pair the ui/api engine clients
-   *  share) — the fragment's only data source (the store-backed arms are
-   *  the documented-unreachable ActionsConfig/scoped pair). */
+   *  share) — the CONSUMER repo's reads (the ref resolution + the
+   *  consumer-walk ErrMsg range and the repo-level arm's config). */
   reads: DispatchInputsReads;
   repo: DispatchInputsRepo;
+  /** The D1 binding the scoped arm's opt-out/effective reads run through
+   *  (config.ts). OPTIONAL — the repo-level arm never reads the store;
+   *  absent alongside a scoped selection answers the template's not-found
+   *  message (the walk is never fabricated). */
+  d1?: D1Database;
+  /** repo.OwnerID — the scoped arm's consumer scope (the opt-out and
+   *  effective-source reads' owner half). */
+  consumerOwnerId?: number;
   /** The `?ref=` value — a FULL ref name (refs/heads/* or refs/tags/*; the
    *  modal's branch dropdown composes exactly those two shapes). */
   ref: string;
   /** The `?workflow=` id. */
   workflow: string;
-  /** The `?scoped_workflow_source_repo_id=` parse (FormInt64 — junk → 0). */
-  scopedWorkflowSourceRepoId: number;
+  /** The RAW `?scoped_workflow_source_repo_id=` text — the TEXT id-space
+   *  adaptation (upstream parses FormInt64 because its repositories.id is
+   *  int64); config.ts's `scopedSourceRepoParam` does the zero-reduction at
+   *  the use point: ""/"0"/negative is the repo-level arm, upstream's
+   *  parsed zero. */
+  scopedWorkflowSourceRepoId: string;
+  /** The SOURCE repo's engine binding for the scoped arm's walk — the
+   *  route threads `(fullName) => engineClient(c.env, fullName)` (the /run
+   *  mount's landed shape). OPTIONAL with the same unthreaded posture as
+   *  `d1`. */
+  sourceEngineFor?: (fullName: string) => DispatchInputsReads;
 }
 
 export type WorkflowDispatchInputsOutcome =
@@ -428,10 +471,14 @@ export type WorkflowDispatchInputsOutcome =
 const WORKFLOW_DIRS = [".gitea/workflows", ".github/workflows"];
 
 /**
- * The WorkflowDispatchInputs arm over one (ref, workflow) pair. The v1
- * fragment reads NOTHING from the store (the ActionsConfig disabled check
- * and the scoped walk are the documented-unreachable arms) — the engine
- * reads carry the whole answer.
+ * The WorkflowDispatchInputs arm over one (ref, workflow) pair. The
+ * repo-level arm reads NOTHING from the store (the ActionsConfig disabled
+ * check stays the documented-unreachable arm) — the engine reads carry the
+ * whole answer. The SCOPED arm adds the store-backed gates (the opt-out +
+ * effective-source reads through `d1`) and the SOURCE repo's walk through
+ * `sourceEngineFor`; upstream renders every one of its failed arms as the
+ * template's not-found message over HTTP 200, never a 4xx/5xx (the module
+ * header).
  */
 export async function loadWorkflowDispatchInputsFragment(input: WorkflowDispatchInputsInput): Promise<WorkflowDispatchInputsOutcome> {
   const { reads, ref, workflow, scopedWorkflowSourceRepoId } = input;
@@ -439,11 +486,12 @@ export async function loadWorkflowDispatchInputsFragment(input: WorkflowDispatch
   if (ref === "") {
     return { status: "not-found" }; // actions.go:174-177's FormString miss
   }
-  if (scopedWorkflowSourceRepoId > 0) {
-    // The scoped arm's documented reduction (the module header): no source
-    // substrate exists in v1, the walk is never fabricated.
-    return { status: "not-found" };
-  }
+
+  // The param's TEXT adaptation (scopedSourceRepoParam — the landed page's
+  // reduction): ""/"0"/negative is the repo-level arm, upstream FormInt64's
+  // parsed zero; any other text rides as a source-id candidate.
+  const scopedSourceId = scopedSourceRepoParam(scopedWorkflowSourceRepoId);
+  const isScoped = scopedSourceId !== "";
 
   // The ref-type parse (actions.go:178-185): tags and branches only.
   const isTag = ref.startsWith("refs/tags/");
@@ -460,7 +508,9 @@ export async function loadWorkflowDispatchInputsFragment(input: WorkflowDispatch
   }
 
   // prepareWorkflowTemplate's ListWorkflows walk (actions.go:210) — the
-  // first existing dir wins, .yml/.yaml blobs (workflows.go:110-113).
+  // CONSUMER repo at the dispatched ref (upstream runs it on BOTH arms; the
+  // modal's ref is always a consumer branch/tag). The first existing dir
+  // wins, .yml/.yaml blobs (workflows.go:110-113).
   let dir: string | null = null;
   let entries: Array<{ name: string; type: string }> = [];
   for (const candidate of WORKFLOW_DIRS) {
@@ -473,43 +523,141 @@ export async function loadWorkflowDispatchInputsFragment(input: WorkflowDispatch
   }
 
   // The `?workflow=` id locates the current file (the base-segment match —
-  // the repo-actions-workflow module's store-spelling divergence).
-  const curExists =
-    dir !== null &&
-    entries.some(
-      (entry) =>
-        entry.type === "blob" &&
-        (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml")) &&
-        entry.name === baseSegment(workflow),
-    );
+  // the repo-actions-workflow module's store-spelling divergence). At
+  // actions.go:210-259 the walk feeds the per-file parses whose ErrMsg the
+  // template's .workflows range renders (:39-45) AND — repo-level only —
+  // the CurWorkflowExists/WorkflowDispatchConfig data (prepareWorkflowDispatchTemplate's
+  // workflowInfos scan, actions.go:425-440).
+  const consumerEntry =
+    dir !== null
+      ? entries.find(
+          (entry) =>
+            entry.type === "blob" && (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml")) && entry.name === baseSegment(workflow),
+        )
+      : undefined;
 
-  let errMsg: string | null = null;
-  let dispatch: { inputs: WorkflowDispatchInput[] } | null = null;
-  if (curExists && dir !== null) {
-    // prepareWorkflowTemplate's per-file parse — the CURRENT file only (the
-    // all-workflows walk feeds the page sidebar; the fragment renders one).
-    const entryName = entries.find((entry) => entry.type === "blob" && entry.name === baseSegment(workflow))?.name;
-    if (entryName !== undefined) {
-      const blob = await reads.readBlob(ref, `${dir}/${entryName}`);
-      if (blob === null) {
-        // GetContentFromEntry's error arm is upstream's ServerError.
-        return { status: "throw", reason: `WorkflowDispatchInputs: GetContentFromEntry ${dir}/${entryName} failed` };
-      }
-      const parsed = parseWorkflowDispatchInputs(new TextDecoder().decode(blob.data));
-      errMsg = parsed.errMsg;
-      dispatch = parsed.dispatch;
+  let consumerErrMsg: string | null = null;
+  let consumerDispatch: { inputs: WorkflowDispatchInput[] } | null = null;
+  if (consumerEntry !== undefined && dir !== null) {
+    // The CURRENT file's parse (the fragment renders one workflow's view).
+    const blob = await reads.readBlob(ref, `${dir}/${consumerEntry.name}`);
+    if (blob === null) {
+      // GetContentFromEntry's error arm is upstream's ServerError.
+      return { status: "throw", reason: `WorkflowDispatchInputs: GetContentFromEntry ${dir}/${consumerEntry.name} failed` };
     }
+    const parsed = parseWorkflowDispatchInputs(new TextDecoder().decode(blob.data));
+    consumerErrMsg = parsed.errMsg;
+    consumerDispatch = parsed.dispatch;
+  }
+
+  let curExists: boolean;
+  let dispatch: { inputs: WorkflowDispatchInput[] } | null;
+  if (isScoped) {
+    // The isScoped branch (actions.go:407-423 → loadScopedWorkflowModel
+    // :372-406): the SOURCE walk answers CurWorkflowExists + the config;
+    // every failed arm leaves CurWorkflowExists unset — the not-found
+    // message. The ErrMsg alert still reads the CONSUMER walk (the
+    // same-named repo-level file's parse, the .workflows range's
+    // eq-EntryName arm — near-always null on a scoped id).
+    const resolved = await resolveScopedWorkflowDispatch(input, scopedSourceId);
+    curExists = resolved.exists;
+    dispatch = resolved.dispatch;
+  } else {
+    curExists = consumerEntry !== undefined;
+    dispatch = consumerDispatch;
   }
 
   return {
     status: "ok",
     html: renderWorkflowDispatchInputsFragment({
       curWorkflow: workflow,
-      errMsg,
+      errMsg: consumerErrMsg,
       curWorkflowExists: curExists,
       dispatch,
     }),
   };
+}
+
+/** The scoped arm's resolution (loadScopedWorkflowModel actions.go:372-406
+ *  → ScopedWorkflowContent scoped_workflow_cache.go:73-85, over the landed
+ *  config.ts reads). Every gate's miss answers `exists: false` — upstream
+ *  logs and returns nil, leaving CurWorkflowExists unset, and the template
+ *  renders the not-found message over 200. */
+async function resolveScopedWorkflowDispatch(
+  input: WorkflowDispatchInputsInput,
+  sourceId: string,
+): Promise<{ exists: boolean; dispatch: { inputs: WorkflowDispatchInput[] } | null }> {
+  const { d1, consumerOwnerId, repo, sourceEngineFor, workflow } = input;
+  if (d1 === undefined || sourceEngineFor === undefined) {
+    // The route seam unthreaded (the HANDOFF header) — never fabricated.
+    return { exists: false, dispatch: null };
+  }
+  const owner = consumerOwnerId ?? 0;
+
+  // The opt-out gate (:409-417 — flagged disabled AND not required; a
+  // required workflow's stale flag never hides the form).
+  const cfg = await loadRepoActionsConfig(d1, repo.id);
+  if (await isScopedWorkflowOptedOut(d1, cfg, owner, sourceId, workflow)) {
+    return { exists: false, dispatch: null };
+  }
+
+  // IsScopedWorkflowSourceEffective (:376-379) — a non-source answers nil.
+  if (!(await isScopedWorkflowSourceEffective(d1, owner, sourceId))) {
+    return { exists: false, dispatch: null };
+  }
+
+  // GetRepositoryByID (:381-385) — a missing or empty source is nil.
+  const sourceRows = await drizzle(d1)
+    .select({
+      id: repositories.id,
+      ownerNamespace: repositories.ownerNamespace,
+      slug: repositories.slug,
+      defaultBranch: repositories.defaultBranch,
+      isEmpty: repositories.isEmpty,
+    })
+    .from(repositories)
+    .where(eq(repositories.id, sourceId))
+    .limit(1);
+  const sourceRepo = sourceRows[0];
+  if (sourceRepo === undefined || sourceRepo.isEmpty) {
+    return { exists: false, dispatch: null };
+  }
+
+  // ScopedWorkflowContent (scoped_workflow_cache.go:73-85): the SOURCE's
+  // default-branch scoped walk (ListScopedWorkflows — the FIRST existing
+  // SCOPED_WORKFLOW_DIRS dir, its .yml/.yaml entries), the entry-name
+  // match, nil when absent. An unresolvable source default branch is
+  // LoadParsedScopedWorkflows' GetBranchExisting error → the log.Error nil
+  // arm (the engine's null-on-miss listTree folds to the same not-found).
+  const sourceReads = sourceEngineFor(`${sourceRepo.ownerNamespace}/${sourceRepo.slug}`);
+  const sourceRef = `refs/heads/${sourceRepo.defaultBranch}`;
+  let dir: string | null = null;
+  let entries: Array<{ name: string; type: string }> = [];
+  for (const candidate of SCOPED_WORKFLOW_DIRS) {
+    const tree = await sourceReads.listTree(sourceRef, candidate);
+    if (tree !== null) {
+      dir = candidate;
+      entries = tree.entries;
+      break;
+    }
+  }
+  const entryName = entries.find(
+    (entry) => entry.type === "blob" && (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml")) && entry.name === baseSegment(workflow),
+  )?.name;
+  if (dir === null || entryName === undefined) {
+    return { exists: false, dispatch: null }; // the parsed set has no such EntryName
+  }
+  const blob = await sourceReads.readBlob(sourceRef, `${dir}/${entryName}`);
+  if (blob === null) {
+    return { exists: false, dispatch: null }; // GetContentFromEntry error → ScopedWorkflowContent error → nil
+  }
+  const parsed = parseWorkflowDispatchInputs(new TextDecoder().decode(blob.data));
+  if (parsed.errMsg !== null) {
+    // jobparser.ReadWorkflow's error → nil (actions.go:401-403) — the
+    // not-found message, NOT the invalid-workflow alert.
+    return { exists: false, dispatch: null };
+  }
+  return { exists: true, dispatch: parsed.dispatch };
 }
 
 /** The path/id's last segment (the repo-actions-workflow module's twin). */

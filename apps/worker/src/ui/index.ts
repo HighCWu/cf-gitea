@@ -176,21 +176,24 @@
  *                                          DELETE arm + the M2 deletion
  *                                          predicate; the refusals flash
  *                                          upstream's exact texts)
- *   /{org}/labels                          org labels management, GET
+ *   /org/{org}/settings/labels             org labels management, GET
  *                                          (pages/org-labels.tsx — wave 14;
  *                                          the landed org-label family's
  *                                          list over the org-teams owner
- *                                          gate; the brief's literal URL —
- *                                          upstream nests the page under
- *                                          /org/{org}/settings/labels, the
- *                                          documented divergence; claims
- *                                          the `labels` second segment
- *                                          before the repo parse, shadowing
- *                                          a repo named "labels" exactly
- *                                          like the teams literal)
- *   /{org}/labels/{new|edit|delete}        the label writes, POST (upstream's
+ *                                          gate; the ledger-B3 shape —
+ *                                          upstream's own subtree,
+ *                                          web.go:1043-1048's /labels group
+ *                                          inside the require-owner
+ *                                          /org/{org} /settings subtree; the
+ *                                          wave brief's bare /{org}/labels
+ *                                          literal was the one shape
+ *                                          upstream does not mount and was
+ *                                          retired with B3)
+ *   /org/{org}/settings/labels/{new|edit|delete|initialize}
+ *                                          the label writes, POST (upstream's
  *                                          exact POST segments, org.NewLabel
- *                                          /UpdateLabel/DeleteLabel; GET →
+ *                                          /UpdateLabel/DeleteLabel/
+ *                                          InitializeLabels; GET →
  *                                          405)
  *   /:owner/:repo/commit/{sha}             commit view, GET (pages/
  *                                          commit-view.tsx — wave 18; the
@@ -271,23 +274,25 @@
  *                                          wave 11; upstream web.go:1436
  *                                          DismissReview, admin only;
  *                                          GET → 405)
- *   /:org/teams                             org teams list, GET (pages/
+ *   /org/{org}/teams                       org teams list, GET (pages/
  *                                          org-teams.tsx — wave 12;
  *                                          upstream web.go:993 org.Teams
  *                                          at the landed requireOrgOwnership
  *                                          posture — owner/site-admin
  *                                          viewers only, everyone else
- *                                          404-shells; the literal claims
- *                                          the shape before the repo parse,
- *                                          upstream's own shadowing order)
- *   /:org/teams/new                         create-team form, GET + POST
+ *                                          404-shells; the ledger-B3 shape
+ *                                          — upstream's own /org group
+ *                                          mount; the retired bare
+ *                                          /{owner}/teams falls to web.go:1292's
+ *                                          /{username}/{reponame} pair)
+ *   /org/{org}/teams/new                   create-team form, GET + POST
  *                                          (pages/org-teams.tsx — wave 12;
  *                                          upstream teams.go:316-390
  *                                          NewTeam/NewTeamPost at the
  *                                          owner gate; POST → the landed
  *                                          createTeam arm → 303 onto the
  *                                          created team's detail slice)
- *   /:org/teams/{id}                        team detail slice, GET (pages/
+ *   /org/{org}/teams/{id}                  team detail slice, GET (pages/
  *                                          org-teams.tsx — wave 12; the
  *                                          members + repo-access lists,
  *                                          upstream members.tmpl +
@@ -588,28 +593,29 @@
  *                                          "Unable to find renderer" 400
  *                                          class elsewhere; the module doc
  *                                          carries the divergences)
- *   /{org}/settings[/{avatar|rename|delete|visibility|avatar/delete}]
+ *   /org/{org}/settings[/{avatar|rename|delete|visibility|avatar/delete}]
  *                                          the org settings page + its
  *                                          write arms, GET + POST on the
  *                                          bare URL, POST elsewhere
  *                                          (pages/org-settings.tsx — wave
  *                                          49; the survey's re-ranked #1,
  *                                          upstream web.go:1017-1092's
- *                                          require-owner /{org} group over
- *                                          org/settings/options.tmpl — the
- *                                          landed orgEdit/renameOrg/
+ *                                          require-owner /org/{org} group
+ *                                          over org/settings/options.tmpl —
+ *                                          the landed orgEdit/renameOrg/
  *                                          orgDelete/avatar ops; the
  *                                          applications/labels/packages/
  *                                          actions/blocked_users/audit_logs
  *                                          TABS are separate pages this
  *                                          wave does not claim; the
- *                                          `settings` literal shadows a
- *                                          repository so named exactly
- *                                          like upstream's group order)
- *   /{org}/settings/hooks                  the org webhooks list + add form,
+ *                                          ledger-B3 shape — the retired
+ *                                          bare /{owner}/settings falls to
+ *                                          web.go:1292's
+ *                                          /{username}/{reponame} pair)
+ *   /org/{org}/settings/hooks              the org webhooks list + add form,
  *                                          GET + POST
- *   /{org}/settings/hooks/{id}             the org per-hook page, GET + POST
- *   /{org}/settings/hooks/{id}/delete      the org hook delete, POST
+ *   /org/{org}/settings/hooks/{id}         the org per-hook page, GET + POST
+ *   /org/{org}/settings/hooks/{id}/delete  the org hook delete, POST
  *                                          (pages/org-settings-hooks.tsx —
  *                                          wave 53; upstream web.go:1033-1044's
  *                                          /hooks group over org/settings/
@@ -622,8 +628,13 @@
  *                                          family); no test/replay arms —
  *                                          the module header's reductions;
  *                                          the same require-owner posture)
- *   /{org}/teams/{id}/edit                 the team edit form, GET + POST
- *   /{org}/teams/{id}/delete               the team delete, POST
+ *   /org/{org}/worktime                    the worktime aggregate, GET
+ *                                          (pages/org-worktime.tsx — the
+ *                                          ledger-B3 shape; upstream
+ *                                          web.go:1015's owner-only literal
+ *                                          inside the /org group)
+ *   /org/{org}/teams/{id}/edit             the team edit form, GET + POST
+ *   /org/{org}/teams/{id}/delete           the team delete, POST
  *                                          (same module — web.go:1011-1013
  *                                          over the landed orgEditTeam/
  *                                          orgDeleteTeam arms; the entry
@@ -2820,8 +2831,9 @@ export interface TagsRoute {
  *  `/labels/delete` — web.go:1417-1422 under reqSignIn +
  *  RepoMustNotBeArchived + reqRepoIssuesOrPullsWriter; the survey's TOP-2
  *  row). The repo-scoped `labels` THIRD segment never collides with the
- *  wave-14 org literal (which claims `/{org}/labels` — `labels` as the
- *  SECOND segment — upstream shadows that repo identically). The
+ *  wave-14 org family (which claims `/org/{org}/settings/labels` — the
+ *  ledger-B3 subtree shape inside the /org group; a bare
+ *  /{owner}/labels path is upstream-faithfully a repository path). The
  *  `/labels/initialize` template loader and every deeper tail stay
  *  unclaimed → the engine's 404. */
 export interface RepoLabelsRoute {
@@ -3745,9 +3757,9 @@ export interface RepoMigrateStatusRoute {
 }
 
 /** The org WORKTIME page (pages/org-worktime.tsx — upstream web.go:1015's
- *  owner-only tracked-times aggregate; served at /{org}/worktime per the
- *  landed require-owner family convention, upstream's /org/... path
- *  recorded in the module header). */
+ *  owner-only tracked-times aggregate; served at the ledger-B3 canonical
+ *  /org/{org}/worktime shape — upstream's own /org-group mount, web.go:1015,
+ *  the module header's recorded path). */
 export interface OrgWorktimeRoute {
   family: "org-worktime";
   owner: string;
@@ -3828,22 +3840,23 @@ export interface UserSettingsTabRoute {
 }
 
 /** The wave-12 org teams families (pages/org-teams.tsx): upstream's
- *  `/{org}/teams` group (web.go:993-1013) at the landed API shapes — the
+ *  `/org/{org}/teams` group (web.go:993-1013) at the landed API shapes — the
  *  list, the detail slice (upstream links by team name; the slice follows
- *  the landed /teams/{id} read arms), and the create form. The literal
- *  `teams` second segment claims the shapes before the repo parse could
- *  read them as a repository named "teams" — upstream shadows such a repo
- *  identically (web.go:993 registers ahead of :1292's
- *  `/{username}/{reponame}`). The deeper tails (`/{id}/repositories`,
- *  `/{id}/edit`, `/{id}/delete`) plus the `/action/*` writes (the O1
- *  membership families below) are the only tails this module claims;
- *  every other tail stays unclaimed → the engine's 404. The census R19
- *  wave adds the NAME CARRIER on the detail family: a non-numeric
- *  `/{team}` segment claims the same detail arm resolved case-folded
- *  through the lower_name (upstream's EqualFold walk,
+ *  the landed /teams/{id} read arms), and the create form. The ledger-B3
+ *  shape: the literal `org` second segment + the literal `teams` fourth —
+ *  upstream mounts every org route inside m.Group("/org", ...) and nothing
+ *  at /{owner}/teams, whose retired bare shape falls to web.go:1292's
+ *  `/{username}/{reponame}` pair (a repository named "teams" renders as the
+ *  repository, the engine's 404 otherwise). The deeper tails
+ *  (`/{id}/repositories`, `/{id}/edit`, `/{id}/delete`) plus the
+ *  `/action/*` writes (the O1 membership families below) are the only
+ *  tails this module claims; every other tail stays unclaimed → the
+ *  engine's 404. The census R19 wave adds the NAME CARRIER on the detail
+ *  family: a non-numeric `/{team}` segment claims the same detail arm
+ *  resolved case-folded through the lower_name (upstream's EqualFold walk,
  *  services/context/org.go:213-218; a miss 404-shells, org.go:214-218 —
  *  upstream answers its 404 page for any team param, so the segment claim
- *  is upstream-shaped), while the five-segment edit/delete tails keep
+ *  is upstream-shaped), while the edit/delete tails keep
  *  their positive-integer-only claims (the wave-49 shapes). */
 export interface OrgTeamsRoute {
   family: "org-teams" | "org-team-new" | "org-team-detail";
@@ -3904,11 +3917,13 @@ export interface OrgMembersActionRoute {
 }
 
 /** The wave-14 org labels management families (pages/org-labels.tsx): the
- *  brief's literal `/{org}/labels` page plus upstream's three POST segments
- *  (`/labels/new`, `/labels/edit`, `/labels/delete` — web.go:1043-1048's
- *  writes; the brief's literal claims the `labels` second segment before the
- *  repo parse, the teams precedent). The `/labels/initialize` template
- *  loader and any deeper tail stay unclaimed → the engine's 404. */
+ *  ledger-B3 `/org/{org}/settings/labels` page (upstream's own subtree —
+ *  web.go:1043-1048's /labels group inside the require-owner /org/{org}
+ *  /settings subtree; the wave brief's bare `/{org}/labels` literal was the
+ *  one shape upstream does not mount and was retired with B3) plus
+ *  upstream's write segments (`/labels/new`, `/labels/edit`,
+ *  `/labels/delete`, `/labels/initialize`). Any deeper tail stays
+ *  unclaimed → the engine's 404. */
 export interface OrgLabelsRoute {
   family: "org-labels" | "org-label-new" | "org-label-edit" | "org-label-delete" | "org-label-initialize";
   /** Decoded org segment. */
@@ -3931,31 +3946,31 @@ export interface OrgLabelsRoute {
  *  PathParamInt64-zero ServerError arm). */
 export interface OrgSettingsRoute {
   family:
-    | "org-settings" // GET+POST /{org}/settings (the options combo)
-    | "org-settings-avatar" // POST /{org}/settings/avatar
-    | "org-settings-avatar-delete" // POST /{org}/settings/avatar/delete
-    | "org-settings-rename" // POST /{org}/settings/rename
-    | "org-settings-delete" // POST /{org}/settings/delete
-    | "org-settings-visibility" // POST /{org}/settings/visibility
-    | "org-settings-hooks" // GET+POST /{org}/settings/hooks (the webhooks list + add form — wave 53)
-    | "org-settings-hook-detail" // GET+POST /{org}/settings/hooks/{id} (the edit page — wave 53)
-    | "org-settings-hook-delete" // POST /{org}/settings/hooks/{id}/delete (wave 53)
-    | "org-settings-blocked" // GET+POST /{org}/settings/blocked_users (window-2b)
-    | "org-settings-applications" // GET /{org}/settings/applications (the R20-a oauth2 list)
-    | "org-settings-applications-create" // POST /{org}/settings/applications/oauth2 (the R20-a create)
-    | "org-settings-applications-delete" // POST /{org}/settings/applications/oauth2/{id}/delete (the R20-a delete)
-    | "org-settings-applications-app" // GET show + POST save on /{org}/settings/applications/oauth2/{id} (the W5 combo — web.go:1025)
-    | "org-settings-applications-regenerate" // POST /{org}/settings/applications/oauth2/{id}/regenerate_secret (the W5 tail — web.go:1027)
-    | "org-settings-audit-logs" // GET /{org}/settings/audit_logs (the R20 +audit arm / R13 org mount — GET only upstream, web.go:1069)
-    | "org-actions-secrets" // GET+POST /{org}/settings/actions/secrets (window-2b)
+    | "org-settings" // GET+POST /org/{org}/settings (the options combo)
+    | "org-settings-avatar" // POST /org/{org}/settings/avatar
+    | "org-settings-avatar-delete" // POST /org/{org}/settings/avatar/delete
+    | "org-settings-rename" // POST /org/{org}/settings/rename
+    | "org-settings-delete" // POST /org/{org}/settings/delete
+    | "org-settings-visibility" // POST /org/{org}/settings/visibility
+    | "org-settings-hooks" // GET+POST /org/{org}/settings/hooks (the webhooks list + add form — wave 53)
+    | "org-settings-hook-detail" // GET+POST /org/{org}/settings/hooks/{id} (the edit page — wave 53)
+    | "org-settings-hook-delete" // POST /org/{org}/settings/hooks/{id}/delete (wave 53)
+    | "org-settings-blocked" // GET+POST /org/{org}/settings/blocked_users (window-2b)
+    | "org-settings-applications" // GET /org/{org}/settings/applications (the R20-a oauth2 list)
+    | "org-settings-applications-create" // POST /org/{org}/settings/applications/oauth2 (the R20-a create)
+    | "org-settings-applications-delete" // POST /org/{org}/settings/applications/oauth2/{id}/delete (the R20-a delete)
+    | "org-settings-applications-app" // GET show + POST save on /org/{org}/settings/applications/oauth2/{id} (the W5 combo — web.go:1025)
+    | "org-settings-applications-regenerate" // POST /org/{org}/settings/applications/oauth2/{id}/regenerate_secret (the W5 tail — web.go:1027)
+    | "org-settings-audit-logs" // GET /org/{org}/settings/audit_logs (the R20 +audit arm / R13 org mount — GET only upstream, web.go:1069)
+    | "org-actions-secrets" // GET+POST /org/{org}/settings/actions/secrets (window-2b)
     | "org-actions-secrets-delete" // POST .../secrets/delete (window-2b)
-    | "org-actions-variables" // GET /{org}/settings/actions/variables (window-2b)
+    | "org-actions-variables" // GET /org/{org}/settings/actions/variables (window-2b)
     | "org-actions-variables-new" // POST .../variables/new (window-2b)
     | "org-actions-variables-edit" // POST .../variables/{id}/edit (window-2b)
     | "org-actions-variables-delete" // POST .../variables/{id}/delete (window-2b)
-    | "org-settings-actions-redirect" // GET /{org}/settings/actions (web.go:1052 bare LocationRedirect)
-    | "org-settings-actions-general" // GET /{org}/settings/actions/general (web.go:1054)
-    | "org-actions-runners" // GET /{org}/settings/actions/runners (the census C7 org arm)
+    | "org-settings-actions-redirect" // GET /org/{org}/settings/actions (web.go:1052 bare LocationRedirect)
+    | "org-settings-actions-general" // GET /org/{org}/settings/actions/general (web.go:1054)
+    | "org-actions-runners" // GET /org/{org}/settings/actions/runners (the census C7 org arm)
     | "org-actions-runners-token-reset" // POST .../runners/reset_registration_token
     | "org-actions-runners-edit" // GET+POST .../runners/{id} (page + the description update)
     | "org-actions-runners-update" // POST .../runners/{id}/update-runner
@@ -3964,18 +3979,18 @@ export interface OrgSettingsRoute {
     // org-settings-actions-scoped-workflows.tsx — web.go:1060's
     // addSettingsScopedWorkflowsRoutes inside the org /settings subtree):
     // the GET page + the three write POSTs.
-    | "org-actions-scoped-workflows" // GET /{org}/settings/actions/scoped-workflows
+    | "org-actions-scoped-workflows" // GET /org/{org}/settings/actions/scoped-workflows
     | "org-actions-scoped-workflows-add" // POST .../scoped-workflows/add
     | "org-actions-scoped-workflows-required" // POST .../scoped-workflows/required
     | "org-actions-scoped-workflows-remove" // POST .../scoped-workflows/remove
-    | "org-settings-packages" // GET /{org}/settings/packages (the cleanup-rules list)
-    | "org-settings-packages-rule-add" // GET+POST /{org}/settings/packages/rules/add
-    | "org-settings-packages-rule-edit" // GET+POST /{org}/settings/packages/rules/{id}
-    | "org-settings-packages-rule-preview" // GET /{org}/settings/packages/rules/{id}/preview
-    | "org-settings-packages-cargo-initialize" // POST /{org}/settings/packages/cargo/initialize (web.go:1082)
-    | "org-settings-packages-cargo-rebuild" // POST /{org}/settings/packages/cargo/rebuild (web.go:1083)
-    | "org-team-edit" // GET+POST /{org}/teams/{id}/edit
-    | "org-team-delete" // POST /{org}/teams/{id}/delete
+    | "org-settings-packages" // GET /org/{org}/settings/packages (the cleanup-rules list)
+    | "org-settings-packages-rule-add" // GET+POST /org/{org}/settings/packages/rules/add
+    | "org-settings-packages-rule-edit" // GET+POST /org/{org}/settings/packages/rules/{id}
+    | "org-settings-packages-rule-preview" // GET /org/{org}/settings/packages/rules/{id}/preview
+    | "org-settings-packages-cargo-initialize" // POST /org/{org}/settings/packages/cargo/initialize (web.go:1082)
+    | "org-settings-packages-cargo-rebuild" // POST /org/{org}/settings/packages/cargo/rebuild (web.go:1083)
+    | "org-team-edit" // GET+POST /org/{org}/teams/{id}/edit
+    | "org-team-delete" // POST /org/{org}/teams/{id}/delete
   ;
   /** Decoded org segment. */
   owner: string;
@@ -4944,6 +4959,267 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "org-dashboard", owner: orgName, team: teamName };
   }
 
+  // The ledger-B3 org TEAMS families (pages/org-teams.tsx — upstream's
+  // /org/{org}/teams routes, web.go:993-1013): the literal `org` second
+  // segment + the {org} login + the literal `teams` fourth. Upstream mounts
+  // EVERY org route inside m.Group("/org", ...) (web.go:963-1095) and
+  // NOTHING at /{owner}/teams — the retired bare shape falls to web.go:1292
+  // `/{username}/{reponame}` (a repository named "teams" renders as the
+  // repository, the engine's 404 otherwise; no redirect either side). The
+  // bare URL is the list; `new` the create form (the static literal
+  // upstream registers ahead of the {team} param, chi tree order); a
+  // positive integer the id-keyed detail slice (PathParamInt64 parity, so
+  // "007" parses as 7); any OTHER decoded segment the R19 NAME carrier —
+  // upstream's team page takes any {team} param and resolves it case-folded
+  // against the lower names (web.go:997's param, org.go:213-218's EqualFold
+  // walk), 404-shelling the miss, so the claim mirrors upstream (the loader
+  // reproduces the miss as the shell). Wave 49 (pages/org-settings.tsx)
+  // adds the {id}/edit combo and the {id}/delete write (web.go:1011-1013 —
+  // the positive-integer claim, keyed on the id carrier only: a name
+  // carrier has no landed edit/delete read arms, so name tails at this
+  // depth stay unclaimed → the engine's 404). The O1 wave claims the
+  // `/action/*` membership writes (web.go:999-1000 — the OrgTeamActionRoute
+  // interface's note); `/{id}/repositories` (web.go:998) and
+  // `teams/-/search` (web.go:1004) stay unclaimed → the engine's 404 (not
+  // landed).
+  if (raw.length >= 4 && raw[1] === "org" && raw[3] === "teams") {
+    if (raw.length > 8) return null;
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    if (raw.length === 4) return { family: "org-teams", owner: orgName };
+    if (raw.length === 5) {
+      if (raw[4] === "new") return { family: "org-team-new", owner: orgName };
+      if (/^\d+$/.test(raw[4] as string)) {
+        return { family: "org-team-detail", owner: orgName, id: Number.parseInt(raw[4] as string, 10) };
+      }
+      // The R19 name carrier (the module header's route-shape note).
+      try {
+        return { family: "org-team-detail", owner: orgName, name: decodeURIComponent(raw[4] as string) };
+      } catch {
+        return null;
+      }
+    }
+    if (raw.length === 6 && /^\d+$/.test(raw[4] as string)) {
+      if (raw[5] === "edit") return { family: "org-team-edit", owner: orgName, id: Number.parseInt(raw[4] as string, 10) };
+      if (raw[5] === "delete") return { family: "org-team-delete", owner: orgName, id: Number.parseInt(raw[4] as string, 10) };
+    }
+    // The O1 membership write families (web.go:999-1000's POST pair): the
+    // literal `action` fifth segment, the team segment in either carrier
+    // form (the detail family's id/name shapes), and the `{action}` tail a
+    // WILDCARD (upstream's path param — TeamsAction's switch answers an
+    // unknown token with the default redirect, teams.go:241-247, so the
+    // claim is shape-level, not a literal set). A junk-encoded token or
+    // carrier decodes nowhere → null (the engine's 404).
+    if (raw.length === 7 && raw[5] === "action") {
+      const carrier = parseTeamCarrier(raw[4] as string);
+      if (carrier === null) return null;
+      try {
+        return { family: "org-team-action", owner: orgName, ...carrier, action: decodeURIComponent(raw[6] as string) };
+      } catch {
+        return null;
+      }
+    }
+    if (raw.length === 8 && raw[5] === "action" && raw[6] === "repo") {
+      const carrier = parseTeamCarrier(raw[4] as string);
+      if (carrier === null) return null;
+      try {
+        return { family: "org-team-repo-action", owner: orgName, ...carrier, action: decodeURIComponent(raw[7] as string) };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+  // The org WORKTIME page (web.go:1015 — owner-only; the module's resolve
+  // ladder owns the gates; the bare 4-segment /org/{org}/worktime shape
+  // only, deeper tails stay engine-owned).
+  if (raw.length === 4 && raw[1] === "org" && raw[3] === "worktime") {
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    return { family: "org-worktime", owner: orgName };
+  }
+  // The wave-49 org settings families (pages/org-settings.tsx — upstream's
+  // require-owner /org/{org} group's /settings subtree, web.go:1017-1092):
+  // the literal `settings` FOURTH segment inside the /org group (the
+  // ledger-B3 shape — the pre-B3 claim sat at the bare /{org}/settings
+  // second segment, a shape upstream does not mount). The bare URL is the
+  // options combo; the deeper literals are exactly upstream's POST segments
+  // (the avatar pair, the danger-zone rename/delete/visibility arms). Wave
+  // 53 (pages/org-settings-hooks.tsx) adds the `/hooks` group's shapes —
+  // web.go:1033-1044: the bare webhooks list + add-form combo and the {id}
+  // edit page (the shared WebHooksEdit; integer-id claim, the repo
+  // hooks-family PathParamInt64 parity so "007" parses as 7 and a negative
+  // 404-shells on the lookup) + the {id}/delete write (the landed repo
+  // page's arm-scoped convention — upstream's shared /delete?id= target is
+  // the list trash buttons' form, which this UI does not render). The
+  // landed tabs' claims grew with their waves (hooks, blocked_users,
+  // applications, audit_logs — each literal's line carries its citation);
+  // every other tail stays unclaimed → the engine's 404. The `user` login
+  // needs no exclusion at this shape: the /org prefix cannot collide with
+  // the reqSignIn /user group (web.go:574's /user/settings literals own
+  // /user/* only), and an org named "user" is create-time reserved anyway
+  // (the resolver's miss 404-shells like upstream's OrgAssignment
+  // NotFound).
+  if (raw.length >= 4 && raw[1] === "org" && raw[3] === "settings") {
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    if (raw.length === 4) return { family: "org-settings", owner: orgName };
+    // The wave-14 org LABELS families ride the /settings subtree at
+    // upstream's web.go:1043-1048 group (the B3 move — the wave brief's
+    // bare /{org}/labels literal was the one shape upstream does not
+    // mount): the literal `labels` fifth segment + the four write tails.
+    if (raw.length === 5 && raw[4] === "labels") return { family: "org-labels", owner: orgName };
+    if (raw.length === 6 && raw[4] === "labels") {
+      if (raw[5] === "new") return { family: "org-label-new", owner: orgName };
+      if (raw[5] === "edit") return { family: "org-label-edit", owner: orgName };
+      if (raw[5] === "delete") return { family: "org-label-delete", owner: orgName };
+      // The template-initialize write (web.go:1048 — the org twin of the
+      // repo arm, under require-owner).
+      if (raw[5] === "initialize") return { family: "org-label-initialize", owner: orgName };
+      return null;
+    }
+    if (raw.length === 5) {
+      if (raw[4] === "avatar") return { family: "org-settings-avatar", owner: orgName };
+      if (raw[4] === "rename") return { family: "org-settings-rename", owner: orgName };
+      if (raw[4] === "delete") return { family: "org-settings-delete", owner: orgName };
+      if (raw[4] === "visibility") return { family: "org-settings-visibility", owner: orgName };
+      if (raw[4] === "hooks") return { family: "org-settings-hooks", owner: orgName };
+      // Window-2b: the blocked_users tab (the committed two-stage module);
+      // the actions sub-tab tails are claimed below the length-5 block.
+      if (raw[4] === "blocked_users") return { family: "org-settings-blocked", owner: orgName };
+      // The R20-a applications tab (the committed module — the list; the
+      // create/delete tails are claimed below the length-5 block).
+      if (raw[4] === "applications") return { family: "org-settings-applications", owner: orgName };
+      // The R20 +audit_logs arm / R13 org mount (pages/settings-audit-logs.tsx
+      // — web.go:1063's literal `m.Get("/audit_logs", org_setting.ViewAudit
+      // Logs)`, GET only; the shared renderer sits under the group's
+      // RequireOwner gate). Query arms ride the URL, so any deeper tail stays
+      // unclaimed → the engine's 404.
+      if (raw[4] === "audit_logs") return { family: "org-settings-audit-logs", owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "applications" && raw[5] === "oauth2") {
+      return { family: "org-settings-applications-create", owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "actions" && raw[5] === "secrets") {
+      return { family: "org-actions-secrets", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "actions" && raw[5] === "secrets" && raw[6] === "delete") {
+      return { family: "org-actions-secrets-delete", owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "actions" && raw[5] === "variables") {
+      return { family: "org-actions-variables", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "actions" && raw[5] === "variables" && raw[6] === "new") {
+      return { family: "org-actions-variables-new", owner: orgName };
+    }
+    if (raw.length === 8 && raw[4] === "actions" && raw[5] === "variables" && raw[7] === "edit" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-actions-variables-edit", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    if (raw.length === 8 && raw[4] === "actions" && raw[5] === "variables" && raw[7] === "delete" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-actions-variables-delete", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    // The census C7 org arm (pages/org-settings-actions-runners.tsx —
+    // upstream web.go:1057's addSettingsRunnersRoutes inside the org
+    // /actions group): the list GET, the reset-token POST (the LITERAL
+    // claims ahead of the {id} combo — chi's static-first dispatch,
+    // web.go:507-512), the {id} edit combo (GET page + POST description)
+    // and the two write POSTs. The runner ids claim integers only (the
+    // repo runners family's PathParamInt64 parity: junk fails the parse, a
+    // negative parses and 404-shells on the scope lookup). Every other
+    // tail stays unclaimed → the engine's 404.
+    if (raw.length === 5 && raw[4] === "actions") {
+      // web.go:1052: GET /org/{org}/settings/actions -> LocationRedirect("./actions/general").
+      return { family: "org-settings-actions-redirect", owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "actions" && raw[5] === "general") {
+      // web.go:1054: the GeneralSettings page (the P2-2 mount).
+      return { family: "org-settings-actions-general", owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "actions" && raw[5] === "runners") {
+      return { family: "org-actions-runners", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "actions" && raw[5] === "runners" && raw[6] === "reset_registration_token") {
+      return { family: "org-actions-runners-token-reset", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "actions" && raw[5] === "runners" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-actions-runners-edit", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    if (raw.length === 8 && raw[4] === "actions" && raw[5] === "runners" && raw[7] === "update-runner" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-actions-runners-update", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    if (raw.length === 8 && raw[4] === "actions" && raw[5] === "runners" && raw[7] === "delete" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-actions-runners-delete", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    // The store wave's SCOPED-WORKFLOWS group (pages/org-settings-actions-
+    // scoped-workflows.tsx — web.go:1060's addSettingsScopedWorkflowsRoutes
+    // inside the org /settings subtree): the bare GET page literal + the
+    // three static write tails.
+    if (raw.length === 6 && raw[4] === "actions" && raw[5] === "scoped-workflows") {
+      return { family: "org-actions-scoped-workflows", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "actions" && raw[5] === "scoped-workflows" && (raw[6] === "add" || raw[6] === "required" || raw[6] === "remove")) {
+      return { family: `org-actions-scoped-workflows-${raw[6]}`, owner: orgName };
+    }
+    // The org settings PACKAGES family (pages/org-settings-packages.tsx —
+    // web.go:1069-1085's cleanup-rules group; the rules/add literal claims
+    // AHEAD of the {id} combo, chi static-first). The cargo tails below ARE
+    // claimed over the landed mirror substrate (web.go:1081-1085).
+    if (raw.length === 5 && raw[4] === "packages") {
+      return { family: "org-settings-packages", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "packages" && raw[5] === "rules" && raw[6] === "add") {
+      return { family: "org-settings-packages-rule-add", owner: orgName };
+    }
+    if (raw.length === 7 && raw[4] === "packages" && raw[5] === "rules" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-settings-packages-rule-edit", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    if (raw.length === 8 && raw[4] === "packages" && raw[5] === "rules" && raw[7] === "preview" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-settings-packages-rule-preview", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    if (raw.length === 7 && raw[4] === "packages" && raw[5] === "cargo" && (raw[6] === "initialize" || raw[6] === "rebuild")) {
+      return { family: `org-settings-packages-cargo-${raw[6]}`, owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "avatar" && raw[5] === "delete") {
+      return { family: "org-settings-avatar-delete", owner: orgName };
+    }
+    if (raw.length === 6 && raw[4] === "hooks" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-settings-hook-detail", owner: orgName, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 7 && raw[4] === "hooks" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "delete") {
+      return { family: "org-settings-hook-delete", owner: orgName, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    // The W5 edit arms (the module header's W5 record — web.go:1026-1028's
+    // family): the {id} COMBO shape (GET show / POST save — one parse shape,
+    // two methods exactly like upstream's m.Combo) and the regenerate tail,
+    // claimed AHEAD of the delete tail (chi's static-first dispatch: the
+    // literal `delete` outranks the combo in upstream's tree too).
+    if (raw.length === 7 && raw[4] === "applications" && raw[5] === "oauth2" && /^-?\d+$/.test(raw[6] as string)) {
+      return { family: "org-settings-applications-app", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    if (raw.length === 8 && raw[4] === "applications" && raw[5] === "oauth2" && /^-?\d+$/.test(raw[6] as string) && raw[7] === "regenerate_secret") {
+      return { family: "org-settings-applications-regenerate", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    // The R20-a delete tail (the landed arm-scoped convention — upstream's
+    // shared list-template `data-url` target; the integer-id claim is the
+    // hooks-family PathParamInt64 parity).
+    if (raw.length === 8 && raw[4] === "applications" && raw[5] === "oauth2" && /^-?\d+$/.test(raw[6] as string) && raw[7] === "delete") {
+      return { family: "org-settings-applications-delete", owner: orgName, id: Number.parseInt(raw[6] as string, 10) };
+    }
+    return null;
+  }
+
   let owner: string;
   try {
     owner = decodeURIComponent(raw[1] as string);
@@ -4989,257 +5265,6 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (repo.endsWith(".git")) repo = repo.slice(0, -4);
   if (repo === "") return null;
-
-  // The wave-12 org teams families (pages/org-teams.tsx — upstream's
-  // /{org}/teams group, web.go:993-1013): the literal `teams` second segment
-  // claimed before the tail parse could read it as a repository named
-  // "teams" (the notifications/explore precedent). Upstream shadows such a
-  // repo identically — the org route group registers at web.go:993, ahead
-  // of :1292's `/{username}/{reponame}` — so /{user}/teams 404-shells at
-  // resolve time exactly like upstream's OrgAssignment miss. The bare URL
-  // is the list; `new` the create form (the static literal upstream
-  // registers ahead of the {team} param, chi tree order); a positive
-  // integer the id-keyed detail slice (the landed /teams/{id} read arms —
-  // PathParamInt64 parity, so "007" parses as 7); any OTHER decoded segment
-  // the R19 NAME carrier — upstream's team page takes any {team} param and
-  // resolves it case-folded against the lower names (web.go:997's param,
-  // org.go:213-218's EqualFold walk), 404-shelling the miss, so the claim
-  // mirrors upstream (the loader reproduces the miss as the shell). Wave 49
-  // (pages/org-settings.tsx) adds the {id}/edit combo and the {id}/delete
-  // write (web.go:1011-1013 — the same positive-integer claim, keyed on the
-  // id carrier only: a name carrier has no landed edit/delete read arms,
-  // so five-segment name tails stay unclaimed → the engine's 404). The O1
-  // wave claims the `/action/*` membership writes (web.go:999-1000 — the
-  // OrgTeamActionRoute interface's note); `/{id}/repositories` and every
-  // other tail stays unclaimed → the engine's 404.
-  // The org WORKTIME page (web.go:1015 — owner-only; the module's resolve
-  // ladder owns the gates; the bare 3-segment shape only, deeper tails
-  // stay engine-owned).
-  if (repo === "worktime") {
-    if (raw.length === 3) return { family: "org-worktime", owner };
-    return null;
-  }
-  if (repo === "teams") {
-    if (raw.length === 3) return { family: "org-teams", owner };
-    if (raw.length === 4) {
-      if (raw[3] === "new") return { family: "org-team-new", owner };
-      if (/^\d+$/.test(raw[3] as string)) {
-        return { family: "org-team-detail", owner, id: Number.parseInt(raw[3] as string, 10) };
-      }
-      // The R19 name carrier (the module header's route-shape note).
-      try {
-        return { family: "org-team-detail", owner, name: decodeURIComponent(raw[3] as string) };
-      } catch {
-        return null;
-      }
-    }
-    if (raw.length === 5 && /^\d+$/.test(raw[3] as string)) {
-      if (raw[4] === "edit") return { family: "org-team-edit", owner, id: Number.parseInt(raw[3] as string, 10) };
-      if (raw[4] === "delete") return { family: "org-team-delete", owner, id: Number.parseInt(raw[3] as string, 10) };
-    }
-    // The O1 membership write families (web.go:999-1000's POST pair): the
-    // literal `action` fourth segment, the team segment in either carrier
-    // form (the detail family's id/name shapes), and the `{action}` tail a
-    // WILDCARD (upstream's path param — TeamsAction's switch answers an
-    // unknown token with the default redirect, teams.go:241-247, so the
-    // claim is shape-level, not a literal set). A junk-encoded token or
-    // carrier decodes nowhere → null (the engine's 404).
-    if (raw.length === 6 && raw[4] === "action") {
-      const carrier = parseTeamCarrier(raw[3] as string);
-      if (carrier === null) return null;
-      try {
-        return { family: "org-team-action", owner, ...carrier, action: decodeURIComponent(raw[5] as string) };
-      } catch {
-        return null;
-      }
-    }
-    if (raw.length === 7 && raw[4] === "action" && raw[5] === "repo") {
-      const carrier = parseTeamCarrier(raw[3] as string);
-      if (carrier === null) return null;
-      try {
-        return { family: "org-team-repo-action", owner, ...carrier, action: decodeURIComponent(raw[6] as string) };
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-
-  // The wave-14 org labels families (pages/org-labels.tsx — the brief's
-  // literal `/{org}/labels` + upstream's three POST segments): the literal
-  // `labels` second segment claimed before the tail parse could read it as a
-  // repository named "labels" (the teams precedent; upstream nests the page
-  // under /org/{org}/settings/labels and shadows nothing here — pages/
-  // org-labels.tsx's divergence note). The `/labels/initialize` template
-  // loader and every other tail stay unclaimed → the engine's 404.
-  if (repo === "labels") {
-    if (raw.length === 3) return { family: "org-labels", owner };
-    if (raw.length === 4) {
-      if (raw[3] === "new") return { family: "org-label-new", owner };
-      if (raw[3] === "edit") return { family: "org-label-edit", owner };
-      if (raw[3] === "delete") return { family: "org-label-delete", owner };
-      // The template-initialize write (web.go:1048 — the org twin of the
-      // repo arm, under require-owner).
-      if (raw[3] === "initialize") return { family: "org-label-initialize", owner };
-    }
-    return null;
-  }
-
-  // The wave-49 org settings families (pages/org-settings.tsx — upstream's
-  // require-owner /{org} group's /settings subtree, web.go:1017-1092): the
-  // literal `settings` second segment claimed before the tail parse could
-  // read it as a repository named "settings" (the teams/labels precedent;
-  // upstream's group registers ahead of :1292 and shadows such a repo
-  // identically — a non-owner's miss 404-shells at resolve time, upstream's
-  // RequireOwner OrgAssignment NotFound). The `user` first segment is
-  // EXCLUDED: upstream's reqSignIn /user group registers ahead of the org
-  // groups and owns the whole /user/* namespace (the wave-12 user-settings
-  // literal's prefix — /user/settings/* stays the user family's shapes, not
-  // an org named "user"). The bare URL is the options combo; the deeper
-  // literals are exactly upstream's POST segments (the avatar pair, the
-  // danger-zone rename/delete/visibility arms). Wave 53 (pages/
-  // org-settings-hooks.tsx) adds the `/hooks` group's shapes — web.go:1033-1044:
-  // the bare webhooks list + add-form combo and the {id} edit page (the
-  // shared WebHooksEdit; integer-id claim, the repo hooks-family
-  // PathParamInt64 parity so "007" parses as 7 and a negative 404-shells on
-  // the lookup) + the {id}/delete write (the landed repo page's arm-scoped
-  // convention — upstream's shared /delete?id= target is the list trash
-  // buttons' form, which this UI does not render). The landed tabs' claims
-  // grew with their waves (hooks, blocked_users, applications, audit_logs —
-  // each literal's line carries its citation); every other tail (the
-  // packages/actions-management tabs — separate pages not landed) stays
-  // unclaimed → the engine's 404.
-  if (repo === "settings" && owner.toLowerCase() !== "user") {
-    if (raw.length === 3) return { family: "org-settings", owner };
-    if (raw.length === 4) {
-      if (raw[3] === "avatar") return { family: "org-settings-avatar", owner };
-      if (raw[3] === "rename") return { family: "org-settings-rename", owner };
-      if (raw[3] === "delete") return { family: "org-settings-delete", owner };
-      if (raw[3] === "visibility") return { family: "org-settings-visibility", owner };
-      if (raw[3] === "hooks") return { family: "org-settings-hooks", owner };
-      // Window-2b: the blocked_users tab (the committed two-stage module);
-      // the actions sub-tab tails are claimed below the length-4 block.
-      if (raw[3] === "blocked_users") return { family: "org-settings-blocked", owner };
-      // The R20-a applications tab (the committed module — the list; the
-      // create/delete tails are claimed below the length-4 block).
-      if (raw[3] === "applications") return { family: "org-settings-applications", owner };
-      // The R20 +audit_logs arm / R13 org mount (pages/settings-audit-logs.tsx
-      // — web.go:1069's literal `m.Get("/audit_logs", org_setting.ViewAudit
-      // Logs)`, GET only; the shared renderer sits under the group's
-      // RequireOwner gate). Query arms ride the URL, so any deeper tail stays
-      // unclaimed → the engine's 404.
-      if (raw[3] === "audit_logs") return { family: "org-settings-audit-logs", owner };
-    }
-    if (raw.length === 5 && raw[3] === "applications" && raw[4] === "oauth2") {
-      return { family: "org-settings-applications-create", owner };
-    }
-    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "secrets") {
-      return { family: "org-actions-secrets", owner };
-    }
-    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "secrets" && raw[5] === "delete") {
-      return { family: "org-actions-secrets-delete", owner };
-    }
-    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "variables") {
-      return { family: "org-actions-variables", owner };
-    }
-    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "variables" && raw[5] === "new") {
-      return { family: "org-actions-variables-new", owner };
-    }
-    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "variables" && raw[6] === "edit" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-actions-variables-edit", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "variables" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-actions-variables-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    // The census C7 org arm (pages/org-settings-actions-runners.tsx —
-    // upstream web.go:1058's addSettingsRunnersRoutes inside the org
-    // /actions group): the list GET, the reset-token POST (the LITERAL
-    // claims ahead of the {id} combo — chi's static-first dispatch,
-    // web.go:507-512), the {id} edit combo (GET page + POST description)
-    // and the two write POSTs. The runner ids claim integers only (the
-    // repo runners family's PathParamInt64 parity: junk fails the parse, a
-    // negative parses and 404-shells on the scope lookup). Every other
-    // tail stays unclaimed → the engine's 404.
-    if (raw.length === 4 && raw[3] === "actions") {
-      // web.go:1052: GET /{org}/settings/actions -> LocationRedirect("./actions/general").
-      return { family: "org-settings-actions-redirect", owner };
-    }
-    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "general") {
-      // web.go:1054: the GeneralSettings page (the P2-2 mount).
-      return { family: "org-settings-actions-general", owner };
-    }
-    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "runners") {
-      return { family: "org-actions-runners", owner };
-    }
-    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "runners" && raw[5] === "reset_registration_token") {
-      return { family: "org-actions-runners-token-reset", owner };
-    }
-    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "runners" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-actions-runners-edit", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "update-runner" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-actions-runners-update", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-actions-runners-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    // The store wave's SCOPED-WORKFLOWS group (pages/org-settings-actions-
-    // scoped-workflows.tsx — web.go:1060's addSettingsScopedWorkflowsRoutes
-    // inside the org /settings subtree): the bare GET page literal + the
-    // three static write tails.
-    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "scoped-workflows") {
-      return { family: "org-actions-scoped-workflows", owner };
-    }
-    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "scoped-workflows" && (raw[5] === "add" || raw[5] === "required" || raw[5] === "remove")) {
-      return { family: `org-actions-scoped-workflows-${raw[5]}`, owner };
-    }
-    // The org settings PACKAGES family (pages/org-settings-packages.tsx —
-    // web.go:1069-1085's cleanup-rules group; the rules/add literal claims
-    // AHEAD of the {id} combo, chi static-first). The cargo tails below ARE
-    // claimed over the landed mirror substrate (web.go:1081-1085).
-    if (raw.length === 4 && raw[3] === "packages") {
-      return { family: "org-settings-packages", owner };
-    }
-    if (raw.length === 6 && raw[3] === "packages" && raw[4] === "rules" && raw[5] === "add") {
-      return { family: "org-settings-packages-rule-add", owner };
-    }
-    if (raw.length === 6 && raw[3] === "packages" && raw[4] === "rules" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-settings-packages-rule-edit", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    if (raw.length === 7 && raw[3] === "packages" && raw[4] === "rules" && raw[6] === "preview" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-settings-packages-rule-preview", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    if (raw.length === 6 && raw[3] === "packages" && raw[4] === "cargo" && (raw[5] === "initialize" || raw[5] === "rebuild")) {
-      return { family: `org-settings-packages-cargo-${raw[5]}`, owner };
-    }
-    if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
-      return { family: "org-settings-avatar-delete", owner };
-    }
-    if (raw.length === 5 && raw[3] === "hooks" && /^-?\d+$/.test(raw[4] as string)) {
-      return { family: "org-settings-hook-detail", owner, id: Number.parseInt(raw[4] as string, 10) };
-    }
-    if (raw.length === 6 && raw[3] === "hooks" && /^-?\d+$/.test(raw[4] as string) && raw[5] === "delete") {
-      return { family: "org-settings-hook-delete", owner, id: Number.parseInt(raw[4] as string, 10) };
-    }
-    // The W5 edit arms (the module header's W5 record — web.go:1025-1029's
-    // family): the {id} COMBO shape (GET show / POST save — one parse shape,
-    // two methods exactly like upstream's m.Combo) and the regenerate tail,
-    // claimed AHEAD of the delete tail (chi's static-first dispatch: the
-    // literal `delete` outranks the combo in upstream's tree too).
-    if (raw.length === 6 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string)) {
-      return { family: "org-settings-applications-app", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    if (raw.length === 7 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "regenerate_secret") {
-      return { family: "org-settings-applications-regenerate", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    // The R20-a delete tail (the landed arm-scoped convention — upstream's
-    // shared list-template `data-url` target; the integer-id claim is the
-    // hooks-family PathParamInt64 parity).
-    if (raw.length === 7 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "delete") {
-      return { family: "org-settings-applications-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
-    return null;
-  }
 
   // The wave-23 org repositories family (pages/org-repos.tsx — upstream's
   // `/{username}/-/repositories`, web.go:1107's `/{username}/-` group's
@@ -8026,6 +8051,7 @@ async function repoActionsRunsPage(c: Context<{ Bindings: Env }>): Promise<Respo
     requestUri: url.pathname + url.search,
     canWriteActions: viewer.kind === "user" && (await canWriteRepo(c.env, repo, viewer)),
     isAdmin: viewer.kind === "user" && (await canAdminRepo(c.env, repo, viewer)), // AllowDisableOrEnableWorkflow (the ⑲A5 kebab)
+    sourceEngineFor: (fullName) => engineClient(c.env, fullName), // the scoped arms' SOURCE walks (prepareScopedWorkflows/loadScopedWorkflowModel)
     nowSeconds: Math.floor(routeNow().getTime() / 1000),
   });
   if (resolved.url.searchParams.has("run_ids")) {
@@ -8340,13 +8366,15 @@ async function repoActionsDispatchInputsRoute(c: Context<{ Bindings: Env }>): Pr
   if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
     return respond(c.html(renderNotFound(ctx), 404)); // reqRepoActionsWriter's NotFound
   }
-  const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
   const outcome = await loadWorkflowDispatchInputsFragment({
     reads: engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+    d1: c.env.DB, // the scoped arm's opt-out/effective store reads (config.ts)
+    consumerOwnerId: repo.ownerId ?? 0, // the scoped arm's consumer scope
     repo,
     ref: url.searchParams.get("ref") ?? "",
     workflow: url.searchParams.get("workflow") ?? "",
-    scopedWorkflowSourceRepoId: formInt64(url.searchParams.get("scoped_workflow_source_repo_id")),
+    scopedWorkflowSourceRepoId: url.searchParams.get("scoped_workflow_source_repo_id") ?? "", // RAW text — the TEXT id adaptation
+    sourceEngineFor: (fullName) => engineClient(c.env, fullName), // the SOURCE repo walk (loadScopedWorkflowModel)
   });
   if (outcome.status === "not-found") return respond(c.html(renderNotFound(ctx), 404));
   if (outcome.status === "throw") throw new Error(outcome.reason); // upstream's ctx.ServerError arm
@@ -11045,7 +11073,7 @@ async function userActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Re
   return p.respond(c.html(renderUserActionsGeneralPage(p.ctx, data), 200));
 }
 
-/** POST /{org}/settings/actions/general (web.go:1055 UpdateGeneralSettings
+/** POST /org/{org}/settings/actions/general (web.go:1055 UpdateGeneralSettings
  * at the org scope): both forms parse then apply to the owner store; the
  * add arm's repo miss answers upstream's JSONError 400 (general.go:125),
  * success 303s back to the page. */
@@ -11074,7 +11102,7 @@ async function orgActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<R
       }),
     );
   }
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/general` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/general` } }));
 }
 
 /** POST /user/settings/actions/general — the reuse twin at the user scope. */
@@ -11890,7 +11918,7 @@ async function orgCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response>
 
 // ---------------------------------------------------------------------------
 // The wave-12 org teams family (pages/org-teams.tsx — upstream's
-// /{org}/teams group, web.go:993-1013)
+// /org/{org}/teams group, web.go:993-1013)
 // ---------------------------------------------------------------------------
 
 /** The org-teams prologue the four handlers share (the settings gate's shape
@@ -11922,7 +11950,7 @@ async function resolveOrgTeamsRequest(c: Context<{ Bindings: Env }>): Promise<Re
   return { ...resolved, org: org.org };
 }
 
-/** GET /{org}/teams (pages/org-teams.tsx — the teams list; the landed
+/** GET /org/{org}/teams (pages/org-teams.tsx — the teams list; the landed
  *  orgListTeams read's owner arm). */
 async function orgTeamsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveOrgTeamsRequest(c);
@@ -11933,7 +11961,7 @@ async function orgTeamsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   return respond(c.html(renderOrgTeamsPage(ctx, data), 200));
 }
 
-/** GET /{org}/teams/{id|name} (pages/org-teams.tsx — the detail slice: the
+/** GET /org/{org}/teams/{id|name} (pages/org-teams.tsx — the detail slice: the
  *  members list + the repo-access list; an unknown or foreign-org carrier
  *  404-shells — id per getTeamById, name per the R19 case-folded lower_name
  *  lookup, loadOrgTeamDetailDataByName). */
@@ -11969,7 +11997,7 @@ async function orgTeamDetailPage(c: Context<{ Bindings: Env }>): Promise<Respons
   );
 }
 
-/** GET /{org}/teams/new (pages/org-teams.tsx — the create form; the same
+/** GET /org/{org}/teams/new (pages/org-teams.tsx — the create form; the same
  *  gate as the list). */
 async function orgTeamNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveOrgTeamsRequest(c);
@@ -11980,7 +12008,7 @@ async function orgTeamNewPage(c: Context<{ Bindings: Env }>): Promise<Response> 
 }
 
 /**
- * POST /{org}/teams/new (upstream NewTeamPost, routers/web/org/teams.go:
+ * POST /org/{org}/teams/new (upstream NewTeamPost, routers/web/org/teams.go:
  * 344-390 over the landed create arm): the §2.8 Origin guard, the shared
  * prologue, then `TeamsService.createTeam` — success 303s onto the created
  * team's detail slice (upstream redirects onto the team's page; the slice
@@ -11998,7 +12026,7 @@ async function orgTeamNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   const form = parseTeamNewForm(await readUrlEncodedForm(c.req.raw));
   const result = await createTeamFromForm(c.env.DB, org, form);
   if (result.outcome === "created") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/teams/${result.team.id}` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/teams/${result.team.id}` } }));
   }
   return respond(c.html(renderOrgTeamNewPage(ctx, { org, form, error: result.message }), 200));
 }
@@ -12099,11 +12127,11 @@ async function orgDashboardHeatmapData(c: Context<{ Bindings: Env }>): Promise<R
 
 // ---------------------------------------------------------------------------
 // The wave-14 org labels family (pages/org-labels.tsx — the brief's literal
-// /{org}/labels page + upstream's /labels/{new,edit,delete} POST segments)
+// /org/{org}/settings/labels page + upstream's /labels/{new,edit,delete} POST segments)
 // ---------------------------------------------------------------------------
 
 /**
- * GET /{org}/labels (pages/org-labels.tsx — the management list + create
+ * GET /org/{org}/settings/labels (pages/org-labels.tsx — the management list + create
  * form). The org-teams prologue is family-agnostic (session → org resolve →
  * the requireOrgOwnership gate) and serves unchanged: an anonymous viewer
  * 303s onto the login round-trip, a signed-in non-owner 404-shells (the
@@ -12120,7 +12148,7 @@ async function orgLabelsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
 }
 
 /**
- * POST /{org}/labels/new (upstream org.NewLabel over the landed create arm):
+ * POST /org/{org}/settings/labels/new (upstream org.NewLabel over the landed create arm):
  * the §2.8 Origin guard, the shared prologue, then `normalizeLabelColor` +
  * `createOrgLabel` — success 303s back onto the list (upstream
  * JSONRedirect's target), the empty-title guard and the color 422 re-render
@@ -12137,14 +12165,14 @@ async function orgLabelNewSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   const form = parseOrgLabelForm(await readUrlEncodedForm(c.req.raw));
   const result = await createOrgLabelFromForm(c.env.DB, org.id, form);
   if (result.outcome === "applied") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/labels` } }));
   }
   const data = await loadOrgLabelsData(c.env.DB, org, new URLSearchParams());
   return respond(c.html(renderOrgLabelsPage({ ctx, data, form, error: result.message }), 200));
 }
 
 /**
- * POST /{org}/labels/edit (upstream org.UpdateLabel over the landed edit
+ * POST /org/{org}/settings/labels/edit (upstream org.UpdateLabel over the landed edit
  * arm's order — the org-scoped lookup before any color 422): success 303s
  * back onto the list; a missing/foreign id 404-shells (the landed PATCH
  * arm's plain "not found"); the failures re-render with the error banner
@@ -12161,7 +12189,7 @@ async function orgLabelEditSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const form = parseOrgLabelForm(params);
   const result = await editOrgLabelFromForm(c.env.DB, org.id, formLabelId(params.get("id")), form);
   if (result.outcome === "applied") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/labels` } }));
   }
   if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
   const data = await loadOrgLabelsData(c.env.DB, org, new URLSearchParams());
@@ -12169,7 +12197,7 @@ async function orgLabelEditSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
 }
 
 /**
- * POST /{org}/labels/delete (upstream org.DeleteLabel over the landed
+ * POST /org/{org}/settings/labels/delete (upstream org.DeleteLabel over the landed
  * delete arm): the cascade delete when the org-scoped row exists, SUCCESS
  * either way (the arm's zero-row 204) — both arms 303 back onto the list.
  */
@@ -12182,7 +12210,7 @@ async function orgLabelDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Resp
   if (resolved.route.family !== "org-label-delete") return respond(await c.notFound()); // drift guard
   const params = await readUrlEncodedForm(c.req.raw);
   await deleteOrgLabelFromForm(c.env.DB, org.id, formLabelId(params.get("id")));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/labels` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -12192,7 +12220,7 @@ async function orgLabelDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Resp
 // ---------------------------------------------------------------------------
 
 /**
- * GET /{org}/settings (pages/org-settings.tsx — the options page: the
+ * GET /org/{org}/settings (pages/org-settings.tsx — the options page: the
  * profile form, the avatar pair and the danger zone). The org-teams
  * prologue is family-agnostic and serves unchanged: anonymous 303s onto the
  * login round-trip, a signed-in non-owner 404-shells (upstream's
@@ -12208,7 +12236,7 @@ async function orgSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 /**
- * POST /{org}/settings (upstream SettingsPost, routers/web/org/setting.go:61-99
+ * POST /org/{org}/settings (upstream SettingsPost, routers/web/org/setting.go:61-99
  * over the landed orgEdit arm): the §2.8 Origin guard, the shared prologue,
  * then `editOrgProfile` — the form's exact fields (empty clears, the Go
  * empty-pointer semantics). Success 303s back onto the page (upstream's
@@ -12224,11 +12252,11 @@ async function orgSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   if (resolved.route.family !== "org-settings") return respond(await c.notFound()); // drift guard
   const form = parseOrgSettingsForm(await readUrlEncodedForm(c.req.raw));
   await applyOrgSettingsForm(c.env.DB, org, form);
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings` } }));
 }
 
 /**
- * POST /{org}/settings/avatar (upstream SettingsAvatar over the landed
+ * POST /org/{org}/settings/avatar (upstream SettingsAvatar over the landed
  * avatar store — the API arm's decode→process→store body): the §2.8 guard,
  * the prologue, the multipart parse, then `storeOrgAvatar`. Both arms
  * redirect back silently (upstream Flash.Error/Success + unconditional
@@ -12245,11 +12273,11 @@ async function orgSettingsAvatarSubmit(c: Context<{ Bindings: Env }>): Promise<R
   if (upload.outcome === "applied") {
     await storeOrgAvatar(c.env.REPO_PACKS, c.env.DB, org, upload);
   }
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings` } }));
 }
 
 /**
- * POST /{org}/settings/avatar/delete (upstream SettingsDeleteAvatar over the
+ * POST /org/{org}/settings/avatar/delete (upstream SettingsDeleteAvatar over the
  * landed deleteAvatar): the delete is a success no-op on a missing object
  * (the API arm's tolerance); the redirect is unconditional.
  */
@@ -12261,11 +12289,11 @@ async function orgSettingsAvatarDeleteSubmit(c: Context<{ Bindings: Env }>): Pro
   const { org, respond } = resolved;
   if (resolved.route.family !== "org-settings-avatar-delete") return respond(await c.notFound()); // drift guard
   await deleteOrgAvatar(c.env.REPO_PACKS, c.env.DB, org);
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings` } }));
 }
 
 /**
- * POST /{org}/settings/rename (upstream SettingsRenamePost over the landed
+ * POST /org/{org}/settings/rename (upstream SettingsRenamePost over the landed
  * renameOrg service): the §2.8 guard, the prologue, then the confirmation +
  * no-change guards and the name rules — the failures re-render the settings
  * page at 200 with the upstream banner text (upstream JSONError into the
@@ -12282,13 +12310,13 @@ async function orgSettingsRenameSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const form = parseOrgRenameForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyOrgRenameForm(c.env.DB, org, form);
   if (result.outcome === "applied") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${result.org.username}/settings` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${result.org.username}/settings` } }));
   }
   return respond(c.html(renderOrgSettingsPage(ctx, { org, error: result.message, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200));
 }
 
 /**
- * POST /{org}/settings/delete (upstream SettingsDeleteOrgPost over the
+ * POST /org/{org}/settings/delete (upstream SettingsDeleteOrgPost over the
  * landed orgDelete cascade): the §2.8 guard, the prologue, then the
  * confirmation guard and the still-owns-repos refusal — the failures
  * re-render at 200 with the banner (upstream JSONError); success 303s onto
@@ -12310,7 +12338,7 @@ async function orgSettingsDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<R
 }
 
 /**
- * POST /{org}/settings/visibility (upstream SettingsChangeVisibilityPost
+ * POST /org/{org}/settings/visibility (upstream SettingsChangeVisibilityPost
  * over the landed orgEdit's `visibility` key): the §2.8 guard, the
  * prologue, then the write — the unchanged and out-of-enum values answer
  * upstream's redirect arms (nothing-has-been-changed / invalid_data), both
@@ -12325,7 +12353,7 @@ async function orgSettingsVisibilitySubmit(c: Context<{ Bindings: Env }>): Promi
   if (resolved.route.family !== "org-settings-visibility") return respond(await c.notFound()); // drift guard
   const visibility = parseOrgVisibilityForm(await readUrlEncodedForm(c.req.raw));
   await applyOrgVisibilityForm(c.env.DB, org, visibility);
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -12336,7 +12364,7 @@ async function orgSettingsVisibilitySubmit(c: Context<{ Bindings: Env }>): Promi
 // ---------------------------------------------------------------------------
 
 /**
- * GET /{org}/settings/hooks (pages/org-settings-hooks.tsx — the webhooks
+ * GET /org/{org}/settings/hooks (pages/org-settings-hooks.tsx — the webhooks
  * list + add form over the landed `listOwnerHooks` arm). The org-teams
  * prologue is family-agnostic and serves unchanged: anonymous 303s onto the
  * login round-trip, a signed-in non-owner 404-shells (upstream's
@@ -12352,7 +12380,7 @@ async function orgHooksSettingsPage(c: Context<{ Bindings: Env }>): Promise<Resp
 }
 
 /**
- * POST /{org}/settings/hooks (upstream's addWebhookAddRoutes reduced to the
+ * POST /org/{org}/settings/hooks (upstream's addWebhookAddRoutes reduced to the
  * single landed provider — pages/org-settings-hooks.tsx's header — over the
  * landed `createOwnerHook`, the orgCreateHook API arm's service): the §2.8
  * Origin guard, the shared prologue, then the write — the
@@ -12370,7 +12398,7 @@ async function orgHooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   const form = parseCreateHookForm(await readUrlEncodedForm(c.req.raw));
   const result = await createOrgHookFromForm(c.env.DB, org, form);
   if (result.outcome === "created") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/hooks` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/hooks` } }));
   }
   const data = await loadOrgHooksSettings(c.env.DB, org, oauth2FeatureEnabled(c.env));
   data.form = { name: form.name, payloadUrl: form.payloadUrl, contentType: form.contentType };
@@ -12378,7 +12406,7 @@ async function orgHooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Re
 }
 
 /**
- * GET /{org}/settings/hooks/{id} (pages/org-settings-hooks.tsx — the edit
+ * GET /org/{org}/settings/hooks/{id} (pages/org-settings-hooks.tsx — the edit
  * page over the landed `getOwnerHook` arm): the shared prologue, the drift
  * guard, then the org-scoped hook read — an unknown or foreign-org id
  * 404-shells (the landed DELETE arm's 404, existence stays hidden).
@@ -12395,7 +12423,7 @@ async function orgHookDetailPage(c: Context<{ Bindings: Env }>): Promise<Respons
 }
 
 /**
- * POST /{org}/settings/hooks/{id} — the edit write (upstream
+ * POST /org/{org}/settings/hooks/{id} — the edit write (upstream
  * GiteaHooksEditPost's org-scope shape over the landed PATCH arm's service —
  * `editRepoHook` is scope-agnostic by construction and the org API arm calls
  * the very same function, routes/hooks-scopes.ts:521): the §2.8 guard, the
@@ -12415,7 +12443,7 @@ async function orgHookDetailSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   if (route.family !== "org-settings-hook-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
   const hook = await getOwnerHook(c.env.DB, org.id, route.id);
   if (hook === null) return respond(c.html(renderNotFound(ctx), 404));
-  const hookLink = `/${org.username}/settings/hooks/${hook.id}`;
+  const hookLink = `/org/${org.username}/settings/hooks/${hook.id}`;
   const form = parseHookEditForm(await readUrlEncodedForm(c.req.raw));
   const result = await editHookFromForm(c.env.DB, hook, form);
   if (result.outcome === "saved") {
@@ -12428,7 +12456,7 @@ async function orgHookDetailSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
 }
 
 /**
- * POST /{org}/settings/hooks/{id}/delete — upstream DeleteWebhook's org arm
+ * POST /org/{org}/settings/hooks/{id}/delete — upstream DeleteWebhook's org arm
  * (org/setting.go:175-187) over the landed `deleteOwnerHook` (the arm-scoped
  * tail — the repo hooks-page convention, the module header): success 303s
  * onto the hooks list (upstream JSONRedirect's target); a miss 404-shells
@@ -12444,7 +12472,7 @@ async function orgHookDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   if (route.family !== "org-settings-hook-delete" || route.id === undefined) return respond(await c.notFound()); // drift guard
   const deleted = await deleteOrgHook(c.env.DB, org, route.id);
   if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/hooks` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/hooks` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -12473,7 +12501,7 @@ async function orgBlockedUsersSubmit(c: Context<{ Bindings: Env }>): Promise<Res
   const form = parseOrgBlockedForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyOrgBlockedForm(c.env.DB, org, { id: viewer.id, isAdmin: viewer.isAdmin }, form);
   if (result.outcome === "applied") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/blocked_users` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/blocked_users` } }));
   }
   const data = await loadOrgBlockedUsers(c.env.DB, org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgBlockedUsersPage({ ctx, data, error: result.message }), 200));
@@ -12498,7 +12526,7 @@ async function orgActionsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const form = parseOrgActionsSecretForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await applyOrgActionsSecretForm(c.env.DB, org.id, form);
   if (outcome.outcome === "saved") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/secrets` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/secrets` } }));
   }
   const data = await loadOrgActionsSecretsPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   // Carried name/description only — plaintext never enters the DOM.
@@ -12515,7 +12543,7 @@ async function orgActionsSecretsDelete(c: Context<{ Bindings: Env }>): Promise<R
   if (resolved.route.family !== "org-actions-secrets-delete") return respond(await c.notFound()); // drift guard
   const form = parseOrgActionsSecretDeleteForm(await readUrlEncodedForm(c.req.raw));
   await deleteOrgActionsSecret(c.env.DB, org.id, form);
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/secrets` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/secrets` } }));
 }
 
 async function orgActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -12537,7 +12565,7 @@ async function orgActionsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Re
   const form = parseOrgActionsVariableForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await applyOrgActionsVariableCreate(c.env.DB, org.id, form);
   if (outcome.outcome === "saved") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/variables` } }));
   }
   const data = await loadOrgActionsVariablesPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   if (outcome.outcome === "invalid") {
@@ -12557,7 +12585,7 @@ async function orgActionsVariablesEdit(c: Context<{ Bindings: Env }>, variableId
   const form = parseOrgActionsVariableForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await applyOrgActionsVariableUpdate(c.env.DB, org.id, variableId, form);
   if (outcome.outcome === "saved") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/variables` } }));
   }
   if (outcome.outcome === "missing") {
     // Upstream's findActionsVariable miss → ctx.NotFound(nil) — a genuine
@@ -12578,7 +12606,7 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
   if (resolved.route.family !== "org-actions-variables-delete") return respond(await c.notFound()); // drift guard
   const outcome = await deleteOrgActionsVariable(c.env.DB, org.id, variableId);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/variables` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -12590,7 +12618,7 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
 // posture, the module header — sameOriginGuard-first POSTs).
 // ---------------------------------------------------------------------------
 
-/** GET /{org}/settings/actions (web.go:1052): the bare group redirect —
+/** GET /org/{org}/settings/actions (web.go:1052): the bare group redirect —
  * misc.LocationRedirect("./actions/general"), the LITERAL relative bytes
  * (the adminActionsGroupRedirect convention). */
 async function orgActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -12601,7 +12629,7 @@ async function orgActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise<R
   return respond(new Response(null, { status: 303, headers: { location: "./actions/general" } }));
 }
 
-/** GET /{org}/settings/actions/general (web.go:1054, shared_actions.
+/** GET /org/{org}/settings/actions/general (web.go:1054, shared_actions.
  * GeneralSettings) — the P2-2 page over the no-setting posture. */
 async function orgActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveOrgTeamsRequest(c);
@@ -12612,7 +12640,7 @@ async function orgActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Res
   return respond(c.html(renderOrgActionsGeneralPage(ctx, { ...data, org }), 200));
 }
 
-/** GET /{org}/settings/actions/runners (shared_actions.Runners' org arm,
+/** GET /org/{org}/settings/actions/runners (shared_actions.Runners' org arm,
  * runners.go:102-155) through the require-owner prologue. */
 async function orgActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveOrgTeamsRequest(c);
@@ -12666,7 +12694,7 @@ async function orgPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<
       ),
     );
   }
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages/rules/${outcome.ruleId}` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/packages/rules/${outcome.ruleId}` } }));
 }
 
 async function orgPackagesRuleEditPage(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
@@ -12697,9 +12725,9 @@ async function orgPackagesRuleEditSubmit(c: Context<{ Bindings: Env }>, ruleId: 
   const outcome = await applyOrgCleanupRuleEdit(c.env.DB, org.id, id, parsed.values, new Date());
   if (outcome.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
   if (outcome.outcome === "removed") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/packages` } }));
   }
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages/rules/${outcome.ruleId}` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/packages/rules/${outcome.ruleId}` } }));
 }
 
 async function orgPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
@@ -12714,7 +12742,7 @@ async function orgPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId:
   return respond(c.html(renderOrgCleanupRulePreviewPage(ctx, data), 200));
 }
 
-/** POST /{org}/settings/packages/cargo/{initialize,rebuild} (web.go:1081-1085
+/** POST /org/{org}/settings/packages/cargo/{initialize,rebuild} (web.go:1081-1085
  *  → org/setting_packages.go:109-124 → shared InitializeCargoIndex/
  *  RebuildCargoIndex): the guard-first + owner prologue + drift guard (the
  *  org packages family's convention), then the SAME mirror arms as the user
@@ -12739,10 +12767,10 @@ async function orgPackagesCargoIndexArm(c: Context<{ Bindings: Env }>, arm: "ini
   } catch (error) {
     console.error(`[packages-cargo-index] org settings ${arm} failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/packages` } }));
 }
 
-/** POST /{org}/settings/actions/runners/reset_registration_token
+/** POST /org/{org}/settings/actions/runners/reset_registration_token
  * (ResetRunnerRegistrationToken, runners.go:275-290): NewRunnerToken at the
  * org scope, then the plain 303 back onto the list URL (upstream's
  * JSONRedirect — the no-session-flash 303 reduction, the repo twin's
@@ -12755,10 +12783,10 @@ async function orgActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Promi
   const { org, respond } = resolved;
   if (resolved.route.family !== "org-actions-runners-token-reset") return respond(await c.notFound()); // drift guard
   await resetOrgActionsRunnerToken(c.env.DB, org.id);
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners` } }));
 }
 
-/** GET /{org}/settings/actions/runners/{id} (RunnersEdit, runners.go:158-216):
+/** GET /org/{org}/settings/actions/runners/{id} (RunnersEdit, runners.go:158-216):
  * the scope-guarded runner plus its recent tasks; a foreign/global/stale id
  * answers the 404 shell (upstream's findActionsRunner org arm +
  * EditableInContext NotFound arms — both fold into the module's scope
@@ -12773,7 +12801,7 @@ async function orgActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId:
   return respond(c.html(renderOrgActionsRunnerEditPage(ctx, data), 200));
 }
 
-/** POST /{org}/settings/actions/runners/{id} (RunnersEditPost,
+/** POST /org/{org}/settings/actions/runners/{id} (RunnersEditPost,
  * runners.go:219-254): the description overwrite; "updated" 303s back onto
  * the LIST URL (upstream's Redirect(redirectTo) with the flash line not
  * rendered — the no-session-flash reduction); "missing" is the 404 shell. */
@@ -12787,10 +12815,10 @@ async function orgActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerI
   const form = parseOrgActionsRunnerDescriptionForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await updateOrgActionsRunnerDescription(c.env.DB, org.id, runnerId, form.description);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners` } }));
 }
 
-/** POST /{org}/settings/actions/runners/{id}/update-runner
+/** POST /org/{org}/settings/actions/runners/{id}/update-runner
  * (RunnerUpdatePost, runners.go:328-369): the required `disabled` flip —
  * an absent param answers upstream's exact 400 ("missing 'disabled'
  * parameter"); "updated" 303s back onto the EDIT page (upstream's
@@ -12809,10 +12837,10 @@ async function orgActionsRunnerUpdate(c: Context<{ Bindings: Env }>, runnerId: n
   }
   const outcome = await setOrgActionsRunnerDisabled(c.env.DB, org.id, runnerId, form.disabled);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners/${runnerId}` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners/${runnerId}` } }));
 }
 
-/** POST /{org}/settings/actions/runners/{id}/delete
+/** POST /org/{org}/settings/actions/runners/{id}/delete
  * (RunnerDeletePost, runners.go:292-326): the scope-guarded hard delete —
  * "deleted" 303s onto the list URL; "missing" is the 404 shell (upstream's
  * findActionsRunner NotFound arm deletes nothing). */
@@ -12825,7 +12853,7 @@ async function orgActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: n
   if (resolved.route.family !== "org-actions-runners-delete") return respond(await c.notFound()); // drift guard
   const outcome = await deleteOrgActionsRunner(c.env.DB, org.id, runnerId);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -12836,7 +12864,7 @@ async function orgActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: n
 // scopes — USER: web.go:730 inside the reqSignIn /user/settings/actions
 // group (MustEnableActions is compile-time true at the owner scopes — the
 // runners twins' gate posture; the tab prologue's session gate); ORG:
-// web.go:1060 inside the /{org}/settings subtree (the require-owner
+// web.go:1060 inside the /org/{org}/settings subtree (the require-owner
 // prologue); ADMIN: web.go:903 behind adminReq (the shared adminPagePrologue).
 // The GET page renders the shared body with the scope's navbar; the POSTs
 // run sameOriginGuard-first and map the appliers' outcomes (the header's
@@ -12937,7 +12965,7 @@ async function userScopedWorkflowsRemove(c: Context<{ Bindings: Env }>): Promise
 
 // --- the ORG scope (web.go:1060, the require-owner prologue) -------------------
 
-/** GET /{org}/settings/actions/scoped-workflows — the shared arm at the ORG
+/** GET /org/{org}/settings/actions/scoped-workflows — the shared arm at the ORG
  *  scope (the org is the owner, getScopedWorkflowsCtx's org arm,
  *  scoped_workflows.go:50-56). */
 async function orgScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -12947,7 +12975,7 @@ async function orgScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Re
   if (resolved.route.family !== "org-actions-scoped-workflows") return respond(await c.notFound()); // drift guard
   const data = await loadOrgScopedWorkflowsPageData(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, (repo) => scopedWorkflowEngineReads(c.env, repo), org);
   return respond(
-    c.html(renderOrgScopedWorkflowsPage(ctx, data, org, OrgSettingsNavbar({ orgLink: `/${org.username}`, active: "actions-scoped-workflows", oauth2Enabled: oauth2FeatureEnabled(c.env) })), 200),
+    c.html(renderOrgScopedWorkflowsPage(ctx, data, org, OrgSettingsNavbar({ orgLink: `/org/${org.username}`, active: "actions-scoped-workflows", oauth2Enabled: oauth2FeatureEnabled(c.env) })), 200),
   );
 }
 
@@ -12960,7 +12988,7 @@ async function orgScopedWorkflowsAdd(c: Context<{ Bindings: Env }>): Promise<Res
   if (!resolved.ok) return resolved.response;
   const { org, respond } = resolved;
   if (resolved.route.family !== "org-actions-scoped-workflows-add") return respond(await c.notFound()); // drift guard
-  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/${org.username}` };
+  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/org/${org.username}` };
   const outcome = await applyScopedWorkflowAdd(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, scope, parseScopedWorkflowAddForm(await readUrlEncodedForm(c.req.raw)));
   return respondScopedWorkflowOutcome(c.env, c.req.raw, respond, scope, outcome);
 }
@@ -12973,7 +13001,7 @@ async function orgScopedWorkflowsRequired(c: Context<{ Bindings: Env }>): Promis
   if (!resolved.ok) return resolved.response;
   const { org, respond } = resolved;
   if (resolved.route.family !== "org-actions-scoped-workflows-required") return respond(await c.notFound()); // drift guard
-  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/${org.username}` };
+  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/org/${org.username}` };
   const outcome = await applyScopedWorkflowRequired(
     scopedWorkflowSourcesStore(c.env.DB),
     c.env.DB,
@@ -12992,7 +13020,7 @@ async function orgScopedWorkflowsRemove(c: Context<{ Bindings: Env }>): Promise<
   if (!resolved.ok) return resolved.response;
   const { org, respond } = resolved;
   if (resolved.route.family !== "org-actions-scoped-workflows-remove") return respond(await c.notFound()); // drift guard
-  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/${org.username}` };
+  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/org/${org.username}` };
   const outcome = await applyScopedWorkflowRemove(scopedWorkflowSourcesStore(c.env.DB), scope, parseScopedWorkflowRemoveForm(await readUrlEncodedForm(c.req.raw)));
   return respondScopedWorkflowOutcome(c.env, c.req.raw, respond, scope, outcome);
 }
@@ -13060,7 +13088,7 @@ async function adminScopedWorkflowsRemove(c: Context<{ Bindings: Env }>): Promis
 // ---------------------------------------------------------------------------
 
 /**
- * GET /{org}/settings/applications (pages/org-settings-applications.tsx —
+ * GET /org/{org}/settings/applications (pages/org-settings-applications.tsx —
  * upstream org.Applications, setting_oauth2.go:34-54, over the landed
  * listOAuth2Applications read keyed uid=org.id): the shared prologue, the
  * drift guard, then the load → render at 200.
@@ -13079,7 +13107,7 @@ async function orgApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Respo
 }
 
 /**
- * POST /{org}/settings/applications/oauth2 — the create (upstream
+ * POST /org/{org}/settings/applications/oauth2 — the create (upstream
  * OAuthApplicationsPost → AddApp's write half, oauth2_common.go:56-88): the
  * §2.8 guard, the shared prologue, the drift guard, the W5 gate (web.go:1030
  * — the group's oauth2Enabled wrap), then the form write. Upstream answers
@@ -13101,7 +13129,7 @@ async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promi
   const form = parseOrgApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyOrgApplicationCreate(c.env.DB, org, form);
   if (result.outcome === "created") {
-    const data = oauth2AppEditPageData(result.row, `/${org.username}/settings/applications/oauth2/${result.row.id}`, null, oauth2FeatureEnabled(c.env));
+    const data = oauth2AppEditPageData(result.row, `/org/${org.username}/settings/applications/oauth2/${result.row.id}`, null, oauth2FeatureEnabled(c.env));
     data.clientSecret = result.secret;
     return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
   }
@@ -13111,7 +13139,7 @@ async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promi
 }
 
 /**
- * POST /{org}/settings/applications/oauth2/{id}/delete — the delete
+ * POST /org/{org}/settings/applications/oauth2/{id}/delete — the delete
  * (upstream DeleteApp's write half, oauth2_common.go:177-193, over the
  * shared (id, uid=org.id) delete + the builtin lock): the hit 303s onto the
  * list (upstream JSONRedirect's target); a miss/lock 404-shells (the org
@@ -13130,14 +13158,14 @@ async function orgApplicationsDeleteSubmit(c: Context<{ Bindings: Env }>, id: nu
   if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
   const outcome = await deleteOrgApplication(c.env.DB, org, id);
   if (outcome.kind !== "deleted") return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/applications` } }));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/applications` } }));
 }
 
 // --- W5: the org edit arms (web.go:1025-1029's combo + regenerate tail,
 // setting_oauth2.go:66-93 — the shared OAuth2CommonHandlers over
 // uid=org.id; the claims ride the org parse tree's applications family) -----
 
-/** GET /{org}/settings/applications/oauth2/{id} (org.OAuth2ApplicationShow →
+/** GET /org/{org}/settings/applications/oauth2/{id} (org.OAuth2ApplicationShow →
  *  EditShow): load + owner check, the shared edit page in the org chrome;
  *  miss 404-shells. */
 async function orgApplicationsShow(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
@@ -13149,11 +13177,11 @@ async function orgApplicationsShow(c: Context<{ Bindings: Env }>, id: number): P
   const shown = await showOauth2Application(c.env.DB, org.id, id);
   if (shown.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
   return respond(
-    c.html(renderOrgOauth2AppEditPage(ctx, org, oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env)), ctx.viewer.kind === "user"), 200),
+    c.html(renderOrgOauth2AppEditPage(ctx, org, oauth2AppEditPageData(shown.app, `/org/${org.username}/settings/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env)), ctx.viewer.kind === "user"), 200),
   );
 }
 
-/** POST /{org}/settings/applications/oauth2/{id} (org.OAuth2ApplicationEdit →
+/** POST /org/{org}/settings/applications/oauth2/{id} (org.OAuth2ApplicationEdit →
  *  EditSave): the binder, the WEB update (NO secret rotation — the shared
  *  module's header), the 303 home; the bind-error arm re-renders the edit
  *  page with the negative line + the kept submission; miss/lock 404-shell. */
@@ -13168,19 +13196,19 @@ async function orgApplicationsSave(c: Context<{ Bindings: Env }>, id: number): P
   const form = parseOauth2AppEditForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await saveOauth2ApplicationFromForm(c.env.DB, org.id, id, form);
   if (outcome.kind === "saved") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/applications` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/applications` } }));
   }
   if (outcome.kind === "invalid") {
     const shown = await showOauth2Application(c.env.DB, org.id, id);
     if (shown.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
-    const data = oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`, outcome.message, oauth2FeatureEnabled(c.env));
+    const data = oauth2AppEditPageData(shown.app, `/org/${org.username}/settings/applications/oauth2/${id}`, outcome.message, oauth2FeatureEnabled(c.env));
     data.form = form;
     return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
   }
   return respond(c.html(renderNotFound(ctx), 404));
 }
 
-/** POST /{org}/settings/applications/oauth2/{id}/regenerate_secret
+/** POST /org/{org}/settings/applications/oauth2/{id}/regenerate_secret
  *  (org.OAuthApplicationsRegenerateSecret → RegenerateSecret): the shared
  *  port; the ok arm re-renders the edit page with the fresh plaintext (shown
  *  once), the miss 404-shells. */
@@ -13194,13 +13222,13 @@ async function orgApplicationsRegenerate(c: Context<{ Bindings: Env }>, id: numb
   if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
   const outcome = await regenerateOauth2ApplicationSecret(c.env.DB, org.id, id);
   if (outcome.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
-  const data = oauth2AppEditPageData(outcome.app, `/${org.username}/settings/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env));
+  const data = oauth2AppEditPageData(outcome.app, `/org/${org.username}/settings/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env));
   data.clientSecret = outcome.secret;
   return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
 }
 
 /**
- * GET /{org}/settings/audit_logs (pages/settings-audit-logs.tsx — the R20
+ * GET /org/{org}/settings/audit_logs (pages/settings-audit-logs.tsx — the R20
  * `+audit_logs` arm / the census R13 org mount; upstream web.go:1069's
  * `m.Get("/audit_logs", org_setting.ViewAuditLogs)` over the SAME shared
  * audit renderer as the repo arm): the org settings family's
@@ -13291,7 +13319,7 @@ async function adminMonitorQueueRemoveAllSubmit(c: Context<{ Bindings: Env }>, q
   return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: { kind: "positive", text: result.message } })));
 }
 
-/** GET /{org}/worktime (the eb8df05 module's mount — the resolve ladder's
+/** GET /org/{org}/worktime (the eb8df05 module's mount — the resolve ladder's
  *  5-arm union maps redirect/signin/missing/forbidden/page). */
 async function orgWorktimePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiSession(c);
@@ -14180,7 +14208,7 @@ async function adminConfigPage(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 /**
- * GET /{org}/teams/{id}/edit (pages/org-settings.tsx — upstream EditTeam,
+ * GET /org/{org}/teams/{id}/edit (pages/org-settings.tsx — upstream EditTeam,
  * routers/web/org/teams.go:495-510, tplTeamNew's edit arm): the org-teams
  * prologue, then the org-scoped team read — an unknown or foreign-org id
  * 404-shells (the detail slice's foreign-id rule).
@@ -14199,7 +14227,7 @@ async function orgTeamEditPage(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 /**
- * POST /{org}/teams/{id}/edit (upstream EditTeamPost over the landed
+ * POST /org/{org}/teams/{id}/edit (upstream EditTeamPost over the landed
  * orgEditTeam arm): the §2.8 guard, the prologue, the org-scoped team read,
  * then the form write — the required-name and rename-collision failures
  * re-render at 200 with the banner and the submitted values (upstream's
@@ -14220,13 +14248,13 @@ async function orgTeamEditSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   const form = parseOrgTeamEditForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyOrgTeamEditForm(c.env.DB, team, form);
   if (result.outcome === "applied") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/teams/${team.id}` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/teams/${team.id}` } }));
   }
   return respond(c.html(renderOrgTeamEditPage(ctx, { org, team, form, error: result.message }), 200));
 }
 
 /**
- * POST /{org}/teams/{id}/delete (upstream DeleteTeam over the landed
+ * POST /org/{org}/teams/{id}/delete (upstream DeleteTeam over the landed
  * orgDeleteTeam cascade): the §2.8 guard, the prologue, the org-scoped team
  * read, then the write — success 303s onto the teams list (upstream's
  * JSONRedirect target); the last-owner refusal 303s back onto the edit form
@@ -14245,7 +14273,7 @@ async function orgTeamDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   if (team === null) return respond(c.html(renderNotFound(ctx), 404));
   const result = await applyOrgTeamDelete(c.env.DB, team);
   const location =
-    result.outcome === "deleted" ? `/${org.username}/teams` : `/${org.username}/teams/${team.id}/edit`;
+    result.outcome === "deleted" ? `/org/${org.username}/teams` : `/org/${org.username}/teams/${team.id}/edit`;
   return respond(new Response(null, { status: 303, headers: { location } }));
 }
 
@@ -14343,14 +14371,14 @@ async function resolveOrgTeamActionRequest(c: Context<{ Bindings: Env }>): Promi
 }
 
 /** The team detail slice URL (the id-carrier internal-link convention —
- *  upstream redirects onto `/{org}/teams/{lowername}`; the slice's
+ *  upstream redirects onto `/org/{org}/teams/{lowername}`; the slice's
  *  route-shape note keys on the id). */
 function orgTeamSliceLocation(org: OrgRecord, team: TeamRecord): string {
-  return `/${org.username}/teams/${team.id}`;
+  return `/org/${org.username}/teams/${team.id}`;
 }
 
 /**
- * POST /{org}/teams/{team}/action/{action} (upstream TeamsAction,
+ * POST /org/{org}/teams/{team}/action/{action} (upstream TeamsAction,
  * routers/web/org/teams.go:113-247). The switch ladder, gate by gate:
  *
  *   - `join` — OWNER-only (`!ctx.Org.IsOwner` → 404, teams.go:117-121): an
@@ -14397,7 +14425,7 @@ async function orgTeamActionSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   if (route.family !== "org-team-action") return respond(await c.notFound()); // drift guard
   const service = new TeamsService(c.env.DB);
   const form = await readUrlEncodedForm(c.req.raw);
-  const teamsList = `/${org.username}/teams`;
+  const teamsList = `/org/${org.username}/teams`;
   const teamSlice = orgTeamSliceLocation(org, team);
   switch (route.action) {
     case "join":
@@ -14460,7 +14488,7 @@ async function orgTeamActionSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
 }
 
 /**
- * POST /{org}/teams/{team}/action/repo/{action} (upstream TeamsRepoAction,
+ * POST /org/{org}/teams/{team}/action/repo/{action} (upstream TeamsRepoAction,
  * routers/web/org/teams.go:271-314): the owner-only repo grant pair.
  * `!ctx.Org.IsOwner` 404s BEFORE the switch (teams.go:272-275); `add`
  * resolves `repo_name` through path.Base within the TEAM's org (277-288 —
@@ -19034,13 +19062,13 @@ uiRouter.get("/repo/migrate", (c) => repoMigratePage(c));
 uiRouter.post("/repo/create", (c) => repoCreateSubmit(c));
 uiRouter.get("/org/create", (c) => orgCreatePage(c));
 uiRouter.post("/org/create", (c) => orgCreateSubmit(c));
-uiRouter.get("/:owner/teams", (c) => orgTeamsPage(c));
+uiRouter.get("/org/:owner/teams", (c) => orgTeamsPage(c));
 // The org worktime page (web.go:1015 — owner-only; registered beside the
 // wave-12 statics BEFORE any dynamic pair, the RegExpRouter rule).
-uiRouter.get("/:owner/worktime", (c) => orgWorktimePage(c));
-uiRouter.get("/:owner/teams/new", (c) => orgTeamNewPage(c));
-uiRouter.post("/:owner/teams/new", (c) => orgTeamNewSubmit(c));
-uiRouter.get("/:owner/teams/:id", (c) => orgTeamDetailPage(c));
+uiRouter.get("/org/:owner/worktime", (c) => orgWorktimePage(c));
+uiRouter.get("/org/:owner/teams/new", (c) => orgTeamNewPage(c));
+uiRouter.post("/org/:owner/teams/new", (c) => orgTeamNewSubmit(c));
+uiRouter.get("/org/:owner/teams/:id", (c) => orgTeamDetailPage(c));
 // Wave-49 team edit + delete (parseUiRoute claims exactly these shapes —
 // upstream web.go:1011-1013's edit combo and delete POST; the edit carries
 // GET + POST, the delete tail answers GET with chi's 405 — the hook
@@ -19048,10 +19076,10 @@ uiRouter.get("/:owner/teams/:id", (c) => orgTeamDetailPage(c));
 // earlier registration can absorb these: the deeper :id/edit and :id/delete
 // tails are 5-segment shapes the wave-12 lines do not carry, and the parser
 // claims positive integers only.
-uiRouter.get("/:owner/teams/:id/edit", (c) => orgTeamEditPage(c));
-uiRouter.post("/:owner/teams/:id/edit", (c) => orgTeamEditSubmit(c));
-uiRouter.post("/:owner/teams/:id/delete", (c) => orgTeamDeleteSubmit(c));
-uiRouter.get("/:owner/teams/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/teams/:id/edit", (c) => orgTeamEditPage(c));
+uiRouter.post("/org/:owner/teams/:id/edit", (c) => orgTeamEditSubmit(c));
+uiRouter.post("/org/:owner/teams/:id/delete", (c) => orgTeamDeleteSubmit(c));
+uiRouter.get("/org/:owner/teams/:id/delete", () => methodNotAllowed("POST"));
 // The O1 membership write families (parseUiRoute claims exactly these
 // shapes — upstream web.go:999-1000's two POST segments inside the
 // RequireMember+RequireTeamMember group; the gates run in the handlers,
@@ -19062,10 +19090,10 @@ uiRouter.get("/:owner/teams/:id/delete", () => methodNotAllowed("POST"));
 // first. The `{action}` tail is upstream's wildcard param (the
 // OrgTeamActionRoute interface's note): unknown tokens 303 to the teams
 // default, exactly TeamsAction's fall-through.
-uiRouter.post("/:owner/teams/:team/action/:action", (c) => orgTeamActionSubmit(c));
-uiRouter.get("/:owner/teams/:team/action/:action", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/teams/:team/action/repo/:action", (c) => orgTeamRepoActionSubmit(c));
-uiRouter.get("/:owner/teams/:team/action/repo/:action", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/teams/:team/action/:action", (c) => orgTeamActionSubmit(c));
+uiRouter.get("/org/:owner/teams/:team/action/:action", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/teams/:team/action/repo/:action", (c) => orgTeamRepoActionSubmit(c));
+uiRouter.get("/org/:owner/teams/:team/action/repo/:action", () => methodNotAllowed("POST"));
 // Wave-49 org settings family (parseUiRoute claims exactly these shapes —
 // upstream web.go:1017-1092's /settings subtree: the options combo (GET +
 // POST), the avatar write pair and the danger-zone rename/delete/visibility
@@ -19079,18 +19107,18 @@ uiRouter.get("/:owner/teams/:team/action/repo/:action", () => methodNotAllowed("
 // registration can absorb the deeper literals: /:owner/:repo/settings (the
 // repo family) needs the literal third segment, and no registered
 // /:owner/:repo/{X} line carries rename/delete/visibility/avatar as X.
-uiRouter.get("/:owner/settings", (c) => orgSettingsPage(c));
-uiRouter.post("/:owner/settings", (c) => orgSettingsSubmit(c));
-uiRouter.post("/:owner/settings/avatar", (c) => orgSettingsAvatarSubmit(c));
-uiRouter.get("/:owner/settings/avatar", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/avatar/delete", (c) => orgSettingsAvatarDeleteSubmit(c));
-uiRouter.get("/:owner/settings/avatar/delete", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/rename", (c) => orgSettingsRenameSubmit(c));
-uiRouter.get("/:owner/settings/rename", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/delete", (c) => orgSettingsDeleteSubmit(c));
-uiRouter.get("/:owner/settings/delete", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/visibility", (c) => orgSettingsVisibilitySubmit(c));
-uiRouter.get("/:owner/settings/visibility", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings", (c) => orgSettingsPage(c));
+uiRouter.post("/org/:owner/settings", (c) => orgSettingsSubmit(c));
+uiRouter.post("/org/:owner/settings/avatar", (c) => orgSettingsAvatarSubmit(c));
+uiRouter.get("/org/:owner/settings/avatar", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/avatar/delete", (c) => orgSettingsAvatarDeleteSubmit(c));
+uiRouter.get("/org/:owner/settings/avatar/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/rename", (c) => orgSettingsRenameSubmit(c));
+uiRouter.get("/org/:owner/settings/rename", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/delete", (c) => orgSettingsDeleteSubmit(c));
+uiRouter.get("/org/:owner/settings/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/visibility", (c) => orgSettingsVisibilitySubmit(c));
+uiRouter.get("/org/:owner/settings/visibility", () => methodNotAllowed("POST"));
 // Wave-53 org settings hooks tab (parseUiRoute claims exactly these
 // shapes — web.go:1033-1044's /hooks group). No earlier registration can
 // absorb these: /:owner/settings/hooks is a 4-segment literal-second
@@ -19098,68 +19126,68 @@ uiRouter.get("/:owner/settings/visibility", () => methodNotAllowed("POST"));
 // other 4-segment line carries a "settings" second segment), the {id}
 // tails are deeper still, and the GET on the POST-only delete tail
 // answers chi's 405 (the repo hooks-family convention).
-uiRouter.get("/:owner/settings/hooks", (c) => orgHooksSettingsPage(c));
-uiRouter.post("/:owner/settings/hooks", (c) => orgHooksSettingsSubmit(c));
-uiRouter.get("/:owner/settings/hooks/:id", (c) => orgHookDetailPage(c));
-uiRouter.post("/:owner/settings/hooks/:id", (c) => orgHookDetailSubmit(c));
-uiRouter.post("/:owner/settings/hooks/:id/delete", (c) => orgHookDeleteSubmit(c));
+uiRouter.get("/org/:owner/settings/hooks", (c) => orgHooksSettingsPage(c));
+uiRouter.post("/org/:owner/settings/hooks", (c) => orgHooksSettingsSubmit(c));
+uiRouter.get("/org/:owner/settings/hooks/:id", (c) => orgHookDetailPage(c));
+uiRouter.post("/org/:owner/settings/hooks/:id", (c) => orgHookDetailSubmit(c));
+uiRouter.post("/org/:owner/settings/hooks/:id/delete", (c) => orgHookDeleteSubmit(c));
 // Window-2b: the blocked_users tab + the actions sub-tabs.
-uiRouter.get("/:owner/settings/blocked_users", (c) => orgBlockedUsersPage(c));
-uiRouter.post("/:owner/settings/blocked_users", (c) => orgBlockedUsersSubmit(c));
-uiRouter.get("/:owner/settings/actions", (c) => orgActionsGroupRedirect(c));
-uiRouter.get("/:owner/settings/actions/general", (c) => orgActionsGeneralPage(c));
-uiRouter.post("/:owner/settings/actions/general", (c) => orgActionsGeneralSubmit(c));
-uiRouter.get("/:owner/settings/actions/secrets", (c) => orgActionsSecretsPage(c));
-uiRouter.post("/:owner/settings/actions/secrets", (c) => orgActionsSecretsSubmit(c));
-uiRouter.post("/:owner/settings/actions/secrets/delete", (c) => orgActionsSecretsDelete(c));
-uiRouter.get("/:owner/settings/actions/variables", (c) => orgActionsVariablesPage(c));
-uiRouter.post("/:owner/settings/actions/variables/new", (c) => orgActionsVariablesNew(c));
-uiRouter.post("/:owner/settings/actions/variables/:id/edit", (c) => orgActionsVariablesEdit(c, Number(c.req.param("id"))));
-uiRouter.post("/:owner/settings/actions/variables/:id/delete", (c) => orgActionsVariablesDelete(c, Number(c.req.param("id"))));
+uiRouter.get("/org/:owner/settings/blocked_users", (c) => orgBlockedUsersPage(c));
+uiRouter.post("/org/:owner/settings/blocked_users", (c) => orgBlockedUsersSubmit(c));
+uiRouter.get("/org/:owner/settings/actions", (c) => orgActionsGroupRedirect(c));
+uiRouter.get("/org/:owner/settings/actions/general", (c) => orgActionsGeneralPage(c));
+uiRouter.post("/org/:owner/settings/actions/general", (c) => orgActionsGeneralSubmit(c));
+uiRouter.get("/org/:owner/settings/actions/secrets", (c) => orgActionsSecretsPage(c));
+uiRouter.post("/org/:owner/settings/actions/secrets", (c) => orgActionsSecretsSubmit(c));
+uiRouter.post("/org/:owner/settings/actions/secrets/delete", (c) => orgActionsSecretsDelete(c));
+uiRouter.get("/org/:owner/settings/actions/variables", (c) => orgActionsVariablesPage(c));
+uiRouter.post("/org/:owner/settings/actions/variables/new", (c) => orgActionsVariablesNew(c));
+uiRouter.post("/org/:owner/settings/actions/variables/:id/edit", (c) => orgActionsVariablesEdit(c, Number(c.req.param("id"))));
+uiRouter.post("/org/:owner/settings/actions/variables/:id/delete", (c) => orgActionsVariablesDelete(c, Number(c.req.param("id"))));
 // The census C7 org arm: the runners sub-tab (parseUiRoute claims exactly
 // these shapes — web.go:1058's addSettingsRunnersRoutes at the org scope,
 // the require-owner prologue as the gate). No earlier registration can
 // absorb these: the `settings` second segment is the org block's static, the
 // `runners` tail literals are deeper still, and the GETs on the POST-only
 // tails answer chi's 405 (the repo runners-family convention).
-uiRouter.get("/:owner/settings/actions/runners", (c) => orgActionsRunnersPage(c));
+uiRouter.get("/org/:owner/settings/actions/runners", (c) => orgActionsRunnersPage(c));
 // The org settings PACKAGES family (the cleanup-rules CRUD + preview; the
 // cargo tails stay unregistered — no substrate).
-uiRouter.get("/:owner/settings/packages", (c) => orgPackagesPage(c));
-uiRouter.post("/:owner/settings/packages", () => methodNotAllowed("GET"));
-uiRouter.get("/:owner/settings/packages/rules/add", (c) => orgPackagesRuleAddPage(c));
-uiRouter.post("/:owner/settings/packages/rules/add", (c) => orgPackagesRuleAddSubmit(c));
-uiRouter.get("/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditPage(c, Number(c.req.param("id"))));
-uiRouter.post("/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
-uiRouter.get("/:owner/settings/packages/rules/:id{(\\d+)}/preview", (c) => orgPackagesRulePreviewPage(c, Number(c.req.param("id"))));
-uiRouter.post("/:owner/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
+uiRouter.get("/org/:owner/settings/packages", (c) => orgPackagesPage(c));
+uiRouter.post("/org/:owner/settings/packages", () => methodNotAllowed("GET"));
+uiRouter.get("/org/:owner/settings/packages/rules/add", (c) => orgPackagesRuleAddPage(c));
+uiRouter.post("/org/:owner/settings/packages/rules/add", (c) => orgPackagesRuleAddSubmit(c));
+uiRouter.get("/org/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/org/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/org/:owner/settings/packages/rules/:id{(\\d+)}/preview", (c) => orgPackagesRulePreviewPage(c, Number(c.req.param("id"))));
+uiRouter.post("/org/:owner/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
 // The org cargo index arms (web.go:1081-1085 — POST-only upstream; the GET
 // twins answer the 405). Registered INSIDE the org settings packages group
 // (the same posture the user twin's arms ride).
-uiRouter.post("/:owner/settings/packages/cargo/initialize", (c) => orgPackagesCargoIndexArm(c, "initialize"));
-uiRouter.post("/:owner/settings/packages/cargo/rebuild", (c) => orgPackagesCargoIndexArm(c, "rebuild"));
-uiRouter.get("/:owner/settings/packages/cargo/initialize", () => methodNotAllowed("POST"));
-uiRouter.get("/:owner/settings/packages/cargo/rebuild", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/actions/runners", () => methodNotAllowed("GET"));
-uiRouter.get("/:owner/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/actions/runners/reset_registration_token", (c) => orgActionsRunnersTokenReset(c));
-uiRouter.get("/:owner/settings/actions/runners/:id", (c) => orgActionsRunnerEditPage(c, Number(c.req.param("id"))));
-uiRouter.post("/:owner/settings/actions/runners/:id", (c) => orgActionsRunnerEditSubmit(c, Number(c.req.param("id"))));
-uiRouter.get("/:owner/settings/actions/runners/:id/update-runner", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/actions/runners/:id/update-runner", (c) => orgActionsRunnerUpdate(c, Number(c.req.param("id"))));
-uiRouter.get("/:owner/settings/actions/runners/:id/delete", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/actions/runners/:id/delete", (c) => orgActionsRunnerDelete(c, Number(c.req.param("id"))));
+uiRouter.post("/org/:owner/settings/packages/cargo/initialize", (c) => orgPackagesCargoIndexArm(c, "initialize"));
+uiRouter.post("/org/:owner/settings/packages/cargo/rebuild", (c) => orgPackagesCargoIndexArm(c, "rebuild"));
+uiRouter.get("/org/:owner/settings/packages/cargo/initialize", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings/packages/cargo/rebuild", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/actions/runners", () => methodNotAllowed("GET"));
+uiRouter.get("/org/:owner/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/actions/runners/reset_registration_token", (c) => orgActionsRunnersTokenReset(c));
+uiRouter.get("/org/:owner/settings/actions/runners/:id", (c) => orgActionsRunnerEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/org/:owner/settings/actions/runners/:id", (c) => orgActionsRunnerEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/org/:owner/settings/actions/runners/:id/update-runner", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/actions/runners/:id/update-runner", (c) => orgActionsRunnerUpdate(c, Number(c.req.param("id"))));
+uiRouter.get("/org/:owner/settings/actions/runners/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/actions/runners/:id/delete", (c) => orgActionsRunnerDelete(c, Number(c.req.param("id"))));
 // The store wave's SCOPED-WORKFLOWS group (parseUiRoute claims exactly these
 // shapes — web.go:1060's addSettingsScopedWorkflowsRoutes inside the org
 // /settings subtree, the require-owner prologue as the gate; the static
 // write tails need no {id} ordering, and the GET twins answer chi's 405).
-uiRouter.get("/:owner/settings/actions/scoped-workflows", (c) => orgScopedWorkflowsPage(c));
-uiRouter.post("/:owner/settings/actions/scoped-workflows/add", (c) => orgScopedWorkflowsAdd(c));
-uiRouter.get("/:owner/settings/actions/scoped-workflows/add", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/actions/scoped-workflows/required", (c) => orgScopedWorkflowsRequired(c));
-uiRouter.get("/:owner/settings/actions/scoped-workflows/required", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/actions/scoped-workflows/remove", (c) => orgScopedWorkflowsRemove(c));
-uiRouter.get("/:owner/settings/actions/scoped-workflows/remove", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings/actions/scoped-workflows", (c) => orgScopedWorkflowsPage(c));
+uiRouter.post("/org/:owner/settings/actions/scoped-workflows/add", (c) => orgScopedWorkflowsAdd(c));
+uiRouter.get("/org/:owner/settings/actions/scoped-workflows/add", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/actions/scoped-workflows/required", (c) => orgScopedWorkflowsRequired(c));
+uiRouter.get("/org/:owner/settings/actions/scoped-workflows/required", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/actions/scoped-workflows/remove", (c) => orgScopedWorkflowsRemove(c));
+uiRouter.get("/org/:owner/settings/actions/scoped-workflows/remove", () => methodNotAllowed("POST"));
 // The census R20 (a) arm: the applications tab (parseUiRoute claims exactly
 // these shapes — web.go:1027-1037's /applications group: the bare list GET,
 // the create POST, the {id}/delete write). No earlier registration can
@@ -19169,25 +19197,25 @@ uiRouter.get("/:owner/settings/actions/scoped-workflows/remove", () => methodNot
 // POST-only tails answer chi's 405 (the hooks-family convention). The
 // /oauth2/{id} show/edit + regenerate_secret shapes stay UNREGISTERED →
 // the engine's 404 (no landed edit page — the module header's reduction).
-uiRouter.get("/:owner/settings/applications", (c) => orgApplicationsPage(c));
-uiRouter.post("/:owner/settings/applications/oauth2", (c) => orgApplicationsCreateSubmit(c));
-uiRouter.get("/:owner/settings/applications/oauth2", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings/applications", (c) => orgApplicationsPage(c));
+uiRouter.post("/org/:owner/settings/applications/oauth2", (c) => orgApplicationsCreateSubmit(c));
+uiRouter.get("/org/:owner/settings/applications/oauth2", () => methodNotAllowed("POST"));
 // The W5 edit arms (web.go:1025-1029's combo + regenerate tail — the {id}
 // GET/POST pair and the regenerate write; GET 405s mirror the family's
 // POST-only-tail convention).
-uiRouter.get("/:owner/settings/applications/oauth2/:id{\\d+}", (c) => orgApplicationsShow(c, Number.parseInt(c.req.param("id"), 10)));
-uiRouter.post("/:owner/settings/applications/oauth2/:id{\\d+}", (c) => orgApplicationsSave(c, Number.parseInt(c.req.param("id"), 10)));
-uiRouter.post("/:owner/settings/applications/oauth2/:id{\\d+}/regenerate_secret", (c) =>
+uiRouter.get("/org/:owner/settings/applications/oauth2/:id{\\d+}", (c) => orgApplicationsShow(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/org/:owner/settings/applications/oauth2/:id{\\d+}", (c) => orgApplicationsSave(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/org/:owner/settings/applications/oauth2/:id{\\d+}/regenerate_secret", (c) =>
   orgApplicationsRegenerate(c, Number.parseInt(c.req.param("id"), 10)),
 );
-uiRouter.get("/:owner/settings/applications/oauth2/:id{\\d+}/regenerate_secret", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/settings/applications/oauth2/:id/delete", (c) => orgApplicationsDeleteSubmit(c, Number(c.req.param("id"))));
-uiRouter.get("/:owner/settings/applications/oauth2/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings/applications/oauth2/:id{\\d+}/regenerate_secret", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/applications/oauth2/:id/delete", (c) => orgApplicationsDeleteSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/org/:owner/settings/applications/oauth2/:id/delete", () => methodNotAllowed("POST"));
 // The R20 +audit_logs arm / census R13 org mount (parseUiRoute claims
 // exactly the 4-segment literal — web.go:1069's GET-only page; the POST
 // answers chi's 405, the compare family's convention).
-uiRouter.get("/:owner/settings/audit_logs", (c) => orgAuditLogsPage(c));
-uiRouter.post("/:owner/settings/audit_logs", () => methodNotAllowed("GET"));
+uiRouter.get("/org/:owner/settings/audit_logs", (c) => orgAuditLogsPage(c));
+uiRouter.post("/org/:owner/settings/audit_logs", () => methodNotAllowed("GET"));
 // Window-2c: the admin group.
 uiRouter.get("/-/admin", (c) => adminDashboardPage(c));
 uiRouter.post("/-/admin", (c) => adminDashboardSubmit(c));
@@ -19329,22 +19357,22 @@ uiRouter.get("/-/admin/applications/oauth2", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/applications/oauth2/:id{\\d+}/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/notices/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/notices/empty", () => methodNotAllowed("POST"));
-uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
 // dynamic /:owner/:repo pair — the wave-9 RegExpRouter note). The three
 // POST-only write tails answer GET with chi's 405.
-uiRouter.get("/:owner/labels", (c) => orgLabelsPage(c));
-uiRouter.post("/:owner/labels/new", (c) => orgLabelNewSubmit(c));
-uiRouter.get("/:owner/labels/new", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/labels/edit", (c) => orgLabelEditSubmit(c));
-uiRouter.get("/:owner/labels/edit", () => methodNotAllowed("POST"));
-uiRouter.post("/:owner/labels/delete", (c) => orgLabelDeleteSubmit(c));
-uiRouter.get("/:owner/labels/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/labels", (c) => orgLabelsPage(c));
+uiRouter.post("/org/:owner/labels/new", (c) => orgLabelNewSubmit(c));
+uiRouter.get("/org/:owner/labels/new", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/labels/edit", (c) => orgLabelEditSubmit(c));
+uiRouter.get("/org/:owner/labels/edit", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/labels/delete", (c) => orgLabelDeleteSubmit(c));
+uiRouter.get("/org/:owner/labels/delete", () => methodNotAllowed("POST"));
 // The org label-template initialize write (web.go:1048, under require-owner
 // — the gate runs at the handler).
-uiRouter.post("/:owner/labels/initialize", (c) => orgLabelInitializeSubmit(c));
-uiRouter.get("/:owner/labels/initialize", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/labels/initialize", (c) => orgLabelInitializeSubmit(c));
+uiRouter.get("/org/:owner/labels/initialize", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));

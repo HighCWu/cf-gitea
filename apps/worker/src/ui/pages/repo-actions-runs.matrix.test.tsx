@@ -21,6 +21,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
 import { saveRepoActionsConfig, type RepoActionsConfig } from "../../services/actions/config";
 import { insertActionRun } from "../../services/actions/model";
+import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
 import { actionRunJobs, actionRunners, actionRuns, repositories } from "../../db/schema";
 import { locale } from "../locale";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -307,7 +308,7 @@ async function loadData(
   patch: Partial<ActionRunListQuery> = {},
   engine: EngineClient = emptyEngine,
   requestUri = "/alice/demo/actions",
-  opts: { canWriteActions?: boolean; isAdmin?: boolean } = {},
+  opts: { canWriteActions?: boolean; isAdmin?: boolean; sourceEngineFor?: (fullName: string) => EngineClient } = {},
 ): Promise<RepoActionsRunsData> {
   return loadRepoActionsRunsData({
     d1: env.DB,
@@ -317,6 +318,7 @@ async function loadData(
     requestUri,
     canWriteActions: opts.canWriteActions ?? true,
     isAdmin: opts.isAdmin,
+    sourceEngineFor: opts.sourceEngineFor,
     nowSeconds: NOW_SECONDS,
   });
 }
@@ -851,7 +853,7 @@ describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
   async function seededHtml(
     engine: EngineClient = emptyEngine,
     patch: Partial<ActionRunListQuery> = {},
-    opts: { canWriteActions?: boolean; isAdmin?: boolean } = {},
+    opts: { canWriteActions?: boolean; isAdmin?: boolean; sourceEngineFor?: (fullName: string) => EngineClient } = {},
   ): Promise<string> {
     const data = await loadData(patch, engine, "/alice/demo/actions", opts);
     // repoHasActions rides the resolved ctx in production (resolveUiRequest's
@@ -1116,9 +1118,9 @@ describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
     const reader = await seededHtml(engine, { workflow: "ci.yml" }, { canWriteActions: false });
     expect(reader).not.toContain("runWorkflowDispatchModal");
     // The literal "0" post (the landed dispatch form's shape) keeps the
-    // repo-level arm; a SCOPED source selection suppresses the banner —
-    // upstream's isScoped branch (actions.go:407/425, loadScopedWorkflowModel)
-    // is the C10-remaining surface.
+    // repo-level arm; a SCOPED source selection with the source-engine seam
+    // UNTHREADED suppresses it (the walk is never fabricated — the module
+    // header; the threaded arm has its own describe below).
     const zeroPosted = await seededHtml(engine, { workflow: "ci.yml", scopedWorkflowSourceRepoId: "0" });
     expect(zeroPosted).toContain("runWorkflowDispatchModal");
     const scopedSelected = await seededHtml(engine, { workflow: "ci.yml", scopedWorkflowSourceRepoId: "repo-9" });
@@ -1208,6 +1210,242 @@ describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
     const data = await loadData();
     expect(() => renderRepoActionsRunsPage(ctx, data)).toThrow("RepoActionsRunsPage requires ctx.repo");
     expect(() => renderRepoActionsRunsPage({ ...ctx, repo: undefined }, data)).toThrow("RepoActionsRunsPage requires ctx.repo");
+  });
+});
+
+// --- the DR-1(c) scoped arms: the sidebar groups (prepareScopedWorkflows,
+//     actions.go:296-366) + the scoped dispatch banner (the isScoped branch,
+//     actions.go:407-423 → loadScopedWorkflowModel) over the source-engine
+//     seam the route threads -----------------------------------------------
+
+/** The SOURCE repo's scoped workflow file — a dispatchable one by default. */
+const SCOPED_DISPATCH = `name: Shared Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: Target env
+        default: staging
+jobs:
+  build:
+    steps: [{ run: echo hi }]
+`;
+
+/** A source-engine factory answering `fullName`-keyed stub engines — the
+ *  route's `(fullName) => engineClient(c.env, fullName)` seam shape. */
+function scopedSourceEngine(files: Record<string, string>): (fullName: string) => EngineClient {
+  const engine = fakeEngine({ workflowFiles: files });
+  return () => engine;
+}
+
+/** One OWNER-level source registration (alice owns repo-1; the store's
+ *  AddScopedWorkflowSource arm). */
+async function seedScopedSource(): Promise<void> {
+  await seedSourceRepo("repo-9", "source-nine");
+  await scopedWorkflowSourcesStore(env.DB).addSource(1, "repo-9");
+}
+
+describe("the DR-1(c) scoped arms: sidebar groups + scoped dispatch banner", () => {
+  beforeEach(async () => {
+    // The scoped describe's own hermetic base (the sources table joins the
+    // main describe's list — the registrations must never bleed between
+    // tests).
+    for (const table of [
+      "action_run_jobs",
+      "action_run_attempts",
+      "action_runs",
+      "action_tasks",
+      "action_runners",
+      "action_runner_tokens",
+      "action_tasks_versions",
+      "action_scoped_workflow_source",
+      "repo_units",
+      "repo_settings",
+      "repositories",
+      "users",
+    ]) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+    repo = await seedRepo("demo");
+  });
+
+  /** The main describe's DOM helper twin — the page render over the
+   *  loader's output (seededHtml lives inside the first describe). */
+  async function scopedHtml(
+    engine: EngineClient = emptyEngine,
+    patch: Partial<ActionRunListQuery> = {},
+    opts: { canWriteActions?: boolean; isAdmin?: boolean; sourceEngineFor?: (fullName: string) => EngineClient } = {},
+  ): Promise<string> {
+    const data = await loadData(patch, engine, "/alice/demo/actions", opts);
+    return renderRepoActionsRunsPage({ ...ctx, repo, repoHasActions: true }, data);
+  }
+
+  it("renders the scoped-workflow sidebar group (sidebar.tmpl:17-34) with the TEXT-id links", async () => {
+    await seedScopedSource();
+    const html = await scopedHtml(emptyEngine, {}, { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) });
+    // The summary: the owner-level source shows the SHORT name + the Owner
+    // label, the tooltip always the full name (sidebar.tmpl:20-21).
+    expect(html).toContain('data-tooltip-content="alice/source-nine"');
+    expect(html).toContain('<summary><span class="gt-ellipsis tw-min-w-0" data-tooltip-content="alice/source-nine">source-nine</span>');
+    expect(html).toContain('<span class="ui label">Owner</span>');
+    // The group renders COLLAPSED without a scoped selection.
+    expect(html).toContain('<details class="item scoped-workflow-group">');
+    // The workflow item: the display name from the source file's `name:`,
+    // the tooltip the ENTRY name, the link carrying the TEXT source id
+    // (sidebar.tmpl:24-25).
+    expect(html).toContain('data-tooltip-content="deploy.yml"');
+    expect(html).toContain("Shared Deploy");
+    expect(
+      html).toContain(
+      'href="/alice/demo/actions?workflow=deploy.yml&amp;scoped_workflow_source_repo_id=repo-9&amp;actor=0&amp;status=0&amp;branch="',
+    );
+    // No Required/Disabled labels on a clean registration.
+    expect(html).not.toContain("<span class=\"ui label\">Required</span>");
+  });
+
+  it("the instance-level source shows the full name + the Global label; a required workflow the Required label", async () => {
+    await seedSourceRepo("repo-9", "source-nine");
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(0, "repo-9"); // instance-level (owner_id = 0)
+    await store.setSourceConfigs(0, "repo-9", { "deploy.yml": { required: true, patterns: ["ci/pass"] } });
+    const html = await scopedHtml(emptyEngine, {}, { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) });
+    expect(html).toContain(">alice/source-nine</span>");
+    expect(html).toContain('<span class="ui label">Global</span>');
+    expect(html).toContain('<span class="ui label">Required</span>');
+    // The opt-out flag WITHOUT required would show the red Disabled label;
+    // required wins the label race (sidebar.tmpl:26-30's if/else-if).
+    await enableActions(); // the unit row the config write rides
+    await saveRepoActionsConfig(env.DB, repo.id, { ...zeroActionsConfig(), disabledScopedWorkflows: { "repo-9": ["deploy.yml"] } });
+    const flagged = await scopedHtml(emptyEngine, {}, { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) });
+    expect(flagged).toContain('<span class="ui label">Required</span>');
+    expect(flagged).not.toContain('<span class="ui red label">Disabled</span>');
+  });
+
+  it("the selected scoped workflow opens its group, activates its item, and keeps same-named repo-level items inactive", async () => {
+    await seedScopedSource();
+    const engine = fakeEngine({
+      workflowFiles: { ".gitea/workflows/deploy.yml": "on: push\njobs:\n  a:\n    steps: [{run: x}]\n" }, // the same-named repo-level file
+    });
+    const opts = { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) };
+    const html = await scopedHtml(engine, { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-9" }, opts);
+    // The group renders expanded (actions.go:361's IsActive) and the scoped
+    // item is active (sidebar.tmpl:24's eq EntryName + eq SourceRepoID).
+    expect(html).toContain('<details class="item scoped-workflow-group" open="">');
+    expect(html).toContain('<a class="item flex-text-block active"');
+    // The same-named repo-level item is NOT active (the `not
+    // CurWorkflowScopedRepoID` half of sidebar.tmpl:5).
+    expect(html).not.toMatch(/item flex-text-block active"[^>]*href="\/alice\/demo\/actions\?workflow=deploy\.yml&amp;scoped_workflow_source_repo_id=0/);
+    // Unselecting collapses the group again.
+    const unselected = await scopedHtml(engine, {}, opts);
+    expect(unselected).toContain('<details class="item scoped-workflow-group">');
+    expect(unselected).not.toContain('scoped-workflow-group" open');
+  });
+
+  it("the scoped dispatch banner renders from the SOURCE content for a writer (actions.go:407-423 + loadScopedWorkflowModel)", async () => {
+    await seedScopedSource();
+    const opts = { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) };
+    const html = await scopedHtml(emptyEngine, { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-9" }, opts);
+    // The banner + the modal, carrying the TEXT source id on both wire URLs
+    // (workflow_dispatch.tmpl:10/:18's CurWorkflowRepoID arm).
+    expect(html).toContain(repoActionsRunsLocale.has_workflow_dispatch);
+    expect(html).toMatch(
+      /action="\/alice\/demo\/actions\/run\?workflow=deploy\.yml&amp;scoped_workflow_source_repo_id=repo-9&amp;actor=0&amp;status=0&amp;branch=" method="post"/,
+    );
+    expect(html).toMatch(/data-fetch-url="\/alice\/demo\/actions\/workflow-dispatch-inputs\?workflow=deploy\.yml&amp;scoped_workflow_source_repo_id=repo-9"/);
+    // The SSR'd inputs body parses the SOURCE file (the declared input).
+    expect(html).toContain('name="env_name"');
+    expect(html).toContain("Target env");
+    // A reader sees no banner (the CanWrite gate precedes the scoped arms).
+    const reader = await scopedHtml(emptyEngine, { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-9" }, { ...opts, canWriteActions: false });
+    expect(reader).not.toContain("runWorkflowDispatchModal");
+  });
+
+  it("the banner hides on the opt-out, shows past a stale flag when required, and hides on dead sources/files", async () => {
+    await seedScopedSource();
+    const opts = { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) };
+    const patch = { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-9" };
+    await enableActions(); // the unit row the config writes below ride
+    // The opt-out flag hides the form (actions.go:409-417's opted-out arm).
+    await saveRepoActionsConfig(env.DB, repo.id, { ...zeroActionsConfig(), disabledScopedWorkflows: { "repo-9": ["deploy.yml"] } });
+    const optedOut = await scopedHtml(emptyEngine, patch, opts);
+    expect(optedOut).not.toContain("runWorkflowDispatchModal");
+    // A REQUIRED registration's stale flag never hides it (:409-417's
+    // comment — IsScopedWorkflowOptedOut answers false).
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(1, "repo-9", { "deploy.yml": { required: true, patterns: ["ci/pass"] } });
+    const required = await scopedHtml(emptyEngine, patch, opts);
+    expect(required).toContain("runWorkflowDispatchModal");
+    await saveRepoActionsConfig(env.DB, repo.id, zeroActionsConfig());
+    // A source id no registration names → the effective-source/row walk
+    // finds nothing → no banner (loadScopedWorkflowModel's nil arms).
+    const deadSource = await scopedHtml(emptyEngine, { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-gone" }, opts);
+    expect(deadSource).not.toContain("runWorkflowDispatchModal");
+    // The file absent from the source's scoped dir → no banner.
+    const absentFile = await scopedHtml(
+      emptyEngine,
+      patch,
+      { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/other.yml": SCOPED_DISPATCH }) },
+    );
+    expect(absentFile).not.toContain("runWorkflowDispatchModal");
+    // A broken source file: upstream's ReadWorkflow error → nil model →
+    // no banner (actions.go:401-403).
+    const brokenFile = await scopedHtml(emptyEngine, patch, { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": ":::: not yaml [[[" }) });
+    expect(brokenFile).not.toContain("runWorkflowDispatchModal");
+    // A valid file WITHOUT the dispatch declaration → the config gate →
+    // no banner.
+    const noDispatch = await scopedHtml(
+      emptyEngine,
+      patch,
+      { sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": "on: push\njobs:\n  a:\n    steps: [{run: x}]\n" }) },
+    );
+    expect(noDispatch).not.toContain("runWorkflowDispatchModal");
+  });
+
+  it("the kebab reads the scoped overwrite: the opt-out flips the label, required renders the disabled class without data-url", async () => {
+    await seedScopedSource();
+    const opts = { isAdmin: true, sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }) };
+    const patch = { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-9" };
+    await enableActions(); // the unit row the config writes below ride
+    // curWorkflowIsListed now spans the scoped set (actions.go:169): the
+    // kebab renders for an admin on a scoped selection; a clean flag reads
+    // "Disable" (actions.go:357's disabled=false).
+    const clean = await scopedHtml(emptyEngine, patch, opts);
+    expect(clean).toMatch(/data-url="\/alice\/demo\/actions\/disable\?workflow=deploy\.yml&amp;scoped_workflow_source_repo_id=repo-9[^"]*"/);
+    expect(clean).toContain(repoActionsRunsLocale.disable_workflow);
+    // The opt-out flag flips the label to Enable (the scoped Disabled arm).
+    await saveRepoActionsConfig(env.DB, repo.id, { ...zeroActionsConfig(), disabledScopedWorkflows: { "repo-9": ["deploy.yml"] } });
+    const flagged = await scopedHtml(emptyEngine, patch, opts);
+    expect(flagged).toMatch(/data-url="\/alice\/demo\/actions\/enable\?workflow=deploy\.yml&amp;scoped_workflow_source_repo_id=repo-9[^"]*"/);
+    expect(flagged).toContain(repoActionsRunsLocale.enable_workflow);
+    // REQUIRED + the stale flag: the disabled class, NO data-url — a
+    // required workflow cannot be disabled here (list.tmpl:89-90 over
+    // actions.go:359).
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(1, "repo-9", { "deploy.yml": { required: true, patterns: ["ci/pass"] } });
+    const required = await scopedHtml(emptyEngine, patch, opts);
+    expect(required).toContain('<a class="item disabled">');
+    expect(required).not.toContain("data-url=");
+    expect(required).toContain(repoActionsRunsLocale.disable_workflow);
+  });
+
+  it("scopedNames alone open the shell (HasWorkflowsOrRuns' fourth arm, actions.go:139)", async () => {
+    await seedScopedSource();
+    const data = await loadData({}, emptyEngine, "/alice/demo/actions", {
+      sourceEngineFor: scopedSourceEngine({ ".gitea/scoped_workflows/deploy.yml": SCOPED_DISPATCH }),
+    });
+    expect(data.pageBlock?.hasWorkflowsOrRuns).toBe(true);
+    expect(data.pageBlock?.scopedWorkflowGroups.map((group) => group.workflows.map((wf) => wf.entryName))).toEqual([["deploy.yml"]]);
+    const html = renderRepoActionsRunsPage({ ...ctx, repo, repoHasActions: true }, data);
+    expect(html).toContain("scoped-workflow-group");
+    expect(html).not.toContain("There are no workflows yet.");
+  });
+
+  it("an unthreaded source-engine seam renders no groups and no scoped banner (the walk is never fabricated)", async () => {
+    await seedScopedSource();
+    const html = await scopedHtml(emptyEngine, { workflow: "deploy.yml", scopedWorkflowSourceRepoId: "repo-9" });
+    expect(html).not.toContain("scoped-workflow-group");
+    expect(html).not.toContain("runWorkflowDispatchModal");
+    const data = await loadData({});
+    expect(data.pageBlock?.scopedWorkflowGroups).toEqual([]);
+    expect(data.pageBlock?.curWorkflowScopedRepoId).toBe("");
   });
 });
 
