@@ -256,6 +256,16 @@ upstream-faithful adaptations exist. Learned 2026-10-29 (the SPEC-0012
 "external runner decision" that wasn't one: upstream's own architecture puts
 execution outside the server — the control plane is pure parity work).
 
+**ADR-0008 extensions (user-ruled 2026-11-04, the password-auth lesson):
+upstream's implemented STANDARD behavior is in scope by default — "usable
+enough" is not a justification for optionality; a deferred SPEC marker is NOT
+a permanent exemption (platform-cited divergences stand, mere deferrals
+re-open as backlog); SILENT IGNORES ARE FORBIDDEN (an accepted UI/API
+operation must really execute or explicitly error — until the real arm lands
+the input is disabled with a not-supported notice, never accept-and-ignore);
+the completion standard is BEHAVIORAL equivalence verified per entry point
+against the pin, not code presence.** See docs/decisions/0008-upstream-behavior-acceptance.md.
+
 ## Gitea Compatibility References
 
 When implementing or reviewing an API endpoint, check upstream behavior in the submodule:
