@@ -396,7 +396,7 @@ export async function saveRepoSettings(
   if (patch.hasActions !== undefined) {
     unitWrites.push(
       patch.hasActions === true
-        ? db.insert(repoUnits).values({ repoId, type: "actions" }).onConflictDoNothing()
+        ? db.insert(repoUnits).values({ repoId, type: "actions", createdAt: now }).onConflictDoNothing()
         : db.delete(repoUnits).where(and(eq(repoUnits.repoId, repoId), eq(repoUnits.type, "actions"))),
     );
   }
@@ -414,7 +414,7 @@ export async function saveRepoSettings(
       unitWrites.push(
         db
           .insert(repoUnits)
-          .values({ repoId, type: "pull_requests", config: JSON.stringify(merged.prUnit) })
+          .values({ repoId, type: "pull_requests", config: JSON.stringify(merged.prUnit), createdAt: now })
           .onConflictDoUpdate({
             target: [repoUnits.repoId, repoUnits.type],
             set: { config: JSON.stringify(merged.prUnit) },
@@ -432,7 +432,7 @@ export async function saveRepoSettings(
       unitWrites.push(
         db
           .insert(repoUnits)
-          .values({ repoId, type: "projects", config })
+          .values({ repoId, type: "projects", config, createdAt: now })
           .onConflictDoUpdate({ target: [repoUnits.repoId, repoUnits.type], set: { config } }),
       );
     }
