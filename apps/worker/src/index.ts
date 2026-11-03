@@ -400,6 +400,17 @@ export default {
     // Attachments carve-out (web.go:912 — the site-level /attachments/:uuid
     // download route): never repo-scoped, never the engine's.
     const isAttachmentServing = segments[0] === "attachments";
+    // The repo-scoped attachment twins (web.go:1513 /:owner/:repo/releases/
+    // attachments/:uuid + web.go:1530 /:owner/:repo/attachments/:uuid — the
+    // same web mux family as the carve above): without this the 4-/5-segment
+    // shapes fall into the repo-scoped branch and the headless engine 404s
+    // them before the attachmentsServingRouter mount sees them (the release
+    // shape parses as a UI page today, the compat shape claims nothing). The
+    // exact shapes only — deeper/shorter tails keep the engine's unclaimed
+    // 404, upstream's chi answer for an unmatched param path.
+    const isRepoScopedAttachment =
+      (segments[2] === "attachments" && segments.length === 4) ||
+      (segments[2] === "releases" && segments[3] === "attachments" && segments.length === 5);
     // The /.well-known family (federation Tier A — the nodeinfo/webfinger
     // pair rides wellKnownRouter; SPEC federation.md §6.1.1's mount): carved
     // out of the repo-scoped branch so the two-segment shapes stop falling
@@ -492,6 +503,7 @@ export default {
       segments[0] !== "v2" && // the OCI root mount (api.go:509) — /v2/{owner}/… is NOT repo-scoped
       !isAvatarServing &&
       !isAttachmentServing &&
+      !isRepoScopedAttachment && // the web.go:1513/1530 twins — attachmentsServingRouter
       !isWellKnown &&
       !isLoginPath &&
       !isUserAuthPath &&

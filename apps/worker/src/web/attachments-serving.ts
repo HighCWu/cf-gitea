@@ -12,8 +12,9 @@ import {
 } from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
-import { doerRepoAccessMode } from "../api/services/repository";
+import { doerRepoAccessMode, findRepositoryByPath } from "../api/services/repository";
 import { collaboratorModeOf } from "../api/services/repo-collaborators";
+import { loadRepoSettings } from "../api/services/repo-settings";
 // The read-grant predicate of SPEC-0010 §2.6 — exactly one copy shared by the
 // git-HTTP matrix and the UI page resolution; this web seam rides it too, so
 // page visibility, git-HTTP visibility, and attachment visibility cannot drift.
@@ -1494,4 +1495,346 @@ attachmentsServingRouter.on(["OPTIONS"], "/attachments/:uuid", () => new Respons
 // ---------------------------------------------------------------------------
 attachmentsServingRouter.on(["POST", "PUT", "DELETE", "PATCH"], "/attachments/:uuid", () =>
   new Response(null, { status: 405, headers: { allow: "GET, OPTIONS" } }),
+);
+
+// ---------------------------------------------------------------------------
+// THE REPO-SCOPED TWINS — upstream web.go:1513 and web.go:1529-1532, the two
+// route shapes GP's recorded-not-wired list named, ported onto THIS module's
+// landed serve pipeline (the shared serveUserContent decision table above —
+// never a second sniffer).
+//
+//   1. `/{username}/{reponame}/releases/attachments/{uuid}` (web.go:1513,
+//      `webAuth.AllowBasic, webAuth.AllowOAuth2, repo.GetAttachment`) inside
+//      `m.Group("/{username}/{reponame}", …, optSignIn, context.RepoAssignment,
+//      repo.MustBeNotEmpty, reqRepoReleaseReader)` (web.go:1504-1527). The
+//      route gates run BEFORE the handler: RequireUnitReader(TypeReleases)
+//      (services/context/permission.go:64-75 — `ctx.NotFound` unless
+//      `perm.CanRead(unit.TypeReleases)`; the TypeCode maintainer arm at :71-72
+//      is code-only, releases has none) consults the releases UNIT — a
+//      disabled unit is absent from the permission's units and 404s for every
+//      viewer — which on this surface is the `hasReleases` setting
+//      (`canReadReleasesUnit` below; the ui releases family's releasesReadGate
+//      and the API releases routes' mustEnableUnit-412 are the other carriers).
+//      `repo.MustBeNotEmpty` (routers/web/repo/repo.go:44-48) 404s an
+//      `IsEmpty` repo before any uuid lookup — owner included.
+//   2. `/{username}/{reponame}/attachments/{uuid}` (web.go:1530) inside
+//      `m.Group("/{username}/{reponame}", …, optSignIn, context.RepoAssignment)`
+//      — web.go:1529's own comment: "to maintain compatibility with old
+//      attachments". NO unit gate, NO MustBeNotEmpty: the per-linked-unit
+//      checks are the HANDLER's (ServeAttachment's perm.CanRead(unitType)),
+//      and an empty repo still serves. The twin exists so pre-1.17 repo-scoped
+//      attachment URLs keep resolving; it answers bytes in place — NO redirect,
+//      no permanence hop (unlike `/{username}/{reponame}/releases/download/
+//      {vTag}/{fileName}` — web.go:1514 RedirectDownload, repo.go:303-347,
+//      which resolves tag+name and calls ServeAttachment directly — still
+//      served by the ui wave-41 release-downloads module, untouched here).
+//
+// Both twins ride the SAME handler as the site route (repo.GetAttachment →
+// ServeAttachment, attachment.go:135-241), so the serve pipeline, the ETag
+// cache, the scope check, the draft arm and the download bump are the landed
+// arms above — re-entered with a RESOLVED URL repo, which flips exactly three
+// arms from the site route's shape:
+//   - the RepoAssignment arms are LIVE (web.go:1529-1532's group carries it;
+//     the site route's group does not): owner+slug resolution
+//     (services/context/repo.go:807-855 — prepareOwner by lower-folded name +
+//     prepareRepo by slug, each miss `ctx.NotFound`) and the visibility gate
+//     (repoAssignmentLegacy :458-470 — no unit access and not publicly
+//     reachable → NotFound), landed here as findRepositoryByPath + readGrant.
+//   - the repo-MISMATCH arm (attachment.go:154-157) is LIVE: the uuid's
+//     linked repo must equal the URL repo — `ctx.Repo.Repository != nil &&
+//     repoID != ctx.Repo.Repository.ID` → 404. This is the doc line 61-65
+//     OPEN-ISSUES twin: the arm guards `/{username}/{reponame}/attachments/
+//     {uuid}` from serving a foreign repo's uuid, which the site route
+//     deliberately serves (any readable uuid). Linked repoId sources mirror
+//     the resolver: issues.repoId (iss.RepoID) for the issue half,
+//     release_assets.repoId (the release's repo, written at upload) for the
+//     release half; the unlinked kinds fall back to the row's own repoId —
+//     upstream's `if repoID == 0 { repoID = attach.RepoID }` (:151-153).
+//   - the linked walk's permission (:164-182) is ctx.Repo.Permission — the
+//     URL repo's already-computed grant — not a fresh GetRepositoryByID walk.
+//     The mismatch arm above guarantees the two repos are one, so the route
+//     gate's readGrant verdict is reused verbatim.
+//
+// ADDITIVE-VS-REPLACE (the integration, disclosed): the RELEASE twin was
+// already served — ui wave-41 claims the shape in parseUiRoute (ui/index.ts
+// release-attachment family) and answers it through pages/release-downloads.ts
+// with its own REDUCED port of this pipeline (its own sniffer without the EOT
+// re-check/charset fast-path; the pre-GP-fix 304 shape — Cache-Control on the
+// 304 — the empty-If-None-Match IMS skip, and JS-Date If-Modified-Since
+// parsing). This port is therefore a REPLACE of the serving path, not an
+// addition: attachmentsServingRouter mounts on src/index.ts BEFORE uiRouter
+// (index.ts:289 vs :354 — first-registered identical pattern wins, verified
+// against the workspace hono), so this arm answers the shape and the wave-41
+// route registration becomes the shadowed dead twin for it; the sibling
+// `/releases/download/{vTag}/{fileName}` arm stays ui-owned (no claim overlap).
+// The wave-41 tests drive uiRouter and the page module directly, so they stay
+// green; the UI module remains the raw/media + download carrier.
+//
+// PERMANENCE/REDIRECT SEMANTICS: none on either twin — upstream serves bytes
+// in place (ServeAttachment has no redirect arm; ServeDirect's presigned
+// redirect is inapplicable on the R2 binding, arm 9 above). No 301/308 hop
+// exists between the twins and the site route upstream, and none is added.
+//
+// VERBS: plain `m.Get` registrations (no `Methods("GET, OPTIONS")`, no
+// optionsCorsHandler — unlike web.go:912). chi serves HEAD from the GET
+// handler and answers every OTHER verb (OPTIONS included) with its
+// methodNotAllowedHandler — 405 with `Allow: GET` from the node's registered
+// methods (mux.go; the site route's bare-405 OPTIONS above is the
+// optionsCorsHandler twin, not this shape).
+//
+// DIVERGENCES (beyond the module-level ones above): the route-gate 404s
+// (RepoAssignment/MustBeNotEmpty/reqRepoReleaseReader) are upstream
+// `ctx.NotFound` — the HTML 404 page — answered here with the plain-text
+// family like every arm of this module (the avatar-serving error-page
+// divergence; the ui wave-41 twin shells them, this module does not render
+// HTML). The linked walk's per-unit enablement consult (upstream
+// perm.CanRead(unitType) reads the repo's units) is not carried on the
+// handler arms — family-consistent with the landed site route; the release
+// twin carries it at the ROUTE gate instead, exactly where upstream's
+// middleware did. 2FA-required sessions (repoAssignmentLegacy's
+// DoerNeedTwoFactorAuth → PermissionNoAccess, repo.go:451-453) are not
+// modeled on the viewer seam — the landed SPEC-0010 posture.
+// ---------------------------------------------------------------------------
+
+/**
+ * The releases-unit read arm of upstream reqRepoReleaseReader
+ * (services/context/permission.go:64-75): `perm.CanRead(unit.TypeReleases)`
+ * consults the repo's ENABLED units — a disabled unit grants nobody, writer
+ * included. On this surface the unit is the `has_releases` setting (the API
+ * releases routes gate it as mustEnableUnit → 412, routes/releases.ts
+ * requireReleasesRepo; the ui releases family gates it inside
+ * releasesReadGate → 404 shell). The web mux answers the middleware verdict
+ * `ctx.NotFound` — the 404 here. Empty-repo is NOT part of this predicate:
+ * upstream's MustBeNotEmpty is a separate middleware and the compat twin
+ * (web.go:1529's group) does not carry it.
+ */
+export async function canReadReleasesUnit(d1: D1Database, repoId: string): Promise<boolean> {
+  return (await loadRepoSettings(d1, repoId)).hasReleases;
+}
+
+/**
+ * The shared body of both twins — ServeAttachment re-entered with the URL
+ * repo resolved. `releaseGate` selects the route-gate set: the release twin
+ * runs MustBeNotEmpty + reqRepoReleaseReader (web.go:1504-1527's group); the
+ * compat twin runs bare RepoAssignment (web.go:1529's group — the route's
+ * whole point: the handler's own checks govern).
+ */
+async function serveRepoScopedAttachment(
+  inputs: {
+    env: Env;
+    request: Request;
+    waitUntil?: (promise: Promise<unknown>) => void;
+  },
+  path: { owner: string; repo: string },
+  uuid: string,
+  releaseGate: boolean,
+): Promise<Response> {
+  const { env, request, waitUntil } = inputs;
+
+  // The webAuth walk (optSignIn + AllowBasic/AllowOAuth2 — the same group
+  // order as the site route): token arm first-match, session arm fallback.
+  // Runs BEFORE the route gates, the way upstream's auth middleware wraps
+  // the group middlewares — ctx.Doer exists when RepoAssignment computes
+  // the permission.
+  const credential = await resolveOptionalCredential(request, env, { waitUntil });
+  const doer = credential.doer;
+  const respond = (response: Response): Response => {
+    if (credential.setCookie !== null) response.headers.append("Set-Cookie", credential.setCookie);
+    return response;
+  };
+
+  // RepoAssignment (owner lower-folded + slug, each miss 404 — repo.go:807-855)
+  // and its visibility gate (repoAssignmentLegacy's no-access NotFound,
+  // repo.go:458-470) over the landed shared predicate (git-http/acl.ts
+  // readGrant — the module header's one-copy seam).
+  const found = await findRepositoryByPath(env.DB, path.owner, path.repo);
+  const ownerRow = found?.owner ?? null;
+  const teamMode =
+    doer === null || found === null
+      ? "none"
+      : await doerRepoAccessMode(env.DB, { id: found.repo.id, ownerId: found.repo.ownerId }, doer.id);
+  const repoReadable =
+    found !== null &&
+    readGrant({
+      repoVisibility: found.repo.visibility,
+      owner: ownerRow === null ? null : { id: ownerRow.id, status: ownerRow.status },
+      ownerVisibility: ownerRow?.visibility ?? "private",
+      doer,
+      teamMode,
+    });
+  if (found === null || !repoReadable) {
+    return respond(NOT_FOUND()); // RepoAssignment's ctx.NotFound arms
+  }
+  const repo = found.repo;
+
+  // The release twin's route gates — MustBeNotEmpty (repo.go:44-48) then
+  // reqRepoReleaseReader (permission.go:64-75 over the unit = hasReleases).
+  // Both `ctx.NotFound`, both BEFORE the handler (so a garbage uuid on an
+  // empty repo answers the gate 404 without a uuid lookup — upstream order).
+  if (releaseGate) {
+    if (repo.isEmpty || !(await canReadReleasesUnit(env.DB, repo.id))) {
+      return respond(NOT_FOUND());
+    }
+  }
+
+  // ServeAttachment steps 1-2 (the landed resolver) — the uuid lookup runs
+  // AFTER the route gates, unlike the site route where it is first.
+  const resolved = await resolveAttachmentByUuid(env.DB, uuid);
+  if (resolved === "missing") {
+    return respond(NOT_FOUND()); // IsErrAttachmentNotExist (attachment.go:138-140)
+  }
+  if (resolved === "dangling") {
+    return respond(SERVER_ERROR()); // GetAttachmentLinkedTypeAndRepoID ServerError (:146-150)
+  }
+
+  // Step 3 — the repo-MISMATCH arm, LIVE on both twins (attachment.go:154-157
+  // `ctx.Repo.Repository != nil && repoID != ctx.Repo.Repository.ID` → 404;
+  // the site route's doc line 61-65 dead arm). repoId sources: the linked
+  // issue's repoId (iss.RepoID) and the release half's own repoId column (the
+  // release's repo — release_assets carries it, upstream's attach.RepoID +
+  // rel.RepoID pair collapsed into one column at upload). RECORDED DIVERGENCE:
+  // upstream's unlinked fallback `if repoID == 0 { repoID = attach.RepoID }`
+  // (:151-153) consults the attachment's uploading repo, but the split
+  // issue_attachments half has NO repoId column (the row's repo rides
+  // issueId/linking), so an unlinked-ISSUE row skips the mismatch check
+  // structurally and falls to the TypeInvalid uploader-only arm below — the
+  // only widening is a wrong-repo URL the sole permitted viewer (the
+  // uploader) can still dereference; an unlinked-RELEASE row keeps the
+  // check (its repoId column exists).
+  const attachedRepoId =
+    resolved.kind === "issue"
+      ? resolved.issue.repoId
+      : resolved.kind === "release" || resolved.kind === "unlinked-release"
+        ? resolved.row.repoId
+        : null; // unlinked-issue — no repo column, mismatch check skipped
+  if (attachedRepoId !== null && attachedRepoId !== repo.id) {
+    return respond(NOT_FOUND());
+  }
+
+  // Step 4 — the TypeInvalid arm (attachment.go:159-163): an unlinked row
+  // serves ONLY to its uploader, linked walk skipped. Identical to the site
+  // route (ctx.IsSigned/ctx.Doer exist under optSignIn on upstream's twins
+  // exactly as on the site route).
+  if (resolved.kind === "unlinked-issue" || resolved.kind === "unlinked-release") {
+    if (doer === null || doer.id !== resolved.row.uploaderId) {
+      return respond(NOT_FOUND());
+    }
+  } else {
+    const unitType = resolved.kind === "issue" ? resolved.unitType : "releases";
+
+    // Steps 5-7 — the linked walk over ctx.Repo.Permission (:164-210): the
+    // mismatch arm above makes the URL repo THE repo, so the route gate's
+    // readGrant verdict is the permission — no second resolution. The draft
+    // arm and the token-scope check are the landed arms verbatim.
+    if (!repoReadable) {
+      return respond(NOT_FOUND()); // perm.CanRead fail (:184-187) — unreachable (gate above)
+    }
+
+    // 6. The draft-release arm (:193-203) — release-writers only.
+    if (resolved.kind === "release" && resolved.release.isDraft) {
+      const canWrite =
+        doer !== null &&
+        (await canWriteReleases(env.DB, repo, ownerRow === null ? null : ownerRow, doer, teamMode));
+      if (!canWrite) {
+        return respond(NOT_FOUND());
+      }
+    }
+
+    // 7. CheckTokenScopes + attachmentReadScope (:205-210) — token doers only.
+    if (doer !== null && credential.scope !== null && !credential.scope.has(attachmentReadScope(unitType))) {
+      return respond(FORBIDDEN());
+    }
+  }
+
+  // Steps 8-11 — the download bump, the ETag cache and the SHARED serve
+  // pipeline (the decision table above — the whole point of this port: the
+  // twins ride the landed sniff/CSP/304 arms, not a second sniffer).
+  if (resolved.kind === "issue" || resolved.kind === "unlinked-issue") {
+    await drizzle(env.DB)
+      .update(issueAttachments)
+      .set({ downloadCount: sql`${issueAttachments.downloadCount} + 1` })
+      .where(eq(issueAttachments.id, resolved.row.id));
+  } else {
+    await drizzle(env.DB)
+      .update(releaseAssets)
+      .set({ downloadCount: sql`${releaseAssets.downloadCount} + 1` })
+      .where(eq(releaseAssets.id, resolved.row.id));
+  }
+
+  const r2Key = resolved.row.r2Key;
+  if (r2Key === null) {
+    return respond(NOT_FOUND()); // the relay's pending arm (row-first landing)
+  }
+  const object = await env.REPO_PACKS.get(r2Key);
+  if (object === null) {
+    return respond(SERVER_ERROR()); // storage.Open ServerError (:233-237)
+  }
+
+  const etag = `"${uuid}"`;
+  const created = resolved.row.createdAt ?? null;
+  const cached = genericEtagTimeCache(request, etag, created);
+  if (cached !== null) {
+    return respond(cached);
+  }
+
+  const { headers, body } = await serveUserContent(object.body as ReadableStream<Uint8Array>, {
+    filename: resolved.row.name,
+    contentLength: object.size,
+    etag,
+    lastModified: object.uploaded,
+  });
+
+  if (request.method === "HEAD") {
+    return respond(new Response(null, { status: 200, headers }));
+  }
+  return respond(new Response(body, { status: 200, headers }));
+}
+
+/** The dispatcher's waitUntil seam — unavailable under router.request() tests
+ *  (the site route handler's inline twin, hoisted for the two registrations).
+ *  Hono types executionCtx with its own minimal ExecutionContext view. */
+function executionWaitUntil(c: {
+  executionCtx: { waitUntil(promise: Promise<unknown>): void };
+}): ((promise: Promise<unknown>) => void) | undefined {
+  try {
+    return c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    return undefined;
+  }
+}
+
+// GET/HEAD /{owner}/{repo}/releases/attachments/{uuid} — web.go:1513. The
+// RELEASE twin (additive-vs-replace derivation in the section header: the ui
+// wave-41 route is shadowed by this earlier-mounted arm).
+attachmentsServingRouter.on(["GET", "HEAD"], "/:owner/:repo/releases/attachments/:uuid", (c) =>
+  serveRepoScopedAttachment(
+    { env: c.env, request: c.req.raw, waitUntil: executionWaitUntil(c) },
+    { owner: c.req.param("owner") ?? "", repo: c.req.param("repo") ?? "" },
+    c.req.param("uuid") ?? "",
+    true,
+  ),
+);
+
+// GET/HEAD /{owner}/{repo}/attachments/{uuid} — web.go:1529-1532. The COMPAT
+// twin ("to maintain compatibility with old attachments"): bare
+// RepoAssignment — no unit gate, no MustBeNotEmpty; an empty repo serves.
+attachmentsServingRouter.on(["GET", "HEAD"], "/:owner/:repo/attachments/:uuid", (c) =>
+  serveRepoScopedAttachment(
+    { env: c.env, request: c.req.raw, waitUntil: executionWaitUntil(c) },
+    { owner: c.req.param("owner") ?? "", repo: c.req.param("repo") ?? "" },
+    c.req.param("uuid") ?? "",
+    false,
+  ),
+);
+
+// OPTIONS + POST-class on both twins — chi's methodNotAllowed shape for a
+// plain m.Get registration (no optionsCorsHandler here): 405 with
+// `Allow: GET` (the node's only registered method; HEAD rides GET upstream's
+// tree fallback). The bare-405 OPTIONS above is the site route's
+// optionsCorsHandler twin — different registration, different wire word.
+attachmentsServingRouter.on(["OPTIONS", "POST", "PUT", "DELETE", "PATCH"], "/:owner/:repo/releases/attachments/:uuid", () =>
+  new Response(null, { status: 405, headers: { allow: "GET" } }),
+);
+attachmentsServingRouter.on(["OPTIONS", "POST", "PUT", "DELETE", "PATCH"], "/:owner/:repo/attachments/:uuid", () =>
+  new Response(null, { status: 405, headers: { allow: "GET" } }),
 );
