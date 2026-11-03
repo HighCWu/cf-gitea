@@ -44,7 +44,10 @@ import {
   base64RawUrlEncode,
   signaturesEqual,
 } from "../../services/actions/secrets";
-import { encodeContentDisposition as sharedEncodeContentDisposition } from "../../web/attachments-serving";
+import {
+  contentDispositionWord,
+  encodeContentDisposition as sharedEncodeContentDisposition,
+} from "../../web/attachments-serving";
 import type { RepositoryWithOwner } from "./repository";
 
 type D1 = D1Database;
@@ -332,11 +335,15 @@ function encodeContentDisposition(kind: "inline" | "attachment", filename: strin
 }
 
 /** serveSetHeadersByUserContent's disposition (serve.go:135-140): the v4
- *  caller always passes ContentType, MimeTypeMap is off, so the computed
- *  disposition is inline unless the type is an SVG image — and a zip never
- *  is. ContentDispositionInline + path.Base(filename). */
-function artifactDisposition(artifactPath: string): string {
-  return encodeContentDisposition("inline", goPathBase(artifactPath));
+ *  caller always passes ContentType, MimeTypeMap is off, so the WORD rides
+ *  the SHARED decision arm (web/attachments-serving contentDispositionWord —
+ *  serveSetHeadersByUserContent's IfZero block: inline unless
+ *  typesniffer.FromContentType(contentType).IsSvgImage() and SVG rendering is
+ *  disabled — the frozen ENABLE_RENDER default keeps every class inline; the
+ *  attachment demote is pinned both-ways in the shared module's suite).
+ *  ContentDispositionInline + path.Base(filename). */
+function artifactDisposition(artifactPath: string, contentType: string): string {
+  return encodeContentDisposition(contentDispositionWord(contentType), goPathBase(artifactPath));
 }
 
 /** serveHeaderCspDefault / serveHeaderCspPdf (serve.go:44-56). */
@@ -430,7 +437,11 @@ export async function serveArtifactV4Raw(
   if (obj === null) {
     throw new Error(`storage open "${art.storagePath}": object missing`);
   }
-  const headers = serveContentHeaders(art.contentEncodingOrType, artifactDisposition(art.artifactPath), obj.uploaded);
+  const headers = serveContentHeaders(
+    art.contentEncodingOrType,
+    artifactDisposition(art.artifactPath, art.contentEncodingOrType),
+    obj.uploaded,
+  );
   const served = await parseRangeServe(env.REPO_PACKS, art.storagePath, obj.size, rangeHeader, headers);
   if (served.kind === "error") {
     // http.Error(w, err.Error(), status): the plain-text body over the

@@ -58,6 +58,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { serveSetHeaders } from "../../web/attachments-serving";
 
 /**
  * The repo-level Actions extras — the board's P1-9 row (residuals v1.3.2 row
@@ -1680,47 +1681,6 @@ function jobLogFilename(runWorkflowId: string, jobName: string, taskId: number):
 }
 
 // ---------------------------------------------------------------------------
-// The content-disposition port (content_disposition.go:25-65 — the
-// attachments-serving module's shape; kept local, no src/web imports)
-// ---------------------------------------------------------------------------
-
-function getSafeName(name: string): { safe: string; encoded: boolean } {
-  let safe = "";
-  let encoded = false;
-  for (const rune of name) {
-    const code = rune.codePointAt(0) ?? 0;
-    if ((code < 0x20 || code > 0x7e) && code !== 0x09) {
-      encoded = true;
-      safe += "_";
-    } else {
-      safe += rune;
-    }
-  }
-  return { safe, encoded };
-}
-
-function formatMediaTypeFilename(t: string, filename: string): string {
-  if (!filename.includes('"') && !filename.includes("\\")) {
-    return `${t}; filename=${filename}`;
-  }
-  let quoted = "";
-  for (const character of filename) {
-    if (character === '"' || character === "\\") quoted += "\\";
-    quoted += character;
-  }
-  return `${t}; filename="${quoted}"`;
-}
-
-function encodeContentDisposition(t: string, filename: string): string {
-  const { safe, encoded } = getSafeName(filename);
-  const result = formatMediaTypeFilename(t, safe);
-  if (!encoded) {
-    return result;
-  }
-  return result + formatMediaTypeFilename(t, filename).slice(t.length);
-}
-
-// ---------------------------------------------------------------------------
 // The runs-deep family helpers (the board's P1-11 row — upstream anchors per
 // helper; the routes below consume them)
 // ---------------------------------------------------------------------------
@@ -2773,16 +2733,25 @@ export function registerRepoActionsRoutes(
         throw new Error(`DownloadActionsRunJobLogs: unable to open task logs: ${task.logFilename}`);
       }
       const filename = jobLogFilename(run.workflowId, job.name, task.id);
-      const base = filename.slice(filename.lastIndexOf("/") + 1);
+      // Base.ServeContent (services/context/base.go:178-183) = ServeSetHeaders
+      // + http.ServeContent. The serve headers ride the SHARED port
+      // (web/attachments-serving serveSetHeaders): the EXPLICIT attachment
+      // word (routers/common/actions.go:129-132 — not the IfZero default,
+      // though the word is the same) over the EXPLICIT
+      // "text/plain; charset=utf-8" — no sniffing on this arm; nosniff +
+      // sandbox CSP come from serveSetHeaderContentRelated (serve.go:56-74,
+      // text/plain is the default CSP class); MaxAge-0 cache-control is the
+      // prod "max-age=0, private, must-revalidate" (httpcache.go:29-34);
+      // serveSetHeaders path.Base-cuts the filename (serve.go:92). The
+      // http.ServeContent Range/206 family stays the documented divergence.
       return new Response(bytes, {
         status: 200,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "content-length": String(bytes.length),
-          "content-disposition": encodeContentDisposition("attachment", base),
-          "access-control-expose-headers": "Content-Disposition",
-          "cache-control": "max-age=0, private, must-revalidate",
-        },
+        headers: serveSetHeaders({
+          filename,
+          contentType: "text/plain; charset=utf-8",
+          contentDisposition: "attachment",
+          contentLength: bytes.length,
+        }),
       });
     },
   );
@@ -3342,16 +3311,24 @@ export function registerRepoActionsRoutes(
       }
       const archiveName = fileNameJoinFields([pathBaseStem(run.workflowId), "run", run.id, "logs", ".zip"]);
       const zip = zipStoreEntries(entries);
-      const base = archiveName.slice(archiveName.lastIndexOf("/") + 1);
+      // SetServeHeaders (services/context/base.go:173-175 → ServeSetHeaders)
+      // — the SHARED port: the EXPLICIT attachment word
+      // (routers/common/actions.go:65-70) over the EXPLICIT
+      // "application/zip", nosniff + sandbox CSP per serve.go:56-74, the
+      // MaxAge-0 prod cache-control (httpcache.go:29-34), the filename
+      // path.Base-cut at serve (serve.go:92). Content-Length is our
+      // documented adaptation: upstream streams the zip.Writer (no length
+      // known), the byte-known Workers body carries it. The gzhttp
+      // no-compression hint (serve.go:80-83) is upstream's internal contract
+      // with its gzip wrapper — not emitted, per the shared port's note.
       return new Response(zip, {
         status: 200,
-        headers: {
-          "content-type": "application/zip",
-          "content-length": String(zip.length),
-          "content-disposition": encodeContentDisposition("attachment", base),
-          "access-control-expose-headers": "Content-Disposition",
-          "cache-control": "max-age=0, private, must-revalidate",
-        },
+        headers: serveSetHeaders({
+          filename: archiveName,
+          contentType: "application/zip",
+          contentDisposition: "attachment",
+          contentLength: zip.length,
+        }),
       });
     },
   );

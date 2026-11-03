@@ -1162,8 +1162,19 @@ describe("GET …/runs/{run}/logs (getWorkflowRunLogs)", () => {
 
     const res = await get(`/repos/alice/repo${repoId}/actions/runs/${run.id}/logs`, alice.id);
     expect(res.status).toBe(200);
+    // SetServeHeaders (base.go:173-175 → ServeSetHeaders): the EXPLICIT
+    // attachment word over the EXPLICIT "application/zip"
+    // (common/actions.go:65-70 — not the IfZero default), nosniff + sandbox
+    // CSP (serve.go:56-74), the MaxAge-0 prod cache-control
+    // (httpcache.go:29-34); Content-Length is the byte-known-body adaptation
+    // (upstream streams the zip.Writer, so its length stays unknown).
     expect(res.headers.get("content-type")).toBe("application/zip");
-    expect(res.headers.get("content-disposition")).toContain(`ci-run-${run.id}-logs.zip`); // PathBaseStem(workflowId) + run + id + logs
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(res.headers.get("access-control-expose-headers")).toBe("Content-Disposition");
+    expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(Number(res.headers.get("content-length"))).toBeGreaterThan(0);
+    expect(res.headers.get("content-disposition")).toBe(`attachment; filename=ci-run-${run.id}-logs.zip`); // PathBaseStem(workflowId) + run + id + logs; token name → Go's unquoted arm
     const entries = await zipEntriesOf(res);
     expect(entries).toHaveLength(2);
     const byName = new Map(entries.map((e) => [e.name, e.data]));

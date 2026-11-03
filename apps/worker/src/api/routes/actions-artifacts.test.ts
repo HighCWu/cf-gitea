@@ -726,6 +726,32 @@ describe("GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip/raw (Dow
     await res.arrayBuffer();
   });
 
+  it("an image/svg+xml content type keeps INLINE at the frozen ENABLE_RENDER default — the word rides the shared contentDispositionWord arm (serve.go:135-141)", async () => {
+    const owner = await seedUser("artifact-owner");
+    const { repoId } = await seedRepo(owner, "repo");
+    const bytes = new Uint8Array([1, 2, 3]);
+    const art = await seedArtifact({
+      repoId,
+      name: "vector",
+      objectBody: bytes,
+      fileSize: bytes.length,
+      contentType: "image/svg+xml",
+    });
+
+    const res = await router()(await signedUrlFor("artifact-owner/repo", art.id), {});
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml");
+    // The v4 caller passes ContentType explicitly, so
+    // serveSetHeadersByUserContent reads the word back through
+    // FromContentType (serve.go:135-141): inline, demoted to attachment ONLY
+    // when SVG rendering is disabled — the wired word is now the SHARED
+    // contentDispositionWord(contentType) arm (the both-arms pin lives in
+    // web/attachments-serving.test.ts); at the frozen default every class
+    // serves inline.
+    expect(res.headers.get("content-disposition")).toBe(`inline; filename=${art.artifactPath}`);
+    await res.arrayBuffer();
+  });
+
   it("206s the minimal single-range arm and 416s/400s the invalid shapes with http.Error's plain text", async () => {
     const owner = await seedUser("artifact-owner");
     const { repoId } = await seedRepo(owner, "repo");

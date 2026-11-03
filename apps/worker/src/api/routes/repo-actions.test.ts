@@ -1341,13 +1341,44 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsR
   it("serves the concatenated chunk bytes as the attachment (200)", async () => {
     const res = await get(`${SUITE}/actions/jobs/${logJobId}/logs`, "alice-token");
     expect(res.status).toBe(200);
+    // The full ServeSetHeaders set (Base.ServeContent = ServeSetHeaders +
+    // http.ServeContent, services/context/base.go:178-183): the explicit
+    // "text/plain; charset=utf-8" (common/actions.go:132 — no sniff on this
+    // arm), nosniff + the default sandbox CSP class (serve.go:56-74), the
+    // MaxAge-0 prod cache-control (httpcache.go:29-34), expose-headers
+    // (serve.go:93-94).
     expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
-    expect(res.headers.get("content-disposition")).toContain("attachment");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(res.headers.get("access-control-expose-headers")).toBe("Content-Disposition");
+    expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
     // FileNameJoinFields(PathBaseStem("ci.yml"), "build", taskID, ".log")
     // — PathBaseStem strips the extension, the fields join with "-"
-    // (modules/util/filename.go:23-52 + path.go:32-34).
-    expect(res.headers.get("content-disposition")).toContain(`ci-build-${logTaskId}.log`);
+    // (modules/util/filename.go:23-52 + path.go:32-34); the token name takes
+    // Go's unquoted arm (mediatype.go isToken) and the word is the EXPLICIT
+    // attachment (common/actions.go:129-132 — not ServeSetHeaders' IfZero
+    // default, though the bytes are the same either way).
+    expect(res.headers.get("content-disposition")).toBe(`attachment; filename=ci-build-${logTaskId}.log`);
     expect(res.headers.get("content-length")).toBe(String(CHUNK_ONE.length + CHUNK_TWO.length));
+    expect(await res.text()).toBe(CHUNK_ONE + CHUNK_TWO);
+  });
+
+  it("a unicode job name takes the quoted safe arm + the RFC 2231 twin (the shared encoder — content_disposition.go:47-65)", async () => {
+    const db = drizzle(env.DB);
+    await db.update(actionRunJobs).set({ name: "日本語 build" }).where(eq(actionRunJobs.id, logJobId));
+    const res = await get(`${SUITE}/actions/jobs/${logJobId}/logs`, "alice-token");
+    // Restore the plain name for any later reader.
+    await db.update(actionRunJobs).set({ name: "build" }).where(eq(actionRunJobs.id, logJobId));
+    expect(res.status).toBe(200);
+    // FileNameJoinFields → `ci-日本語 build-${logTaskId}.log`; getSafeName
+    // masks each rune to `_` (the space kept) and the safe value stops being
+    // a token (space) → Go's quoted-string arm — the former local hand-roll
+    // left such names UNQUOTED (its arm keyed on quote/backslash only). The
+    // twin encodes the RAW name per Go's RFC 2231 byte class (upper hex,
+    // space %20).
+    expect(res.headers.get("content-disposition")).toBe(
+      `attachment; filename="ci-___ build-${logTaskId}.log"; filename*=utf-8''ci-%E6%97%A5%E6%9C%AC%E8%AA%9E%20build-${logTaskId}.log`,
+    );
     expect(await res.text()).toBe(CHUNK_ONE + CHUNK_TWO);
   });
 
