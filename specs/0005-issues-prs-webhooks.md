@@ -1139,6 +1139,137 @@ never cited as suite-green (ADR-0006):
 - The original_author DEFER-vs-LAND decision (§7.2) — the port unit's SPEC
   record states the choice; FN-9 remains the family carrier if deferred.
 
+## 8. FN-5 rename plan — PLAN ONLY
+
+**Status: PLAN ONLY. Nothing is built; no migration has been generated.**
+Derived by the GM-resume unit (2026-11-03) from the upstream pin
+`fc49368845`; the derivation record (per-member verification, the
+same-class sweep, blast-radius counts, and the drizzle migration-shape
+evidence) is the audit doc's §7.10. This section is the port unit's
+normative plan.
+
+### 8.1 Scope — the 18 renames (17 columns + 1 table)
+
+Ours → upstream's literal DDL. Ours cites are schema.ts snapshots
+(working-tree, per the audit's own convention); upstream cites verified
+at the pin. Every tag reading applies the audit §1 override rule
+(GonicMapper runs only when the tag does not name the column; a quoted
+first token pins a legacy name).
+
+| # | table (ours) | column rename | upstream cite | ours cite | note |
+|---|---|---|---|---|---|
+| 1 | `repo_transfer` | `team_ids` → `team_i_ds` | models/repo/transfer.go:72 (`TeamIDs` untagged) | :332 | mapper |
+| 2 | `protected_tags` | `allowlist_team_ids` → `allowlist_team_i_ds` | models/git/protected_tag.go:28 (`JSON TEXT` tokens only) | :3133 | mapper |
+| 3 | `protected_tags` | `allowlist_user_ids` → `allowlist_user_i_ds` | models/git/protected_tag.go:27 (same) | :3131 | mapper |
+| 4 | `protected_branches` | `rule_name` → `branch_name` | models/git/protected_branch.go:34 (quoted `'branch_name' UNIQUE(s)`) | :2573 | quoted pin |
+| 5 | `protected_branches` | `rules` → `config` | models/git/protected_branch.go:38 (quoted `'config' JSON LONGTEXT`) | :2579 | quoted pin |
+| 6 | `project_columns` | TABLE → `project_board` | models/project/column.go:66-68 (`TableName()` override; upstream TODO keeps the legacy name) | :2995 | table rename |
+| 7 | `project_columns` | `is_default` → `default` | models/project/column.go:52 (`Default`, `NOT NULL DEFAULT false` tokens only) | :3004 | mapper |
+| 8 | `project_issues` | `project_column_id` → `project_board_id` | models/project/issue.go:21 (quoted `'project_board_id' INDEX`) | :3048 | quoted pin |
+| 9 | `project_workflows` | `event` → `workflow_event` | models/project/workflows.go:163 (`WorkflowEvent`, no tag) | :3078 | mapper |
+| 10 | `project_workflows` | `filters` → `workflow_filters` | models/project/workflows.go:164 (`TEXT JSON` tokens only) | :3081 | mapper |
+| 11 | `project_workflows` | `actions` → `workflow_actions` | models/project/workflows.go:165 (`TEXT JSON` tokens only) | :3084 | mapper |
+| 12 | `tracked_time` | `seconds` → `time` | models/issues/tracked_time.go:30 (`Time`, `NOT NULL` only) | :1920 | mapper |
+| 13 | `issues` | `title` → `name` | models/issues/issue.go:63 (`Title xorm:"name"` — the explicit column-NAME tag; upstream's own SQL binds it, issue_update.go:198 + issue.go:536) | :624 | column-NAME tag |
+| 14 | `pull_auto_merges` | `issue_id` → `pull_id` | models/pull/automerge.go:19 (`PullID xorm:"UNIQUE"`) | :4994 | NAME+VALUE-SPACE |
+| 15 | `pull_auto_merges` | `merge_message` → `message` | models/pull/automerge.go:23 (`Message xorm:"LONGTEXT"`) | :5004 | mapper |
+| 16 | `audit_event` | `created_unix` → `timestamp_unix` | models/audit/audit_event.go:37 (`TimestampUnix xorm:"INDEX NOT NULL"`) | :3552 | mapper |
+| 17 | `repo_transfer` | `new_owner_id` → `recipient_id` | models/repo/transfer.go:68 (`RecipientID` untagged; upstream's own query binds it, :177) | :313 | sweep addition (audit §7.10) |
+| 18 | `review_state` | `issue_id` → `pull_id` | models/pull/review_state.go:44 (`PullID`, type tokens only; binds :71,:132,:143) | :4971 | NAME+VALUE-SPACE; sweep addition (audit §7.10) |
+
+Out of scope, with the reason:
+
+- `issue_subscriptions` → `issue_watch` table rename: DECLINED — the
+  association rename is recorded intentional (audit §7.5, the SPEC-0005
+  §3.2 block). Not a member.
+- The withdrawn members stay withdrawn (audit §7.8): `redirect_ur_is`
+  and the package_blobs `hash_*` quartet — upstream pins those column
+  names via explicit first-token xorm overrides ours already matches
+  verbatim.
+- The VALUE-SPACE arms of members 14 and 18 (ours `issue_id` stores
+  `issues.id`; upstream `pull_id` stores `pull_request.id`) are NOT
+  moved by this plan — the FN-3 landing's note stands (safe while the
+  rows stay 1:1; audit §4 review_state). This plan renames columns only.
+- FN-7 (`pull_auto_merges.merged_commit_id` port) rides the same unit
+  per the backlog's dependency note; its DDL is additive, not a rename.
+
+### 8.2 The property-kept contract (zero application-code edits)
+
+Drizzle property names and table export names are KEPT: upstream's Go
+field names map to ours drizzle properties (`Title`→`title`,
+`TeamIDs`→`teamIds`), so the batch edits ONLY the explicit column-name
+strings in `src/db/schema.ts` (18 mapping strings) plus raw-SQL test
+fixtures. Production source has ZERO raw-SQL column bindings for any
+member (audit §7.10.3). All string hits for these names outside
+schema.ts are upstream-parity HTTP surfaces that MUST NOT change: the
+`?rule_name=` query param, the transfer form's `team_ids` key, the
+merge `merge_message_field` form key, the type-31 comment-meta content
+JSON's `project_column_id` key, and the `[pull_id: …]` auto-merge error
+text (upstream's exact string, api/routes/pulls.ts:1704). The
+`projectColumns` export name stays even though the SQL table becomes
+`project_board` (ours-side ergonomics; the audit's census compares SQL
+names, not exports). Index names stay ours (`protected_branches_repo_rule_uq`
+keeps its name; drizzle re-emits it over the renamed column).
+
+### 8.3 The migration (one generated migration, ALTERs-only)
+
+The migration-shape verdict (audit §7.10.4, trial `/tmp/fn5-drizzle-trial`
++ drizzle-kit 0.31.11 dist): drizzle-kit's SQLite dialect generates
+`ALTER TABLE … RENAME COLUMN` / `ALTER TABLE … RENAME TO` when its
+interactive rename prompt is answered — never drop+add; under a non-TTY
+stdin generate FAILS LOUD (no silent data-loss path). The port unit's
+flow:
+
+1. Flip the 18 schema.ts mapping strings (properties/exports untouched).
+2. Run `pnpm db:generate` in an interactive TTY; answer each
+   renamed-or-created prompt with the rename candidate (17 column
+   prompts + 1 table prompt). drizzle-kit emits
+   `rename_table` first, then `rename_column`, then the rest, and
+   rebuilds affected indexes (drop + create under the new column names —
+   `protected_branches_repo_rule_uq` moves onto `branch_name`).
+3. Post-generate gate: read the emitted SQL with your own eyes —
+   ALTERs-only, no `CREATE TABLE`, no `DROP COLUMN`, no data-copy
+   staging (the FN-6/0066 rebuild lesson does not apply here).
+4. Apply and prove preservation: seed a local dev D1 (rows in every
+   member table), `pnpm db:migrate:local`, then assert the rows read
+   back under the new names (the fixtures in §8.4 double as this
+   battery).
+5. `pnpm db:migrate:remote` is the deploy-time step per the house
+   deploy discipline.
+
+### 8.4 Test plan (names + asserted shapes; no code)
+
+- ~26 raw-SQL fixture lines across 6 test files carry the OLD names and
+  flip mechanically with the migration: bench-d1.test.ts:2144
+  (`SELECT id, rule_name FROM protected_branches`) and :2198
+  (`FROM project_columns`); audit.test.ts:130 INSERT + :417/:436/:442
+  EXPLAIN witnesses (`created_unix` → `timestamp_unix`);
+  schema.test.ts:1045 (`review_state` `issue_id`) and :1454-1479
+  (`tracked_time` `seconds` ×6); activity-feeds.test.tsx:98 and ~13
+  sibling `INSERT INTO issues (… title …)` fixtures; and
+  settings-danger-zone.matrix.test.tsx:120 (`repo_transfer.new_owner_id`).
+- The schema.test FN-3 describe pins stay green except the
+  review_state INSERT fixture named above; no new DDL-pin describes are
+  required — the renames carry no shape change (types, nullability,
+  defaults, and pks are all untouched by a rename).
+- Full-suite verdict per ADR-0006 (`pnpm test:full`), with the renamed
+  fixtures' scopes attributed.
+
+### 8.5 Open items for the port unit
+
+- The rename prompts must be answered deliberately: drizzle-kit
+  offers "created" as the default-arm; choosing it for any member would
+  emit DROP COLUMN + ADD COLUMN and destroy data — the §8.3 step-3 gate
+  exists to catch exactly that.
+- Optional ours-side follow-up (NOT this unit): FN-7 may rename the
+  `pullAutoMerges.issueId`/`reviewState.issueId` drizzle properties to
+  match their new columns — a code refactor riding FN-7's additive DDL,
+  not an FN-5 deliverable.
+- The bench-d1 raw SELECTs (:2144, :2198) are benchmark witnesses —
+  after the rename they must still hit the same plans (the index under
+  `protected_branches_repo_rule_uq` is rebuilt over the renamed column;
+  re-run the bench file, not just the unit tests).
+
 ## 9. FN-9 disposition — the original_author family: RECORD (intentional-recorded-absent)
 
 **Status: RECORD. Nothing to build; no migration is planned.** Derived by
