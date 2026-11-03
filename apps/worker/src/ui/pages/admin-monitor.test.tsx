@@ -361,13 +361,14 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
 const NOW = new Date("2026-01-01T12:07:33Z");
 
 describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 listing)", () => {
-  it("carries all THIRTEEN landed arms with their wrangler schedules in registry order", () => {
+  it("carries all FOURTEEN landed arms with their wrangler schedules in registry order", () => {
     const { entries } = loadAdminMonitorCron(NOW);
     expect(entries.map((entry) => [entry.name, entry.spec])).toEqual([
       ["update_mirrors", "*/10 * * * *"],
       ["update_push_mirrors", "*/10 * * * *"],
       ["stop_zombie_tasks", "*/10 * * * *"],
       ["stop_endless_tasks", "*/10 * * * *"],
+      ["start_schedule_tasks", "*/10 * * * *"], // FZ fd1fa58: the step entry
       ["demo_sweep", "0 * * * *"],
       ["delete_old_audit_events", "0 * * * *"],
       ["cleanup_packages", "0 * * * *"],
@@ -376,7 +377,7 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
       ["cancel_abandoned_jobs", "0 * * * *"],
       ["cleanup_ephemeral_runners", "0 * * * *"],
       ["cleanup_hook_task_table", "0 * * * *"],
-      ["start_schedule_tasks", "0 * * * *"],
+      ["clean_repo_schedule_tasks", "0 * * * *"], // FZ fd1fa58: the residue sweep
     ]);
     // The never-fired posture without recorded state (the sync loader's
     // shape): prev null, zero executions, the empty-Status result arm.

@@ -514,7 +514,9 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default
     const res = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "Renamed" }) });
     expect(res.status).toBe(200);
     const body = await res.json<Record<string, unknown>>();
-    expect(body.name).toBe("renamed"); // slug is stored lowercase
+    // FN-4/0068: `name` renders the display-case Name column (rename stamps
+    // both carriers, repo.go:666-667); full_name stays the slug-folded pair.
+    expect(body.name).toBe("Renamed");
     expect(body.full_name).toBe("cf-gitea-stub/renamed");
 
     expect((await makeApp()("/repos/cf-gitea-stub/edit-me")).status).toBe(404);
@@ -922,7 +924,7 @@ describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
     const { replaceRepoTopics, listRepoTopics } = await import("./services/repo-topics");
     const { watchRepo, countRepoWatchers } = await import("./services/repo-watchers");
     const { isCollaborator } = await import("./services/repo-collaborators");
-    const { saveRepoSettings, loadRepoSettings } = await import("./services/repo-settings");
+    const { saveRepoSettings } = await import("./services/repo-settings");
     await replaceRepoTopics(env.DB, "7401", ["web"]);
     await watchRepo(env.DB, "7401", otherUserId, new Date());
     await addOrUpdateCollaborator(env.DB, "7401", otherUserId, "read", new Date());
@@ -937,7 +939,14 @@ describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
     expect(await listRepoTopics(env.DB, "7401")).toEqual([]);
     expect(await countRepoWatchers(env.DB, "7401")).toBe(0);
     expect(await isCollaborator(env.DB, "7401", otherUserId)).toBe(false);
-    expect(await loadRepoSettings(env.DB, "7401")).toMatchObject({ description: "" });
+    // FN-4/0068 retired description from repo_settings (moved to the
+    // repositories row); the empty-store assertion rides the column.
+    const deletedDescRow = await drizzle(env.DB)
+      .select({ description: repositories.description })
+      .from(repositories)
+      .where(eq(repositories.id, "7401"))
+      .all();
+    expect(deletedDescRow).toEqual([]); // the row is gone entirely
   });
 
   it("403s a non-owner and 404s a missing repo", async () => {

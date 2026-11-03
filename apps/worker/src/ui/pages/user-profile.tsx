@@ -95,7 +95,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { doerCanViewPrivate } from "../../api/services/orgs";
 import { isBlockedBy } from "../../api/services/blocks";
 import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
-import { orgMembers, projects, repoSettings, repositories, users } from "../../db/schema";
+import { orgMembers, projects, repositories, users } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { formatDueDate } from "./milestones";
 import { OrgHomePagination, OrgRepoListItem, orgDisplayName, type OrgHomeRepoItem } from "./org-home";
@@ -333,9 +333,9 @@ export async function loadUserProfileData(
   const descriptions = new Map<string, string>();
   if (rows.length > 0) {
     const settings = await db
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, rows.map((row) => row.id)))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, rows.map((row) => row.id)))
       .all();
     for (const row of settings) descriptions.set(row.repoId, row.description);
   }

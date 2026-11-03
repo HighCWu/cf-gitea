@@ -100,7 +100,7 @@ import {
   type ExploreUserRow,
   type ExploreUserSort,
 } from "../../api/services/search";
-import { repoSettings, users, type repositories } from "../../db/schema";
+import { repositories, users } from "../../db/schema";
 import { OrgRepoListItem, type OrgHomeRepoItem } from "./org-home";
 import { formatDueDate } from "./milestones";
 import { parsePageNumber } from "../page-data";
@@ -184,9 +184,9 @@ export async function loadExploreReposData(
   const descriptions = new Map<string, string>();
   if (listing.items.length > 0) {
     const rows = await drizzle(d1)
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, listing.items.map((item) => item.repo.id)))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, listing.items.map((item) => item.repo.id)))
       .all();
     for (const row of rows) descriptions.set(row.repoId, row.description);
   }

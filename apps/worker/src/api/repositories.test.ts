@@ -188,7 +188,7 @@ describe("GET /repos/{owner}/{repo} (repoGet)", () => {
       watchers_count: 0,
       branch_count: 0,
       release_counter: 0,
-      archived_at: "0001-01-01T00:00:00Z",
+      archived_at: "1970-01-01T00:00:00Z", // FN-4/0068: upstream renders AsTime(0) — the 1970 epoch — for never-archived (the 0001 pin was our GO_ZERO_TIME placeholder)
       mirror_updated: "0001-01-01T00:00:00Z",
       // upstream stock-repo unit/PR defaults
       has_code: true,

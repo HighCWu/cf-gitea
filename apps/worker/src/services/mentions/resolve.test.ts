@@ -85,7 +85,10 @@ async function seedAll(): Promise<void> {
       createdAt: new Date(0),
     });
   }
-  await db().insert(repositories).values([
+  // One insert per row: repositories grew to 46 columns in 0068 and D1 caps
+  // bound SQL variables per statement (3 rows x 46 > 100 — "too many SQL
+  // variables"); single-row inserts stay well under.
+  const repoSeedRows: (typeof repositories.$inferInsert)[] = [
     { id: ORG_REPO, storageKey: `r_${ORG_REPO}`, ownerNamespace: "acme", ownerId: ORG_ID, slug: "repo", visibility: "public", status: "ready" },
     { id: SOLO_REPO, storageKey: `r_${SOLO_REPO}`, ownerNamespace: "solo", ownerId: SOLO_ID, slug: "repo", visibility: "public", status: "ready" },
     {
@@ -97,7 +100,10 @@ async function seedAll(): Promise<void> {
       visibility: "private",
       status: "ready",
     },
-  ]);
+  ];
+  for (const row of repoSeedRows) {
+    await db().insert(repositories).values(row);
+  }
   await db().insert(teams).values([
     { id: 1, orgId: ORG_ID, lowerName: "devs", name: "devs", authorize: "write", unitsMap: null },
     // The unit-gated team: authorize 'none' + an issues-only override (the

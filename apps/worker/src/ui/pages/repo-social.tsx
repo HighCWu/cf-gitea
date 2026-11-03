@@ -77,13 +77,13 @@
  *   upstream — kept verbatim).
  */
 
-import { inArray } from "drizzle-orm";
+import { inArray , sql} from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { listForks } from "../../api/services/forks";
 import { listRepoStargazers, listRepoSubscribers } from "../../api/services/social-lists";
 import type { RepositoryWithOwner, UserRow } from "../../api/services/repository";
-import { repoSettings } from "../../db/schema";
+import { repositories } from "../../db/schema";
 import { userLink } from "../links";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -168,9 +168,9 @@ export async function loadRepoSocialData(
     const descriptions = new Map<string, string>();
     if (listing.items.length > 0) {
       const rows = await drizzle(d1)
-        .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-        .from(repoSettings)
-        .where(inArray(repoSettings.repoId, listing.items.map((item) => item.repo.id)))
+        .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+        .from(repositories)
+        .where(inArray(repositories.id, listing.items.map((item) => item.repo.id)))
         .all();
       for (const row of rows) descriptions.set(row.repoId, row.description);
     }

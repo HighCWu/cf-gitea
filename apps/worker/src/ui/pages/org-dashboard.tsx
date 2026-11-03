@@ -104,16 +104,7 @@ import { TeamsService, type TeamRecord } from "../../api/routes/org-teams";
 import { pathEscape } from "../../api/services/releases";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
-import {
-  actions,
-  repoCollaborators,
-  repoSettings,
-  repositories,
-  teamMembers,
-  teamRepoAccess,
-  teams,
-  users,
-} from "../../db/schema";
+import { actions, repoCollaborators, repositories, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -519,9 +510,9 @@ export async function loadOrgDashboardData(
   const descriptions = new Map<string, string>();
   if (listing.items.length > 0) {
     const rows_ = await db
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, listing.items.map((item) => item.repo.id)))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, listing.items.map((item) => item.repo.id)))
       .all();
     for (const row of rows_) descriptions.set(row.repoId, row.description);
   }

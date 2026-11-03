@@ -6,7 +6,7 @@ import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import { z } from "zod";
 
 import { CommentType } from "../../issues/comment-types";
-import type { IssueRow, PullRequestRow } from "../../issues/service";
+import type { IssueRow } from "../../issues/service";
 import {
   comments,
   issueSubscriptions,
@@ -381,9 +381,13 @@ interface DerivedThread {
   issue: IssueRow;
   repo: typeof repositories.$inferSelect;
   owner: typeof users.$inferSelect;
-  pull: PullRequestRow | null;
-  /** The caller's state row (null when never touched). */
-  state: typeof notificationStates.$inferSelect | null;
+  pull: { hasMerged: boolean } | null;
+  /** The caller's state row (null when never touched) — only the two
+   *  fields the status resolver reads; the select is column-trimmed to
+   *  keep the whole-table join under D1's result-set column cap (the
+   *  FN-4 regression: five whole tables + 18 new repositories columns
+   *  pushed the wide list query over it). */
+  state: { pinned: boolean; readAtUnix: number } | null;
   /** Unix seconds of the last activity authored by someone else. */
   lastActivity: number;
   /** Latest CommentType.Comment id on the issue (upstream GetLastComment). */
@@ -589,8 +593,11 @@ function threadRowQuery(db: DrizzleD1Database, userId: number, lastActivity: SQL
       issue: issues,
       repo: repositories,
       owner: users,
-      pull: pullRequests,
-      state: notificationStates,
+      // Column-trimmed (the D1 result-set cap — see DerivedThread.state):
+      // the serializer reads only pull.hasMerged and state's two fields;
+      // issue/repo/owner stay whole (toApiRepository consumes them fully).
+      pull: { hasMerged: pullRequests.hasMerged },
+      state: { pinned: notificationStates.pinned, readAtUnix: notificationStates.readAtUnix },
       lastActivity: sql<number>`(${lastActivity})`,
     })
     .from(issues)
@@ -879,7 +886,13 @@ async function threadById(
 ): Promise<DerivedThread> {
   const db = drizzle(d1);
   const rows = await db
-    .select({ issue: issues, repo: repositories, owner: users, pull: pullRequests })
+    // pull trimmed to the serializer's only read (the D1 result-set cap).
+    .select({
+      issue: issues,
+      repo: repositories,
+      owner: users,
+      pull: { hasMerged: pullRequests.hasMerged },
+    })
     .from(issues)
     .innerJoin(repositories, eq(repositories.id, issues.repoId))
     .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
@@ -946,7 +959,7 @@ type ThreadBase = {
   issue: IssueRow;
   repo: typeof repositories.$inferSelect;
   owner: typeof users.$inferSelect;
-  pull: PullRequestRow | null;
+  pull: { hasMerged: boolean } | null;
 };
 
 async function assembleThread(d1: D1Database, userId: number, base: ThreadBase, lastActivity: number): Promise<DerivedThread> {

@@ -137,10 +137,10 @@
  *    literal; the avatar POSTs already carry their own deeper paths).
  */
 
-import { asc, eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray , sql} from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { emailAddresses, repoSettings, repositories, users } from "../../db/schema";
+import { emailAddresses, repositories, users } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -262,9 +262,9 @@ export async function loadAdminUserDetail(d1: D1Database, userId: number): Promi
   const descriptions = new Map<string, string>();
   if (repoRows.length > 0) {
     const settings = await db
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, repoRows.map((row) => row.id)))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, repoRows.map((row) => row.id)))
       .all();
     for (const row of settings) descriptions.set(row.repoId, row.description);
   }

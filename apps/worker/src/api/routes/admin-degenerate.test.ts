@@ -214,14 +214,20 @@ describe("adminCronList (GET /admin/cron)", () => {
     // the hourly census gained the auto_merge_due_scan producer, 79a94f9,
     // the cleanup_hook_task_table producer, 870c9b3, and the
     // start_schedule_tasks row — the W14 schedule producer's census twin).
-    expect(res.headers.get("X-Total-Count")).toBe("13");
+    // FZ fd1fa58: the clean_repo_schedule_tasks residue sweep (hourly,
+    // probe-gated) is the FOURTEENTH arm.
+    expect(res.headers.get("X-Total-Count")).toBe("14");
     const list: Record<string, unknown>[] = await res.json();
-    expect(list).toHaveLength(13);
+    expect(list).toHaveLength(14);
     expect(list.map((entry) => entry.name)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
       "stop_zombie_tasks",
       "stop_endless_tasks",
+      // FZ fd1fa58 moved start_schedule_tasks to the */10 step entry (the
+      // due-spec producer) and added clean_repo_schedule_tasks as the
+      // hourly group's residue-sweep tail.
+      "start_schedule_tasks",
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
@@ -230,9 +236,10 @@ describe("adminCronList (GET /admin/cron)", () => {
       "cancel_abandoned_jobs",
       "cleanup_ephemeral_runners",
       "cleanup_hook_task_table",
-      "start_schedule_tasks",
+      "clean_repo_schedule_tasks",
     ]);
     expect(list.map((entry) => entry.schedule)).toEqual([
+      "*/10 * * * *",
       "*/10 * * * *",
       "*/10 * * * *",
       "*/10 * * * *",
@@ -290,14 +297,14 @@ describe("adminCronList (GET /admin/cron)", () => {
   it("paginates like upstream (page beyond the set → empty, total kept)", async () => {
     const page2 = await adminSend("/admin/cron?page=2&limit=5", authed());
     expect(page2.status).toBe(200);
-    expect(page2.headers.get("X-Total-Count")).toBe("13");
+    expect(page2.headers.get("X-Total-Count")).toBe("14");
     const page2List: Record<string, unknown>[] = await page2.json();
     expect(page2List.map((entry) => entry.name)).toEqual([
+      "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
       "cleanup_actions",
       "auto_merge_due_scan",
-      "cancel_abandoned_jobs",
     ]);
 
     const page1 = await adminSend("/admin/cron?page=1&limit=1", authed());

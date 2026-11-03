@@ -29,15 +29,7 @@ import type { MigrateEnv } from "../../services/migrate";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 import type { RepoEventExecution } from "../../services/repo-events";
-import {
-  orgMembers,
-  repoMirrors,
-  repoSettings,
-  repositories,
-  users,
-  webhookDeliveries,
-  webhooks,
-} from "../../db/schema";
+import { orgMembers, repoMirrors, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -455,9 +447,14 @@ describe("migrateRepoFromForm — the mirror arm's submit semantics", () => {
     expect(mirror?.remoteAddress).toBe(SOURCE_URL);
     expect(mirror?.credentialsCiphertext).not.toBeNull();
 
-    // The description rides the repo-edit stored subset.
-    const settings = await drizzle(env.DB).select().from(repoSettings).where(eq(repoSettings.repoId, repo.id)).get();
-    expect(settings?.description).toBe("mirrored from upstream");
+    // FN-4/0068: description rides the repositories row (repo_settings
+    // retired in place).
+    const descRow = await drizzle(env.DB)
+      .select({ description: repositories.description })
+      .from(repositories)
+      .where(eq(repositories.id, repo.id))
+      .get();
+    expect(descRow?.description).toBe("mirrored from upstream");
 
     // THE SINGLE BIRTH EMISSION: exactly one repository-created, in-request.
     expect(await createdEmissions()).toHaveLength(1);

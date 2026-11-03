@@ -224,7 +224,15 @@ describe("POST /repo/create — the user arm (createUserRepository)", () => {
       .from(repoSettings)
       .where(eq(repoSettings.repoId, row.id))
       .get();
-    expect(description?.description).toBe("auto init");
+    // FN-4/0068: description lives on the repositories row now (the
+    // repo_settings store is retired in place).
+    expect(description?.description).toBe("");
+    const descColumn = await drizzle(env.DB)
+      .select({ description: repositories.description })
+      .from(repositories)
+      .where(eq(repositories.id, row.id))
+      .get();
+    expect(descColumn?.description).toBe("auto init");
   });
 
   it("creates empty without auto-init: is_empty stays, public by default", async () => {
@@ -315,7 +323,14 @@ describe("POST /repo/create — the org arm (requireCanCreateOrgRepo + RepoServi
       .from(repoSettings)
       .where(eq(repoSettings.repoId, row.id))
       .get();
-    expect(description?.description).toBe("org repo"); // stored for both owner kinds
+    // FN-4/0068: the repositories column carries it (the store retired).
+    expect(description?.description).toBe("");
+    const descColumn2 = await drizzle(env.DB)
+      .select({ description: repositories.description })
+      .from(repositories)
+      .where(eq(repositories.id, row.id))
+      .get();
+    expect(descColumn2?.description).toBe("org repo"); // stored for both owner kinds
   });
 
   it("refuses a non-granted org member with the landed 403 message and a forged uid with the owner error", async () => {

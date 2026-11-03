@@ -63,7 +63,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { readGrant } from "../../git-http/acl";
-import { issueSubscriptions, issues, repoSettings, repoWatchers, repositories, users } from "../../db/schema";
+import { issueSubscriptions, issues, repoWatchers, repositories, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { OrgRepoListItem, type OrgHomeRepoItem } from "./org-home";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -166,9 +166,9 @@ async function descriptionsFor(d1: D1Database, repoIds: string[]): Promise<Map<s
   const descriptions = new Map<string, string>();
   if (repoIds.length > 0) {
     const rows = await drizzle(d1)
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, repoIds))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, repoIds))
       .all();
     for (const row of rows) descriptions.set(row.repoId, row.description);
   }

@@ -67,14 +67,14 @@
  *   (modules/setting/ui.go:147).
  */
 
-import { inArray } from "drizzle-orm";
+import { inArray , sql} from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { isFollowing } from "../../api/services/follows";
 import { listOrgRepositories, orgVisibleToDoer, type OrgDoer } from "../../api/services/org-repos";
 import { resolveOrgForRequest, type ResolvedOrg } from "../../api/services/orgs";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
-import { repoSettings, type repositories } from "../../db/schema";
+import { repositories } from "../../db/schema";
 import { AdminEmbeddedSvg } from "./admin-users";
 import { TimeSince } from "../components/file-list";
 import { parsePageNumber } from "../page-data";
@@ -152,9 +152,9 @@ export async function loadOrgHomeData(
   const descriptions = new Map<string, string>();
   if (listing.items.length > 0) {
     const rows = await drizzle(d1)
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, listing.items.map((item) => item.repo.id)))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, listing.items.map((item) => item.repo.id)))
       .all();
     for (const row of rows) descriptions.set(row.repoId, row.description);
   }

@@ -181,15 +181,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { hasWorkInProgressPrefix, issueLabelRows } from "../../api/services/issues";
 import type { LabelRow } from "../../issues/service";
-import {
-  issues,
-  milestones,
-  pullRequests,
-  repoSettings,
-  repoWatchers,
-  repositories,
-  users,
-} from "../../db/schema";
+import { issues, milestones, pullRequests, repoWatchers, repositories, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
 import { parsePageNumber } from "../page-data";
@@ -791,9 +783,9 @@ export async function loadWatchingData(
   const descriptions = new Map<string, string>();
   if (rows.length > 0) {
     const settingRows = await db
-      .select({ repoId: repoSettings.repoId, description: repoSettings.description })
-      .from(repoSettings)
-      .where(inArray(repoSettings.repoId, rows.map((row) => row.repo.id)))
+      .select({ repoId: repositories.id, description: sql<string>`coalesce(${repositories.description}, '')` })
+      .from(repositories)
+      .where(inArray(repositories.id, rows.map((row) => row.repo.id)))
       .all();
     for (const row of settingRows) descriptions.set(row.repoId, row.description);
   }
