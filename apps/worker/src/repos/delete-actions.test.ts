@@ -32,7 +32,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { actions, renamedBranches } from "../db/schema";
+import { actions, deletedBranches, renamedBranches } from "../db/schema";
 import { ActionType, getFeedRows, recordAction } from "../api/services/activity-feeds";
 import { RepoService } from "./service";
 
@@ -45,6 +45,7 @@ beforeEach(async () => {
     "action",
     "personal_access_tokens",
     "protected_branches",
+    "deleted_branches",
     "renamed_branches",
     "repo_units",
     "repo_transfer",
@@ -236,6 +237,12 @@ describe("repo delete sweeps the repo's renamed_branches rows (delete.go:164 Del
       { repoId: doomedId, from: "feat/one", to: "feat/two", createdUnix: 1_700_000_200 },
       { repoId: keeperId, from: "side", to: "trunk", createdUnix: 1_700_000_300 },
     ]);
+    // The Branch bean's analog (:163, the row BEFORE RenamedBranch): the
+    // deleted-arm substrate dies in the same batch.
+    await db.insert(deletedBranches).values([
+      { repoId: doomedId, name: "stale-deleted", commitId: "a".repeat(40), deletedById: 1, deletedUnix: 1_700_000_150 },
+      { repoId: keeperId, name: "keeper-deleted", commitId: "b".repeat(40), deletedById: 1, deletedUnix: 1_700_000_250 },
+    ]);
     expect((await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, doomedId)).all()).length).toBe(2);
 
     await service().deleteRepository(doomedId);
@@ -245,5 +252,8 @@ describe("repo delete sweeps the repo's renamed_branches rows (delete.go:164 Del
     expect((await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, doomedId)).all()).length).toBe(0);
     const survivor = await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, keeperId)).all();
     expect(survivor.map((row) => row.from)).toEqual(["side"]);
+    // The deleted-arm substrate swept identically (the Branch-bean analog).
+    expect((await db.select().from(deletedBranches).where(eq(deletedBranches.repoId, doomedId)).all()).length).toBe(0);
+    expect((await db.select().from(deletedBranches).where(eq(deletedBranches.repoId, keeperId)).all()).length).toBe(1);
   });
 });

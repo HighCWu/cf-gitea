@@ -94,6 +94,7 @@ import {
   orgMembers,
   pullRequests,
   protectedBranches,
+  deletedBranches,
   renamedBranches,
   repositories,
   stars,
@@ -1196,6 +1197,12 @@ export class RepoService {
       // {RepoID: repoID}, services/repository/delete.go:171). The schema's
       // repo-scoped convention (no FK) already promised this sweep.
       this.db.delete(protectedBranches).where(eq(protectedBranches.repoId, repoId)),
+      // The deleted-arm substrate dies with the repo FIRST — upstream's
+      // Branch bean (delete.go:163) covers the live+deleted rows of its
+      // single branch table; ours splits live (engine) from deleted
+      // (deleted_branches), so THIS sweep is that bean's analog (RB's
+      // routed fold).
+      this.db.delete(deletedBranches).where(eq(deletedBranches.repoId, repoId)),
       // The renamed-branch log dies with the repo (upstream's DeleteBeans
       // census carries &git_model.RenamedBranch{RepoID: repoID},
       // services/repository/delete.go:164 — the row right after Branch).
