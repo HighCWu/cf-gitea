@@ -1685,11 +1685,20 @@ import {
 import {
   createIssueFromForm,
   loadNewIssueData,
+  loadNewIssuePrefill,
   newIssueLocale,
+  prefillLabelIds,
   readNewIssueForm,
   renderNewIssuePage,
+  renderSubmittedTemplate,
 } from "./pages/new-issue";
-import { issueNewChooseRedirect } from "./pages/issue-new-choose";
+import {
+  hasAnyTemplateOrContactLink,
+  issueNewChooseRedirect,
+  loadIssueNewChooseData,
+  renderIssueNewChoosePage,
+} from "./pages/issue-new-choose";
+import { DEFAULT_ISSUE_CONFIG, issueConfigFromDefaultBranch, parseTemplatesFromDefaultBranch } from "./pages/issue-templates";
 import { loadPullFilesData, renderPullFilesPage, updateViewedFilesFromWeb } from "./pages/pull-files";
 // Wave-29 diffpatch downloads (the survey's row 4 — the four raw-text
 // .diff/.patch routes; the loaders + Response builder live in the module,
@@ -1767,6 +1776,7 @@ import {
   renderHooksSettingsPage,
   renderMirrorSettingsPage,
   renderRepoSettingsPage,
+  saveMirrorSettingsFromForm,
   syncMirrorNow,
 } from "./pages/settings";
 import {
@@ -7345,13 +7355,34 @@ function loginRedirect(requestUri: string): Response {
  *  (`?milestone=` — upstream NewIssue's FormInt64("milestone"); a
  *  non-numeric or unknown id falls through to none, the form's own
  *  parsing). */
+/** GET /{owner}/{repo}/issues/new/choose (pages/issue-new-choose.tsx —
+ *  upstream NewIssueChooseTemplate, issue_new.go:180-204): the ladder, then
+ *  the default-branch template discovery; the no-templates arm stays the
+ *  pure 303 seam (issue_new.go:191-195, query verbatim), the render arm
+ *  answers the choose.tmpl card list. No archived gate, no login gate (the
+ *  reqUnitIssuesReader posture — the module header). */
 async function issueNewChoosePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { repo, url, respond } = resolved;
-  return respond(issueNewChooseRedirect(repo, url));
+  const { repo, url, ctx, respond } = resolved;
+  const data = await loadIssueNewChooseData(c.env, repo, url);
+  if (!hasAnyTemplateOrContactLink(data)) {
+    return respond(issueNewChooseRedirect(repo, url));
+  }
+  return respond(c.html(renderIssueNewChoosePage({ ctx, data }), 200));
 }
 
+/** GET /{owner}/{repo}/issues/new (pages/new-issue.tsx): the form for the
+ *  signed-in viewer; anonymous 303s onto the login round-trip. Wave 26: the
+ *  milestone-detail page's New Issue link preselects its milestone
+ *  (`?milestone=` — upstream NewIssue's FormInt64("milestone"); a
+ *  non-numeric or unknown id falls through to none, the form's own
+ *  parsing). SPEC-0005 §11: the ISSUE-TEMPLATE prefill arms — the `?template=`
+ *  candidate chain over the 18 fallbacks (setTemplateIfExists,
+ *  issue_new.go:40-96), the title/body query prefills, the label
+ *  name/id prefill with the query precedence (issue_page_meta.go:184-188),
+ *  the yaml FIELDS arm, and the blank-issues-disabled 303 onto the choose
+ *  page with the raw query (issue_new.go:146-150). */
 async function issueNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -7363,13 +7394,49 @@ async function issueNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     /^\d+$/.test(milestoneParam) && Number.parseInt(milestoneParam, 10) > 0
       ? Number.parseInt(milestoneParam, 10)
       : null;
+  // The template arms (empty repos skip the walks — upstream's IsEmpty
+  // early returns, services/issue/template.go:119-121,160-162).
+  const reads = engineReads(c.env, repo);
+  const tips = refTipMap(await reads.listRefs());
+  const tip = repo.isEmpty ? null : (tips.get(branchRef(repo.defaultBranch))?.target ?? null);
+  const prefill = await loadNewIssuePrefill(c.env, repo, url);
+  const parsed = await parseTemplatesFromDefaultBranch(reads, tip);
+  const { config } = repo.isEmpty
+    ? { config: DEFAULT_ISSUE_CONFIG }
+    : await issueConfigFromDefaultBranch(reads, tip, repo.defaultBranch);
+  const hasTemplates = parsed.templates.length > 0 || config.contactLinks.length > 0;
+  // The merged invalid-template notice (upstream maps BOTH error sets into
+  // one flash — issue_new.go:132-141).
+  const templateErrors = new Map(parsed.errors);
+  for (const [name, message] of prefill.templateErrors) templateErrors.set(name, message);
+
+  // The blank-issues redirect (issue_new.go:146-150): no template loaded,
+  // templates exist, and the config disables blank issues → the choose page
+  // with the SAME query (upstream re-emits RawQuery, the literal `?`).
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  if (!config.blankIssuesEnabled && hasTemplates && prefill.template === null) {
+    const rawQuery = url.search.startsWith("?") ? url.search.slice(1) : "";
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLink}/issues/new/choose?${rawQuery}` } }));
+  }
+
+  // The title/body prefills (new_form.tmpl's precedence chain: TitleQuery >
+  // IssueTemplateTitle > default; BodyQuery > the md template's content).
+  const template = prefill.template;
+  const title = prefill.titleQuery !== "" ? prefill.titleQuery : (template?.title ?? "");
+  const content =
+    prefill.bodyQuery !== "" ? prefill.bodyQuery : (template !== null && template.fields.length === 0 ? template.content : "");
+  // The labels (issue_page_meta.go:184-188): `?label=` (fallback `?labels=`)
+  // wins; the template's label NAMES match case-insensitively otherwise.
+  const labelIds = prefillLabelIds(data.labels, template?.labels ?? [], url.searchParams.get("label") ?? url.searchParams.get("labels"));
   return respond(
     c.html(
       renderNewIssuePage({
         ctx,
         data,
-        form: { title: "", content: "", labelIds: [], milestoneId },
+        form: { title, content, labelIds, milestoneId, templateFile: null, fieldParams: new URLSearchParams() },
         error: null,
+        template,
+        templateErrors,
       }),
       200,
     ),
@@ -7399,6 +7466,11 @@ async function issueNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
     const data = await loadNewIssueData(c.env.DB, repo.id);
     return respond(c.html(renderNewIssuePage({ ctx, data, form, error: newIssueLocale.repo_archived }), 200));
   }
+  // The yaml-template render arm (issue_new.go:354-359): template-file set →
+  // re-unmarshal from the DEFAULT branch; on success the issue body IS the
+  // rendered markdown; any failure leaves the submitted content standing.
+  const rendered = await renderSubmittedTemplate(c.env, repo, form);
+  if (rendered !== null) form.content = rendered;
   // The emission hook rides the write (services/issue-events.ts): the SAME
   // issues "opened" fan-out the API POST route emits — the wave-4 divergence.
   const result = await createIssueFromForm(c.env.DB, repo.id, form, viewer.id, { request: c, origin: ctx.origin });
@@ -8667,6 +8739,8 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
   const outcome = await dispatchWorkflow({
     d1: c.env.DB,
     reads: engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+    // HOOKS' fold: the web dispatch's creation emissions.
+    webhook: { bindings: c.env, origin: ctx.origin },
     repo,
     workflowId: formValue("workflow"),
     ref: form.get("ref") ?? url.searchParams.get("ref") ?? "",
@@ -10212,12 +10286,19 @@ async function mirrorSettingsPage(c: Context<{ Bindings: Env }>): Promise<Respon
 }
 
 /**
- * POST /{owner}/{repo}/settings/mirror — Synchronize Now (upstream
- * handleSettingsPostMirrorSync, setting.go:379-390): the mirror-sync enqueue
- * through syncMirrorNow; success 303s back with the `?sync=queued` flash
- * (upstream's Flash.Info + Redirect), the not-a-mirror/archived refusals
- * 404-shell exactly upstream's NotFound arm, the queue-side failures answer
- * the gate's 500 plain-text shape.
+ * POST /{owner}/{repo}/settings/mirror — the upstream dispatch switch
+ * (SettingsPost's action cases, setting.go:186-188): `action=mirror` is the
+ * settings SAVE (handleSettingsPostMirror, setting.go:279-372) through
+ * saveMirrorSettingsFromForm — a validation refusal re-renders the page with
+ * the message (RenderWithErr reduction), success 303s back onto the page
+ * (the Flash.Success reduction; the KEK 500 family propagates to the
+ * router's plain-text 500); `action=mirror-sync` (and the landed
+ * empty-body reduction — the historical clients post no action) is
+ * Synchronize Now (handleSettingsPostMirrorSync, setting.go:379-390): the
+ * mirror-sync enqueue through syncMirrorNow; success 303s back with the
+ * `?sync=queued` flash (upstream's Flash.Info + Redirect), the
+ * not-a-mirror/archived refusals 404-shell exactly upstream's NotFound arm,
+ * the queue-side failures answer the gate's 500 plain-text shape.
  */
 async function mirrorSyncSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
@@ -10227,6 +10308,20 @@ async function mirrorSyncSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   const gate = await settingsGate(c, resolved);
   if (gate !== null) return gate;
   const { ctx, repo, respond } = resolved;
+  const form = await readUrlEncodedForm(c.req.raw);
+  if (form.get("action") === "mirror") {
+    const result = await saveMirrorSettingsFromForm(c.env.DB, c.env, repo, form);
+    if (result.outcome === "saved") {
+      return respond(
+        new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/mirror` } }),
+      );
+    }
+    if (result.outcome === "not-mirror" || result.outcome === "archived") {
+      return respond(c.html(renderNotFound(ctx), 404));
+    }
+    const data = await loadMirrorSettings(c.env.DB, repo.id);
+    return respond(c.html(renderMirrorSettingsPage({ ctx, data, error: result.message }), 200));
+  }
   const result = await syncMirrorNow(c.env.DB, c.env.MIRROR_SYNC_QUEUE, repo);
   if (result.outcome === "queued") {
     return respond(

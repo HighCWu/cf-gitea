@@ -1,19 +1,10 @@
 /**
- * The issue-template CHOOSER seam's tests (pages/issue-new-choose.ts — the
- * `/{owner}/{repo}/issues/new/choose` census slice). The module is the
- * NO-TEMPLATES arm, ported honestly: our side has no issue-template
- * pipeline (no template tables, no default-branch tree walk — the module
- * doc's data-gate section), so upstream's `HasTemplatesOrContactLinks`
- * (services/issue/template.go:182-192) is structurally false at every repo
- * and the page's ONLY reachable arm is the 303 onto `/{o}/{r}/issues/new`
- * with the raw query preserved (issue_new.go:191-195). The choose.tmpl card
- * DOM is deliberately NOT ported — the dead-card rule forbids inventing
- * cards for data that cannot exist.
+ * The issue-template CHOOSER seam's tests (pages/issue-new-choose.tsx — the
+ * `/{owner}/{repo}/issues/new/choose` page). The module carries BOTH arms
+ * since the ISSUE-TEMPLATE pipeline landed (SPEC-0005 §11): the no-templates
+ * 303 (issue_new.go:191-195) and the choose.tmpl render (issue_new.go:180-204).
  *
- * Coverage (the route arm rides the mount recipe — the module header's
- * HANDOFF NOTE; the tail is UNCLAIMED in parseUiRoute today, so the live
- * dispatcher cannot reach the seam yet and these tests drive the module
- * directly, the search-aux convention):
+ * THIS FILE keeps the pure-unit coverage (no bindings, no D1):
  *
  *   - the no-templates arm's EXACT shape: 303 See Other, the location
  *     byte-shape `/{o}/{r}/issues/new?{rawQuery}` with the query preserved
@@ -25,20 +16,27 @@
  *     viewer input, repeated calls identical;
  *   - the chain terminates on a LANDED surface: the redirect target's path
  *     parses to the wave-4 `issue-new` family;
- *   - the claim state (the two-stage pin): `parseUiRoute` returns null and
- *     `handlesUiRoute` false for the choose tail — the wiring window flips
- *     these per the HANDOFF — while the sibling shapes prove the recipe's
- *     guards claim nothing extra (the bare `/issues/new` literal, the
- *     case-exact literals, the deeper tails all stay as they are).
+ *   - the claim state: `parseUiRoute` claims the choose tail beside the
+ *     wave-4 literal, and the sibling shapes prove the recipe's guards
+ *     claim nothing extra;
+ *   - THE RENDER ARM's pure pieces: the invalid-template notice formatter
+ *     (renderErrorOfTemplates' sorted `file: error` lines + the %v
+ *     summary), the has-anything predicate, and the en-US locale literals.
  *
- * Pure unit suite — no D1, no engine, no bindings (the seam touches no
- * storage; parseUiRoute is a pure parser).
+ * The ENGINE-BACKED arms (discovery over a real tree, the rendered cards,
+ * the prefill round-trip) live in pages/issue-templates.matrix.test.tsx.
  */
 
 import { describe, expect, it } from "vitest";
 
 import { handlesUiRoute, parseUiRoute } from "../index";
-import { issueNewChooseRedirect } from "./issue-new-choose";
+import {
+  formatTemplateErrors,
+  hasAnyTemplateOrContactLink,
+  issueNewChooseLocale,
+  issueNewChooseRedirect,
+  type IssueNewChooseData,
+} from "./issue-new-choose";
 
 const OWNER = "nimx";
 const REPO = "newchoose";
@@ -124,5 +122,58 @@ describe("the claim state (two-stage HANDOFF — flipped by the wiring window)",
       owner: OWNER,
       repo: REPO,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the render arm's pure pieces (SPEC-0005 §11)
+// ---------------------------------------------------------------------------
+
+describe("formatTemplateErrors (renderErrorOfTemplates, issue_new.go:155-177)", () => {
+  it("the files sort for the stable output; the lines are `file: error`", () => {
+    const errors = new Map<string, string>([
+      [".gitea/ISSUE_TEMPLATE/z.yaml", "'about' is required"],
+      [".gitea/ISSUE_TEMPLATE/a.md", "too large: 9000000 > MaxDisplayFileSize"],
+    ]);
+    const formatted = formatTemplateErrors(errors);
+    expect(formatted.summary).toBe("2 invalid template(s) found"); // the %v substitution
+    expect(formatted.details).toEqual([
+      ".gitea/ISSUE_TEMPLATE/a.md: too large: 9000000 > MaxDisplayFileSize",
+      ".gitea/ISSUE_TEMPLATE/z.yaml: 'about' is required",
+    ]);
+  });
+
+  it("an empty errors map formats to the zero summary (the page gates on size before calling)", () => {
+    const formatted = formatTemplateErrors(new Map());
+    expect(formatted.summary).toBe("0 invalid template(s) found");
+    expect(formatted.details).toEqual([]);
+  });
+});
+
+describe("hasAnyTemplateOrContactLink (HasTemplatesOrContactLinks, template.go:182-190)", () => {
+  const base: IssueNewChooseData = {
+    templates: [],
+    templateErrors: new Map(),
+    config: { blankIssuesEnabled: true, contactLinks: [] },
+    configError: null,
+    prefillQuery: "",
+  };
+
+  it("false with no templates and no links (the 303 arm's predicate)", () => {
+    expect(hasAnyTemplateOrContactLink(base)).toBe(false);
+  });
+
+  it("true on templates alone; true on contact links alone (even with zero templates)", () => {
+    expect(hasAnyTemplateOrContactLink({ ...base, templates: [{ name: "x", title: "", about: "a", labels: [], assignees: [], ref: "", content: "", fields: [], fileName: "x.md" }] })).toBe(true);
+    expect(hasAnyTemplateOrContactLink({ ...base, config: { blankIssuesEnabled: true, contactLinks: [{ name: "Chat", url: "https://x", about: "a" }] } })).toBe(true);
+  });
+
+  it("the locale literals are the en-US pins", () => {
+    expect(issueNewChooseLocale.get_started).toBe("Get Started");
+    expect(issueNewChooseLocale.open_external_link).toBe("Open");
+    expect(issueNewChooseLocale.blank).toBe("Default");
+    expect(issueNewChooseLocale.blank_about).toBe("Create an issue from default template.");
+    expect(issueNewChooseLocale.ignore_invalid_templates).toBe("Invalid templates have been ignored");
+    expect(issueNewChooseLocale.invalid_config).toBe("The issue config contains errors:");
   });
 });
