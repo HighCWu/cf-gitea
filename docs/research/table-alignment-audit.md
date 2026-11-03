@@ -21,15 +21,15 @@ sources and found accurate.
 - **Our tables: 107** exported `sqliteTable` definitions in
   `apps/worker/src/db/schema.ts`, all with explicit snake_case SQL names.
 - **Verdicts over the 117 upstream tables:**
-  - **45 aligned** (structure faithful; only the blanket families of §2 apply)
-  - **22 intentional-recorded** (a SPEC or code-level record owns the divergence)
-  - **28 drift** (accidental divergence — the migration backlog, §5/FN)
+  - **46 aligned** (structure faithful; only the blanket families of §2 apply)
+  - **23 intentional-recorded** (a SPEC or code-level record owns the divergence)
+  - **26 drift** (accidental divergence — the migration backlog, §5/FN)
   - **22 missing-table** (no counterpart; §3.3 splits the no-reader arm)
   - *(0 platform-adapted PAIRS — platform adaptation shows up in the blanket
     families of §2 and in the missing-table rows, not as whole-table rewrites)*
 - **Ours-extras: 12** tables with no upstream counterpart (§3.4).
 - The lost report's "~115 tables / ~60 drifted columns / 4 missing tables"
-  is **superseded**: this census counts 117 / 70 table-specific drift
+  is **superseded**: this census counts 117 / 65 table-specific drift
   columns (+ the blanket families and the 26-column `repositories`
   residual) / **22 missing tables**. The 4-missing-table figure undercounts
   by counting only data tables a reader would touch; this census counts
@@ -62,8 +62,20 @@ sed -n 50,58p gitea/models/db/engine_init.go
 Column shapes come from the xorm struct fields + tags, mapped with xorm's
 `gonicCasedName` algorithm (`names/mapper.go`, fetched from the xorm v1
 upstream because the module cache is absent; ported verbatim into a scratch
-parser). That mapper is why upstream has quirk names like `redirect_ur_is`
-(`RedirectURIs`), `team_i_ds` (`TeamIDs`), `hash_m_d5` (`HashMD5`) — the
+parser). **The override rule (added 2026-11-03 after two false drifts,
+§7.8): GonicMapper runs ONLY when the tag does not name the column — an
+explicit FIRST tag token wins, and a quoted first token pins a legacy
+name.** `xorm:"redirect_uris JSON TEXT"` sets the column to `redirect_uris`
+(never a mapper quirk); `xorm:"'branch_name' UNIQUE(s)"` pins
+`branch_name`; a tag of bare type tokens (`JSON TEXT`, `NOT NULL`,
+`UNIQUE`, `INDEX ...`) leaves the field to the mapper. Before classifying
+ANY gonic-quirk rename, read the tag's first token — the original parse
+skipped this and produced two false renames (oauth2_application and the
+package_blobs hashes, both withdrawn in §7.8). The true quirk names are
+the trailing-initialism splits whose tags carry no column token:
+`team_i_ds` (`TeamIDs`, transfer.go:72),
+`allowlist_team_i_ds`/`allowlist_user_i_ds` (`AllowlistTeamIDs`/
+`AllowlistUserIDs`, protected_tag.go:27-28) — the
 trailing-lowercase-after-initialism rule splits before the final letter
 run. Embedded fields: `LFSMetaObject` extends `lfs.Pointer`
 (`gitea/modules/lfs/shared.go:41-44` → `oid`, `size`); the five
@@ -129,18 +141,29 @@ table verdicts in §3 assume them.
    (`comments.removed_assignee`, `users.repo_admin_change_team_access`,
    `repositories.close_issues_via_commit_in_any_branch`) — storage-equal,
    cosmetic only.
-5. **Timestamp column names — drift family (cosmetic).** Upstream
-   `created_unix`/`updated_unix` vs ours `created_at`/`updated_at` on the
-   SPEC-0001/0005-era tables, and `created`/`updated` on the actions
-   family — ~30 tables. Nothing records the choice, and the codebase is
-   internally inconsistent about it (SPEC-0018 §4.1 used `created_unix`
-   for parity when it landed post-ADR). Names never cross the API (Drizzle
-   property names are already camelCase; the JSON renderers name their own
-   fields), so this is the lowest-stakes drift — FN-13 bundles it into a
-   record-or-rename decision unit.
-6. **`uid` → `user_id` renames — drift family (cosmetic).** `follow`,
-   `star`, `issue_user`, `team_user`, `email_address` (5 tables) — batched
-   with FN-13.
+5. **Timestamp column names — drift family (cosmetic; FN-13 disposition:
+   record, not rename).** Ours `created_at`/`updated_at` vs upstream
+   `created_unix`/`updated_unix` on 16 paired tables — the member census
+   with both-side cites is §7.2. Folded erratum (2026-11-03, §7.8): this
+   family's original sketch here was wrong on both of its arms — the
+   actions family (`created`/`updated`) is PARITY (upstream's fields are
+   literally `Created`/`Updated` and GonicMapper renders exactly those
+   column names), and the SPEC-0001/0005-era tables are the parity side
+   too (they carry upstream's `*_unix` names verbatim; the `*_at`
+   suffixes there are Drizzle PROPERTY names, never SQL names). What
+   survives of the original text: nothing recorded the choice until
+   FN-13 landed the SPEC-0005 §3.2 as-built block (SPEC-0018 §4.1 had
+   used `created_unix` for parity when it landed post-ADR), and names
+   never cross the API (Drizzle property names are already camelCase;
+   the JSON renderers name their own fields) — the lowest-stakes family.
+6. **`uid` → `user_id` renames — recorded family (FN-13:
+   intentional-recorded, rename declined, §7.3).** Members: `star`,
+   `issue_user`, `team_user`, `email_address`, `org_user`,
+   `access_token`, `two_factor` (7 tables; the member table with
+   both-side cites is §7.3). Folded erratum (2026-11-03, §7.8): the
+   original list here named `follow` — NOT a member (upstream's field is
+   `UserID`, follow.go:17, rendering `user_id`: parity) — and omitted
+   `org_user`/`access_token`/`two_factor`.
 7. **NOT-NULL strictness inversion — drift class (386 columns), recommend
    record-not-migrate.** Upstream xorm leaves columns nullable unless the
    tag says `NOT NULL`; ours declares `notNull()` far more widely. Ours is
@@ -150,9 +173,11 @@ table verdicts in §3 assume them.
    "stricter-than-upstream" class, so honestly: drift by the letter,
    resolved by RECORDING (an ADR-0007 appendix note), not by DDL. The
    handful of inversions where OURS is the nullable side are itemized in
-   §4 under their tables (`issue_pins.repo_id/issue_id`,
+   §7.1's verified-members table (`issue_pins.repo_id`,
    `issue_subscriptions.created_unix/updated_unix`,
-   `users.email/avatar_email`).
+   `users.email/avatar_email`; an earlier `issue_pins.issue_id` member
+   here was withdrawn — ours is the composite PK and NOT NULL, the same
+   strictness as upstream, issue_pin.go:19 vs schema.ts:1095).
 
 ## 3. The census
 
@@ -372,16 +397,130 @@ lines are structural. Both-side cites on every line.
 
 upstream: models/issues/comment.go (struct `Comment`)
 
-- MISSING `assignee_team_id` (integer NOT NULL, DEFAULT 0) — upstream models/issues/comment.go:308 (`AssigneeTeamID`); no ours counterpart
-- MISSING `comment_meta_data` (text(json)) — upstream models/issues/comment.go:361 (`CommentMetaData`); no ours counterpart
-- MISSING `old_project_id` (integer) — upstream models/issues/comment.go:292 (`OldProjectID`); no ours counterpart
-- MISSING `original_author` (text) — upstream models/issues/comment.go:281 (`OriginalAuthor`); no ours counterpart
-- MISSING `original_author_id` (integer) — upstream models/issues/comment.go:282 (`OriginalAuthorID`); no ours counterpart
-- MISSING `patch_quoted` (text) — upstream models/issues/comment.go:331 (`PatchQuoted`); no ours counterpart
-- MISSING `project_id` (integer) — upstream models/issues/comment.go:293 (`ProjectID`); no ours counterpart
-- MISSING `time_id` (integer) — upstream models/issues/comment.go:302 (`TimeID`); no ours counterpart
-- OURS-EXTRA `patch` — schema.ts:763 (`comments.patch`)
-- TYPE `removed_assignee`: upstream boolean (models/issues/comment.go:306) vs ours integer (schema.ts:752 (`comments`))
+**FN-2 derivation expansion (unit GJ, 2026-11-03, pin `fc4936884584`; this
+unit owns this entry's cells).** Erratum to the census cells first:
+**upstream has no `patch_quoted` column.** The Go field `PatchQuoted`
+carries the xorm column-name override `xorm:"LONGTEXT patch"`
+(models/issues/comment.go:330 — bare-token column rename, same convention
+as `Issue.Title xorm:"name"`, issue.go:63), so the persisted column is
+literally `patch`; the runtime `Patch` field is `xorm:"-"` (comment.go:329,
+never stored — BeforeInsert/BeforeUpdate copy Patch→PatchQuoted with an
+invalid-UTF-8 `strconv.Quote` guard, comment.go:402-415, and AfterLoad
+unquotes, :418-426). Ours `comments.patch` (schema.ts:763) IS that column:
+the pair "MISSING `patch_quoted`" + "OURS-EXTRA `patch`" below collapses to
+**PARITY** (name and content family both match; ours stores the raw engine
+diff — the quote guard is a no-op for valid UTF-8, which is the only
+divergence arm and it is unobserved). The §3.1 `comment` row's reason
+inherits this correction: FN-2 adds **7 columns, not 8** — the audit's
+"8 mutation-metadata cols" figure counts `patch_quoted`, which does not
+exist as a column. Verdict matrix and derivation follow.
+
+Verdict matrix (ADR-0007 vocabulary; ours cites = this worktree):
+
+| upstream column | upstream field (cite) | our write seam today | our read arm today | verdict |
+|---|---|---|---|---|
+| `project_id` | `ProjectID int64` nullable (comment.go:292) | LIVE — type-30/31 writers carry the id in `content` JSON (api/services/projects.ts:914,967,1060; api/services/issues.ts:2258-2266) | LIVE-but-hardcoded — `project_id: 0` (api/services/issues.ts:1422) | drift → PORT (FN-2) |
+| `old_project_id` | `OldProjectID int64` nullable (comment.go:291) | same type-30 writers (same cells) | LIVE-but-hardcoded — `old_project_id: 0` (issues.ts:1421) | drift → PORT (FN-2) |
+| `time_id` | `TimeID int64` nullable (comment.go:301) | LIVE — time writers omit it (ui/pages/issue-timeline-writes.ts:764-771,817-824; api/routes/issue-tables-t2.ts:1541-1549) | LIVE-but-heuristic — `trackedTimeOfComment` correlates (poster, seconds, second) (api/services/issues.ts:1207) | drift → PORT (FN-2) |
+| `assignee_team_id` | `AssigneeTeamID int64` NOT NULL DEFAULT 0 (comment.go:307) | LIVE — team review-request comments write neither id arm (api/routes/pull-reviews.ts:1596-1602 add, :1699-1706 remove) | LIVE-but-null — `assignee_team: null` (issues.ts:1437) | drift → PORT (FN-2) |
+| `comment_meta_data` | `CommentMetaData *CommentMetaData` JSON TEXT nullable (comment.go:360, struct :249-257) | PARTIAL — type-31 column-move payload rides `content` JSON (projects.ts:1060); no CODEOWNERS arm; workflows reuse the human write (services/projects-workflow.ts:510-560) | none — no type-31/label timeline render (ui/pages/issue-detail.tsx:734-746 renders types 0/1/2/28 only), no label-merge guard | drift → PORT the column-move arm; SpecialDoerName arms PORT-WHEN-READ |
+| `original_author` | `OriginalAuthor string` nullable (comment.go:280) | none — no comment-migration inflow (grep 0) | none — API `user` renders the poster row directly (issues.ts:1417), no `ToAuthor` fallback | port-when-read (twin of the unwritten `issues.original_author`, schema.ts:620) |
+| `original_author_id` | `OriginalAuthorID int64` nullable (comment.go:281) | none | none | port-when-read |
+| (`patch`) | `PatchQuoted string xorm:"LONGTEXT patch"` (comment.go:330) | LIVE — code-comment create + reply write it (api/routes/pull-reviews.ts:1013; api/routes/repo-extras-t2.ts:1511) | LIVE — diff-hunk render (pull-reviews.ts:506) | PARITY (erratum above) |
+
+The derivation, column by column (upstream write/read cites verified at the
+pin):
+
+- `project_id` / `old_project_id` — WRITE: the type-30 project comments.
+  Remove arm `OldProjectID: projectID, ProjectID: 0`
+  (models/issues/issue_project.go:90-99, cells :95-96); add arm
+  `OldProjectID: 0, ProjectID: projectID` (:138-147, cells :143-144);
+  `CreateComment` copies the opts verbatim (comment.go:882-883). READ:
+  `LoadProject` (comment.go:594-607) from the web timeline
+  (routers/web/repo/issue_view.go:735-752); the type-30 template arm
+  branches `gt .OldProjectID 0` / `gt .ProjectID 0`
+  (templates/repo/issue/view_content/comments.tmpl:565-576); and
+  `ToTimelineComment` emits both
+  (services/convert/issue_comment.go:97-98 → contract
+  `old_project_id`/`project_id`, modules/structs/issue_comment.go:68-69).
+  Our writers exist and store the same VALUES in content JSON
+  (api/services/projects.ts:914 `{old_project_id:0, project_id}`,
+  :967 `{old_project_id, project_id:0}`; api/services/issues.ts:2258-2266
+  mirrors the shape) — the port moves the values into the columns and
+  empties `content` (upstream's type-30/31 content is empty: the
+  CreateCommentOptions pass no Content), backfilling stored rows from
+  their JSON (SPEC-0005 §7 PLAN).
+- `time_id` — WRITE: add-time-manual (models/issues/tracked_time.go:180-189,
+  cell :188) and stop-tracking (models/issues/stopwatch.go:156-164, cell
+  :162) ONLY; the delete/start/cancel arms set none (tracked_time.go:256-263,
+  :280-287; stopwatch.go:194-201, :222-230). READ: `LoadTime`
+  (comment.go:732-739) → `ToTimelineComment`'s `tracked_time`
+  (services/convert/issue_comment.go:58-62,121-129) and the delete-time
+  template's link (templates/repo/issue/view_content/
+  comments_delete_time.tmpl:6). Our writers omit the column and the reader
+  is the documented heuristic correlation (api/services/issues.ts:1183-1196
+  docstring; :1207 `trackedTimeOfComment`) — the port writes `time_id` in
+  the same batch at both writer pairs and retires the heuristic for new
+  rows; legacy-row backfill rides the heuristic's own correlation.
+- `assignee_team_id` — WRITE: the team review-request add/remove comments
+  (models/issues/review.go:859-869, cell :865; :916-928, cell :922 — the
+  `NOT NULL DEFAULT 0` tag at comment.go:307). READ:
+  `LoadAssigneeUserAndTeam` (comment.go:686-700) → `ToTimelineComment`'s
+  `assignee_team` (services/convert/issue_comment.go:40-44,179-181 →
+  contract modules/structs/issue_comment.go:89-90) and the timeline text
+  (comment.go:821-845 `TimelineRequestedReviewTr`). Our team arms exist
+  and write type-27 comments WITHOUT the column
+  (api/routes/pull-reviews.ts:1596-1602, :1699-1706) — the port stamps it
+  in both arms; the API render stops being hardcoded null (issues.ts:1437).
+- `comment_meta_data` — WRITE: `buildCreateCommentMetaData`
+  (comment.go:847-864) fills it from (a) the type-31 column-move opts
+  (services/projects/issue.go:180-191), (b) CODEOWNERS review requests
+  (models/issues/review.go:756, :867), (c) project-workflow-triggered
+  comments via the ctx carrier (comment.go:261-266, consumed :849-851;
+  services/projects/workflow_notifier.go:145). READ: the type-31 template
+  arm (templates/repo/issue/view_content/comments.tmpl:578-591 —
+  `CommentMetaData.ProjectColumnTitle`/`ProjectTitle` + `LoadProject`),
+  `MetaSpecialDoerTr` author attribution (comment.go:806-819;
+  templates/repo/issue/view_content/comments_authorlink.tmpl:10-14), and
+  the label-comment merge guard (routers/web/repo/issue_view.go:221-231
+  `sameCommentMetaData` — workflow label comments must not merge with
+  manual ones). Our live arm is only (a), encoded in content JSON
+  (api/services/projects.ts:1060); (b) has no surface (no CODEOWNERS arm,
+  grep 0) and (c) routes through the human write path
+  (services/projects-workflow.ts:510-560) with no metadata. Verdict: the
+  column-move arm ports with type-31 (the column stores the struct's JSON,
+  so the content→column move is mechanical); the SpecialDoerName arms
+  queue port-when-read — no reader arms exist here (the UI renders no
+  label or type-31 events this wave, ui/pages/issue-detail.tsx:734-746).
+- `original_author` / `original_author_id` — WRITE: solely the migration
+  uploader's `RemapExternalUser` (comment.go:1279-1283, reached from
+  services/migrations/gitea_uploader.go:1010-1026 when the source user
+  cannot be mapped; the same flow's code comments carry `Patch`,
+  gitea_uploader.go:940-963, cell :958). READ: `ToAuthor`'s ghost-author
+  fallback (services/convert/user.go:53-58, fed at
+  services/convert/issue_comment.go:21,89), the migrated-author template
+  (templates/repo/issue/view_content/comments_authorlink.tmpl:1-8; avatar
+  gate comments_avatarlink.tmpl:1), `roleDescriptor`'s
+  `HasOriginalAuthor` arm (comment.go:1295-1298;
+  routers/web/repo/issue_view.go:47-49,708,808), and the label-merge
+  poster guard (issue_view.go:234). No writer and no reader arm exists
+  here (no comment-migration inflow; `issues` already carries the twin
+  columns unwritten, schema.ts:620-621). Port-when-read: land the
+  additive pair with the FN-9 family (the `releases`/`reactions`/
+  `pull_reviews` twins, §4) when a migration inflow or an author-fallback
+  reader lands — do not plan blind ports.
+
+Remaining structural cells (unchanged by this expansion):
+
+- MISSING `assignee_team_id` (integer NOT NULL, DEFAULT 0) — upstream models/issues/comment.go:307 (`AssigneeTeamID`); resolved PORT above (census cite :308 corrected — the field sits at :307; same column `assignee_team_id` under GonicMapper)
+- MISSING `comment_meta_data` (text(json)) — upstream models/issues/comment.go:360 (`CommentMetaData`); no ours column (census cite :361 off by one — :360 is the field, :361 is blank)
+- MISSING `old_project_id` (integer) — upstream models/issues/comment.go:291 (`OldProjectID`); no ours column (census cite :292 off by one)
+- MISSING `original_author` (text) — upstream models/issues/comment.go:280 (`OriginalAuthor`); no ours counterpart
+- MISSING `original_author_id` (integer) — upstream models/issues/comment.go:281 (`OriginalAuthorID`); no ours counterpart
+- MISSING `project_id` (integer) — upstream models/issues/comment.go:292 (`ProjectID`); no ours column (census cite :293 off by one)
+- MISSING `time_id` (integer) — upstream models/issues/comment.go:301 (`TimeID`); no ours column (census cite :302 off by one)
+- ~~MISSING `patch_quoted`~~ / ~~OURS-EXTRA `patch`~~ — ERRATUM: one parity column `patch` (schema.ts:763 ↔ comment.go:330's tag override); see the expansion header
+- TYPE `removed_assignee`: upstream boolean (models/issues/comment.go:305) vs ours integer (schema.ts:752 (`comments`)) — the §2.4 blanket (storage-equal, cosmetic; census cite :306 corrected — the field sits at :305)
 
 ### `commit_status` → `commit_statuses` schema.ts:1066
 
@@ -681,24 +820,31 @@ applies).
   several feed API fields (`description`, `website`, `avatar`) that ours
   renders empty today.
 - **FN-5: the gonic-quirk + project rename batch (one migration).** All
-  name-only renames to upstream's literal DDL: `redirect_uris`→
-  `redirect_ur_is` (oauth2.go:52), `team_ids`→`team_i_ds` (transfer.go:73),
-  `allowlist_team_ids`/`allowlist_user_ids`→`..._i_ds` (protected_tag.go:28-29),
-  package_blobs `hash_md5`→`hash_m_d5`, `hash_sha1`→`hash_sh_a1`,
-  `hash_sha256`→`hash_sh_a256`, `hash_sha512`→`hash_sh_a512`
-  (package_blob.go:34-37), `protected_branches.rule_name`→`branch_name` +
-  `rules`→`config` (protected_branch.go:35,39 — note upstream's field is
-  RuleName with an explicit `'branch_name'` tag),
+  name-only renames to upstream's literal DDL: `team_ids`→`team_i_ds`
+  (transfer.go:72 — `TeamIDs` untagged, pure GonicMapper),
+  `allowlist_team_ids`/`allowlist_user_ids`→`..._i_ds` (protected_tag.go:27-28
+  — the tags carry type tokens `JSON TEXT` only, no column override),
+  `protected_branches.rule_name`→`branch_name` + `rules`→`config`
+  (protected_branch.go:34,38 — upstream pins both via quoted tags
+  `'branch_name'`/`'config'`),
   `project_columns`→`project_board` (table) + `is_default`→`default`
-  (column.go:49,53 — upstream keeps the legacy name under its own TODO),
-  `project_issues.project_column_id`→`project_board_id` (issue.go:22),
+  (column.go:49,52 — upstream keeps the legacy name under its own TODO),
+  `project_issues.project_column_id`→`project_board_id` (issue.go:22 —
+  upstream pins it via the quoted tag `'project_board_id'`),
   `project_workflows event/filters/actions`→`workflow_*`
-  (workflows.go:164-166), `tracked_time.seconds`→`time` (tracked_time.go),
+  (workflows.go:163-165), `tracked_time.seconds`→`time` (tracked_time.go:30),
+  `issues.title`→`name` (issue.go:63 — the explicit xorm column-NAME tag;
+  upstream's writes and search bind the literal column, issue_update.go:198
+  + issue.go:536; §7.8),
   `pull_auto_merges issue_id`→`pull_id` + `merge_message`→`message`
-  (automerge.go:18,24), `audit_event.created_unix`→`timestamp_unix`
-  (audit_event.go:38), `issue_subscriptions`→`issue_watch` table name
+  (automerge.go:19,23), `audit_event.created_unix`→`timestamp_unix`
+  (audit_event.go:37), `issue_subscriptions`→`issue_watch` table name
   (iff recorded — else keep, see FN-13). Zero API surface; do it in one
-  generated migration to pay the rename tax once.
+  generated migration to pay the rename tax once. Method note: two earlier
+  members — `redirect_uris`→`redirect_ur_is` and the package_blobs
+  `hash_*` quartet — were WITHDRAWN (2026-11-03, §7.8): explicit
+  first-token column overrides mean upstream already has the plain names;
+  every surviving member was re-verified against the §1 override rule.
 - **FN-6: repo_units completion.** Missing `id`, `created_unix`,
   `everyone_access_mode` (repo_unit.go:44,48,50 — the 2026 upstream
   everyone-permission column is a real capability gap). Enum-text family
@@ -726,7 +872,7 @@ applies).
 - **FN-12: small completions.** `gpg_keys.emails` (gpg_key.go:34 — the
   serialized address list), `issue_dependency.updated_unix`
   (dependency.go:108), `repo_transfer.recipient_access_granted` +
-  `updated_unix` (transfer.go:76,79), `repo_collaborators.id` +
+  `updated_unix` (transfer.go:76,78), `repo_collaborators.id` +
   timestamp arm (collaboration.go:22), `lfs_locks.lower_path` record
   (ours-extra — keep, record in SPEC-0006).
 - **FN-13: the record unit (no DDL) — DISPOSITIONED (2026-11-03), see §7.**
@@ -807,8 +953,8 @@ record. Verified members:
 | `users.email` / `users.avatar_email` | NULLable (schema.ts:440, 457) | `NOT NULL` (models/user/user.go:101, 149) | **intentional-recorded** via SPEC-0002 §4.6 item 16 — part of the recorded users reduction: orgs ARE user rows here and the org-create surface writes `email: input.email ?? null`, `avatarEmail: null` (services/orgs/orgs.ts:430-437); upstream's org-as-user-row survives the same NOT NULL only because xorm writes the Go zero `''` for the never-set fields (CreateOrganization, models/organization/org.go:316-337, sets no Email) — ours models "no email" as NULL where upstream stores `''`; same information, different zero convention |
 | `repo_transfer.created_at` | NOT NULL DEFAULT unixepoch (schema.ts:314-316) | `INDEX NOT NULL created` (models/repo/transfer.go:77) | parity-strict — checked because §2.7's itemization hinted at it; no inversion |
 
-Errata to §2.7's minority-arm itemization (recorded here; §2's text left
-as written): `issue_pins.issue_id` is NOT inverted (ours is the
+Errata to §2.7's minority-arm itemization (recorded here; folded into
+§2.7's own text by the census-owner cleanup, §7.8): `issue_pins.issue_id` is NOT inverted (ours is the
 composite PK, NOT NULL — schema.ts:1095 — vs upstream `NOT NULL`,
 issue_pin.go:19: same strictness); the §3.1 census row's `pin_order`
 claim is likewise withdrawn (ours NOT NULL — schema.ts:1097 — vs
@@ -887,7 +1033,7 @@ Not members (parity `*_unix`/`created` names already): `two_factor`
 (schema.ts:5032-5033), `webauthn_credentials` (:5116-5118),
 `login_source` (:4861-4862), `external_login_user` block, `pull_auto_merges`
 (:5005), `review_state` (:4975), `system_notices` (:3891), `audit_event`
-(:3552 — upstream's own name is `timestamp_unix`, audit_event.go:38;
+(:3552 — upstream's own name is `timestamp_unix`, audit_event.go:37;
 that stays FN-5's table-specific rename), `system_keystore`
 (:4600-4603), `cron_state`, `oauth2_grant`/`oauth2_authorization_code`
 (:3236-3237; upstream oauth2.go:512-513), `milestones.deadline_unix`/
@@ -1024,7 +1170,9 @@ upstream edits the title via `UpdateIssueCols(ctx, issue, "name")`
 and §4 (which has no `issues` subsection) miss this rename; FN-5's
 rename batch is the natural carrier if the census owner queues it.
 This unit did NOT reclassify the `issues` row — outside FN-13's
-families and outside this unit's cell ownership.
+families and outside this unit's cell ownership. RESOLVED by the
+census-owner cleanup (§7.8, 2026-11-03): the find VERIFIED at the pin;
+the row is flipped and FN-5 carries the rename.
 
 Corroboration counts (not a re-derivation): upstream `NOT NULL` xorm
 tags ≈ 269 over 1081 census columns; ours `.notNull()` = 715 over 1010
@@ -1032,12 +1180,109 @@ tags ≈ 269 over 1081 census columns; ours `.notNull()` = 715 over 1010
 Direction and magnitude corroborate §2.7; the 386 figure stays the §1
 parser's census number.
 
-Errata index (recorded here; the §2/§4 text left as written by the
-census owner to fold): §2.5 actions arm is parity, not divergence, and
-the SPEC-0005-era claim is inverted (those tables are the parity side);
-§2.6 `follow` is not a member, and `org_user`/`access_token`/
-`two_factor` are missing members; §2.7's itemization overstates the
-ours-looser arm (`issue_id`/`pin_order` withdrawn); §4 `repo_transfer`
-cites transfer.go:79 for `updated_unix` — the field is at :78 (:76
-`RecipientAccessGranted` is correct); §3.1 `hook_task` row cites
-SPEC-0005 §3.7 — the delivery section is §3.6.
+Errata index — EMPTIED (2026-11-03 census-owner cleanup, §7.8): every
+entry this index once carried is folded in-place — §2.5's timestamp
+family and §2.6's uid family now state their corrected memberships,
+§2.7's ours-looser itemization drops the withdrawn `issue_pins.issue_id`
+member and points at §7.1's table, §4 repo_transfer's `updated_unix`
+cite reads transfer.go:78 (FN-12's twin cite fixed the same way), and
+the §3.1 `hook_task` row already carried the corrected SPEC-0005 §3.6
+cite (verified against the SPEC's headings: §3.6 exists, §3.7 does not).
+
+### 7.8 Census-owner cleanup (2026-11-03) — side-find verified; two false drifts withdrawn; errata folded
+
+**1. The §7.7 side-find VERIFIES — `issues.title` is a real column-name
+drift; the census row was wrong to call the table aligned.** Re-verified
+with my own eyes at the pin: the field carries an explicit column-NAME
+tag — `Title string xorm:"name"` (models/issues/issue.go:63) — so the
+SQL column is `name`, not the field-name mapping `title`; upstream's own
+SQL binds that literal on both sides (title writes: `UpdateIssueCols(ctx,
+issue, "name")` inside ChangeIssueTitle, models/issues/issue_update.go:198;
+keyword search: `BuildCaseInsensitiveLike` over the backticked column,
+models/issues/issue.go:536); ours declares `title: text("title")`
+(schema.ts:624). A sweep of `gitea/models/issues/` for stray `name`
+binds hit only label/milestone's own parity `name` columns; the pin
+carries no migrations tree to cross-check a CREATE TABLE. Edits: §3.1
+`issue` row **aligned → drift** (reason carries both-side cites; FN-5
+recorded as the carrier); §4 gains the `issue` subsection with the
+RENAME line (the intro's subsection count updated).
+
+**2. TWO FALSE DRIFTS withdrawn (FY2's spot-sample, re-verified at this
+pin).** The census had called two tables drift on "gonic-quirk renames"
+that DO NOT EXIST upstream — both fields carry explicit xorm first-token
+column overrides, and ours already matches:
+- `oauth2_application`: `RedirectURIs []string xorm:"redirect_uris JSON
+  TEXT"` (models/auth/oauth2.go:51) — upstream column `redirect_uris`;
+  ours `redirect_uris` verbatim (schema.ts:3184). Census row **drift →
+  aligned**; its §4 subsection (one RENAME line) deleted.
+- `package_blob`: `HashMD5 xorm:"hash_md5 char(32) UNIQUE(md5) INDEX NOT
+  NULL"`, `hash_sha1 char(40)`, `hash_sha256 char(64)`, `hash_sha512
+  char(128)` (models/packages/package_blob.go:33-36) — ours matches all
+  four names verbatim (schema.ts:3700-3704). Census row **drift →
+  intentional-recorded** (NOT aligned, a deliberate deviation from the
+  dispatch): the residual divergence is real but recorded — ours keeps
+  md5/sha1/sha512 NULLABLE where upstream is NOT NULL (Workers'
+  WebCrypto has no MD5; generic uploads land `hash_md5` NULL; NULLs
+  keep the UNIQUE indexes sound) — SPEC-0016's package_blobs data-model
+  bullet + the schema.ts table comment. Its §4 subsection (four RENAME
+  lines) deleted.
+Consequence: FN-5 as previously written prescribed renaming ours to
+column names upstream does not have — executing it would have BROKEN
+parity, the opposite of the batch's goal. Both FN-5 items are dropped;
+every surviving member was re-verified mechanically against the §1
+override rule at the pin and all HOLD (transfer.go:72 `TeamIDs` untagged;
+protected_tag.go:27-28 tags carry `JSON TEXT` type tokens only;
+protected_branch.go:34,38 quoted `'branch_name'`/`'config'` tags — true
+legacy pins; project/issue.go:22 quoted `'project_board_id'`; column.go:52
+`Default` untagged; workflows.go:163-165 `TEXT JSON` type tokens only;
+tracked_time.go:30 `NOT NULL` only; automerge.go:19,23 `UNIQUE`/
+`LONGTEXT` only; audit_event.go:37 `INDEX NOT NULL` only; issue.go:63
+`name` — the one true column-NAME tag in the batch). FN-5's member cites
+were corrected to the verified field lines in the same pass (several
+were off by one).
+
+**3. Method rule added to §1.** GonicMapper runs ONLY when the tag does
+not name the column; an explicit first token wins and a quoted first
+token pins a legacy name. §1's quirk-name examples were corrected:
+`redirect_ur_is` (`RedirectURIs`) and `hash_m_d5` (`HashMD5`) never
+existed upstream — the true quirks are `team_i_ds` and the protected_tag
+allowlist pair.
+
+**4. The errata index is folded and emptied** (the paragraph above is
+now a pointer). §2.5's timestamp-family text states the corrected arms
+(actions = parity; the SPEC-0001/0005-era tables are the parity side;
+true divergence = 16 paired tables, census at §7.2); §2.6's uid-family
+text lists the true 7 members and withdraws `follow` (census at §7.3);
+§2.7's ours-looser itemization drops the withdrawn `issue_pins.issue_id`
+member and points at §7.1's table (§7.1's "left as written" note
+updated); §4 repo_transfer's `updated_unix` cite corrected
+transfer.go:79 → :78 (verified at the pin: :76 `RecipientAccessGranted`,
+:77 `CreatedUnix`, :78 `UpdatedUnix`) and FN-12's twin cite fixed the
+same way; the §3.1 `hook_task` row's in-row §3.6 cite verified against
+SPEC-0005's headings (§3.6 "Webhook delivery (Cloudflare Queues)"
+exists; no §3.7).
+
+**5. The broken `external_login_user` cite fixed.** The census row
+cited external-auth-sources §7.6/§7.8, but that SPEC's §7 is a single
+numbered edge-case list (items 1-13) with no subsections — §7.6/§7.8
+are list items, not sections. The normative home of both census claims
+(raw_data dropped; token columns written empty) is §4.3, which carries
+the data model with both decisions inline (`raw_data` is likewise
+dropped... v1 persists the bounded profile fields only; the token-field
+comment "v1 WRITES EMPTY"); the upstream shape is §2.6. The row now
+cites §4.3 (+§2.6).
+
+**6. Headline tallies re-derived — FN-13's un-propagated flip caught.**
+Before this unit the census body counted 46 aligned / 27 drift / 22
+intentional-recorded / 22 missing-table (= 117), but the Headline still
+claimed 47/26/22/22: FN-13's §7.6 `issue_watch` aligned→drift flip had
+never been propagated. This unit's verdict moves: `issue`
+aligned→drift; `oauth2_application` drift→aligned; `package_blob`
+drift→intentional-recorded. Final, re-grepped from the §3.1 table:
+**46 aligned + 23 intentional-recorded + 26 drift + 22 missing-table =
+117** (117 rows re-counted ✓; ours-extras 12 and the ours-side
+95-paired + 12 = 107 arithmetic unchanged — none of the three moves
+touches a pairing). The table-specific drift-column figure drops
+69 → 65: §4 now carries 32 MISSING + 21 RENAME + 5 OURS-EXTRA + 7 TYPE
+structural lines outside the `repositories` subsection (+1
+`issues.title` RENAME, −5 for the withdrawn false RENAMEs).
