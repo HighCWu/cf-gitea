@@ -796,8 +796,37 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
       .where(eq(issueAttachments.id, attachmentId));
     const got = await makeApp()(blobUrl);
     expect(got.status).toBe(200);
+    // The Go-exact composition (content_disposition.go:47-65): a token-safe
+    // name emits the SINGLE unquoted token arm — the former hand-roll always
+    // emitted both arms with an uppercase charset (the disclosed pin move).
+    expect(got.headers.get("Content-Disposition")).toBe(`attachment; filename=relay.bin`);
+  });
+
+  it("an accented stored name masks the safe arm and appends the lowercase RFC 2231 twin (the Go bytes)", async () => {
+    const issue = await seedIssue();
+    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=rapport.bin`, {
+      method: "POST",
+      headers: { ...auth },
+    });
+    const attachmentId = (await init.json<Record<string, unknown>>()).id as number;
+    const blobUrl = `${REPO_PATH}/issues/attachments/${attachmentId}/blob`;
+    const payload = new TextEncoder().encode("accented bytes");
+    expect(
+      (
+        await makeApp()(blobUrl, {
+          method: "PUT",
+          headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": String(payload.byteLength) },
+          body: payload,
+        })
+      ).status,
+    ).toBe(200);
+    await drizzle(env.DB).update(issueAttachments).set({ name: "rapport (final)é.bin" }).where(eq(issueAttachments.id, attachmentId));
+    const got = await makeApp()(blobUrl);
+    expect(got.status).toBe(200);
+    // getSafeName masks é→_ (quotes: () are printable non-token → quoted arm,
+    // riding raw inside the quotes); the twin re-encodes the RAW name.
     expect(got.headers.get("Content-Disposition")).toBe(
-      `attachment; filename="relay.bin"; filename*=UTF-8''relay.bin`,
+      `attachment; filename="rapport (final)_.bin"; filename*=utf-8''rapport%20%28final%29%C3%A9.bin`,
     );
   });
 

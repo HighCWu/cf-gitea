@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { personDate, toAnnotatedTag, toTag } from "./git-models";
+import { personDate, toAnnotatedTag, toReference, toTag } from "./git-models";
 import type { RepositoryWithOwner } from "./repository";
 
 const PAIR = {
@@ -73,5 +73,38 @@ describe("tag converters' arms fold (P3-11 closeout)", () => {
     const annotated = toAnnotatedTag("v1.0.0", TIP, SHA, PAIR, ORIGIN);
     expect(annotated.message).toBe("");
     expect(annotated.tagger).toBeNull();
+  });
+});
+
+// --- the archive/ref URL escapers (the escaper-census ports) ----------------
+
+describe("the tag archive URL escaper (ToTag convert.go:224-225)", () => {
+  it("escapes per url.PathEscape over name+suffix — `!'()*` encode, `$&+:;=@` stay raw (encodeURIComponent was the inverse class)", () => {
+    const tag = toTag("v1!+$&'()*;=?", TIP, SHA, PAIR, ORIGIN);
+    // single-SEGMENT escape: `!'()*;?` encode, `$&+=~.` stay raw
+    expect(tag.zipball_url).toBe(`${ORIGIN}/owner/repo/archive/v1%21+$&%27%28%29%2A%3B=%3F.zip`);
+    expect(tag.tarball_url).toBe(`${ORIGIN}/owner/repo/archive/v1%21+$&%27%28%29%2A%3B=%3F.tar.gz`);
+  });
+
+  it("encodes a slash tag as %2F (the ToTag SINGLE-segment class, unlike the release family's PathEscapeSegments)", () => {
+    const tag = toTag("v1/2", TIP, SHA, PAIR, ORIGIN);
+    expect(tag.zipball_url).toBe(`${ORIGIN}/owner/repo/archive/v1%2F2.zip`);
+    expect(tag.tarball_url).toBe(`${ORIGIN}/owner/repo/archive/v1%2F2.tar.gz`);
+  });
+});
+
+describe("the Reference URL (git_ref.go:91-94 — /git/ + PathEscapeSegments(full ref))", () => {
+  it("renders the full ref under one escaped /git/ path — no doubled segment, divergent-byte names Go-escaped", () => {
+    const ref = toReference("refs/heads/release!v1", { target: TIP.target }, PAIR, ORIGIN);
+    expect(ref.ref).toBe("refs/heads/release!v1");
+    expect(ref.url).toBe(`${ORIGIN}/api/v1/repos/owner/repo/git/refs/heads/release%21v1`);
+    expect(ref.object?.url).toBe(`${ORIGIN}/api/v1/repos/owner/repo/git/commits/${TIP.target}`);
+  });
+
+  it("a tag ref renders /git/refs/tags/... and the annotated peel points at /git/tags/{oid}", () => {
+    const ref = toReference("refs/tags/v1.0.0", { target: TIP.target, peeled: SHA }, PAIR, ORIGIN);
+    expect(ref.url).toBe(`${ORIGIN}/api/v1/repos/owner/repo/git/refs/tags/v1.0.0`);
+    expect(ref.object?.type).toBe("tag");
+    expect(ref.object?.url).toBe(`${ORIGIN}/api/v1/repos/owner/repo/git/tags/${TIP.target}`);
   });
 });

@@ -433,3 +433,19 @@ describe("enumeratePubPackage / getPubVersionMetadata / openPubFileForDownload",
     ).toBeNull();
   });
 });
+
+// --- the pub version escaper (pub.go:68/102/138/221 — the census port) ------
+
+describe("the pub URL escaper (url.PathEscape per pub.go)", () => {
+  it("a build-metadata version keeps its RAW plus in the archive_url (encodeURIComponent escaped it %2B)", async () => {
+    // parseSwiftVersionStrict admits semver build metadata; upstream pub.go:68
+    // rides url.PathEscape, which keeps `+` raw in a path segment.
+    await uploadArchive(await makePackageArchive(PUBSPEC.replace("version: 1.0.1", "version: 1.0.3+meta"), null));
+    const list = await enumeratePubPackage(env.DB, owner(), "test_package", "https://example.com/api/packages/o/pub/api/packages");
+    expect(list?.versions.map((entry) => entry.version)).toContain("1.0.3+meta");
+    const entry = list?.versions.find((v) => v.version === "1.0.3+meta");
+    expect(entry?.archive_url).toBe(
+      "https://example.com/api/packages/o/pub/api/packages/test_package/files/1.0.3+meta.tar.gz",
+    );
+  });
+});

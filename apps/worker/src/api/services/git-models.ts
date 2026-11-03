@@ -51,6 +51,7 @@ import type {
 } from "../models/git";
 import type { ContentsResponse } from "../models/contents";
 import type { EngineReads, RefTip } from "./engine";
+import { pathEscape, pathEscapeSegments } from "./releases";
 import { apiUserFromRow, type RepositoryWithOwner, type UserRow, type Viewer } from "./repository";
 
 /**
@@ -392,8 +393,12 @@ export function toTag(
       sha: commitSha,
       url: `${base}/api/v1/repos/${owner}/${slug}/git/commits/${commitSha}`,
     },
-    zipball_url: `${htmlUrl}/archive/${encodeURIComponent(`${name}.zip`)}`,
-    tarball_url: `${htmlUrl}/archive/${encodeURIComponent(`${name}.tar.gz`)}`,
+    // ToTag (services/convert/convert.go:224-225): url.PathEscape over the
+    // WHOLE `name + ".zip"` / `name + ".tar.gz"` — the SINGLE-segment
+    // escaper (a slash tag rides %2F, unlike the release family's
+    // PathEscapeSegments at release.go:146).
+    zipball_url: `${htmlUrl}/archive/${pathEscape(`${name}.zip`)}`,
+    tarball_url: `${htmlUrl}/archive/${pathEscape(`${name}.tar.gz`)}`,
   };
 }
 
@@ -447,10 +452,17 @@ export function toReference(fullRef: string, tip: { target: string; peeled?: str
   const isAnnotated = isTag && tip.peeled !== undefined;
   return {
     ref: fullRef,
-    url: `${origin}/api/v1/repos/${owner}/${slug}/git/${isTag ? "tags" : "refs"}/${fullRef}`,
+    // getGitRefsInternal (routers/api/v1/repo/git_ref.go:91-94): URL =
+    // APIURL + "/git/" + util.PathEscapeSegments(ref name) — the FULL ref
+    // rides one escaped /git/ path (`/git/refs/tags/v1`), never a doubled
+    // segment, and a divergent-byte ref name (branches legally carry
+    // `!'()$&+;=@`) encodes per Go's segment class.
+    url: `${origin}/api/v1/repos/${owner}/${slug}/git/${pathEscapeSegments(fullRef)}`,
     object: {
       sha: tip.target,
       type: isAnnotated ? "tag" : "commit",
+      // git_ref.go:95-96: "/git/" + PathEscape(type) + "s/" + PathEscape(oid)
+      // — the type words and hex oids ride the identical bytes both classes.
       url: `${origin}/api/v1/repos/${owner}/${slug}/git/${isAnnotated ? "tags" : "commits"}/${tip.target}`,
     },
   };

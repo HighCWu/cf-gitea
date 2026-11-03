@@ -86,6 +86,7 @@ import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { getOrInsertBlob, packageBlobContentKey, spoolAndHash, type SpooledBlob } from "./blobs";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
+import { pathEscape } from "../../api/services/releases";
 import { readTarMembers } from "./distro-common";
 import { parseSwiftVersionStrict, swiftCompareVersions } from "./swift";
 
@@ -336,7 +337,10 @@ export async function buildChefUniverse(
     versions[entry.version.version] = {
       location_type: "opscode",
       location_path: apiV1BaseURL,
-      download_url: `${apiV1BaseURL}/cookbooks/${encodeURIComponent(entry.pkgName)}/versions/${encodeURIComponent(entry.version.version)}/download`,
+      // chef.go:73: PathEscape(pd.Package.Name); the version rides RAW upstream —
+      // ours stays encodeURIComponent-only over the CHEF_VERSION_PATTERN gate
+      // (`\d+.\d+(.\d+)?`: no divergent byte is admissible, byte-equal there).
+      download_url: `${apiV1BaseURL}/cookbooks/${pathEscape(entry.pkgName)}/versions/${encodeURIComponent(entry.version.version)}/download`,
       dependencies: entry.metadata.dependencies,
     };
     universe[entry.pkgName] = versions;
@@ -408,7 +412,7 @@ export async function searchChefPackages(
     cookbook_name: row.pkg.name,
     cookbook_maintainer: loadChefMetadata(row.version).author,
     cookbook_description: loadChefMetadata(row.version).description,
-    cookbook: `${cookbooksBaseURL}${encodeURIComponent(row.pkg.name)}`,
+    cookbook: `${cookbooksBaseURL}${pathEscape(row.pkg.name)}`, // chef.go:137 PathEscape(pd.Package.Name)
   }));
   return { start, total: count, items: itemRows };
 }
@@ -451,6 +455,9 @@ export async function getChefCookbookMetadata(
     maintainer: latest.metadata.author,
     description: latest.metadata.description,
     category: "",
+    // The version tails ride RAW upstream (chef.go:187/:251/:73) — ours keeps
+    // encodeURIComponent over the CHEF_VERSION_PATTERN gate (`\d+\.\d+(.\d+)?`),
+    // the byte-equal choice: no gate-admissible byte diverges between the two.
     latest_version: `${versionsBaseURL}${encodeURIComponent(latest.version.version)}`,
     source_url: latest.metadata.repository_url,
     created_at: created,
@@ -489,6 +496,7 @@ export async function getChefVersionMetadata(
   const first = descriptors[0];
   if (first === undefined) return null;
   const metadata = loadChefMetadata(versionRow);
+  // RAW upstream (chef.go:251) — byte-equal under the CHEF_VERSION_PATTERN gate.
   const versionUrl = `${cookbookBaseURL}/versions/${encodeURIComponent(versionRow.version)}`;
   return {
     version: versionRow.version,

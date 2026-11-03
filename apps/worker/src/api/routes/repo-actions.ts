@@ -50,6 +50,7 @@ import type { RepositoryWithOwner, UserRow } from "../services/repository";
 import { GO_ZERO_TIME, apiUserFromRow, toApiRepository, viewerOf } from "../services/repository";
 import { canWriteRepository, isRepositoryAdmin, requireVisibleRepo } from "../services/repo-access";
 import { loadRepoSettings } from "../services/repo-settings";
+import { pathEscapeSegments } from "../services/releases";
 import { engineReads } from "../services/engine";
 import { toApiArtifact } from "../services/actions-artifacts";
 import { workflowJobFiltersFromQuery } from "../services/secrets-variables";
@@ -716,14 +717,14 @@ function repoApiUrl(origin: string, pair: RepositoryWithOwner): string {
   return `${origin}/api/v1/repos/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
 }
 
-/** util.PathEscapeSegments (modules/util/path.go): escape each '/'-component,
- *  keep the separators — the workflow-dir paths stay path-shaped. */
-function escapeSegment(segment: string): string {
-  return segment
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/");
-}
+/** util.PathEscapeSegments (modules/util/url.go:12-19) rides the canonical
+ *  Go-parity port (api/services/releases pathEscapeSegments) — the workflow
+ *  wire's segment escaper. The former local (encodeURIComponent per segment)
+ *  was the INVERSE class on the legal filename/branch bytes: it kept
+ *  `!'()*` raw where Go emits %21 %27 %28 %29 %2A and escaped `$ & + : = @`
+ *  where Go keeps them (`/ ; , ?` encode under BOTH classes) — all legal in
+ *  workflow file names, dir names, and ref names (convert.go:598-602's
+ *  PathEscapeSegments + actions.go:722). */
 
 /**
  * getActionWorkflowEntry (convert.go:593-651): the workflow wire over one
@@ -770,9 +771,12 @@ export function workflowWire(input: {
     state,
     created_at: when,
     updated_at: when,
-    url: `${apiUrl}/actions/workflows/${escapeSegment(entry.name)}`,
-    html_url: `${htmlUrl}/src/branch/${escapeSegment(defaultBranch)}/${escapeSegment(entry.dir)}/${escapeSegment(entry.name)}`,
-    badge_url: `${htmlUrl}/actions/workflows/${escapeSegment(entry.name)}/badge.svg?branch=${encodeURIComponent(defaultBranch)}`,
+    url: `${apiUrl}/actions/workflows/${pathEscapeSegments(entry.name)}`,
+    html_url: `${htmlUrl}/src/branch/${pathEscapeSegments(defaultBranch)}/${pathEscapeSegments(entry.dir)}/${pathEscapeSegments(entry.name)}`,
+    // The branch query rides url.QueryEscape upstream (actions.go:722;
+    // convert.go:602) — the query family stays encodeURIComponent here
+    // (decode-equivalent: the badge handler reads FormString, `+`-aware).
+    badge_url: `${htmlUrl}/actions/workflows/${pathEscapeSegments(entry.name)}/badge.svg?branch=${encodeURIComponent(defaultBranch)}`,
     deleted_at: GO_ZERO_TIME,
   };
 }

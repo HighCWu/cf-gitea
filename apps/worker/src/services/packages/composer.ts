@@ -75,6 +75,7 @@ import {
   tryInsertFile,
 } from "./model";
 import { packageProperties, packageVersions } from "../../db/schema";
+import { pathEscape } from "../../api/services/releases";
 import {
   copySpoolToContentKey,
   getOrInsertBlob,
@@ -873,7 +874,12 @@ export async function getComposerPackageMetadata(
       metadata: loadComposerMetadata(version),
       dist: {
         type: "zip",
-        url: `${registryURL}/files/${encodeURIComponent(pkg.lowerName)}/${encodeURIComponent(version.lowerVersion)}/${encodeURIComponent(first.file.lowerName)}`,
+        // composer/api.go:130: url.PathEscape over lowerName / lowerVersion / file
+      // lowerName. The lowerName segment rides upstream's own composer name
+      // gate (metadata.go:119, [a-z0-9._-/]) — byte-equal under encodeURIComponent;
+      // the version/file segments are REACHABLE divergent (semver build
+      // metadata admits +), so the canonical port rides there.
+      url: `${registryURL}/files/${encodeURIComponent(pkg.lowerName)}/${pathEscape(version.lowerVersion)}/${pathEscape(first.file.lowerName)}`,
         shasum: first.blob.hashSha1 ?? "",
       },
       source,

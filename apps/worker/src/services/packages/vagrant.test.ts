@@ -452,3 +452,30 @@ describe("uploadVagrantBox (vagrant.go:97-171)", () => {
     expect(await db().select().from(packageVersions).all()).toHaveLength(2);
   });
 });
+
+// --- the vagrant version/file escaper (vagrant.go:84/91 — the census port) ---
+
+describe("the vagrant URL escaper (url.PathEscape per vagrant.go:84/91)", () => {
+  it("a build-metadata version keeps its RAW plus in the enumerate URLs (encodeURIComponent escaped it %2B)", async () => {
+    // parseVagrantSemver admits semver build metadata; vagrant.go:84/91 ride
+    // url.PathEscape over the version and the box file name.
+    const box = await makeVagrantBox(INFO_JSON);
+    const uploadResult = (await upload(ownerRow, doerRow.id, {
+      content: new Response(box.slice()).body as ReadableStream<Uint8Array>,
+      version: "1.0.2+meta",
+    })) as Awaited<ReturnType<typeof uploadVagrantBox>>;
+    expect(uploadResult).not.toBeNull();
+
+    const enumerate = await enumerateVagrantBox(
+      env.DB,
+      { id: ownerRow.id, type: "user", visibility: "public" },
+      "test_package",
+      "https://example.com/api/packages/vagrantowner/vagrant/test_package",
+    );
+    const version = enumerate?.versions.find((v) => v.version === "1.0.2+meta");
+    expect(version).not.toBeNull();
+    expect(version?.providers[0]?.url).toBe(
+      "https://example.com/api/packages/vagrantowner/vagrant/test_package/1.0.2+meta/virtualbox.box",
+    );
+  });
+});

@@ -44,6 +44,7 @@ import {
   base64RawUrlEncode,
   signaturesEqual,
 } from "../../services/actions/secrets";
+import { encodeContentDisposition as sharedEncodeContentDisposition } from "../../web/attachments-serving";
 import type { RepositoryWithOwner } from "./repository";
 
 type D1 = D1Database;
@@ -316,25 +317,18 @@ export function goPathBase(p: string): string {
 }
 
 /** getSafeName + encodeContentDisposition (content_disposition.go:16-65):
- *  the ASCII-safe quoted form plus the RFC 2231 filename* twin when any
- *  rune needed masking (the C4 module's port, byte-equal). */
+ *  the ASCII-safe quoted form plus the RFC 2231 filename* twin when any rune
+ *  needed masking. The former LOCAL hand-roll was byte-divergent from Go's
+ *  mime.FormatMediaType on three counts (the charset case `UTF-8''` vs Go's
+ *  lowercase `utf-8''`; the quoted-string arm left `\` unescaped where Go
+ *  backslash-escapes both `"` and `\`; the extended arm rode encodeURIComponent,
+ *  whose class inverts Go's RFC 2231 attribute-char set on `$ & + : ; = @ , /`
+ *  — kept raw by Go, escaped by encodeURIComponent — and on space, %20 vs the
+ *  attribute class' raw) — so it now rides the SHARED Go-exact port
+ *  (web/attachments-serving encodeContentDisposition, byte-equal to
+ *  FormatMediaType + the content_disposition.go composition). */
 function encodeContentDisposition(kind: "inline" | "attachment", filename: string): string {
-  let safe = "";
-  let needsEncoding = false;
-  for (const char of filename) {
-    const code = char.codePointAt(0) ?? 0;
-    if ((code < 0x20 || code > 0x7e) && code !== 0x09) {
-      needsEncoding = true;
-      safe += "_";
-    } else {
-      safe += char;
-    }
-  }
-  const quoted = (value: string): string =>
-    /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(value) ? value : `"${value.replaceAll(`"`, `\\"`)}"`;
-  const base = `${kind}; filename=${quoted(safe)}`;
-  if (!needsEncoding) return base;
-  return `${base}; filename*=UTF-8''${encodeURIComponent(filename)}`;
+  return sharedEncodeContentDisposition(kind, filename);
 }
 
 /** serveSetHeadersByUserContent's disposition (serve.go:135-140): the v4

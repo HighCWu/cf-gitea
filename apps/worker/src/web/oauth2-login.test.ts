@@ -244,6 +244,18 @@ describe("the start leg (GET /user/oauth2/{source})", () => {
     expect(start.parked?.sourceId).toBe(source.id);
   });
 
+  it("the callback redirect_uri escapes the source name per url.PathEscape (providers.go:225 — the escaper-census port)", async () => {
+    // a display name is admin-entered and legally carries the divergent
+    // bytes; Go escapes '() (raw under encodeURIComponent) and keeps $&+:=@
+    // (escaped under encodeURIComponent).
+    const source = await seedOidcSource("My corp (SSO)!");
+    const start = await startDance({ sourceName: source.name });
+    expect(start.authorizeUrl.searchParams.get("redirect_uri")).toBe(
+      "https://app.example.com/user/oauth2/My%20corp%20%28SSO%29%21/callback",
+    );
+    expect(start.parked?.sourceId).toBe(source.id);
+  });
+
   it("the Referer fallback parks a same-origin non-/user/ path (rememberAuthRedirectLink)", async () => {
     const source = await seedOidcSource();
     const response = await req(`https://app.example.com/user/oauth2/${encodeURIComponent(source.name)}`, {

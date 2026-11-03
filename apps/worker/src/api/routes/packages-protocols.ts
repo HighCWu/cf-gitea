@@ -47,6 +47,7 @@ import { userRedirectDoesNotExist } from "../../auth/middleware";
 import { ScopeSet } from "../../auth/scopes";
 import { TokenService } from "../../auth/token-service";
 import { findUserByName, type UserRow } from "../services/repository";
+import { pathEscape } from "../services/releases";
 import {
   type PackageAccessMode,
   DuplicatePackageVersionError,
@@ -2353,8 +2354,11 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
           return swiftProblemResponse(404, "");
         }
         // baseURL (swift.go:149): AppURL + api/packages/{PathEscape
-        // lowerowner}/swift/{PathEscape scope}/{PathEscape name}/ — the JS
-        // twin of PathEscape is encodeURIComponent (the helm precedent).
+        // lowerowner}/swift/{PathEscape scope}/{PathEscape name}/ — the scope
+        // and name ride upstream's own upload gates (swift.go:40-42,
+        // services/packages/swift.ts:254-255: [a-zA-Z0-9-] / [a-zA-Z0-9-_]),
+        // charsets DISJOINT from the divergent set, so encodeURIComponent is
+        // byte-equal there (the owner segment: the username gate).
         const baseURL = `${origin}/api/packages/${encodeURIComponent(owner.usernameLower)}/swift/${encodeURIComponent(target.scope)}/${encodeURIComponent(target.name)}/`;
         // Link (swift.go:159-161): the LAST sorted row's RAW version.
         const last = versions[versions.length - 1]?.version ?? "";
@@ -2363,7 +2367,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
           headers: {
             "content-type": "application/json;charset=utf-8",
             "content-version": "1",
-            link: `<${baseURL}${encodeURIComponent(last)}>; rel="latest-version"`,
+            link: `<${baseURL}${pathEscape(last)}>; rel="latest-version"` // swift.go:160 PathEscape(version),
           },
         });
       }
@@ -4644,7 +4648,7 @@ async function vagrantEnumerate(c: Context<{ Bindings: Env }>): Promise<Response
   try {
     const { owner } = await protocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
-    const baseURL = `${origin}/api/packages/${owner.username}/vagrant/${encodeURIComponent(c.req.param("name") ?? "")}`;
+    const baseURL = `${origin}/api/packages/${owner.username}/vagrant/${pathEscape(c.req.param("name") ?? "")}`; // vagrant.go:125 PathEscape(box name)
     const enumerate = await enumerateVagrantBox(c.env.DB, owner, c.req.param("name") ?? "", baseURL);
     if (enumerate === null) {
       return vagrantErrorResponse(404, "");
@@ -5373,7 +5377,8 @@ async function pubUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
     return new Response(null, {
       status: 204,
       headers: {
-        location: `${pubOriginBaseURL(c, owner)}/versions/new/finalize/${encodeURIComponent(result.parsed.name)}/${encodeURIComponent(result.parsed.version)}`,
+        // pub.go:221: PathEscape(pck.Name) + PathEscape(pck.Version)
+        location: `${pubOriginBaseURL(c, owner)}/versions/new/finalize/${pathEscape(result.parsed.name)}/${pathEscape(result.parsed.version)}`,
       },
     });
   } catch (error) {
@@ -5636,7 +5641,7 @@ async function chefCookbookMetadata(c: Context<{ Bindings: Env }>): Promise<Resp
     const { owner } = await chefProtocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const name = c.req.param("name") ?? "";
-    const versionsBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${encodeURIComponent(name)}/versions/`;
+    const versionsBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${pathEscape(name)}/versions/`; // chef.go:187 PathEscape(packageName)
     const metadata = await getChefCookbookMetadata(c.env.DB, owner, name, versionsBaseURL);
     if (metadata === null) {
       return chefErrorResponse(404, "");
@@ -5654,7 +5659,7 @@ async function chefVersionMetadata(c: Context<{ Bindings: Env }>): Promise<Respo
     const { owner } = await chefProtocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const name = c.req.param("name") ?? "";
-    const cookbookBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${encodeURIComponent(name)}`;
+    const cookbookBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${pathEscape(name)}`; // chef.go:242 PathEscape(pd.Package.Name)
     const metadata = await getChefVersionMetadata(c.env.DB, owner, name, c.req.param("version") ?? "", cookbookBaseURL);
     if (metadata === null) {
       return chefErrorResponse(404, "");

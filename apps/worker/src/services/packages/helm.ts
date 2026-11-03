@@ -82,6 +82,7 @@ import {
   type SpooledBlob,
 } from "./blobs";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
+import { pathEscape } from "../../api/services/releases";
 
 // ---------------------------------------------------------------------------
 // Errors — upstream's InvalidArgument sentinels answer 400 at the route
@@ -865,7 +866,7 @@ export async function buildHelmIndexYaml(
     }
     // URLs: baseURL + "/" + the escaped canonical filename (helm.go:83).
     const filename = `${name}-${entry.version as string}.tgz`.toLowerCase();
-    entry.urls = [`${baseUrl}/${encodeURIComponent(filename)}`];
+    entry.urls = [`${baseUrl}/${pathEscape(filename)}`]; // helm.go:83 url.PathEscape(createFilename)
     // Created (helm.go:82) — ISO with millis where Go renders RFC3339 nanos.
     entry.created = row.version.createdUnix.toISOString();
     const list = grouped.get(name);

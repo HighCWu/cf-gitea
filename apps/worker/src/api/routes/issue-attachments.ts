@@ -9,7 +9,7 @@ import { IssueNotExistError } from "../../issues/errors";
 import { issueAttachments, comments, issues } from "../../db/schema";
 // The serve-site basename cut — the single httplib port copy (web/
 // attachments-serving owns the encodeContentDisposition path.Base family).
-import { goPathBase } from "../../web/attachments-serving";
+import { encodeContentDisposition, goPathBase } from "../../web/attachments-serving";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { attachmentSchema } from "../models/release";
@@ -1305,13 +1305,22 @@ export function registerIssueAttachmentRoutes(
       .set({ downloadCount: sql`${issueAttachments.downloadCount} + 1` })
       .where(eq(issueAttachments.id, row.id));
     // path.Base at serve (modules/httplib/serve.go:92, ServeSetHeaders) — a
-    // stored name carrying "/" serves its final element only.
+    // stored name carrying "/" serves its final element only — then the
+    // Go-exact Content-Disposition composition (content_disposition.go:47-65:
+    // the safe-name arm plus the RFC 2231 filename* twin ONLY when a rune
+    // needed masking; the former hand-roll emitted both arms always, masked
+    // differently, spelled the charset `UTF-8''` and rode encodeURIComponent's
+    // inverted class). The DISPOSITION WORD stays "attachment" (upstream's
+    // ServeUserContentByReader/serveSetHeadersByUserContent pipeline sniffs
+    // and defaults inline for non-SVG — a serve-pipeline divergence recorded
+    // for the serve unit, not an escaper byte); serve.go:93's expose-headers
+    // companion rides too.
     const servedName = goPathBase(row.name);
-    const fallback = servedName.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
     return c.newResponse(object.body, 200, {
       "Content-Type": "application/octet-stream",
       "Content-Length": String(object.size),
-      "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(servedName)}`,
+      "Content-Disposition": encodeContentDisposition("attachment", servedName),
+      "Access-Control-Expose-Headers": "Content-Disposition",
       ETag: object.httpEtag,
     });
   });

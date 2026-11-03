@@ -39,6 +39,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import { buildArchive, parseArchiveName, resolveArchiveRef } from "../services/archive";
 import { engineReads, refTipMap } from "../services/engine";
 import { requireVisibleRepo } from "../services/repo-access";
+import { encodeContentDisposition } from "../../web/attachments-serving";
 
 const notFoundResponse = {
   description: "notFound",
@@ -97,11 +98,17 @@ async function serveArchive(c: Context<ApiEnv>, owner: string, repo: string, arc
   const ownerEnc = encodeURIComponent(pair.repo.ownerNamespace);
   const slugEnc = encodeURIComponent(pair.repo.slug);
   const contentType = parsed.format === "zip" ? "application/zip" : "application/gzip";
+  // ServeSetHeaders with the attachment default (archiver.go:374 → serve.go:
+  // 88-94 → content_disposition.go:47-65): the downloadName carries the REF
+  // short name (slashes already dashed), which legally contains `"`/`\`/non-
+  // ASCII — the raw quoted interpolation was header-breakable there; the
+  // Go-exact composition masks per getSafeName and adds the RFC 2231 twin
+  // only when encoding is needed.
   return new Response(stream.body, {
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Content-Disposition": `attachment; filename="${stream.downloadName}"`,
+      "Content-Disposition": encodeContentDisposition("attachment", stream.downloadName),
       Link: `<${origin}/api/v1/repos/${ownerEnc}/${slugEnc}/archive/${commit.oid}.${parsed.format}?rev=${commit.oid}>; rel="immutable"`,
     },
   });

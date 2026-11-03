@@ -68,6 +68,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { packageFiles, packageProperties, packageVersions, packages, repositories } from "../../db/schema";
 import { doerRepoAccessMode } from "../../api/services/repository";
+import { pathEscape } from "../../api/services/releases";
 import {
   type PackageBlobRow,
   type PackageDoer,
@@ -527,21 +528,21 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 // ---------------------------------------------------------------------------
 // Go's URL escapers (net/url PathEscape/QueryEscape) — the dist.tarball shapes
-// (api.go:88, creator.go:349) render through them.
+// (api.go:88: QueryEscape(package name) + PathEscape(version) +
+// PathEscape(file), and creator.go:349's shapes) render through them.
 // ---------------------------------------------------------------------------
 
-/** Go url.PathEscape (encodePathSegment: only / ; , ? are segment-escaped). */
+/** Go url.PathEscape (net/url shouldEscape, encodePathSegment): unreserved
+ *  plus the reserved keepers `$ & + : = @` stay raw; EVERYTHING else —
+ *  `!'()*` included — percent-encodes, one %XX per UTF-8 byte. The former
+ *  local (encodeURIComponent + a %2x→raw restore chain) kept `!'()*` raw and
+ *  escaped `+`, byte-divergent on semver build-metadata versions; it now
+ *  rides the canonical Go-parity port. */
 export function goPathEscape(value: string): string {
-  return encodeURIComponent(value)
-    .replace(/%24/g, "$")
-    .replace(/%26/g, "&")
-    .replace(/%2[Bb]/g, "+")
-    .replace(/%3[Aa]/g, ":")
-    .replace(/%3[Dd]/g, "=")
-    .replace(/%40/g, "@");
+  return pathEscape(value);
 }
 
-/** Go url.QueryEscape (everything but unreserved; space becomes +). */
+/** Go url.QueryEscape (unreserved stays; space becomes `+`; `!'()*` encode). */
 export function goQueryEscape(value: string): string {
   return encodeURIComponent(value)
     .replace(/%20/g, "+")

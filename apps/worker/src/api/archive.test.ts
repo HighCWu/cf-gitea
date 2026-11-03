@@ -398,7 +398,9 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
     const res = await fetchRoute(`${REPO_PATH}/archive/main.tar.gz`);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/gzip");
-    expect(res.headers.get("Content-Disposition")).toBe(`attachment; filename="${SLUG}-main.tar.gz"`);
+    // Go's FormatMediaType emits the TOKEN arm (unquoted) for a token-safe
+    // name — the former hand-roll quoted everything (the disclosed pin move).
+    expect(res.headers.get("Content-Disposition")).toBe(`attachment; filename=${SLUG}-main.tar.gz`);
 
     const gz = new Uint8Array(await res.arrayBuffer());
     expect(gz[0]).toBe(0x1f); // gzip magic
@@ -470,7 +472,7 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
 
     const res = await fetchRoute(`${REPO_PATH}/archive/feature/one.tar.gz`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("Content-Disposition")).toBe(`attachment; filename="${SLUG}-feature-one.tar.gz"`);
+    expect(res.headers.get("Content-Disposition")).toBe(`attachment; filename=${SLUG}-feature-one.tar.gz`);
     const gz = new Uint8Array(await res.arrayBuffer());
     const tarBytes = new Uint8Array(
       await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer(),
@@ -912,6 +914,34 @@ describe("parseGitattributes matching rules", () => {
 // ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/languages
 // ---------------------------------------------------------------------------
+
+describe("the archive Content-Disposition escaper (content_disposition.go — the census port)", () => {
+  it("an accented ref name masks the safe-name arm and appends the RFC 2231 twin (the exact Go bytes)", async () => {
+    // A branch ref legally carries non-ASCII; the downloadName rides
+    // ServeSetHeaders' encodeContentDisposition (archiver.go:374 → serve.go:92):
+    // getSafeName masks é→_, needsEncoding appends the utf-8 twin.
+    const tip = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SLUG })
+      .listRefs()
+      .then((refs) => refs.refs.find((r) => r.name === "refs/heads/main")?.target);
+    expect(tip).toBeDefined();
+    const landed = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SLUG }).commitApiChange({
+      ref: "refs/heads/rélease-1",
+      expectedOldOid: ZERO_OID,
+      newOid: tip as string,
+    });
+    expect(landed.tag).toBe("committed");
+
+    const res = await fetchRoute(`${REPO_PATH}/archive/rélease-1.tar.gz`);
+    expect(res.status).toBe(200);
+    // The masked safe name (`${SLUG}-r_lease-1.tar.gz` — each é collapses to
+    // _ in place) is ALL token chars, so FormatMediaType emits the UNQUOTED
+    // token arm; then the twin rides the RAW name (é → %C3%A9 per byte).
+    expect(res.headers.get("Content-Disposition")).toBe(
+      `attachment; filename=${SLUG}-r_lease-1.tar.gz; filename*=utf-8''${SLUG}-r%C3%A9lease-1.tar.gz`,
+    );
+    await res.arrayBuffer();
+  });
+});
 
 describe("GET /repos/{owner}/{repo}/languages (repoGetLanguages)", () => {
   it("returns bytes per language over the seeded tree, descending", async () => {

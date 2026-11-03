@@ -438,3 +438,24 @@ describe("buildChefMetadataJson", () => {
     expect(bare).toEqual({});
   });
 });
+
+// --- the cookbook-name escaper (chef.go:73/137/187/242 — the census port) ----
+
+describe("the chef cookbook-name URL escaper (url.PathEscape per chef.go)", () => {
+  it("a divergent-byte cookbook name encodes per Go's segment class in the universe and search URLs", async () => {
+    // CHEF_NAME_PATTERN `^\S+$` admits `!'()$&+;=@` (non-space) — upstream
+    // rides url.PathEscape there; encodeURIComponent was the inverse class.
+    await uploadCookbook(
+      await makeCookbook(JSON.stringify({ name: "test(x)!", version: "1.0.1", description: "D", maintainer: "M" })),
+    );
+    const universe = await buildChefUniverse(env.DB, owner(), "https://ex.com/api/packages/o/chef/api/v1");
+    expect(Object.keys(universe)).toEqual(["test(x)!"]);
+    expect(universe["test(x)!"]?.["1.0.1"]?.download_url).toBe(
+      "https://ex.com/api/packages/o/chef/api/v1/cookbooks/test%28x%29%21/versions/1.0.1/download",
+    );
+
+    const search = await searchChefPackages(env.DB, owner(), "", "", 0, 10, "https://ex.com/cb/");
+    expect(search.items[0]?.cookbook_name).toBe("test(x)!");
+    expect(search.items[0]?.cookbook).toBe("https://ex.com/cb/test%28x%29%21");
+  });
+});

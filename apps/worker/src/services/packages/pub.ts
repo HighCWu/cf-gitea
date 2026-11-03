@@ -69,6 +69,7 @@ import {
   type SpooledBlob,
 } from "./blobs";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
+import { pathEscape } from "../../api/services/releases";
 
 import { readTarMembers } from "./distro-common";
 import { parseSwiftVersionStrict, swiftCompareVersions, swiftVersionString, type SwiftVersion } from "./swift";
@@ -508,7 +509,8 @@ export interface PubVersionMetadata {
 export function pubDescriptorToMetadata(baseURL: string, version: PackageVersionRow, pubspec: unknown): PubVersionMetadata {
   return {
     version: version.version,
-    archive_url: `${baseURL}/files/${encodeURIComponent(version.version)}.tar.gz`,
+    // pub.go:68: url.PathEscape(pd.Version.Version)
+    archive_url: `${baseURL}/files/${pathEscape(version.version)}.tar.gz`,
     published: version.createdUnix.toISOString(),
     ...(pubspec === null || pubspec === undefined ? {} : { pubspec }),
   };
@@ -541,6 +543,9 @@ export async function enumeratePubPackage(
   const sorted = [...list].sort((a, b) => comparePubVersions(a.version, b.version));
   const pkgName = sorted[0]?.pkgName ?? id;
   const versions = sorted.map((entry) =>
+    // pub.go:138 rides PathEscape(pd.Package.Name), but the pub name gate
+    // (metadata.go:27, [a-zA-Z_][a-zA-Z0-9_]*) is disjoint from the divergent
+    // set — encodeURIComponent is byte-equal there.
     pubDescriptorToMetadata(`${baseURL}/${encodeURIComponent(pkgName)}`, entry.version, entry.pubspec),
   );
   const latest = versions[versions.length - 1];
@@ -830,6 +835,7 @@ export async function getPubVersionMetadata(
   const { pubspec } = (await listPubVersions(d1, owner.id, id)).find((entry) => entry.version.id === versionRow.id) ?? {
     pubspec: null,
   };
+  // pub.go:102 — the id is the same gated name charset (byte-equal).
   return pubDescriptorToMetadata(`${baseURL}/${encodeURIComponent(id)}`, versionRow, pubspec);
 }
 

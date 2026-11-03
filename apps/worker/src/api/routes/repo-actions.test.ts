@@ -104,7 +104,7 @@ import { createTokenAuthMiddleware, extractTokenHeader, STUB_USER, type AuthReso
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
-import { registerRepoActionsRoutes } from "./repo-actions";
+import { registerRepoActionsRoutes, workflowWire } from "./repo-actions";
 
 const T0 = 1_770_000_000;
 
@@ -1549,5 +1549,56 @@ describe("the audit arms (workflow.go:49/:192-193 — the API twins)", () => {
     expect(rows[0]!.actorCredential).toBe("oauth2-grant:4242");
     // the stranded-disable hazard (this describe's afterAll comment)
     await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token");
+  });
+});
+
+// --- the workflow-wire escaper (convert.go:598-602 + actions.go:722) --------
+
+describe("workflowWire's PathEscapeSegments port (the escaper-census pin)", () => {
+  const PAIR = {
+    repo: { ownerNamespace: "alice", slug: "escaper-suite" },
+    owner: {},
+  } as unknown as Parameters<typeof workflowWire>[0]["pair"];
+  const WHEN = new Date(1700000000000);
+
+  it("escapes the branch/dir/name segments per Go's segment class — `!'()*` encode, `$&+:;=@` stay raw (encodeURIComponent was the inverse class)", () => {
+    const wire = workflowWire({
+      origin: ORIGIN,
+      pair: PAIR,
+      defaultBranch: "release!$&+;=@1",
+      entry: { dir: "sub dir", name: "build (x)!.yml" },
+      commitAuthorWhen: WHEN,
+      content: null,
+      disabledWorkflows: [],
+    });
+    // `!'()*` + space encode (`; ? / ,` too); `$ & + : = @` stay RAW in
+    // path segments
+    expect(wire.url).toBe(`${ORIGIN}/api/v1/repos/alice/escaper-suite/actions/workflows/build%20%28x%29%21.yml`);
+    expect(wire.html_url).toBe(
+      `${ORIGIN}/alice/escaper-suite/src/branch/release%21$&+%3B=@1/sub%20dir/build%20%28x%29%21.yml`,
+    );
+    // the workflow path segment is PathEscapeSegments; the branch QUERY rides
+    // url.QueryEscape upstream (actions.go:722) — the query family stays
+    // encodeURIComponent (decode-equivalent): the `$&+;=@` bytes encode but
+    // decode back identically.
+    expect(wire.badge_url).toBe(
+      `${ORIGIN}/alice/escaper-suite/actions/workflows/build%20%28x%29%21.yml/badge.svg?branch=release!%24%26%2B%3B%3D%401`,
+    );
+    expect(wire.path).toBe("sub dir/build (x)!.yml");
+    expect(wire.id).toBe("build (x)!.yml");
+  });
+
+  it("a slash-carrying dir keeps its separators (PathEscapeSegments, not PathEscape)", () => {
+    const wire = workflowWire({
+      origin: ORIGIN,
+      pair: PAIR,
+      defaultBranch: "main",
+      entry: { dir: "a/b", name: "ci.yml" },
+      commitAuthorWhen: WHEN,
+      content: null,
+      disabledWorkflows: [],
+    });
+    expect(wire.url).toBe(`${ORIGIN}/api/v1/repos/alice/escaper-suite/actions/workflows/ci.yml`);
+    expect(wire.html_url).toBe(`${ORIGIN}/alice/escaper-suite/src/branch/main/a/b/ci.yml`);
   });
 });

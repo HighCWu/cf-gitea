@@ -708,6 +708,24 @@ describe("GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip/raw (Dow
     expect(Array.from(new Uint8Array(await res.arrayBuffer()))).toEqual(Array.from(bytes));
   });
 
+  it("an accented artifact path masks the safe arm and appends the lowercase RFC 2231 twin (content_disposition.go — the census port)", async () => {
+    const owner = await seedUser("artifact-owner");
+    const { repoId } = await seedRepo(owner, "repo");
+    const bytes = new Uint8Array([5, 4, 3]);
+    const art = await seedArtifact({ repoId, name: "résumé (x)", objectBody: bytes, fileSize: bytes.length });
+    // The v4 serve disposition: inline + path.Base (serve.go:135-140/:92);
+    // getSafeName masks EACH é to _ in place (the () force the quoted arm,
+    // riding raw inside the quotes); the twin re-encodes the RAW path per
+    // Go's RFC 2231 class — the former local hand-roll spelled UTF-8'' and
+    // rode encodeURIComponent (both divergent).
+    const res = await router()(await signedUrlFor("artifact-owner/repo", art.id), {});
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toBe(
+      `inline; filename="r_sum_ (x).zip"; filename*=utf-8''r%C3%A9sum%C3%A9%20%28x%29.zip`,
+    );
+    await res.arrayBuffer();
+  });
+
   it("206s the minimal single-range arm and 416s/400s the invalid shapes with http.Error's plain text", async () => {
     const owner = await seedUser("artifact-owner");
     const { repoId } = await seedRepo(owner, "repo");

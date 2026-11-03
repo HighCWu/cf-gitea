@@ -75,6 +75,7 @@ import {
   type SpooledBlob,
 } from "./blobs";
 import { writeVersionMetadata } from "./protocol-common";
+import { pathEscape } from "../../api/services/releases";
 import { DuplicatePackageFileError } from "./generic";
 // The hashicorp/go-version port (the swift unit's) — vagrant's upload gate
 // and sort ride the SAME library (vagrant.go imports
@@ -501,10 +502,11 @@ export async function enumerateVagrantBox(
     const descriptors = await getFileDescriptors(d1, row.version.id);
     const providers: VagrantProviderData[] = [];
     for (const descriptor of descriptors) {
-      const versionUrl = `${baseURL}/${encodeURIComponent(row.version.version)}`;
+      // vagrant.go:84: url.PathEscape(pd.Version.Version)
+      const versionUrl = `${baseURL}/${pathEscape(row.version.version)}`;
       providers.push({
         name: await readVagrantProviderProperty(d1, descriptor.file.id),
-        url: `${versionUrl}/${encodeURIComponent(descriptor.file.name)}`,
+        url: `${versionUrl}/${pathEscape(descriptor.file.name)}`, // vagrant.go:91 PathEscape(f.File.Name)
         checksum: descriptor.blob.hashSha512 ?? "",
         checksum_type: "sha512",
       });

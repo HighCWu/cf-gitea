@@ -102,6 +102,7 @@ import {
 } from "../services/auth-sources/gplus-client";
 import { getActiveOAuth2SourceByName } from "../services/auth-sources/store";
 import { AuditActions, emitAudit } from "../services/audit";
+import { pathEscape } from "../api/services/releases";
 import { lookupValidSession, mintSession, safeRedirectTarget, sessionCookieValue, sessionSetCookie } from "../ui/session";
 
 export type FetchImpl = OidcFetchImpl;
@@ -179,9 +180,15 @@ function readContinuation(url: string): "signin-link" | "signup" | undefined {
 
 /** The redirect_uri the IdP registration binds — the SOURCE NAME rides it
  *  (§5.2: the button href and the name-keyed lookup both encode it;
- *  renaming a source invalidates the registration). */
+ *  renaming a source invalidates the registration). Upstream builds it with
+ *  url.PathEscape (services/auth/source/oauth2/providers.go:225: AppURL +
+ *  "user/oauth2/" + url.PathEscape(providerName) + "/callback") — the source
+ *  display name is admin-entered and legally carries the divergent bytes
+ *  (`My corp (SSO)`), so the Go-parity pathEscape rides here instead of the
+ *  platform builtin (which was the inverse class: raw `!'()*` and escaped
+ *  `$&+:=@` — `/ ; , ?` encode under both classes). */
 function callbackRedirectUri(requestUrl: string, sourceName: string): string {
-  return `${new URL(requestUrl).origin}/user/oauth2/${encodeURIComponent(sourceName)}/callback`;
+  return `${new URL(requestUrl).origin}/user/oauth2/${pathEscape(sourceName)}/callback`;
 }
 
 interface RouterDeps {
