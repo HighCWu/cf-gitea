@@ -923,9 +923,15 @@ describe("org column-issues list query-shape witness (query-shape-audit A2/A6, t
     // interim shape (cddae16) paid the unbatched toApiProject counts+creator
     // pair PER PROJECTED row (all 3 rows carry projects → measured 23); the
     // bounds below fail if any per-project or per-row fan returns (each
-    // row's 3 reads alone exceed it).
-    expect(count).toBeLessThanOrEqual(19);
-    expect(count).toBeLessThan(20);
+    // row's 3 reads alone exceed it). +3 (the R5-3 threading): the viewer
+    // now rides the counts scope, whose owner-scope branch adds ONE
+    // visible-set walk per DISTINCT owner (`userVisibleRepos`, once for the
+    // org here — measured: the owner row + the org's repo listing + the
+    // vault's single team-mode read, the public repo short-circuiting at
+    // canViewRepository) — page-independent,
+    // services/projects/issue.go:330-340.
+    expect(count).toBeLessThanOrEqual(22);
+    expect(count).toBeLessThan(23);
 
     // Contract discipline: every batched render is deep-equal to the
     // per-row single GET of ITS repo (per-repo indexes, one per repo pair).
@@ -941,5 +947,55 @@ describe("org column-issues list query-shape witness (query-shape-audit A2/A6, t
     }
     expect(list.find((item) => item.repository.full_name === `${s.org.username}/vault`)?.user).toBeNull();
     expect(list.find((item) => item.number === 2)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R5-3's counts scope at the ROUTE level: the column-issues list threads its
+// resolved viewer into prefetchIssueRenderContext (the same viewer the
+// render already receives), so the org board's OWNER-scope numbers intersect
+// the viewer's visible repo set — upstream LoadIssueNumbersForProject's
+// owner branch (services/projects/issue.go:330-340). The FK battery's
+// 1/0/1 stranger shape, rendered on the wire.
+// ---------------------------------------------------------------------------
+describe("org board counts scope on the column-issues route (R5-3 threading)", () => {
+  it("a private-repo member issue counts for the org owner but not for a stranger", async () => {
+    const s = await seedOrgAndActors("scope");
+    const pubRepo = await seedOrgRepo(s.org, "boardpub");
+    const privRepo = await seedOrgRepo(s.org, "boardvault", { visibility: "private" });
+    const pubIssue = await seedIssue(pubRepo, 1, { title: "public board issue", posterId: s.owner.id });
+    await seedIssue(privRepo, 1, { title: "vault open", posterId: s.owner.id });
+    await seedIssue(privRepo, 2, { title: "vault closed", posterId: s.owner.id, isClosed: true });
+    const project = await seedOrgProject(s.org.id, s.owner.id);
+    const column = await seedColumn(project.id, { title: "Backlog", isDefault: true });
+    // The public issue rides the column (the route's page); the vault issues
+    // stay bare project memberships — the grouped counts read spans the
+    // whole board, not just the column's page.
+    await seedMembership(pubIssue.id, project.id, column.id);
+    const vaultRows = await db().select({ id: issues.id }).from(issues).where(eq(issues.repoId, privRepo)).all();
+    expect(vaultRows).toHaveLength(2);
+    await db().insert(projectIssues).values(vaultRows.map((row) => ({ issueId: row.id, projectId: project.id })));
+
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerProjectsOrgRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    const send = async (path: string, init?: RequestInit): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), env);
+    const path = `/orgs/${s.org.username}/projects/${project.id}/columns/${column.id}/issues`;
+    type BoardIssue = { projects: Array<{ num_open_issues: number; num_closed_issues: number; num_issues: number }> | null };
+
+    // The org owner sees every member issue: 2 open (public + vault) + 1 closed.
+    const ownerRes = await send(path, { headers: authHeaders(s.owner.id) });
+    expect(ownerRes.status).toBe(200);
+    const ownerList = await ownerRes.json<[BoardIssue]>();
+    expect(ownerList[0]?.projects?.[0]).toMatchObject({ num_open_issues: 2, num_closed_issues: 1, num_issues: 3 });
+
+    // The stranger (the org-visibility read fallback) counts only the public
+    // repo's membership — the vault buckets drop out of the owner-scope
+    // numbers (1/0/1), the batched stage's viewer scope live on the route.
+    const strangerRes = await send(path, { headers: authHeaders(s.outsider.id) });
+    expect(strangerRes.status).toBe(200);
+    const strangerList = await strangerRes.json<[BoardIssue]>();
+    expect(strangerList[0]?.projects?.[0]).toMatchObject({ num_open_issues: 1, num_closed_issues: 0, num_issues: 1 });
   });
 });

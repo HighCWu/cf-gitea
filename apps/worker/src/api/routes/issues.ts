@@ -1166,8 +1166,10 @@ export function registerIssueRoutes(
     // The query-shape audit's A2: the per-issue enrichment selects (poster,
     // labels, pin order, milestone, PR row) batch into one inArray read per
     // entity kind for the page, handed to the render through the preload —
-    // the response shape is unchanged.
-    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    // the response shape is unchanged. The viewer rides the counts scope
+    // (R5-3): owner-scope project numbers intersect the viewer's visible
+    // repo set, the same viewer the render below already receives.
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items, { viewer });
     const rendered = await Promise.all(items.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });
@@ -2138,7 +2140,7 @@ export function registerIssueRoutes(
     // keeps the per-row skip), and the issue render batches like the
     // repo-scoped list above; the render parallelizes over the page.
     const pairsById = await findRepositoriesByIds(c.env.DB, [...new Set(items.map((issue) => issue.repoId))]);
-    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items, { viewer });
     const rendered = await Promise.all(
       items.map(async (issue) => {
         const pair = pairsById.get(issue.repoId);

@@ -622,7 +622,7 @@ async function renderTimeRows(
   // The M-grade list batching's tier-2 adoption (routes/issues.ts A2 shape):
   // the per-issue enrichment reads batch into one inArray per entity kind for
   // the page; the render below is map lookups. Response shape unchanged.
-  const renderContext = await prefetchIssueRenderContext(d1, issueRows);
+  const renderContext = await prefetchIssueRenderContext(d1, issueRows, { viewer });
   const rendered: Array<Record<string, unknown>> = [];
   for (const row of rows) {
     const issue = issueById.get(row.issueId);

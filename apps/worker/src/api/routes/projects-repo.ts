@@ -998,7 +998,7 @@ export function registerProjectsRepoRoutes(
     // selects (poster, labels, pin order, milestone, PR row) batch into one
     // inArray read per entity kind for the page, handed to the render through
     // the preload — the response shape is unchanged (routes/issues.ts A2).
-    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items, { viewer });
     const rendered = await Promise.all(items.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });

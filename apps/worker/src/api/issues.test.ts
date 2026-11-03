@@ -4963,4 +4963,80 @@ describe("the owner-project counts scope (R5-3)", () => {
     // public page — only the vault buckets stay filtered out.
     expect(ctx.projectCounts.get(world.projectId)).toEqual({ open: 1, closed: 0, total: 1 });
   });
+
+  /** The board actors over the wire: a local resolver mapping tokens to the
+   *  seeded org owner and stranger (the FK battery's two viewers above). */
+  function boardRouter(world: Awaited<ReturnType<typeof seedBoardWorld>>) {
+    const owner = { ...STUB_USER, id: world.ownerId, login: "orgboss", username: "orgboss" };
+    const stranger = { ...STUB_USER, id: world.strangerId, login: "boardstranger", username: "boardstranger" };
+    const app = createApiRouter({
+      auth: {
+        resolveToken: (token) =>
+          token === "owner-token"
+            ? Promise.resolve(owner)
+            : token === "stranger-token"
+              ? Promise.resolve(stranger)
+              : Promise.resolve(null),
+      },
+    });
+    return async (path: string, token: string): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, { headers: { Authorization: `token ${token}` } }), env);
+  }
+
+  // The threading spots (the representative ROUTE pin lives on the org
+  // column-issues list, routes/projects-org.test.ts): two further routes
+  // whose prefetch now carries the route's resolved viewer, so the board's
+  // owner-scope numbers scope per viewer ON THE WIRE.
+  it("the issues list route threads its viewer — the board's counts scope is live on the wire", async () => {
+    const world = await seedBoardWorld();
+    const fetchAs = boardRouter(world);
+    // The org owner: every member issue counts — 2 open (public + vault) + 1 closed.
+    const ownerRes = await fetchAs(`/repos/acme/${world.pairRepoSlug}/issues?state=all`, "owner-token");
+    expect(ownerRes.status).toBe(200);
+    const ownerList = await ownerRes.json<
+      Array<{ projects: Array<{ num_open_issues: number; num_closed_issues: number; num_issues: number }> | null }>
+    >();
+    expect(ownerList).toHaveLength(1);
+    expect(ownerList[0]!.projects?.[0]).toMatchObject({ num_open_issues: 2, num_closed_issues: 1, num_issues: 3 });
+    // The stranger counts only the public repo's membership (1/0/1) — the
+    // vault buckets drop out of the owner-scope numbers.
+    const strangerRes = await fetchAs(`/repos/acme/${world.pairRepoSlug}/issues?state=all`, "stranger-token");
+    expect(strangerRes.status).toBe(200);
+    const strangerList = await strangerRes.json<
+      Array<{ projects: Array<{ num_open_issues: number; num_closed_issues: number; num_issues: number }> | null }>
+    >();
+    expect(strangerList).toHaveLength(1);
+    expect(strangerList[0]!.projects?.[0]).toMatchObject({ num_open_issues: 1, num_closed_issues: 0, num_issues: 1 });
+  });
+
+  it("the tracked-times route threads its viewer — the embedded issue's board counts scope per viewer", async () => {
+    const world = await seedBoardWorld();
+    const pubIssue = await db().select({ index: issues.index }).from(issues).where(eq(issues.id, world.pubIssueId)).all();
+    expect(pubIssue).toHaveLength(1);
+    const index = pubIssue[0]!.index;
+    // One row per viewer: the owner's survives the stranger's cantSetUser
+    // self-scoping (issue_tracked_time.go:108-119) so both arms have an
+    // entry whose embedded issue renders the board.
+    await db().insert(trackedTimes).values([
+      { issueId: world.pubIssueId, userId: world.ownerId, seconds: 90, createdAt: new Date("2026-02-03T04:05:06Z") },
+      { issueId: world.pubIssueId, userId: world.strangerId, seconds: 30, createdAt: new Date("2026-02-03T04:05:06Z") },
+    ]);
+    const fetchAs = boardRouter(world);
+    const ownerRes = await fetchAs(`/repos/acme/${world.pairRepoSlug}/issues/${index}/times`, "owner-token");
+    expect(ownerRes.status).toBe(200);
+    const ownerTimes = await ownerRes.json<
+      Array<{ issue: { projects: Array<{ num_open_issues: number; num_closed_issues: number; num_issues: number }> | null } }>
+    >();
+    expect(ownerTimes).toHaveLength(2);
+    expect(ownerTimes[0]!.issue.projects?.[0]).toMatchObject({ num_open_issues: 2, num_closed_issues: 1, num_issues: 3 });
+    // The stranger's scoped page: their own row only, the board's counts
+    // narrowed to the public repo (1/0/1).
+    const strangerRes = await fetchAs(`/repos/acme/${world.pairRepoSlug}/issues/${index}/times`, "stranger-token");
+    expect(strangerRes.status).toBe(200);
+    const strangerTimes = await strangerRes.json<
+      Array<{ issue: { projects: Array<{ num_open_issues: number; num_closed_issues: number; num_issues: number }> | null } }>
+    >();
+    expect(strangerTimes).toHaveLength(1);
+    expect(strangerTimes[0]!.issue.projects?.[0]).toMatchObject({ num_open_issues: 1, num_closed_issues: 0, num_issues: 1 });
+  });
 });

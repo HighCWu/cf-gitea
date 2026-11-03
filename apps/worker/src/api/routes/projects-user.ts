@@ -1060,7 +1060,7 @@ export function registerProjectsUserRoutes(
     // shape): the render parallelizes over the page with the issue context
     // prefetched once, the invisible-pair skip preserved (both sides read
     // the same visible set — defensive only); the response shape is unchanged.
-    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items, { viewer });
     const rendered = await Promise.all(
       items.flatMap((issue) => {
         const pair = pairsById.get(issue.repoId);

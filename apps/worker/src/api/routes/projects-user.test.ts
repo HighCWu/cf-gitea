@@ -769,8 +769,14 @@ describe("user column-issues list query-shape witness (query-shape-audit A2/A6, 
     // visible repos + count + page) + 5 prefetch arms — page-INDEPENDENT.
     // The pre-fix shape added N×(1 poster + 1 labels + 1 pin + 1 milestone)
     // = 12 at this N=3; the bound below fails if any per-row fan returns.
-    expect(count).toBeLessThanOrEqual(20);
-    expect(count).toBeLessThan(21);
+    // +2 (the R5-3 threading): the viewer now rides the counts scope, whose
+    // owner-scope branch adds ONE visible-set walk per DISTINCT owner
+    // (`userVisibleRepos`, once for the board owner here — measured: the
+    // owner row + the owner's repo listing; both repos public so the
+    // canView loop short-circuits at zero reads) — page-independent,
+    // services/projects/issue.go:330-340. Measured 18 at this N.
+    expect(count).toBeLessThanOrEqual(18);
+    expect(count).toBeLessThan(19);
 
     // Contract discipline: every batched render is deep-equal to the
     // per-row single GET of ITS repo (per-repo indexes).

@@ -349,7 +349,7 @@ export async function prefetchPullRequestRenderContext(
   const [mergerRows, headRepos, issue] = await Promise.all([
     mergerIds.length > 0 ? drizzle(d1).select().from(users).where(inArray(users.id, mergerIds)).all() : Promise.resolve([]),
     findRepositoriesByIds(d1, headRepoIds),
-    prefetchIssueRenderContext(d1, rows.map((row) => row.issue)),
+    prefetchIssueRenderContext(d1, rows.map((row) => row.issue), { viewer }),
   ]);
   // The grant batch rides the fetched pairs (ownerId/ownerNamespace feed the
   // matrix arms) — the page's distinct-head fan collapses to the twin's

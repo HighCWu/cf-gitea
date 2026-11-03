@@ -989,7 +989,7 @@ async function prepareBlockerBatch(
       canView.set(pair.repo.id, await canViewRepositoryWithTeams(d1, viewer, pair.repo));
     }),
   );
-  const context = await prefetchIssueRenderContext(d1, rows.map((row) => row.issue));
+  const context = await prefetchIssueRenderContext(d1, rows.map((row) => row.issue), { viewer });
   return { pairs, canView, context };
 }
 
@@ -1490,7 +1490,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     // full enrichment read set PER TIME ROW. The page context prefetches it
     // once (the arms that miss on this issue skip to zero statements), so
     // the render is map-lookups only.
-    const renderContext = await prefetchIssueRenderContext(c.env.DB, [issue]);
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, [issue], { viewer });
     const rendered = await Promise.all(
       rows.slice((page - 1) * limit, page * limit).map(async (row) => ({
         id: row.time.id,

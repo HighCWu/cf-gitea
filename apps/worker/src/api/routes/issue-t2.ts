@@ -855,7 +855,7 @@ export function registerIssueT2Routes(
     await assertIssuesOrPullsUnit(c.env.DB, found);
     await assertIssuesUnitReadable(c.env.DB, found);
     const rows = await listPinnedIssues(c.env.DB, found.repo.id, false);
-    const renderContext = await prefetchIssueRenderContext(c.env.DB, rows);
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, rows, { viewer });
     const rendered = await Promise.all(rows.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });
