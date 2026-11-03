@@ -8032,7 +8032,7 @@ const oauth2Steps = (ctx) => [
   },
   {
     id: "oauth2-userinfo",
-    expect: `GET /login/oauth/userinfo with the Bearer → 200 {sub,name,preferred_username,email,picture,groups} in Go struct member order (sub == the API user id; groups null for an org-less user or an array); the SAME call with the run PAT → 401 (a PAT is NOT an OAuth2 credential — the AuthedMethod check)`,
+    expect: `GET /login/oauth/userinfo with the Bearer → 200 {sub,name,preferred_username,email,picture,groups} in Go struct member order (sub == the API user id; groups null for an org-less user or an array); the SAME call with the run PAT (all-scopes) → 200 (FJ's M2: upstream's OAuth2 method authenticates dotless PATs with read:user — oauth2.go:146-165's else branch sets AuthedMethod; the R3 adjudication retired the 401-misread)`,
     run: async () => {
       expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
       expect(Number.isInteger(ctx.userId), "no user id from the dispatch arm (fixture missing)");
@@ -8055,10 +8055,16 @@ const oauth2Steps = (ctx) => [
         `picture ${JSON.stringify(body.picture)} is not the resolvable avatar shape (<base>/avatars/u_<id> or <base>/avatars/<64-hex HashAvatar>, 7362128)`);
       expect(body.groups === null || Array.isArray(body.groups), `groups ${JSON.stringify(body.groups)} (expected null for an org-less user or an array)`);
       const pat = await fetchT(`${opts.baseUrl}/login/oauth/userinfo`, { headers: { authorization: `token ${TOKEN}` } });
-      await pat.text();
-      expect(pat.status === 401, `the PAT userinfo status ${pat.status} (expected 401 — a PAT is not an OAuth2 token)`);
-      ctx.danceLog.push("GET /login/oauth/userinfo (Bearer) → 200 OIDC shape; (PAT) → 401");
-      return `200 OIDC shape (sub=${body.sub}, groups ${body.groups === null ? "null" : `array[${body.groups.length}]`}); PAT → 401`;
+      const patText = await pat.text();
+      // FJ's M2 re-baseline (the R3 finding): a dotless bearer resolves as a
+      // PAT with the read:user/public-only gate — the all-scopes run PAT
+      // 200s with the SAME OIDC shape (oauth2.go:146-165's else branch +
+      // group.go:63-64's AuthedMethod; SPEC oauth2-provider §2.6 as-built).
+      expect(pat.status === 200, `the PAT userinfo status ${pat.status} (expected 200 — FJ's M2: upstream authenticates dotless PATs, oauth2.go:146-165): ${patText.slice(0, 120)}`);
+      const patBody = JSON.parse(patText);
+      expect(patBody.sub === String(ctx.userId), `PAT sub ${JSON.stringify(patBody.sub)} != String(${ctx.userId})`);
+      ctx.danceLog.push("GET /login/oauth/userinfo (Bearer) → 200 OIDC shape; (PAT) → 200 the same shape (FJ M2)");
+      return `200 OIDC shape (sub=${body.sub}, groups ${body.groups === null ? "null" : `array[${body.groups.length}]`}); PAT → 200 the same shape (FJ M2)`;
     },
   },
   {
