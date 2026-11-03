@@ -413,9 +413,15 @@ them.) Dispatch material for the trigger-live ports: `/tmp/GS-port-plans.md`.
      `POST /{owner}/{repo}/branches/rename` (`ui/index.ts:9287-9345`,
      route :19915) — but neither persists a rename log, and the legacy-ref
      walk omits upstream's renamed arm (`ui/pages/raw-files.ts:94-95`,
-     recorded at landing): a stale link falls to the DEFAULT-branch
-     fallback with the tail as tree path and silently serves the WRONG
-     branch's content where upstream redirects. Feature live + table
+     recorded at landing). THE PRECISION (FY3's review, at the freeze): the
+     TYPED shape `/src/branch/{old}` 404s in ours (resolveRefSuffix
+     returns null -> the notFound shell, ui/index.ts:7020-7027 +
+     file-view.tsx:279-280) — no wrong content; the default-branch
+     wrong-content fallback bites only the LEGACY raw/media arm
+     (resolveLegacyRefSuffix, raw-files.ts:212-229, which ports
+     upstream's getRefNameLegacy INCLUDING its FIXME fallback
+     repo.go:859-862 — upstream's legacy arm calls getRefName first and
+     so would have redirected). Feature live + table
      serves it → the port-when-read trigger is LIVE, named: the legacy-ref
      redirect arm of the `/src` family (reader) riding the two landed
      rename writers.
