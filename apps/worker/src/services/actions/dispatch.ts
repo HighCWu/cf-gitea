@@ -56,6 +56,8 @@ import {
   type TaskRow,
   type TaskWithToken,
 } from "./model";
+import { refreshRunStatus } from "./update";
+import { emitWorkflowJobStatus, emitWorkflowRunStatus } from "./webhook-events";
 import { taskAllowsOidcToken } from "./oidc";
 import { createAuthorizationToken, oidcIssuer, signActionsClaims } from "./secrets";
 import {
@@ -230,6 +232,23 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
     // identical pending context and createWorkflowCommitStatus's
     // identical-state short-circuit absorbs the duplicate.
     await postClaimCommitStatus(d1, assembled.ctx, appUrl);
+    // The claim emissions (GAPS #7, task.go:113-120): after the commit
+    // status, the claimed job's workflow_job event ("in_progress") and —
+    // on the FIRST pick-up of the run (run.started still null, upstream's
+    // job.Run.Started.IsZero() read before UpdateRunJob's refresh) — the
+    // run's workflow_run event ("in_progress"). The run aggregate refresh
+    // rides UpdateRunJob's tail upstream (run_job.go:593-600); our claim
+    // path had skipped it, so the refresh here is what makes the payload's
+    // status read RUNNING instead of the stale WAITING row.
+    await refreshRunStatus(d1, claimed.job.repoId, claimed.job.runId, claimed.job.runAttemptId);
+    // env IS the bindings view here (DB + REPO + the optional queue
+    // producer) — the pick route always holds it.
+    await emitWorkflowJobStatus(env, { origin: appUrl }, claimed.job.repoId, claimed.job.id);
+    const runStartedRows = await drizzle(d1).select().from(actionRuns).where(eq(actionRuns.id, claimed.job.runId)).limit(1);
+    const runStarted = runStartedRows[0];
+    if (runStarted !== undefined && runStarted.started !== null) {
+      await emitWorkflowRunStatus(env, { origin: appUrl }, claimed.job.repoId, claimed.job.runId);
+    }
     // The disconnect check (task.go:123-128): the job was claimed and its
     // payload assembled, but if the request died meanwhile the response can
     // no longer reach the runner — release the claim so another poll picks

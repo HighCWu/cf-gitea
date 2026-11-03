@@ -486,7 +486,9 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
     // inside the arm).
     if (isActionsScheduleTriggerMessage(message.body)) {
       try {
-        const inserted = await handleActionsScheduleTrigger({ d1: env.DB, appUrl: env.APP_URL ?? "" }, message.body);
+        // HOOKS' fold: REPO threaded — the scheduled run's creation pair fires
+        // (upstream funnels every producer through PrepareRunAndInsert).
+        const inserted = await handleActionsScheduleTrigger({ d1: env.DB, appUrl: env.APP_URL ?? "", REPO: env.REPO }, message.body);
         console.log(`[repo-tasks] actions-trigger ${message.id}: spec ${message.body.specId} inserted ${inserted}`);
         message.ack();
       } catch (error) {

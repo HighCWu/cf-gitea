@@ -23,6 +23,7 @@ import {
 } from "../../db/schema";
 import type { AuthInfo } from "../../auth/auth-context";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../../services/actions/audit-arms";
+import type { ActionsWebhookBindings } from "../../services/actions/webhook-events";
 import { actorCredentialOf } from "../../services/oauth2/audit-arms";
 import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
 import { increaseTaskVersion, updateRepoRunsNumbers } from "../../services/actions/model";
@@ -1249,6 +1250,8 @@ export async function dispatchActionWorkflow(input: {
   ref: string;
   scopedWorkflowSourceRepoId: string;
   sourceEngineFor: (fullName: string) => ReturnType<typeof engineReads>;
+  /** HOOKS' fold: the webhook context for the creation emissions. */
+  webhook?: { bindings: ActionsWebhookBindings; origin: string } | undefined;
   bodyInputs: Record<string, string> | undefined;
 }): Promise<DispatchOutcome> {
   const { d1, reads, origin, pair, doerId, workflowId, ref, bodyInputs } = input;
@@ -1408,6 +1411,8 @@ export async function dispatchActionWorkflow(input: {
       repoOwnerNamespace: pair.repo.ownerNamespace,
       repoSlug: pair.repo.slug,
       appUrl: origin,
+      // HOOKS' fold: the creation emissions' webhook context.
+      webhook: input.webhook,
     },
     content,
     readWorkflowRawConcurrency(content),
@@ -2584,6 +2589,7 @@ export function registerRepoActionsRoutes(
         d1: c.env.DB,
         reads: engineReads(c.env, { ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug }),
         origin: viewer.origin,
+        webhook: { bindings: c.env, origin: viewer.origin },
         pair,
         doerId: viewer.requester?.id ?? 0,
         workflowId,
@@ -2997,7 +3003,7 @@ export function registerRepoActionsRoutes(
       await requireActionsWriter(c, pair);
       const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
       const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
-      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, jobs);
+      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, jobs, { bindings: c.env, origin: new URL(c.req.url).origin });
       if (!result.ok) throw rerunRejectionToApiError(result);
       const reloaded = await runByRepoAndId(c.env.DB, pair.repo.id, run.id);
       const origin = new URL(c.req.url).origin;
@@ -3045,7 +3051,7 @@ export function registerRepoActionsRoutes(
       if (failedJobs.length === 0) {
         throw new ApiError(400, "this workflow run has no failed jobs to re-run"); // action.go:1453-1456
       }
-      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, failedJobs);
+      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, failedJobs, { bindings: c.env, origin: new URL(c.req.url).origin });
       if (!result.ok) throw rerunRejectionToApiError(result);
       return c.body(null, 201);
     },
@@ -3253,7 +3259,7 @@ export function registerRepoActionsRoutes(
       if (targetJob === undefined) {
         throw new ApiError(404, "workflow job not found"); // APIErrorNotFound, action.go:1506-1508
       }
-      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, [targetJob]);
+      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, [targetJob], { bindings: c.env, origin: new URL(c.req.url).origin });
       if (!result.ok) throw rerunRejectionToApiError(result);
       // The new attempt's row for the target job's AttemptJobID — the
       // legacy rows' backfilled identity re-read (action.go:1523-1535).

@@ -418,7 +418,7 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
       encodeUpdateTaskResponse,
       async (req: UpdateTaskRequest, c) => {
         const runner = runnerOf(c);
-        const outcome = await updateTask(c.env.DB, runner.id, req, appUrlOf(c));
+        const outcome = await updateTask(c.env.DB, runner.id, req, appUrlOf(c), c.env);
         return {
           state: {
             id: outcome.stateId,

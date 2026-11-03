@@ -61,6 +61,9 @@ import type { StepState, TaskState, UpdateLogRequest, UpdateTaskRequest } from "
 // hoisted refreshRunStatus/stopTask declarations) — ESM resolves it at call
 // time, the exact shape the M3 rewire was staged for.
 import { checkJobsOfRun, createCommitStatusForRunJobs } from "./trigger";
+// The Actions webhook emissions (GAPS #7) — webhook-events imports nothing
+// from this module or trigger.ts, the DAG stays clean.
+import { emitWorkflowJobStatus, emitWorkflowRunStatus, type ActionsWebhookBindings } from "./webhook-events";
 
 type D1 = D1Database;
 
@@ -573,8 +576,22 @@ export interface UpdateTaskOutcome {
  * report). `appUrl` spells the commit-status target URLs (the request
  * origin, the routes handler's appUrlOf; the emitter pass itself runs with
  * "" the way trigger.ts's callers do when no origin is at hand).
+ *
+ * `bindings` (GAPS #7) threads the Actions webhook emission context: the
+ * notifier half of upstream's tail — NotifyWorkflowJobStatusUpdateWithTask
+ * for the completing job (runner.go:266) and NotifyWorkflowRunStatusUpdate-
+ * WithReload for the settled run (runner.go:274) — fires here when the
+ * caller supplies the bindings; the run leg of the emitter pass
+ * (checkJobsOfRun's webhook param) rides the same context. Absent (the
+ * current routes/fake-runner callers) → no emissions from this path.
  */
-export async function updateTask(d1: D1, runnerId: number, req: UpdateTaskRequest, appUrl = ""): Promise<UpdateTaskOutcome> {
+export async function updateTask(
+  d1: D1,
+  runnerId: number,
+  req: UpdateTaskRequest,
+  appUrl = "",
+  bindings?: ActionsWebhookBindings,
+): Promise<UpdateTaskOutcome> {
   if (req.state === undefined) {
     throw new Error("state is required");
   }
@@ -647,8 +664,28 @@ export async function updateTask(d1: D1, runnerId: number, req: UpdateTaskReques
       [job],
     );
   }
+
+  // The completion webhook emissions (GAPS #7, runner.go:266): the finished
+  // job's workflow_job event — before the needs-graph pass, exactly
+  // upstream's notify-then-emit order. The announce filter inside the
+  // emitter drops requested/pending states.
+  if (bindings !== undefined && !preJobWasDone && isDoneStatus(task.status)) {
+    await emitWorkflowJobStatus(bindings, { origin: appUrl }, job.repoId, job.id);
+  }
+
   if (req.state.result !== RUNNERV1_RESULT.UNSPECIFIED) {
-    await checkJobsOfRun(d1, job.runId);
+    await checkJobsOfRun(d1, job.runId, bindings !== undefined ? { bindings, origin: appUrl } : undefined);
+
+    // The settled run's workflow_run event (runner.go:274): the run row
+    // re-read AFTER the pass — the cascade may have flipped the aggregate to
+    // a done status here.
+    if (bindings !== undefined) {
+      const settledRows = await db.select().from(actionRuns).where(eq(actionRuns.id, job.runId)).limit(1);
+      const settled = settledRows[0];
+      if (settled !== undefined && isDoneStatus(settled.status)) {
+        await emitWorkflowRunStatus(bindings, { origin: appUrl }, job.repoId, job.runId);
+      }
+    }
   }
 
   return {

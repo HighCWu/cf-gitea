@@ -1078,6 +1078,9 @@ export async function handleActionsScheduleTrigger(env: ActionsScheduleConsumerE
         repoOwnerNamespace: repo.repo.ownerNamespace,
         repoSlug: repo.repo.slug,
         appUrl: env.appUrl,
+        // HOOKS' fold: the scheduled run's creation pair (upstream funnels
+        // through PrepareRunAndInsert like every producer).
+        webhook: env.REPO !== undefined ? { bindings: { DB: d1, REPO: env.REPO }, origin: env.appUrl } : undefined,
       },
       scheduleRow.content,
     );
@@ -1133,6 +1136,10 @@ export async function getScheduleById(d1: D1Database, id: number): Promise<Sched
 export interface ActionsScheduleConsumerEnv {
   d1: D1Database;
   appUrl: string;
+  /** HOOKS' fold: the engine cell for the creation emissions' workflow
+   *  resolution (scheduled runs fire workflow_run/workflow_job at creation
+   *  upstream — PrepareRunAndInsert funnels every producer). */
+  REPO?: Env["REPO"];
 }
 
 /** The unit gate's readback (notifier_helper.go:162-166 → UnitEnabled): the

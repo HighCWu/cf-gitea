@@ -175,6 +175,11 @@ automation (tags + releases + assets + PR merge), CI checkout/status tooling
 
 ### 2.4 Tier-1 mapping to layers, auth, cache, and upstream gotchas
 
+> **id-semantics note (FN-8, migration 0072)**: the commit-status REST
+> serializer's `id` is the per-sha ordinal (the `index` column), not the row
+> pk — upstream's own asymmetry (convert/status.go:24 REST vs
+> notifier.go:942 webhook); the webhook payload's `id` remains the row pk.
+
 Data source legend: **D1** = Drizzle tables only; **engine** = RepoDO/R2 via the
 SPEC-0001 storage interface; **both** = orchestrates engine + D1. Auth scope column
 names the SPEC-0002 token scope category enforced when a token is presented

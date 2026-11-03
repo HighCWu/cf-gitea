@@ -141,6 +141,7 @@ import {
   readWorkflowRawConcurrency,
   type TriggerRunOutcome,
 } from "./trigger";
+import type { ActionsWebhookContext } from "./webhook-events";
 import { repositories } from "../../db/schema";
 import {
   isScopedWorkflowOptedOut,
@@ -218,6 +219,11 @@ export interface WorkflowDispatchInputRequest {
   triggerUserId: number;
   /** The instance origin (the github context's server_url). */
   appUrl: string;
+  /** The Actions webhook emission context (GAPS #7) — the dispatch arm's
+   *  creation notify rides insertTriggeredRunSplit's shared tail; the route
+   *  threads {bindings: env, origin}. Absent → the DB-only degraded view
+   *  (job events fire, run events stay silent until REPO arrives). */
+  webhook?: ActionsWebhookContext;
 }
 
 export type WorkflowDispatchOutcome =
@@ -395,6 +401,7 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
       repoOwnerNamespace: repo.ownerNamespace,
       repoSlug: repo.slug,
       appUrl,
+      webhook: input.webhook,
     },
     content,
     readWorkflowRawConcurrency(content),

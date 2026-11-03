@@ -79,6 +79,7 @@ import {
   updateRepoRunsNumbers,
 } from "./model";
 import { aggregateJobStatus, isDoneStatus, isRunningStatus } from "./update";
+import { emitWorkflowJobsAndRunStatus, type ActionsWebhookContext } from "./webhook-events";
 import {
   buildGithubContext,
   cancelPreviousJobsByRunConcurrency,
@@ -470,6 +471,7 @@ export async function rerunWorkflowRunJobs(
   run: RunRow,
   triggerUserId: number,
   jobsToRerun: RunJobRow[],
+  webhook?: ActionsWebhookContext,
 ): Promise<RerunResult> {
   const invalid = await validateRerun(d1, repoId, run, triggerUserId, jobsToRerun);
   if (invalid !== null) return invalid;
@@ -761,7 +763,22 @@ export async function rerunWorkflowRunJobs(
   // deferred block below.
   for (const affectedRunId of [...new Set(affectedRunsByCancel)]) {
     if (affectedRunId === run.id) continue;
-    await checkJobsOfRun(d1, affectedRunId);
+    await checkJobsOfRun(d1, affectedRunId, webhook);
+  }
+
+  // The webhook emissions (GAPS #7, rerun.go:391's
+  // NotifyWorkflowJobsAndRunsStatusUpdate): the run ("requested" — the new
+  // attempt's aggregate) then the cloned jobs ("queued"; the announce filter
+  // drops the needs-pending clones inside the emitter). Absent webhook →
+  // silent (the current route callers pass no bindings until the fold).
+  if (webhook !== undefined) {
+    await emitWorkflowJobsAndRunStatus(
+      webhook.bindings,
+      { origin: webhook.origin },
+      run.repoId,
+      run.id,
+      newJobs.map((j) => j.id),
+    );
   }
 
   // Post-commit (rerun.go:389-396): CreateCommitStatusForRunJobs,

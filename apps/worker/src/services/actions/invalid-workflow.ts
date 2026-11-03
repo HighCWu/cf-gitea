@@ -44,6 +44,7 @@ import { loadRepoActionsConfig } from "./config";
 import { ACTION_STATUS_FAILURE, ellipsisDisplayString, updateRepoRunsNumbers } from "./model";
 import type { RunRow } from "./model";
 import { nextRunIndex } from "./trigger";
+import { emitWorkflowRunStatus, type ActionsWebhookContext } from "./webhook-events";
 
 /** The run fields upstream's handleInvalidWorkflows assembles from the push
  * notify input (invalid_workflow.go:33-41). The caller (the trigger chain) —
@@ -67,6 +68,9 @@ export interface InvalidWorkflowRunInput {
   triggerEvent: string;
   /** The encoded event payload JSON (input.EncodedPayload()). */
   eventPayload: string;
+  /** HOOKS' fold: the creation-emission context (invalid_workflow.go:95-97's
+   *  NotifyWorkflowRunStatusUpdate — the module header's named-unported arm). */
+  webhook?: ActionsWebhookContext;
 }
 
 /** The parse error surface: the static-validation error the workflow failed
@@ -176,6 +180,15 @@ export async function insertInvalidWorkflowRun(
   // FN-4: this arm inserts a CLOSED (failure) run — the tally recount rides
   // the create settle like every other producer.
   await updateRepoRunsNumbers(d1, run.repoId);
+  // HOOKS' fold: the invalid-run status emission (invalid_workflow.go:95-97) —
+  // best-effort, the seam never throws.
+  if (run.webhook !== undefined) {
+    try {
+      await emitWorkflowRunStatus(run.webhook.bindings, { origin: run.webhook.origin }, run.repoId, runRow.id);
+    } catch {
+      // never fail the insert on the emission
+    }
+  }
   return { ...runRow, latestAttemptId: attemptRow.id };
 }
 
