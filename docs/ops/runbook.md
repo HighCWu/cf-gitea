@@ -321,6 +321,87 @@ runtime). If you hand-rename the bucket, keep the constant in step. Full
 config commentary: the LFS tail of `apps/worker/wrangler.jsonc.example`;
 the as-built record: SPEC-0006 §6.
 
+### Monitor platform auth (one-time setup, SPEC-0021 §4 as-built)
+
+The monitor-platform probe battery (`node scripts/deploy-probes.mjs
+monitor-platform …`) drives the official Cloudflare APIs directly (the
+`/set` queue-concurrency closed loop + the pprof content probe). It needs
+two minimal-privilege Cloudflare API tokens, authorized ONCE — the
+architecture is one-time authorization → automatic configuration →
+centralized management → unattended thereafter:
+
+1. **Mint two tokens** in the Cloudflare dashboard (My Profile → API
+   Tokens), separate and minimal:
+   - `CLOUDFLARE_QUEUES_TOKEN` — **Queues Read + Write** (the `/set`
+     closed loop);
+   - `CLOUDFLARE_PROFILE_TOKEN` — **Workers Scripts Read** ONLY (the
+     profiler; account-scoped read is NOT needed — the old answer
+     over-asked).
+2. **Run the one-time setup** (interactive; the paste is echo-suppressed):
+
+   ```bash
+   node scripts/setup-monitor-auth.mjs
+   ```
+
+   It validates each scope with DRY-RUN calls (nothing created, nothing
+   mutated; the write-scope probe aims a PUT at a NIL UUID queue — a 404
+   there is the pass signal, labeled PROVISIONAL, and the battery's real
+   PUT re-proves it) and persists to **`.monitor-auth.json` at the repo
+   root, mode 0600, gitignored** — runtime state, never committed. Set
+   `MONITOR_QUEUE_CONSUMERS` (the allowlist JSON naming the queue/consumer
+   the `/set` loop may drive) when prompted — without an entry the `/set`
+   arm stays missing-auth.
+
+3. **The battery picks the store up unattended**: env names
+   (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`,
+   `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`,
+   `MONITOR_WORKER_NAME`) win field-by-field when both exist.
+4. **Re-validate any time** (non-interactive, no writes):
+   `node scripts/setup-monitor-auth.mjs --check` — exit 0 all scopes ok,
+   1 a verdict not ok, 2 usage, 3 missing-auth.
+5. **Worker-side secrets are separate** — the deployed monitor adapters
+   read the same token NAMES as Worker secrets; arm them at deploy:
+
+   ```bash
+   wrangler secret put CLOUDFLARE_QUEUES_TOKEN
+   wrangler secret put CLOUDFLARE_PROFILE_TOKEN
+   ```
+
+   Cloudflare Secrets Store was evaluated and declined for the PROBE side
+   (overkill for a single-worker deployment — SPEC-0021 §4).
+
+**Rotation**: mint the fresh tokens, `node scripts/setup-monitor-auth.mjs
+--force` (rewrites the 0600 store in place), `--check` until both scopes
+answer ok, then delete the old token in the dashboard. A leaked store file:
+delete it, rotate both tokens (the store is local-only; nothing else holds
+them).
+
+**What each taxonomy class means for the release verdict** (the four-way
+taxonomy, SPEC-0021 §5 — the class word leads each check's detail):
+
+- `missing-auth` → `[warn]`: the pre-authorization state, NOT a release
+  verdict and never "permanently closed" — run the one-time setup (or fix
+  the store's mode/JSON; the detail names which). The run still exits 0
+  (warn never fails), but a v1.5-style convergence record citing it is an
+  UNVERIFIED claim, not a pass.
+- `permission-denied` → `[fail]`: the token lacks the scope (401/403) — a
+  REAL red: fix the token in the dashboard, re-run `--check`, then the
+  battery. Never a "platform unsupported".
+- `api-unsupported` → `[warn]`: the endpoint/capability itself is absent
+  for the account (405/415/410/451/501, or an entitlement-naming 403) —
+  honest, no action on the token; the arm is unverifiable on that account
+  until Cloudflare ships/entitles it.
+- `failure` → `[fail]`: network unreachable, 429 after bounded retries,
+  400 rejected request, 404 unresolving configured id (fix
+  `MONITOR_QUEUE_CONSUMERS` / `MONITOR_WORKER_NAME` or the store),
+  read-back mismatch, unexpected status.
+- One environment-condition `[warn]` beside the four: the profile POST's
+  no-live-instance answer — send traffic to the Worker and re-run.
+
+`implementation-status 已实现` claims ride ONLY a green (no fail) battery
+run against the live deployment with real credentials — a missing-auth
+warn does not support the claim.
+
 ### Building from a fresh worktree
 
 A fresh `git worktree add` checks out neither `gitea/` (submodule dirs start

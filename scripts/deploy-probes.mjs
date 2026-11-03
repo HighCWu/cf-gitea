@@ -396,38 +396,73 @@
  *                  unwritten; the implementation-status flip 集成待验证 →
  *                  已实现 rides this battery passing against a live
  *                  deployment, SPEC-0021 §6). DIRECT-API CLASS, DOCUMENTED
- *                  HONESTLY: the admin UI's POST /-/admin/monitor/queue/
- *                  {qid}/set and GET /-/admin/monitor/profile routes are the
- *                  PENDING ui/index.ts fold (admin-monitor.tsx's "route
- *                  HANDOFF" block ships them claim-ready), so no admin
- *                  endpoint exists for either arm yet — the battery drives
- *                  the OFFICIAL Cloudflare APIs the deployed adapters ride
- *                  (api.cloudflare.com; services/monitor/{platform,queue-
- *                  concurrency,profile}.ts's exact URLs/bodies/envelopes) and
- *                  the admin-side route surface stays ADMIN-MANUAL until the
- *                  fold lands. It is the ONLY battery whose HTTP leaves the
- *                  deployment entirely (the probe host needs outbound
+ *                  HONESTLY: the battery drives the OFFICIAL Cloudflare APIs
+ *                  the deployed adapters ride (api.cloudflare.com;
+ *                  services/monitor/{platform,queue-concurrency,profile}.ts's
+ *                  exact URLs/bodies/envelopes) — the admin-side /set UI fold
+ *                  has since LANDED (applyAdminMonitorQueueSet mounted in
+ *                  ui/index.ts), and the battery keeps exercising the
+ *                  platform API itself (the adapter class documented
+ *                  admin-manual). It is the ONLY battery whose HTTP leaves
+ *                  the deployment entirely (the probe host needs outbound
  *                  api.cloudflare.com reachability).
- *                  TOKEN-GATED from the probe's OWN environment — the SAME
- *                  names the Worker carries as secrets: CLOUDFLARE_ACCOUNT_ID,
- *                  CLOUDFLARE_QUEUES_TOKEN, MONITOR_QUEUE_CONSUMERS (the
- *                  server-side allowlist JSON, same shape), MONITOR_WORKER_NAME,
- *                  CLOUDFLARE_PROFILE_TOKEN; absent/malformed = the arm's
- *                  checks answer [warn] "skipped: unconfigured …" — never a
- *                  pass, never a network call. Both tokens ride the run's
- *                  scrub table (never echoed).
+ *                  AUTH-GATED, THE ONE-TIME-AUTHORIZATION MODEL (SPEC-0021
+ *                  §4 as-built): credentials come from the probe's OWN env —
+ *                  the SAME names the Worker carries as secrets
+ *                  (CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_QUEUES_TOKEN,
+ *                  MONITOR_QUEUE_CONSUMERS, MONITOR_WORKER_NAME,
+ *                  CLOUDFLARE_PROFILE_TOKEN) — with the persisted 0600 store
+ *                  scripts/setup-monitor-auth.mjs writes once
+ *                  (.monitor-auth.json at the repo root, GITIGNORED;
+ *                  $MONITOR_AUTH_FILE relocates) as the fallback when the
+ *                  env names are absent; env wins field-by-field when both
+ *                  exist. Tokens (either source) ride the run's scrub table
+ *                  (never echoed). Missing/unusable credentials are the
+ *                  missing-auth class — the honest skip, never fake-green.
+ *                  THE FOUR-WAY TAXONOMY (SPEC-0021 §5 as-built — the
+ *                  blanket warn-skip is gone; the class word LEADS the
+ *                  check's detail; exit codes follow the battery's standing
+ *                  convention — warn never fails, fail exits non-zero):
+ *                  missing-auth → [warn] (no credentials; the detail names
+ *                  the one-time fix; it is the pre-authorization state, NOT
+ *                  a release verdict and never "permanently closed");
+ *                  permission-denied → [fail] (401/403 — token mis-scoped,
+ *                  NEVER relabeled "platform unsupported"; a 403 whose
+ *                  envelope names entitlement/availability rather than
+ *                  scope is api-unsupported);
+ *                  api-unsupported → [warn] (the endpoint/capability itself
+ *                  absent for the account — 405/415/410/451/501; honest,
+ *                  never a pass);
+ *                  failure → [fail] (network unreachable, 429 after its
+ *                  bounded retries, 400 rejected request, 404 unresolving
+ *                  configured id, read-back mismatch, unexpected status).
+ *                  The ONE documented environment-condition arm keeps its
+ *                  carve-out: a profile POST whose 400-family body names no
+ *                  live instance is the [warn] environment-condition —
+ *                  never claimed green.
  *                  ARM 1 — THE /SET CLOSED LOOP, serial-locked: ONE consumer
  *                  per run (the allowlist's first entry, or --monitor-consumer;
  *                  never two): read (GET the consumer's FULL config — the
- *                  saved snapshot) → modify (PUT settings.max_concurrency to
- *                  a SAFE value — current−1, or current+1 at the 1-floor;
- *                  auto (null) → the allowlist's declared value, else 1 —
- *                  preserving batch_size / max_retries / max_wait_time_ms /
- *                  retry_delay / dead_letter_queue / script_name / type
- *                  VERBATIM: PUT replaces the consumer wholesale, dropping a
- *                  field DROPS the setting) → verify (GET-verify the
- *                  effective value, 3 reads 500 ms apart — the PUT's own echo
- *                  is NOT trusted) → finally-RESTORE (the saved config
+ *                  saved snapshot) → PERSISTED-RESTORE (the snapshot is
+ *                  written to disk — 0600, OUTSIDE the battery's scratch
+ *                  dir — BEFORE the mutation, and the restore runs on ANY
+ *                  exit path: the restore steps cover success/assertion-
+ *                  failure/throw, a SIGINT/SIGTERM guard performs the
+ *                  restore PUT mid-loop before exiting 130/143, a battery
+ *                  failure-tail retries an unverified restore, and a hard
+ *                  kill leaves the snapshot on disk carrying the hand-
+ *                  restore recipe (no secrets in it); the snapshot is
+ *                  deleted only when the restore is verified) → modify (PUT
+ *                  settings.max_concurrency to a SAFE value — current−1, or
+ *                  current+1 at the 1-floor; auto (null) → the allowlist's
+ *                  declared value, else 1 — preserving batch_size /
+ *                  max_retries / max_wait_time_ms / retry_delay /
+ *                  dead_letter_queue / script_name / type VERBATIM: PUT
+ *                  replaces the consumer wholesale, dropping a field DROPS
+ *                  the setting; the mutation NEVER fires when the snapshot
+ *                  could not be persisted) → verify (GET-verify the
+ *                  effective value, 3 reads 500 ms apart — the PUT's own
+ *                  echo is NOT trusted) → finally-RESTORE (the saved config
  *                  verbatim — RUNS EVEN WHEN the modify/verify steps red: a
  *                  failed PUT may still have landed) → re-verify. RESTORE
  *                  FAILURE IS A BLOCKING RED (never [warn]).
@@ -444,21 +479,15 @@
  *                  sane. ONE 429 retry with backoff (Retry-After honored,
  *                  capped 5 s), then the report. NO secrets and NO binary
  *                  bytes in the logs — byte counts + parse verdicts only.
- *                  The frozen taxonomy (SPEC-0021 §5), ONE classifier for
- *                  every arm: 401/403 → FAIL with the explicit "token
- *                  mis-scoped" message (never "platform unsupported"); 400 →
- *                  fail (the ONE documented exception: a no-live-instance
- *                  message on the profile POST is the environment-condition
- *                  [warn] — never claimed green, the platform's message rides
- *                  the detail); read-back mismatch → fail; unconfigured →
- *                  [warn] skipped; 429 → bounded retries then report.
  *                  INDEPENDENT (the arms report their own verdicts; the /set
  *                  steps gate on the loop's own state instead of chain() so a
- *                  red modify/verify can NEVER chain-skip the restore). A red
- *                  run sweeps NOTHING — the battery creates no deployment
- *                  state (the loop's finally-restore IS the cleanup and its
- *                  failure is the blocking red; profiling is side-effect-
- *                  free), so there is no failureTail.
+ *                  red modify/verify can NEVER chain-skip the restore). The
+ *                  battery creates no deployment state — the failureTail is
+ *                  the PERSISTED-RESTORE safety net (it restores, never
+ *                  sweeps; green runs no-op silently); profiling is side-
+ *                  effect-free. The taxonomy/restore logic is exercised by
+ *                  scripts/setup-monitor-auth.test.mjs against a local stub
+ *                  (MONITOR_CF_API_BASE — point it only at a stub you own).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -558,7 +587,7 @@ import { execFile } from "node:child_process";
 import console from "node:console";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { gunzipSync, gzipSync, inflateSync } from "node:zlib";
 import http from "node:http";
@@ -599,6 +628,16 @@ const MONITOR_PROFILE_DURATION_MIN_MS = 1_000; // the platform's documented mini
 const MONITOR_PROFILE_DURATION_MAX_MS = 5_000; // the probe's frozen cap (the platform accepts up to 50 s)
 const MONITOR_PROFILE_CAP_BYTES = 10 * 1024 * 1024; // the frozen 10 MiB body cap
 const MONITOR_GUNZIP_CAP_BYTES = 64 * 1024 * 1024; // the decompression-bomb guard
+/** Test/stub seam (scripts/setup-monitor-auth.mjs shares the name): the
+ *  monitor arms send their BEARER tokens to this origin. Default the real
+ *  platform; point it ONLY at a stub you own —
+ *  scripts/setup-monitor-auth.test.mjs does exactly that. */
+const MONITOR_CF_API_BASE = (process.env.MONITOR_CF_API_BASE ?? "").trim().replace(/\/+$/, "") || "https://api.cloudflare.com";
+/** The persisted 0600 probe-auth store (the one-time-authorization model,
+ *  SPEC-0021 §4 as-built): scripts/setup-monitor-auth.mjs writes it once;
+ *  the monitor arms fall back to it when the CLOUDFLARE_* env names are
+ *  absent. $MONITOR_AUTH_FILE relocates it (operator/test seam). */
+const MONITOR_AUTH_FILE = (process.env.MONITOR_AUTH_FILE ?? "").trim() || path.join(repoRoot, ".monitor-auth.json");
 
 // ---------- CLI ----------
 
@@ -702,7 +741,7 @@ const usage = () =>
   "  packages-minor: (no extra options — pure HTTP + the run PAT, every fixture generated inline; the husk row sweep reuses --d1-scope and needs wrangler auth, the packages-registry precedent)\n" +
   "  packages-terraform: (no extra options — pure HTTP + the run PAT; the whole-state DELETE is its own row cascade, so unlike the other packages batteries there is NO D1 arm and no wrangler auth)\n" +
   "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
-  "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). The arms read CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME from the probe's OWN env (the same names the Worker carries as secrets); absent = the arm [warn]-skips (never fake-green). HTTP goes to api.cloudflare.com, NOT the deployment.\n" +
+  "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). Auth: the CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME env names (the same names the Worker carries as secrets), falling back to the persisted 0600 store scripts/setup-monitor-auth.mjs writes once (.monitor-auth.json; $MONITOR_AUTH_FILE relocates; env wins field-by-field); absent/unusable = the arm reports missing-auth [warn] (never fake-green — the four-way taxonomy is SPEC-0021 §5 as-built: permission-denied [fail] / api-unsupported [warn] / failure [fail]). HTTP goes to api.cloudflare.com, NOT the deployment (MONITOR_CF_API_BASE relocates the origin — a test/stub seam, point it only at a stub you own).\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1 — the per-run probe token; 0 between runs)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -8400,23 +8439,76 @@ const parseMonitorAllowlist = (raw) => {
   return { targets, error: null };
 };
 
+/** Load the persisted 0600 probe-auth store (the one-time-authorization
+ *  model, SPEC-0021 §4 as-built). Absent → null; present-but-unusable →
+ *  { error } (the pointed reason rides the missing-auth detail); good →
+ *  { auth, savedAt }. Sync — the context builder runs before any step. */
+const monitorLoadAuthFile = () => {
+  let st;
+  try {
+    st = statSync(MONITOR_AUTH_FILE);
+  } catch {
+    return null;
+  }
+  if (!st.isFile()) return { error: `${MONITOR_AUTH_FILE} is not a regular file` };
+  const mode = st.mode & 0o777;
+  if (mode !== 0o600) {
+    return { error: `${MONITOR_AUTH_FILE} must be 0600 (scripts/setup-monitor-auth.mjs writes it so) — got mode ${mode.toString(8).padStart(3, "0")}; fix with chmod 600` };
+  }
+  let doc;
+  try {
+    doc = JSON.parse(readFileSync(MONITOR_AUTH_FILE, "utf8"));
+  } catch (err) {
+    return { error: `${MONITOR_AUTH_FILE} is not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const str = (v) => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
+  return {
+    auth: {
+      accountId: str(doc.account_id),
+      queuesToken: str(doc.queues_token),
+      profileToken: str(doc.profile_token),
+      workerName: str(doc.worker_name),
+      consumers: doc.queue_consumers === undefined || doc.queue_consumers === null
+        ? null
+        : typeof doc.queue_consumers === "string" ? doc.queue_consumers : JSON.stringify(doc.queue_consumers),
+    },
+    savedAt: str(doc.saved_at),
+  };
+};
+
 const monitorPlatformContext = () => {
   const env = process.env;
-  const accountId = env.CLOUDFLARE_ACCOUNT_ID?.trim() || null;
-  const queuesToken = env.CLOUDFLARE_QUEUES_TOKEN?.trim() || null;
-  const profileToken = env.CLOUDFLARE_PROFILE_TOKEN?.trim() || null;
-  const workerName = env.MONITOR_WORKER_NAME?.trim() || MONITOR_PROFILE_DEFAULT_WORKER;
+  // THE ONE-TIME-AUTHORIZATION MODEL: env names first (the same names the
+  // Worker carries as secrets), the persisted 0600 store as the fallback —
+  // env wins field-by-field when both exist.
+  const fileAuth = monitorLoadAuthFile();
+  const pick = (envName, fileKey) => env[envName]?.trim() || fileAuth?.auth?.[fileKey] || null;
+  const accountId = pick("CLOUDFLARE_ACCOUNT_ID", "accountId");
+  const queuesToken = pick("CLOUDFLARE_QUEUES_TOKEN", "queuesToken");
+  const profileToken = pick("CLOUDFLARE_PROFILE_TOKEN", "profileToken");
+  const workerName = pick("MONITOR_WORKER_NAME", "workerName") || MONITOR_PROFILE_DEFAULT_WORKER;
+  const consumersRaw = pick("MONITOR_QUEUE_CONSUMERS", "consumers");
   // The platform tokens ride the same scrub table as the PAT (never echoed).
   if (queuesToken !== null) secrets.push(queuesToken);
   if (profileToken !== null) secrets.push(profileToken);
-  const allow = parseMonitorAllowlist(env.MONITOR_QUEUE_CONSUMERS);
+  const authSource = env.CLOUDFLARE_QUEUES_TOKEN?.trim() || env.CLOUDFLARE_PROFILE_TOKEN?.trim() || env.CLOUDFLARE_ACCOUNT_ID?.trim()
+    ? "env"
+    : fileAuth?.auth
+      ? `${path.basename(MONITOR_AUTH_FILE)}${fileAuth.savedAt ? ` (saved ${fileAuth.savedAt})` : ""}`
+      : "none";
+  const allow = parseMonitorAllowlist(consumersRaw ?? "");
   const qsetMissing = [];
   if (accountId === null) qsetMissing.push("CLOUDFLARE_ACCOUNT_ID");
   if (queuesToken === null) qsetMissing.push("CLOUDFLARE_QUEUES_TOKEN");
+  // A present-but-unusable store is itself the pointed reason — but only when
+  // the env names do not already supply the /set arm's credentials.
+  const fileProblem = fileAuth?.error ?? null;
+  const envSuppliesQset = Boolean(env.CLOUDFLARE_ACCOUNT_ID?.trim() && env.CLOUDFLARE_QUEUES_TOKEN?.trim());
+  if (fileProblem !== null && !envSuppliesQset) qsetMissing.push(`the auth store is unusable: ${fileProblem} (re-run scripts/setup-monitor-auth.mjs)`);
   if (allow.error !== null) {
     qsetMissing.push(allow.error);
   } else if (allow.targets.size === 0) {
-    qsetMissing.push("MONITOR_QUEUE_CONSUMERS (no allowlist entries)");
+    qsetMissing.push("MONITOR_QUEUE_CONSUMERS (no allowlist entries — env absent, the auth store carries none)");
   }
   let qsetTarget = null;
   if (allow.error === null && allow.targets.size > 0) {
@@ -8432,12 +8524,18 @@ const monitorPlatformContext = () => {
   const profileMissing = [];
   if (accountId === null) profileMissing.push("CLOUDFLARE_ACCOUNT_ID");
   if (profileToken === null) profileMissing.push("CLOUDFLARE_PROFILE_TOKEN");
+  if (fileProblem !== null && !(env.CLOUDFLARE_PROFILE_TOKEN?.trim() && env.CLOUDFLARE_ACCOUNT_ID?.trim())) {
+    profileMissing.push(`the auth store is unusable: ${fileProblem} (re-run scripts/setup-monitor-auth.mjs)`);
+  }
   return {
     tmp: null,
+    authSource,
     durationMs: opts.profileDurationMs,
     qsetGate: { configured: qsetMissing.length === 0, reason: qsetMissing.join("; "), accountId, token: queuesToken, target: qsetTarget },
     profileGate: { configured: profileMissing.length === 0, reason: profileMissing.join("; "), accountId, token: profileToken, workerName },
     saved: null, loopOpened: false, modifyTarget: null, restorePutOk: false,
+    // PERSISTED-RESTORE state (see the header block's ARM 1 paragraph).
+    restoreVerified: false, snapshotPath: null, guardInstalled: false, guardOff: null,
   };
 };
 
@@ -8529,30 +8627,189 @@ const monitorEnvelopeErrors = (r) => {
 const monitorErrText = (r) =>
   monitorEnvelopeErrors(r).map((e) => (e.code !== null ? `${e.code}: ${e.message}` : e.message)).filter(Boolean).join("; ").slice(0, 200);
 
-/** THE FROZEN TAXONOMY'S classifier-thrower — ONE mapping for every arm
- *  (classifyNonOk's mirror): 401/403 names the mis-scoped token (NEVER
- *  "platform unsupported"); 400/405/415 the rejected request shape; 404 the
- *  unresolving id; a 429 that survived its retries is reported; everything
- *  else is platform-unavailable. Always throws — the caller's check records
- *  the FAIL. */
+/** 403 envelopes that name entitlement/availability rather than token scope
+ *  (the attribution rule shared with scripts/setup-monitor-auth.mjs — a
+ *  plan/entitlement gap is NOT a mis-scoped token). */
+const MONITOR_ENTITLEMENT_RE = /not\s+entitled|entitlement|not\s+available|not\s+been\s+enabled|not\s+enabled|upgrade|only\s+available|enterprise/i;
+
+/** THE FOUR-WAY TAXONOMY'S classifier-thrower (SPEC-0021 §5 as-built — ONE
+ *  mapping for every arm, classifyNonOk's mirror). The thrown Error carries a
+ *  `.cfClass` stamp the step runner (monitorRun) turns into the verdict:
+ *  "permission-denied" (401/403 — token mis-scoped, NEVER "platform
+ *  unsupported"; an entitlement-naming 403 is api-unsupported instead),
+ *  "api-unsupported" (405/415/410/451/501 — the endpoint/capability absent
+ *  for this account), or "failure" (network, 429-after-retries, 400, 404 —
+ *  the configured id does not resolve, everything else). Always throws — the
+ *  caller's check records the verdict. */
 const monitorThrowCfFailure = (where, r) => {
+  const throwClass = (cls, message) => {
+    const err = new Error(message);
+    err.cfClass = cls;
+    throw err;
+  };
   if (r.networkError !== undefined) {
-    throw new Error(`${where}: the platform is unreachable — ${r.networkError}`);
+    throwClass("failure", `${where}: failure — the platform is unreachable (${r.networkError})`);
   }
   if (r.rateLimited) {
-    throw new Error(`${where}: rate limited after ${r.attempts} attempts (Retry-After honored, capped at ${MONITOR_429_BACKOFF_CAP_MS} ms) — reported per the taxonomy, never a silent green`);
+    throwClass("failure", `${where}: failure — rate limited after ${r.attempts} attempts (Retry-After honored, capped at ${MONITOR_429_BACKOFF_CAP_MS} ms); reported per the taxonomy, never a silent green`);
   }
   const errText = monitorErrText(r);
   if (r.status === 401 || r.status === 403) {
-    throw new Error(`${where}: token mis-scoped — the platform answered ${r.status} (${errText || "no error detail"}); this FAILS the battery and is NEVER reported as "platform unsupported"`);
+    if (r.status === 403 && MONITOR_ENTITLEMENT_RE.test(errText)) {
+      throwClass("api-unsupported", `${where}: api-unsupported — the account answered 403 naming entitlement/availability, not token scope (${errText || "no error detail"}); the capability is not there for this account`);
+    }
+    throwClass("permission-denied", `${where}: permission-denied — token mis-scoped, the platform answered ${r.status} (${errText || "no error detail"}); this FAILS the battery and is NEVER reported as "platform unsupported"`);
   }
-  if (r.status === 400 || r.status === 405 || r.status === 415) {
-    throw new Error(`${where}: the platform rejected the request (${r.status}): ${errText}`);
+  if (r.status === 405 || r.status === 415 || r.status === 410 || r.status === 451 || r.status === 501) {
+    throwClass("api-unsupported", `${where}: api-unsupported — the platform answered ${r.status} for the documented endpoint (${errText || "no error detail"}); the capability/route is not usable as designed`);
+  }
+  if (r.status === 400) {
+    throwClass("failure", `${where}: failure — the platform rejected the request (400): ${errText}`);
   }
   if (r.status === 404) {
-    throw new Error(`${where}: 404 — the configured queue/consumer/worker id does not resolve: ${errText}`);
+    throwClass("failure", `${where}: failure — 404, the configured queue/consumer/worker id does not resolve (${errText}); fix MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME or the auth store`);
   }
-  throw new Error(`${where}: the platform answered ${r.status}: ${errText}`);
+  throwClass("failure", `${where}: failure — the platform answered ${r.status}: ${errText}`);
+};
+
+/** The four-way taxonomy's step runner: an error stamped api-unsupported is
+ *  the honest [warn] (the capability is absent — never fake-green, never a
+ *  claimed pass); every other throw rethrows (the [fail] detail already
+ *  leads with its class word: permission-denied / failure). */
+const monitorRun = async (fn) => {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err && err.cfClass === "api-unsupported") {
+      return { status: "warn", detail: err.message };
+    }
+    throw err;
+  }
+};
+
+// -- PERSISTED-RESTORE (the /set loop's crash-safety net — the saved original
+//    config rides disk BEFORE the mutation and the restore runs on ANY exit
+//    path; see the header block's ARM 1 paragraph) --
+
+/** Write the saved snapshot OUTSIDE the battery's scratch dir (os.tmpdir() —
+ *  a mid-probe death must not lose it to the battery's own cleanup), mode
+ *  0600, NO secrets (ids + config + a hand-restore recipe only). Throws —
+ *  the caller refuses to mutate without a persisted restore point. */
+const monitorPersistSnapshot = async (ctx, gate) => {
+  const snapshotPath = path.join(os.tmpdir(), `cf-gitea-monitor-restore-${hexId(8)}.json`);
+  const putBody = monitorConsumerPutBody(ctx.saved, ctx.saved.maxConcurrency);
+  const doc = {
+    tool: "deploy-probes monitor-platform",
+    purpose: "PERSISTED-RESTORE snapshot — the consumer's FULL saved config taken BEFORE the probe's modify PUT. If this run died before restoring, PUT this config back verbatim (see restore_recipe). Contains NO secrets.",
+    saved_at: new Date().toISOString(),
+    account_id: gate.accountId,
+    queue_key: gate.target.key,
+    queue_id: gate.target.queueId,
+    consumer_id: gate.target.consumerId,
+    consumer_url: monitorConsumerUrl(gate),
+    saved_consumer: {
+      script_name: ctx.saved.scriptName,
+      type: ctx.saved.type,
+      dead_letter_queue: ctx.saved.deadLetterQueue,
+      settings: {
+        batch_size: ctx.saved.batchSize,
+        max_concurrency: ctx.saved.maxConcurrency,
+        max_retries: ctx.saved.maxRetries,
+        max_wait_time_ms: ctx.saved.maxWaitTimeMs,
+        retry_delay: ctx.saved.retryDelay,
+      },
+    },
+    modify_target: ctx.modifyTarget,
+    restored: false,
+    restore_recipe: `PUT ${monitorConsumerUrl(gate)} with body ${putBody} and an "Authorization: Bearer <a Queues-Write token>" header — or restore through the admin Monitor UI's pool settings`,
+  };
+  try {
+    await writeFile(snapshotPath, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
+  } catch (err) {
+    throw new Error(`PERSISTED-RESTORE precondition failed: the snapshot could not be written to ${snapshotPath} — refusing to mutate the consumer without a persisted restore point`, { cause: err });
+  }
+  return snapshotPath;
+};
+
+/** One best-effort restore PUT (+ verify read) with NO retries — the signal
+ *  guard's and the failure-tail's shared muscle. Never throws. */
+const monitorRestoreNow = async (gate, ctx) => {
+  let putOk = false;
+  try {
+    const r = await monitorCfCall({ method: "PUT", url: monitorConsumerUrl(gate), token: gate.token, body: monitorConsumerPutBody(ctx.saved, ctx.saved.maxConcurrency), maxRetries: 0 });
+    putOk = Boolean(r.ok);
+    if (putOk) ctx.restorePutOk = true;
+  } catch {
+    // monitorCfCall already folds every transport fault into its return;
+    // a throw here is a plumbing bug — the tail/guard caller reports it.
+  }
+  let verified = false;
+  if (putOk) {
+    try {
+      await monitorVerifyLoop(gate, ctx.saved.maxConcurrency);
+      verified = true;
+      ctx.restoreVerified = true;
+    } catch {
+      verified = false;
+    }
+  }
+  if (verified && ctx.snapshotPath) await rm(ctx.snapshotPath, { force: true }).catch(() => {});
+  return { putOk, verified };
+};
+
+/** Install the SIGINT/SIGTERM guard for the open loop: the default signal
+ *  behavior is suppressed while a mutation may be outstanding, the restore
+ *  PUT runs first, THEN the process exits 130/143 with the verdict on
+ *  stderr. Idempotent; uninstalled by the restore-put step and the tail. */
+const monitorInstallRestoreGuard = (ctx, gate) => {
+  if (ctx.guardInstalled) return;
+  ctx.guardInstalled = true;
+  const handler = (sig) => {
+    const code = sig === "SIGINT" ? 130 : 143;
+    if (!ctx.loopOpened || ctx.restorePutOk) process.exit(code);
+    console.error(`\n  [tail] monitor-restore-guard: ${sig} mid-loop — putting the saved config back before exit (PERSISTED-RESTORE)`);
+    monitorRestoreNow(gate, ctx)
+      .then(({ putOk, verified }) => {
+        if (verified) console.error("  [tail] monitor-restore-guard: restored + re-verified — the consumer is back on its saved config");
+        else if (putOk) console.error(`  [tail] monitor-restore-guard: the restore PUT was accepted but the verify read did not confirm — snapshot kept for hand-restore: ${ctx.snapshotPath}`);
+        else console.error(`  [tail] monitor-restore-guard: RESTORE FAILED — PUT the snapshot back by hand before relying on this queue: ${ctx.snapshotPath}`);
+        process.exit(code);
+      })
+      .catch(() => {
+        console.error(`  [tail] monitor-restore-guard: RESTORE FAILED (error) — PUT the snapshot back by hand: ${ctx.snapshotPath}`);
+        process.exit(code);
+      });
+  };
+  process.on("SIGINT", handler);
+  process.on("SIGTERM", handler);
+  ctx.guardOff = () => {
+    process.off("SIGINT", handler);
+    process.off("SIGTERM", handler);
+    ctx.guardInstalled = false;
+    ctx.guardOff = null;
+  };
+};
+
+/** The PERSISTED-RESTORE failure tail (the red-runs-self-sweep posture's
+ *  shape — but it RESTORES, it never sweeps: the battery creates no
+ *  deployment state). No-ops silently on green runs (the restore steps
+ *  already verified); retries an unverified restore once and names the
+ *  snapshot for hand-restore when even that fails. */
+const monitorFailureCleanup = async (ctx) => {
+  if (ctx.guardOff) ctx.guardOff();
+  if (!ctx.qsetGate?.configured || !ctx.loopOpened || ctx.restoreVerified) return;
+  const gate = ctx.qsetGate;
+  console.error("  [tail] monitor-restore-tail: the /set loop closed without a verified restore — best-effort restore PUT now (PERSISTED-RESTORE)");
+  let outcome;
+  try {
+    outcome = await monitorRestoreNow(gate, ctx);
+  } catch (err) {
+    console.error(`  [tail] monitor-restore-tail: RESTORE FAILED (${err instanceof Error ? err.message : String(err)}) — PUT the snapshot back by hand: ${ctx.snapshotPath}`);
+    return;
+  }
+  if (outcome.verified) console.error("  [tail] monitor-restore-tail: restored + re-verified — the consumer is back on its saved config (snapshot cleared)");
+  else if (outcome.putOk) console.error(`  [tail] monitor-restore-tail: the restore PUT was accepted but the verify read did not confirm — snapshot kept for hand-restore: ${ctx.snapshotPath}`);
+  else console.error(`  [tail] monitor-restore-tail: RESTORE FAILED — PUT the snapshot back by hand before relying on this queue: ${ctx.snapshotPath}`);
 };
 
 // -- the consumer shapes (queue-concurrency.ts's mirrors) --
@@ -8596,10 +8853,10 @@ const monitorConsumerPutBody = (saved, maxConcurrency) => {
 };
 
 const monitorConsumerUrl = (gate) =>
-  `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(gate.accountId)}/queues/${encodeURIComponent(gate.target.queueId)}/consumers/${encodeURIComponent(gate.target.consumerId)}`;
+  `${MONITOR_CF_API_BASE}/client/v4/accounts/${encodeURIComponent(gate.accountId)}/queues/${encodeURIComponent(gate.target.queueId)}/consumers/${encodeURIComponent(gate.target.consumerId)}`;
 
 const monitorProfileUrl = (gate) =>
-  `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(gate.accountId)}/workers/workers/${encodeURIComponent(gate.workerName)}/versions/latest/profile`;
+  `${MONITOR_CF_API_BASE}/client/v4/accounts/${encodeURIComponent(gate.accountId)}/workers/workers/${encodeURIComponent(gate.workerName)}/versions/latest/profile`;
 
 const monitorFmtMax = (v) => (v === null ? "auto" : String(v));
 
@@ -8791,78 +9048,90 @@ const monitorPlatformSteps = (ctx) => {
   const targetLabel = gate.target !== null
     ? `${gate.target.key} (queue ${gate.target.queueId}, consumer ${gate.target.consumerId})`
     : "the allowlisted consumer";
+  const missingAuth = (reason) => ({
+    status: "warn",
+    detail: `missing-auth: not configured — ${reason} (the one-time fix: node scripts/setup-monitor-auth.mjs, or export the CLOUDFLARE_* names into the probe env)`,
+  });
   return [
     {
       id: "mon-qset-consumer-read",
-      expect: `ARM 1 — THE /SET CLOSED LOOP, serial-locked to ONE consumer (${targetLabel}; the battery never targets two): GET …/queues/{q}/consumers/{c} → 200 envelope; the FULL config is SAVED as the loop's snapshot (the restore rides it verbatim). 401/403 → FAIL "token mis-scoped" (never "platform unsupported"); 400/404/network → fail; unconfigured env → [warn] skip`,
-      run: async () => {
-        if (!gate.configured) return { status: "warn", detail: `skipped: unconfigured — ${gate.reason}` };
+      expect: `ARM 1 — THE /SET CLOSED LOOP, serial-locked to ONE consumer (${targetLabel}; the battery never targets two): GET …/queues/{q}/consumers/{c} → 200 envelope; the FULL config is SAVED as the loop's snapshot (the restore rides it verbatim). Four-way taxonomy: missing-auth → [warn]; permission-denied (401/403) → FAIL (never "platform unsupported"); api-unsupported (405/415/410/451/501) → [warn]; failure (400/404/network) → FAIL`,
+      run: () => monitorRun(async () => {
+        if (!gate.configured) return missingAuth(gate.reason);
         const r = await monitorCfCall({ method: "GET", url: monitorConsumerUrl(gate), token: gate.token, maxRetries: MONITOR_429_RETRIES_ENVELOPE });
         if (!r.ok) monitorThrowCfFailure("reading the consumer", r);
         let saved;
         try {
           saved = monitorParseConsumer(r.json?.result);
         } catch (err) {
-          throw new Error(`the consumer read answered a non-envelope/unknown shape — ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+          throw new Error(`failure — the consumer read answered a non-envelope/unknown shape: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
         ctx.saved = saved;
         ctx.loopOpened = true;
         ctx.modifyTarget = monitorSafeTarget(saved.maxConcurrency, gate.target.declaredMaxConcurrency);
-        return `saved config (consumer ${gate.target.consumerId.slice(0, 8)}…): max_concurrency ${monitorFmtMax(saved.maxConcurrency)}, batch_size ${monitorFmtMax(saved.batchSize)}, max_retries ${monitorFmtMax(saved.maxRetries)} — modify target ${monitorFmtMax(ctx.modifyTarget)}`;
-      },
+        return `saved config (consumer ${gate.target.consumerId.slice(0, 8)}…): max_concurrency ${monitorFmtMax(saved.maxConcurrency)}, batch_size ${monitorFmtMax(saved.batchSize)}, max_retries ${monitorFmtMax(saved.maxRetries)} — modify target ${monitorFmtMax(ctx.modifyTarget)} (auth: ${ctx.authSource})`;
+      }),
     },
     {
       id: "mon-qset-modify-put",
-      expect: `PUT the consumer — settings.max_concurrency → the SAFE target (current−1, or current+1 at the 1-floor; auto → the declared value, else 1), batch_size/max_retries/max_wait_time_ms/retry_delay/dead_letter_queue/script_name/type PRESERVED VERBATIM (PUT replaces the consumer wholesale — dropping a field DROPS the setting). A failure here does NOT skip the restore steps (a failed PUT may still have landed)`,
-      run: async () => {
-        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+      expect: `PUT the consumer — settings.max_concurrency → the SAFE target (current−1, or current+1 at the 1-floor; auto → the declared value, else 1), batch_size/max_retries/max_wait_time_ms/retry_delay/dead_letter_queue/script_name/type PRESERVED VERBATIM (PUT replaces the consumer wholesale — dropping a field DROPS the setting). PERSISTED-RESTORE: the snapshot is written to disk BEFORE the mutation (and the mutation never fires when the persist fails); a PUT failure here does NOT skip the restore steps (a failed PUT may still have landed)`,
+      run: () => monitorRun(async () => {
+        if (!gate.configured) return missingAuth(gate.reason);
         if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified)" };
+        // PERSISTED-RESTORE: the snapshot hits disk BEFORE the mutation —
+        // any death after this point has the original config on disk for
+        // hand-restore (a hard kill) or for the signal guard / failure tail.
+        ctx.snapshotPath = await monitorPersistSnapshot(ctx, gate);
+        monitorInstallRestoreGuard(ctx, gate);
         const r = await monitorCfCall({ method: "PUT", url: monitorConsumerUrl(gate), token: gate.token, body: monitorConsumerPutBody(ctx.saved, ctx.modifyTarget), maxRetries: MONITOR_429_RETRIES_ENVELOPE });
         if (!r.ok) monitorThrowCfFailure(`writing the consumer (max_concurrency ${monitorFmtMax(ctx.saved.maxConcurrency)} → ${monitorFmtMax(ctx.modifyTarget)})`, r);
-        return `PUT accepted — max_concurrency ${monitorFmtMax(ctx.saved.maxConcurrency)} → ${monitorFmtMax(ctx.modifyTarget)} (the untouched fields rode the saved config verbatim)`;
-      },
+        return `PUT accepted — max_concurrency ${monitorFmtMax(ctx.saved.maxConcurrency)} → ${monitorFmtMax(ctx.modifyTarget)} (the untouched fields rode the saved config verbatim; PERSISTED-RESTORE snapshot: ${ctx.snapshotPath})`;
+      }),
     },
     {
       id: "mon-qset-verify-effective",
       expect: `GET-verify the effective value (${MONITOR_VERIFY_ATTEMPTS} reads, ${MONITOR_VERIFY_DELAY_MS} ms apart — the PUT's own echo is NOT trusted): it must equal the modify target; a persistent mismatch is THE read-back-mismatch FAIL (never a claimed success)`,
-      run: async () => {
-        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+      run: () => monitorRun(async () => {
+        if (!gate.configured) return missingAuth(gate.reason);
         if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified)" };
         const { got, attempts } = await monitorVerifyLoop(gate, ctx.modifyTarget);
         return `effective max_concurrency = ${monitorFmtMax(got)} (verified on read ${attempts}/${MONITOR_VERIFY_ATTEMPTS})`;
-      },
+      }),
     },
     {
       id: "mon-qset-restore-put",
-      expect: `FINALLY-RESTORE the saved config (PUT settings.max_concurrency back to the SAVED value — RUNS EVEN WHEN the modify/verify steps red): RESTORE FAILURE IS A BLOCKING RED, never [warn] — the probe never leaves a consumer modified while claiming anything`,
-      run: async () => {
-        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+      expect: `FINALLY-RESTORE the saved config (PUT settings.max_concurrency back to the SAVED value — RUNS EVEN WHEN the modify/verify steps red): RESTORE FAILURE IS A BLOCKING RED, never [warn] — the probe never leaves a consumer modified while claiming anything; on success the SIGINT/SIGTERM guard is uninstalled`,
+      run: () => monitorRun(async () => {
+        if (!gate.configured) return missingAuth(gate.reason);
         if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified; nothing to restore)" };
         const r = await monitorCfCall({ method: "PUT", url: monitorConsumerUrl(gate), token: gate.token, body: monitorConsumerPutBody(ctx.saved, ctx.saved.maxConcurrency), maxRetries: MONITOR_429_RETRIES_ENVELOPE });
         if (!r.ok) {
-          throw new Error(`RESTORE FAILED (BLOCKING): the platform refused the restore PUT (${r.status}: ${monitorErrText(r)}) — the consumer may still carry the probe's modified max_concurrency ${monitorFmtMax(ctx.modifyTarget)}; restore it by hand (the admin Monitor UI's pool settings or the Queues API) before relying on this queue`);
+          throw new Error(`RESTORE FAILED (BLOCKING): the platform refused the restore PUT (${r.status}: ${monitorErrText(r)}) — the consumer may still carry the probe's modified max_concurrency ${monitorFmtMax(ctx.modifyTarget)}; restore it by hand (the admin Monitor UI's pool settings, the Queues API, or the snapshot's restore_recipe) before relying on this queue`);
         }
         ctx.restorePutOk = true;
+        if (ctx.guardOff) ctx.guardOff(); // the restore is in — the signal guard's job is done
         return `restored max_concurrency = ${monitorFmtMax(ctx.saved.maxConcurrency)} (the saved config verbatim)`;
-      },
+      }),
     },
     {
       id: "mon-qset-verify-restore",
-      expect: `GET-re-verify the restore (the same bounded reads): the effective value must equal the SAVED value again — the closed loop is clean; a mismatch here is a BLOCKING RED (read-back mismatch never passes)`,
-      run: async () => {
-        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+      expect: `GET-re-verify the restore (the same bounded reads): the effective value must equal the SAVED value again — the closed loop is clean; a mismatch here is a BLOCKING RED (read-back mismatch never passes). On success the PERSISTED-RESTORE snapshot is cleared (no residue)`,
+      run: () => monitorRun(async () => {
+        if (!gate.configured) return missingAuth(gate.reason);
         if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified; nothing to verify)" };
         const { got, attempts } = await monitorVerifyLoop(gate, ctx.saved.maxConcurrency);
+        ctx.restoreVerified = true;
+        if (ctx.snapshotPath) await rm(ctx.snapshotPath, { force: true }).catch(() => {});
         const note = ctx.restorePutOk ? "" : " (the restore PUT answered an error — but the effective value IS the saved config again; the restore step's red stands)";
-        return `restore re-verified: effective max_concurrency = ${monitorFmtMax(got)} (read ${attempts}/${MONITOR_VERIFY_ATTEMPTS})${note}`;
-      },
+        return `restore re-verified: effective max_concurrency = ${monitorFmtMax(got)} (read ${attempts}/${MONITOR_VERIFY_ATTEMPTS}); PERSISTED-RESTORE snapshot cleared${note}`;
+      }),
     },
     {
       id: "mon-pprof-content",
-      expect: `ARM 2 — THE PPROF CONTENT PROBE: POST …/workers/workers/{w}/versions/latest/profile {"duration_ms":${ctx.durationMs} ≤ 5000,"profile_type":"cpu"} → 200 with a GZIPPED PPROF FILE → validate CONTENT: non-empty → the 10 MiB cap (content-length gated; the streamed read aborts past it) → gunzip (64 MiB bomb guard) → the pprof protobuf parses (a minimal field-tag walk, NO parser linked) → string_table[0] empty, sample_type resolves non-empty strings, time_nanos/duration_nanos positive. ONE 429 retry with backoff, then report. NO secrets, NO binary bytes in the logs (byte counts + verdicts only). 401/403 → FAIL "token mis-scoped"; 400 → FAIL (a no-live-instance message is the documented environment-condition [warn], never claimed green); unconfigured env → [warn] skip`,
-      run: async () => {
+      expect: `ARM 2 — THE PPROF CONTENT PROBE: POST …/workers/workers/{w}/versions/latest/profile {"duration_ms":${ctx.durationMs} ≤ 5000,"profile_type":"cpu"} → 200 with a GZIPPED PPROF FILE → validate CONTENT: non-empty → the 10 MiB cap (content-length gated; the streamed read aborts past it) → gunzip (64 MiB bomb guard) → the pprof protobuf parses (a minimal field-tag walk, NO parser linked) → string_table[0] empty, sample_type resolves non-empty strings, time_nanos/duration_nanos positive. ONE 429 retry with backoff, then report. NO secrets, NO binary bytes in the logs (byte counts + verdicts only). Four-way taxonomy: missing-auth → [warn]; permission-denied (401/403) → FAIL; api-unsupported → [warn]; failure → FAIL (a no-live-instance message on the 400-family is the documented environment-condition [warn], never claimed green)`,
+      run: () => monitorRun(async () => {
         const pGate = ctx.profileGate;
-        if (!pGate.configured) return { status: "warn", detail: `skipped: unconfigured — ${pGate.reason}` };
+        if (!pGate.configured) return missingAuth(pGate.reason);
         const r = await monitorProfileCall(pGate, ctx.durationMs);
         if (!r.ok) {
           // The ONE documented environment-condition carve-out: a 400-family
@@ -8877,22 +9146,22 @@ const monitorPlatformSteps = (ctx) => {
         }
         const declared = Number.parseInt(r.res.headers.get("content-length") ?? "", 10);
         if (Number.isFinite(declared) && declared > MONITOR_PROFILE_CAP_BYTES) {
-          throw new Error(`profile exceeds the probe's 10 MiB cap (${declared} bytes declared)`);
+          throw new Error(`failure — profile exceeds the probe's 10 MiB cap (${declared} bytes declared)`);
         }
         const bytes = await monitorReadBodyCapped(r.res, MONITOR_PROFILE_CAP_BYTES);
-        if (bytes.length === 0) throw new Error("the platform answered 200 with an EMPTY body (a profile is never empty)");
+        if (bytes.length === 0) throw new Error("failure — the platform answered 200 with an EMPTY body (a profile is never empty)");
         if (!(bytes[0] === 0x1f && bytes[1] === 0x8b)) {
-          throw new Error(`the response is not a gzip stream (first bytes ${bytes[0]}, ${bytes.length === 1 ? "<end>" : bytes[1]})`);
+          throw new Error(`failure — the response is not a gzip stream (first bytes ${bytes[0]}, ${bytes.length === 1 ? "<end>" : bytes[1]})`);
         }
         let inflated;
         try {
           inflated = gunzipSync(bytes, { maxOutputLength: MONITOR_GUNZIP_CAP_BYTES });
         } catch (err) {
-          throw new Error(`gunzip failed on the ${bytes.length} byte body — ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+          throw new Error(`failure — gunzip failed on the ${bytes.length} byte body: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
         const walk = monitorAnalyzePprof(inflated);
-        return `${bytes.length} B gzip → ${inflated.length} B pprof; protobuf parses (${walk.fieldCount} fields, all wire types valid); string_table ${walk.stringCount} entries (entry 0 empty); sample_type ${walk.sampleType}; time_nanos/duration_nanos positive (window ≈ ${walk.durationMs} ms)${walk.periodType !== null ? `; period_type ${walk.periodType}` : ""}`;
-      },
+        return `${bytes.length} B gzip → ${inflated.length} B pprof; protobuf parses (${walk.fieldCount} fields, all wire types valid); string_table ${walk.stringCount} entries (entry 0 empty); sample_type ${walk.sampleType}; time_nanos/duration_nanos positive (window ≈ ${walk.durationMs} ms)${walk.periodType !== null ? `; period_type ${walk.periodType}` : ""} (auth: ${ctx.authSource})`;
+      }),
     },
   ];
 };
@@ -9092,13 +9361,17 @@ const BATTERIES = {
   // Independent (the two arms report their own verdicts; the /set family's
   // restore steps gate on the loop's own state instead of chain() so a red
   // modify/verify can NEVER chain-skip the restore). Direct-API class: the
-  // admin UI's /set + /profile routes are the pending ui/index.ts fold, so
-  // the arms drive the OFFICIAL Cloudflare APIs from the probe's env —
-  // token-gated, absent = [warn]-skip, never fake-green (see the battery
-  // section + the header block). No failureTail: the battery creates no
-  // deployment state — the /set loop's finally-restore IS the cleanup, and
-  // its failure is the blocking red; profiling is side-effect-free.
-  "monitor-platform": { title: "monitor platform arms (SPEC-0021 §7: the /set closed loop — GET-save → SAFE modify → GET-verify → finally-RESTORE → re-verify, serial-locked to one MONITOR_QUEUE_CONSUMERS entry, restore failure a BLOCKING red — and the pprof content probe — cpu ≤ 5 s, 10 MiB cap, gunzip → minimal protobuf walk → sane fields, ONE 429 retry; direct-API class over api.cloudflare.com, token-gated from the probe's env)", context: monitorPlatformContext, steps: monitorPlatformSteps, independent: true },
+  // arms drive the OFFICIAL Cloudflare APIs, auth-gated from the probe's env
+  // OR the persisted 0600 store (scripts/setup-monitor-auth.mjs writes
+  // .monitor-auth.json once; env wins field-by-field) — missing/unusable
+  // credentials are the missing-auth [warn], never fake-green; the four-way
+  // taxonomy is SPEC-0021 §5 as-built (see the battery section + the header
+  // block). The failureTail is the PERSISTED-RESTORE safety net (it
+  // RESTORES, never sweeps — the battery creates no deployment state): the
+  // /set loop's finally-restore steps are the primary cleanup and their
+  // failure is the blocking red; the tail retries an unverified restore and
+  // names the on-disk snapshot for hand-restore when even that fails.
+  "monitor-platform": { title: "monitor platform arms (SPEC-0021 §7: the /set closed loop — GET-save → PERSISTED-RESTORE snapshot → SAFE modify → GET-verify → finally-RESTORE → re-verify, serial-locked to one MONITOR_QUEUE_CONSUMERS entry, restore failure a BLOCKING red, the restore covering EVERY exit path incl. SIGINT/SIGTERM and the failure tail — and the pprof content probe — cpu ≤ 5 s, 10 MiB cap, gunzip → minimal protobuf walk → sane fields, ONE 429 retry; direct-API class over api.cloudflare.com, the four-way taxonomy, auth from the probe's env or the 0600 store)", context: monitorPlatformContext, steps: monitorPlatformSteps, failureTail: monitorFailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };

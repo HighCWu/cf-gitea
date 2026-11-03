@@ -29,3 +29,7 @@ apps/worker/.vitest/
 # Real wrangler config (from .example via pnpm setup:deploy or the deploy
 # button; carries the account's real resource ids)
 apps/worker/wrangler.jsonc
+
+# Monitor-platform probe auth (scripts/setup-monitor-auth.mjs) — the
+# operator's 0600 token store; secrets, runtime state, never committed
+.monitor-auth.json

@@ -67,8 +67,11 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   ui-login battery captures. The monitor-platform battery's platform tokens
   (`CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`) ride the SAME scrub
   table — they are read from the probe's own environment (the same names the
-  Worker carries as secrets), never from a file or a flag, and are absent-
-  gated to `[warn]` skips (never fake-green).
+  Worker carries as secrets) with the persisted 0600 store
+  `scripts/setup-monitor-auth.mjs` writes once (`.monitor-auth.json` at the
+  repo root, gitignored; `$MONITOR_AUTH_FILE` relocates) as the fallback when
+  the env names are absent — env wins field-by-field — and are absent-gated
+  to the `missing-auth` `[warn]` class (never fake-green).
 - After the run the operator DELETEs the per-run PAT (by id/prefix) and re-checks
   the token count with `cleanup-audit` — the default expectation is **1, the
   per-run probe token itself; 0 between runs** (the v1.5.1 re-baseline,
@@ -107,7 +110,7 @@ default 3):
 | `packages-minor` | 9 | the SPEC-0016 §7 minor six: chef (cookbook tar.gz → universe + search + cookbook/version metadata with the 1_0_1 knife quirk → download → protocol version delete) + composer (raw zip PUT ?version= → packages.json/list.json/p2 with the %2F dist url + sha1 → download → management delete) + conan (v2 recipe revision → revisions/latest + the pinned revision-files list {"conanfile.py":null} → pinned download → pinned v2 delete) + cran (DESCRIPTION tar.gz → PACKAGES(.gz) block with the EMPTY MD5sum → download → management delete) + pub (request-upload → multipart → finalize → the normalized enumerate → download → management delete) + vagrant (box PUT → HEAD probe → the provider array + sha512 → download → management delete) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `packages-terraform` | 13 | the SPEC-0016 §7 terraform state backend: anonymous write 401s + the anonymous read-through to the EMPTY 404, state upload → GET byte-parity round-trip (serial/lineage re-parsed off the wire, HEAD parity), duplicate-serial 409, latest-serial DELETE 403 + non-latest 204, lock set/locked 423 with the Go field-order JSON (the 423 body IS the lock read — no GET lock route in the pin), the PRE-BODY `?ID=` upload gate (mismatch 423 over a parse-hostile body, match 201, lock survives), whole-DELETE locked 423 plain, unlock mismatch 423 plain / right ID 200 + the freed re-lock proof, the lock's package allocation + protocol-husk cascade, the unknown-name DELETE 404 contrast, whole-state delete t+0 + repo delete | HTTP (no D1 arms — the whole-state DELETE is its own row cascade) |
 | `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
-| `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → SAFE modify → GET-verify → finally-RESTORE → re-verify; restore failure a BLOCKING red; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the direct-API class stands in by design: the admin `/set` UI fold has since LANDED (`applyAdminMonitorQueueSet` mounted in `ui/index.ts`), but the battery exercises the platform API itself, documented admin-manual) + the arm tokens from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets; absent = the arm `[warn]`-skips, never fake-green) |
+| `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → PERSISTED-RESTORE snapshot → SAFE modify → GET-verify → finally-RESTORE → re-verify; the saved original config rides disk — 0600, outside the battery's scratch dir, no secrets, a hand-restore recipe inside — BEFORE the mutation, and the restore covers EVERY exit path: the restore steps on success/assertion-failure/throw, a SIGINT/SIGTERM guard that restores before exiting 130/143, a failure-tail retry for an unverified restore, and a hard kill leaving the snapshot for hand-restore; restore failure a BLOCKING red; the mutation never fires when the persist fails; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the direct-API class stands in by design: the admin `/set` UI fold has since LANDED (`applyAdminMonitorQueueSet` mounted in `ui/index.ts`), but the battery exercises the platform API itself, documented admin-manual) + the FOUR-WAY auth taxonomy (SPEC-0021 §5 as-built — the class word leads each detail; `missing-auth` `[warn]` = the pre-authorization state, never a release verdict and never "permanently closed" / `permission-denied` `[fail]` = 401/403 mis-scoped, never "platform unsupported" / `api-unsupported` `[warn]` = 405/415/410/451/501 or an entitlement-naming 403 / `failure` `[fail]` = network, 429-after-retries, 400, 404 unresolving id, read-back mismatch; the profile's no-live-instance answer stays the environment-condition `[warn]`) + credentials from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets) with the persisted 0600 store `.monitor-auth.json` written once by `scripts/setup-monitor-auth.mjs` (env wins field-by-field; absent/unusable = the `missing-auth` class, never fake-green) + the test seams `MONITOR_CF_API_BASE` / `MONITOR_AUTH_FILE` (point them only at a stub/path you own; `scripts/setup-monitor-auth.test.mjs` drives the battery's taxonomy/restore logic against a local stub) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
 | **`all`** | **253** | every battery in registry order, audit last | union of the above |
 
@@ -935,41 +938,53 @@ prints all of them verbatim.
   verification half the 1308 quota death left unwritten; the SPEC's
   implementation-status flip 集成待验证 → 已实现 rides this battery passing
   against a live deployment — SPEC-0021 §6). **Direct-API class, documented
-  honestly:** the admin UI's `POST /-/admin/monitor/queue/{qid}/set` and
-  `GET /-/admin/monitor/profile` routes are the PENDING `ui/index.ts` fold
-  (admin-monitor.tsx's "route HANDOFF" block ships them claim-ready), so no
-  admin endpoint exists for either arm yet — the battery drives the OFFICIAL
-  Cloudflare APIs the deployed adapters ride
+  honestly:** the battery drives the OFFICIAL Cloudflare APIs the deployed
+  adapters ride
   (`apps/worker/src/services/monitor/{platform,queue-concurrency,profile}.ts`'s
   exact URLs, bodies, envelope shapes, preservation rule, verify posture,
-  and 429 bounds, mirrored as literals) and the admin-side route surface
-  stays **admin-manual** until the fold lands. It is the only battery whose
-  HTTP leaves the deployment entirely (the probe host needs outbound
-  api.cloudflare.com reachability). **Token gating (never fake-green):** each
-  arm reads the SAME env names the Worker carries as secrets, from the
-  probe's OWN environment — `CLOUDFLARE_ACCOUNT_ID`,
-  `CLOUDFLARE_QUEUES_TOKEN`, `MONITOR_QUEUE_CONSUMERS` (the server-side
-  allowlist JSON, same shape), `MONITOR_WORKER_NAME` (default `cf-gitea`),
-  `CLOUDFLARE_PROFILE_TOKEN`; an absent/malformed name degrades that arm's
-  checks to `[warn] "skipped: unconfigured …"` — never a pass, never a
-  network call (proven: a token-absent run makes exactly ONE HTTP request,
-  the PAT preflight). Both platform tokens ride the run's scrub table.
+  and 429 bounds, mirrored as literals) — the admin `/set` UI fold has since
+  LANDED (`applyAdminMonitorQueueSet` mounted in `ui/index.ts`), and the
+  battery keeps exercising the platform API itself, the adapter class
+  documented admin-manual. It is the only battery whose HTTP leaves the
+  deployment entirely (the probe host needs outbound api.cloudflare.com
+  reachability). **Auth gating — the one-time-authorization model
+  (SPEC-0021 §4 as-built), never fake-green:** each arm reads the SAME env
+  names the Worker carries as secrets, from the probe's OWN environment —
+  `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`,
+  `MONITOR_QUEUE_CONSUMERS` (the server-side allowlist JSON, same shape),
+  `MONITOR_WORKER_NAME` (default `cf-gitea`), `CLOUDFLARE_PROFILE_TOKEN` —
+  with the persisted 0600 store `scripts/setup-monitor-auth.mjs` writes once
+  (`.monitor-auth.json` at the repo root, gitignored; `$MONITOR_AUTH_FILE`
+  relocates) as the fallback when the env names are absent; env wins
+  field-by-field when both exist. Absent/unusable credentials are the
+  `missing-auth` class — never a pass, never a network call beyond the PAT
+  preflight. Both platform tokens ride the run's scrub table.
   **Arm 1 — the `/set` closed loop, serial-locked:** ONE consumer per run
   (the allowlist's first entry, or `--monitor-consumer <key>`; the battery
   never targets two): read (GET the consumer's FULL config — the saved
-  snapshot) → modify (PUT `settings.max_concurrency` to a SAFE value —
-  current−1, or current+1 at the 1-floor; auto (`null`) → the allowlist's
-  declared value, else 1 — preserving `batch_size` / `max_retries` /
-  `max_wait_time_ms` / `retry_delay` / `dead_letter_queue` / `script_name` /
-  `type` VERBATIM: PUT replaces the consumer wholesale, dropping a field
-  DROPS the setting) → verify (GET-verify the effective value, 3 reads
-  500 ms apart — the PUT's own echo is NOT trusted) → finally-RESTORE (the
-  saved config verbatim — RUNS EVEN WHEN the modify/verify steps red: a
-  failed PUT may still have landed, so the restore + its re-verify are
-  unconditional once the loop opened; the /set steps gate on the loop's own
-  state instead of `chain()` so a red modify/verify can NEVER chain-skip the
-  restore) → re-verify. **RESTORE FAILURE IS A BLOCKING RED** (never
-  `[warn]`). **Arm 2 — the pprof content probe:** POST the profile
+  snapshot) → **PERSISTED-RESTORE** (the snapshot — the consumer's full
+  saved config, ids, and a hand-restore recipe, NO secrets — is written to
+  disk at mode 0600 OUTSIDE the battery's scratch dir BEFORE the mutation;
+  the mutation NEVER fires when the persist fails; the snapshot is deleted
+  only when the restore is verified) → modify (PUT `settings.max_concurrency`
+  to a SAFE value — current−1, or current+1 at the 1-floor; auto (`null`) →
+  the allowlist's declared value, else 1 — preserving `batch_size` /
+  `max_retries` / `max_wait_time_ms` / `retry_delay` / `dead_letter_queue` /
+  `script_name` / `type` VERBATIM: PUT replaces the consumer wholesale,
+  dropping a field DROPS the setting) → verify (GET-verify the effective
+  value, 3 reads 500 ms apart — the PUT's own echo is NOT trusted) →
+  finally-RESTORE (the saved config verbatim — RUNS EVEN WHEN the
+  modify/verify steps red: a failed PUT may still have landed, so the
+  restore + its re-verify are unconditional once the loop opened; the /set
+  steps gate on the loop's own state instead of `chain()` so a red
+  modify/verify can NEVER chain-skip the restore) → re-verify. **The
+  restore covers EVERY exit path** (the PERSISTED-RESTORE contract): the
+  steps above on success/assertion-failure/throw; a SIGINT/SIGTERM guard
+  performs the restore PUT mid-loop before exiting 130/143; a failure-tail
+  (`monitor-restore-tail`) retries an unverified restore after the steps;
+  and a hard kill leaves the on-disk snapshot as the hand-restore record.
+  **RESTORE FAILURE IS A BLOCKING RED** (never `[warn]`).
+  **Arm 2 — the pprof content probe:** POST the profile
   (`profile_type: "cpu"`, `--profile-duration-ms` default 1000, capped 5000
   — the platform answers synchronously, so this is the arm's wall time) and
   validate CONTENT: non-empty → the 10 MiB cap (content-length gated; the
@@ -980,17 +995,28 @@ prints all of them verbatim.
   in-bounds strings; `time_nanos` + `duration_nanos` present and positive;
   `period` positive when present) → sane. ONE 429 retry with backoff
   (Retry-After honored, capped 5 s), then the report. NO secrets and NO
-  binary bytes in the logs — byte counts + parse verdicts only. **The frozen
-  taxonomy (SPEC-0021 §5), ONE classifier for every arm:** 401/403 → FAIL
-  with the explicit "token mis-scoped" message (never "platform
-  unsupported"); 400 → FAIL (the ONE documented exception: a
-  no-live-instance message on the profile POST is the environment-condition
-  `[warn]` — never claimed green, the platform's message rides the detail
-  verbatim); read-back mismatch → FAIL; unconfigured → `[warn]` skipped;
-  429 → bounded retries then report. INDEPENDENT (the arms report their own
-  verdicts). **No failureTail:** the battery creates no deployment state —
-  the loop's finally-restore IS the cleanup and its failure is the blocking
-  red; profiling is side-effect-free.
+  binary bytes in the logs — byte counts + parse verdicts only. **The
+  four-way taxonomy (SPEC-0021 §5 as-built — the blanket warn-skip is
+  gone), ONE classifier for every arm, the class word leading each
+  detail:** `missing-auth` → `[warn]` (the pre-authorization state — NOT a
+  release verdict, never "permanently closed"; the detail names the
+  one-time fix); `permission-denied` → FAIL (401/403 "token mis-scoped",
+  never "platform unsupported"; an entitlement-naming 403 is
+  api-unsupported instead); `api-unsupported` → `[warn]` (405/415/410/451/
+  501 — the capability absent for the account, honest, never a pass);
+  `failure` → FAIL (400, 404 unresolving configured id, read-back mismatch,
+  network, 429 after its bounded retries); plus the ONE documented
+  environment-condition exception: a no-live-instance message on the
+  profile POST is the environment-condition `[warn]` — never claimed
+  green, the platform's message rides the detail verbatim. Exit codes
+  follow the battery's standing convention (warn never fails, fail exits
+  non-zero). INDEPENDENT (the arms report their own verdicts). **The
+  failureTail is the PERSISTED-RESTORE safety net** (it RESTORES, never
+  sweeps — the battery creates no deployment state; green runs no-op
+  silently); profiling is side-effect-free. The taxonomy/restore/auth
+  logic is exercised end-to-end by `scripts/setup-monitor-auth.test.mjs`
+  against a local stub (the `MONITOR_CF_API_BASE` origin seam — point it
+  only at a stub you own).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
