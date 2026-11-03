@@ -130,7 +130,13 @@ describe("wave-19 parser families (parseUiRoute / handlesUiRoute)", () => {
     // shadow pin updated to the family claim (the sweep's finding).
     expect(parseUiRoute("/repo/migrate")).toEqual({ family: "repo-migrate" });
     expect(parseUiRoute("/repo/create/more")).toBeNull();
-    expect(parseUiRoute("/org/teams")?.family).toBe("org-teams"); // wave 12's literal, untouched
+    // The ledger-B3 flip: /org/{org}/teams is the wave-12 literal's shape
+    // now. A 3-segment /org/teams parses as the REPO-HOME family (owner
+    // "org", repo "teams") — the parser claims it, and the handler 404s at
+    // resolution (upstream's OrgAssignment miss for an org named "teams",
+    // web.go:993's group needing the {org} login — the same observable).
+    expect(parseUiRoute("/org/teams")).toEqual({ family: "home", owner: "org", repo: "teams", refSuffix: null });
+    expect(parseUiRoute("/org/someorg/teams")?.family).toBe("org-teams");
   });
 });
 

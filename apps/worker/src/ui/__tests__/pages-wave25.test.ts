@@ -255,7 +255,7 @@ describe("wave-25 parser claims", () => {
     expect(handlesUiRoute("/wave25-owner/labeled/tags/extra")).toBe(false);
     // The wave-14 org literal keeps its second-segment claim: a TWO-segment
     // /{owner}/labels is the org page, never the repo page.
-    expect(parseUiRoute("/wave25-owner/labels")).toEqual({ family: "org-labels", owner: "wave25-owner" });
+    expect(parseUiRoute("/org/wave25-owner/settings/labels")).toEqual({ family: "org-labels", owner: "wave25-owner" });
   });
 });
 
@@ -481,12 +481,12 @@ describe("labels page /{owner}/{repo}/labels", () => {
     const outsiderHtml = await outsider.text();
     expect(outsiderHtml).toContain("Organization-level labels");
     expect(outsiderHtml).toContain("org-wide");
-    expect(outsiderHtml).not.toContain('href="/wave25org/labels"');
+    expect(outsiderHtml).not.toContain('href="/org/wave25org/settings/labels"');
 
     const ownerRes = await fetchUi("/wave25org/canvas/labels", withCookie("/wave25org/canvas/labels", fixture.orgOwnerCookie));
     expect(ownerRes.status).toBe(200);
     const ownerHtml = await ownerRes.text();
-    expect(ownerHtml).toContain('href="/wave25org/labels"');
+    expect(ownerHtml).toContain('href="/org/wave25org/settings/labels"');
     // The org rows render no edit/delete controls even for the org owner
     // (upstream's $canEditLabel is the repo write grant, and canvas has no
     // repo labels — the only rows are org rows).

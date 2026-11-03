@@ -1,7 +1,7 @@
 /**
  * The org settings HOOKS tab — pages wave 53 (the org-settings module's named
  * next slice): upstream web.go:1033-1044's `/hooks` group inside the
- * require-owner `/{org}/settings` subtree over `gitea/templates/org/settings/
+ * require-owner `/org/{org}/settings` subtree over `gitea/templates/org/settings/
  * hooks.tmpl` (the list, `organization settings webhooks`) and
  * `org/settings/hook_new.tmpl` (the per-hook edit, `organization settings new
  * webhook` — the shared repo_setting.WebHooksEdit handler renders BOTH the
@@ -120,7 +120,7 @@ import {
 } from "./settings";
 
 // ---------------------------------------------------------------------------
-// The list page (GET /{org}/settings/hooks — org/settings/hooks.tmpl)
+// The list page (GET /org/{org}/settings/hooks — org/settings/hooks.tmpl)
 // ---------------------------------------------------------------------------
 
 /** One rendered hook row: the stored row, its event names (hookEventsArray)
@@ -211,7 +211,7 @@ export function renderOrgHooksSettingsPage(options: {
 export function OrgHooksSettingsPage(props: { ctx: UiContext; data: OrgHooksSettingsData; error: string | null }) {
   const { ctx, data } = props;
   const org = data.org;
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   const hooksLink = `${orgLink}/settings/hooks`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsLocale.settings} pageClass="organization settings webhooks">
@@ -318,7 +318,7 @@ export function OrgHooksSettingsPage(props: { ctx: UiContext; data: OrgHooksSett
 }
 
 // ---------------------------------------------------------------------------
-// The per-hook page (GET+POST /{org}/settings/hooks/{id} +
+// The per-hook page (GET+POST /org/{org}/settings/hooks/{id} +
 // POST .../{id}/delete — org/settings/hook_new.tmpl's edit arm over the
 // shared repo_setting.WebHooksEdit / GiteaHooksEditPost / DeleteWebhook
 // org-scope shapes)
@@ -442,7 +442,7 @@ export function renderOrgHookDetailPage(options: {
 export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailData; error: string | null }) {
   const { ctx, data } = props;
   const org = data.org;
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   const hookLink = `${orgLink}/settings/hooks/${data.hook.id}`;
   const form = data.form;
   return (

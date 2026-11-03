@@ -1,7 +1,7 @@
 /**
  * The org settings APPLICATIONS tab — the census R20 (a) arm: upstream
  * web.go:1027-1037's `/applications` group inside the require-owner
- * `/{org}/settings` subtree (`GET org.Applications` + `POST web.Bind
+ * `/org/{org}/settings` subtree (`GET org.Applications` + `POST web.Bind
  * [*forms.EditOAuth2ApplicationForm] org.OAuthApplicationsPost` + the
  * `/oauth2/{id}` family whose `POST /oauth2/{id}/delete` deletes) over
  * `gitea/templates/org/settings/applications.tmpl` — which embeds the SHARED
@@ -106,15 +106,15 @@
  *
  * ## Mount record (MOUNTED this wave — the routes are live)
  *
- *   GET  /{org}/settings/applications                     the list (the
+ *   GET  /org/{org}/settings/applications                     the list (the
  *                                                         org-teams
  *                                                         prologue → load
  *                                                         → render at 200)
- *   POST /{org}/settings/applications/oauth2              the create (guard
+ *   POST /org/{org}/settings/applications/oauth2              the create (guard
  *                                                         + prologue → form
  *                                                         → create /
  *                                                         re-render at 200)
- *   POST /{org}/settings/applications/oauth2/{id}/delete  the delete (guard
+ *   POST /org/{org}/settings/applications/oauth2/{id}/delete  the delete (guard
  *                                                         + prologue → 303
  *                                                         / 404 shell)
  *
@@ -136,7 +136,7 @@
  *     verbatim) → the shared edit page (pages/oauth2-app-edit.tsx — the
  *     OAuth2CommonHandlers port; the org variant renders this page's chrome
  *     with the edit-form segment). The parse-tree claims ride the W5 handoff
- *     (ui/index.ts): GET/POST /{org}/settings/applications/oauth2/{id} and
+ *     (ui/index.ts): GET/POST /org/{org}/settings/applications/oauth2/{id} and
  *     POST .../{id}/regenerate_secret, all inside the landed applications
  *     group's `oauth2Enabled` gate (web.go:1030 — the group wrap answers
  *     oauth2SettingsForbidden's 403 when OAUTH2_ENABLED=false; the landed
@@ -344,7 +344,7 @@ export function renderOrgApplicationsPage(options: {
 export function OrgApplicationsPage(props: { ctx: UiContext; data: OrgSettingsApplicationsData; error: string | null }) {
   const { ctx, data } = props;
   const org = data.org;
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   const pageLink = `${orgLink}/settings/applications`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsApplicationsLocale.applications} pageClass="organization settings options">

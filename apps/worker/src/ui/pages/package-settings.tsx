@@ -96,10 +96,10 @@
  *
  * The user arm's visibility button targets `/{owner}/settings` — upstream's
  * `ContextUser.SettingsLink` spells orgs `/org/{name}/settings`
- * (models/user/user.go:334-339), a URL family this codebase does not host;
- * the landed org settings page is `/{org}/settings` (the dead-link rule's
- * bend, documented here). Users target `/user/settings` (the same fixed
- * literal upstream spells).
+ * (models/user/user.go:334-339), and the landed org settings page rides the
+ * SAME canonical `/org/{org}/settings` shape since ledger B3 (the pre-B3
+ * bare /{org}/settings bend retired — upstream-parity restored). Users
+ * target `/user/settings` (the same fixed literal upstream spells).
  *
  * ## Mount (the b91dd1c pattern — ui/index.ts is a sibling's file)
  *
@@ -452,7 +452,7 @@ export interface PackageSettingsFlash {
  *  the user arm targets the fixed `/user/settings`; the org arm targets
  *  the LANDED org settings page (the module header's URL bend). */
 function ownerSettingsLink(owner: PackagesOwner): string {
-  return owner.kind === "org" ? `/${owner.org.username}/settings` : "/user/settings";
+  return owner.kind === "org" ? `/org/${owner.org.username}/settings` : "/user/settings";
 }
 
 /** The user arm's avatar strip (shared/user/org_profile_avatar.tmpl — the

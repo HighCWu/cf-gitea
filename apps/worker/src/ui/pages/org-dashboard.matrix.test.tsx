@@ -270,10 +270,12 @@ describe("org-dashboard claim pins", () => {
     // The bare /org/{org} shape stays the REPO-HOME family's (owner "org"
     // resolves to nothing at handler time — the create-time reservation).
     expect(parseUiRoute("/org/dashorg")).toEqual({ family: "home", owner: "org", repo: "dashorg", refSuffix: null });
-    // The "org" first segment is create-time reserved (isReservedOwnerName —
-    // SPEC-0003 §3): every deeper /org/{x} shape without a landed literal
-    // stays engine-owned, so even the teams literal under it never claims.
-    expect(parseUiRoute("/org/dashorg/teams")).toBeNull();
+    // The ledger-B3 flip: the teams literal IS a landed /org-group shape
+    // now (web.go:993's /org/{org}/teams — the parse claims it for every
+    // org; the retired bare /{owner}/teams shape is upstream-faithfully a
+    // repository path, web.go:1292's /{username}/{reponame} pair).
+    expect(parseUiRoute("/org/dashorg/teams")).toEqual({ family: "org-teams", owner: "dashorg" });
+    expect(parseUiRoute("/dashorg/teams")).toEqual({ family: "home", owner: "dashorg", repo: "teams", refSuffix: null });
   });
 });
 

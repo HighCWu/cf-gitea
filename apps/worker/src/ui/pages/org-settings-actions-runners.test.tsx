@@ -65,7 +65,7 @@ const T0 = new Date(1_700_000_000 * 1000); // 2023-11-14T22:13:20Z
 const NOW = new Date(T0.getTime() + 5_000);
 const ORIGIN = "https://test.local";
 const ORG_ID = 7;
-const ORG_LINK = "/coalition";
+const ORG_LINK = "/org/coalition";
 const RUNNERS_URL = `${ORG_LINK}/settings/actions/runners`;
 const SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
 
@@ -712,11 +712,11 @@ describe("the mounted org runners routes (the census C7 org mount: the minted-se
     const runner = await seedRunner({ name: "coalition-fleet-1", ownerId: world.coalitionId });
     const carolId = await sessionOwnerCarolId();
     // Carol owns rivals: her GET of the rivals list never shows coalition rows.
-    const rivalsList = await getRoute("/rivals/settings/actions/runners", carolId);
+    const rivalsList = await getRoute("/org/rivals/settings/actions/runners", carolId);
     expect(rivalsList.status).toBe(200);
     expect(await rivalsList.text()).not.toContain("coalition-fleet-1");
     // And the coalition runner's id is unwritable through the rivals' URLs.
-    await expectNotFoundShell(await postRoute(`/rivals/settings/actions/runners/${runner.id}`, carolId, { description: "hijack" }));
+    await expectNotFoundShell(await postRoute(`/org/rivals/settings/actions/runners/${runner.id}`, carolId, { description: "hijack" }));
     expect((await findOrgScopedRunner(env.DB, world.coalitionId, runner.id))?.description).toBe("");
     // The rivals list mints ITS OWN scope token, never coalition's.
     const rivalsToken = await getLatestRunnerToken(env.DB, world.rivalsId, "");

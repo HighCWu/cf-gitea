@@ -349,45 +349,45 @@ describe("Sec2Hours (util.SecToHours verbatim)", () => {
 describe("the owner gate (resolveOrgWorktimePage — RequireOwner, org.go:144)", () => {
   it("the anonymous viewer is the login 303 (reqSignIn, web.go:1103)", async () => {
     const seeded = await seedWorktime();
-    const outcome = await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, { kind: "anonymous" }, "/acme-worktime/worktime", "by=members");
+    const outcome = await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, { kind: "anonymous" }, "/org/acme-worktime/worktime", "by=members");
     expect(outcome.kind).toBe("signin");
     if (outcome.kind !== "signin") return;
-    expect(outcome.location).toBe(`/login?redirect_to=${encodeURIComponent("/acme-worktime/worktime?by=members")}`);
+    expect(outcome.location).toBe(`/login?redirect_to=${encodeURIComponent("/org/acme-worktime/worktime?by=members")}`);
   });
 
   it("a signed-in NON-OWNER (member or outsider) is forbidden — the 404 shell arm", async () => {
     const seeded = await seedWorktime();
     const member: Viewer = { kind: "user", id: seeded.base.memberId, username: "worktime-member", isAdmin: false };
     const outsider: Viewer = { kind: "user", id: seeded.base.outsiderId, username: "worktime-out", isAdmin: false };
-    expect((await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, member, "/acme-worktime/worktime", "")).kind).toBe("forbidden");
-    expect((await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, outsider, "/acme-worktime/worktime", "")).kind).toBe("forbidden");
+    expect((await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, member, "/org/acme-worktime/worktime", "")).kind).toBe("forbidden");
+    expect((await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, outsider, "/org/acme-worktime/worktime", "")).kind).toBe("forbidden");
   });
 
   it("the org owner passes; a SITE ADMIN non-member passes (org.go:118-123's super-access arm)", async () => {
     const seeded = await seedWorktime();
     const owner: Viewer = { kind: "user", id: seeded.base.ownerId, username: "worktime-owner", isAdmin: false };
     const admin: Viewer = { kind: "user", id: seeded.base.adminId, username: "worktime-admin", isAdmin: true };
-    const ownerOutcome = await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, owner, "/acme-worktime/worktime", "");
+    const ownerOutcome = await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, owner, "/org/acme-worktime/worktime", "");
     expect(ownerOutcome.kind).toBe("page");
     if (ownerOutcome.kind === "page") expect(ownerOutcome.org.id).toBe(seeded.base.orgId);
-    expect((await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, admin, "/acme-worktime/worktime", "")).kind).toBe("page");
+    expect((await resolveOrgWorktimePage(env.DB, seeded.base.orgUsername, admin, "/org/acme-worktime/worktime", "")).kind).toBe("page");
   });
 
   it("an unknown org is missing; a renamed org is the 307 (the resolveOrgTeamsOrg ladder)", async () => {
     const seeded = await seedWorktime();
     expect(
-      (await resolveOrgWorktimePage(env.DB, "no-such-org", { kind: "user", id: seeded.base.ownerId, username: "worktime-owner", isAdmin: false }, "/no-such-org/worktime", "")).kind,
+      (await resolveOrgWorktimePage(env.DB, "no-such-org", { kind: "user", id: seeded.base.ownerId, username: "worktime-owner", isAdmin: false }, "/org/no-such-org/worktime", "")).kind,
     ).toBe("missing");
     await drizzle(env.DB).insert(userRedirects).values({ lowerName: "acme-old", redirectUserId: seeded.base.orgId }).run();
     const renamed = await resolveOrgWorktimePage(
       env.DB,
       "acme-old",
       { kind: "user", id: seeded.base.ownerId, username: "worktime-owner", isAdmin: false },
-      "/acme-old/worktime",
+      "/org/acme-old/worktime",
       "",
     );
     expect(renamed.kind).toBe("redirect");
-    if (renamed.kind === "redirect") expect(renamed.location).toBe("/acme-worktime/worktime");
+    if (renamed.kind === "redirect") expect(renamed.location).toBe("/org/acme-worktime/worktime");
   });
 });
 
@@ -412,8 +412,8 @@ describe("the render (worktime.tmpl's DOM)", () => {
     if (loaded.outcome !== "ok") throw new Error("expected ok");
     const html = renderToString(<OrgWorktimePage ctx={ctxFor(OWNER_VIEWER)} data={loaded.data} />);
     // hono/jsx renders `class` ahead of `href`.
-    expect(html).toContain('class="active item" href="/acme-worktime/worktime?by=members&amp;from=2026-06-01&amp;to=2026-06-15"');
-    expect(html).toContain('class="item" href="/acme-worktime/worktime?by=repos&amp;from=2026-06-01&amp;to=2026-06-15"');
+    expect(html).toContain('class="active item" href="/org/acme-worktime/worktime?by=members&amp;from=2026-06-01&amp;to=2026-06-15"');
+    expect(html).toContain('class="item" href="/org/acme-worktime/worktime?by=repos&amp;from=2026-06-01&amp;to=2026-06-15"');
     expect(html).not.toContain('name="by" value="repos"'); // the echo follows the active arm
     expect(html).toContain('name="by" value="members"');
   });

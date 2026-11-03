@@ -472,14 +472,14 @@ describe("parseUiRoute", () => {
     ["/-/actions/other", null], // the /-/actions group claims only the artifacts subtree
     // The org settings packages family (the nesting-bug guard — these shapes
     // once sat inside the runners-delete arm and were unreachable).
-    ["/acme/settings/packages", { family: "org-settings-packages", owner: "acme" }],
-    ["/acme/settings/packages/rules/add", { family: "org-settings-packages-rule-add", owner: "acme" }],
-    ["/acme/settings/packages/rules/7", { family: "org-settings-packages-rule-edit", owner: "acme", id: 7 }],
-    ["/acme/settings/packages/rules/7/preview", { family: "org-settings-packages-rule-preview", owner: "acme", id: 7 }],
-    ["/acme/settings/packages/cargo/initialize", { family: "org-settings-packages-cargo-initialize", owner: "acme" }],
-    ["/acme/settings/packages/cargo/rebuild", { family: "org-settings-packages-cargo-rebuild", owner: "acme" }],
-    ["/acme/settings/packages/cargo/other", null], // the group claims the two write tails only
-    ["/acme/settings/packages/rules/junk", null], // non-numeric id
+    ["/org/acme/settings/packages", { family: "org-settings-packages", owner: "acme" }],
+    ["/org/acme/settings/packages/rules/add", { family: "org-settings-packages-rule-add", owner: "acme" }],
+    ["/org/acme/settings/packages/rules/7", { family: "org-settings-packages-rule-edit", owner: "acme", id: 7 }],
+    ["/org/acme/settings/packages/rules/7/preview", { family: "org-settings-packages-rule-preview", owner: "acme", id: 7 }],
+    ["/org/acme/settings/packages/cargo/initialize", { family: "org-settings-packages-cargo-initialize", owner: "acme" }],
+    ["/org/acme/settings/packages/cargo/rebuild", { family: "org-settings-packages-cargo-rebuild", owner: "acme" }],
+    ["/org/acme/settings/packages/cargo/other", null], // the group claims the two write tails only
+    ["/org/acme/settings/packages/rules/junk", null], // non-numeric id
     // The USER-scope packages family (the same nesting-bug guard class).
     ["/user/settings/packages", { family: "user-settings-packages", id: null }],
     ["/user/settings/packages/rules/add", { family: "user-settings-packages-rule-add", id: null }],
@@ -490,8 +490,8 @@ describe("parseUiRoute", () => {
     ["/user/settings/packages/rules/junk", null], // non-numeric id
     // The P2-1/P2-2 actions-general mounts (web.go:722/:724 user,
     // :1052/:1054 org — the bare group redirects + the General pages).
-    ["/acme/settings/actions", { family: "org-settings-actions-redirect", owner: "acme" }],
-    ["/acme/settings/actions/general", { family: "org-settings-actions-general", owner: "acme" }],
+    ["/org/acme/settings/actions", { family: "org-settings-actions-redirect", owner: "acme" }],
+    ["/org/acme/settings/actions/general", { family: "org-settings-actions-general", owner: "acme" }],
     ["/user/settings/actions", { family: "user-settings-actions-redirect", id: null }],
     ["/user/settings/actions/general", { family: "user-settings-actions-general", id: null }],
     // The TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
@@ -518,11 +518,11 @@ describe("parseUiRoute", () => {
     ["/user/settings/actions/scoped-workflows/required", { family: "user-settings-actions-scoped-workflows-required", id: null }],
     ["/user/settings/actions/scoped-workflows/remove", { family: "user-settings-actions-scoped-workflows-remove", id: null }],
     ["/user/settings/actions/scoped-workflows/extra", null], // junk deeper tail
-    ["/acme/settings/actions/scoped-workflows", { family: "org-actions-scoped-workflows", owner: "acme" }],
-    ["/acme/settings/actions/scoped-workflows/add", { family: "org-actions-scoped-workflows-add", owner: "acme" }],
-    ["/acme/settings/actions/scoped-workflows/required", { family: "org-actions-scoped-workflows-required", owner: "acme" }],
-    ["/acme/settings/actions/scoped-workflows/remove", { family: "org-actions-scoped-workflows-remove", owner: "acme" }],
-    ["/acme/settings/actions/scoped-workflows/extra", null],
+    ["/org/acme/settings/actions/scoped-workflows", { family: "org-actions-scoped-workflows", owner: "acme" }],
+    ["/org/acme/settings/actions/scoped-workflows/add", { family: "org-actions-scoped-workflows-add", owner: "acme" }],
+    ["/org/acme/settings/actions/scoped-workflows/required", { family: "org-actions-scoped-workflows-required", owner: "acme" }],
+    ["/org/acme/settings/actions/scoped-workflows/remove", { family: "org-actions-scoped-workflows-remove", owner: "acme" }],
+    ["/org/acme/settings/actions/scoped-workflows/extra", null],
     ["/-/admin/actions/scoped-workflows", { family: "admin-actions-scoped-workflows" }],
     ["/-/admin/actions/scoped-workflows/add", { family: "admin-actions-scoped-workflows-add" }],
     ["/-/admin/actions/scoped-workflows/required", { family: "admin-actions-scoped-workflows-required" }],
@@ -1867,35 +1867,35 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
     return { ownerId: owner.id, orgId: org.id, teamId: team.id };
   }
 
-  const teamAction = (action: string, teamId: number): string => `/o1-org/teams/${teamId}/action/${action}`;
+  const teamAction = (action: string, teamId: number): string => `/org/o1-org/teams/${teamId}/action/${action}`;
 
   it("claims the action shapes with both team carriers and the wildcard action", () => {
-    expect(parseUiRoute("/acme/teams/42/action/join")).toEqual({ family: "org-team-action", owner: "acme", id: 42, action: "join" });
-    expect(parseUiRoute("/acme/teams/007/action/join")).toEqual({ family: "org-team-action", owner: "acme", id: 7, action: "join" });
-    expect(parseUiRoute("/acme/teams/devs/action/leave")).toEqual({ family: "org-team-action", owner: "acme", name: "devs", action: "leave" });
-    expect(parseUiRoute("/acme/teams/42/action/repo/add")).toEqual({ family: "org-team-repo-action", owner: "acme", id: 42, action: "add" });
-    expect(parseUiRoute("/acme/teams/42/action/repo/remove-all")).toEqual({ family: "org-team-repo-action", owner: "acme", id: 42, action: "remove-all" });
+    expect(parseUiRoute("/org/acme/teams/42/action/join")).toEqual({ family: "org-team-action", owner: "acme", id: 42, action: "join" });
+    expect(parseUiRoute("/org/acme/teams/007/action/join")).toEqual({ family: "org-team-action", owner: "acme", id: 7, action: "join" });
+    expect(parseUiRoute("/org/acme/teams/devs/action/leave")).toEqual({ family: "org-team-action", owner: "acme", name: "devs", action: "leave" });
+    expect(parseUiRoute("/org/acme/teams/42/action/repo/add")).toEqual({ family: "org-team-repo-action", owner: "acme", id: 42, action: "add" });
+    expect(parseUiRoute("/org/acme/teams/42/action/repo/remove-all")).toEqual({ family: "org-team-repo-action", owner: "acme", id: 42, action: "remove-all" });
     expect(parseUiRoute("/org/acme/members/action/leave")).toEqual({ family: "org-members-action", owner: "acme", action: "leave" });
     // The wave-12 flip: the previously-unclaimed tail is this battery's
     // family (the pages-wave12.test.ts pin carries the same assertion).
-    expect(handlesUiRoute("/acme/teams/42/action/join")).toBe(true);
+    expect(handlesUiRoute("/org/acme/teams/42/action/join")).toBe(true);
     // The repo literal is CLAIMED at the 6-segment shape as the wildcard
     // action "repo" (upstream's path param: TeamsAction's switch falls the
     // unknown token through to the default redirect) — only the 7-segment
     // literal pair is the repo family.
-    expect(parseUiRoute("/acme/teams/42/action/repo")).toEqual({ family: "org-team-action", owner: "acme", id: 42, action: "repo" });
+    expect(parseUiRoute("/org/acme/teams/42/action/repo")).toEqual({ family: "org-team-action", owner: "acme", id: 42, action: "repo" });
   });
 
   it("leaves the malformed and adjacent tails with the engine", () => {
     // Junk-encoded segments decode nowhere (the parser's per-segment rule).
-    expect(parseUiRoute("/acme/teams/%zz/action/join")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/action/%zz")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/action/repo/%zz")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/%zz/action/join")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/action/%zz")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/action/repo/%zz")).toBeNull();
     expect(parseUiRoute("/org/acme/members/action/%zz")).toBeNull();
     // The literal `action` segment and the exact segment counts only.
-    expect(parseUiRoute("/acme/teams/42/action")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/actions/join")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/action/repo/add/extra")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/action")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/actions/join")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/action/repo/add/extra")).toBeNull();
     expect(parseUiRoute("/org/acme/members/action")).toBeNull();
     expect(parseUiRoute("/org/acme/members/extra")).toBeNull();
     expect(parseUiRoute("/org/acme/members/action/leave/extra")).toBeNull();
@@ -1910,7 +1910,7 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
 
     const added = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "O1-Candidate" }, ownerCookie));
     expect(added.status).toBe(303);
-    expect(added.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(added.headers.get("location")).toBe(`/org/o1-org/teams/${fx.teamId}`);
     expect(await teams.isTeamMember(fx.teamId, candidate.id)).toBe(true);
     // AddTeamMember ensured the ORG membership ("user will have membership
     // to given organization automatically").
@@ -1962,47 +1962,47 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
     // Join: the owner adds THEMSELVES to the team.
     const join = await fetchUi(teamAction("join", fx.teamId), formPost(teamAction("join", fx.teamId), { page: "team", uid: String(fx.ownerId) }, ownerCookie));
     expect(join.status).toBe(303);
-    expect(join.headers.get("location")).toBe("/o1-org/teams");
+    expect(join.headers.get("location")).toBe("/org/o1-org/teams");
     expect(await teams.isTeamMember(fx.teamId, fx.ownerId)).toBe(true);
     // ...and their own leave attempt is the last-owner refusal (the sole
     // role='owner' row, no remaining team): nothing is deleted and the
     // redirect ladder keeps the default teams-list target.
     const leave = await fetchUi(teamAction("leave", fx.teamId), formPost(teamAction("leave", fx.teamId), { uid: String(fx.ownerId) }, ownerCookie));
     expect(leave.status).toBe(303);
-    expect(leave.headers.get("location")).toBe("/o1-org/teams");
+    expect(leave.headers.get("location")).toBe("/org/o1-org/teams");
     expect(await teams.isTeamMember(fx.teamId, fx.ownerId)).toBe(true);
 
     // Remove with a zero uid: upstream's user==nil arm → the teams list.
     const zero = await fetchUi(teamAction("remove", fx.teamId), formPost(teamAction("remove", fx.teamId), { uid: "0" }, ownerCookie));
     expect(zero.status).toBe(303);
-    expect(zero.headers.get("location")).toBe("/o1-org/teams");
+    expect(zero.headers.get("location")).toBe("/org/o1-org/teams");
     // Remove with an unknown uid: the same arm.
     const ghost = await fetchUi(teamAction("remove", fx.teamId), formPost(teamAction("remove", fx.teamId), { uid: "999999" }, ownerCookie));
     expect(ghost.status).toBe(303);
-    expect(ghost.headers.get("location")).toBe("/o1-org/teams");
+    expect(ghost.headers.get("location")).toBe("/org/o1-org/teams");
     // The owner removing a member: the 303 lands on the team slice (the
     // still-member ladder) and the row goes.
     const removed = await fetchUi(teamAction("remove", fx.teamId), formPost(teamAction("remove", fx.teamId), { uid: String(fx.member2Id) }, ownerCookie));
     expect(removed.status).toBe(303);
-    expect(removed.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(removed.headers.get("location")).toBe(`/org/o1-org/teams/${fx.teamId}`);
     expect(await teams.isTeamMember(fx.teamId, fx.member2Id)).toBe(false);
     // An unknown action token: the wildcard's default redirect.
     const unknown = await fetchUi(teamAction("promote", fx.teamId), formPost(teamAction("promote", fx.teamId), {}, ownerCookie));
     expect(unknown.status).toBe(303);
-    expect(unknown.headers.get("location")).toBe("/o1-org/teams");
+    expect(unknown.headers.get("location")).toBe("/org/o1-org/teams");
     // An unknown REPO action token: the repo family's default.
     const unknownRepo = await fetchUi(`${teamAction("repo", fx.teamId)}/swap`, formPost(`${teamAction("repo", fx.teamId)}/swap`, {}, ownerCookie));
     expect(unknownRepo.status).toBe(303);
-    expect(unknownRepo.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(unknownRepo.headers.get("location")).toBe(`/org/o1-org/teams/${fx.teamId}`);
   });
 
   it("the last-owner team leave refusal keeps the team row and lands on the teams list", async () => {
     const fx = await seedSoloOrgFixture();
     const teams = new TeamsService(env.DB);
-    const leave = await fetchUi(`/o1-solo-org/teams/${fx.teamId}/action/leave`, formPost(`/o1-solo-org/teams/${fx.teamId}/action/leave`, {}, await sessionHeader(fx.ownerId)));
+    const leave = await fetchUi(`/org/o1-solo-org/teams/${fx.teamId}/action/leave`, formPost(`/org/o1-solo-org/teams/${fx.teamId}/action/leave`, {}, await sessionHeader(fx.ownerId)));
     expect(leave.status).toBe(303);
     // Still a member (refused) → the default teams list.
-    expect(leave.headers.get("location")).toBe("/o1-solo-org/teams");
+    expect(leave.headers.get("location")).toBe("/org/o1-solo-org/teams");
     expect(await teams.isTeamMember(fx.teamId, fx.ownerId)).toBe(true);
   });
 
@@ -2013,7 +2013,7 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
 
     const ghost = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "o1-nobody" }, ownerCookie));
     expect(ghost.status).toBe(303);
-    expect(ghost.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(ghost.headers.get("location")).toBe(`/org/o1-org/teams/${fx.teamId}`);
     // An ORG row is the cannot_add_org_to_team arm (users.type='org').
     const orgRow = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "o1-org" }, ownerCookie));
     expect(orgRow.status).toBe(303);
@@ -2036,7 +2036,7 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
     // Unknown repo: the nonexistent arm redirects without a grant.
     const ghost = await fetchUi(repoAction("add"), formPost(repoAction("add"), { repo_name: "teamorg/nope" }, ownerCookie));
     expect(ghost.status).toBe(303);
-    expect(ghost.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(ghost.headers.get("location")).toBe(`/org/o1-org/teams/${fx.teamId}`);
 
     // Add by name (the search box's org/repo form base-strips).
     const add = await fetchUi(repoAction("add"), formPost(repoAction("add"), { repo_name: "o1-org/o1repo" }, ownerCookie));
@@ -2171,6 +2171,56 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
       const twin = await fetchUi(path, { method: "GET", headers: { cookie: ownerCookie } });
       expect(twin.status).toBe(405);
       expect(twin.headers.get("allow")).toBe("POST");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ledger-B3 org route-shape claim pins: every org family lives at the
+// canonical /org/{org}/... shape (upstream mounts ALL org routes inside
+// m.Group("/org", ...), web.go:963-1095, and its OrganisationLink emits
+// /org/{name}, models/user/user.go:351-355). The retired bare /{owner}/
+// teams|settings|labels|worktime shapes are upstream-faithfully REPOSITORY
+// paths (web.go falls them to :1292's /{username}/{reponame} pair — a repo
+// so named renders as the repository, the 404 otherwise, no redirect), so
+// the pinned requests 404 with no such repo seeded.
+// ---------------------------------------------------------------------------
+
+describe("the ledger-B3 retired org-shape claim pins", () => {
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  it("404s the retired bare shapes and answers the canonical /org twins", async () => {
+    // The 2-segment retired shapes parse as the repo-home claim (an
+    // owner/repo pair — upstream's /{username}/{reponame} fall-through);
+    // the deeper retired tail /{owner}/settings/hooks stays unclaimed
+    // (null) — both answer the engine's 404 with no such repo seeded.
+    for (const retired of ["/b3org/teams", "/b3org/settings", "/b3org/labels", "/b3org/worktime"]) {
+      const res = await fetchUi(retired);
+      expect(res.status, retired).toBe(404);
+      expect(parseUiRoute(retired)?.family, retired).toBe("home"); // the repo-home claim (owner/repo pair)
+    }
+    const deepTail = await fetchUi("/b3org/settings/hooks");
+    expect(deepTail.status, "/b3org/settings/hooks").toBe(404);
+    expect(parseUiRoute("/b3org/settings/hooks")).toBeNull();
+    // The canonical twins claim their families at the /org-group shape
+    // (web.go:993 teams, web.go:1015 worktime, web.go:1017 settings,
+    // web.go:1043 settings/labels).
+    expect(parseUiRoute("/org/b3org/teams")?.family).toBe("org-teams");
+    expect(parseUiRoute("/org/b3org/settings")?.family).toBe("org-settings");
+    expect(parseUiRoute("/org/b3org/settings/labels")?.family).toBe("org-labels");
+    expect(parseUiRoute("/org/b3org/worktime")?.family).toBe("org-worktime");
+    // With no such org seeded, the canonical twins reach the family's
+    // resolution prologue and 404-shell on the org miss (upstream's
+    // OrgAssignment NotFound parity) — never the ENGINE's unclaimed 404.
+    // The mounted live-page posture (the anonymous login 303 for a seeded
+    // org) is wave-12/14/49/53's own pins.
+    for (const canonical of ["/org/b3org/teams", "/org/b3org/settings", "/org/b3org/settings/labels", "/org/b3org/worktime"]) {
+      const res = await fetchUi(canonical);
+      expect(res.status, canonical).toBe(404);
+      const body = await res.text();
+      expect(body).toContain("page-content"); // the not-found SHELL, not a bare engine 404
     }
   });
 });

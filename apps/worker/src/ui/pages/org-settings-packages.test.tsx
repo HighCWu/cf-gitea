@@ -594,31 +594,31 @@ describe("the list page render (packages.tmpl → cleanup_rules/list.tmpl)", () 
     expect(html.startsWith("<!DOCTYPE html>")).toBe(true);
     expect(html).toContain("organization settings packages");
     expect(html).toContain(orgSettingsPackagesLocale.cleanup_rules_title);
-    expect(html).toContain(`href="/coalition/settings/packages/rules/add"`);
+    expect(html).toContain(`href="/org/coalition/settings/packages/rules/add"`);
     expect(html).toContain(">Generic</a>"); // the type-name title link → the edit page
     expect(html).toContain(`<i>${orgSettingsPackagesLocale.enabled}</i>`);
     expect(html).toContain(`<i>${orgSettingsPackagesLocale.keep_count}:</i> ${cleanupRuleKeepCountN(5)}`);
     expect(html).toContain(`<i>${orgSettingsPackagesLocale.keep_pattern}:</i> keep-.*`);
     expect(html).toContain(`<i>${orgSettingsPackagesLocale.remove_days}:</i> ${cleanupRuleDays(30)}`);
     expect(html).toContain(`<i>${orgSettingsPackagesLocale.remove_pattern}:</i> rc-.*`);
-    expect(html).toContain(`href="/coalition/settings/packages/rules/${ruleId}">Edit`);
-    expect(html).toContain(`href="/coalition/settings/packages/rules/${ruleId}/preview"`);
+    expect(html).toContain(`href="/org/coalition/settings/packages/rules/${ruleId}">Edit`);
+    expect(html).toContain(`href="/org/coalition/settings/packages/rules/${ruleId}/preview"`);
     // The CARGO section renders (the template's second include — the landed
     // ./user-settings-packages-cargo module; the pre-substrate dead-control
     // reduction expired at e4d7e49) over the org frame's base.
     expect(html).toContain("Cargo Registry Index"); // packages.owner.settings.cargo.title
-    expect(html).toContain(`action="/coalition/settings/packages/cargo/initialize"`);
-    expect(html).toContain(`action="/coalition/settings/packages/cargo/rebuild"`);
+    expect(html).toContain(`action="/org/coalition/settings/packages/cargo/initialize"`);
+    expect(html).toContain(`action="/org/coalition/settings/packages/cargo/rebuild"`);
     // The nav scaffolding's Packages item is the active one; the shared
     // family's hrefs ride verbatim (incl. the labels wave-14 divergence).
-    expect(html).toContain(`class="active item" href="/coalition/settings/packages"`);
-    expect(html).toContain(`href="/coalition/settings"`);
-    expect(html).toContain(`href="/coalition/settings/hooks"`);
-    expect(html).toContain(`href="/coalition/labels"`);
-    expect(html).toContain(`href="/coalition/settings/applications"`);
-    expect(html).toContain(`href="/coalition/settings/blocked_users"`);
-    expect(html).toContain(`href="/coalition/settings/actions/runners"`);
-    expect(html).toContain(`href="/coalition/settings/audit_logs"`);
+    expect(html).toContain(`class="active item" href="/org/coalition/settings/packages"`);
+    expect(html).toContain(`href="/org/coalition/settings"`);
+    expect(html).toContain(`href="/org/coalition/settings/hooks"`);
+    expect(html).toContain(`href="/org/coalition/settings/labels"`);
+    expect(html).toContain(`href="/org/coalition/settings/applications"`);
+    expect(html).toContain(`href="/org/coalition/settings/blocked_users"`);
+    expect(html).toContain(`href="/org/coalition/settings/actions/runners"`);
+    expect(html).toContain(`href="/org/coalition/settings/audit_logs"`);
   });
 
   it("the disabled rule renders Disabled; the zero facets render no body lines; the empty arm renders the none-line", async () => {
@@ -648,7 +648,7 @@ describe("the add/edit page render (packages_cleanup_rules_edit.tmpl → cleanup
     const html = renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataForAdd(org));
     expect(html).toContain("organization settings packages");
     expect(html).toContain(orgSettingsPackagesLocale.add_rule);
-    expect(html).toContain(`action="/coalition/settings/packages/rules/add"`);
+    expect(html).toContain(`action="/org/coalition/settings/packages/rules/add"`);
     expect(html).toContain(`<input type="hidden" name="id" value="0"/>`);
     expect(html).toContain('name="type"');
     expect([...html.matchAll(/<option/g)].length).toBe(23 + 7 + 7); // types + keep counts + remove days
@@ -665,7 +665,7 @@ describe("the add/edit page render (packages_cleanup_rules_edit.tmpl → cleanup
     const data = (await loadOrgCleanupRuleEditPageData(env.DB, org, ruleId))!;
     const html = renderOrgCleanupRuleEditPage(ctx, data);
     expect(html).toContain(orgSettingsPackagesLocale.edit_rule);
-    expect(html).toContain(`action="/coalition/settings/packages/rules/${ruleId}"`);
+    expect(html).toContain(`action="/org/coalition/settings/packages/rules/${ruleId}"`);
     expect(html).toContain(`name="id" value="${ruleId}"`);
     expect(html).toContain('class="disabled field'); // the type field's edit-mode arm (upstream leaves the trailing space when no error)
     expect(html).toContain('<option value="maven" selected=""'); // the row's type echoes selected
@@ -675,7 +675,7 @@ describe("the add/edit page render (packages_cleanup_rules_edit.tmpl → cleanup
     expect(html).toContain('value="dev-.*"');
     expect(html).toContain('name="action" value="save"');
     expect(html).toContain('name="action" value="remove"');
-    expect(html).toContain(`href="/coalition/settings/packages/rules/${ruleId}/preview"`);
+    expect(html).toContain(`href="/org/coalition/settings/packages/rules/${ruleId}/preview"`);
     expect(html).toContain(">Save</button>");
     expect(html).toContain(">Remove</button>");
   });

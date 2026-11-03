@@ -1,5 +1,5 @@
 /**
- * The organization WORKTIME page — `/{org}/worktime` (census gap #20's
+ * The organization WORKTIME page — `/org/{org}/worktime` (census gap #20's
  * aggregate view) — upstream web.go:1015's
  * `m.Get("/worktime", context.OrgAssignment(...{RequireOwner: true}), org.Worktime)`
  * inside the require-owner `/{org}` group (web.go:1008-1092), served by
@@ -11,19 +11,16 @@
  * load + render; the route lives behind the orchestrator's index.ts fold
  * (the mount recipe at the bottom of this header).
  *
- * ## URL shape (the landed require-owner family convention)
+ * ## URL shape (the ledger-B3 canonical family shape)
  *
  * Upstream nests this route under `m.Group("/org", ...)` — the wire path is
- * `/org/{org}/worktime` — but the landed port serves the require-owner org
- * group at the bare `/{org}/...` shapes (teams `/{org}/teams` wave-12,
- * labels `/{org}/labels` wave-14, settings `/{org}/settings` wave-49 — each
- * a recorded family divergence with the same reason: the second-segment
- * literal claims before the repo parse). The worktime page rides the SAME
- * convention: `/{org}/worktime`, the literal `worktime` second segment
- * claimed before the tail parse could read it as a repository named
- * "worktime" (the teams/labels/settings precedent; upstream shadows such a
- * repo identically — the org group registers ahead of the dynamic
- * `/{username}/{reponame}` pair). The template's own links confirm the
+ * `/org/{org}/worktime` (web.go:1015), and the landed port serves the SAME
+ * shape (the B3 unification: the pre-B3 bare `/{org}/worktime` claim sat at
+ * a shape upstream does not mount — every org route lives inside the /org
+ * group, web.go:963-1095, and upstream's own link generator
+ * `OrganisationLink` emits `/org/{name}`, models/user/user.go:351-355).
+ * The literal `worktime` fourth segment is claimed inside the /org group;
+ * deeper tails stay engine-owned. The template's own links confirm the
  * family shape: worktime.tmpl builds them from `$.Org.OrganisationLink`
  * (= "/org/{name}" upstream, models/user/user.go:352-354) + "/worktime".
  *
@@ -123,10 +120,11 @@
  *      }
  *
  * 4. Registration BESIDE THE WAVE-12 STATICS (the RegExpRouter rule — a
- *    static registered after the dynamic owner/repo pair loses;
- *    `/:owner/teams` at index.ts:16607 is the precedent slot):
+ *    static registered after the dynamic owner/repo pair loses; the
+ *    `/org/:owner/teams` line is the precedent slot — the ledger-B3
+ *    canonical shape):
  *
- *      uiRouter.get("/:owner/worktime", (c) => orgWorktimePage(c));
+ *      uiRouter.get("/org/:owner/worktime", (c) => orgWorktimePage(c));
  */
 
 import { and, asc, desc, eq, gte, lte, sql } from "drizzle-orm";
@@ -613,13 +611,18 @@ export function renderOrgWorktimePage(ctx: UiContext, data: OrgWorktimeData): st
  *  `organization times`). */
 export function OrgWorktimePage(props: { ctx: UiContext; data: OrgWorktimeData }) {
   const { ctx, data } = props;
+  // The repo-issue links below ride the BARE /{org}/{repo} paths (the
+  // rows' ReposTable/MilestonesTable props), so orgLink stays the org home;
+  // the page's SELF links ride the ledger-B3 canonical /org/{org}/worktime
+  // shape (web.go:1015's /org-group literal).
+  const worktimeLink = `/org/${data.org.username}/worktime`;
   const orgLink = `/${data.org.username}`;
   // worktime.tmpl:18's QueryBuild — the switcher links carry the CURRENT
   // from/to (defaulted values included — parseOrgTimes always sets the
   // Data keys).
   const queryParams = `from=${encodeURIComponent(data.rangeFrom)}&to=${encodeURIComponent(data.rangeTo)}`;
   const switcherItem = (by: WorktimeBy, label: string, glyph: "repo" | "milestone" | "people") => (
-    <a class={data.by === by ? "active item" : "item"} href={`${orgLink}/worktime?by=${by}&${queryParams}`}>
+    <a class={data.by === by ? "active item" : "item"} href={`${worktimeLink}?by=${by}&${queryParams}`}>
       {glyph === "repo" ? <Icon name="octicon-repo" /> : glyph === "milestone" ? <Icon name="octicon-milestone" /> : <PeopleSvg />} {label}
     </a>
   );
@@ -631,7 +634,7 @@ export function OrgWorktimePage(props: { ctx: UiContext; data: OrgWorktimeData }
           <div class="three wide column">
             {/* The filter form (worktime.tmpl:7-18): the hidden `by` echo
                 keeps the current arm across the Query submit. */}
-            <form class="ui form" method="get" action={`${orgLink}/worktime`}>
+            <form class="ui form" method="get" action={worktimeLink}>
               <input type="hidden" name="by" value={data.by} />
               <div class="field">
                 <label for="worktime-from">{orgWorktimeLocale.date_range_start}</label>

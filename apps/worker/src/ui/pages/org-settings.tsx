@@ -1,7 +1,7 @@
 /**
  * The org settings group + the team edit form — pages wave 49 (the parity
  * survey's re-ranked #1: upstream web.go:1011 `org.EditTeam`/`EditTeamPost`/
- * `DeleteTeam` and web.go:1017-1092's `/{org}/settings` group over
+ * `DeleteTeam` and web.go:1017-1092's `/org/{org}/settings` group over
  * `gitea/templates/org/settings/{layout_head,navbar,options,options_dangerzone}
  * .tmpl` and `gitea/templates/org/team/new.tmpl` in its edit arm). THE
  * owner/admin family, like every org settings page: each handler answers the
@@ -48,9 +48,9 @@
  * `.flex-container-nav` menu and the options form. The navbar is the SHARED
  * components/settings-nav OrgSettingsNavbar (the wave-114 swap — the local
  * Options/Hooks/Labels copy deleted) with the Options item active; the
- * Labels item keeps the landed `/{org}/labels` target (upstream's item
- * targets `{.OrgLink}}/settings/labels`, the documented wave-14 URL
- * divergence; the target exists so the tab stays live). The org/menu strip the header
+ * Labels item targets `/org/{org}/settings/labels` — upstream's own
+ * `{.OrgLink}/settings/labels` href, also the landed target since the B3
+ * unification (the wave-14 divergence retired). The org/menu strip the header
  * template includes reduces away on the same convention as the landed org
  * members/teams/labels pages (their headers also drop it — the owner-only
  * Settings item is the menu's only unlanded entry).
@@ -611,7 +611,7 @@ export function renderOrgSettingsPage(ctx: UiContext, data: OrgSettingsData): st
 export function OrgSettingsPage(props: { ctx: UiContext; data: OrgSettingsData }) {
   const { ctx, data } = props;
   const org = data.org;
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   return (
     <BaseLayout ctx={ctx} title={orgDisplayName(org)} pageClass="organization settings options">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
@@ -820,7 +820,7 @@ export function OrgTeamEditPage(props: { ctx: UiContext; data: OrgTeamEditData }
   const { ctx, data } = props;
   const org = data.org;
   const team = data.team;
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   const units = storedUnits(team);
   const unitNames = Object.keys(units).sort();
   const isUnitsTeam = team.authorize === "none" || unitNames.length > 0;

@@ -293,10 +293,10 @@ function formPost(
 }
 
 /** One team row's slice of the panel: from the team's id-keyed anchor to the
- *  next team anchor (TeamRow renders `/{org}/teams/{id}`), so the per-team
+ *  next team anchor (TeamRow renders `/org/{org}/teams/{id}`), so the per-team
  *  mode text and Units line are asserted without cross-row collisions. */
 function teamChunk(html: string, teamId: number): string {
-  const marker = `/scm-org/teams/${teamId}`;
+  const marker = `/org/scm-org/teams/${teamId}`;
   const start = html.indexOf(marker);
   if (start === -1) return "";
   const next = html.indexOf('class="item-title tw-text-primary"', start);

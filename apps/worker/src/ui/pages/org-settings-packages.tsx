@@ -19,7 +19,7 @@
  *     NOTE the landed org family's URL divergence (the wave-14 record, the
  *     shared settings-nav header): upstream serves `/org/{name}/settings/
  *     packages` (the redirect target at setting_packages.go:76), the landed
- *     family serves `/{org}/settings/packages` — this module follows the
+ *     family serves `/org/{org}/settings/packages` — this module follows the
  *     LANDED family's shape.
  *   - `routers/web/org/setting_packages.go` — the six thin handlers; all set
  *     Title `packages.title` and delegate to `routers/web/shared/packages/
@@ -171,10 +171,10 @@
  *
  *      plus the union entries (beside the other org-settings families):
  *
- *        | "org-settings-packages" // GET /{org}/settings/packages (the cleanup-rules list)
- *        | "org-settings-packages-rule-add" // GET+POST /{org}/settings/packages/rules/add
- *        | "org-settings-packages-rule-edit" // GET+POST /{org}/settings/packages/rules/{id}
- *        | "org-settings-packages-rule-preview" // GET /{org}/settings/packages/rules/{id}/preview
+ *        | "org-settings-packages" // GET /org/{org}/settings/packages (the cleanup-rules list)
+ *        | "org-settings-packages-rule-add" // GET+POST /org/{org}/settings/packages/rules/add
+ *        | "org-settings-packages-rule-edit" // GET+POST /org/{org}/settings/packages/rules/{id}
+ *        | "org-settings-packages-rule-preview" // GET /org/{org}/settings/packages/rules/{id}/preview
  *
  *   3. ui/index.ts handlers — the shared prologue exactly as the blocked/
  *      runners handlers compose it (import the module's exports beside the
@@ -877,12 +877,12 @@ export function renderOrgSettingsPackagesPage(ctx: UiContext, data: OrgPackagesS
  *  dead-control reduction expired at e4d7e49). */
 export function OrgPackagesSettingsPage(props: { ctx: UiContext; data: OrgPackagesSettingsPageData }) {
   const { ctx, data } = props;
-  const base = `/${data.org.username}/settings/packages`;
+  const base = `/org/${data.org.username}/settings/packages`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
+        <OrgSettingsNavbar orgLink={`/org/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* list.tmpl:1-5 — the header + the Add button. */}
@@ -981,13 +981,13 @@ const REMOVE_DAYS_OPTIONS: readonly number[] = [0, 7, 14, 30, 60, 90, 180];
  *  `.../rules/{id}`. */
 export function OrgCleanupRuleEditPage(props: { ctx: UiContext; data: OrgCleanupRuleEditPageData }) {
   const { ctx, data } = props;
-  const base = `/${data.org.username}/settings/packages`;
+  const base = `/org/${data.org.username}/settings/packages`;
   const formAction = data.isEditRule ? `${base}/rules/${data.rule.id}` : `${base}/rules/add`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
+        <OrgSettingsNavbar orgLink={`/org/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             <h4 class="ui top attached header">
@@ -1112,7 +1112,7 @@ export function OrgCleanupRulePreviewPage(props: { ctx: UiContext; data: Extract
     <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
+        <OrgSettingsNavbar orgLink={`/org/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             <h4 class="ui top attached header">{orgSettingsPackagesLocale.preview}</h4>

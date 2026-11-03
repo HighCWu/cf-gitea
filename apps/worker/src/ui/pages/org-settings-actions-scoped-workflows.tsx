@@ -5,7 +5,7 @@
  * the pin fc4936884584a41931906553d96c2601d750e6ef.
  *
  * Upstream: web.go:1060 mounts addSettingsScopedWorkflowsRoutes inside the
- * `/{org}/settings/actions` group (web.go:1051-1061, behind
+ * `/org/{org}/settings/actions` group (web.go:1051-1061, behind
  * `actions.MustEnableActions` — at the OWNER scopes the gate is the
  * instance flags only, the runners twins' gate posture) inside the
  * org-settings prologue; the handler renders
@@ -54,7 +54,7 @@ export async function loadOrgScopedWorkflowsPageData(
   readsFor: (repo: ScopedWorkflowSourceRepoView) => ScopedWorkflowFileReads,
   org: Pick<OrgRecord, "id" | "username">,
 ): Promise<OrgScopedWorkflowsPageData> {
-  return loadScopedWorkflowsPageData(store, d1, readsFor, { kind: "org", ownerId: org.id, orgLink: `/${org.username}` });
+  return loadScopedWorkflowsPageData(store, d1, readsFor, { kind: "org", ownerId: org.id, orgLink: `/org/${org.username}` });
 }
 
 /** The full-document render (the render.tsx pattern — `index.ts` stays a

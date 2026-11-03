@@ -282,21 +282,21 @@ beforeAll(async () => {
 
 describe("wave-14 parser families (parseUiRoute / handlesUiRoute)", () => {
   it("claims the org labels shapes", () => {
-    expect(parseUiRoute("/acme/labels")).toEqual({ family: "org-labels", owner: "acme" });
-    expect(parseUiRoute("/acme/labels/new")).toEqual({ family: "org-label-new", owner: "acme" });
-    expect(parseUiRoute("/acme/labels/edit")).toEqual({ family: "org-label-edit", owner: "acme" });
-    expect(parseUiRoute("/acme/labels/delete")).toEqual({ family: "org-label-delete", owner: "acme" });
-    expect(handlesUiRoute("/acme/labels")).toBe(true);
+    expect(parseUiRoute("/org/acme/settings/labels")).toEqual({ family: "org-labels", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/labels/new")).toEqual({ family: "org-label-new", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/labels/edit")).toEqual({ family: "org-label-edit", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/labels/delete")).toEqual({ family: "org-label-delete", owner: "acme" });
+    expect(handlesUiRoute("/org/acme/settings/labels")).toBe(true);
     // The trailing-slash form classifies to the same shape (the dispatcher's
     // middleware 301s it to the canonical URL).
-    expect(parseUiRoute("/acme/labels/")).toEqual({ family: "org-labels", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/labels/")).toEqual({ family: "org-labels", owner: "acme" });
   });
 
   it("claims the initialize write; deeper tails stay with the engine", () => {
     // The org initialize write LANDED (the issue-write-tails fold).
-    expect(parseUiRoute("/acme/labels/initialize")).toEqual({ family: "org-label-initialize", owner: "acme" });
-    expect(parseUiRoute("/acme/labels/new/more")).toBeNull();
-    expect(parseUiRoute("/acme/labels/abc")).toBeNull();
+    expect(parseUiRoute("/org/acme/settings/labels/initialize")).toEqual({ family: "org-label-initialize", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/labels/new/more")).toBeNull();
+    expect(parseUiRoute("/org/acme/settings/labels/abc")).toBeNull();
   });
 
   it("claims the per-hook shapes with PathParamInt64 id parity", () => {
@@ -346,33 +346,33 @@ describe("wave-14 parser families (parseUiRoute / handlesUiRoute)", () => {
 
 describe("GET /{org}/labels (the requireOrgOwnership posture)", () => {
   it("303s an anonymous viewer onto the login round-trip", async () => {
-    const res = await fetchUi("/labelorg/labels");
+    const res = await fetchUi("/org/labelorg/settings/labels");
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Flabelorg%2Flabels");
+    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Forg%2Flabelorg%2Fsettings%2Flabels");
   });
 
   it("404-shells a signed-in non-member and a plain member (non-owner)", async () => {
     const fixture = await ensureWave14Fixtures();
-    const pal = await fetchUi("/labelorg/labels", withCookie(fixture.palCookie));
+    const pal = await fetchUi("/org/labelorg/settings/labels", withCookie(fixture.palCookie));
     expect(pal.status).toBe(404);
-    const member = await fetchUi("/labelorg/labels", withCookie(fixture.memberCookie));
+    const member = await fetchUi("/org/labelorg/settings/labels", withCookie(fixture.memberCookie));
     expect(member.status).toBe(404);
   });
 
   it("answers the owner and a site admin with the management page", async () => {
     const fixture = await ensureWave14Fixtures();
     for (const cookie of [fixture.morganCookie, fixture.adminCookie]) {
-      const res = await fetchUi("/labelorg/labels", withCookie(cookie));
+      const res = await fetchUi("/org/labelorg/settings/labels", withCookie(cookie));
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("page-content organization settings labels");
       // The header count, the create form (the two brief fields + the
       // modal's default color) and the delete/edit controls.
       expect(html).toContain("<h4 class=\"ui top attached header\">2 labels</h4>");
-      expect(html).toContain('action="/labelorg/labels/new" method="post"');
+      expect(html).toContain('action="/org/labelorg/settings/labels/new" method="post"');
       expect(html).toContain('id="new-label_title" name="title" value=""');
       expect(html).toContain('id="new-label_color" name="color" value="#70c24a"');
-      expect(html).toContain('action="/labelorg/labels/delete" method="post"');
+      expect(html).toContain('action="/org/labelorg/settings/labels/delete" method="post"');
       expect(html).toContain("<summary");
       // The default-alphabetical order (alpha before beta) — reverse sorts
       // are the next test.
@@ -390,7 +390,7 @@ describe("GET /{org}/labels (the requireOrgOwnership posture)", () => {
 
   it("honors the silent ?sort= reversal exactly like the landed list arm", async () => {
     const fixture = await ensureWave14Fixtures();
-    const res = await fetchUi("/labelorg/labels?sort=reversealphabetically", withCookie(fixture.morganCookie));
+    const res = await fetchUi("/org/labelorg/settings/labels?sort=reversealphabetically", withCookie(fixture.morganCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html.indexOf(">beta</span>")).toBeLessThan(html.indexOf(">alpha</span>"));
@@ -398,9 +398,9 @@ describe("GET /{org}/labels (the requireOrgOwnership posture)", () => {
 
   it("307s a renamed org onto the new name", async () => {
     const fixture = await ensureWave14Fixtures();
-    const res = await fetchUi("/labelold/labels?q=x", withCookie(fixture.morganCookie));
+    const res = await fetchUi("/org/labelold/settings/labels?q=x", withCookie(fixture.morganCookie));
     expect(res.status).toBe(307);
-    expect(res.headers.get("location")).toBe("/labelnew/labels?q=x");
+    expect(res.headers.get("location")).toBe("/org/labelnew/settings/labels?q=x");
   });
 });
 
@@ -408,12 +408,12 @@ describe("POST /{org}/labels/new (the create arm)", () => {
   it("creates through the landed arm, normalizing the color, and 303s back", async () => {
     const fixture = await ensureWave14Fixtures();
     const res = await fetchUi(
-      "/labelorg/labels/new",
-      formPost("/labelorg/labels/new", { title: "infra", color: "00AABB" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/new",
+      formPost("/org/labelorg/settings/labels/new", { title: "infra", color: "00AABB" }, fixture.morganCookie),
     );
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/labelorg/labels");
-    const html = await (await fetchUi("/labelorg/labels", withCookie(fixture.morganCookie))).text();
+    expect(res.headers.get("location")).toBe("/org/labelorg/settings/labels");
+    const html = await (await fetchUi("/org/labelorg/settings/labels", withCookie(fixture.morganCookie))).text();
     expect(html).toContain(">infra</span>");
     // The stored color is the normalizer's lowercase #rrggbb form.
     const rows = await listOrgLabels(env.DB, fixture.orgId, "", 1, 50);
@@ -424,8 +424,8 @@ describe("POST /{org}/labels/new (the create arm)", () => {
   it("re-renders the color 422 and the empty-title guard with the kept submission", async () => {
     const fixture = await ensureWave14Fixtures();
     const badColor = await fetchUi(
-      "/labelorg/labels/new",
-      formPost("/labelorg/labels/new", { title: "kept title", color: "notacolor" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/new",
+      formPost("/org/labelorg/settings/labels/new", { title: "kept title", color: "notacolor" }, fixture.morganCookie),
     );
     expect(badColor.status).toBe(200);
     const badHtml = await badColor.text();
@@ -433,8 +433,8 @@ describe("POST /{org}/labels/new (the create arm)", () => {
     expect(badHtml).toContain('name="title" value="kept title"');
 
     const empty = await fetchUi(
-      "/labelorg/labels/new",
-      formPost("/labelorg/labels/new", { title: "", color: "#00aabb" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/new",
+      formPost("/org/labelorg/settings/labels/new", { title: "", color: "#00aabb" }, fixture.morganCookie),
     );
     expect(empty.status).toBe(200);
     expect(await empty.text()).toContain("Label name cannot be empty.");
@@ -442,17 +442,17 @@ describe("POST /{org}/labels/new (the create arm)", () => {
 
   it("refuses the unprivileged and cross-origin posts", async () => {
     const fixture = await ensureWave14Fixtures();
-    const anon = await fetchUi("/labelorg/labels/new", formPost("/labelorg/labels/new", { title: "Nope", color: "#00aabb" }));
+    const anon = await fetchUi("/org/labelorg/settings/labels/new", formPost("/org/labelorg/settings/labels/new", { title: "Nope", color: "#00aabb" }));
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toContain("/login?redirect_to=");
     const member = await fetchUi(
-      "/labelorg/labels/new",
-      formPost("/labelorg/labels/new", { title: "Nope", color: "#00aabb" }, fixture.memberCookie),
+      "/org/labelorg/settings/labels/new",
+      formPost("/org/labelorg/settings/labels/new", { title: "Nope", color: "#00aabb" }, fixture.memberCookie),
     );
     expect(member.status).toBe(404);
     const crossOrigin = await fetchUi(
-      "/labelorg/labels/new",
-      formPost("/labelorg/labels/new", { title: "Nope", color: "#00aabb" }, fixture.morganCookie, "https://evil.example"),
+      "/org/labelorg/settings/labels/new",
+      formPost("/org/labelorg/settings/labels/new", { title: "Nope", color: "#00aabb" }, fixture.morganCookie, "https://evil.example"),
     );
     expect(crossOrigin.status).toBe(403);
   });
@@ -462,11 +462,11 @@ describe("POST /{org}/labels/edit + /delete (the per-row arms)", () => {
   it("edits name and color through the arm, keeping the unposted fields", async () => {
     const fixture = await ensureWave14Fixtures();
     const res = await fetchUi(
-      "/labelorg/labels/edit",
-      formPost("/labelorg/labels/edit", { id: String(fixture.blockedLabelId), title: "beta-renamed", color: "#123abc" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/edit",
+      formPost("/org/labelorg/settings/labels/edit", { id: String(fixture.blockedLabelId), title: "beta-renamed", color: "#123abc" }, fixture.morganCookie),
     );
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/labelorg/labels");
+    expect(res.headers.get("location")).toBe("/org/labelorg/settings/labels");
     const row = (await findOrgLabelById(env.DB, fixture.orgId, fixture.blockedLabelId))!;
     expect(row.name).toBe("beta-renamed");
     expect(row.color).toBe("#123abc");
@@ -478,13 +478,13 @@ describe("POST /{org}/labels/edit + /delete (the per-row arms)", () => {
   it("404-shells a missing id and a foreign org's label", async () => {
     const fixture = await ensureWave14Fixtures();
     const missing = await fetchUi(
-      "/labelorg/labels/edit",
-      formPost("/labelorg/labels/edit", { id: "999999", title: "x", color: "#00aabb" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/edit",
+      formPost("/org/labelorg/settings/labels/edit", { id: "999999", title: "x", color: "#00aabb" }, fixture.morganCookie),
     );
     expect(missing.status).toBe(404);
     const foreign = await fetchUi(
-      "/labelorg/labels/edit",
-      formPost("/labelorg/labels/edit", { id: String(fixture.foreignLabelId), title: "x", color: "#00aabb" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/edit",
+      formPost("/org/labelorg/settings/labels/edit", { id: String(fixture.foreignLabelId), title: "x", color: "#00aabb" }, fixture.morganCookie),
     );
     expect(foreign.status).toBe(404);
     // The foreign row never changed.
@@ -496,8 +496,8 @@ describe("POST /{org}/labels/edit + /delete (the per-row arms)", () => {
   it("re-renders the color 422 with the error banner", async () => {
     const fixture = await ensureWave14Fixtures();
     const res = await fetchUi(
-      "/labelorg/labels/edit",
-      formPost("/labelorg/labels/edit", { id: String(fixture.blockedLabelId), title: "beta-renamed", color: "zzz" }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/edit",
+      formPost("/org/labelorg/settings/labels/edit", { id: String(fixture.blockedLabelId), title: "beta-renamed", color: "zzz" }, fixture.morganCookie),
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("invalid color: #zzz");
@@ -506,24 +506,24 @@ describe("POST /{org}/labels/edit + /delete (the per-row arms)", () => {
   it("deletes through the cascade arm, idempotently, never touching foreign rows", async () => {
     const fixture = await ensureWave14Fixtures();
     const res = await fetchUi(
-      "/labelorg/labels/delete",
-      formPost("/labelorg/labels/delete", { id: String(fixture.blockedLabelId) }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/delete",
+      formPost("/org/labelorg/settings/labels/delete", { id: String(fixture.blockedLabelId) }, fixture.morganCookie),
     );
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/labelorg/labels");
+    expect(res.headers.get("location")).toBe("/org/labelorg/settings/labels");
     expect(await findOrgLabelById(env.DB, fixture.orgId, fixture.blockedLabelId)).toBeNull();
 
     // The zero-row success (the landed DELETE arm's 204 semantics).
     const again = await fetchUi(
-      "/labelorg/labels/delete",
-      formPost("/labelorg/labels/delete", { id: String(fixture.blockedLabelId) }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/delete",
+      formPost("/org/labelorg/settings/labels/delete", { id: String(fixture.blockedLabelId) }, fixture.morganCookie),
     );
     expect(again.status).toBe(303);
 
     // The foreign org's label survives (the delete is org-scoped).
     const foreignPost = await fetchUi(
-      "/labelorg/labels/delete",
-      formPost("/labelorg/labels/delete", { id: String(fixture.foreignLabelId) }, fixture.morganCookie),
+      "/org/labelorg/settings/labels/delete",
+      formPost("/org/labelorg/settings/labels/delete", { id: String(fixture.foreignLabelId) }, fixture.morganCookie),
     );
     expect(foreignPost.status).toBe(303);
     expect(await findOrgLabelById(env.DB, fixture.orgId, fixture.foreignLabelId)).toBeNull();
@@ -532,11 +532,11 @@ describe("POST /{org}/labels/edit + /delete (the per-row arms)", () => {
 
   it("gates both writes like the list", async () => {
     const fixture = await ensureWave14Fixtures();
-    const anonDelete = await fetchUi("/labelorg/labels/delete", formPost("/labelorg/labels/delete", { id: "1" }));
+    const anonDelete = await fetchUi("/org/labelorg/settings/labels/delete", formPost("/org/labelorg/settings/labels/delete", { id: "1" }));
     expect(anonDelete.status).toBe(303);
     const memberEdit = await fetchUi(
-      "/labelorg/labels/edit",
-      formPost("/labelorg/labels/edit", { id: "1", title: "x", color: "#00aabb" }, fixture.memberCookie),
+      "/org/labelorg/settings/labels/edit",
+      formPost("/org/labelorg/settings/labels/edit", { id: "1", title: "x", color: "#00aabb" }, fixture.memberCookie),
     );
     expect(memberEdit.status).toBe(404);
   });
@@ -769,8 +769,8 @@ describe("wave-14 a11y smoke", () => {
   it("every new page passes the structural rules for its gate-admitted viewer", async () => {
     const fixture = await ensureWave14Fixtures();
     for (const [path, init] of [
-      ["/labelorg/labels", withCookie(fixture.morganCookie)],
-      ["/labelorg/labels?sort=mostissues", withCookie(fixture.adminCookie)],
+      ["/org/labelorg/settings/labels", withCookie(fixture.morganCookie)],
+      ["/org/labelorg/settings/labels?sort=mostissues", withCookie(fixture.adminCookie)],
       [`/alice/wave14/settings/hooks/${fixture.hookId}`, withCookie(fixture.ownerCookie)],
       [`/alice/wave14/settings/hooks/${fixture.hookId}?test=queued`, withCookie(fixture.adminCookie)],
     ] as Array<[string, RequestInit]>) {

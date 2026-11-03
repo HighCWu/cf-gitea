@@ -1,6 +1,6 @@
 /**
  * The org labels management page — pages wave 14 (SPEC-0008 U3 extension):
- * the label list (`/{org}/labels`), the create form, and the per-row edit +
+ * the label list (`/org/{org}/settings/labels`), the create form, and the per-row edit +
  * delete writes, all over the landed org-label service family
  * (src/api/services/labels-t2.ts — the orgLabel API family orgListLabels /
  * orgCreateLabel / orgGetLabel / orgEditLabel / orgDeleteLabel, routes/
@@ -27,13 +27,15 @@
  *
  * ## Route shapes (upstream divergences, §6 method)
  *
- * - The URL is the wave brief's literal `/{org}/labels`; upstream mounts the
- *   management page at `/{org}/settings/labels` under the `/org` prefix
- *   (web.go:1043-1048) — the literal claims the second segment before the
- *   repo parse could read it as a repository named "labels" (the teams
- *   precedent), which upstream's nested route does not shadow: the
- *   documented divergence, wave-12's teams posture.
- * - The writes POST to `/labels/new`, `/labels/edit`, `/labels/delete` —
+ * - The URL is upstream's own subtree `/org/{org}/settings/labels`
+ *   (web.go:1043-1048, inside the require-owner /org/{org} /settings group)
+ *   — the ledger-B3 canonical shape; the wave brief's bare `/{org}/labels`
+ *   literal was the one shape upstream does not mount and was retired with
+ *   B3 (a bare /{owner}/labels path is upstream-faithfully a repository
+ *   path).
+ * - The writes POST to `/settings/labels/new`, `/settings/labels/edit`,
+ *   `/settings/labels/delete` (under /org/{org}) — upstream's exact POST
+ *   segments.
  *   upstream's exact POST segments. The form field names are upstream's
  *   CreateLabelForm (`title`, `color`, hidden `id`).
  * - The per-row edit is upstream's JS modal (label_edit_modal.tmpl) reduced
@@ -44,9 +46,9 @@
  * - `/labels/initialize` (the upstream label-template loader) rides
  *   issue-write-tails.ts's orgLabelInitializeSubmit (census gap #8 — the
  *   catalog is the landed misc-t2 embed, options/label/'s exact pair; the
- *   303 target is this page's live URL, upstream's
- *   /org/{org}/settings/labels target being the documented divergence the
- *   landed org writes share), and the loader block renders on the empty
+ *   303 target is this page's live URL — upstream's
+ *   /org/{org}/settings/labels target, the same shape since B3), and the
+ *   loader block renders on the empty
  *   list (org/settings/labels.tmpl renders it on `(eq .NumLabels 0)` — the
  *   page is owner-only, so no extra gate).
  *
@@ -276,7 +278,7 @@ export function LabelColorSwatch(props: { color: string }) {
  * The label-template loader block (label_load_template.tmpl — census gap
  * #8, the org twin): the native-select reduction of upstream's JS dropdown
  * (Default preselected like the template's hidden input), posting
- * `template_name` to `/{org}/labels/initialize` (issue-write-tails.ts's
+ * `template_name` to `/org/{org}/settings/labels/initialize` (issue-write-tails.ts's
  * orgLabelInitializeSubmit; the require-owner gate runs there).
  */
 function OrgLabelTemplateLoader(props: { orgLink: string }) {
@@ -284,7 +286,7 @@ function OrgLabelTemplateLoader(props: { orgLink: string }) {
     <div class="ui centered grid">
       <div class="twelve wide computer column">
         <p>{orgLabelsLocale.templates_info}</p>
-        <form class="ui form center" action={`${props.orgLink}/labels/initialize`} method="post">
+        <form class="ui form center" action={`${props.orgLink}/settings/labels/initialize`} method="post">
           <div class="field">
             <label for="org-label-template-name" class="sr-only">
               {orgLabelsLocale.templates_helper}
@@ -358,7 +360,7 @@ function LabelOperation(props: { orgLink: string; label: LabelRow }) {
         <summary class="flex-text-inline">
           <Icon name="octicon-pencil" /> {orgLabelsLocale.label_edit}
         </summary>
-        <form class="ui form" action={`${props.orgLink}/labels/edit`} method="post">
+        <form class="ui form" action={`${props.orgLink}/settings/labels/edit`} method="post">
           <LabelFormFields prefix={`label-edit-${label.id}`} form={{ title: label.name, color: label.color ?? "" }} withId={label.id} />
           <div class="field">
             <button type="submit" class="ui tiny primary button">
@@ -367,7 +369,7 @@ function LabelOperation(props: { orgLink: string; label: LabelRow }) {
           </div>
         </form>
       </details>
-      <form class="tw-inline-block" action={`${props.orgLink}/labels/delete`} method="post">
+      <form class="tw-inline-block" action={`${props.orgLink}/settings/labels/delete`} method="post">
         <input type="hidden" name="id" value={label.id} />
         <button type="submit" class="ui tiny button">
           {orgLabelsLocale.label_delete}
@@ -417,7 +419,7 @@ export function renderOrgLabelsPage(options: {
  *  brief's literal, the module header's divergence note). */
 export function OrgLabelsPage(props: { ctx: UiContext; data: OrgLabelsData; form: OrgLabelForm; error: string | null }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   return (
     <BaseLayout ctx={ctx} title={orgLabelsLocale.labels} pageClass="organization settings labels">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
@@ -436,7 +438,7 @@ export function OrgLabelsPage(props: { ctx: UiContext; data: OrgLabelsData; form
         {/* The create form (the modal's two brief fields). */}
         <h4 class="ui top attached header">{orgLabelsLocale.new_label}</h4>
         <div class="ui attached segment">
-          <form class="ui form" action={`${orgLink}/labels/new`} method="post">
+          <form class="ui form" action={`${orgLink}/settings/labels/new`} method="post">
             <LabelFormFields prefix="new-label" form={props.form} />
             <div class="field">
               <button type="submit" class="ui primary button">

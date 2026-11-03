@@ -1,6 +1,6 @@
 /**
  * The settings AUDIT LOG pages' tests (the census R13 module — GET
- * /{owner}/{repo}/settings/audit_logs + GET /{org}/settings/audit_logs at
+ * /{owner}/{repo}/settings/audit_logs + GET /org/{org}/settings/audit_logs at
  * ui/index.ts over pages/settings-audit-logs.tsx, the shared renderer over
  * the landed M4 findAuditEvents): the filter parse matrix
  * (SearchOptionsFromRequest port), the actor resolution (unknown name
@@ -215,13 +215,13 @@ describe("parseAuditFilters (shared/audit/audit.go:37-77's request half)", () =>
 
   it("the sort link builder keeps every non-empty param and drops the page on page 1 (paginate.tmpl's GetParams)", () => {
     const filters = parseAuditFilters(new URLSearchParams("sort=timestamp_asc&action=repository:create&origin=api&actor=alice"));
-    expect(auditPageHref("/x/settings/audit_logs", filters, 2)).toBe(
-      "/x/settings/audit_logs?page=2&sort=timestamp_asc&action=repository%3Acreate&origin=api&actor=alice",
+    expect(auditPageHref("/org/x/settings/audit_logs", filters, 2)).toBe(
+      "/org/x/settings/audit_logs?page=2&sort=timestamp_asc&action=repository%3Acreate&origin=api&actor=alice",
     );
     // Page 1 omits the page param (paginate.tmpl renders ?page= only for
     // the link's target page — ours carries it whenever it isn't 1).
-    expect(auditPageHref("/x/settings/audit_logs", filters, 1)).toBe(
-      "/x/settings/audit_logs?sort=timestamp_asc&action=repository%3Acreate&origin=api&actor=alice",
+    expect(auditPageHref("/org/x/settings/audit_logs", filters, 1)).toBe(
+      "/org/x/settings/audit_logs?sort=timestamp_asc&action=repository%3Acreate&origin=api&actor=alice",
     );
   });
 });
@@ -680,12 +680,12 @@ describe("the org audit page DOM (org/settings/audit_logs.tmpl)", () => {
     // The navbar item lights up in upstream's LAST position (org navbar
     // .tmpl:50-52 — after the Actions details, the menu's final anchor; the
     // order itself is the shared navbar suite's assertHrefOrder pin).
-    expect(html).toContain('class="active item" href="/acme/settings/audit_logs"');
+    expect(html).toContain('class="active item" href="/org/acme/settings/audit_logs"');
     const at = (s: string) => html.indexOf(s);
-    expect(at('href="/acme/settings/audit_logs"')).toBeGreaterThan(at('href="/acme/settings/actions/variables"'));
-    expect(html.lastIndexOf('href="/acme/settings/audit_logs"')).toBe(at('href="/acme/settings/audit_logs"')); // exactly one
+    expect(at('href="/org/acme/settings/audit_logs"')).toBeGreaterThan(at('href="/org/acme/settings/actions/variables"'));
+    expect(html.lastIndexOf('href="/org/acme/settings/audit_logs"')).toBe(at('href="/org/acme/settings/audit_logs"')); // exactly one
     // The full-document render path agrees.
-    expect(renderOrgSettingsAuditLogsPage({ ctx, org, data })).toContain('href="/acme/settings/audit_logs"');
+    expect(renderOrgSettingsAuditLogsPage({ ctx, org, data })).toContain('href="/org/acme/settings/audit_logs"');
     // The org page shows the org's own emit (the createOrg instrumentation).
     expect(html).toContain("Created organization acme.");
   });
@@ -716,7 +716,7 @@ async function ownerSessionHeader(): Promise<string> {
 }
 
 const repoPagePath = (): string => `/${alice.username}/${repo.slug}/settings/audit_logs`;
-const orgPagePath = (): string => `/${org.username}/settings/audit_logs`;
+const orgPagePath = (): string => `/org/${org.username}/settings/audit_logs`;
 
 describe("the mounted repo route (GET /{owner}/{repo}/settings/audit_logs — the settingsGate posture)", () => {
   it("303s an anonymous GET onto the login round-trip", async () => {
@@ -764,7 +764,7 @@ describe("the mounted repo route (GET /{owner}/{repo}/settings/audit_logs — th
   });
 });
 
-describe("the mounted org route (GET /{org}/settings/audit_logs — the require-owner prologue)", () => {
+describe("the mounted org route (GET /org/{org}/settings/audit_logs — the require-owner prologue)", () => {
   it("303s an anonymous GET onto the login round-trip", async () => {
     const res = await fetchUi(orgPagePath());
     expect(res.status).toBe(303);
@@ -840,7 +840,7 @@ describe("the route claim pins (the settings families claim exactly the audit ar
     // The singular misspelling, deeper tails, and query-less junk.
     expect(parseUiRoute(`/${alice.username}/${repo.slug}/settings/audit_log`)).toBeNull();
     expect(parseUiRoute(`/${alice.username}/${repo.slug}/settings/audit_logs/extra`)).toBeNull();
-    expect(parseUiRoute(`/${org.username}/settings/audit_logs/extra`)).toBeNull();
-    expect(handlesUiRoute(`/${org.username}/settings/audit_logs/extra`)).toBe(false);
+    expect(parseUiRoute(`/org/${org.username}/settings/audit_logs/extra`)).toBeNull();
+    expect(handlesUiRoute(`/org/${org.username}/settings/audit_logs/extra`)).toBe(false);
   });
 });

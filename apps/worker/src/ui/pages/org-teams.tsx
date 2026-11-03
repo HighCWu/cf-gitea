@@ -1,8 +1,9 @@
 /**
  * The org teams pages — pages wave 12 (SPEC-0008 U3 extension): the teams
- * list (`/{org}/teams`), each team's detail slice (`/{org}/teams/{id}` —
+ * list (`/org/{org}/teams` — the ledger-B3 canonical shape, upstream's own
+ * /org-group mount), each team's detail slice (`/org/{org}/teams/{id}` —
  * the members list and the repo-access list on ONE page), and the create-team
- * form (`/{org}/teams/new`, GET + POST). THE owner/admin family: every route
+ * form (`/org/{org}/teams/new`, GET + POST). THE owner/admin family: every route
  * here answers the landed `requireOrgOwnership` posture (org owner
  * `role='owner'` or site admin — services/orgs.ts:148) collapsed to the
  * settings pages' gate shape — a signed-in non-owner 404-shells exactly like
@@ -33,7 +34,7 @@
  *
  * ## Route shapes (upstream divergences, §6 method)
  *
- * - The detail URL keys on the team ID (`/{org}/teams/{id}`), not upstream's
+ * - The detail URL keys on the team ID (`/org/{org}/teams/{id}`), not upstream's
  *   `{{.LowerName | PathEscape}}` name link — the landed team read arms
  *   (`orgGetTeam`/`orgListTeamMembers`/`orgListTeamRepos`) all resolve by the
  *   int64 id (org-teams.ts `intPathParam`), so the slice follows the API
@@ -46,7 +47,7 @@
  *   the repositories sub-list stays merged into the slice (upstream's
  *   members.tmpl + repositories.tmpl pages show the same two lists; the
  *   recorded divergence stands).
- * - `/{org}/teams` claims the literal second segment before the repo parse
+ * - `/org/{org}/teams` claims the literal second segment before the repo parse
  *   could read it as a repository named "teams" (the notifications/explore
  *   precedent). Upstream shadows a repo named "teams" identically: the org
  *   teams group registers at web.go:993, ahead of :1292's
@@ -180,7 +181,7 @@ export const ORG_TEAMS_PAGE_SIZE = 20;
 // page module owns its data path, the org-home pattern)
 // ---------------------------------------------------------------------------
 
-/** The resolution outcome for the `/{org}/teams` family: the resolved org, a
+/** The resolution outcome for the `/org/{org}/teams` family: the resolved org, a
  *  rename redirect, or a miss (→ 404 shell). */
 export type OrgTeamsResolution =
   | { kind: "org"; org: OrgRecord }
@@ -365,7 +366,7 @@ export type CreateTeamResult = { outcome: "created"; team: TeamRecord } | { outc
 
 /**
  * The create write through the landed `TeamsService.createTeam` (the exact
- * arm POST /orgs/{org}/teams serves). The typed NewTeam 422s re-render with
+ * arm POST /orgs/org/{org}/teams serves). The typed NewTeam 422s re-render with
  * the API's messages (the settings/hooks pattern); the reserved `new` name
  * propagates its bare upstream 500 (teams.go:229-235's APIErrorInternal —
  * the module header's mapping note).
@@ -539,7 +540,7 @@ export function renderOrgTeamsPage(ctx: UiContext, data: OrgTeamsData): string {
  *  teams.tmpl:3). */
 export function OrgTeamsPage(props: { ctx: UiContext; data: OrgTeamsData }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   // The pager preserves the `?q=` keyword (upstream's base/paginate keeps
   // the query; the shared OrgHomePagination appends a bare ?page=).
   const pageHref = (target: number): string => {
@@ -637,7 +638,7 @@ export function OrgTeamDetailPage(props: {
   isTeamMember: boolean;
 }) {
   const { ctx, data, viewerId, isOrgOwner, isTeamMember } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   const team = data.team;
   // repositories.tmpl:14's pair — owner AND not includes-all (an
   // includes-all team's coverage is the union flag, not grant rows).
@@ -799,7 +800,7 @@ export function OrgTeamDetailPage(props: {
                         <Icon name="octicon-repo" size={24} />
                       </div>
                       <div class="item-main">
-                        <a class="item-title tw-text-primary" href={`${orgLink}/${repo.slug}`}>
+                        <a class="item-title tw-text-primary" href={`/${data.org.username}/${repo.slug}`}>
                           {data.org.username}/{repo.slug}
                         </a>
                       </div>
@@ -844,7 +845,7 @@ export function renderOrgTeamNewPage(ctx: UiContext, data: TeamNewData): string 
  *  reduction note). */
 export function OrgTeamNewPage(props: { ctx: UiContext; data: TeamNewData }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   return (
     <BaseLayout ctx={ctx} title={orgDisplayName(data.org)} pageClass="organization new team">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />

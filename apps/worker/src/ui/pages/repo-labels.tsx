@@ -54,7 +54,7 @@
  * appends the intro row — the org_labels_desc sentence with the
  * "(manage)" link for org owners (upstream targets
  * `{OrganizationLink}/settings/labels`; the landed page lives at
- * `/{org}/labels`, the org-labels module's documented divergence, so the
+ * `/org/{org}/settings/labels`, the org-labels module's documented divergence, so the
  * link emits the live URL) — followed by the org label rows (badge +
  * description + count anchor; NEVER edit/delete controls).
  *
@@ -584,7 +584,7 @@ export function RepoLabelsPage(props: { ctx: UiContext; data: RepoLabelsData; fo
                       {repoLabelsLocale.org_labels_desc_1} <strong>{repoLabelsLocale.org_labels_desc_strong}</strong>{" "}
                       {repoLabelsLocale.org_labels_desc_2}
                       {data.orgSection.canManage ? (
-                        <a href={`/${data.orgSection.org.username}/labels`}> {repoLabelsLocale.org_labels_manage}</a>
+                        <a href={`/org/${data.orgSection.org.username}/settings/labels`}> {repoLabelsLocale.org_labels_manage}</a>
                       ) : null}
                       :
                     </div>

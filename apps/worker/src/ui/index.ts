@@ -18897,10 +18897,11 @@ uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
 // Wave-12 families (parseUiRoute claims exactly these shapes; registered
 // with the wave-9 statics so the literals beat the dynamic owner/repo and
 // owner regexes — the wave-9 RegExpRouter note: a static registered after
-// the dynamic pair LOSES to it, and /:owner/teams must beat /:owner/:repo
-// the same way). The POST-only tails answer GET with chi's 405 posture is
-// not needed here: /user/settings POST carries the literal GET above, and
-// the teams POSTs hang off the /new literal's own GET+POST pair.
+// the dynamic pair LOSES to it, and /org/:owner/teams must beat the
+// /:owner/:repo pair the same way — the ledger-B3 shape). The POST-only
+// tails answer GET with chi's 405 posture is not needed here: /user/
+// settings POST carries the literal GET above, and the teams POSTs hang
+// off the /new literal's own GET+POST pair.
 uiRouter.get("/user/settings", (c) => userSettingsPage(c));
 // The preferences write (web.go:636 — POST-only; the GET twin answers chi's
 // 405 — the account_link convention).
@@ -19362,17 +19363,17 @@ uiRouter.get("/org/:owner/settings/hooks/:id/delete", () => methodNotAllowed("PO
 // literal `labels` registers with the wave-9/12 statics so it beats the
 // dynamic /:owner/:repo pair — the wave-9 RegExpRouter note). The three
 // POST-only write tails answer GET with chi's 405.
-uiRouter.get("/org/:owner/labels", (c) => orgLabelsPage(c));
-uiRouter.post("/org/:owner/labels/new", (c) => orgLabelNewSubmit(c));
-uiRouter.get("/org/:owner/labels/new", () => methodNotAllowed("POST"));
-uiRouter.post("/org/:owner/labels/edit", (c) => orgLabelEditSubmit(c));
-uiRouter.get("/org/:owner/labels/edit", () => methodNotAllowed("POST"));
-uiRouter.post("/org/:owner/labels/delete", (c) => orgLabelDeleteSubmit(c));
-uiRouter.get("/org/:owner/labels/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/org/:owner/settings/labels", (c) => orgLabelsPage(c));
+uiRouter.post("/org/:owner/settings/labels/new", (c) => orgLabelNewSubmit(c));
+uiRouter.get("/org/:owner/settings/labels/new", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/labels/edit", (c) => orgLabelEditSubmit(c));
+uiRouter.get("/org/:owner/settings/labels/edit", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/labels/delete", (c) => orgLabelDeleteSubmit(c));
+uiRouter.get("/org/:owner/settings/labels/delete", () => methodNotAllowed("POST"));
 // The org label-template initialize write (web.go:1048, under require-owner
 // — the gate runs at the handler).
-uiRouter.post("/org/:owner/labels/initialize", (c) => orgLabelInitializeSubmit(c));
-uiRouter.get("/org/:owner/labels/initialize", () => methodNotAllowed("POST"));
+uiRouter.post("/org/:owner/settings/labels/initialize", (c) => orgLabelInitializeSubmit(c));
+uiRouter.get("/org/:owner/settings/labels/initialize", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));

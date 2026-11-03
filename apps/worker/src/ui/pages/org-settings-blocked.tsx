@@ -6,7 +6,7 @@
  *
  * ## Upstream surface (at the pin)
  *
- * `routers/web/web.go:1088-1090`'s `/{org}/settings/blocked_users` group —
+ * `routers/web/web.go:1088-1090`'s `/org/{org}/settings/blocked_users` group —
  * `GET org.BlockedUsers` + `POST web.Bind[*forms.BlockUserForm]`
  * `org.BlockedUsersPost` (routers/web/org/block.go:18-39, both thin shims
  * over `routers/web/shared/user/block.go`: the GET calls
@@ -21,7 +21,7 @@
  * — upstream answers a signed-in non-owner with the OrgAssignment NotFound
  * shell and anonymous with the login redirect; the landed
  * `resolveOrgTeamsRequest` prologue serves the identical posture for the
- * whole `/{org}/settings` family.
+ * whole `/org/{org}/settings` family.
  *
  * ## Data (§3.2 — the landed blocks family, never a self-fetch)
  *
@@ -111,10 +111,10 @@
  * `{ family: "org-settings-blocked", owner }`; the two handlers are shaped
  * exactly like the wave-53 hooks pair:
  *
- *   GET  /{org}/settings/blocked_users   resolveOrgTeamsRequest →
+ *   GET  /org/{org}/settings/blocked_users   resolveOrgTeamsRequest →
  *                                        loadOrgBlockedUsers →
  *                                        renderOrgBlockedUsersPage
- *   POST /{org}/settings/blocked_users   sameOriginGuard FIRST →
+ *   POST /org/{org}/settings/blocked_users   sameOriginGuard FIRST →
  *                                        resolveOrgTeamsRequest →
  *                                        parseOrgBlockedForm(
  *                                        readUrlEncodedForm(req)) →
@@ -268,7 +268,7 @@ export async function applyOrgBlockedForm(
 }
 
 // ---------------------------------------------------------------------------
-// The list page (GET /{org}/settings/blocked_users — org/settings/
+// The list page (GET /org/{org}/settings/blocked_users — org/settings/
 // blocked_users.tmpl over shared/user/blocked_users.tmpl)
 // ---------------------------------------------------------------------------
 
@@ -329,12 +329,12 @@ export function renderOrgBlockedUsersPage(options: {
 export function OrgBlockedUsersPage(props: { ctx: UiContext; data: OrgBlockedUsersData; error: string | null }) {
   const { ctx, data } = props;
   const org = data.org;
-  const pageLink = `/${org.username}/settings/blocked_users`;
+  const pageLink = `/org/${org.username}/settings/blocked_users`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsBlockedLocale.blocked_users} pageClass="organization settings blocked_users">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${org.username}`} active="blocked" oauth2Enabled={data.oauth2Enabled} />
+        <OrgSettingsNavbar orgLink={`/org/${org.username}`} active="blocked" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* The invalid-POST re-render's banner (the org hooks-page
               convention — upstream's JSONError toast, the no-JS

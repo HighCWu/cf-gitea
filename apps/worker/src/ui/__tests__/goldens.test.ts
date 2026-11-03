@@ -1209,7 +1209,7 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     is golden's repository pair: the pinned create emit (T0+220) + the
   //     rich visibility row (T0+221, morgan impersonating alice with the
   //     access-token credential + the IP).
-  //   - org-settings-audit-logs: /acme/settings/audit_logs signed in as
+  //   - org-settings-audit-logs: /org/acme/settings/audit_logs signed in as
   //     morgan (acme's owner — the require-owner prologue). The scope is
   //     acme's organization pair: the pinned createOrg emit (T0) + the
   //     member-add row (T0+230).
@@ -1219,7 +1219,7 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "repo-settings-audit-logs.html", path: "/alice/golden/settings/audit_logs", status: 200, signedIn: true },
   {
     file: "org-settings-audit-logs.html",
-    path: "/acme/settings/audit_logs",
+    path: "/org/acme/settings/audit_logs",
     status: 200,
     signedIn: true,
     sessionUser: "morgan",
@@ -1270,7 +1270,7 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     delete forms (the autoincrement ids 1/2 ride the fixed seed order),
   //     and the inline add form (the dialog reduction) with the empty-triple
   //     arm.
-  //   - org-settings-actions-runners: `/acme/settings/actions/runners`
+  //   - org-settings-actions-runners: `/org/acme/settings/actions/runners`
   //     signed in as morgan (the require-owner prologue), the census C7 ORG
   //     arm. Pins the OrgHeader + OrgSettingsNavbar (active "runners") over
   //     the "Total 2" list: the WithAvailable scope arm — the org's own
@@ -1308,7 +1308,7 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-actions-variables.html", path: "/-/admin/actions/variables", status: 200, signedIn: true, sessionUser: "morgan" },
   {
     file: "org-settings-actions-runners.html",
-    path: "/acme/settings/actions/runners",
+    path: "/org/acme/settings/actions/runners",
     status: 200,
     signedIn: true,
     sessionUser: "morgan",
@@ -1350,7 +1350,7 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     renders with active="runners" (the Actions disclosure open, the
   //     72af05a fold), and the token panel input is the FIXED alice-scope
   //     token.
-  //   - org-settings-packages: /acme/settings/packages signed in as morgan
+  //   - org-settings-packages: /org/acme/settings/packages signed in as morgan
   //     (the require-owner prologue), SPEC-0016's staged management page.
   //     The OrgHeader + OrgSettingsNavbar (active "packages" — the 6bf9c17
   //     fold) over the one seeded rule row: the Container type name, the
@@ -1382,7 +1382,7 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "user-settings-actions-runners.html", path: "/user/settings/actions/runners", status: 200, signedIn: true },
   {
     file: "org-settings-packages.html",
-    path: "/acme/settings/packages",
+    path: "/org/acme/settings/packages",
     status: 200,
     signedIn: true,
     sessionUser: "morgan",

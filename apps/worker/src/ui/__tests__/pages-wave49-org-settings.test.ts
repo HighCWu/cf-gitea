@@ -161,31 +161,34 @@ async function teamById(id: number): Promise<TeamRecord> {
 
 describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
   it("claims the settings shapes", () => {
-    expect(parseUiRoute("/acme/settings")).toEqual({ family: "org-settings", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/avatar")).toEqual({ family: "org-settings-avatar", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/avatar/delete")).toEqual({ family: "org-settings-avatar-delete", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/rename")).toEqual({ family: "org-settings-rename", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/delete")).toEqual({ family: "org-settings-delete", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/visibility")).toEqual({ family: "org-settings-visibility", owner: "acme" });
-    expect(handlesUiRoute("/acme/settings")).toBe(true);
+    expect(parseUiRoute("/org/acme/settings")).toEqual({ family: "org-settings", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/avatar")).toEqual({ family: "org-settings-avatar", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/avatar/delete")).toEqual({ family: "org-settings-avatar-delete", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/rename")).toEqual({ family: "org-settings-rename", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/delete")).toEqual({ family: "org-settings-delete", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/visibility")).toEqual({ family: "org-settings-visibility", owner: "acme" });
+    expect(handlesUiRoute("/org/acme/settings")).toBe(true);
   });
 
   it("leaves the unclaimed tabs and deeper junk with the engine", () => {
     // The labels/... tabs are separate upstream pages still not
     // claimed; every other tail stays engine-owned. (Wave 53 lifted the
     // hooks tab out of this set — pages/org-settings-hooks.tsx — so
-    // /acme/settings/hooks now parses to its own family.)
-    expect(parseUiRoute("/acme/settings/hooks")).toEqual({ family: "org-settings-hooks", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/labels")).toBeNull();
+    // /org/acme/settings/hooks now parses to its own family.)
+    expect(parseUiRoute("/org/acme/settings/hooks")).toEqual({ family: "org-settings-hooks", owner: "acme" });
+    // The wave-14 labels tab rides the SAME canonical subtree since ledger
+    // B3 — the bare /{org}/labels claim retired (web.go:1043-1048's
+    // /settings/labels group).
+    expect(parseUiRoute("/org/acme/settings/labels")).toEqual({ family: "org-labels", owner: "acme" });
     // The R20-a applications arm (pages/org-settings-applications.tsx)
     // lifted the applications tab out of this set — the stale toBeNull pin
     // updated to the claimed shapes (the window-2b blocked_users precedent).
-    expect(parseUiRoute("/acme/settings/applications")).toEqual({ family: "org-settings-applications", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/applications/oauth2")).toEqual({
+    expect(parseUiRoute("/org/acme/settings/applications")).toEqual({ family: "org-settings-applications", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/applications/oauth2")).toEqual({
       family: "org-settings-applications-create",
       owner: "acme",
     });
-    expect(parseUiRoute("/acme/settings/applications/oauth2/7/delete")).toEqual({
+    expect(parseUiRoute("/org/acme/settings/applications/oauth2/7/delete")).toEqual({
       family: "org-settings-applications-delete",
       owner: "acme",
       id: 7,
@@ -197,12 +200,12 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
     // (the window-2b / R20-a precedents). Upstream web.go:1025-1027: the
     // /oauth2/{id} group's Combo("") (GET show + POST save — one parse
     // shape, two methods) and the literal regenerate_secret POST.
-    expect(parseUiRoute("/acme/settings/applications/oauth2/7")).toEqual({
+    expect(parseUiRoute("/org/acme/settings/applications/oauth2/7")).toEqual({
       family: "org-settings-applications-app",
       owner: "acme",
       id: 7,
     });
-    expect(parseUiRoute("/acme/settings/applications/oauth2/7/regenerate_secret")).toEqual({
+    expect(parseUiRoute("/org/acme/settings/applications/oauth2/7/regenerate_secret")).toEqual({
       family: "org-settings-applications-regenerate",
       owner: "acme",
       id: 7,
@@ -210,27 +213,27 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
     // Window-2b (4f2805f) mounted the blocked-users tab — the stale
     // toBeNull pin updated to the claimed shape (the org-settings matrix's
     // escalation).
-    expect(parseUiRoute("/acme/settings/blocked_users")).toEqual({ family: "org-settings-blocked", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/blocked_users")).toEqual({ family: "org-settings-blocked", owner: "acme" });
     // R13 mounted the org audit-logs tab (M4's findAuditEvents behind the
     // require-owner prologue) — the stale toBeNull pin updated to the claim.
-    expect(parseUiRoute("/acme/settings/audit_logs")).toEqual({ family: "org-settings-audit-logs", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/rename/extra")).toBeNull();
-    expect(parseUiRoute("/acme/settings/")).toEqual({ family: "org-settings", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/audit_logs")).toEqual({ family: "org-settings-audit-logs", owner: "acme" });
+    expect(parseUiRoute("/org/acme/settings/rename/extra")).toBeNull();
+    expect(parseUiRoute("/org/acme/settings/")).toEqual({ family: "org-settings", owner: "acme" });
   });
 
   it("claims the team edit/delete shapes (positive integers only)", () => {
-    expect(parseUiRoute("/acme/teams/7/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 7 });
-    expect(parseUiRoute("/acme/teams/007/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 7 });
-    expect(parseUiRoute("/acme/teams/7/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 7 });
-    expect(parseUiRoute("/acme/teams/new/edit")).toBeNull();
-    expect(parseUiRoute("/acme/teams/not-a-number/edit")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/7/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 7 });
+    expect(parseUiRoute("/org/acme/teams/007/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 7 });
+    expect(parseUiRoute("/org/acme/teams/7/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 7 });
+    expect(parseUiRoute("/org/acme/teams/new/edit")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/not-a-number/edit")).toBeNull();
   });
 
   it("shadows a repository named 'settings' exactly like upstream's route order", () => {
     // The require-owner /{org} group registers ahead of :1292's
     // /{username}/{reponame} — a repo named "settings" is shadowed for every
     // viewer; a user owner 404-shells at resolve time.
-    expect(parseUiRoute("/alice/settings")).toEqual({ family: "org-settings", owner: "alice" });
+    expect(parseUiRoute("/org/alice/settings")).toEqual({ family: "org-settings", owner: "alice" });
   });
 });
 
@@ -238,51 +241,51 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
 
 describe("GET /{org}/settings (the requireOrgOwnership posture)", () => {
   it("303s an anonymous viewer onto the login round-trip", async () => {
-    const res = await fetchUi("/setorg/settings");
+    const res = await fetchUi("/org/setorg/settings");
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Fsetorg%2Fsettings");
+    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Forg%2Fsetorg%2Fsettings");
   });
 
   it("404-shells a signed-in non-member, a plain member and a user owner", async () => {
     const fixture = await ensureWave49Fixtures();
-    const pal = await fetchUi("/setorg/settings", withCookie(fixture.memberCookie));
+    const pal = await fetchUi("/org/setorg/settings", withCookie(fixture.memberCookie));
     expect(pal.status).toBe(404);
     // A USER namespace: the org resolution's type gate misses → the shell.
-    const userOwner = await fetchUi("/wave49member/settings", withCookie(fixture.memberCookie));
+    const userOwner = await fetchUi("/org/wave49member/settings", withCookie(fixture.memberCookie));
     expect(userOwner.status).toBe(404);
   });
 
   it("answers the owner and a site admin with the options page", async () => {
     const fixture = await ensureWave49Fixtures();
     for (const cookie of [fixture.ownerCookie, fixture.adminCookie]) {
-      const res = await fetchUi("/setorg/settings", withCookie(cookie));
+      const res = await fetchUi("/org/setorg/settings", withCookie(cookie));
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("page-content organization settings options");
       // The options form's fields with the stored values.
       expect(html).toContain('name="full_name"');
       expect(html).toContain('name="repo_admin_change_team_access"');
-      expect(html).toContain('action="/setorg/settings"');
+      expect(html).toContain('action="/org/setorg/settings"');
       // The live navbar items (Options active; Hooks onto the wave-53 page;
       // Labels onto the landed wave-14 page — the URL divergence).
-      expect(html).toContain('<a class="active item" href="/setorg/settings">');
-      expect(html).toContain('<a class="item" href="/setorg/settings/hooks">');
-      expect(html).toContain('<a class="item" href="/setorg/labels">');
+      expect(html).toContain('<a class="active item" href="/org/setorg/settings">');
+      expect(html).toContain('<a class="item" href="/org/setorg/settings/hooks">');
+      expect(html).toContain('<a class="item" href="/org/setorg/settings/labels">');
       // The danger zone's three rows, each a <details> form.
       expect(html).toContain("Danger Zone");
-      expect(html).toContain('action="/setorg/settings/visibility"');
-      expect(html).toContain('action="/setorg/settings/rename"');
-      expect(html).toContain('action="/setorg/settings/delete"');
+      expect(html).toContain('action="/org/setorg/settings/visibility"');
+      expect(html).toContain('action="/org/setorg/settings/rename"');
+      expect(html).toContain('action="/org/setorg/settings/delete"');
       // The avatar pair.
-      expect(html).toContain('action="/setorg/settings/avatar"');
-      expect(html).toContain('formaction="/setorg/settings/avatar/delete"');
+      expect(html).toContain('action="/org/setorg/settings/avatar"');
+      expect(html).toContain('formaction="/org/setorg/settings/avatar/delete"');
     }
   });
 
   it("307s a renamed org (the shared resolve seam)", async () => {
     const fixture = await ensureWave49Fixtures();
     // ownerlock is NOT renamed — use the seam's shape with the settings path.
-    const res = await fetchUi("/ownerlock/settings?q=x", withCookie(fixture.ownerCookie));
+    const res = await fetchUi("/org/ownerlock/settings?q=x", withCookie(fixture.ownerCookie));
     expect(res.status).toBe(200);
   });
 });
@@ -293,8 +296,8 @@ describe("POST /{org}/settings (the options write over the landed orgEdit arm)",
   it("applies the form fields and clears on empty (the Go empty-pointer semantics)", async () => {
     const fixture = await ensureWave49Fixtures();
     const post = await fetchUi(
-      "/setorg/settings",
-      formPost("/setorg/settings", {
+      "/org/setorg/settings",
+      formPost("/org/setorg/settings", {
         full_name: "Settings Org",
         email: "contact@setorg.example",
         description: "The wave-49 fixture org.",
@@ -304,7 +307,7 @@ describe("POST /{org}/settings (the options write over the landed orgEdit arm)",
       }, fixture.ownerCookie),
     );
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe("/setorg/settings");
+    expect(post.headers.get("location")).toBe("/org/setorg/settings");
 
     const org = (await new OrgService(env.DB).getOrgByUsername("setorg"))!;
     expect(org.fullName).toBe("Settings Org");
@@ -315,24 +318,24 @@ describe("POST /{org}/settings (the options write over the landed orgEdit arm)",
     expect(org.repoAdminChangeTeamAccess).toBe(true);
 
     // The unchecked checkbox posts ABSENT — false, not keep.
-    await fetchUi("/setorg/settings", formPost("/setorg/settings", { full_name: "Settings Org" }, fixture.ownerCookie));
+    await fetchUi("/org/setorg/settings", formPost("/org/setorg/settings", { full_name: "Settings Org" }, fixture.ownerCookie));
     const cleared = (await new OrgService(env.DB).getOrgByUsername("setorg"))!;
     expect(cleared.repoAdminChangeTeamAccess).toBe(false);
     expect(cleared.description).toBe("");
     // The re-rendered page carries the fresh values.
-    const page = await fetchUi("/setorg/settings", withCookie(fixture.ownerCookie));
+    const page = await fetchUi("/org/setorg/settings", withCookie(fixture.ownerCookie));
     expect(await page.text()).toContain('value="Settings Org"');
   });
 
   it("rejects a cross-origin post (the §2.8 guard)", async () => {
     const fixture = await ensureWave49Fixtures();
-    const res = await fetchUi("/setorg/settings", formPost("/setorg/settings", { full_name: "x" }, fixture.ownerCookie, "https://evil.example"));
+    const res = await fetchUi("/org/setorg/settings", formPost("/org/setorg/settings", { full_name: "x" }, fixture.ownerCookie, "https://evil.example"));
     expect(res.status).toBe(403);
   });
 
   it("keeps the member gate on the POST arm", async () => {
     const fixture = await ensureWave49Fixtures();
-    const res = await fetchUi("/setorg/settings", formPost("/setorg/settings", { full_name: "x" }, fixture.memberCookie));
+    const res = await fetchUi("/org/setorg/settings", formPost("/org/setorg/settings", { full_name: "x" }, fixture.memberCookie));
     expect(res.status).toBe(404);
   });
 });
@@ -340,19 +343,19 @@ describe("POST /{org}/settings (the options write over the landed orgEdit arm)",
 describe("POST /{org}/settings/avatar + /avatar/delete (the landed avatar store)", () => {
   it("stores an uploaded PNG and clears it again", async () => {
     const fixture = await ensureWave49Fixtures();
-    const post = await fetchUi("/setorg/settings/avatar", avatarPost("/setorg/settings/avatar", fixture.ownerCookie, true));
+    const post = await fetchUi("/org/setorg/settings/avatar", avatarPost("/org/setorg/settings/avatar", fixture.ownerCookie, true));
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe("/setorg/settings");
+    expect(post.headers.get("location")).toBe("/org/setorg/settings");
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: fixture.orgId })).toBe(true);
 
-    const del = await fetchUi("/setorg/settings/avatar/delete", avatarPost("/setorg/settings/avatar/delete", fixture.ownerCookie, false));
+    const del = await fetchUi("/org/setorg/settings/avatar/delete", avatarPost("/org/setorg/settings/avatar/delete", fixture.ownerCookie, false));
     expect(del.status).toBe(303);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: fixture.orgId })).toBe(false);
   });
 
   it("redirects silently on an empty upload (upstream's flash-redirect arms)", async () => {
     const fixture = await ensureWave49Fixtures();
-    const res = await fetchUi("/setorg/settings/avatar", avatarPost("/setorg/settings/avatar", fixture.ownerCookie, false));
+    const res = await fetchUi("/org/setorg/settings/avatar", avatarPost("/org/setorg/settings/avatar", fixture.ownerCookie, false));
     expect(res.status).toBe(303);
   });
 });
@@ -360,13 +363,13 @@ describe("POST /{org}/settings/avatar + /avatar/delete (the landed avatar store)
 describe("POST /{org}/settings/visibility (the landed orgEdit visibility key)", () => {
   it("flips the visibility and answers the no-change arm with a redirect", async () => {
     const fixture = await ensureWave49Fixtures();
-    const post = await fetchUi("/setorg/settings/visibility", formPost("/setorg/settings/visibility", { visibility: "limited" }, fixture.ownerCookie));
+    const post = await fetchUi("/org/setorg/settings/visibility", formPost("/org/setorg/settings/visibility", { visibility: "limited" }, fixture.ownerCookie));
     expect(post.status).toBe(303);
     expect((await new OrgService(env.DB).getOrgByUsername("setorg"))!.visibility).toBe("limited");
     // Re-flip back (later asserts read a public org) and exercise the
     // unchanged arm + the out-of-enum arm — both upstream redirects.
     for (const body of [{ visibility: "limited" }, { visibility: "bogus" }, { visibility: "public" }]) {
-      const res = await fetchUi("/setorg/settings/visibility", formPost("/setorg/settings/visibility", body, fixture.ownerCookie));
+      const res = await fetchUi("/org/setorg/settings/visibility", formPost("/org/setorg/settings/visibility", body, fixture.ownerCookie));
       expect(res.status).toBe(303);
     }
     expect((await new OrgService(env.DB).getOrgByUsername("setorg"))!.visibility).toBe("public");
@@ -378,29 +381,29 @@ describe("POST /{org}/settings/visibility (the landed orgEdit visibility key)", 
 describe("POST /{org}/settings/rename (the landed renameOrg service)", () => {
   it("re-renders with the upstream texts on the confirm and no-change arms", async () => {
     const fixture = await ensureWave49Fixtures();
-    const wrong = await fetchUi("/delorg/settings/rename", formPost("/delorg/settings/rename", { org_name: "not-delorg", new_org_name: "delorg2" }, fixture.ownerCookie));
+    const wrong = await fetchUi("/org/delorg/settings/rename", formPost("/org/delorg/settings/rename", { org_name: "not-delorg", new_org_name: "delorg2" }, fixture.ownerCookie));
     expect(wrong.status).toBe(200);
     expect(await wrong.text()).toContain("The organization name you entered is incorrect.");
-    const same = await fetchUi("/delorg/settings/rename", formPost("/delorg/settings/rename", { org_name: "delorg", new_org_name: "delorg" }, fixture.ownerCookie));
+    const same = await fetchUi("/org/delorg/settings/rename", formPost("/org/delorg/settings/rename", { org_name: "delorg", new_org_name: "delorg" }, fixture.ownerCookie));
     expect(same.status).toBe(200);
     expect(await same.text()).toContain("Organization name is not changed.");
   });
 
   it("renames and 303s onto the new name's settings page", async () => {
     const fixture = await ensureWave49Fixtures();
-    const post = await fetchUi("/delorg/settings/rename", formPost("/delorg/settings/rename", { org_name: "delorg", new_org_name: "delorg2" }, fixture.ownerCookie));
+    const post = await fetchUi("/org/delorg/settings/rename", formPost("/org/delorg/settings/rename", { org_name: "delorg", new_org_name: "delorg2" }, fixture.ownerCookie));
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe("/delorg2/settings");
+    expect(post.headers.get("location")).toBe("/org/delorg2/settings");
     expect(await new OrgService(env.DB).getOrgByUsername("delorg2")).not.toBeNull();
     // The old name rides the redirect row (the RenameUser port).
-    const old = await fetchUi("/delorg/settings", withCookie(fixture.ownerCookie));
+    const old = await fetchUi("/org/delorg/settings", withCookie(fixture.ownerCookie));
     expect(old.status).toBe(307);
-    expect(old.headers.get("location")).toBe("/delorg2/settings");
+    expect(old.headers.get("location")).toBe("/org/delorg2/settings");
   });
 
   it("answers a collision with the upstream text (the shared-namespace guard)", async () => {
     const fixture = await ensureWave49Fixtures();
-    const post = await fetchUi("/delorg2/settings/rename", formPost("/delorg2/settings/rename", { org_name: "delorg2", new_org_name: "setorg" }, fixture.ownerCookie));
+    const post = await fetchUi("/org/delorg2/settings/rename", formPost("/org/delorg2/settings/rename", { org_name: "delorg2", new_org_name: "setorg" }, fixture.ownerCookie));
     expect(post.status).toBe(200);
     // The banner text HTML-escapes the quoted name in the serialized DOM.
     expect(await post.text()).toContain("The organization name &quot;setorg&quot; has already been taken.");
@@ -410,10 +413,10 @@ describe("POST /{org}/settings/rename (the landed renameOrg service)", () => {
 describe("POST /{org}/settings/delete (the landed orgDelete cascade)", () => {
   it("refuses a wrong confirmation and an org that still owns repositories", async () => {
     const fixture = await ensureWave49Fixtures();
-    const wrong = await fetchUi("/setorg/settings/delete", formPost("/setorg/settings/delete", { org_name: "not-setorg" }, fixture.ownerCookie));
+    const wrong = await fetchUi("/org/setorg/settings/delete", formPost("/org/setorg/settings/delete", { org_name: "not-setorg" }, fixture.ownerCookie));
     expect(wrong.status).toBe(200);
     expect(await wrong.text()).toContain("The organization name you entered is incorrect.");
-    const owns = await fetchUi("/setorg/settings/delete", formPost("/setorg/settings/delete", { org_name: "setorg" }, fixture.ownerCookie));
+    const owns = await fetchUi("/org/setorg/settings/delete", formPost("/org/setorg/settings/delete", { org_name: "setorg" }, fixture.ownerCookie));
     expect(owns.status).toBe(200);
     expect(await owns.text()).toContain("This organization still owns one or more repositories.");
     expect(await new OrgService(env.DB).getOrgByUsername("setorg")).not.toBeNull();
@@ -421,7 +424,7 @@ describe("POST /{org}/settings/delete (the landed orgDelete cascade)", () => {
 
   it("deletes the emptied org and lands on the site root", async () => {
     const fixture = await ensureWave49Fixtures();
-    const post = await fetchUi("/delorg2/settings/delete", formPost("/delorg2/settings/delete", { org_name: "delorg2" }, fixture.ownerCookie));
+    const post = await fetchUi("/org/delorg2/settings/delete", formPost("/org/delorg2/settings/delete", { org_name: "delorg2" }, fixture.ownerCookie));
     expect(post.status).toBe(303);
     expect(post.headers.get("location")).toBe("/");
     expect(await new OrgService(env.DB).getOrgByUsername("delorg2")).toBeNull();
@@ -433,22 +436,22 @@ describe("POST /{org}/settings/delete (the landed orgDelete cascade)", () => {
 describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
   it("renders the edit form with the stored values for the owner", async () => {
     const fixture = await ensureWave49Fixtures();
-    const res = await fetchUi(`/setorg/teams/${fixture.devTeamId}/edit`, withCookie(fixture.ownerCookie));
+    const res = await fetchUi(`/org/setorg/teams/${fixture.devTeamId}/edit`, withCookie(fixture.ownerCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("page-content organization new team");
-    expect(html).toContain('action="/setorg/teams/');
+    expect(html).toContain('action="/org/setorg/teams/');
     expect(html).toContain('value="Dev Team"');
     expect(html).toContain("Ships the settings.");
     expect(html).toContain('value="write" checked');
     // The delete control rides its own form onto the delete route.
-    expect(html).toContain('action="/setorg/teams/');
+    expect(html).toContain('action="/org/setorg/teams/');
     expect(html).toContain("Delete Team");
   });
 
   it("renders the stored unit rows of a per-unit team", async () => {
     const fixture = await ensureWave49Fixtures();
-    const res = await fetchUi(`/setorg/teams/${fixture.unitTeamId}/edit`, withCookie(fixture.ownerCookie));
+    const res = await fetchUi(`/org/setorg/teams/${fixture.unitTeamId}/edit`, withCookie(fixture.ownerCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('name="units_present"');
@@ -458,19 +461,19 @@ describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
 
   it("carries the org gate (anonymous 303, member 404, unknown/foreign id 404)", async () => {
     const fixture = await ensureWave49Fixtures();
-    const anon = await fetchUi(`/setorg/teams/${fixture.devTeamId}/edit`);
+    const anon = await fetchUi(`/org/setorg/teams/${fixture.devTeamId}/edit`);
     expect(anon.status).toBe(303);
-    const member = await fetchUi(`/setorg/teams/${fixture.devTeamId}/edit`, withCookie(fixture.memberCookie));
+    const member = await fetchUi(`/org/setorg/teams/${fixture.devTeamId}/edit`, withCookie(fixture.memberCookie));
     expect(member.status).toBe(404);
-    const unknown = await fetchUi("/setorg/teams/999999/edit", withCookie(fixture.ownerCookie));
+    const unknown = await fetchUi("/org/setorg/teams/999999/edit", withCookie(fixture.ownerCookie));
     expect(unknown.status).toBe(404);
   });
 
   it("applies the form fields and 303s onto the detail slice", async () => {
     const fixture = await ensureWave49Fixtures();
     const post = await fetchUi(
-      `/setorg/teams/${fixture.devTeamId}/edit`,
-      formPost(`/setorg/teams/${fixture.devTeamId}/edit`, {
+      `/org/setorg/teams/${fixture.devTeamId}/edit`,
+      formPost(`/org/setorg/teams/${fixture.devTeamId}/edit`, {
         team_name: "Dev Team Renamed",
         description: "Renamed by wave 49.",
         visibility: "public",
@@ -479,7 +482,7 @@ describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
       }, fixture.ownerCookie),
     );
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe(`/setorg/teams/${fixture.devTeamId}`);
+    expect(post.headers.get("location")).toBe(`/org/setorg/teams/${fixture.devTeamId}`);
     const team = await teamById(fixture.devTeamId);
     expect(team.name).toBe("Dev Team Renamed");
     expect(team.description).toBe("Renamed by wave 49.");
@@ -491,14 +494,14 @@ describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
   it("re-renders on the required-name and duplicate-name arms", async () => {
     const fixture = await ensureWave49Fixtures();
     const empty = await fetchUi(
-      `/setorg/teams/${fixture.devTeamId}/edit`,
-      formPost(`/setorg/teams/${fixture.devTeamId}/edit`, { team_name: "  ", description: "x" }, fixture.ownerCookie),
+      `/org/setorg/teams/${fixture.devTeamId}/edit`,
+      formPost(`/org/setorg/teams/${fixture.devTeamId}/edit`, { team_name: "  ", description: "x" }, fixture.ownerCookie),
     );
     expect(empty.status).toBe(200);
     expect(await empty.text()).toContain("Team name is required.");
     const dup = await fetchUi(
-      `/setorg/teams/${fixture.devTeamId}/edit`,
-      formPost(`/setorg/teams/${fixture.devTeamId}/edit`, { team_name: "Unit Team" }, fixture.ownerCookie),
+      `/org/setorg/teams/${fixture.devTeamId}/edit`,
+      formPost(`/org/setorg/teams/${fixture.devTeamId}/edit`, { team_name: "Unit Team" }, fixture.ownerCookie),
     );
     expect(dup.status).toBe(200);
     expect(await dup.text()).toContain("The team name is already taken.");
@@ -507,8 +510,8 @@ describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
   it("updates a units team's per-unit map through the units_present post", async () => {
     const fixture = await ensureWave49Fixtures();
     const post = await fetchUi(
-      `/setorg/teams/${fixture.unitTeamId}/edit`,
-      formPost(`/setorg/teams/${fixture.unitTeamId}/edit`, {
+      `/org/setorg/teams/${fixture.unitTeamId}/edit`,
+      formPost(`/org/setorg/teams/${fixture.unitTeamId}/edit`, {
         team_name: "Unit Team",
         description: "",
         visibility: "private",
@@ -525,8 +528,8 @@ describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
   it("converts a units team to a blanket mode when a permission radio posts", async () => {
     const fixture = await ensureWave49Fixtures();
     const post = await fetchUi(
-      `/setorg/teams/${fixture.unitTeamId}/edit`,
-      formPost(`/setorg/teams/${fixture.unitTeamId}/edit`, {
+      `/org/setorg/teams/${fixture.unitTeamId}/edit`,
+      formPost(`/org/setorg/teams/${fixture.unitTeamId}/edit`, {
         team_name: "Unit Team",
         visibility: "private",
         permission: "read",
@@ -542,19 +545,19 @@ describe("GET+POST /{org}/teams/{id}/edit (the landed orgEditTeam arm)", () => {
 describe("POST /{org}/teams/{id}/delete (the landed orgDeleteTeam cascade)", () => {
   it("405s the GET shape and deletes the team for the owner", async () => {
     const fixture = await ensureWave49Fixtures();
-    const get = await fetchUi(`/setorg/teams/${fixture.devTeamId}/delete`, withCookie(fixture.ownerCookie));
+    const get = await fetchUi(`/org/setorg/teams/${fixture.devTeamId}/delete`, withCookie(fixture.ownerCookie));
     expect(get.status).toBe(405);
-    const post = await fetchUi(`/setorg/teams/${fixture.devTeamId}/delete`, formPost(`/setorg/teams/${fixture.devTeamId}/delete`, {}, fixture.ownerCookie));
+    const post = await fetchUi(`/org/setorg/teams/${fixture.devTeamId}/delete`, formPost(`/org/setorg/teams/${fixture.devTeamId}/delete`, {}, fixture.ownerCookie));
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe("/setorg/teams");
+    expect(post.headers.get("location")).toBe("/org/setorg/teams");
     expect(await new TeamsService(env.DB).getTeamById(fixture.devTeamId)).toBeNull();
   });
 
   it("refuses the last-owner team with a redirect back onto the edit form", async () => {
     const fixture = await ensureWave49Fixtures();
-    const post = await fetchUi(`/ownerlock/teams/${fixture.lockTeamId}/delete`, formPost(`/ownerlock/teams/${fixture.lockTeamId}/delete`, {}, fixture.ownerCookie));
+    const post = await fetchUi(`/org/ownerlock/teams/${fixture.lockTeamId}/delete`, formPost(`/org/ownerlock/teams/${fixture.lockTeamId}/delete`, {}, fixture.ownerCookie));
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe(`/ownerlock/teams/${fixture.lockTeamId}/edit`);
+    expect(post.headers.get("location")).toBe(`/org/ownerlock/teams/${fixture.lockTeamId}/edit`);
     expect(await new TeamsService(env.DB).getTeamById(fixture.lockTeamId)).not.toBeNull();
     // The owner's membership survived (the whole upstream tx rolls back).
     expect(
@@ -572,16 +575,16 @@ describe("POST /{org}/teams/{id}/delete (the landed orgDeleteTeam cascade)", () 
 describe("the wave-49 surfaces on the landed pages", () => {
   it("renders the team detail sidebar's Settings button (the entry link)", async () => {
     const fixture = await ensureWave49Fixtures();
-    const res = await fetchUi(`/setorg/teams/${fixture.unitTeamId}`, withCookie(fixture.ownerCookie));
+    const res = await fetchUi(`/org/setorg/teams/${fixture.unitTeamId}`, withCookie(fixture.ownerCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain(`href="/setorg/teams/${fixture.unitTeamId}/edit"`);
+    expect(html).toContain(`href="/org/setorg/teams/${fixture.unitTeamId}/edit"`);
   });
 
   it("answers GET on every POST-only settings tail with chi's 405", async () => {
     const fixture = await ensureWave49Fixtures();
     for (const tail of ["avatar", "avatar/delete", "rename", "delete", "visibility"]) {
-      const res = await fetchUi(`/setorg/settings/${tail}`, withCookie(fixture.ownerCookie));
+      const res = await fetchUi(`/org/setorg/settings/${tail}`, withCookie(fixture.ownerCookie));
       expect(res.status).toBe(405);
     }
   });

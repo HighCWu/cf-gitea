@@ -56,12 +56,11 @@
  *               `{{.OrganisationLink}}/settings` = /org/{name}/settings
  *               (OrganisationLink, user.go:351-353; the upstream settings
  *               group, web.go:1017). The TARGET page (org-settings.tsx) IS
- *               landed — but at our DOCUMENTED-DIVERGENCE mount
- *               `/{org}/settings` (the index.ts mount record; pinned at
- *               ui/index.test.ts's org-settings family cases), with no
- *               `/org/{name}` alias, so the emitted href follows the
- *               MOUNTED shape, not upstream's bytes (upstream-parity rule:
- *               the mount is the divergence, the emitter adapts — the
+ *               landed at the SAME canonical `/org/{org}/settings` shape
+ *               (the ledger-B3 unification — the pre-B3 bare /{org}/settings
+ *               divergence mount retired; pinned at
+ *               ui/index.test.ts's org-settings family cases), so the
+ *               emitted href IS upstream's bytes.
  *               link-crawl A1/A4 fix, docs/usability/findings-links.md)
  *               (octicon-pencil, allowlisted)
  *
@@ -436,14 +435,14 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
                   <td>{formatAdminDate(org.createdAt)}</td>
                   {/* The settings pencil (list.tmpl:70). Upstream emits
                       OrganisationLink()/settings = /org/{name}/settings
-                      (user.go:351-353, web.go:1017); our org-settings mount
-                      is the DOCUMENTED DIVERGENCE at /{org}/settings (no
-                      /org/{name} alias), so the href follows the mounted
-                      shape — org-settings.tsx is landed there and the link
-                      is live (the link-crawl A1/A4 fix; the module
-                      header's actions row). */}
+                      (user.go:351-353, web.go:1017); the landed org-settings
+                      mount rides the SAME canonical /org/{org}/settings
+                      shape since ledger B3 (the pre-B3 bare /{org}/settings
+                      divergence retired) — the href IS upstream's bytes
+                      (the link-crawl A1/A4 fix; the module header's actions
+                      row). */}
                   <td>
-                    <a href={`/${org.username}/settings`} data-tooltip-content={adminOrgsLocale.edit} aria-label={adminOrgsLocale.edit}>
+                    <a href={`/org/${org.username}/settings`} data-tooltip-content={adminOrgsLocale.edit} aria-label={adminOrgsLocale.edit}>
                       <Icon name="octicon-pencil" />
                     </a>
                   </td>

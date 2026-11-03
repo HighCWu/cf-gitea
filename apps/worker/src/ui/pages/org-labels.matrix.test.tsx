@@ -21,7 +21,7 @@
  *
  *   - the claim pin the parser test leaves open (the org second-segment
  *     literal): a REAL repository named "labels" under the org — the
- *     anonymous GET /{org}/labels still 303s onto the login round-trip
+ *     anonymous GET /org/{org}/settings/labels still 303s onto the login round-trip
  *     (a public repo home would have answered 200: the org claim beat the
  *     repo parse), the owner still gets the management page, and a create
  *     POST at the claimed URL lands an ORG label while the shadowed
@@ -270,30 +270,30 @@ beforeAll(async () => {
 describe("the claim pin: a REAL repository named labels stays shadowed by the org literal", () => {
   it("the anonymous GET still 303s onto the login round-trip (a public repo home would have answered 200)", async () => {
     await ensureOrgLabelsFixtures();
-    const res = await fetchUi(`/${ORG_NAME}/labels`);
+    const res = await fetchUi(`/org/${ORG_NAME}/settings/labels`);
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${ORG_NAME}/labels`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${ORG_NAME}/settings/labels`)}`,
     );
   });
 
   it("the owner still gets the management page, and a create POST at the claimed URL lands an ORG label — the shadowed repo's label list stays empty", async () => {
     const fixture = await ensureOrgLabelsFixtures();
-    const page = await fetchUi(`/${ORG_NAME}/labels`, {
+    const page = await fetchUi(`/org/${ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
     });
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain("page-content organization settings labels");
-    expect(html).toContain(`action="/${ORG_NAME}/labels/new" method="post"`);
+    expect(html).toContain(`action="/org/${ORG_NAME}/settings/labels/new" method="post"`);
 
     await purgeOrgLabelNamed(fixture.orgId, "ol-claim");
     const created = await fetchUi(
-      `/${ORG_NAME}/labels/new`,
+      `/org/${ORG_NAME}/settings/labels/new`,
       withCookie(formPost({ title: "ol-claim", color: "#00aabb" }), fixture.ownerCookie),
     );
     expect(created.status).toBe(303);
-    expect(created.headers.get("location")).toBe(`/${ORG_NAME}/labels`);
+    expect(created.headers.get("location")).toBe(`/org/${ORG_NAME}/settings/labels`);
     // The org family handled it: the row is an ORG label…
     expect(await findOrgLabelByName(env.DB, fixture.orgId, "ol-claim")).not.toBeNull();
     // …and the shadowed repo's own label list never saw the write.
@@ -309,10 +309,10 @@ describe("the write gates' deferred org arms (wave14 pinned contains-only on /ne
     for (const tail of ["new", "edit", "delete"]) {
       const fields: Record<string, string> =
         tail === "delete" ? { id: "1" } : { id: "1", title: "x", color: "#00aabb" };
-      const res = await fetchUi(`/${ORG_NAME}/labels/${tail}`, formPost(fields));
+      const res = await fetchUi(`/org/${ORG_NAME}/settings/labels/${tail}`, formPost(fields));
       expect(res.status, `anon ${tail}`).toBe(303);
       expect(res.headers.get("location"), `anon ${tail}`).toBe(
-        `/login?redirect_to=${encodeURIComponent(`/${ORG_NAME}/labels/${tail}`)}`,
+        `/login?redirect_to=${encodeURIComponent(`/org/${ORG_NAME}/settings/labels/${tail}`)}`,
       );
     }
   });
@@ -320,7 +320,7 @@ describe("the write gates' deferred org arms (wave14 pinned contains-only on /ne
   it("a signed-in plain MEMBER 404s edit AND delete with a REAL row id before any write (D1 read-back)", async () => {
     const fixture = await ensureOrgLabelsFixtures();
     const edit = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       withCookie(
         formPost({ id: String(fixture.lightLabelId), title: "member rename", color: "#121212" }),
         fixture.memberCookie,
@@ -328,7 +328,7 @@ describe("the write gates' deferred org arms (wave14 pinned contains-only on /ne
     );
     expect(edit.status).toBe(404);
     const del = await fetchUi(
-      `/${ORG_NAME}/labels/delete`,
+      `/org/${ORG_NAME}/settings/labels/delete`,
       withCookie(formPost({ id: String(fixture.lightLabelId) }), fixture.memberCookie),
     );
     expect(del.status).toBe(404);
@@ -339,15 +339,15 @@ describe("the write gates' deferred org arms (wave14 pinned contains-only on /ne
 
   it("the site admin passes requireOrgOwnership on a WRITE: the render shows the controls and a create POST lands (pre-purged target)", async () => {
     const fixture = await ensureOrgLabelsFixtures();
-    const page = await fetchUi(`/${ORG_NAME}/labels`, {
+    const page = await fetchUi(`/org/${ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },
     });
     expect(page.status).toBe(200);
-    expect(await page.text()).toContain(`action="/${ORG_NAME}/labels/new" method="post"`);
+    expect(await page.text()).toContain(`action="/org/${ORG_NAME}/settings/labels/new" method="post"`);
 
     await purgeOrgLabelNamed(fixture.orgId, "ol-admin-create");
     const created = await fetchUi(
-      `/${ORG_NAME}/labels/new`,
+      `/org/${ORG_NAME}/settings/labels/new`,
       withCookie(formPost({ title: "ol-admin-create", color: "AA7700" }), fixture.adminCookie),
     );
     expect(created.status).toBe(303);
@@ -365,14 +365,14 @@ describe("the create round-trip's deferred color math + carried form (org)", () 
     await purgeOrgLabelNamed(fixture.orgId, "ol-padded");
 
     const expanded = await fetchUi(
-      `/${ORG_NAME}/labels/new`,
+      `/org/${ORG_NAME}/settings/labels/new`,
       withCookie(formPost({ title: "ol-3digit", color: "F0A" }), fixture.ownerCookie),
     );
     expect(expanded.status).toBe(303);
     expect((await findOrgLabelByName(env.DB, fixture.orgId, "ol-3digit"))?.color).toBe("#ff00aa");
 
     const padded = await fetchUi(
-      `/${ORG_NAME}/labels/new`,
+      `/org/${ORG_NAME}/settings/labels/new`,
       withCookie(formPost({ title: "ol-padded", color: " #00AABB " }), fixture.ownerCookie),
     );
     expect(padded.status).toBe(303);
@@ -381,7 +381,7 @@ describe("the create round-trip's deferred color math + carried form (org)", () 
 
   it("a light badge renders the ContrastColor #000 arm on the org page — the row badge AND the row's edit-disclosure swatch (only #fff was pinned)", async () => {
     const fixture = await ensureOrgLabelsFixtures();
-    const res = await fetchUi(`/${ORG_NAME}/labels`, {
+    const res = await fetchUi(`/org/${ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
     });
     expect(res.status).toBe(200);
@@ -396,7 +396,7 @@ describe("the create round-trip's deferred color math + carried form (org)", () 
     const fixture = await ensureOrgLabelsFixtures();
     const before = await listOrgLabels(env.DB, fixture.orgId, "", 1, 50);
     const res = await fetchUi(
-      `/${ORG_NAME}/labels/new`,
+      `/org/${ORG_NAME}/settings/labels/new`,
       withCookie(formPost({ title: "kept submission", color: "notacolor" }), fixture.ownerCookie),
     );
     expect(res.status).toBe(200);
@@ -417,7 +417,7 @@ describe("the failed edit's re-render shape (org — the repo matrix pinned the 
   it("re-renders the STORED row values plus the RESET create form, the row untouched in D1", async () => {
     const fixture = await ensureOrgLabelsFixtures();
     const res = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       withCookie(
         formPost({ id: String(fixture.lightLabelId), title: "submitted title", color: "notacolor" }),
         fixture.ownerCookie,
@@ -446,7 +446,7 @@ describe("cookie-less cross-origin POST edit/delete 403 before the anonymous 303
   it("the guard fronts requireOrgOwnership's login round-trip on both tails and the row survives", async () => {
     const fixture = await ensureOrgLabelsFixtures();
     const edit = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       crossOriginPost({ id: String(fixture.lightLabelId), title: "evil rename", color: "#121212" }),
     );
     expect(edit.status).toBe(403);
@@ -454,7 +454,7 @@ describe("cookie-less cross-origin POST edit/delete 403 before the anonymous 303
     expect(await edit.text()).toContain("cross-origin request rejected");
 
     const del = await fetchUi(
-      `/${ORG_NAME}/labels/delete`,
+      `/org/${ORG_NAME}/settings/labels/delete`,
       crossOriginPost({ id: String(fixture.lightLabelId) }),
     );
     expect(del.status).toBe(403);
@@ -475,16 +475,16 @@ describe("the visibility ladder collapses into the ownership gate (batch 11 — 
     // The owner: a private org's owner manages its labels exactly like a
     // public org's (the resolveOrgTeamsOrg note — ownership implies every
     // visibility answer).
-    const ownerRes = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`, {
+    const ownerRes = await fetchUi(`/org/${PRIVATE_ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
     });
     expect(ownerRes.status).toBe(200);
     const ownerHtml = await ownerRes.text();
     expect(ownerHtml).toContain('class="page-content organization settings labels"');
-    expect(ownerHtml).toContain(`action="/${PRIVATE_ORG_NAME}/labels/new" method="post"`);
+    expect(ownerHtml).toContain(`action="/org/${PRIVATE_ORG_NAME}/settings/labels/new" method="post"`);
 
     // The site admin passes requireOrgOwnership on the private org too.
-    const adminRes = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`, {
+    const adminRes = await fetchUi(`/org/${PRIVATE_ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },
     });
     expect(adminRes.status).toBe(200);
@@ -492,7 +492,7 @@ describe("the visibility ladder collapses into the ownership gate (batch 11 — 
 
     // The private org's own MEMBER: not the owner — the 404 shell, exactly
     // the public org's member arm (visibility grants no management).
-    const memberRes = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`, {
+    const memberRes = await fetchUi(`/org/${PRIVATE_ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.memberCookie}` },
     });
     expect(memberRes.status).toBe(404);
@@ -501,10 +501,10 @@ describe("the visibility ladder collapses into the ownership gate (batch 11 — 
 
   it("the anonymous viewer of a PRIVATE org 303s onto the login round-trip (no visibility leak ahead of the session arm)", async () => {
     await ensureOrgLabelsFixtures();
-    const res = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`);
+    const res = await fetchUi(`/org/${PRIVATE_ORG_NAME}/settings/labels`);
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${PRIVATE_ORG_NAME}/labels`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${PRIVATE_ORG_NAME}/settings/labels`)}`,
     );
   });
 });
@@ -530,7 +530,7 @@ describe("the repo-consumption arms (batch 11 — the .OrgLabels section is the 
     }
 
     const edit = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       withCookie(
         formPost({ id: String(repoLabel.id), title: "org hijack", color: "#121212" }),
         fixture.ownerCookie,
@@ -541,7 +541,7 @@ describe("the repo-consumption arms (batch 11 — the .OrgLabels section is the 
     // The delete's zero-row success is idempotent — but the REPO-scoped row
     // it fails to match survives untouched.
     const del = await fetchUi(
-      `/${ORG_NAME}/labels/delete`,
+      `/org/${ORG_NAME}/settings/labels/delete`,
       withCookie(formPost({ id: String(repoLabel.id) }), fixture.ownerCookie),
     );
     expect(del.status).toBe(303);
@@ -575,11 +575,11 @@ describe("the repo-consumption arms (batch 11 — the .OrgLabels section is the 
 
     // The org page's delete removes the org-scoped row…
     const del = await fetchUi(
-      `/${ORG_NAME}/labels/delete`,
+      `/org/${ORG_NAME}/settings/labels/delete`,
       withCookie(formPost({ id: String(consumed.id) }), fixture.ownerCookie),
     );
     expect(del.status).toBe(303);
-    expect(del.headers.get("location")).toBe(`/${ORG_NAME}/labels`);
+    expect(del.headers.get("location")).toBe(`/org/${ORG_NAME}/settings/labels`);
     expect(await findOrgLabelById(env.DB, fixture.orgId, consumed.id)).toBeNull();
 
     // …and the consuming repo's section re-renders WITHOUT it (ol-light —

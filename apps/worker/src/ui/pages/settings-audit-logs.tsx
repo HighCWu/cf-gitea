@@ -115,7 +115,7 @@
  *                                             login, a signed-in non-admin
  *                                             404-shells, the tags-page
  *                                             siblings' exact posture)
- *   GET /{org}/settings/audit_logs            the org settings arm (the
+ *   GET /org/{org}/settings/audit_logs            the org settings arm (the
  *                                             org-teams require-owner
  *                                             prologue — anonymous 303s, a
  *                                             member non-owner 404-shells,
@@ -698,7 +698,7 @@ export function renderOrgSettingsAuditLogsPage(options: { ctx: UiContext; org: O
  */
 export function OrgSettingsAuditLogsPage(props: { ctx: UiContext; org: OrgRecord; data: AuditLogsPageData }) {
   const { ctx, org } = props;
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   const pageLink = `${orgLink}/settings/audit_logs`;
   return (
     <BaseLayout ctx={ctx} title={settingsAuditLogsLocale.title} pageClass="organization settings">

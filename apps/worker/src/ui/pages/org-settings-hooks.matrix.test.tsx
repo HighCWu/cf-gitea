@@ -238,7 +238,7 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
   // -- the gates (the shared org-teams prologue) -----------------------------
 
   it("303s an anonymous GET of the list and the detail onto the login round-trip", async () => {
-    for (const path of [`/hookforge/settings/hooks`, `/hookforge/settings/hooks/${world.editHookId}`]) {
+    for (const path of [`/org/hookforge/settings/hooks`, `/org/hookforge/settings/hooks/${world.editHookId}`]) {
       const res = await getRoute(path, null);
       expect(res.status).toBe(303);
       expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(path)}`);
@@ -246,7 +246,7 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
   });
 
   it("303s an anonymous same-origin create POST onto the login round-trip too (guard passes, then the gate; nothing written)", async () => {
-    const res = await postRoute("/hookforge/settings/hooks", null, {
+    const res = await postRoute("/org/hookforge/settings/hooks", null, {
       name: "anon hook",
       payload_url: "https://hooks.example.test/anon",
       content_type: "json",
@@ -254,15 +254,15 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
       active: "on",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/hookforge/settings/hooks")}`);
+    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/org/hookforge/settings/hooks")}`);
     expect(await allHooks()).toHaveLength(3); // the three seeds only — the write never ran
   });
 
   it("303s an anonymous same-origin delete POST onto the login round-trip (the row survives)", async () => {
-    const res = await postRoute(`/hookforge/settings/hooks/${world.doomedHookId}/delete`, null, {});
+    const res = await postRoute(`/org/hookforge/settings/hooks/${world.doomedHookId}/delete`, null, {});
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/hookforge/settings/hooks/${world.doomedHookId}/delete`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/hookforge/settings/hooks/${world.doomedHookId}/delete`)}`,
     );
     const rows = await allHooks();
     expect(rows.map((row) => row.id)).toContain(world.doomedHookId); // untouched
@@ -270,29 +270,29 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
 
   it("404-shells a signed-in non-owner (plain member AND outsider) on GET — before any write", async () => {
     for (const userId of [world.memberId, world.outsiderId]) {
-      await expectNotFoundShell(await getRoute("/hookforge/settings/hooks", userId));
-      await expectNotFoundShell(await getRoute(`/hookforge/settings/hooks/${world.editHookId}`, userId));
+      await expectNotFoundShell(await getRoute("/org/hookforge/settings/hooks", userId));
+      await expectNotFoundShell(await getRoute(`/org/hookforge/settings/hooks/${world.editHookId}`, userId));
     }
   });
 
   it("404-shells the non-owner's write POSTs BEFORE the write arms run (RequireOwner fronts all three)", async () => {
     for (const userId of [world.memberId, world.outsiderId]) {
       await expectNotFoundShell(
-        await postRoute("/hookforge/settings/hooks", userId, {
+        await postRoute("/org/hookforge/settings/hooks", userId, {
           name: "pal hook",
           payload_url: "https://hooks.example.test/pal",
           content_type: "json",
         }),
       );
       await expectNotFoundShell(
-        await postRoute(`/hookforge/settings/hooks/${world.editHookId}`, userId, {
+        await postRoute(`/org/hookforge/settings/hooks/${world.editHookId}`, userId, {
           name: "hijacked",
           payload_url: "https://hooks.example.test/hijacked",
           content_type: "json",
           events: "push",
         }),
       );
-      await expectNotFoundShell(await postRoute(`/hookforge/settings/hooks/${world.doomedHookId}/delete`, userId, {}));
+      await expectNotFoundShell(await postRoute(`/org/hookforge/settings/hooks/${world.doomedHookId}/delete`, userId, {}));
     }
     const rows = await allHooks();
     expect(rows).toHaveLength(3); // the seeds only
@@ -300,10 +300,10 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
     expect(rows.find((row) => row.id === world.doomedHookId)).toBeDefined(); // never deleted
   });
 
-  // -- the owner's create arms (POST /{org}/settings/hooks) -------------------
+  // -- the owner's create arms (POST /org/{org}/settings/hooks) -------------------
 
   it("the owner's create POST saves owner-scoped and 303s back onto the list (the round-trip renders the row)", async () => {
-    const res = await postRoute("/hookforge/settings/hooks", world.ownerId, {
+    const res = await postRoute("/org/hookforge/settings/hooks", world.ownerId, {
       name: "route created hook",
       payload_url: "https://hooks.example.test/route-created",
       content_type: "json",
@@ -311,7 +311,7 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
       active: "on",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/hookforge/settings/hooks");
+    expect(res.headers.get("location")).toBe("/org/hookforge/settings/hooks");
     const rows = await allHooks();
     const created = rows.find((row) => row.url === "https://hooks.example.test/route-created");
     expect(created).toBeDefined();
@@ -322,16 +322,16 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
     expect(created!.secret).toBe("top-secret");
     expect(created!.type).toBe("gitea"); // the single landed provider
     // The list re-render carries the fresh row (the follow-up GET).
-    const page = await getRoute("/hookforge/settings/hooks", world.ownerId);
+    const page = await getRoute("/org/hookforge/settings/hooks", world.ownerId);
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain("page-content organization settings webhooks"); // the §2.4.1 discriminator
     expect(html).toContain("route created hook");
-    expect(html).toContain(`href="/hookforge/settings/hooks/${created!.id}"`);
+    expect(html).toContain(`href="/org/hookforge/settings/hooks/${created!.id}"`);
   });
 
   it("the owner's invalid create POST re-renders at 200 with the API's 422 message and the CARRIED form (nothing written)", async () => {
-    const res = await postRoute("/hookforge/settings/hooks", world.ownerId, {
+    const res = await postRoute("/org/hookforge/settings/hooks", world.ownerId, {
       name: "carried name",
       payload_url: "not-a-url",
       content_type: "form",
@@ -352,11 +352,11 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
   // -- the owner's detail GET + the edit arms with the hidden-events preserve --
 
   it("the owner's detail GET renders the stored values with the hidden events preserve inputs in the form", async () => {
-    const res = await getRoute(`/hookforge/settings/hooks/${world.editHookId}`, world.ownerId);
+    const res = await getRoute(`/org/hookforge/settings/hooks/${world.editHookId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("page-content organization settings new webhook"); // the §2.4.1 discriminator
-    expect(html).toContain(`action="/hookforge/settings/hooks/${world.editHookId}"`);
+    expect(html).toContain(`action="/org/hookforge/settings/hooks/${world.editHookId}"`);
     expect(html).toContain('value="https://hooks.example.test/forge-ci"');
     expect(html).toContain('value="forge ci hook"');
     expect(html).toContain('value="main"'); // the stored branch filter
@@ -367,7 +367,7 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
   });
 
   it("the owner's edit POST applies the form and the hidden events KEEP push in the stored blob (303 back onto the page)", async () => {
-    const res = await postRoute(`/hookforge/settings/hooks/${world.editHookId}`, world.ownerId, {
+    const res = await postRoute(`/org/hookforge/settings/hooks/${world.editHookId}`, world.ownerId, {
       name: "forge ci hook renamed",
       payload_url: "https://hooks.example.test/forge-ci-v2",
       content_type: "form",
@@ -376,7 +376,7 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
       active: "on",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/hookforge/settings/hooks/${world.editHookId}`);
+    expect(res.headers.get("location")).toBe(`/org/hookforge/settings/hooks/${world.editHookId}`);
     const row = (await drizzle(env.DB).select().from(webhooks).where(eq(webhooks.id, world.editHookId)).get())!;
     expect(row.url).toBe("https://hooks.example.test/forge-ci-v2");
     expect(row.name).toBe("forge ci hook renamed");
@@ -387,12 +387,12 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
     expect(hookEventsArray(row.events)).toContain("push");
     expect((JSON.parse(row.events) as { branch_filter?: string }).branch_filter).toBe("release/*");
     // The follow-up page renders the fresh values.
-    const page = await getRoute(`/hookforge/settings/hooks/${world.editHookId}`, world.ownerId);
+    const page = await getRoute(`/org/hookforge/settings/hooks/${world.editHookId}`, world.ownerId);
     expect(await page.text()).toContain('value="https://hooks.example.test/forge-ci-v2"');
   });
 
   it("the owner's invalid edit POST re-renders at 200 with the message, the kept submission AND the hidden events inputs (row untouched)", async () => {
-    const res = await postRoute(`/hookforge/settings/hooks/${world.editHookId}`, world.ownerId, {
+    const res = await postRoute(`/org/hookforge/settings/hooks/${world.editHookId}`, world.ownerId, {
       name: "kept name",
       payload_url: "also not a url",
       content_type: "json",
@@ -417,22 +417,22 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
   // -- the delete arms ---------------------------------------------------------
 
   it("the owner's delete POST removes the row and 303s onto the list", async () => {
-    const res = await postRoute(`/hookforge/settings/hooks/${world.doomedHookId}/delete`, world.ownerId, {});
+    const res = await postRoute(`/org/hookforge/settings/hooks/${world.doomedHookId}/delete`, world.ownerId, {});
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/hookforge/settings/hooks");
+    expect(res.headers.get("location")).toBe("/org/hookforge/settings/hooks");
     expect((await allHooks()).map((row) => row.id)).not.toContain(world.doomedHookId);
     // The follow-up list no longer renders the deleted row.
-    const page = await getRoute("/hookforge/settings/hooks", world.ownerId);
+    const page = await getRoute("/org/hookforge/settings/hooks", world.ownerId);
     expect(await page.text()).not.toContain("forge doomed hook");
   });
 
   it("the delete miss 404-shells an unknown id and a foreign-org id — existence stays hidden, the foreign row survives", async () => {
     for (const id of [999999, world.foreignHookId]) {
-      await expectNotFoundShell(await postRoute(`/hookforge/settings/hooks/${id}/delete`, world.ownerId, {}));
+      await expectNotFoundShell(await postRoute(`/org/hookforge/settings/hooks/${id}/delete`, world.ownerId, {}));
     }
     // The same fidelity on the DETAIL GET: the foreign-org id is an ordinary
     // miss (the owner-scoped lookup keys on the org).
-    await expectNotFoundShell(await getRoute(`/hookforge/settings/hooks/${world.foreignHookId}`, world.ownerId));
+    await expectNotFoundShell(await getRoute(`/org/hookforge/settings/hooks/${world.foreignHookId}`, world.ownerId));
     const rival = (await drizzle(env.DB).select().from(webhooks).where(eq(webhooks.ownerId, world.rivalOrgId)).all()).at(0);
     expect(rival).toBeDefined();
     expect(rival!.url).toBe("https://hooks.example.test/rival"); // untouched
@@ -443,9 +443,9 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
 
   it("rejects a cross-origin write POST with 403 before any write (sameOriginGuard first, all three arms)", async () => {
     for (const [path, fields] of [
-      ["/hookforge/settings/hooks", { name: "evil hook", payload_url: "https://hooks.example.test/evil", content_type: "json" }],
-      [`/hookforge/settings/hooks/${world.editHookId}`, { name: "evil", payload_url: "https://hooks.example.test/evil", content_type: "json", events: "push" }],
-      [`/hookforge/settings/hooks/${world.doomedHookId}/delete`, {}],
+      ["/org/hookforge/settings/hooks", { name: "evil hook", payload_url: "https://hooks.example.test/evil", content_type: "json" }],
+      [`/org/hookforge/settings/hooks/${world.editHookId}`, { name: "evil", payload_url: "https://hooks.example.test/evil", content_type: "json", events: "push" }],
+      [`/org/hookforge/settings/hooks/${world.doomedHookId}/delete`, {}],
     ] as const) {
       const res = await postRoute(path, world.ownerId, fields, "https://evil.example");
       expect(res.status).toBe(403);
@@ -468,19 +468,19 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
       .values({ lowerName: "forgeold", redirectUserId: world.orgUserId })
       .run();
     // Anonymous: the seam precedes the login 303 in the prologue.
-    const anon = await getRoute("/forgeold/settings/hooks", null);
+    const anon = await getRoute("/org/forgeold/settings/hooks", null);
     expect(anon.status).toBe(307);
-    expect(anon.headers.get("location")).toBe("/hookforge/settings/hooks");
+    expect(anon.headers.get("location")).toBe("/org/hookforge/settings/hooks");
     // The owner with a query string: first-occurrence rewrite + query kept.
-    const owner = await getRoute("/forgeold/settings/hooks?tab=hooks", world.ownerId);
+    const owner = await getRoute("/org/forgeold/settings/hooks?tab=hooks", world.ownerId);
     expect(owner.status).toBe(307);
-    expect(owner.headers.get("location")).toBe("/hookforge/settings/hooks?tab=hooks");
+    expect(owner.headers.get("location")).toBe("/org/hookforge/settings/hooks?tab=hooks");
     // The detail shape rewrites its old-name segment the same way.
-    const detail = await getRoute(`/forgeold/settings/hooks/${world.editHookId}`, world.ownerId);
+    const detail = await getRoute(`/org/forgeold/settings/hooks/${world.editHookId}`, world.ownerId);
     expect(detail.status).toBe(307);
-    expect(detail.headers.get("location")).toBe(`/hookforge/settings/hooks/${world.editHookId}`);
+    expect(detail.headers.get("location")).toBe(`/org/hookforge/settings/hooks/${world.editHookId}`);
     // The target answers 200 behind the new name.
-    const target = await getRoute("/hookforge/settings/hooks", world.ownerId);
+    const target = await getRoute("/org/hookforge/settings/hooks", world.ownerId);
     expect(target.status).toBe(200);
     expect(await target.text()).toContain("page-content organization settings webhooks");
   });

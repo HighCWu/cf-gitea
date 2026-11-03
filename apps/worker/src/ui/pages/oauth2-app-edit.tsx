@@ -94,7 +94,7 @@
  *
  * The route handlers calling into this module live in the W5 handoff block
  * (user: /user/settings/applications/oauth2[/…]; org:
- * /{org}/settings/applications/oauth2[/…]; admin:
+ * /org/{org}/settings/applications/oauth2[/…]; admin:
  * /-/admin/applications/oauth2[/…]) — all gated on
  * `oauth2FeatureEnabled(c.env)` with 403 (`oauth2SettingsForbidden` below,
  * web.go:373-378's oauth2Enabled analog — upstream wraps the user /oauth2
@@ -618,7 +618,7 @@ export function renderUserOauth2AppEditPage(ctx: UiContext, data: OAuth2AppEditP
  * and the settings navbar with the Applications item active.
  */
 export function renderOrgOauth2AppEditPage(ctx: UiContext, org: OrgRecord, data: OAuth2AppEditPageData, signedIn: boolean): string {
-  const orgLink = `/${org.username}`;
+  const orgLink = `/org/${org.username}`;
   return renderPage(
     <BaseLayout ctx={ctx} title={data.app.name} pageClass="organization settings options">
       <OrgHeader org={org} signedIn={signedIn} />

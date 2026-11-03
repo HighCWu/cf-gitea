@@ -160,27 +160,27 @@ beforeAll(async () => {
 
 describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
   it("claims the org teams shapes", () => {
-    expect(parseUiRoute("/acme/teams")).toEqual({ family: "org-teams", owner: "acme" });
-    expect(parseUiRoute("/acme/teams/new")).toEqual({ family: "org-team-new", owner: "acme" });
-    expect(parseUiRoute("/acme/teams/42")).toEqual({ family: "org-team-detail", owner: "acme", id: 42 });
+    expect(parseUiRoute("/org/acme/teams")).toEqual({ family: "org-teams", owner: "acme" });
+    expect(parseUiRoute("/org/acme/teams/new")).toEqual({ family: "org-team-new", owner: "acme" });
+    expect(parseUiRoute("/org/acme/teams/42")).toEqual({ family: "org-team-detail", owner: "acme", id: 42 });
     // int64 parity (org-teams.ts intPathParam): "007" parses as 7.
-    expect(parseUiRoute("/acme/teams/007")).toEqual({ family: "org-team-detail", owner: "acme", id: 7 });
-    expect(handlesUiRoute("/acme/teams")).toBe(true);
+    expect(parseUiRoute("/org/acme/teams/007")).toEqual({ family: "org-team-detail", owner: "acme", id: 7 });
+    expect(handlesUiRoute("/org/acme/teams")).toBe(true);
     // The trailing-slash form classifies to the same shape (the dispatcher's
     // middleware 301s it to the canonical URL).
-    expect(parseUiRoute("/acme/teams/")).toEqual({ family: "org-teams", owner: "acme" });
+    expect(parseUiRoute("/org/acme/teams/")).toEqual({ family: "org-teams", owner: "acme" });
   });
 
   it("leaves the deeper tails and junk ids with the engine", () => {
-    expect(parseUiRoute("/acme/teams/42/repositories")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/repositories")).toBeNull();
     // {id}/edit flipped to the wave-49 team-edit family (pages/
     // org-settings.tsx) — the assertion below is that wave's claim now.
-    expect(parseUiRoute("/acme/teams/42/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
-    expect(parseUiRoute("/acme/teams/42/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
+    expect(parseUiRoute("/org/acme/teams/42/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
+    expect(parseUiRoute("/org/acme/teams/42/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
     // {id}/action/{action} flipped to the O1 membership-write family
     // (ui/index.ts OrgTeamActionRoute — web.go:997-998's POST pair); the
     // assertion below is that wave's claim now.
-    expect(parseUiRoute("/acme/teams/42/action/join")).toEqual({
+    expect(parseUiRoute("/org/acme/teams/42/action/join")).toEqual({
       family: "org-team-action",
       owner: "acme",
       id: 42,
@@ -191,10 +191,10 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
     // case-folded against the lower names (org.go:213-218), 404-shelling
     // the miss, so the claim mirrors upstream. The five-segment edit/
     // delete tails keep their id-only claims.
-    expect(parseUiRoute("/acme/teams/not-a-number")).toEqual({ family: "org-team-detail", owner: "acme", name: "not-a-number" });
-    expect(parseUiRoute("/acme/teams/not-a-number/edit")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/edit/extra")).toBeNull();
-    expect(parseUiRoute("/acme/teams/new/more")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/not-a-number")).toEqual({ family: "org-team-detail", owner: "acme", name: "not-a-number" });
+    expect(parseUiRoute("/org/acme/teams/not-a-number/edit")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/edit/extra")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/new/more")).toBeNull();
   });
 
   it("claims the user settings literal before the repo parse", () => {
@@ -218,7 +218,7 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
     // web.go:993 (org teams group) registers ahead of :1292's
     // /{username}/{reponame} — the shape belongs to the teams family; a
     // user owner 404-shells at resolve time (the resolve gate below).
-    expect(parseUiRoute("/alice/teams")).toEqual({ family: "org-teams", owner: "alice" });
+    expect(parseUiRoute("/org/alice/teams")).toEqual({ family: "org-teams", owner: "alice" });
   });
 });
 
@@ -226,32 +226,32 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
 
 describe("GET /{org}/teams (the requireOrgOwnership posture)", () => {
   it("303s an anonymous viewer onto the login round-trip", async () => {
-    const res = await fetchUi("/teamorg/teams");
+    const res = await fetchUi("/org/teamorg/teams");
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Fteamorg%2Fteams");
+    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Forg%2Fteamorg%2Fteams");
   });
 
   it("404-shells a signed-in non-member and a plain member (non-owner)", async () => {
     const fixture = await ensureWave12Fixtures();
-    const pal = await fetchUi("/teamorg/teams", withCookie(fixture.palCookie));
+    const pal = await fetchUi("/org/teamorg/teams", withCookie(fixture.palCookie));
     expect(pal.status).toBe(404);
     // Upstream's teams page admits org members (web.go:980-1001) — the wave
     // brief pins the landed requireOrgOwnership posture: a member without
     // the owner role 404-shells exactly like a stranger.
-    const member = await fetchUi("/teamorg/teams", withCookie(fixture.memberCookie));
+    const member = await fetchUi("/org/teamorg/teams", withCookie(fixture.memberCookie));
     expect(member.status).toBe(404);
   });
 
   it("answers the owner and a site admin with the list", async () => {
     const fixture = await ensureWave12Fixtures();
     for (const cookie of [fixture.morganCookie, fixture.adminCookie]) {
-      const res = await fetchUi("/teamorg/teams", withCookie(cookie));
+      const res = await fetchUi("/org/teamorg/teams", withCookie(cookie));
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("page-content organization teams");
       // The row content: name link onto the id-keyed detail, the
       // permission badge, the maintained counters.
-      expect(html).toContain(`/teamorg/teams/${fixture.developersTeamId}`);
+      expect(html).toContain(`/org/teamorg/teams/${fixture.developersTeamId}`);
       expect(html).toContain("<strong>Developers</strong>");
       expect(html).toContain("Ships the waves.");
       // Permission badge (the brief's addition) + the visibility badge.
@@ -262,13 +262,13 @@ describe("GET /{org}/teams (the requireOrgOwnership posture)", () => {
       expect(html).toContain("2 members");
       expect(html).toContain("2 repositories");
       // The New Team button anchors the live form.
-      expect(html).toContain('href="/teamorg/teams/new"');
+      expect(html).toContain('href="/org/teamorg/teams/new"');
     }
   });
 
   it("filters the list by the q keyword (the landed listTeams read)", async () => {
     const fixture = await ensureWave12Fixtures();
-    const res = await fetchUi("/teamorg/teams?q=devel", withCookie(fixture.morganCookie));
+    const res = await fetchUi("/org/teamorg/teams?q=devel", withCookie(fixture.morganCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<strong>Developers</strong>");
@@ -278,13 +278,13 @@ describe("GET /{org}/teams (the requireOrgOwnership posture)", () => {
   it("404-shells a user owner (never an org) and answers a renamed org with the 307", async () => {
     const fixture = await ensureWave12Fixtures();
     // A USER namespace: the org resolution's type gate misses → the shell.
-    const user = await fetchUi("/wave12pal/teams", withCookie(fixture.palCookie));
+    const user = await fetchUi("/org/wave12pal/teams", withCookie(fixture.palCookie));
     expect(user.status).toBe(404);
     // A renamed org: the shared resolveOrgForRequest seam 307s (query
     // preserved).
-    const renamed = await fetchUi("/teamold/teams?q=x", withCookie(fixture.morganCookie));
+    const renamed = await fetchUi("/org/teamold/teams?q=x", withCookie(fixture.morganCookie));
     expect(renamed.status).toBe(307);
-    expect(renamed.headers.get("location")).toBe("/teamnew/teams?q=x");
+    expect(renamed.headers.get("location")).toBe("/org/teamnew/teams?q=x");
   });
 });
 
@@ -293,7 +293,7 @@ describe("GET /{org}/teams (the requireOrgOwnership posture)", () => {
 describe("GET /{org}/teams/{id} (the detail slice)", () => {
   it("renders the sidebar and both lists for the owner", async () => {
     const fixture = await ensureWave12Fixtures();
-    const res = await fetchUi(`/teamorg/teams/${fixture.developersTeamId}`, withCookie(fixture.morganCookie));
+    const res = await fetchUi(`/org/teamorg/teams/${fixture.developersTeamId}`, withCookie(fixture.morganCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("page-content organization teams");
@@ -311,7 +311,7 @@ describe("GET /{org}/teams/{id} (the detail slice)", () => {
 
   it("renders the includes-all arm of the access section", async () => {
     const fixture = await ensureWave12Fixtures();
-    const res = await fetchUi(`/teamorg/teams/${fixture.readersTeamId}`, withCookie(fixture.morganCookie));
+    const res = await fetchUi(`/org/teamorg/teams/${fixture.readersTeamId}`, withCookie(fixture.morganCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<strong>Readers</strong>");
@@ -326,19 +326,19 @@ describe("GET /{org}/teams/{id} (the detail slice)", () => {
 
   it("404-shells an unknown id and a foreign org's team", async () => {
     const fixture = await ensureWave12Fixtures();
-    const unknown = await fetchUi("/teamorg/teams/999999", withCookie(fixture.morganCookie));
+    const unknown = await fetchUi("/org/teamorg/teams/999999", withCookie(fixture.morganCookie));
     expect(unknown.status).toBe(404);
     // The id keys globally — another org's team never leaks through it.
-    const foreign = await fetchUi(`/teamorg/teams/${fixture.outsidersTeamId}`, withCookie(fixture.morganCookie));
+    const foreign = await fetchUi(`/org/teamorg/teams/${fixture.outsidersTeamId}`, withCookie(fixture.morganCookie));
     expect(foreign.status).toBe(404);
   });
 
   it("carries the list gate: anonymous 303, non-owner 404", async () => {
     const fixture = await ensureWave12Fixtures();
-    const anon = await fetchUi(`/teamorg/teams/${fixture.developersTeamId}`);
+    const anon = await fetchUi(`/org/teamorg/teams/${fixture.developersTeamId}`);
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toContain("/login?redirect_to=");
-    const member = await fetchUi(`/teamorg/teams/${fixture.developersTeamId}`, withCookie(fixture.memberCookie));
+    const member = await fetchUi(`/org/teamorg/teams/${fixture.developersTeamId}`, withCookie(fixture.memberCookie));
     expect(member.status).toBe(404);
   });
 });
@@ -348,31 +348,31 @@ describe("GET /{org}/teams/{id} (the detail slice)", () => {
 describe("GET+POST /{org}/teams/new (the owner's create form)", () => {
   it("renders the form for the owner and gates it like the list", async () => {
     const fixture = await ensureWave12Fixtures();
-    const res = await fetchUi("/teamorg/teams/new", withCookie(fixture.morganCookie));
+    const res = await fetchUi("/org/teamorg/teams/new", withCookie(fixture.morganCookie));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("page-content organization new team");
     expect(html).toContain('id="team_name" name="team_name"');
     expect(html).toContain('id="permission" name="permission"');
     expect(html).toContain('<option value="read" selected="">');
-    expect(html).toContain('action="/teamorg/teams/new" method="post"');
+    expect(html).toContain('action="/org/teamorg/teams/new" method="post"');
 
-    const anon = await fetchUi("/teamorg/teams/new");
+    const anon = await fetchUi("/org/teamorg/teams/new");
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toContain("/login?redirect_to=");
-    const member = await fetchUi("/teamorg/teams/new", withCookie(fixture.memberCookie));
+    const member = await fetchUi("/org/teamorg/teams/new", withCookie(fixture.memberCookie));
     expect(member.status).toBe(404);
   });
 
   it("creates through the landed arm and 303s onto the created detail slice", async () => {
     const fixture = await ensureWave12Fixtures();
     const res = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "Ship Crew", permission: "admin" }, fixture.morganCookie),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "Ship Crew", permission: "admin" }, fixture.morganCookie),
     );
     expect(res.status).toBe(303);
     const location = res.headers.get("location") ?? "";
-    expect(location.startsWith("/teamorg/teams/")).toBe(true);
+    expect(location.startsWith("/org/teamorg/teams/")).toBe(true);
     const teamId = Number.parseInt(location.split("/").pop() ?? "0", 10);
     const row = await new TeamsService(env.DB).getTeamById(teamId);
     expect(row?.name).toBe("Ship Crew");
@@ -388,8 +388,8 @@ describe("GET+POST /{org}/teams/new (the owner's create form)", () => {
     const fixture = await ensureWave12Fixtures();
     // The duplicate (case-insensitive — the UNIQUE arbiter).
     const dup = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "developers", permission: "read" }, fixture.morganCookie),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "developers", permission: "read" }, fixture.morganCookie),
     );
     expect(dup.status).toBe(200);
     const dupHtml = await dup.text();
@@ -398,8 +398,8 @@ describe("GET+POST /{org}/teams/new (the owner's create form)", () => {
 
     // The empty name (the typed TeamNameEmptyError).
     const empty = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "", permission: "read" }, fixture.morganCookie),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "", permission: "read" }, fixture.morganCookie),
     );
     expect(empty.status).toBe(200);
     expect(await empty.text()).toContain("empty team name");
@@ -407,8 +407,8 @@ describe("GET+POST /{org}/teams/new (the owner's create form)", () => {
     // The `owners` bridge: the role row IS the Owners team — the duplicate
     // 422 (createTeam's §3.3 arm).
     const owners = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "owners", permission: "admin" }, fixture.morganCookie),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "owners", permission: "admin" }, fixture.morganCookie),
     );
     expect(owners.status).toBe(200);
     expect(await owners.text()).toContain("team already exists");
@@ -417,21 +417,21 @@ describe("GET+POST /{org}/teams/new (the owner's create form)", () => {
   it("refuses the write for the anonymous and the unprivileged, and cross-origin posts", async () => {
     const fixture = await ensureWave12Fixtures();
     const anon = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "Nope", permission: "read" }),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "Nope", permission: "read" }),
     );
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toContain("/login?redirect_to=");
 
     const member = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "Nope", permission: "read" }, fixture.memberCookie),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "Nope", permission: "read" }, fixture.memberCookie),
     );
     expect(member.status).toBe(404);
 
     const crossOrigin = await fetchUi(
-      "/teamorg/teams/new",
-      formPost("/teamorg/teams/new", { team_name: "Nope", permission: "read" }, fixture.morganCookie, "https://evil.example"),
+      "/org/teamorg/teams/new",
+      formPost("/org/teamorg/teams/new", { team_name: "Nope", permission: "read" }, fixture.morganCookie, "https://evil.example"),
     );
     expect(crossOrigin.status).toBe(403);
   });
@@ -552,10 +552,10 @@ describe("wave-12 a11y smoke", () => {
   it("every new page passes the structural rules for its gate-admitted viewer", async () => {
     const fixture = await ensureWave12Fixtures();
     for (const [path, init] of [
-      ["/teamorg/teams", withCookie(fixture.morganCookie)],
-      [`/teamorg/teams/${fixture.developersTeamId}`, withCookie(fixture.morganCookie)],
-      [`/teamorg/teams/${fixture.readersTeamId}`, withCookie(fixture.adminCookie)],
-      ["/teamorg/teams/new", withCookie(fixture.morganCookie)],
+      ["/org/teamorg/teams", withCookie(fixture.morganCookie)],
+      [`/org/teamorg/teams/${fixture.developersTeamId}`, withCookie(fixture.morganCookie)],
+      [`/org/teamorg/teams/${fixture.readersTeamId}`, withCookie(fixture.adminCookie)],
+      ["/org/teamorg/teams/new", withCookie(fixture.morganCookie)],
       ["/user/settings", withCookie(fixture.palCookie)],
     ] as Array<[string, RequestInit]>) {
       const res = await fetchUi(path, init);

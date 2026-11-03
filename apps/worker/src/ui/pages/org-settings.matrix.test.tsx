@@ -233,12 +233,12 @@ async function postAvatarRoute(path: string, userId: number | null, file: boolea
  *  the loops over the gates and the §2.8 guard iterate this list. */
 function writeArms(): Array<{ path: string; fields: Record<string, string>; avatar?: boolean }> {
   return [
-    { path: `/${OPTIONS_ORG}/settings`, fields: { full_name: "written behind a gate" } },
-    { path: `/${OPTIONS_ORG}/settings/avatar`, fields: {}, avatar: true },
-    { path: `/${OPTIONS_ORG}/settings/avatar/delete`, fields: {} },
-    { path: `/${OPTIONS_ORG}/settings/rename`, fields: { org_name: OPTIONS_ORG, new_org_name: "optnova" } },
-    { path: `/${OPTIONS_ORG}/settings/delete`, fields: { org_name: OPTIONS_ORG } },
-    { path: `/${OPTIONS_ORG}/settings/visibility`, fields: { visibility: "private" } },
+    { path: `/org/${OPTIONS_ORG}/settings`, fields: { full_name: "written behind a gate" } },
+    { path: `/org/${OPTIONS_ORG}/settings/avatar`, fields: {}, avatar: true },
+    { path: `/org/${OPTIONS_ORG}/settings/avatar/delete`, fields: {} },
+    { path: `/org/${OPTIONS_ORG}/settings/rename`, fields: { org_name: OPTIONS_ORG, new_org_name: "optnova" } },
+    { path: `/org/${OPTIONS_ORG}/settings/delete`, fields: { org_name: OPTIONS_ORG } },
+    { path: `/org/${OPTIONS_ORG}/settings/visibility`, fields: { visibility: "private" } },
   ];
 }
 
@@ -271,10 +271,10 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   // -- the gates (the shared org-teams prologue) -----------------------------
 
   it("303s an anonymous GET onto the login round-trip; the site admin gets the page (the requireOrgOwnership family)", async () => {
-    const anon = await getRoute(`/${OPTIONS_ORG}/settings`, null);
+    const anon = await getRoute(`/org/${OPTIONS_ORG}/settings`, null);
     expect(anon.status).toBe(303);
-    expect(anon.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(`/${OPTIONS_ORG}/settings`)}`);
-    const admin = await getRoute(`/${OPTIONS_ORG}/settings`, world.adminId);
+    expect(anon.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(`/org/${OPTIONS_ORG}/settings`)}`);
+    const admin = await getRoute(`/org/${OPTIONS_ORG}/settings`, world.adminId);
     expect(admin.status).toBe(200);
     expect(await admin.text()).toContain("page-content organization settings options");
   });
@@ -301,8 +301,8 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   });
 
   it("404-shells a signed-in non-owner (plain member AND outsider) on GET and BEFORE every write POST", async () => {
-    await expectNotFoundShell(await getRoute(`/${OPTIONS_ORG}/settings`, world.memberId));
-    await expectNotFoundShell(await getRoute(`/${OPTIONS_ORG}/settings`, world.outsiderId));
+    await expectNotFoundShell(await getRoute(`/org/${OPTIONS_ORG}/settings`, world.memberId));
+    await expectNotFoundShell(await getRoute(`/org/${OPTIONS_ORG}/settings`, world.outsiderId));
     for (const userId of [world.memberId, world.outsiderId]) {
       for (const arm of writeArms()) {
         const res = arm.avatar === true
@@ -323,7 +323,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   // -- the owner's options round-trip + the carried form on the invalid arms --
 
   it("the owner's options POST round-trips onto the re-rendered page (every field carried, the Permissions box checked)", async () => {
-    const res = await postRoute(`/${OPTIONS_ORG}/settings`, world.ownerId, {
+    const res = await postRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId, {
       full_name: "Roundtrip Org",
       email: "contact@optforge.example",
       description: "The deferred matrix org.",
@@ -332,7 +332,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
       repo_admin_change_team_access: "on",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(res.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     const org = await orgRow(OPTIONS_ORG);
     expect(org.fullName).toBe("Roundtrip Org");
     expect(org.email).toBe("contact@optforge.example");
@@ -342,7 +342,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     expect(org.repoAdminChangeTeamAccess).toBe(true);
     // The follow-up GET renders the submitted values in the form controls —
     // the round-trip's re-render half.
-    const page = await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId);
+    const page = await getRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId);
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain('value="Roundtrip Org"');
@@ -355,7 +355,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
 
   it("the invalid rename arm re-renders the WHOLE settings page with the CARRIED form (stored values survive the banner; the org row untouched)", async () => {
     // Store distinctive options first (the fresh world starts null).
-    await postRoute(`/${OPTIONS_ORG}/settings`, world.ownerId, {
+    await postRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId, {
       full_name: "Roundtrip Org",
       email: "contact@optforge.example",
       description: "The deferred matrix org.",
@@ -364,7 +364,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
       repo_admin_change_team_access: "on",
     });
     // A wrong confirmation name → upstream's JSONError arm re-renders at 200.
-    const res = await postRoute(`/${OPTIONS_ORG}/settings/rename`, world.ownerId, {
+    const res = await postRoute(`/org/${OPTIONS_ORG}/settings/rename`, world.ownerId, {
       org_name: "not-optforge",
       new_org_name: "optnova",
     });
@@ -387,9 +387,9 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   // -- the avatar write pair (the R2 read-back beyond wave-49's exists flag) --
 
   it("the owner's avatar upload stores the exact bytes and the follow-up page renders the live serving seam", async () => {
-    const res = await postAvatarRoute(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, true);
+    const res = await postAvatarRoute(`/org/${OPTIONS_ORG}/settings/avatar`, world.ownerId, true);
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(res.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     // The R2 read-back: the stored object at the shared `u_` namespace key is
     // byte-identical (under-cap inputs store VERBATIM) and typed PNG.
     const stored = await env.REPO_PACKS.get(`avatars/u_${world.orgUserId}`);
@@ -404,16 +404,16 @@ describe("the mounted org settings routes (the minted-session route-level matrix
       .get();
     expect(marker?.useCustomAvatar).toBe(true);
     // The page renders the widget's live seam beside the file input.
-    const page = await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId);
+    const page = await getRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId);
     expect(await page.text()).toContain(`src="/user/avatar/${OPTIONS_ORG}/64"`);
   });
 
   it("the avatar delete arm clears the object and the marker; deleting nothing still 303s silently", async () => {
-    await postAvatarRoute(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, true);
+    await postAvatarRoute(`/org/${OPTIONS_ORG}/settings/avatar`, world.ownerId, true);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(true);
-    const del = await postAvatarRoute(`/${OPTIONS_ORG}/settings/avatar/delete`, world.ownerId, false);
+    const del = await postAvatarRoute(`/org/${OPTIONS_ORG}/settings/avatar/delete`, world.ownerId, false);
     expect(del.status).toBe(303);
-    expect(del.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(del.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
     const marker = await drizzle(env.DB)
       .select({ useCustomAvatar: users.useCustomAvatar })
@@ -422,7 +422,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
       .get();
     expect(marker?.useCustomAvatar).toBe(false);
     // The missing-object delete is a success no-op (the API arm's tolerance).
-    const delAgain = await postAvatarRoute(`/${OPTIONS_ORG}/settings/avatar/delete`, world.ownerId, false);
+    const delAgain = await postAvatarRoute(`/org/${OPTIONS_ORG}/settings/avatar/delete`, world.ownerId, false);
     expect(delAgain.status).toBe(303);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
   });
@@ -452,12 +452,12 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     // decodeImageConfig null → the error outcome, the route 303s back
     // without storing — the object and the marker stay untouched.
     const res = await postAvatarBlob(
-      `/${OPTIONS_ORG}/settings/avatar`,
+      `/org/${OPTIONS_ORG}/settings/avatar`,
       world.ownerId,
       new Blob([new TextEncoder().encode("definitely not an image")], { type: "text/plain" }),
     );
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(res.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
     expect(await avatarMarker()).toBe(false);
   });
@@ -469,7 +469,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     // arm through the same silent redirect).
     const oversized = new Uint8Array(262_144);
     oversized.set(PNG_1X1, 0);
-    const res = await postAvatarBlob(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, new Blob([oversized], { type: "image/png" }));
+    const res = await postAvatarBlob(`/org/${OPTIONS_ORG}/settings/avatar`, world.ownerId, new Blob([oversized], { type: "image/png" }));
     expect(res.status).toBe(303);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
     expect(await avatarMarker()).toBe(false);
@@ -481,7 +481,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     // redirect with nothing stored.
     const big = new Uint8Array(600_000);
     big.set(PNG_1X1, 0);
-    const res = await postAvatarBlob(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, new Blob([big], { type: "image/png" }));
+    const res = await postAvatarBlob(`/org/${OPTIONS_ORG}/settings/avatar`, world.ownerId, new Blob([big], { type: "image/png" }));
     expect(res.status).toBe(303);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
     expect(await avatarMarker()).toBe(false);
@@ -493,9 +493,9 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     // would still flip UseCustomAvatar and generate a random avatar
     // (profile.go:157-163); the landed none arm stores and flips NOTHING —
     // the documented reduction wave-49 pins only as a 303.
-    const res = await postAvatarRoute(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, false);
+    const res = await postAvatarRoute(`/org/${OPTIONS_ORG}/settings/avatar`, world.ownerId, false);
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(res.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
     expect(await avatarMarker()).toBe(false);
   });
@@ -503,12 +503,12 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   // -- the rename 307/redirect semantics --------------------------------------
 
   it("the rename POST 303s onto the NEW name's settings page; the seam 307s the old name for the owner, anonymous viewers and a write POST", async () => {
-    const res = await postRoute(`/${OPTIONS_ORG}/settings/rename`, world.ownerId, {
+    const res = await postRoute(`/org/${OPTIONS_ORG}/settings/rename`, world.ownerId, {
       org_name: OPTIONS_ORG,
       new_org_name: "optnova",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/optnova/settings");
+    expect(res.headers.get("location")).toBe("/org/optnova/settings");
     // The redirect row reads back (the RenameUser port's user_redirects write).
     const redirect = await drizzle(env.DB)
       .select()
@@ -518,19 +518,19 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     expect(redirect).toBeDefined();
     expect(redirect!.redirectUserId).toBe(world.orgUserId);
     // The owner's old-name GET rewrites with the query preserved.
-    const owner = await getRoute(`/${OPTIONS_ORG}/settings?tab=options`, world.ownerId);
+    const owner = await getRoute(`/org/${OPTIONS_ORG}/settings?tab=options`, world.ownerId);
     expect(owner.status).toBe(307);
-    expect(owner.headers.get("location")).toBe("/optnova/settings?tab=options");
+    expect(owner.headers.get("location")).toBe("/org/optnova/settings?tab=options");
     // Anonymous: the seam precedes the login 303 in the prologue.
-    const anon = await getRoute(`/${OPTIONS_ORG}/settings`, null);
+    const anon = await getRoute(`/org/${OPTIONS_ORG}/settings`, null);
     expect(anon.status).toBe(307);
-    expect(anon.headers.get("location")).toBe("/optnova/settings");
+    expect(anon.headers.get("location")).toBe("/org/optnova/settings");
     // A write-POST path rewrites the same way (the seam is method-blind).
-    const anonPost = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, null, { visibility: "private" });
+    const anonPost = await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, null, { visibility: "private" });
     expect(anonPost.status).toBe(307);
-    expect(anonPost.headers.get("location")).toBe("/optnova/settings/visibility");
+    expect(anonPost.headers.get("location")).toBe("/org/optnova/settings/visibility");
     // The target answers 200 behind the new name, carrying the renamed org.
-    const target = await getRoute("/optnova/settings", world.ownerId);
+    const target = await getRoute("/org/optnova/settings", world.ownerId);
     expect(target.status).toBe(200);
     expect(await target.text()).toContain("page-content organization settings options");
   });
@@ -538,7 +538,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   // -- the danger delete arm's D1 cascade read-back ----------------------------
 
   it("the still-owns-repos refusal keeps the repo row standing (the guard's read-back)", async () => {
-    const res = await postRoute(`/${OPTIONS_ORG}/settings/delete`, world.ownerId, { org_name: OPTIONS_ORG });
+    const res = await postRoute(`/org/${OPTIONS_ORG}/settings/delete`, world.ownerId, { org_name: OPTIONS_ORG });
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("This organization still owns one or more repositories.");
@@ -548,7 +548,7 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   });
 
   it("the emptied org's delete 303s onto the site root and the D1 cascade reads back empty (users row, memberships)", async () => {
-    const res = await postRoute(`/${DELETE_ORG}/settings/delete`, world.ownerId, { org_name: DELETE_ORG });
+    const res = await postRoute(`/org/${DELETE_ORG}/settings/delete`, world.ownerId, { org_name: DELETE_ORG });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/");
     // The cascade's read-back: the org's users row and every membership edge
@@ -564,20 +564,20 @@ describe("the mounted org settings routes (the minted-session route-level matrix
       await drizzle(env.DB).select().from(orgMembers).where(eq(orgMembers.orgId, world.deleteOrgUserId)).all(),
     ).toHaveLength(0);
     // Both names 404-shell afterwards — the org resolution misses.
-    await expectNotFoundShell(await getRoute(`/${DELETE_ORG}/settings`, world.ownerId));
+    await expectNotFoundShell(await getRoute(`/org/${DELETE_ORG}/settings`, world.ownerId));
   });
 
   it("the cascade also clears the rename's redirect row — the old name 404-shells after the delete instead of 307ing", async () => {
     // Rename first so a redirect row exists (the delete cascade's
     // user_redirects arms have something to sweep).
-    const renamed = await postRoute(`/${DELETE_ORG}/settings/rename`, world.ownerId, {
+    const renamed = await postRoute(`/org/${DELETE_ORG}/settings/rename`, world.ownerId, {
       org_name: DELETE_ORG,
       new_org_name: "delforge2",
     });
     expect(renamed.status).toBe(303);
-    expect((await getRoute(`/${DELETE_ORG}/settings`, world.ownerId)).status).toBe(307); // the alias lived
+    expect((await getRoute(`/org/${DELETE_ORG}/settings`, world.ownerId)).status).toBe(307); // the alias lived
     // Delete the org under its new name.
-    const res = await postRoute("/delforge2/settings/delete", world.ownerId, { org_name: "delforge2" });
+    const res = await postRoute("/org/delforge2/settings/delete", world.ownerId, { org_name: "delforge2" });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/");
     // The redirect rows read back gone — by the org's id AND by the old name.
@@ -590,19 +590,19 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     ).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(userRedirects).where(eq(userRedirects.lowerName, DELETE_ORG)).all()).toHaveLength(0);
     // The old name no longer redirects — the alias died with the org.
-    await expectNotFoundShell(await getRoute(`/${DELETE_ORG}/settings`, world.ownerId));
-    await expectNotFoundShell(await getRoute("/delforge2/settings", world.ownerId));
+    await expectNotFoundShell(await getRoute(`/org/${DELETE_ORG}/settings`, world.ownerId));
+    await expectNotFoundShell(await getRoute("/org/delforge2/settings", world.ownerId));
   });
 
   // -- the visibility arm's page posture ---------------------------------------
 
   it("the visibility flip lands in D1 and the danger-zone radios re-render the new state", async () => {
-    const res = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
+    const res = await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(res.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     expect((await orgRow(OPTIONS_ORG)).visibility).toBe("limited");
     // The follow-up GET's visibility modal carries the flipped radio.
-    const page = await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId);
+    const page = await getRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId);
     const html = await page.text();
     expect(html).toContain('name="visibility" type="radio" value="limited" checked');
     expect(html).not.toContain('name="visibility" type="radio" value="public" checked');
@@ -611,13 +611,13 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   it("the PRIVATE flip combo: lands in D1, the private radio re-renders (the modal's hidden field rides), and the flip back re-opens public", async () => {
     // The third enum value's write (SettingsChangeVisibilityPost's success
     // arm, routers/web/org/setting.go:258-265) — public → private.
-    const res = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "private" });
+    const res = await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "private" });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(res.headers.get("location")).toBe(`/org/${OPTIONS_ORG}/settings`);
     expect((await orgRow(OPTIONS_ORG)).visibility).toBe("private");
     // The re-rendered modal: private checked, the other two radios off, and
     // the hidden current_visibility field carrying the new state.
-    const page = await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId);
+    const page = await getRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId);
     const html = await page.text();
     expect(html).toContain('name="visibility" type="radio" value="private" checked');
     expect(html).not.toContain('name="visibility" type="radio" value="public" checked');
@@ -625,26 +625,26 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     expect(html).toContain('name="current_visibility" value="private"');
     // The re-open: private → public round-trips the same arms (the flip-back
     // the wave-49 suite drives only from limited).
-    const back = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "public" });
+    const back = await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "public" });
     expect(back.status).toBe(303);
     expect((await orgRow(OPTIONS_ORG)).visibility).toBe("public");
-    const reopened = await (await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId)).text();
+    const reopened = await (await getRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId)).text();
     expect(reopened).toContain('name="visibility" type="radio" value="public" checked');
     expect(reopened).not.toContain('name="visibility" type="radio" value="private" checked');
   });
 
   it("the unchanged and out-of-enum bodies answer the redirect arms and the PAGE keeps the stored radios (setting.go:246-255)", async () => {
     // Start from limited so the stored state is distinguishable.
-    await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
+    await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
     // The unchanged value (nothing_has_been_changed, :252-255)…
-    const same = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
+    const same = await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
     expect(same.status).toBe(303);
     // …and the out-of-enum value (invalid_data, :246-249) both land back
     // silently; the page's radios render the STORED state, never the junk.
-    const bogus = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "stealth" });
+    const bogus = await postRoute(`/org/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "stealth" });
     expect(bogus.status).toBe(303);
     expect((await orgRow(OPTIONS_ORG)).visibility).toBe("limited");
-    const html = await (await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId)).text();
+    const html = await (await getRoute(`/org/${OPTIONS_ORG}/settings`, world.ownerId)).text();
     expect(html).toContain('name="visibility" type="radio" value="limited" checked');
     expect(html).not.toContain('name="visibility" type="radio" value="stealth"');
   });
@@ -673,31 +673,31 @@ describe("the mounted org settings routes (the minted-session route-level matrix
   // -- the route claim pin (the blocked-users matrix's pin) ----------------------
 
   it("the settings family claims exactly its six shapes; misspelled and deeper tails stay unclaimed, the trailing slash folds", () => {
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings`)).toEqual({ family: "org-settings", owner: OPTIONS_ORG });
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings/avatar`)).toEqual({ family: "org-settings-avatar", owner: OPTIONS_ORG });
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings/avatar/delete`)).toEqual({
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings`)).toEqual({ family: "org-settings", owner: OPTIONS_ORG });
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings/avatar`)).toEqual({ family: "org-settings-avatar", owner: OPTIONS_ORG });
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings/avatar/delete`)).toEqual({
       family: "org-settings-avatar-delete",
       owner: OPTIONS_ORG,
     });
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings/rename`)).toEqual({ family: "org-settings-rename", owner: OPTIONS_ORG });
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings/delete`)).toEqual({ family: "org-settings-delete", owner: OPTIONS_ORG });
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings/visibility`)).toEqual({
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings/rename`)).toEqual({ family: "org-settings-rename", owner: OPTIONS_ORG });
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings/delete`)).toEqual({ family: "org-settings-delete", owner: OPTIONS_ORG });
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings/visibility`)).toEqual({
       family: "org-settings-visibility",
       owner: OPTIONS_ORG,
     });
     // The trailing slash folds onto the canonical shape (§4.13 — the parser
     // classifies the trimmed form so the router's 301 admits it).
-    expect(parseUiRoute(`/${OPTIONS_ORG}/settings/visibility/`)).toEqual({
+    expect(parseUiRoute(`/org/${OPTIONS_ORG}/settings/visibility/`)).toEqual({
       family: "org-settings-visibility",
       owner: OPTIONS_ORG,
     });
     // The tails this family never claimed — parse null, the dispatcher's
     // handlesUiRoute false.
     for (const tail of [
-      `/${OPTIONS_ORG}/settings/renamed`, // the misspelling
-      `/${OPTIONS_ORG}/settings/avatar/upload`, // a deeper avatar tail
-      `/${OPTIONS_ORG}/settings/delete/confirm`, // a deeper delete tail
-      `/${OPTIONS_ORG}/settings/visibility/private`, // a deeper visibility tail
+      `/org/${OPTIONS_ORG}/settings/renamed`, // the misspelling
+      `/org/${OPTIONS_ORG}/settings/avatar/upload`, // a deeper avatar tail
+      `/org/${OPTIONS_ORG}/settings/delete/confirm`, // a deeper delete tail
+      `/org/${OPTIONS_ORG}/settings/visibility/private`, // a deeper visibility tail
     ]) {
       expect(parseUiRoute(tail)).toBeNull();
       expect(handlesUiRoute(tail)).toBe(false);
@@ -708,13 +708,13 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     // The uiRouter's registrations end where the parse claim ends: no
     // settings gate ran (NOT a login 303 for the anonymous viewer), no
     // settings page rendered, the sub-app's default 404 answers.
-    const anon = await getRoute(`/${OPTIONS_ORG}/settings/renamed`, null);
+    const anon = await getRoute(`/org/${OPTIONS_ORG}/settings/renamed`, null);
     expect(anon.status).toBe(404);
     const html = await anon.text();
     expect(html).not.toContain("page-content organization settings options");
     expect(html).not.toContain("signing in"); // never the login round-trip
     // The same posture signed-in on a deeper tail — the family never answered.
-    const owner = await getRoute(`/${OPTIONS_ORG}/settings/avatar/upload`, world.ownerId);
+    const owner = await getRoute(`/org/${OPTIONS_ORG}/settings/avatar/upload`, world.ownerId);
     expect(owner.status).toBe(404);
     expect((await owner.text()).includes("page-content organization settings options")).toBe(false);
   });

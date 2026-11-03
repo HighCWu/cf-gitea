@@ -104,7 +104,7 @@ export const packagesCargoLocale = {
 /**
  * The cargo index section. `base` is the page URI `{{.Link}}` — the user
  * frame's `/user/settings/packages` or the org frame's
- * `/{org}/settings/packages` — so the form actions are `{Link}/cargo/initialize`
+ * `/org/{org}/settings/packages` — so the form actions are `{Link}/cargo/initialize`
  * and `{Link}/cargo/rebuild` byte-exactly.
  */
 export function CargoIndexSection(props: { base: string }) {

@@ -204,7 +204,7 @@ describe("the invisible-org gates (private + limited, the arms wave23's public f
     expect(html).toContain("Member Role:");
     expect(html).toContain('<span class="ui basic small label">Hidden</span>');
     expect(html).not.toContain("Members are managed through teams.");
-    expect(html).not.toContain('href="/gate-priv/teams"');
+    expect(html).not.toContain('href="/org/gate-priv/teams"');
   });
 
   it("the OWNER of the private org gets the manage prompt on top of the full listing", async () => {
@@ -214,7 +214,7 @@ describe("the invisible-org gates (private + limited, the arms wave23's public f
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("Members are managed through teams.");
-    expect(html).toContain('href="/gate-priv/teams"');
+    expect(html).toContain('href="/org/gate-priv/teams"');
   });
 
   it("a SITE ADMIN non-member sees role lines + prompt with NO membership (the two admin arms)", async () => {
@@ -232,7 +232,7 @@ describe("the invisible-org gates (private + limited, the arms wave23's public f
     // …and the prompt rides isOrgOwnerViewer's isAdmin branch (no membership
     // row exists for gate-admin at all).
     expect(html).toContain("Members are managed through teams.");
-    expect(html).toContain('href="/gate-priv/teams"');
+    expect(html).toContain('href="/org/gate-priv/teams"');
   });
 
   it("the LIMITED org hides from the anonymous viewer but renders PUBLIC-ONLY for a signed-in non-member", async () => {

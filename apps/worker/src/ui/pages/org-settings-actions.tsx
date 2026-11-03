@@ -30,7 +30,7 @@
  *
  * Mounting upstream: web.go:498-503's `addSettingsSecretsRoutes` and
  * web.go:489-497's `addSettingsVariablesRoutes` inside web.go:1054-1062's
- * `/{org}/settings` `/actions` group (require-owner, behind
+ * `/org/{org}/settings` `/actions` group (require-owner, behind
  * `actions.MustEnableActions`; `GET /settings/actions` is upstream's
  * LocationRedirect onto ./actions/general).
  *
@@ -45,9 +45,9 @@
  * RequireOwner OrgAssignment NotFound, web.go:1032's settings subtree).
  * Seven routes:
  *
- *   GET  /{org}/settings/actions/secrets → the ownership gate →
+ *   GET  /org/{org}/settings/actions/secrets → the ownership gate →
  *            loadOrgActionsSecretsPageData → renderOrgActionsSecretsPage.
- *   POST /{org}/settings/actions/secrets → the sameOriginGuard + the
+ *   POST /org/{org}/settings/actions/secrets → the sameOriginGuard + the
  *            ownership gate, `readUrlEncodedForm`,
  *            `parseOrgActionsSecretForm`, then `applyOrgActionsSecretForm`
  *            (upstream SecretsPost → PerformSecretsPost). `outcome: "saved"`
@@ -57,30 +57,30 @@
  *            `outcome: "invalid"` re-renders the page with the `error` line +
  *            the submitted `form` values (upstream's JSONErrorAuto is a
  *            form-fetch-action JS arm — the no-JS reduction re-renders).
- *   POST /{org}/settings/actions/secrets/delete →
+ *   POST /org/{org}/settings/actions/secrets/delete →
  *            `parseOrgActionsSecretDeleteForm` + `deleteOrgActionsSecret` —
  *            both outcomes 303 back (a null/foreign/stale id answers
  *            "missing" and deletes nothing; the idempotent-303 reduction).
- *   GET  /{org}/settings/actions/variables →
+ *   GET  /org/{org}/settings/actions/variables →
  *            loadOrgActionsVariablesPageData → renderOrgActionsVariablesPage.
- *   POST /{org}/settings/actions/variables/new → `parseOrgActionsVariableForm`
+ *   POST /org/{org}/settings/actions/variables/new → `parseOrgActionsVariableForm`
  *            + `applyOrgActionsVariableCreate` (upstream VariableCreate);
  *            "saved" 303s back, "invalid" re-renders with the error line +
  *            the submitted add-form values, a non-ApiError (the UNIQUE
  *            duplicate-name db error — upstream has no web pre-check either)
  *            propagates to the generic error handler.
- *   POST /{org}/settings/actions/variables/{id}/edit → the path id through
+ *   POST /org/{org}/settings/actions/variables/{id}/edit → the path id through
  *            `parseOrgActionsVariablePathId`, then
  *            `applyOrgActionsVariableUpdate` (upstream VariableUpdate).
  *            "saved" 303s back; "invalid" re-renders; "missing" is upstream's
  *            `findActionsVariable` arm — a genuine ctx.NotFound(nil)
  *            (variables.go:172-175): answer the app's 404 shell.
- *   POST /{org}/settings/actions/variables/{id}/delete → the path id +
+ *   POST /org/{org}/settings/actions/variables/{id}/delete → the path id +
  *            `deleteOrgActionsVariable` (upstream VariableDelete).
  *            "deleted" 303s back; "missing" is the same NotFound arm
  *            (variables.go:186-191).
  *
- * `GET /{org}/settings/actions` itself is upstream's LocationRedirect onto
+ * `GET /org/{org}/settings/actions` itself is upstream's LocationRedirect onto
  * ./actions/general (web.go:1055) — the general tab is NOT this module's
  * claim (no landed page); the dispatcher 404-shells it until that slice
  * lands. `/{org}` in every URL is the LIVE org name (orgLink =
@@ -709,7 +709,7 @@ export function renderOrgActionsVariablesPage(ctx: UiContext, data: OrgActionsVa
  *  `actions.actions`, secrets.go:77). */
 export function OrgActionsSecretsPage(props: { ctx: UiContext; data: OrgActionsSecretsPageData; error: string | null }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsActionsLocale.actions} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
@@ -763,7 +763,7 @@ export function OrgActionsSecretsPage(props: { ctx: UiContext; data: OrgActionsS
  *  variables.go:84). */
 export function OrgActionsVariablesPage(props: { ctx: UiContext; data: OrgActionsVariablesPageData; error: string | null }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsActionsLocale.variables} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />

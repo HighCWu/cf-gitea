@@ -177,7 +177,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
 
 describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
   it("renders the header and every landed item text (the pin's locale strings)", () => {
-    const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
+    const html = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="options" />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain(`<div class="header item">${settingsNavLocale.org_settings}</div>`); // "org.settings"
     for (const text of [
@@ -199,56 +199,56 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
   });
 
   it("renders the landed items in upstream order (navbar.tmpl:4-48 + the Audit item, dead items dropped)", () => {
-    assertHrefOrder(renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />), [
-      'href="/acme/settings"',
-      'href="/acme/settings/hooks"',
-      'href="/acme/labels"', // the wave-14 divergence — upstream: /settings/labels
-      'href="/acme/settings/applications"', // lit by the R20-a applications tab's mount
-      'href="/acme/settings/blocked_users"',
-      'href="/acme/settings/actions"', // lit by the org general page's module (P2-2) — navbar.tmpl:32-34's BARE actions URL, before Runners
-      'href="/acme/settings/actions/runners"', // lit by the C7 org twin's mount — navbar.tmpl:35-37, before Secrets
-      'href="/acme/settings/actions/secrets"',
-      'href="/acme/settings/actions/variables"',
-      'href="/acme/settings/actions/scoped-workflows"', // lit by the store wave's org mount — navbar.tmpl:44-45
-      'href="/acme/settings/audit_logs"', // lit by the census R13 org arm's mount — LAST, navbar.tmpl:50-52
+    assertHrefOrder(renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="options" />), [
+      'href="/org/acme/settings"',
+      'href="/org/acme/settings/hooks"',
+      'href="/org/acme/settings/labels"', // the wave-14 divergence — upstream: /settings/labels
+      'href="/org/acme/settings/applications"', // lit by the R20-a applications tab's mount
+      'href="/org/acme/settings/blocked_users"',
+      'href="/org/acme/settings/actions"', // lit by the org general page's module (P2-2) — navbar.tmpl:32-34's BARE actions URL, before Runners
+      'href="/org/acme/settings/actions/runners"', // lit by the C7 org twin's mount — navbar.tmpl:35-37, before Secrets
+      'href="/org/acme/settings/actions/secrets"',
+      'href="/org/acme/settings/actions/variables"',
+      'href="/org/acme/settings/actions/scoped-workflows"', // lit by the store wave's org mount — navbar.tmpl:44-45
+      'href="/org/acme/settings/audit_logs"', // lit by the census R13 org arm's mount — LAST, navbar.tmpl:50-52
     ]);
   });
 
-  it("keeps the documented Labels href divergence (the landed /{org}/labels target, org-settings.tsx's header)", () => {
-    const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
-    expect(html).toContain('href="/acme/labels"');
-    expect(html).not.toContain('href="/acme/settings/labels"');
+  it("renders the Labels item at upstream's settings/labels subtree (the wave-14 divergence retired — ledger B3)", () => {
+    const html = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="options" />);
+    expect(html).toContain('href="/org/acme/settings/labels"'); // upstream navbar.tmpl:12-14's `{.OrgLink}/settings/labels`
+    expect(html).not.toContain('href="/org/acme/labels"'); // the retired bare /{org}/labels target — never rendered
   });
 
   it("renders NO dead items — every Actions sub-item is landed (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount, Packages with the org settings packages tab's mount, General with the org general page's module, Scoped-workflows with the store wave's org mount)", () => {
-    const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
+    const html = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="options" />);
     // The General sub-item (:32-34) renders with upstream's own bare
     // `{OrgLink}/settings/actions` href — the quoted attribute shape
     // disambiguates it from the landed tails' longer hrefs.
-    expect(html).toContain('href="/acme/settings/actions"');
+    expect(html).toContain('href="/org/acme/settings/actions"');
     // The Scoped-workflows sub-item (:44-45) rendered with the store wave's
     // mount (pages/org-settings-actions-scoped-workflows.tsx).
-    expect(html).toContain('href="/acme/settings/actions/scoped-workflows"');
+    expect(html).toContain('href="/org/acme/settings/actions/scoped-workflows"');
   });
 
   it("marks exactly the active tab's anchor (every union member)", () => {
     const expectations: Record<string, string> = {
-      options: 'href="/acme/settings"',
-      hooks: 'href="/acme/settings/hooks"',
-      labels: 'href="/acme/labels"',
-      applications: 'href="/acme/settings/applications"',
-      blocked: 'href="/acme/settings/blocked_users"',
-      "actions-general": 'href="/acme/settings/actions"', // the org general page (P2-2) — the bare actions URL
-      runners: 'href="/acme/settings/actions/runners"',
-      secrets: 'href="/acme/settings/actions/secrets"',
-      variables: 'href="/acme/settings/actions/variables"',
-      "actions-scoped-workflows": 'href="/acme/settings/actions/scoped-workflows"', // the store wave's org page
-      audit: 'href="/acme/settings/audit_logs"',
+      options: 'href="/org/acme/settings"',
+      hooks: 'href="/org/acme/settings/hooks"',
+      labels: 'href="/org/acme/settings/labels"',
+      applications: 'href="/org/acme/settings/applications"',
+      blocked: 'href="/org/acme/settings/blocked_users"',
+      "actions-general": 'href="/org/acme/settings/actions"', // the org general page (P2-2) — the bare actions URL
+      runners: 'href="/org/acme/settings/actions/runners"',
+      secrets: 'href="/org/acme/settings/actions/secrets"',
+      variables: 'href="/org/acme/settings/actions/variables"',
+      "actions-scoped-workflows": 'href="/org/acme/settings/actions/scoped-workflows"', // the store wave's org page
+      audit: 'href="/org/acme/settings/audit_logs"',
     };
     for (const [tab, href] of Object.entries(expectations)) {
       const html = renderToString(
         <OrgSettingsNavbar
-          orgLink="/acme"
+          orgLink="/org/acme"
           active={
             tab as
               | "options"
@@ -271,22 +271,22 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
   });
 
   it("opens the Actions disclosure while an actions-group page renders, closed otherwise (navbar.tmpl:29)", () => {
-    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="actions-general" />)).toContain('<details class="item" open');
-    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="runners" />)).toContain('<details class="item" open');
-    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="secrets" />)).toContain('<details class="item" open');
-    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="variables" />)).toContain('<details class="item" open');
-    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="actions-scoped-workflows" />)).toContain('<details class="item" open');
-    const closed = renderToString(<OrgSettingsNavbar orgLink="/acme" active="blocked" />);
+    expect(renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="actions-general" />)).toContain('<details class="item" open');
+    expect(renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="runners" />)).toContain('<details class="item" open');
+    expect(renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="secrets" />)).toContain('<details class="item" open');
+    expect(renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="variables" />)).toContain('<details class="item" open');
+    expect(renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="actions-scoped-workflows" />)).toContain('<details class="item" open');
+    const closed = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="blocked" />);
     expect(closed).toContain('<details class="item">');
     expect(closed).not.toContain("open");
   });
 
-  it("carries the orgLink verbatim into every href (the family's OrgLink = /{org})", () => {
-    const html = renderToString(<OrgSettingsNavbar orgLink="/Org-With-Caps" active="options" />);
-    expect(html).toContain('href="/Org-With-Caps/settings"');
-    expect(html).toContain('href="/Org-With-Caps/settings/hooks"');
-    expect(html).toContain('href="/Org-With-Caps/labels"');
-    expect(html).toContain('href="/Org-With-Caps/settings/applications"');
-    expect(html).toContain('href="/Org-With-Caps/settings/blocked_users"');
+  it("carries the orgLink verbatim into every href (the family's OrgLink = /org/{org} — upstream OrganisationLink, user.go:351-355)", () => {
+    const html = renderToString(<OrgSettingsNavbar orgLink="/org/Org-With-Caps" active="options" />);
+    expect(html).toContain('href="/org/Org-With-Caps/settings"');
+    expect(html).toContain('href="/org/Org-With-Caps/settings/hooks"');
+    expect(html).toContain('href="/org/Org-With-Caps/settings/labels"');
+    expect(html).toContain('href="/org/Org-With-Caps/settings/applications"');
+    expect(html).toContain('href="/org/Org-With-Caps/settings/blocked_users"');
   });
 });

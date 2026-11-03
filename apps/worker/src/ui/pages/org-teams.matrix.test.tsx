@@ -285,35 +285,35 @@ async function teamById(id: number): Promise<TeamRecord | null> {
 
 describe("org-teams family claim pins (the folds and edges wave-12 never pinned)", () => {
   it("canonicalizes the trailing-slash form of every wildcard shape", () => {
-    expect(parseUiRoute("/acme/teams/new/")).toEqual({ family: "org-team-new", owner: "acme" });
-    expect(parseUiRoute("/acme/teams/42/")).toEqual({ family: "org-team-detail", owner: "acme", id: 42 });
-    expect(parseUiRoute("/acme/teams/42/edit/")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
-    expect(parseUiRoute("/acme/teams/42/delete/")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
-    expect(parseUiRoute("/acme/teams/0/")).toEqual({ family: "org-team-detail", owner: "acme", id: 0 });
-    expect(handlesUiRoute("/acme/teams/42/edit/")).toBe(true);
+    expect(parseUiRoute("/org/acme/teams/new/")).toEqual({ family: "org-team-new", owner: "acme" });
+    expect(parseUiRoute("/org/acme/teams/42/")).toEqual({ family: "org-team-detail", owner: "acme", id: 42 });
+    expect(parseUiRoute("/org/acme/teams/42/edit/")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
+    expect(parseUiRoute("/org/acme/teams/42/delete/")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
+    expect(parseUiRoute("/org/acme/teams/0/")).toEqual({ family: "org-team-detail", owner: "acme", id: 0 });
+    expect(handlesUiRoute("/org/acme/teams/42/edit/")).toBe(true);
   });
 
   it("claims the digit edges and the R19 name carrier, leaving the junk edit tails with the engine", () => {
     // /^\d+$/ admits "0" (the resolve shells it — the detail arm below) and
     // the int64-overflow digits (parseInt folds to 1e20; getTeamById misses).
-    expect(parseUiRoute("/acme/teams/0")).toEqual({ family: "org-team-detail", owner: "acme", id: 0 });
-    expect(parseUiRoute("/acme/teams/99999999999999999999")).toEqual({
+    expect(parseUiRoute("/org/acme/teams/0")).toEqual({ family: "org-team-detail", owner: "acme", id: 0 });
+    expect(parseUiRoute("/org/acme/teams/99999999999999999999")).toEqual({
       family: "org-team-detail",
       owner: "acme",
       id: 100000000000000000000,
     });
-    expect(parseUiRoute("/acme/teams/0/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 0 });
+    expect(parseUiRoute("/org/acme/teams/0/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 0 });
     // The census R19 wave: a non-numeric segment is now the NAME carrier —
     // upstream's team page takes any {team} param and resolves it
     // case-folded against the lower names (org.go:213-218), 404-shelling
     // the miss, so the claim mirrors upstream (the loader reproduces the
     // miss as the shell — the detail arm below).
-    expect(parseUiRoute("/acme/teams/not-a-number")).toEqual({
+    expect(parseUiRoute("/org/acme/teams/not-a-number")).toEqual({
       family: "org-team-detail",
       owner: "acme",
       name: "not-a-number",
     });
-    expect(parseUiRoute("/acme/teams/Alpha%20Crew")).toEqual({
+    expect(parseUiRoute("/org/acme/teams/Alpha%20Crew")).toEqual({
       family: "org-team-detail",
       owner: "acme",
       name: "Alpha Crew",
@@ -321,40 +321,40 @@ describe("org-teams family claim pins (the folds and edges wave-12 never pinned)
     // The five-segment edit/delete tails keep their id-only claims: a name
     // carrier has no landed edit/delete read arms, so name tails stay
     // unclaimed → the engine's 404.
-    expect(parseUiRoute("/acme/teams/not-a-number/edit")).toBeNull();
-    expect(parseUiRoute("/acme/teams/not-a-number/delete")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/not-a-number/edit")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/not-a-number/delete")).toBeNull();
     // The junk carriers: only the UNDECODABLE segment stays unclaimed — the
     // `+1`/`1.5`/`-1` shapes are decodable segments, so the R19 name-carrier
     // claim now takes them exactly like upstream's {team} param (their
     // lookups miss → the resolved shell, the detail arm below).
-    expect(parseUiRoute("/acme/teams/+1")).toEqual({ family: "org-team-detail", owner: "acme", name: "+1" });
-    expect(parseUiRoute("/acme/teams/1.5")).toEqual({ family: "org-team-detail", owner: "acme", name: "1.5" });
-    expect(parseUiRoute("/acme/teams/-1")).toEqual({ family: "org-team-detail", owner: "acme", name: "-1" });
-    expect(parseUiRoute("/acme/teams/%zz")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/%zz")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/delete/x")).toBeNull();
-    expect(handlesUiRoute("/acme/teams/not-a-number")).toBe(true);
-    expect(handlesUiRoute("/acme/teams/42/delete/x")).toBe(false);
+    expect(parseUiRoute("/org/acme/teams/+1")).toEqual({ family: "org-team-detail", owner: "acme", name: "+1" });
+    expect(parseUiRoute("/org/acme/teams/1.5")).toEqual({ family: "org-team-detail", owner: "acme", name: "1.5" });
+    expect(parseUiRoute("/org/acme/teams/-1")).toEqual({ family: "org-team-detail", owner: "acme", name: "-1" });
+    expect(parseUiRoute("/org/acme/teams/%zz")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/%zz")).toBeNull();
+    expect(parseUiRoute("/org/acme/teams/42/delete/x")).toBeNull();
+    expect(handlesUiRoute("/org/acme/teams/not-a-number")).toBe(true);
+    expect(handlesUiRoute("/org/acme/teams/42/delete/x")).toBe(false);
   });
 
   it("301s the trailing-slash GETs onto the canonical URLs (query preserved) and never launders a slashed POST write", async () => {
     const world = await seedTeamsWorld();
     // The list with a query: the middleware's default mode answers the 404
     // with a 301 whose absolute location keeps it (c.redirect's URL form).
-    const list = await getRoute("/teamorgmx/teams/?q=x", null);
+    const list = await getRoute("/org/teamorgmx/teams/?q=x", null);
     expect(list.status).toBe(301);
-    expect(list.headers.get("location")).toBe(`${ORIGIN}/teamorgmx/teams?q=x`);
+    expect(list.headers.get("location")).toBe(`${ORIGIN}/org/teamorgmx/teams?q=x`);
     // The detail wildcard.
-    const detail = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}/`, world.ownerId);
+    const detail = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}/`, world.ownerId);
     expect(detail.status).toBe(301);
-    expect(detail.headers.get("location")).toBe(`${ORIGIN}/teamorgmx/teams/${world.alphaTeamId}`);
+    expect(detail.headers.get("location")).toBe(`${ORIGIN}/org/teamorgmx/teams/${world.alphaTeamId}`);
     // The create form literal.
-    const form = await getRoute("/teamorgmx/teams/new/", world.ownerId);
+    const form = await getRoute("/org/teamorgmx/teams/new/", world.ownerId);
     expect(form.status).toBe(301);
-    expect(form.headers.get("location")).toBe(`${ORIGIN}/teamorgmx/teams/new`);
+    expect(form.headers.get("location")).toBe(`${ORIGIN}/org/teamorgmx/teams/new`);
     // A slashed POST is GET/HEAD-only in the middleware — it stays a 404 and
     // can never launder into the write (the create count is untouched).
-    const slashedPost = await postArm("/teamorgmx/teams/new/", world.ownerId, {
+    const slashedPost = await postArm("/org/teamorgmx/teams/new/", world.ownerId, {
       team_name: "Slashed",
       permission: "read",
     });
@@ -374,10 +374,10 @@ describe("the gate posture on the mounted routes (the arms wave-12/wave-49 never
 
   it("303s an anonymous GET of every shape onto the login round-trip and 405s the delete GET before any session work", async () => {
     for (const path of [
-      "/teamorgmx/teams",
-      `/teamorgmx/teams/${world.alphaTeamId}`,
-      "/teamorgmx/teams/new",
-      `/teamorgmx/teams/${world.alphaTeamId}/edit`,
+      "/org/teamorgmx/teams",
+      `/org/teamorgmx/teams/${world.alphaTeamId}`,
+      "/org/teamorgmx/teams/new",
+      `/org/teamorgmx/teams/${world.alphaTeamId}/edit`,
     ]) {
       const res = await getRoute(path, null);
       expect(res.status).toBe(303);
@@ -385,20 +385,20 @@ describe("the gate posture on the mounted routes (the arms wave-12/wave-49 never
     }
     // The delete tail is POST-only: chi's 405 answers before the session
     // gate is even consulted.
-    const deleteGet = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}/delete`, null);
+    const deleteGet = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, null);
     expect(deleteGet.status).toBe(405);
   });
 
   it("303s an anonymous same-origin edit/delete POST onto the login round-trip carrying the POSTED path — nothing written", async () => {
-    const edit = await postArm(`/teamorgmx/teams/${world.alphaTeamId}/edit`, null, { team_name: "Hijacked" });
+    const edit = await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/edit`, null, { team_name: "Hijacked" });
     expect(edit.status).toBe(303);
     expect(edit.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/teamorgmx/teams/${world.alphaTeamId}/edit`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/teamorgmx/teams/${world.alphaTeamId}/edit`)}`,
     );
-    const del = await postArm(`/teamorgmx/teams/${world.alphaTeamId}/delete`, null, {});
+    const del = await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, null, {});
     expect(del.status).toBe(303);
     expect(del.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/teamorgmx/teams/${world.alphaTeamId}/delete`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/teamorgmx/teams/${world.alphaTeamId}/delete`)}`,
     );
     // D1 read-backs: the name is untouched and the team survives.
     const alpha = await teamById(world.alphaTeamId);
@@ -409,12 +409,12 @@ describe("the gate posture on the mounted routes (the arms wave-12/wave-49 never
   it("404-shells the non-owner write POSTs (plain member AND outsider) before any write", async () => {
     for (const userId of [world.memberId, world.outsiderId]) {
       await expectNotFoundShell(
-        await postArm("/teamorgmx/teams/new", userId, { team_name: "Pal Crew", permission: "admin" }),
+        await postArm("/org/teamorgmx/teams/new", userId, { team_name: "Pal Crew", permission: "admin" }),
       );
       await expectNotFoundShell(
-        await postArm(`/teamorgmx/teams/${world.alphaTeamId}/edit`, userId, { team_name: "Hijacked Crew" }),
+        await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/edit`, userId, { team_name: "Hijacked Crew" }),
       );
-      await expectNotFoundShell(await postArm(`/teamorgmx/teams/${world.alphaTeamId}/delete`, userId, {}));
+      await expectNotFoundShell(await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, userId, {}));
     }
     // Nothing written: the five seeds only, Alpha intact.
     expect((await allTeams()).filter((team) => team.orgId === world.org.id)).toHaveLength(5);
@@ -423,32 +423,32 @@ describe("the gate posture on the mounted routes (the arms wave-12/wave-49 never
 
   it("404-shells a USER namespace on every shape (the owner segment is not an org)", async () => {
     for (const path of [
-      "/vera/teams",
-      "/vera/teams/42",
-      "/vera/teams/new",
-      "/vera/teams/42/edit",
+      "/org/vera/teams",
+      "/org/vera/teams/42",
+      "/org/vera/teams/new",
+      "/org/vera/teams/42/edit",
     ]) {
       await expectNotFoundShell(await getRoute(path, world.outsiderId));
     }
   });
 
   it("admits the site admin onto the edit arm and its write (the wave-49 suite pinned the org owner only)", async () => {
-    const get = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}/edit`, world.adminId);
+    const get = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}/edit`, world.adminId);
     expect(get.status).toBe(200);
     const html = await get.text();
     expect(html).toContain("page-content organization new team");
-    expect(html).toContain(`action="/teamorgmx/teams/${world.alphaTeamId}/edit" method="post"`);
+    expect(html).toContain(`action="/org/teamorgmx/teams/${world.alphaTeamId}/edit" method="post"`);
     expect(html).toContain('value="Alpha Crew"');
     expect(html).toContain('value="write" checked');
 
-    const post = await postArm(`/teamorgmx/teams/${world.alphaTeamId}/edit`, world.adminId, {
+    const post = await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/edit`, world.adminId, {
       team_name: "Alpha Crew Admin Renamed",
       description: "Renamed by the admin.",
       visibility: "private",
       permission: "write",
     });
     expect(post.status).toBe(303);
-    expect(post.headers.get("location")).toBe(`/teamorgmx/teams/${world.alphaTeamId}`);
+    expect(post.headers.get("location")).toBe(`/org/teamorgmx/teams/${world.alphaTeamId}`);
     const row = await teamById(world.alphaTeamId);
     expect(row?.name).toBe("Alpha Crew Admin Renamed");
     expect(row?.authorize).toBe("write");
@@ -466,9 +466,9 @@ describe("the §2.8 cross-origin 403s on all three write arms (the arms wave-12 
 
   it("403s a cross-origin POST ahead of every gate — even with a valid owner cookie — and nothing is written", async () => {
     for (const [path, fields] of [
-      ["/teamorgmx/teams/new", { team_name: "Evil Crew", permission: "admin" }],
-      [`/teamorgmx/teams/${world.alphaTeamId}/edit`, { team_name: "Evil Crew" }],
-      [`/teamorgmx/teams/${world.alphaTeamId}/delete`, {}],
+      ["/org/teamorgmx/teams/new", { team_name: "Evil Crew", permission: "admin" }],
+      [`/org/teamorgmx/teams/${world.alphaTeamId}/edit`, { team_name: "Evil Crew" }],
+      [`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, {}],
     ] as const) {
       const res = await postArm(path, world.ownerId, fields, "https://evil.example");
       expect(res.status).toBe(403);
@@ -480,9 +480,9 @@ describe("the §2.8 cross-origin 403s on all three write arms (the arms wave-12 
 
   it("403s the cookie-less cross-origin probe instead of 303ing onto login (the guard precedes the session gate)", async () => {
     for (const [path, fields] of [
-      ["/teamorgmx/teams/new", { team_name: "Ghost Crew", permission: "read" }],
-      [`/teamorgmx/teams/${world.alphaTeamId}/edit`, { team_name: "Ghost Crew" }],
-      [`/teamorgmx/teams/${world.alphaTeamId}/delete`, {}],
+      ["/org/teamorgmx/teams/new", { team_name: "Ghost Crew", permission: "read" }],
+      [`/org/teamorgmx/teams/${world.alphaTeamId}/edit`, { team_name: "Ghost Crew" }],
+      [`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, {}],
     ] as const) {
       const res = await postArm(path, null, fields, "https://evil.example");
       expect(res.status).toBe(403);
@@ -493,23 +493,23 @@ describe("the §2.8 cross-origin 403s on all three write arms (the arms wave-12 
 
   it("falls back to the Referer when Origin is absent — foreign rejects, same-origin admits, header-less rides into the session gate", async () => {
     // Foreign referer, delete arm: 403, the team survives.
-    const foreign = await postArm(`/teamorgmx/teams/${world.alphaTeamId}/delete`, world.ownerId, {}, null, "https://evil.example/admin");
+    const foreign = await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, world.ownerId, {}, null, "https://evil.example/admin");
     expect(foreign.status).toBe(403);
     expect(await foreign.text()).toContain("cross-origin request rejected");
     expect(await teamById(world.alphaTeamId)).not.toBeNull();
     // Same-origin referer, edit arm: the write proceeds end-to-end.
     const admitted = await postArm(
-      `/teamorgmx/teams/${world.alphaTeamId}/edit`,
+      `/org/teamorgmx/teams/${world.alphaTeamId}/edit`,
       world.ownerId,
       { team_name: "Alpha Crew Referred", visibility: "private", permission: "write" },
       null,
-      `${ORIGIN}/teamorgmx/teams/${world.alphaTeamId}/edit`,
+      `${ORIGIN}/org/teamorgmx/teams/${world.alphaTeamId}/edit`,
     );
     expect(admitted.status).toBe(303);
     expect((await teamById(world.alphaTeamId))?.name).toBe("Alpha Crew Referred");
     // Header-less anonymous delete: the guard passes, the session gate 303s
     // onto the login round-trip, nothing is deleted.
-    const headerless = await postArm(`/teamorgmx/teams/${world.alphaTeamId}/delete`, null, {}, null);
+    const headerless = await postArm(`/org/teamorgmx/teams/${world.alphaTeamId}/delete`, null, {}, null);
     expect(headerless.status).toBe(303);
     expect(headerless.headers.get("location")).toContain("/login?redirect_to=");
     expect(await teamById(world.alphaTeamId)).not.toBeNull();
@@ -531,34 +531,34 @@ describe("the renamed-org 307 across the family (wave-12 pinned the list arm onl
 
   it("rewrites the old-name segment with the query preserved — anon included, and before any same-origin write", async () => {
     // Anonymous list arm: the seam precedes the login 303 in the prologue.
-    const anon = await getRoute("/teamoldmx/teams", null);
+    const anon = await getRoute("/org/teamoldmx/teams", null);
     expect(anon.status).toBe(307);
-    expect(anon.headers.get("location")).toBe("/teamorgmx/teams");
+    expect(anon.headers.get("location")).toBe("/org/teamorgmx/teams");
     // The detail wildcard with a query.
-    const detail = await getRoute(`/teamoldmx/teams/${world.alphaTeamId}?q=x`, world.ownerId);
+    const detail = await getRoute(`/org/teamoldmx/teams/${world.alphaTeamId}?q=x`, world.ownerId);
     expect(detail.status).toBe(307);
-    expect(detail.headers.get("location")).toBe(`/teamorgmx/teams/${world.alphaTeamId}?q=x`);
+    expect(detail.headers.get("location")).toBe(`/org/teamorgmx/teams/${world.alphaTeamId}?q=x`);
     // The create form literal.
-    const form = await getRoute("/teamoldmx/teams/new", world.ownerId);
+    const form = await getRoute("/org/teamoldmx/teams/new", world.ownerId);
     expect(form.status).toBe(307);
-    expect(form.headers.get("location")).toBe("/teamorgmx/teams/new");
+    expect(form.headers.get("location")).toBe("/org/teamorgmx/teams/new");
     // A same-origin edit write 307s BEFORE the write (the team is untouched).
-    const editPost = await postArm(`/teamoldmx/teams/${world.alphaTeamId}/edit`, world.ownerId, {
+    const editPost = await postArm(`/org/teamoldmx/teams/${world.alphaTeamId}/edit`, world.ownerId, {
       team_name: "Renamed Under Old Name",
     });
     expect(editPost.status).toBe(307);
-    expect(editPost.headers.get("location")).toBe(`/teamorgmx/teams/${world.alphaTeamId}/edit`);
+    expect(editPost.headers.get("location")).toBe(`/org/teamorgmx/teams/${world.alphaTeamId}/edit`);
     expect((await teamById(world.alphaTeamId))?.name).toBe("Alpha Crew");
     // The create write likewise (count untouched).
-    const createPost = await postArm("/teamoldmx/teams/new", world.ownerId, {
+    const createPost = await postArm("/org/teamoldmx/teams/new", world.ownerId, {
       team_name: "Created Under Old Name",
       permission: "read",
     });
     expect(createPost.status).toBe(307);
-    expect(createPost.headers.get("location")).toBe("/teamorgmx/teams/new");
+    expect(createPost.headers.get("location")).toBe("/org/teamorgmx/teams/new");
     expect((await allTeams()).filter((team) => team.orgId === world.org.id)).toHaveLength(5);
     // The target answers 200 behind the new name.
-    const target = await getRoute("/teamorgmx/teams", world.ownerId);
+    const target = await getRoute("/org/teamorgmx/teams", world.ownerId);
     expect(target.status).toBe(200);
     expect(await target.text()).toContain("page-content organization teams");
   });
@@ -574,7 +574,7 @@ describe("the list shape: the badge trio, the strip isolation, the pagination", 
   });
 
   it("renders the visibility badge trio with their tooltip helpers and the permission labels — a units team carries the visibility badge only", async () => {
-    const res = await getRoute("/teamorgmx/teams", world.ownerId);
+    const res = await getRoute("/org/teamorgmx/teams", world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     const boxes = html.split("team-item-box").slice(1);
@@ -605,7 +605,7 @@ describe("the list shape: the badge trio, the strip isolation, the pagination", 
   });
 
   it("keeps every row's member strip to its own team (names, counts, and the empty strip)", async () => {
-    const res = await getRoute("/teamorgmx/teams", world.ownerId);
+    const res = await getRoute("/org/teamorgmx/teams", world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     const boxes = html.split("team-item-box").slice(1);
@@ -630,27 +630,27 @@ describe("the list shape: the badge trio, the strip isolation, the pagination", 
     for (let index = 1; index <= 17; index += 1) {
       await service.createTeam(world.org, { name: `bulk-${String(index).padStart(2, "0")}`, permission: "read" });
     }
-    const page1 = await getRoute("/teamorgmx/teams", world.ownerId);
+    const page1 = await getRoute("/org/teamorgmx/teams", world.ownerId);
     expect(page1.status).toBe(200);
     const html1 = await page1.text();
     expect(html1).toContain("<strong>Alpha Crew</strong>"); // the 5 fixture teams lead the sort
     expect(html1).toContain("<strong>Limited Ring</strong>"); // the 20th row
     expect(html1).not.toContain("<strong>Unit Crew</strong>"); // pushed to page 2
-    expect(html1).toContain('href="/teamorgmx/teams?page=2"');
+    expect(html1).toContain('href="/org/teamorgmx/teams?page=2"');
     expect(html1).toContain("<span class=\"navigation_label\">Older</span>");
     expect(html1).not.toContain("Newer</span>"); // nothing older than page 1
 
-    const page2 = await getRoute("/teamorgmx/teams?page=2", world.ownerId);
+    const page2 = await getRoute("/org/teamorgmx/teams?page=2", world.ownerId);
     expect(page2.status).toBe(200);
     const html2 = await page2.text();
     expect(html2).toContain("<strong>Unit Crew</strong>");
     expect(html2).not.toContain("<strong>Alpha Crew</strong>");
-    expect(html2).toContain('href="/teamorgmx/teams?page=1"');
+    expect(html2).toContain('href="/org/teamorgmx/teams?page=1"');
     expect(html2).toContain("Newer</span>");
     expect(html2).not.toContain("Older</span>"); // 22 total: page 2 is the last
 
     // The junk page parameter folds onto page 1 (parsePageNumber's arm).
-    const junk = await getRoute("/teamorgmx/teams?page=abc", world.ownerId);
+    const junk = await getRoute("/org/teamorgmx/teams?page=abc", world.ownerId);
     expect(junk.status).toBe(200);
     expect(await junk.text()).toContain("<strong>Alpha Crew</strong>");
   });
@@ -661,18 +661,18 @@ describe("the list shape: the badge trio, the strip isolation, the pagination", 
     for (let index = 1; index <= 21; index += 1) {
       await service.createTeam(world.org, { name: `kwteam-${String(index).padStart(2, "0")}`, permission: "read" });
     }
-    const page1 = await getRoute("/teamorgmx/teams?q=kwteam", world.ownerId);
+    const page1 = await getRoute("/org/teamorgmx/teams?q=kwteam", world.ownerId);
     expect(page1.status).toBe(200);
     const html1 = await page1.text();
     expect(html1).toContain('value="kwteam"'); // the search input keeps the keyword
-    expect(html1).toContain('href="/teamorgmx/teams?q=kwteam&amp;page=2"');
-    const page2 = await getRoute("/teamorgmx/teams?q=kwteam&page=2", world.ownerId);
+    expect(html1).toContain('href="/org/teamorgmx/teams?q=kwteam&amp;page=2"');
+    const page2 = await getRoute("/org/teamorgmx/teams?q=kwteam&page=2", world.ownerId);
     expect(page2.status).toBe(200);
     const html2 = await page2.text();
-    expect(html2).toContain('href="/teamorgmx/teams?q=kwteam&amp;page=1"');
+    expect(html2).toContain('href="/org/teamorgmx/teams?q=kwteam&amp;page=1"');
 
     // A keyword matching nothing renders the empty grid with the keyword kept.
-    const noMatch = await getRoute("/teamorgmx/teams?q=zzz-none", world.ownerId);
+    const noMatch = await getRoute("/org/teamorgmx/teams?q=zzz-none", world.ownerId);
     expect(noMatch.status).toBe(200);
     const noMatchHtml = await noMatch.text();
     expect(noMatchHtml).toContain('value="zzz-none"');
@@ -683,11 +683,11 @@ describe("the list shape: the badge trio, the strip isolation, the pagination", 
     // posture) with the prompt row and the search form.
     const orgs = new OrgService(env.DB);
     await orgs.createOrg({ name: "emptytmx", ownerId: world.ownerId, visibility: "public", now: T0 });
-    const empty = await getRoute("/emptytmx/teams", world.ownerId);
+    const empty = await getRoute("/org/emptytmx/teams", world.ownerId);
     expect(empty.status).toBe(200);
     const emptyHtml = await empty.text();
     expect(emptyHtml).toContain("page-content organization teams");
-    expect(emptyHtml).toContain(`action="/emptytmx/teams"`);
+    expect(emptyHtml).toContain(`action="/org/emptytmx/teams"`);
     expect(emptyHtml).not.toContain("team-item-box");
     expect(emptyHtml).toContain("Members are managed through teams.");
   });
@@ -703,7 +703,7 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
   });
 
   it("renders the write team's full slice: description, specific-repos access, both lists, the Settings entry link", async () => {
-    const res = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("page-content organization teams");
@@ -719,11 +719,11 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
     expect(html).toContain(">teamorgmx/open-repo</a>");
     expect(html).toContain(">teamorgmx/secret-repo</a>");
     // The wave-49 entry link onto the edit form.
-    expect(html).toContain(`href="/teamorgmx/teams/${world.alphaTeamId}/edit"`);
+    expect(html).toContain(`href="/org/teamorgmx/teams/${world.alphaTeamId}/edit"`);
   });
 
   it("renders the admin desc paragraph and the Administrator Access badge for the admin team", async () => {
-    const res = await getRoute(`/teamorgmx/teams/${world.adminTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.adminTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain(
@@ -733,7 +733,7 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
   });
 
   it("renders a units team's stored per-unit rows in the sidebar table", async () => {
-    const res = await getRoute(`/teamorgmx/teams/${world.unitTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.unitTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<table class="ui table">');
@@ -745,7 +745,7 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
   });
 
   it("renders the empty arms: no description, the can_create_org_repo item, the memberless + repoless lists — and the includes-all fan-out on the limited team", async () => {
-    const publicRes = await getRoute(`/teamorgmx/teams/${world.publicTeamId}`, world.ownerId);
+    const publicRes = await getRoute(`/org/teamorgmx/teams/${world.publicTeamId}`, world.ownerId);
     expect(publicRes.status).toBe(200);
     const publicHtml = await publicRes.text();
     expect(publicHtml).toContain("This team has no description");
@@ -754,7 +754,7 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
     expect(publicHtml).toContain("No members on this team.");
     expect(publicHtml).toContain("No repositories could be accessed by this team.");
 
-    const limitedRes = await getRoute(`/teamorgmx/teams/${world.limitedTeamId}`, world.ownerId);
+    const limitedRes = await getRoute(`/org/teamorgmx/teams/${world.limitedTeamId}`, world.ownerId);
     expect(limitedRes.status).toBe(200);
     const limitedHtml = await limitedRes.text();
     expect(limitedHtml).toContain("<li>All repositories</li>");
@@ -766,13 +766,13 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
   it("404-shells the zero and overflow ids the parser claims, and answers the R19 name carrier's miss with the shell", async () => {
     // id 0 and the folded overflow claim parse but never resolve — the shell
     // answers, existence stays hidden.
-    await expectNotFoundShell(await getRoute("/teamorgmx/teams/0", world.ownerId));
-    await expectNotFoundShell(await getRoute("/teamorgmx/teams/0/edit", world.ownerId));
-    await expectNotFoundShell(await getRoute("/teamorgmx/teams/99999999999999999999", world.ownerId));
+    await expectNotFoundShell(await getRoute("/org/teamorgmx/teams/0", world.ownerId));
+    await expectNotFoundShell(await getRoute("/org/teamorgmx/teams/0/edit", world.ownerId));
+    await expectNotFoundShell(await getRoute("/org/teamorgmx/teams/99999999999999999999", world.ownerId));
     // The R19 name carrier claims any decoded segment (upstream's {team}
     // param posture): an unknown name is the RESOLVED miss → the shell
     // (upstream's NotFound page), never the plain engine 404.
-    await expectNotFoundShell(await getRoute("/teamorgmx/teams/not-a-number", world.ownerId));
+    await expectNotFoundShell(await getRoute("/org/teamorgmx/teams/not-a-number", world.ownerId));
   });
 
   it("resolves the R19 name carrier case-folded through the lower name and shells the foreign-org name", async () => {
@@ -780,24 +780,24 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
     // URL carries the display form (upstream links `{{.Team.LowerName |
     // PathEscape}}`-shaped names) — the case-folded lookup answers, and a
     // lowercase link resolves the same slice.
-    const byName = await getRoute("/teamorgmx/teams/Alpha%20Crew", world.ownerId);
+    const byName = await getRoute("/org/teamorgmx/teams/Alpha%20Crew", world.ownerId);
     expect(byName.status).toBe(200);
     const html = await byName.text();
     expect(html).toContain("page-content organization teams");
     expect(html).toContain("<strong>Alpha Crew</strong>");
     expect(html).toContain("Ships the matrix.");
-    const lower = await getRoute("/teamorgmx/teams/ALPHA%20CREW", world.ownerId);
+    const lower = await getRoute("/org/teamorgmx/teams/ALPHA%20CREW", world.ownerId);
     expect(lower.status).toBe(200);
     expect(await lower.text()).toContain("<strong>Alpha Crew</strong>");
     // The id carrier stays byte-equal (both carriers render the slice).
-    const byId = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    const byId = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
     expect(await byId.text()).toBe(html);
     // A name from ANOTHER org 404-shells (the lookup is org-scoped — the
     // rival team never leaks through its name).
-    await expectNotFoundShell(await getRoute("/teamorgmx/teams/rival-team", world.ownerId));
+    await expectNotFoundShell(await getRoute("/org/teamorgmx/teams/rival-team", world.ownerId));
     // The owner gate rides both carriers alike: a non-owner 404-shells the
     // name arm too (the landed requireOrgOwnership posture).
-    await expectNotFoundShell(await getRoute("/teamorgmx/teams/Alpha%20Crew", world.memberId));
+    await expectNotFoundShell(await getRoute("/org/teamorgmx/teams/Alpha%20Crew", world.memberId));
   });
 });
 
@@ -814,10 +814,10 @@ describe("the detail slice's write controls (the O1 action families' rendered ga
     // nadia owns the org AND sits on Alpha Crew — sidebar.tmpl:14-23's
     // Leave rides the membership, members.tmpl:11-17's add form and
     // :36-42's Remove ride IsOrganizationOwner.
-    const res = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
-    const action = `/teamorgmx/teams/${world.alphaTeamId}/action`;
+    const action = `/org/teamorgmx/teams/${world.alphaTeamId}/action`;
     // The add form (the search input + the upstream label).
     expect(html).toContain(`<form class="ui form ignore-dirty tw-flex tw-flex-wrap tw-gap-2" action="${action}/add" method="post">`);
     expect(html).toContain('name="uname"');
@@ -836,10 +836,10 @@ describe("the detail slice's write controls (the O1 action families' rendered ga
   it("renders the Join form for an owner not on the team, and the repo controls only off the includes-all flag", async () => {
     // Public Squad: nadia is an owner NOT on the team — sidebar.tmpl's
     // Join arm; the repo section is a plain (non-includes-all) team.
-    const res = await getRoute(`/teamorgmx/teams/${world.publicTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.publicTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
-    const action = `/teamorgmx/teams/${world.publicTeamId}/action`;
+    const action = `/org/teamorgmx/teams/${world.publicTeamId}/action`;
     expect(html).toContain(`<form method="post" action="${action}/join">`);
     expect(html).toContain('<input type="hidden" name="page" value="team"/>');
     expect(html).toContain(">Join</button>");
@@ -856,10 +856,10 @@ describe("the detail slice's write controls (the O1 action families' rendered ga
   });
 
   it("suppresses the repo controls on an includes-all team (the canAddRemove pair) but keeps the member controls", async () => {
-    const res = await getRoute(`/teamorgmx/teams/${world.limitedTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.limitedTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
-    const action = `/teamorgmx/teams/${world.limitedTeamId}/action`;
+    const action = `/org/teamorgmx/teams/${world.limitedTeamId}/action`;
     expect(html).toContain("<li>All repositories</li>");
     expect(html).not.toContain(`action="${action}/repo/`);
     // The member add/remove pair is owner-only, membership-independent.
@@ -871,10 +871,10 @@ describe("the detail slice's write controls (the O1 action families' rendered ga
   });
 
   it("renders the per-repo remove forms keyed on the repo id for the owner on a plain team", async () => {
-    const res = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    const res = await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
-    const action = `/teamorgmx/teams/${world.alphaTeamId}/action`;
+    const action = `/org/teamorgmx/teams/${world.alphaTeamId}/action`;
     // repositories.tmpl:45-49 — the submit button itself names repoid.
     expect((html.split(`action="${action}/repo/remove"`).length - 1)).toBe(2);
     expect(html).toContain('name="repoid"');
@@ -892,7 +892,7 @@ describe("the create form's parse edges", () => {
   });
 
   it("re-renders the out-of-enum permission as the landed validator's 422 with the kept name (nothing written)", async () => {
-    const res = await postArm("/teamorgmx/teams/new", world.ownerId, {
+    const res = await postArm("/org/teamorgmx/teams/new", world.ownerId, {
       team_name: "Carried Name",
       permission: "maintainer",
     });
@@ -907,14 +907,14 @@ describe("the create form's parse edges", () => {
 
   it("trims the submitted name before the empty guard and on the success path", async () => {
     // Whitespace-only folds onto the empty-name 422.
-    const blank = await postArm("/teamorgmx/teams/new", world.ownerId, {
+    const blank = await postArm("/org/teamorgmx/teams/new", world.ownerId, {
       team_name: "   ",
       permission: "read",
     });
     expect(blank.status).toBe(200);
     expect(await blank.text()).toContain("empty team name");
     // A padded name trims to its display form and creates.
-    const padded = await postArm("/teamorgmx/teams/new", world.ownerId, {
+    const padded = await postArm("/org/teamorgmx/teams/new", world.ownerId, {
       team_name: "  Trimmed Crew  ",
       permission: "read",
     });
@@ -924,7 +924,7 @@ describe("the create form's parse edges", () => {
   });
 
   it("propagates the reserved `new` name's bare 500 (the module header's documented arm) without creating a row", async () => {
-    const res = await postArm("/teamorgmx/teams/new", world.ownerId, {
+    const res = await postArm("/org/teamorgmx/teams/new", world.ownerId, {
       team_name: "new",
       permission: "read",
     });
@@ -943,11 +943,11 @@ describe("the edit/delete tails' id fidelity (the foreign and unknown carriers w
   });
 
   it("404-shells a foreign-org id on the edit GET and BOTH write POSTs — the rival team survives", async () => {
-    await expectNotFoundShell(await getRoute(`/teamorgmx/teams/${world.rivalTeamId}/edit`, world.ownerId));
+    await expectNotFoundShell(await getRoute(`/org/teamorgmx/teams/${world.rivalTeamId}/edit`, world.ownerId));
     await expectNotFoundShell(
-      await postArm(`/teamorgmx/teams/${world.rivalTeamId}/edit`, world.ownerId, { team_name: "Captured" }),
+      await postArm(`/org/teamorgmx/teams/${world.rivalTeamId}/edit`, world.ownerId, { team_name: "Captured" }),
     );
-    await expectNotFoundShell(await postArm(`/teamorgmx/teams/${world.rivalTeamId}/delete`, world.ownerId, {}));
+    await expectNotFoundShell(await postArm(`/org/teamorgmx/teams/${world.rivalTeamId}/delete`, world.ownerId, {}));
     // The rival org's team is untouched behind its own gate.
     const rival = await teamById(world.rivalTeamId);
     expect(rival?.name).toBe("Rival Team");
@@ -957,21 +957,21 @@ describe("the edit/delete tails' id fidelity (the foreign and unknown carriers w
   });
 
   it("404-shells the unknown id on both write POSTs (wave-49 pinned the edit GET only)", async () => {
-    await expectNotFoundShell(await postArm("/teamorgmx/teams/999999/edit", world.ownerId, { team_name: "Nobody" }));
-    await expectNotFoundShell(await postArm("/teamorgmx/teams/999999/delete", world.ownerId, {}));
+    await expectNotFoundShell(await postArm("/org/teamorgmx/teams/999999/edit", world.ownerId, { team_name: "Nobody" }));
+    await expectNotFoundShell(await postArm("/org/teamorgmx/teams/999999/delete", world.ownerId, {}));
     expect((await allTeams()).filter((team) => team.orgId === world.org.id)).toHaveLength(5);
   });
 
   it("keeps the org-teams gate off the rival owner's cross-org reads: vera sees only her own org's slices", async () => {
     // Vera (rivaltmx's owner) is exactly the foreign arm's mirror: her own
     // detail answers, teamorgmx's never does.
-    const own = await getRoute(`/rivaltmx/teams/${world.rivalTeamId}`, world.outsiderId);
+    const own = await getRoute(`/org/rivaltmx/teams/${world.rivalTeamId}`, world.outsiderId);
     expect(own.status).toBe(200);
     expect(await own.text()).toContain("<strong>Rival Team</strong>");
-    await expectNotFoundShell(await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.outsiderId));
+    await expectNotFoundShell(await getRoute(`/org/teamorgmx/teams/${world.alphaTeamId}`, world.outsiderId));
     // And the AND-arm the fixture pins for the list: nadia's list never
     // carries the rival team (the org-scoped listTeams read).
-    const list = await getRoute("/teamorgmx/teams", world.ownerId);
+    const list = await getRoute("/org/teamorgmx/teams", world.ownerId);
     expect(await list.text()).not.toContain("Rival Team");
   });
 });

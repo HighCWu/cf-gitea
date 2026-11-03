@@ -291,13 +291,13 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // + repo access), and the user settings profile (alice's own row; the
   // teams pages are owner/admin-only, the settings page is self-only — both
   // goldens ride the session cookie, whose value never renders).
-  { file: "org-teams.html", path: "/acme/teams", status: 200, signedIn: true, sessionUser: "morgan" },
-  { file: "org-team-detail.html", path: "/acme/teams/1", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "org-teams.html", path: "/org/acme/teams", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "org-team-detail.html", path: "/org/acme/teams/1", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "user-settings-profile.html", path: "/user/settings", status: 200, signedIn: true },
   // Org labels management (wave 14): the SIGNED-IN owner view (morgan owns
   // acme) — the two fixture labels with their ContrastColor badges, the
   // create form and the per-row edit/delete controls.
-  { file: "org-labels.html", path: "/acme/labels", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "org-labels.html", path: "/org/acme/settings/labels", status: 200, signedIn: true, sessionUser: "morgan" },
   // The per-hook page (wave 14): the SIGNED-IN admin view of alice/golden's
   // fixture hook — the edit form bound to the stored row and the
   // recent-deliveries list with the three status marks (the fixed-uuid

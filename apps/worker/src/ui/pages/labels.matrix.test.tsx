@@ -411,15 +411,15 @@ describe("claim pins (route-level answers the parse pins leave open)", () => {
     const repoScope = await fetchUi(`/labelmx/${REPO_SLUG}/labels/initialize`);
     expect(repoScope.status).toBe(405);
 
-    const orgScope = await fetchUi(`/${ORG_NAME}/labels/initialize`);
+    const orgScope = await fetchUi(`/org/${ORG_NAME}/settings/labels/initialize`);
     expect(orgScope.status).toBe(405);
   });
 
   it("the ORG write tails answer GET with chi's 405 (the convention wave25 pins repo-side only)", async () => {
     await ensureLabelsFixtures();
-    expect((await fetchUi(`/${ORG_NAME}/labels/new`)).status).toBe(405);
-    expect((await fetchUi(`/${ORG_NAME}/labels/edit`)).status).toBe(405);
-    expect((await fetchUi(`/${ORG_NAME}/labels/delete`)).status).toBe(405);
+    expect((await fetchUi(`/org/${ORG_NAME}/settings/labels/new`)).status).toBe(405);
+    expect((await fetchUi(`/org/${ORG_NAME}/settings/labels/edit`)).status).toBe(405);
+    expect((await fetchUi(`/org/${ORG_NAME}/settings/labels/delete`)).status).toBe(405);
   });
 });
 
@@ -552,7 +552,7 @@ describe("cross-origin 403s on the write arms (repo side unpinned; org side pinn
   it("the ORG edit/delete arms 403 cross-origin with the owner cookie and both rows survive", async () => {
     const fixture = await ensureLabelsFixtures();
     const edit = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       crossOriginPost(
         { id: String(fixture.orgBlockedLabelId), title: "evil rename", color: "#121212" },
         fixture.ownerCookie,
@@ -560,7 +560,7 @@ describe("cross-origin 403s on the write arms (repo side unpinned; org side pinn
     );
     expect(edit.status).toBe(403);
     const del = await fetchUi(
-      `/${ORG_NAME}/labels/delete`,
+      `/org/${ORG_NAME}/settings/labels/delete`,
       crossOriginPost({ id: String(fixture.orgBlockedLabelId) }, fixture.ownerCookie),
     );
     expect(del.status).toBe(403);
@@ -572,7 +572,7 @@ describe("cross-origin 403s on the write arms (repo side unpinned; org side pinn
   it("a cookie-less cross-origin ORG POST 403s before the login 303 (the guard fronts requireOrgOwnership)", async () => {
     await ensureLabelsFixtures();
     const res = await fetchUi(
-      `/${ORG_NAME}/labels/new`,
+      `/org/${ORG_NAME}/settings/labels/new`,
       crossOriginPost({ title: "evil org label", color: "#121212" }),
     );
     expect(res.status).toBe(403);
@@ -701,7 +701,7 @@ describe("the edit round-trip's deferred arms (both scopes)", () => {
   it("the org edit's empty-title guard keeps the org row stored (uncovered on the org scope)", async () => {
     const fixture = await ensureLabelsFixtures();
     const res = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       withCookie(
         formPost({ id: String(fixture.orgLightLabelId), title: "", color: "#00aabb" }),
         fixture.ownerCookie,
@@ -717,7 +717,7 @@ describe("the edit round-trip's deferred arms (both scopes)", () => {
   it("the org edit's garbage id 404-shells (formLabelId parity on the org scope)", async () => {
     const fixture = await ensureLabelsFixtures();
     const res = await fetchUi(
-      `/${ORG_NAME}/labels/edit`,
+      `/org/${ORG_NAME}/settings/labels/edit`,
       withCookie(formPost({ id: "abc", title: "x", color: "#00aabb" }), fixture.ownerCookie),
     );
     expect(res.status).toBe(404);
@@ -730,11 +730,11 @@ describe("the delete arm's deferred org-side shape", () => {
   it("the org delete's zero-row success for a garbage id 303s onto the list (idempotent like the numeric miss)", async () => {
     const fixture = await ensureLabelsFixtures();
     const res = await fetchUi(
-      `/${ORG_NAME}/labels/delete`,
+      `/org/${ORG_NAME}/settings/labels/delete`,
       withCookie(formPost({ id: "1.5" }), fixture.ownerCookie),
     );
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${ORG_NAME}/labels`);
+    expect(res.headers.get("location")).toBe(`/org/${ORG_NAME}/settings/labels`);
     expect((await listOrgLabels(env.DB, fixture.orgId, "", 1, 1)).total).toBe(2); // both rows intact
   });
 });
@@ -1185,13 +1185,13 @@ describe("the /labels/initialize template loader (census gap #8 — the initiali
     const fixture = await ensureLabelsFixtures();
     await purgeInitTargets(fixture);
     const res = await fetchTail(
-      `/${INIT_ORG_NAME}/labels/initialize`,
+      `/org/${INIT_ORG_NAME}/settings/labels/initialize`,
       withCookie(formPost({ template_name: "Default" }), fixture.ownerCookie),
     );
     expect(res.status).toBe(303);
     // The landed org page's URL is the 303 target (upstream's
     // /org/{org}/settings/labels being the documented divergence).
-    expect(res.headers.get("location")).toBe(`/${INIT_ORG_NAME}/labels`);
+    expect(res.headers.get("location")).toBe(`/org/${INIT_ORG_NAME}/settings/labels`);
 
     const rows = (await listOrgLabels(env.DB, fixture.initOrgId, "", 1, 50)).items;
     expect(rows.map((row) => row.name)).toEqual([
@@ -1206,7 +1206,7 @@ describe("the /labels/initialize template loader (census gap #8 — the initiali
     expect(rows.every((row) => row.repoId === null)).toBe(true);
 
     const unknown = await fetchTail(
-      `/${INIT_ORG_NAME}/labels/initialize`,
+      `/org/${INIT_ORG_NAME}/settings/labels/initialize`,
       withCookie(formPost({ template_name: "Nope" }), fixture.ownerCookie),
     );
     expect(unknown.status).toBe(200);
@@ -1218,25 +1218,25 @@ describe("the /labels/initialize template loader (census gap #8 — the initiali
     expect(
       (
         await fetchTail(
-          `/${INIT_ORG_NAME}/labels/initialize`,
+          `/org/${INIT_ORG_NAME}/settings/labels/initialize`,
           withCookie(formPost({ template_name: "Default" }), fixture.palCookie),
         )
       ).status,
     ).toBe(404);
-    const anon = await fetchTail(`/${INIT_ORG_NAME}/labels/initialize`, formPost({ template_name: "Default" }));
+    const anon = await fetchTail(`/org/${INIT_ORG_NAME}/settings/labels/initialize`, formPost({ template_name: "Default" }));
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${INIT_ORG_NAME}/labels/initialize`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${INIT_ORG_NAME}/settings/labels/initialize`)}`,
     );
 
     // The org page renders the loader on its empty list (owner view) —
     // labelmxempty stayed label-less, so it shows the block; labelmxinit
     // now carries rows and does not.
-    const emptyOrgPage = await fetchUi(`/${EMPTY_ORG_NAME}/labels`, {
+    const emptyOrgPage = await fetchUi(`/org/${EMPTY_ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
     });
     expect(await emptyOrgPage.text()).toContain('name="template_name"');
-    const initOrgPage = await fetchUi(`/${INIT_ORG_NAME}/labels`, {
+    const initOrgPage = await fetchUi(`/org/${INIT_ORG_NAME}/settings/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
     });
     expect(await initOrgPage.text()).not.toContain('name="template_name"');

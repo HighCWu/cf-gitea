@@ -68,7 +68,7 @@
  * - The Allowed cell's avatar images (ctx.AvatarUtils.Avatar . 26) render as
  *   the plain label text; display name is GetDisplayName's
  *   displayName-else-username, the user label links the `/{username}` home,
- *   the team label links `/{org}/teams/{lowerName}` (OrganisationLink,
+ *   the team label links `/org/{org}/teams/{lowerName}` (OrganisationLink,
  *   models/user/user.go:352-354).
  * - The pattern help's doc link (the %s tail, "Read more in the protected
  *   tags guide") drops — no external docs surface (the branch module's
@@ -214,7 +214,7 @@ export interface TagRuleListUser {
   homeLink: string;
 }
 
-/** One Allowed-cell team label over the `/{org}/teams/{lowerName}` link
+/** One Allowed-cell team label over the `/org/{org}/teams/{lowerName}` link
  *  (OrganisationLink + the teams path, models/user/user.go:352-354). */
 export interface TagRuleListTeam {
   id: number;

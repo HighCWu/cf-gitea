@@ -17,7 +17,7 @@
  *     `ScopedWorkflowRemove`. Mounted inside the USER group (web.go:730, the
  *     reqSignIn `/user/settings/actions` group behind
  *     `actions.MustEnableActions`), the ADMIN group (web.go:903, behind
- *     `adminReq`) and the ORG group (web.go:1060, the `/{org}/settings`
+ *     `adminReq`) and the ORG group (web.go:1060, the `/org/{org}/settings`
  *     subtree behind `actions.MustEnableActions`).
  *   - `routers/web/shared/actions/scoped_workflows.go` — the handlers:
  *     `getScopedWorkflowsCtx` (:44-80 — OwnerID / IsOrg|IsUser|IsGlobal /
@@ -870,7 +870,7 @@ export function ScopedWorkflowsSections(props: { link: string; data: ScopedWorkf
  *  around the shared body; the navbar rides the `nav` prop — the header's
  *  nav reduction). */
 export function OrgScopedWorkflowsPage(props: { ctx: UiContext; data: ScopedWorkflowsPageData; org: OrgRecord; nav: Child }) {
-  const orgLink = `/${props.org.username}`;
+  const orgLink = `/org/${props.org.username}`;
   const link = `${orgLink}/settings/actions/scoped-workflows`;
   return (
     <BaseLayout ctx={props.ctx} title={scopedWorkflowsLocale.scoped_workflows} pageClass="organization settings actions">

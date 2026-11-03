@@ -146,7 +146,7 @@ describe("org members page /org/{org}/members", () => {
     expect(html).not.toContain("Member Role:");
     expect(html).not.toContain("Hidden");
     // The owner prompt row is owner-only.
-    expect(html).not.toContain('href="/wave23org/teams"');
+    expect(html).not.toContain('href="/org/wave23org/teams"');
   });
 
   it("the org owner sees every membership with the role lines and the manage prompt", async () => {
@@ -162,7 +162,7 @@ describe("org members page /org/{org}/members", () => {
     expect(html).toContain("Owner");
     expect(html).toContain("Member");
     expect(html).toContain("Members are managed through teams.");
-    expect(html).toContain('href="/wave23org/teams"');
+    expect(html).toContain('href="/org/wave23org/teams"');
   });
 
   it("a signed-in non-member stays public-only (the PublicOnly doer arm)", async () => {
@@ -173,7 +173,7 @@ describe("org members page /org/{org}/members", () => {
     expect(html).toContain('href="/wave23-pub"');
     expect(html).not.toContain('href="/wave23-priv"');
     expect(html).not.toContain("Member Role:");
-    expect(html).not.toContain('href="/wave23org/teams"');
+    expect(html).not.toContain('href="/org/wave23org/teams"');
   });
 
   it("a signed-in private member sees the full listing with the role lines", async () => {

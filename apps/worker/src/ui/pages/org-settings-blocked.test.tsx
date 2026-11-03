@@ -1,6 +1,6 @@
 /**
  * The org settings BLOCKED USERS tab's tests (the bench-row module, MOUNTED
- * since window-2b 4f2805f — GET+POST /{org}/settings/blocked_users at
+ * since window-2b 4f2805f — GET+POST /org/{org}/settings/blocked_users at
  * ui/index.ts): the load/parse/apply matrix over real D1 (generated
  * migrations in beforeAll; the writes go through the landed org-scope block
  * service arms — the same `user_blocking` store the API family's GET/PUT/
@@ -291,10 +291,10 @@ describe("the blocked-users tab DOM (shared/user/blocked_users.tmpl at the pin)"
     const data = await loadOrgBlockedUsers(env.DB, org.record);
     const html = renderToString(<OrgBlockedUsersPage ctx={ctx} data={data} error={null} />);
     expect(html).toContain("organization settings blocked_users"); // the §2.4.1 discriminator
-    expect(html).toContain('action="/acme/settings/blocked_users"');
+    expect(html).toContain('action="/org/acme/settings/blocked_users"');
     // The full-document render matches the component path.
     expect(renderOrgBlockedUsersPage({ ctx, data, error: null })).toContain(
-      'action="/acme/settings/blocked_users"',
+      'action="/org/acme/settings/blocked_users"',
     );
   });
 
@@ -324,7 +324,7 @@ describe("the blocked-users tab DOM (shared/user/blocked_users.tmpl at the pin)"
     // The default posture arms the item (the absent prop = enabled).
     const enabled = await loadOrgBlockedUsers(env.DB, org.record);
     expect(renderToString(<OrgBlockedUsersPage ctx={ctx} data={enabled} error={null} />)).toContain(
-      'href="/acme/settings/applications"',
+      'href="/org/acme/settings/applications"',
     );
     // The pinned-false arm rides the strict-polarity read the route passes
     // (`oauth2FeatureEnabled(c.env)`) through the loader into the shared
@@ -335,9 +335,9 @@ describe("the blocked-users tab DOM (shared/user/blocked_users.tmpl at the pin)"
     armedEnv.OAUTH2_ENABLED = "false";
     const data = await loadOrgBlockedUsers(env.DB, org.record, oauth2FeatureEnabled(armedEnv));
     const html = renderToString(<OrgBlockedUsersPage ctx={ctx} data={data} error={null} />);
-    expect(html).not.toContain('href="/acme/settings/applications"');
+    expect(html).not.toContain('href="/org/acme/settings/applications"');
     // The gate is item-exact: the navbar's siblings stay.
-    expect(html).toContain('href="/acme/settings/blocked_users"');
+    expect(html).toContain('href="/org/acme/settings/blocked_users"');
   });
 
   it("renders the rows: avatar seam img, HomeLink title, the note arm, the unblock form", async () => {
@@ -386,12 +386,12 @@ describe("the blocked-users tab DOM (shared/user/blocked_users.tmpl at the pin)"
   // "blocked" — the same pins hold against the shared component (which adds
   // the Actions disclosure's Secrets/Variables sub-items).
   it("the shared navbar renders the landed tabs plus the Blocked-users item active", () => {
-    const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="blocked" />);
+    const html = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="blocked" />);
     expect(html).toContain('class="flex-container-nav"');
-    expect(html).toContain('href="/acme/settings"'); // Options
-    expect(html).toContain('href="/acme/settings/hooks"'); // Hooks
-    expect(html).toContain('href="/acme/labels"'); // Labels
-    expect(html).toContain('class="active item" href="/acme/settings/blocked_users"');
+    expect(html).toContain('href="/org/acme/settings"'); // Options
+    expect(html).toContain('href="/org/acme/settings/hooks"'); // Hooks
+    expect(html).toContain('href="/org/acme/settings/labels"'); // Labels
+    expect(html).toContain('class="active item" href="/org/acme/settings/blocked_users"');
     expect(html).toContain(orgSettingsBlockedLocale.blocked_users);
   });
 });
@@ -443,7 +443,7 @@ async function ownerSessionHeader(): Promise<string> {
  *  same-origin Origin header (the §2.8 guard's happy path) and the owner's
  *  minted session cookie. */
 async function blockedUsersPost(fields: Record<string, string>): Promise<Response> {
-  return fetchUi(`/${org.username}/settings/blocked_users`, {
+  return fetchUi(`/org/${org.username}/settings/blocked_users`, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -456,24 +456,24 @@ async function blockedUsersPost(fields: Record<string, string>): Promise<Respons
 
 /** The owner's GET of the tab through the real route. */
 async function blockedUsersGet(): Promise<Response> {
-  return fetchUi(`/${org.username}/settings/blocked_users`, {
+  return fetchUi(`/org/${org.username}/settings/blocked_users`, {
     headers: { cookie: await ownerSessionHeader() },
   });
 }
 
-// --- the mounted routes (window-2b: GET + POST /{org}/settings/blocked_users) ------
+// --- the mounted routes (window-2b: GET + POST /org/{org}/settings/blocked_users) ------
 
-describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => {
+describe("the mounted routes (GET + POST /org/{org}/settings/blocked_users)", () => {
   it("303s an anonymous GET onto the login round-trip (the org-teams prologue)", async () => {
-    const res = await fetchUi(`/${org.username}/settings/blocked_users`);
+    const res = await fetchUi(`/org/${org.username}/settings/blocked_users`);
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${org.username}/settings/blocked_users`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${org.username}/settings/blocked_users`)}`,
     );
   });
 
   it("303s an anonymous same-origin POST onto the login round-trip too (guard passes, then the signed-in gate; nothing written)", async () => {
-    const res = await fetchUi(`/${org.username}/settings/blocked_users`, {
+    const res = await fetchUi(`/org/${org.username}/settings/blocked_users`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -483,14 +483,14 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
     });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${org.username}/settings/blocked_users`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${org.username}/settings/blocked_users`)}`,
     );
     expect((await loadOrgBlockedUsers(env.DB, org.record)).blocks).toEqual([]);
   });
 
   it("404-shells a signed-in non-owner's GET (the RequireOwner posture)", async () => {
     const bob = await seedBlockee("bob");
-    const res = await fetchUi(`/${org.username}/settings/blocked_users`, {
+    const res = await fetchUi(`/org/${org.username}/settings/blocked_users`, {
       headers: { cookie: await sessionHeader(bob.id) },
     });
     expect(res.status).toBe(404);
@@ -501,7 +501,7 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
 
   it("404-shells a signed-in non-owner's block POST before any write (the ownership gate fronts the write arm too)", async () => {
     const bob = await seedBlockee("bob");
-    const res = await fetchUi(`/${org.username}/settings/blocked_users`, {
+    const res = await fetchUi(`/org/${org.username}/settings/blocked_users`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -520,7 +520,7 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("organization settings blocked_users"); // the §2.4.1 pageClass
-    expect(html).toContain(`class="active item" href="/${org.username}/settings/blocked_users"`);
+    expect(html).toContain(`class="active item" href="/org/${org.username}/settings/blocked_users"`);
     expect(html).toContain(orgSettingsBlockedLocale.list_none); // the empty arm
   });
 
@@ -528,7 +528,7 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
     await seedBlockee("bob");
     const res = await blockedUsersPost({ action: "block", blockee: "bob", note: "spam waves" });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${org.username}/settings/blocked_users`);
+    expect(res.headers.get("location")).toBe(`/org/${org.username}/settings/blocked_users`);
     const data = await loadOrgBlockedUsers(env.DB, org.record);
     expect(data.blocks.map((row) => [row.blockee.username, row.note])).toEqual([["bob", "spam waves"]]);
     const page = await blockedUsersGet();
@@ -541,7 +541,7 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
     await seedBlock(bob, "spam");
     const res = await blockedUsersPost({ action: "unblock", blockee: "bob", note: "" });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${org.username}/settings/blocked_users`);
+    expect(res.headers.get("location")).toBe(`/org/${org.username}/settings/blocked_users`);
     expect((await loadOrgBlockedUsers(env.DB, org.record)).blocks).toEqual([]);
     const page = await blockedUsersGet();
     expect(await page.text()).toContain(orgSettingsBlockedLocale.list_none);
@@ -594,7 +594,7 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
 
   it("rejects a cross-origin block POST with 403 before any write (sameOriginGuard first)", async () => {
     await seedBlockee("bob");
-    const res = await fetchUi(`/${org.username}/settings/blocked_users`, {
+    const res = await fetchUi(`/org/${org.username}/settings/blocked_users`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -629,13 +629,13 @@ describe("the mounted routes (GET + POST /{org}/settings/blocked_users)", () => 
 
 describe("the route claim pin (the settings family claims exactly the blocked_users tab)", () => {
   it("parses the GET/POST shape; misspelled or deeper tails stay unclaimed", () => {
-    expect(parseUiRoute(`/${org.username}/settings/blocked_users`)).toEqual({
+    expect(parseUiRoute(`/org/${org.username}/settings/blocked_users`)).toEqual({
       family: "org-settings-blocked",
       owner: org.username,
     });
-    expect(handlesUiRoute(`/${org.username}/settings/blocked_users`)).toBe(true);
-    expect(parseUiRoute(`/${org.username}/settings/blocked_user`)).toBeNull(); // the singular misspelling
-    expect(parseUiRoute(`/${org.username}/settings/blocked_users/extra`)).toBeNull();
-    expect(handlesUiRoute(`/${org.username}/settings/blocked_users/extra`)).toBe(false);
+    expect(handlesUiRoute(`/org/${org.username}/settings/blocked_users`)).toBe(true);
+    expect(parseUiRoute(`/org/${org.username}/settings/blocked_user`)).toBeNull(); // the singular misspelling
+    expect(parseUiRoute(`/org/${org.username}/settings/blocked_users/extra`)).toBeNull();
+    expect(handlesUiRoute(`/org/${org.username}/settings/blocked_users/extra`)).toBe(false);
   });
 });

@@ -531,7 +531,7 @@ describe("the member-and-team strip non-rendering (the documented v1 reduction)"
     expect(html).not.toContain("repo/migrate?org=");
     expect(html).not.toContain("view_as");
     expect(html).not.toContain('href="/ohmpub/members"');
-    expect(html).not.toContain('href="/ohmpub/teams"');
+    expect(html).not.toContain('href="/org/ohmpub/teams"');
   });
 });
 

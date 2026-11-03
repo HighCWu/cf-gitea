@@ -10,9 +10,9 @@
  * org/header.tmpl (pages/org-home.tsx OrgHeader — the teams/org-labels
  * precedent; the template carries no org menu), then the container: the
  * owner prompt row (`.flex-text-block` with the "Manage teams and members"
- * primary button — upstream links `./teams` under /org/{org}; ours links the
- * landed teams page at `/{org}/teams`, the org-teams/labels literal
- * divergence), the `?q=` search form (members.tmpl's
+ * primary button — upstream links `./teams` under /org/{org}; ours links
+ * the landed teams page at the same canonical `/org/{org}/teams` shape
+ * (ledger B3 — the pre-B3 bare /{org}/teams divergence retired), the `?q=` search form (members.tmpl's
  * `ui form ignore-dirty tw-my-4` + `ui small fluid action input`), the
  * `.flex-divided-list.items-with-main` member rows, and base/paginate.
  * Per-row: the `.item-leading` avatar slot (the org-home placeholder rule —
@@ -360,7 +360,7 @@ export function OrgMembersPage(props: {
   isOrgOwner: boolean;
 }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   const basePath = `/org/${data.org.username}/members`;
   const actionBase = `${basePath}/action`;
   // The pager preserves the `?q=` keyword (the org-teams pattern; upstream's

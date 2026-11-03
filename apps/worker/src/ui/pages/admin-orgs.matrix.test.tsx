@@ -217,12 +217,11 @@ describe("the admin orgs DOM (templates/admin/org/list.tmpl at the pin)", () => 
     expect(html.split("<td>2</td>").length - 1).toBeGreaterThanOrEqual(1); // alpha's teams/repos counters
     // The settings pencil: upstream's list.tmpl:70 emits
     // OrganisationLink()/settings = /org/{name}/settings (user.go:351-353),
-    // but our org-settings mount is the documented divergence at
-    // /{name}/settings (no /org/{name} alias — the mount would 404 the
-    // upstream shape for every org, the link-crawl A1/A4 row), so the
-    // emitted href follows the mounted shape.
-    expect(html).toContain('<a href="/alpha/settings"'); // the LIVE settings pencil
-    expect(html).not.toContain('href="/org/alpha/settings"'); // the upstream-shaped dead link is gone
+    // and the org-settings mount rides the SAME canonical /org/{org}/settings
+    // shape since ledger B3 (the pre-B3 bare /{name}/settings divergence
+    // mount retired) — the href IS upstream's bytes.
+    expect(html).toContain('<a href="/org/alpha/settings"'); // the LIVE settings pencil
+    expect(html).not.toContain('href="/alpha/settings"'); // the retired bare-shape link is gone
     expect(html).toContain("octicon-pencil");
   });
 

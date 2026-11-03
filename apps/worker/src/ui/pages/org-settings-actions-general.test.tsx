@@ -53,7 +53,7 @@ import {
 const T0 = new Date(1_700_000_000 * 1000);
 const ORIGIN = "https://test.local";
 const ORG_ID = 7;
-const ORG_LINK = "/coalition";
+const ORG_LINK = "/org/coalition";
 const GENERAL_LINK = `${ORG_LINK}/settings/actions/general`;
 
 const manifest: UiManifest = {
@@ -445,7 +445,7 @@ describe("applyOwnerActionsGeneralForms (UpdateGeneralSettings over the owner st
 
 // --- the mounted POST (the 4bffff0 glue's route-level matrix) --------------------
 //
-// The registrations (index.ts: POST /{org}/settings/actions/general → the
+// The registrations (index.ts: POST /org/{org}/settings/actions/general → the
 // orgActionsGeneralSubmit glue) ride the require-owner prologue
 // (resolveOrgTeamsRequest: session → org resolution → the anonymous login
 // 303 → the non-owner 404 shell) with sameOriginGuard FIRST (§2.8 layer 2),
@@ -488,10 +488,10 @@ async function seedRouteOrg(): Promise<{ org: OrgRecord; ownerCookie: string; me
   };
 }
 
-describe("the mounted POST /{org}/settings/actions/general (the route-level matrix)", () => {
+describe("the mounted POST /org/{org}/settings/actions/general (the route-level matrix)", () => {
   it("saves through the router — the permissions post 303s back onto the page and writes the ORG's row", async () => {
     const f = await seedRouteOrg();
-    const path = `/${f.org.username}/settings/actions/general`;
+    const path = `/org/${f.org.username}/settings/actions/general`;
     const res = await postUi(
       path,
       formPost({
@@ -513,7 +513,7 @@ describe("the mounted POST /{org}/settings/actions/general (the route-level matr
 
   it("adds a cross-repo target through the router — the within-owner resolution lands the id once", async () => {
     const f = await seedRouteOrg();
-    const path = `/${f.org.username}/settings/actions/general`;
+    const path = `/org/${f.org.username}/settings/actions/general`;
     const repoId = `route-${f.org.id}`;
     await env.DB.prepare(
       "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, created_at) VALUES (?, ?, ?, ?, 'demo', 'main', 'public', unixepoch())",
@@ -532,7 +532,7 @@ describe("the mounted POST /{org}/settings/actions/general (the route-level matr
 
   it("answers the :125 JSONError 400 through the router — the literal body, NOTHING stored", async () => {
     const f = await seedRouteOrg();
-    const path = `/${f.org.username}/settings/actions/general`;
+    const path = `/org/${f.org.username}/settings/actions/general`;
     const res = await postUi(path, formPost({ cross_repo_add_target: "true", cross_repo_add_target_name: "missing" }, f.ownerCookie));
     expect(res.status).toBe(400);
     expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
@@ -543,14 +543,14 @@ describe("the mounted POST /{org}/settings/actions/general (the route-level matr
 
   it("keeps the require-owner prologue on the POST — anonymous 303s to login, a signed-in non-owner 404-shells, an unknown org 404-shells", async () => {
     const f = await seedRouteOrg();
-    const path = `/${f.org.username}/settings/actions/general`;
+    const path = `/org/${f.org.username}/settings/actions/general`;
     const body = { token_permission_mode: "restricted" };
     const anon = await postUi(path, formPost(body));
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(path)}`);
     const member = await postUi(path, formPost(body, f.memberCookie));
     expect(member.status).toBe(404); // the non-owner shell — no org context leaks
-    const unknown = await postUi("/no-such-org/settings/actions/general", formPost(body, f.ownerCookie));
+    const unknown = await postUi("/org/no-such-org/settings/actions/general", formPost(body, f.ownerCookie));
     expect(unknown.status).toBe(404);
     // The refused posts wrote nothing.
     const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_settings_kv").first<{ n: number }>();
@@ -559,7 +559,7 @@ describe("the mounted POST /{org}/settings/actions/general (the route-level matr
 
   it("rejects a cross-origin write before the session gate (§2.8 layer 2 — the guard answers first)", async () => {
     const f = await seedRouteOrg();
-    const path = `/${f.org.username}/settings/actions/general`;
+    const path = `/org/${f.org.username}/settings/actions/general`;
     // No cookie AND a foreign origin: the guard's 403 wins over the login 303.
     const res = await postUi(path, formPost({ token_permission_mode: "restricted" }, undefined, "https://evil.example"));
     expect(res.status).toBe(403);
@@ -572,7 +572,7 @@ describe("the mounted POST /{org}/settings/actions/general (the route-level matr
   it("scopes the write to the ORG's owner id — the doer's own user-scope row is never touched", async () => {
     const f = await seedRouteOrg();
     await setOwnerActionsConfig(env.DB, f.ownerId, { tokenPermissionMode: "restricted", maxTokenPermissions: null, allowedCrossRepoIds: [] });
-    const path = `/${f.org.username}/settings/actions/general`;
+    const path = `/org/${f.org.username}/settings/actions/general`;
     const res = await postUi(path, formPost({ token_permission_mode: "permissive" }, f.ownerCookie));
     expect(res.status).toBe(303);
     expect((await storedConfig(f.org.id)).token_permission_mode).toBe("permissive"); // the org's row written

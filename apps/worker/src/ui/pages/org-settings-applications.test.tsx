@@ -1,6 +1,6 @@
 /**
  * The org settings APPLICATIONS tab's tests (the census R20-a module —
- * GET /{org}/settings/applications + POST .../oauth2 + POST .../oauth2/{id}
+ * GET /org/{org}/settings/applications + POST .../oauth2 + POST .../oauth2/{id}
  * /delete at ui/index.ts): the load/parse/apply matrix over real D1
  * (generated migrations in beforeAll; the writes go through the landed
  * oauth2 service arms — the same `oauth2_application` store the API family
@@ -300,9 +300,9 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
     // org/settings/applications.tmpl:1 passes the OPTIONS page's pageClass —
     // the verbatim upstream quirk (the hooks page's Settings-h4 precedent).
     expect(html).toContain("organization settings options");
-    expect(html).toContain('action="/acme/settings/applications/oauth2"');
+    expect(html).toContain('action="/org/acme/settings/applications/oauth2"');
     expect(renderOrgApplicationsPage({ ctx, data, error: null })).toContain(
-      'action="/acme/settings/applications/oauth2"',
+      'action="/org/acme/settings/applications/oauth2"',
     );
   });
 
@@ -330,13 +330,13 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
     expect(html).toContain(">row app</div>"); // the item-title
     expect(html).toContain(orgSettingsApplicationsLocale.client_id);
     expect(html).toContain(`<span class="ui label"> ${app.clientId}</span>`); // the ui label projection
-    expect(html).toContain(`action="/acme/settings/applications/oauth2/${app.id}/delete"`);
+    expect(html).toContain(`action="/org/acme/settings/applications/oauth2/${app.id}/delete"`);
     expect(html).toContain(`name="id" value="${String(app.id)}"`);
     expect(html).toContain(orgSettingsApplicationsLocale.remove);
     // The W5 Edit anchor (applications_oauth2_list.tmpl:23-26) rides the
     // shared edit page (the module header's W5 record); the confirm dialog
     // stays unreproduced.
-    expect(html).toContain(`href="/acme/settings/applications/oauth2/${app.id}"`);
+    expect(html).toContain(`href="/org/acme/settings/applications/oauth2/${app.id}"`);
     expect(html).toContain("octicon-pencil");
     expect(html).not.toContain("remove-gitea-oauth2-application");
   });
@@ -361,13 +361,13 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
 
   it("the W5 shared edit page renders in the ORG chrome: the masked arm on a plain show, the plaintext arm on a regenerate", async () => {
     const app = await seedApp("edit me", org.id);
-    const showData = oauth2AppEditPageData(app, `/acme/settings/applications/oauth2/${app.id}`);
+    const showData = oauth2AppEditPageData(app, `/org/acme/settings/applications/oauth2/${app.id}`);
     const showHtml = renderOrgOauth2AppEditPage(ctx, org.record, showData, true);
     expect(showHtml).toContain("organization settings options"); // the org chrome quirk
-    expect(showHtml).toContain(`action="/acme/settings/applications/oauth2/${app.id}/regenerate_secret"`);
+    expect(showHtml).toContain(`action="/org/acme/settings/applications/oauth2/${app.id}/regenerate_secret"`);
     expect(showHtml).toContain('id="client-secret" type="password" readonly'); // the masked arm
     expect(showHtml).toContain(oauth2AppEditLocale.masked_secret_placeholder);
-    const regenData = oauth2AppEditPageData(app, `/acme/settings/applications/oauth2/${app.id}`);
+    const regenData = oauth2AppEditPageData(app, `/org/acme/settings/applications/oauth2/${app.id}`);
     regenData.clientSecret = "gto_plaintext-once-value";
     const regenHtml = renderOrgOauth2AppEditPage(ctx, org.record, regenData, true);
     expect(regenHtml).toContain('id="client-secret" type="text" readonly'); // the shown-once arm
@@ -385,16 +385,16 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
   });
 
   it("the shared navbar renders the Applications item active between Labels and Blocked users", () => {
-    const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="applications" />);
-    expect(html).toContain('class="active item" href="/acme/settings/applications"');
-    expect(html).toContain('href="/acme/settings/hooks"'); // Hooks
-    expect(html).toContain('href="/acme/labels"'); // Labels
-    expect(html).toContain('href="/acme/settings/blocked_users"'); // Blocked users
+    const html = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="applications" />);
+    expect(html).toContain('class="active item" href="/org/acme/settings/applications"');
+    expect(html).toContain('href="/org/acme/settings/hooks"'); // Hooks
+    expect(html).toContain('href="/org/acme/settings/labels"'); // Labels
+    expect(html).toContain('href="/org/acme/settings/blocked_users"'); // Blocked users
     expect(html).toContain(orgSettingsApplicationsLocale.applications);
     // The other tabs never steal the active mark.
-    const blocked = renderToString(<OrgSettingsNavbar orgLink="/acme" active="blocked" />);
-    expect(blocked).toContain('class="active item" href="/acme/settings/blocked_users"');
-    expect(blocked).not.toContain('class="active item" href="/acme/settings/applications"');
+    const blocked = renderToString(<OrgSettingsNavbar orgLink="/org/acme" active="blocked" />);
+    expect(blocked).toContain('class="active item" href="/org/acme/settings/blocked_users"');
+    expect(blocked).not.toContain('class="active item" href="/org/acme/settings/applications"');
   });
 });
 
@@ -434,7 +434,7 @@ async function ownerSessionHeader(): Promise<string> {
 
 /** The owner's GET of the tab through the real route. */
 async function applicationsGet(): Promise<Response> {
-  return fetchUi(`/${org.username}/settings/applications`, {
+  return fetchUi(`/org/${org.username}/settings/applications`, {
     headers: { cookie: await ownerSessionHeader() },
   });
 }
@@ -450,7 +450,7 @@ async function createPost(
 ): Promise<Response> {
   const cookie = session === "owner" ? await ownerSessionHeader() : session;
   return fetchUi(
-    `/${org.username}/settings/applications/oauth2`,
+    `/org/${org.username}/settings/applications/oauth2`,
     {
       method: "POST",
       headers: {
@@ -467,7 +467,7 @@ async function createPost(
 /** A delete POST through the real route (same-origin by default). */
 async function deletePost(id: number, session: string | null = "owner", origin: string = ORIGIN): Promise<Response> {
   const cookie = session === "owner" ? await ownerSessionHeader() : session;
-  return fetchUi(`/${org.username}/settings/applications/oauth2/${id}/delete`, {
+  return fetchUi(`/org/${org.username}/settings/applications/oauth2/${id}/delete`, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -478,14 +478,14 @@ async function deletePost(id: number, session: string | null = "owner", origin: 
   });
 }
 
-// --- the mounted routes (GET + POST /{org}/settings/applications[...]) -------------
+// --- the mounted routes (GET + POST /org/{org}/settings/applications[...]) -------------
 
 describe("the mounted routes (the R20-a arm through the org-teams prologue)", () => {
   it("303s an anonymous GET onto the login round-trip (the org-teams prologue)", async () => {
-    const res = await fetchUi(`/${org.username}/settings/applications`);
+    const res = await fetchUi(`/org/${org.username}/settings/applications`);
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${org.username}/settings/applications`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${org.username}/settings/applications`)}`,
     );
   });
 
@@ -496,7 +496,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     );
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent(`/${org.username}/settings/applications/oauth2`)}`,
+      `/login?redirect_to=${encodeURIComponent(`/org/${org.username}/settings/applications/oauth2`)}`,
     );
     expect((await loadOrgSettingsApplications(env.DB, org.record)).apps).toEqual([]);
   });
@@ -507,7 +507,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
       .insert(orgMembers)
       .values({ orgId: org.id, userId: bob.id, role: "member", createdAt: ORG_CREATED })
       .run();
-    const res = await fetchUi(`/${org.username}/settings/applications`, {
+    const res = await fetchUi(`/org/${org.username}/settings/applications`, {
       headers: { cookie: await sessionHeader(bob.id) },
     });
     expect(res.status).toBe(404);
@@ -549,7 +549,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("organization settings options"); // the §2.4.1 pageClass (the upstream quirk)
-    expect(html).toContain(`class="active item" href="/${org.username}/settings/applications"`);
+    expect(html).toContain(`class="active item" href="/org/${org.username}/settings/applications"`);
     expect(html).toContain(orgSettingsApplicationsLocale.no_apps); // the empty arm
   });
 
@@ -569,7 +569,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     expect(html).toContain('id="client-secret" type="text" readonly'); // the shown-once arm
     expect(html).toContain(`value="${plaintext}"`);
     expect(html).toContain("organization settings options"); // the org chrome
-    expect(html).toMatch(/action="\/acme\/settings\/applications\/oauth2\/\d+"/); // the FormActionPath
+    expect(html).toMatch(/action="\/org\/acme\/settings\/applications\/oauth2\/\d+"/); // the FormActionPath
     const data = await loadOrgSettingsApplications(env.DB, org.record);
     expect(data.apps).toHaveLength(1);
     expect(data.apps[0]?.uid).toBe(org.id);
@@ -583,7 +583,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     expect(pageHtml).toContain(`<span class="ui label"> ${clientId}</span>`);
     expect(pageHtml).not.toContain(plaintext);
     // The plain show re-renders the MASKED placeholder instead.
-    const show = await fetchUi(`/${org.username}/settings/applications/oauth2/${data.apps[0]?.id}`, {
+    const show = await fetchUi(`/org/${org.username}/settings/applications/oauth2/${data.apps[0]?.id}`, {
       headers: { cookie: await ownerSessionHeader() },
     });
     expect(show.status).toBe(200);
@@ -616,7 +616,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     if (created.outcome !== "created") throw new Error("seed create failed");
     const firstSecret = created.secret;
 
-    const saved = await fetchUi(`/${org.username}/settings/applications/oauth2/${created.row.id}`, {
+    const saved = await fetchUi(`/org/${org.username}/settings/applications/oauth2/${created.row.id}`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -626,7 +626,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
       body: new URLSearchParams({ application_name: "renamed", redirect_uris: "https://new.example/cb" }).toString(),
     });
     expect(saved.status).toBe(303);
-    expect(saved.headers.get("location")).toBe(`/${org.username}/settings/applications`);
+    expect(saved.headers.get("location")).toBe(`/org/${org.username}/settings/applications`);
     const row = await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, created.row.id)).get();
     expect(row?.name).toBe("renamed");
     expect(JSON.parse(row?.redirectUris ?? "[]")).toEqual(["https://new.example/cb"]);
@@ -635,7 +635,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
 
     // A bind error re-renders the edit page (200) with the negative line +
     // the kept submission.
-    const invalid = await fetchUi(`/${org.username}/settings/applications/oauth2/${created.row.id}`, {
+    const invalid = await fetchUi(`/org/${org.username}/settings/applications/oauth2/${created.row.id}`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -660,7 +660,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
       skipSecondaryAuthorization: false,
     });
     if (created.outcome !== "created") throw new Error("seed create failed");
-    const regen = await fetchUi(`/${org.username}/settings/applications/oauth2/${created.row.id}/regenerate_secret`, {
+    const regen = await fetchUi(`/org/${org.username}/settings/applications/oauth2/${created.row.id}/regenerate_secret`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -681,7 +681,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
   });
 
   it("the W5 gate: OAUTH2_ENABLED=false answers the group's 403 on the list and every write arm", async () => {
-    const gatedList = await fetchUi(`/${org.username}/settings/applications`, {
+    const gatedList = await fetchUi(`/org/${org.username}/settings/applications`, {
       headers: { cookie: await ownerSessionHeader() },
     }, { OAUTH2_ENABLED: "false" });
     expect(gatedList.status).toBe(403);
@@ -700,7 +700,7 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     const app = await seedApp("doomed", org.id);
     const res = await deletePost(app.id);
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(`/${org.username}/settings/applications`);
+    expect(res.headers.get("location")).toBe(`/org/${org.username}/settings/applications`);
     expect((await loadOrgSettingsApplications(env.DB, org.record)).apps).toEqual([]);
   });
 
@@ -733,11 +733,11 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
   });
 
   it("the POST-only tails answer GET with 405 (the hooks-family convention)", async () => {
-    const create = await fetchUi(`/${org.username}/settings/applications/oauth2`, {
+    const create = await fetchUi(`/org/${org.username}/settings/applications/oauth2`, {
       headers: { cookie: await ownerSessionHeader() },
     });
     expect(create.status).toBe(405);
-    const del = await fetchUi(`/${org.username}/settings/applications/oauth2/1/delete`, {
+    const del = await fetchUi(`/org/${org.username}/settings/applications/oauth2/1/delete`, {
       headers: { cookie: await ownerSessionHeader() },
     });
     expect(del.status).toBe(405);
@@ -748,40 +748,40 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
 
 describe("the route claim pin (the settings family claims exactly the applications family)", () => {
   it("parses the five shapes; misspellings and junk ids stay unclaimed", () => {
-    expect(parseUiRoute(`/${org.username}/settings/applications`)).toEqual({
+    expect(parseUiRoute(`/org/${org.username}/settings/applications`)).toEqual({
       family: "org-settings-applications",
       owner: org.username,
     });
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2`)).toEqual({
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2`)).toEqual({
       family: "org-settings-applications-create",
       owner: org.username,
     });
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7/delete`)).toEqual({
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2/7/delete`)).toEqual({
       family: "org-settings-applications-delete",
       owner: org.username,
       id: 7,
     });
     // The W5 edit arms: the {id} combo (GET show + POST save) + the
     // regenerate tail.
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7`)).toEqual({
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2/7`)).toEqual({
       family: "org-settings-applications-app",
       owner: org.username,
       id: 7,
     });
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7/regenerate_secret`)).toEqual({
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2/7/regenerate_secret`)).toEqual({
       family: "org-settings-applications-regenerate",
       owner: org.username,
       id: 7,
     });
-    expect(handlesUiRoute(`/${org.username}/settings/applications`)).toBe(true);
-    expect(handlesUiRoute(`/${org.username}/settings/applications/oauth2/7`)).toBe(true);
+    expect(handlesUiRoute(`/org/${org.username}/settings/applications`)).toBe(true);
+    expect(handlesUiRoute(`/org/${org.username}/settings/applications/oauth2/7`)).toBe(true);
     // The singular misspelling and deeper tails.
-    expect(parseUiRoute(`/${org.username}/settings/application`)).toBeNull();
-    expect(parseUiRoute(`/${org.username}/settings/applications/extra`)).toBeNull();
-    expect(handlesUiRoute(`/${org.username}/settings/applications/extra`)).toBe(false);
+    expect(parseUiRoute(`/org/${org.username}/settings/application`)).toBeNull();
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/extra`)).toBeNull();
+    expect(handlesUiRoute(`/org/${org.username}/settings/applications/extra`)).toBe(false);
     // A junk id never claims (the hooks-family integer parity).
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/xx/delete`)).toBeNull();
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/xx`)).toBeNull();
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7/unknown`)).toBeNull();
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2/xx/delete`)).toBeNull();
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2/xx`)).toBeNull();
+    expect(parseUiRoute(`/org/${org.username}/settings/applications/oauth2/7/unknown`)).toBeNull();
   });
 });

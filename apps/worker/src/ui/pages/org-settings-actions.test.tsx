@@ -411,26 +411,26 @@ describe("the secrets page DOM (org/settings/actions.tmpl PageType secrets + sha
     expect(html).toContain("organization settings actions"); // layout_head's pageClass
     expect(html).toContain("<details"); // navbar.tmpl:29's disclosure
     expect(html).toContain("open"); // the PageIsSharedSettingsSecrets open arm
-    expect(html).toContain('class="active item" href="/coalition/settings/actions/secrets"');
-    expect(html).toContain('href="/coalition/settings/actions/variables"'); // the sibling sub-item
-    expect(html).toContain('href="/coalition/settings/actions/runners"'); // lit by the C7 org twin's mount (navbar.tmpl:35-37)
-    expect(html).toContain('href="/coalition/settings"'); // the landed settings tabs stay linked
-    expect(html).toContain('href="/coalition/settings/hooks"');
-    expect(html).toContain('href="/coalition/labels"');
+    expect(html).toContain('class="active item" href="/org/coalition/settings/actions/secrets"');
+    expect(html).toContain('href="/org/coalition/settings/actions/variables"'); // the sibling sub-item
+    expect(html).toContain('href="/org/coalition/settings/actions/runners"'); // lit by the C7 org twin's mount (navbar.tmpl:35-37)
+    expect(html).toContain('href="/org/coalition/settings"'); // the landed settings tabs stay linked
+    expect(html).toContain('href="/org/coalition/settings/hooks"');
+    expect(html).toContain('href="/org/coalition/settings/labels"');
     // The Scoped-workflows sub-item RENDERED with the store wave's mount
     // (navbar.tmpl:44-45). The General sub-item LIT with the P2-2 org
     // general page's module (the navbar's quoted href is upstream's own
     // bare-actions URL, navbar.tmpl:32-34 — the quoted shape disambiguates
     // it from the landed tails).
-    expect(html).toContain('href="/coalition/settings/actions/scoped-workflows"');
-    expect(html).toContain('href="/coalition/settings/actions"');
+    expect(html).toContain('href="/org/coalition/settings/actions/scoped-workflows"');
+    expect(html).toContain('href="/org/coalition/settings/actions"');
   });
 
   it("renders the empty arm (secrets.none) and the add form with the upstream contract", async () => {
     const html = await secretsHtml();
     expect(html).toContain(orgSettingsActionsLocale.secrets_management);
     expect(html).toContain(orgSettingsActionsLocale.secrets_none);
-    expect(html).toContain('action="/coalition/settings/actions/secrets"');
+    expect(html).toContain('action="/org/coalition/settings/actions/secrets"');
     expect(html).toContain('name="name"');
     expect(html).toContain(`pattern="${ORG_ACTIONS_NAME_PATTERN}"`); // add_list.tmpl:81
     expect(html).toContain("MY_SECRET_NAME"); // add_list.tmpl:83's placeholder
@@ -468,7 +468,7 @@ describe("the secrets page DOM (org/settings/actions.tmpl PageType secrets + sha
     expect(html).toContain('value="EDITABLE"');
     expect(html).toContain('readOnly="true"'); // add_list.tmpl:46's read-only arm
     expect(html).not.toContain("secret-value"); // add_list.tmpl:47's empty data arm
-    expect(html).toContain('action="/coalition/settings/actions/secrets/delete"');
+    expect(html).toContain('action="/org/coalition/settings/actions/secrets/delete"');
     expect(html).toContain(`name="id" value="${String(row.id)}"`);
     expect(html).toContain(orgSettingsActionsLocale.remove);
     expect(html).not.toContain("show-modal"); // the JS modal pair is not reproduced
@@ -518,15 +518,15 @@ describe("the variables page DOM (org/settings/actions.tmpl PageType variables +
     expect(html).toContain("organization settings actions");
     expect(html).toContain("<details");
     expect(html).toContain("open");
-    expect(html).toContain('class="active item" href="/coalition/settings/actions/variables"');
-    expect(html).toContain('href="/coalition/settings/actions/secrets"'); // the sibling sub-item
+    expect(html).toContain('class="active item" href="/org/coalition/settings/actions/variables"');
+    expect(html).toContain('href="/org/coalition/settings/actions/secrets"'); // the sibling sub-item
   });
 
   it("renders the empty arm (actions.variables.none) and the add form posting to /new", async () => {
     const html = await variablesHtml();
     expect(html).toContain(orgSettingsActionsLocale.variables_management);
     expect(html).toContain(orgSettingsActionsLocale.variables_none);
-    expect(html).toContain('action="/coalition/settings/actions/variables/new"');
+    expect(html).toContain('action="/org/coalition/settings/actions/variables/new"');
     expect(html).toContain(`pattern="${ORG_ACTIONS_NAME_PATTERN}"`);
     expect(html).toContain("MY_VARIABLE_NAME"); // variable_list.tmpl:81's placeholder
     expect(html).toContain(`maxlength="${ORG_ACTIONS_VARIABLE_DATA_MAXLENGTH}"`);
@@ -555,8 +555,8 @@ describe("the variables page DOM (org/settings/actions.tmpl PageType variables +
     expect(html).toContain("kept-value"); // the dialog pre-fills all three fields
     expect(html).toContain("kept-desc");
     expect(html).not.toContain('readOnly="true"'); // no read-only arm in the variables dialog
-    expect(html).toContain(`action="/coalition/settings/actions/variables/${row.id}/edit"`);
-    expect(html).toContain(`action="/coalition/settings/actions/variables/${row.id}/delete"`); // the id in the path
+    expect(html).toContain(`action="/org/coalition/settings/actions/variables/${row.id}/edit"`);
+    expect(html).toContain(`action="/org/coalition/settings/actions/variables/${row.id}/delete"`); // the id in the path
     expect(html).toContain(orgSettingsActionsLocale.deletion);
     expect(html).toContain("octicon-trash");
   });
@@ -722,7 +722,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   // -- the gates ------------------------------------------------------------
 
   it("303s an anonymous GET of both sub-tabs onto the login round-trip (the org resolved first)", async () => {
-    for (const path of ["/coalition/settings/actions/secrets", "/coalition/settings/actions/variables"]) {
+    for (const path of ["/org/coalition/settings/actions/secrets", "/org/coalition/settings/actions/variables"]) {
       const res = await getRoute(path, null);
       expect(res.status).toBe(303);
       expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(path)}`);
@@ -730,26 +730,26 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   });
 
   it("303s an anonymous same-origin POST onto the login round-trip too (the guard passes, then the signed-in gate)", async () => {
-    const res = await fetchUi("/coalition/settings/actions/secrets", {
+    const res = await fetchUi("/org/coalition/settings/actions/secrets", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN },
       body: new URLSearchParams({ name: "ANON_ROW", data: "v", description: "" }).toString(),
     });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent("/coalition/settings/actions/secrets")}`,
+      `/login?redirect_to=${encodeURIComponent("/org/coalition/settings/actions/secrets")}`,
     );
     expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0); // nothing written
   });
 
   it("404-shells a signed-in non-owner (a plain member) on GET and POST — nothing written", async () => {
-    await expectNotFoundShell(await getRoute("/coalition/settings/actions/secrets", world.bobId));
-    await expectNotFoundShell(await getRoute("/coalition/settings/actions/variables", world.bobId));
+    await expectNotFoundShell(await getRoute("/org/coalition/settings/actions/secrets", world.bobId));
+    await expectNotFoundShell(await getRoute("/org/coalition/settings/actions/variables", world.bobId));
     await expectNotFoundShell(
-      await postRoute("/coalition/settings/actions/secrets", world.bobId, { name: "BOB_ROW", data: "v", description: "" }),
+      await postRoute("/org/coalition/settings/actions/secrets", world.bobId, { name: "BOB_ROW", data: "v", description: "" }),
     );
     await expectNotFoundShell(
-      await postRoute("/coalition/settings/actions/variables/new", world.bobId, { name: "BOB_VAR", data: "v", description: "" }),
+      await postRoute("/org/coalition/settings/actions/variables/new", world.bobId, { name: "BOB_VAR", data: "v", description: "" }),
     );
     expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
     expect((await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
@@ -758,17 +758,17 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   // -- the owner's secrets sub-tab through the mount ------------------------
 
   it("the owner's secret POST saves through the mount and the follow-up GET renders the row (the round-trip)", async () => {
-    const res = await postRoute("/coalition/settings/actions/secrets", 1, {
+    const res = await postRoute("/org/coalition/settings/actions/secrets", 1, {
       name: "ROUTE_SECRET",
       data: "route-plaintext",
       description: "route description",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/coalition/settings/actions/secrets");
+    expect(res.headers.get("location")).toBe("/org/coalition/settings/actions/secrets");
     const rows = (await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows;
     expect(rows.map((row) => row.name)).toEqual(["ROUTE_SECRET"]);
 
-    const page = await getRoute("/coalition/settings/actions/secrets", 1);
+    const page = await getRoute("/org/coalition/settings/actions/secrets", 1);
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain("organization settings actions"); // the §2.4.1 pageClass
@@ -778,7 +778,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   });
 
   it("the owner's invalid secret POST re-renders with the carried form — name/description kept, the value EMPTY", async () => {
-    const res = await postRoute("/coalition/settings/actions/secrets", 1, {
+    const res = await postRoute("/org/coalition/settings/actions/secrets", 1, {
       name: "GITEA_TOKEN",
       data: "route-plaintext",
       description: "kept description",
@@ -798,43 +798,43 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   it("the owner's secret delete POST removes the row and 303s back; a stale id 303s idempotently", async () => {
     await createOrUpdateSecret(env.DB, ownerScope(world.coalitionId), "DOOMED", "v", "");
     const row = (await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
-    const hit = await postRoute("/coalition/settings/actions/secrets/delete", 1, { id: String(row.id) });
+    const hit = await postRoute("/org/coalition/settings/actions/secrets/delete", 1, { id: String(row.id) });
     expect(hit.status).toBe(303);
-    expect(hit.headers.get("location")).toBe("/coalition/settings/actions/secrets");
+    expect(hit.headers.get("location")).toBe("/org/coalition/settings/actions/secrets");
     expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
     // A repeated (now stale) id: the same 303, nothing else happens (the
     // idempotent-303 reduction).
-    const stale = await postRoute("/coalition/settings/actions/secrets/delete", 1, { id: String(row.id) });
+    const stale = await postRoute("/org/coalition/settings/actions/secrets/delete", 1, { id: String(row.id) });
     expect(stale.status).toBe(303);
-    expect(stale.headers.get("location")).toBe("/coalition/settings/actions/secrets");
+    expect(stale.headers.get("location")).toBe("/org/coalition/settings/actions/secrets");
   });
 
   // -- the owner's variables sub-tab through the mount ----------------------
 
   it("renders the owner's variables GET at 200 with the discriminator and the new-form action", async () => {
-    const res = await getRoute("/coalition/settings/actions/variables", 1);
+    const res = await getRoute("/org/coalition/settings/actions/variables", 1);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("organization settings actions");
-    expect(html).toContain('action="/coalition/settings/actions/variables/new"');
+    expect(html).toContain('action="/org/coalition/settings/actions/variables/new"');
     expect(html).toContain(orgSettingsActionsLocale.variables_none); // the fresh-store empty arm
   });
 
   it("the owner's variable POST new saves through the mount — 303 onto the list, the name stored UPPERCASE", async () => {
-    const res = await postRoute("/coalition/settings/actions/variables/new", 1, {
+    const res = await postRoute("/org/coalition/settings/actions/variables/new", 1, {
       name: "route_var",
       data: "route-open-value",
       description: "route description",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/coalition/settings/actions/variables");
+    expect(res.headers.get("location")).toBe("/org/coalition/settings/actions/variables");
     const rows = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows;
     expect(rows.map((row) => row.name)).toEqual(["ROUTE_VAR"]); // the service's UPPERCASE arm
     expect(rows[0]!.data).toBe("route-open-value");
   });
 
   it("the owner's invalid variable POST re-renders with ALL THREE fields carried (the value rides along, unlike secrets)", async () => {
-    const res = await postRoute("/coalition/settings/actions/variables/new", 1, {
+    const res = await postRoute("/org/coalition/settings/actions/variables/new", 1, {
       name: "BAD-NAME",
       data: "carried-value",
       description: "carried description",
@@ -852,13 +852,13 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   it("the owner's variable edit POST saves through the mount (the row rewritten)", async () => {
     await createVariableRow(env.DB, ownerScope(world.coalitionId), "EDITABLE", "old-value", "");
     const row = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
-    const res = await postRoute(`/coalition/settings/actions/variables/${row.id}/edit`, 1, {
+    const res = await postRoute(`/org/coalition/settings/actions/variables/${row.id}/edit`, 1, {
       name: "EDITABLE",
       data: "new-value",
       description: "new description",
     });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/coalition/settings/actions/variables");
+    expect(res.headers.get("location")).toBe("/org/coalition/settings/actions/variables");
     const after = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
     expect(after.id).toBe(row.id);
     expect(after.data).toBe("new-value");
@@ -874,18 +874,18 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
 
     for (const id of [row.id, foreignId]) {
       await expectNotFoundShell(
-        await postRoute(`/coalition/settings/actions/variables/${id}/edit`, 1, { name: "X", data: "v", description: "" }),
+        await postRoute(`/org/coalition/settings/actions/variables/${id}/edit`, 1, { name: "X", data: "v", description: "" }),
       );
-      await expectNotFoundShell(await postRoute(`/coalition/settings/actions/variables/${id}/delete`, 1, {}));
+      await expectNotFoundShell(await postRoute(`/org/coalition/settings/actions/variables/${id}/delete`, 1, {}));
     }
     // The junk path ids never reach the write (the parse guard's digits-only
     // claim — "-3" parses to a rowid that misses, "junk"/"12.5" fail the
     // parse itself; both answer the same 404).
     for (const junk of ["junk", "-3", "12.5"]) {
       await expectNotFoundShell(
-        await postRoute(`/coalition/settings/actions/variables/${junk}/edit`, 1, { name: "X", data: "v", description: "" }),
+        await postRoute(`/org/coalition/settings/actions/variables/${junk}/edit`, 1, { name: "X", data: "v", description: "" }),
       );
-      await expectNotFoundShell(await postRoute(`/coalition/settings/actions/variables/${junk}/delete`, 1, {}));
+      await expectNotFoundShell(await postRoute(`/org/coalition/settings/actions/variables/${junk}/delete`, 1, {}));
     }
     expect((await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows).toHaveLength(1); // the foreign row survives
   });
@@ -893,7 +893,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
   // -- the guard + the scope isolation ---------------------------------------
 
   it("rejects a cross-origin POST with 403 before any write (sameOriginGuard first, both sub-tabs)", async () => {
-    for (const path of ["/coalition/settings/actions/secrets", "/coalition/settings/actions/variables/new"]) {
+    for (const path of ["/org/coalition/settings/actions/secrets", "/org/coalition/settings/actions/variables/new"]) {
       const res = await postRoute(path, 1, { name: "EVIL_ROW", data: "v", description: "" }, "https://evil.example");
       expect(res.status).toBe(403);
       expect(await res.text()).toContain("cross-origin request rejected");
@@ -909,7 +909,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     await createVariableRow(env.DB, ownerScope(world.rivalsId), "THEIR_VAR", "their-open-value", "");
     const rivalsSecretId = (await listSecretRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!.id;
 
-    const secretsPage = await getRoute("/coalition/settings/actions/secrets", 1);
+    const secretsPage = await getRoute("/org/coalition/settings/actions/secrets", 1);
     expect(secretsPage.status).toBe(200);
     const secretsText = await secretsPage.text();
     expect(secretsText).toContain(">OURS</div>");
@@ -918,7 +918,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     expect(secretsText).not.toContain("theirs-plaintext");
     expect(secretsText).not.toContain(`name="id" value="${String(rivalsSecretId)}"`); // no foreign delete form
 
-    const variablesPage = await getRoute("/coalition/settings/actions/variables", 1);
+    const variablesPage = await getRoute("/org/coalition/settings/actions/variables", 1);
     expect(variablesPage.status).toBe(200);
     const variablesText = await variablesPage.text();
     expect(variablesText).toContain(">OUR_VAR</div>");
@@ -935,7 +935,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
 
     // The secrets delete always 303s (the idempotent-303 reduction) — but a
     // foreign id deletes nothing.
-    const del = await postRoute("/coalition/settings/actions/secrets/delete", 1, { id: String(rivalsSecret.id) });
+    const del = await postRoute("/org/coalition/settings/actions/secrets/delete", 1, { id: String(rivalsSecret.id) });
     expect(del.status).toBe(303);
     const rivalSecrets = (await listSecretRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows;
     expect(rivalSecrets).toHaveLength(1);
@@ -944,13 +944,13 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     // The variable edit/delete answer the genuine 404 shell — the row
     // survives untouched.
     await expectNotFoundShell(
-      await postRoute(`/coalition/settings/actions/variables/${rivalsVariable.id}/edit`, 1, {
+      await postRoute(`/org/coalition/settings/actions/variables/${rivalsVariable.id}/edit`, 1, {
         name: "HIJACKED",
         data: "hijacked-value",
         description: "",
       }),
     );
-    await expectNotFoundShell(await postRoute(`/coalition/settings/actions/variables/${rivalsVariable.id}/delete`, 1, {}));
+    await expectNotFoundShell(await postRoute(`/org/coalition/settings/actions/variables/${rivalsVariable.id}/delete`, 1, {}));
     const after = (await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!;
     expect(after.name).toBe("THEIR_VAR");
     expect(after.data).toBe("their-open-value");

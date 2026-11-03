@@ -216,7 +216,7 @@ describe("the settings page — the loader, both chrome arms, the render", () =>
     const data = await loadPackageSettingsData(env.DB, owner, viewer, ORIGIN, pkg);
     const html = renderPackageSettingsPage(pageCtx(viewer), data);
     expect(html).toContain("package settings options organization");
-    expect(html).toContain('href="/toolsorg/settings"'); // the landed org settings URL
+    expect(html).toContain('href="/org/toolsorg/settings"'); // the landed org settings URL
   });
 
   it("renders the flash banner in the base/alert slot only when armed", async () => {

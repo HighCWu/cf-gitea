@@ -567,7 +567,7 @@ export function CollaborationPage(props: {
                         <TeamRow
                           key={team.id}
                           repoLink={repoLink}
-                          orgLink={`/${repo.ownerNamespace}`}
+                          orgLink={`/org/${repo.ownerNamespace}`}
                           team={team}
                           canChange={data.canChangeTeams}
                         />

@@ -10,7 +10,7 @@
  *     (web.go:1430, the form-borne `id`, the unlink cascade)
  *   - POST /{owner}/{repo}/labels/initialize        repo.InitializeLabels
  *     (web.go:1421, `web.Bind[*forms.InitializeLabelsForm]`)
- *   - POST /{org}/labels/initialize                 org.InitializeLabels
+ *   - POST /org/{org}/settings/labels/initialize    org.InitializeLabels
  *     (web.go:1048, the org twin — upstream nests it at
  *     /org/{org}/settings/labels/initialize under the require-owner group;
  *     the landed org labels page lives at the literal /{org}/labels, the
@@ -179,10 +179,9 @@
  *   here, the modules/repository/init.go InitializeLabels port (one
  *   db.batch, sequential statements = upstream's per-label insert order).
  *   Success redirects: repo → /{owner}/{repo}/labels (upstream's
- *   JSONRedirect/Redirect target), org → /{org}/labels (the landed page's
- *   live URL; upstream redirects onto /org/{org}/settings/labels — the
- *   org-labels divergence carried over, the same target every landed org
- *   label write 303s onto).
+ *   JSONRedirect/Redirect target), org → /org/{org}/settings/labels (the
+ *   landed page's canonical URL since ledger B3 — the same target every
+ *   landed org label write 303s onto).
  *
  * ## The resolution prologue (the leaf-only duplication, link-account-router's
  *    documented posture)
@@ -689,11 +688,11 @@ export async function orgLabelInitializeSubmit(c: RouteContext): Promise<Respons
   const params = await readUrlEncodedForm(c.req.raw);
   const templateName = params.get("template_name") ?? "";
   if (templateName === "") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/labels` } }));
   }
   const result = await initializeOrgLabelsFromTemplate(c.env.DB, org.id, templateName);
   if (result.outcome === "applied") {
-    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+    return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/labels` } }));
   }
   const data = await loadOrgLabelsData(c.env.DB, org, new URLSearchParams());
   return respond(
@@ -728,8 +727,8 @@ function methodNotAllowedTail(allow: string): Response {
  *  3-segment shape never collides with the repo trio's 4-segment one). */
 export function createIssueWriteTailsRouter(): Hono<{ Bindings: Env }> {
   const router = new Hono<{ Bindings: Env }>();
-  router.get("/:owner/labels/initialize", () => methodNotAllowedTail("POST"));
-  router.post("/:owner/labels/initialize", (c) => orgLabelInitializeSubmit(c));
+  router.get("/org/:owner/settings/labels/initialize", () => methodNotAllowedTail("POST"));
+  router.post("/org/:owner/settings/labels/initialize", (c) => orgLabelInitializeSubmit(c));
   router.get("/:owner/:repo/labels/initialize", () => methodNotAllowedTail("POST"));
   router.post("/:owner/:repo/labels/initialize", (c) => repoLabelInitializeSubmit(c));
   router.get("/:owner/:repo/milestones/delete", () => methodNotAllowedTail("POST"));

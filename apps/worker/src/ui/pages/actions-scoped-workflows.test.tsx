@@ -198,9 +198,9 @@ beforeEach(async () => {
 
 describe("scopedWorkflowsScopeContext (getScopedWorkflowsCtx's three arms)", () => {
   it("derives the org scope — owner id, the OrgLink redirect, the exclusive owner-pinned search, desc_org", () => {
-    expect(scopedWorkflowsScopeContext({ kind: "org", ownerId: ORG_ID, orgLink: "/coalition" })).toEqual({
+    expect(scopedWorkflowsScopeContext({ kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" })).toEqual({
       ownerId: ORG_ID,
-      redirectLink: "/coalition/settings/actions/scoped-workflows", // :54
+      redirectLink: "/org/coalition/settings/actions/scoped-workflows", // :54
       searchUid: ORG_ID, // :55
       searchExclusive: true, // :144
       searchFullName: false, // :145
@@ -354,7 +354,7 @@ describe("loadScopedWorkflowsPageData (ScopedWorkflows, :98-149)", () => {
     const data = await loadScopedWorkflowsPageData(store, env.DB, () => treeReads({ ".gitea/scoped_workflows/deploy.yml": DEPLOY_WF }), {
       kind: "org",
       ownerId: ORG_ID,
-      orgLink: "/coalition",
+      orgLink: "/org/coalition",
     });
     expect(data.dirsText).toBe(".gitea/scoped_workflows"); // :147's joined dirs
     expect(data.sources).toHaveLength(1); // repo-missing skipped (the :129-133 continue)
@@ -362,7 +362,7 @@ describe("loadScopedWorkflowsPageData (ScopedWorkflows, :98-149)", () => {
     expect(view?.repo.fullName).toBe("coalition/demo");
     expect(view?.infos[0]?.entryName).toBe("deploy.yml"); // the dir-relative entry name
     expect(view?.infos[0]?.required).toBe(false); // the config merged by the entry name
-    expect(data.redirectLink).toBe("/coalition/settings/actions/scoped-workflows");
+    expect(data.redirectLink).toBe("/org/coalition/settings/actions/scoped-workflows");
   });
 });
 
@@ -416,11 +416,11 @@ describe("applyScopedWorkflowAdd (ScopedWorkflowAdd, :245-280)", () => {
   it("resolves the add WITHIN the owner at the org/user scopes — case-folded, foreign owners unknown", async () => {
     const store = memoryStore();
     expect(
-      await applyScopedWorkflowAdd(store, env.DB, { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" }, { repoName: "DEMO" }),
+      await applyScopedWorkflowAdd(store, env.DB, { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" }, { repoName: "DEMO" }),
     ).toEqual({ outcome: "added" }); // lower_name case-fold
     expect(store.rows).toEqual([{ ownerId: ORG_ID, sourceRepoId: "repo-1", workflowConfigs: {} }]);
     // A duplicate add is the no-op (:153-169) — still "added", still one row.
-    expect(await applyScopedWorkflowAdd(store, env.DB, { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" }, { repoName: "demo" })).toEqual({
+    expect(await applyScopedWorkflowAdd(store, env.DB, { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" }, { repoName: "demo" })).toEqual({
       outcome: "added",
     });
     expect(store.rows).toHaveLength(1);
@@ -443,7 +443,7 @@ describe("applyScopedWorkflowAdd (ScopedWorkflowAdd, :245-280)", () => {
 });
 
 describe("applyScopedWorkflowRequired (ScopedWorkflowSetRequired, :282-349)", () => {
-  const scope = { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" } as const;
+  const scope = { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" } as const;
 
   it("refuses an unregistered source — the not-exist JSONError arm", async () => {
     const store = memoryStore();
@@ -527,11 +527,11 @@ describe("applyScopedWorkflowRequired (ScopedWorkflowSetRequired, :282-349)", ()
 describe("applyScopedWorkflowRemove (ScopedWorkflowRemove, :351-368)", () => {
   it("removes the registration — and answers success for an absent row (no not-found arm)", async () => {
     const store = memoryStore([{ ownerId: ORG_ID, sourceRepoId: "repo-1", workflowConfigs: {} }]);
-    expect(await applyScopedWorkflowRemove(store, { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" }, { repoId: "repo-1" })).toEqual({
+    expect(await applyScopedWorkflowRemove(store, { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" }, { repoId: "repo-1" })).toEqual({
       outcome: "removed",
     });
     expect(store.rows).toEqual([]);
-    expect(await applyScopedWorkflowRemove(store, { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" }, { repoId: "repo-1" })).toEqual({
+    expect(await applyScopedWorkflowRemove(store, { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" }, { repoId: "repo-1" })).toEqual({
       outcome: "removed",
     }); // the silent zero-row delete twin
   });
@@ -557,7 +557,7 @@ describe("findScopedSourceRepoById (GetRepositoryByID's twin)", () => {
 /** A one-source page data fixture — live row + orphan, one required. */
 const pageData: ScopedWorkflowsPageData = {
   ownerId: ORG_ID,
-  redirectLink: "/coalition/settings/actions/scoped-workflows",
+  redirectLink: "/org/coalition/settings/actions/scoped-workflows",
   searchUid: ORG_ID,
   searchExclusive: true,
   searchFullName: false,
@@ -596,7 +596,7 @@ const pageData: ScopedWorkflowsPageData = {
   ],
 };
 
-const ORG_LINK = "/coalition";
+const ORG_LINK = "/org/coalition";
 const PAGE_LINK = `${ORG_LINK}/settings/actions/scoped-workflows`;
 
 describe("ScopedWorkflowsSections (shared/actions/scoped_workflows.tmpl)", () => {
@@ -775,7 +775,7 @@ describe("the drizzle source store through the page arms (the store wave's integ
   it("rides add → GET → required → remove over the REAL table (the full round-trip)", async () => {
     const store = scopedWorkflowSourcesStore(env.DB);
     const reads = treeReads({ ".gitea/scoped_workflows/deploy.yml": DEPLOY_WF });
-    const scope = { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" } as const;
+    const scope = { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" } as const;
 
     // The add resolves within the owner and registers through the real table.
     expect(await applyScopedWorkflowAdd(store, env.DB, scope, { repoName: "demo" })).toEqual({ outcome: "added" });
@@ -843,7 +843,7 @@ describe("the settings page's required flag arms the consumer's refusal (the F3 
       store,
       env.DB,
       () => treeReads({ ".gitea/scoped_workflows/ci.yml": "on: push\njobs: {}\n" }),
-      { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" },
+      { kind: "org", ownerId: ORG_ID, orgLink: "/org/coalition" },
       {
         repoId: "repo-1",
         workflowIds: ["ci.yml"],
@@ -954,7 +954,7 @@ describe("the mounted scoped-workflows routes (the store wave's route-level matr
     // index.test.ts — here only the CLAIMED-ness of the POST tails pins.
     for (const path of [
       "/user/settings/actions/scoped-workflows/add",
-      "/coalition/settings/actions/scoped-workflows/required",
+      "/org/coalition/settings/actions/scoped-workflows/required",
       "/-/admin/actions/scoped-workflows/remove",
     ]) {
       const res = await fetchRoute(path, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN }, body: "" });
@@ -1051,31 +1051,31 @@ describe("the mounted scoped-workflows routes (the store wave's route-level matr
   // -- the ORG scope (web.go:1060 — the require-owner prologue) ---------------
 
   it("org: 303s an anonymous GET, 404-shells a plain member, and serves the owner", async () => {
-    const anon = await getRoute("/coalition/settings/actions/scoped-workflows", null);
+    const anon = await getRoute("/org/coalition/settings/actions/scoped-workflows", null);
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toBe(
-      `/login?redirect_to=${encodeURIComponent("/coalition/settings/actions/scoped-workflows")}`,
+      `/login?redirect_to=${encodeURIComponent("/org/coalition/settings/actions/scoped-workflows")}`,
     );
 
-    const member = await getRoute("/coalition/settings/actions/scoped-workflows", world.bobId);
+    const member = await getRoute("/org/coalition/settings/actions/scoped-workflows", world.bobId);
     expect(member.status).toBe(404);
 
-    const owner = await getRoute("/coalition/settings/actions/scoped-workflows", DOER_ID);
+    const owner = await getRoute("/org/coalition/settings/actions/scoped-workflows", DOER_ID);
     expect(owner.status).toBe(200);
     const html = await owner.text();
     expect(html).toContain('class="page-content organization settings actions"');
-    expect(html).toContain('class="active item" href="/coalition/settings/actions/scoped-workflows"'); // the org fold
-    expect(html).toContain('action="/coalition/settings/actions/scoped-workflows/add"');
+    expect(html).toContain('class="active item" href="/org/coalition/settings/actions/scoped-workflows"'); // the org fold
+    expect(html).toContain('action="/org/coalition/settings/actions/scoped-workflows/add"');
   });
 
   it("org: the owner's add POST registers under the org's owner id and the remove takes it out", async () => {
     const store = scopedWorkflowSourcesStore(env.DB);
-    const added = await postRoute("/coalition/settings/actions/scoped-workflows/add", DOER_ID, { repo_name: "DEMO" });
+    const added = await postRoute("/org/coalition/settings/actions/scoped-workflows/add", DOER_ID, { repo_name: "DEMO" });
     expect(added.status).toBe(303);
-    expect(added.headers.get("location")).toBe("/coalition/settings/actions/scoped-workflows");
+    expect(added.headers.get("location")).toBe("/org/coalition/settings/actions/scoped-workflows");
     expect((await store.listSourcesByOwner(ORG_ID)).map((r) => r.sourceRepoId)).toEqual(["repo-1"]); // the ORG id, case-folded add
 
-    const removed = await postRoute("/coalition/settings/actions/scoped-workflows/remove", DOER_ID, { repo_id: "repo-1" });
+    const removed = await postRoute("/org/coalition/settings/actions/scoped-workflows/remove", DOER_ID, { repo_id: "repo-1" });
     expect(removed.status).toBe(303);
     expect(await store.listSourcesByOwner(ORG_ID)).toEqual([]);
   });

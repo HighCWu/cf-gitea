@@ -177,7 +177,7 @@ export type UserSettingsNavTab =
  *  blocked (committed-unmounted), secrets/variables/runners (landed via
  *  org-settings-actions / org-settings-actions-runners), plus `labels` for
  *  upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 — today the item
- *  links the landed `/{org}/labels` page, which renders no settings nav, so
+ *  links the landed `/org/{org}/settings/labels` page, which renders no settings nav, so
  *  no caller passes it yet). */
 export type OrgSettingsNavTab =
   | "options"
@@ -313,8 +313,9 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
 // ---------------------------------------------------------------------------
 
 /**
- * The shared ORG settings navbar. `orgLink` is `/{org}` (the family's
- * OrgLink); `active` marks the rendered page's tab. `oauth2Enabled` is the
+ * The shared ORG settings navbar. `orgLink` is `/org/{org}` (upstream's
+ * `OrganisationLink`, models/user/user.go:351-355 — the ledger-B3
+ * canonical base every org-family URL builds on); `active` marks the rendered page's tab. `oauth2Enabled` is the
  * W5 navbar gate read (`oauth2FeatureEnabled(c.env)`, the strict-polarity
  * class — absent/true = enabled, only an explicit `false` hides the item;
  * the same polarity `packagesEnabled` carries elsewhere): upstream gates
@@ -340,10 +341,10 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
         <a class={item("hooks")} href={`${props.orgLink}/settings/hooks`}>
           {settingsNavLocale.hooks}
         </a>
-        {/* navbar.tmpl:12-14 — the wave-14 URL divergence: the landed target
-            is `/{org}/labels`, upstream's href is `{.OrgLink}}/settings/
-            labels` (pages/org-settings.tsx's documented reduction). */}
-        <a class={item("labels")} href={`${props.orgLink}/labels`}>
+        {/* navbar.tmpl:12-14 — upstream's href `{.OrgLink}/settings/labels`;
+            the wave-14 URL divergence is retired (ledger B3: the landed
+            target rides the same canonical subtree). */}
+        <a class={item("labels")} href={`${props.orgLink}/settings/labels`}>
           {settingsNavLocale.labels}
         </a>
         {/* navbar.tmpl:15-19 — the item sits inside upstream's

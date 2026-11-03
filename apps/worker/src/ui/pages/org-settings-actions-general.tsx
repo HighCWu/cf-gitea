@@ -9,7 +9,7 @@
  *
  * ## Upstream surface (VERIFIED at the pin)
  *
- *   - `routers/web/web.go:1051-1061` — the org `/{org}/settings` subtree's
+ *   - `routers/web/web.go:1051-1061` — the org `/org/{org}/settings` subtree's
  *     `/actions` group, behind `actions.MustEnableActions` (web.go:1061; at
  *     the OWNER scopes the gate is the instance flags only — ctx.Repo is nil
  *     so the repo-permission arm cannot ride, routers/web/repo/actions/
@@ -392,7 +392,7 @@ export interface OrgActionsGeneralPageDataWithOrg extends OwnerActionsGeneralPag
  *  login round-trip, a signed-in non-owner 404-shells). */
 export function OrgActionsGeneralPage(props: { ctx: UiContext; data: OrgActionsGeneralPageDataWithOrg }) {
   const { ctx } = props;
-  const orgLink = `/${props.data.org.username}`;
+  const orgLink = `/org/${props.data.org.username}`;
   const link = `${orgLink}/settings/actions/general`;
   return (
     <BaseLayout ctx={ctx} title={orgSettingsActionsGeneralLocale.actions} pageClass="">
@@ -610,7 +610,7 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
 // ownership/signed-in settings prologues:
 //
 //   1. THE BARE REDIRECTS (landable today — no store):
-//        GET  /{org}/settings/actions          → 303 Location:
+//        GET  /org/{org}/settings/actions          → 303 Location:
 //              "./actions/general" — upstream's
 //              `misc.LocationRedirect("./actions/general")` (web.go:1052,
 //              misc.go:76-80): the LITERAL relative bytes are the Location
@@ -637,7 +637,7 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
 //   3. THE POST ARMS (the store IS landed — these register the mounted
 //      applier; upstream posts BOTH forms to the page URL itself, `.Link`;
 //      owner_general_settings.tmpl:5/:44):
-//        POST /{org}/settings/actions/general
+//        POST /org/{org}/settings/actions/general
 //        POST /user/settings/actions/general
 //      The applier is applyOwnerActionsGeneralForms (the UpdateGeneral-
 //      Settings port, general.go:100-161 — the add arm's within-owner

@@ -56,19 +56,19 @@
  *
  * ## Mount record
  *
- *   GET  /{org}/settings/actions/runners                       → list
- *   GET  /{org}/settings/actions/runners/{id}                  → edit
- *   POST /{org}/settings/actions/runners/{id}                  → desc
- *   POST /{org}/settings/actions/runners/{id}/update-runner    → flip
- *   POST /{org}/settings/actions/runners/{id}/delete           → del
- *   POST /{org}/settings/actions/runners/reset_registration_token
+ *   GET  /org/{org}/settings/actions/runners                       → list
+ *   GET  /org/{org}/settings/actions/runners/{id}                  → edit
+ *   POST /org/{org}/settings/actions/runners/{id}                  → desc
+ *   POST /org/{org}/settings/actions/runners/{id}/update-runner    → flip
+ *   POST /org/{org}/settings/actions/runners/{id}/delete           → del
+ *   POST /org/{org}/settings/actions/runners/reset_registration_token
  *
  * all behind the shared `resolveOrgTeamsRequest` prologue (the anonymous
  * login 303 + the requireOrgOwnership 404 shell — a signed-in non-owner, and
  * any anonymous request, never reaches a handler) PLUS sameOriginGuard-first
  * POSTs. The literal `reset_registration_token` claims ahead of the {id}
  * combo (chi's static-first dispatch, web.go:507-512's group order). The
- * bare `GET /{org}/settings/actions` stays upstream's LocationRedirect onto
+ * bare `GET /org/{org}/settings/actions` stays upstream's LocationRedirect onto
  * ./actions/general — the general tab is NOT this module's claim (the
  * dispatcher 404-shells it until that slice lands, the secrets/variables
  * twins' posture).
@@ -498,7 +498,7 @@ export function renderOrgActionsRunnersPage(ctx: UiContext, data: OrgActionsRunn
  *  `actions.actions`, runners.go:105). */
 export function OrgActionsRunnersPage(props: { ctx: UiContext; data: OrgActionsRunnersPageData }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   const base = `${orgLink}/settings/actions/runners`;
   return (
     <BaseLayout ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="organization settings actions">
@@ -659,7 +659,7 @@ export function renderOrgActionsRunnerEditPage(ctx: UiContext, data: OrgActionsR
  *  runners_edit.tmpl:1). */
 export function OrgActionsRunnerEditPage(props: { ctx: UiContext; data: OrgActionsRunnerEditPageData }) {
   const { ctx, data } = props;
-  const orgLink = `/${data.org.username}`;
+  const orgLink = `/org/${data.org.username}`;
   const base = `${orgLink}/settings/actions/runners`;
   const runnerLink = `${base}/${data.runner.id}`;
   return (
