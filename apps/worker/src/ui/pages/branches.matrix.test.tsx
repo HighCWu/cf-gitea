@@ -111,9 +111,10 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { ZERO_OID } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
+import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { actionSchedules, deletedBranches, issues, pullRequests, repositories, users } from "../../db/schema";
+import { actionSchedules, deletedBranches, issues, protectedBranches, pullRequests, repositories, users } from "../../db/schema";
 import { settleCreatingRepo } from "../../git-http/gate";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
@@ -890,6 +891,150 @@ describe("w100 rename write (POST /branches/rename)", () => {
     expect((await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).head).toBe("refs/heads/main-two");
     // The switch's delete half ran (the registry row above is gone).
     expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
+  });
+});
+
+// The rename write × protected rules — RenameBranch's tx step 3 (models/git/
+// branch.go:363-390) ported to the UI POST writer (the API PATCH writer's
+// twin lives in api/engine-read.test.ts's rename-protection describe):
+// an EXACT rule named `from` follows the rename in the D1 tail (:369-380 —
+// silent keep when a different rule claims `to` exactly), a plain/glob rule
+// merely MATCHING `from` refuses the rename before the ref surgery
+// (:381-390 — ErrBranchIsProtected, no admin escape, wildcards NEVER
+// rewritten), and the :451-459/:461-468 service gates close the writer gaps
+// (a plain writer renaming a rule-named branch, or onto a protected name).
+// Runs AFTER the default-rename test above: the w100wr fixture then holds
+// main-two/side-two/w100-made and the seeded w100-root site admin.
+describe("w100 rename × protected rules (tx step 3 on the UI writer)", () => {
+  let repoId = "";
+  const refsNow = async (): Promise<string[]> =>
+    (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
+
+  beforeAll(async () => {
+    repoId = (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w100wr"))).get())!.id;
+    await drizzle(env.DB).insert(protectedBranches).values([
+      // The exact-named pair: w100-made follows its rename (test 1);
+      // side-two admin-gates its rename for the plain owner (test 2).
+      {
+        repoId,
+        ruleName: "w100-made",
+        priority: 1,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: false }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      {
+        repoId,
+        ruleName: "side-two",
+        priority: 2,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: false }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      // The glob that MATCHES a branch without naming it: w100-wi* covers
+      // w100-wild (test 4's refusal) and never rewrites.
+      {
+        repoId,
+        ruleName: "w100-wi*",
+        priority: 3,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      // The canPush-off glob the onto-target test keys on (test 3).
+      {
+        repoId,
+        ruleName: "w100-tgt-*",
+        priority: 4,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: false }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+  });
+
+  it("the site admin renames a rule-named branch: the rule follows in the D1 tail, the other rules stand (tx :369-380)", async () => {
+    const before = (await drizzle(env.DB).select().from(protectedBranches).all()).find((rule) => rule.ruleName === "w100-made");
+    expect(before).toBeDefined();
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "w100-made", to: "w100-renamed" }, await cookieFor("w100-root")),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?renamed=w100-renamed`);
+    const refs = await refsNow();
+    expect(refs).not.toContain("refs/heads/w100-made");
+    expect(refs).toContain("refs/heads/w100-renamed");
+    // SAME row (id), name now the new branch, config + updated_unix
+    // untouched (upstream's .Cols("branch_name") update).
+    const after = await drizzle(env.DB).select().from(protectedBranches).all();
+    const moved = after.find((rule) => rule.ruleName === "w100-renamed");
+    expect(moved).toBeDefined();
+    expect(moved?.id).toBe(before?.id);
+    expect(moved?.rules).toBe(serializeRuleConfig({ ...emptyRuleConfig(), canPush: false }));
+    expect(moved?.updatedAt?.getTime()).toBe(before?.updatedAt?.getTime());
+    // The unrelated rules stand exactly as seeded.
+    const names = after.map((rule) => rule.ruleName);
+    expect(names).toContain("side-two");
+    expect(names).toContain("w100-wi*");
+    expect(names).toContain("w100-tgt-*");
+    expect(names).not.toContain("w100-made");
+  });
+
+  it("the plain owner cannot rename a rule-named branch (the :451-459 admin arm — upstream's shared rename_default_or_protected flash)", async () => {
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "side-two", to: "side-three" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=default&name=side-two`);
+    const refs = await refsNow();
+    expect(refs).toContain("refs/heads/side-two");
+    expect(refs).not.toContain("refs/heads/side-three");
+    // The rule row never moved.
+    const names = (await drizzle(env.DB).select({ ruleName: protectedBranches.ruleName }).from(protectedBranches).all()).map((row) => row.ruleName);
+    expect(names).toContain("side-two");
+    expect(names).not.toContain("side-three");
+  });
+
+  it("the plain writer cannot rename ONTO a protected name (:461-468 — the CanUserPush gate this writer lacked)", async () => {
+    await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/main-two`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/main-two`, { new_branch_name: "w100-src" }, await cookieFor(OWNER)),
+    );
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "w100-src", to: "w100-tgt-x" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=protected&name=w100-src`);
+    const refs = await refsNow();
+    expect(refs).toContain("refs/heads/w100-src");
+    expect(refs).not.toContain("refs/heads/w100-tgt-x");
+  });
+
+  it("a wildcard rule matching the OLD name refuses the rename (tx :381-390 — no admin escape upstream) and the pattern is never rewritten", async () => {
+    await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/main-two`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/main-two`, { new_branch_name: "w100-wild" }, await cookieFor(OWNER)),
+    );
+    // The OWNER session runs it (the refusal has no admin escape upstream);
+    // the target w100-clear matches NO rule, so the :461-468 gate above
+    // passes and what fires is the tx's IsBranchProtected arm.
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "w100-wild", to: "w100-clear" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=protected&name=w100-wild`);
+    const refs = await refsNow();
+    expect(refs).toContain("refs/heads/w100-wild");
+    expect(refs).not.toContain("refs/heads/w100-clear");
+    // The pattern stands verbatim — substitution never happens upstream.
+    const names = (await drizzle(env.DB).select({ ruleName: protectedBranches.ruleName }).from(protectedBranches).all()).map((row) => row.ruleName);
+    expect(names).toContain("w100-wi*");
+    expect(names).not.toContain("w100-clear");
+    expect(names).not.toContain("w100-wild");
   });
 });
 

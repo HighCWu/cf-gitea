@@ -37,10 +37,13 @@ import {
   canUserDelete,
   canUserPush,
   compileRuleName,
+  findRuleByName,
   isUserMergeWhitelisted,
   listRepoRules,
   parseRuleConfig,
   principalAccessOf,
+  renameProtectedRuleName,
+  renameRefusedByProtection,
   ruleMatches,
   type PrincipalAccess,
   type ProtectedBranchRow,
@@ -71,7 +74,11 @@ import type { MiddlewareHandler } from "hono";
  *     pull request target branch";
  *   - PATCH renames create-then-delete (the engine has no rename primitive);
  *     renaming the default branch updates meta.head via setHead + the D1
- *     default_branch column, admin-gated (upstream RenameBranch).
+ *     default_branch column, admin-gated (upstream RenameBranch); the tx's
+ *     step-3 protected-rule arms port too — an exact-named rule follows the
+ *     rename in the D1 tail, a plain/glob rule matching the old name (with
+ *     no exact-named rule) refuses the rename before the ref surgery
+ *     (models/git/branch.go:363-390).
  *
  * Declared responses mirror the vendored contract exactly. RUNTIME-ONLY code
  * the handlers can still emit (undeclared; the orchestrator-owned
@@ -792,12 +799,22 @@ export function registerBranchRoutes(
         principalAccessOf(c.env.DB, pair.repo, viewerOf(c).requester),
         listRepoRules(c.env.DB, pair.repo.id),
       ]);
-      const fromNamedRule = renameRules.find((rule) => rule.ruleName === oldName);
-      if ((isDefault || fromNamedRule !== undefined) && !renameAccess.admin) {
+      const fromNamedRule = findRuleByName(renameRules, oldName);
+      if ((isDefault || fromNamedRule !== null) && !renameAccess.admin) {
         throw new ApiError(403, "User must be a repo or site admin to rename default or protected branches.");
       }
       const toRule = firstMatchRule(renameRules, newName);
       if (toRule !== null && !(await canUserPush(c.env.DB, parseRuleConfig(toRule.rules), renameAccess))) {
+        throw new ApiError(403, "Failed to rename branch due to branch protection rules.");
+      }
+      // RenameBranch tx step 3's refuse arm (models/git/branch.go:381-390):
+      // with NO exact rule named `from`, a plain/glob rule that MATCHES the
+      // old name aborts the rename — ErrBranchIsProtected, the same 403 body
+      // as the to-gate above. No admin escape (unlike :461-468, upstream's
+      // IsBranchProtected refusal is unconditional); wildcards are NEVER
+      // rewritten. Our engine surgery has no tx rollback, so the refusal
+      // runs before the ref mutation (upstream: inside the tx, before step 4).
+      if (renameRefusedByProtection(renameRules, oldName, fromNamedRule)) {
         throw new ApiError(403, "Failed to rename branch due to branch protection rules.");
       }
 
@@ -832,6 +849,17 @@ export function registerBranchRoutes(
           .set({ defaultBranch: newName })
           .where(eq(repositories.id, pair.repo.id));
       }
+
+      // RenameBranch tx step 3's rewrite arm (models/git/branch.go:369-380):
+      // a rule exactly named `from` follows the rename in place (rule_name
+      // column only — upstream's .Cols("branch_name") update leaves
+      // updated_unix at the admin's last deliberate edit), skipped silently
+      // when a DIFFERENT rule already claims the new name exactly (upstream
+      // leaves the old-name rule dangling there). Upstream runs this INSIDE
+      // the tx before the git action; ours rides the D1 tail after the ref
+      // surgery — a D1 failure leaves the rule on the old name (the same
+      // partial-rename window the engine/D1 split discloses elsewhere).
+      await renameProtectedRuleName(c.env.DB, renameRules, fromNamedRule, newName);
 
       // Webhook: upstream fires DeleteRef(from) → CreateRef(to, the shared
       // tip) on a rename (services/repository/branch.go:492-493) — the same

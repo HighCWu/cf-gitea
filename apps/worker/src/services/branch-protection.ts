@@ -79,6 +79,16 @@
  * allowlist column": the port scrubs all SIX user and SIX team arrays —
  * upstream's five-array sweep predates the bypass allowlist and misses
  * bypass_allowlist_user_ids/team_ids (:654–668).
+ *
+ * BRANCH-RENAME INTERPLAY — the RenameBranch tx step-3 port (models/git/
+ * branch.go:363-390): findRuleByName is GetProtectedBranchRuleByName's EXACT
+ * equality (case-sensitive on D1, unlike plain-name matching); the two
+ * rename writers (routes/branches.ts PATCH, ui/index.ts POST) call
+ * renameRefusedByProtection BEFORE the engine ref surgery (a plain/glob rule
+ * matching the old name with no exact-named rule is ErrBranchIsProtected —
+ * wildcards are never rewritten) and renameProtectedRuleName in the D1 tail
+ * (the exact-named rule renames in place unless a different rule claims the
+ * new name — the silent keep upstream leaves dangling).
  */
 
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
@@ -481,12 +491,7 @@ export async function listRepoRules(d1: D1Database, repoId: string): Promise<Pro
  */
 export async function findRule(d1: D1Database, repoId: string, branchName: string): Promise<ProtectedBranchRow | null> {
   const rules = await listRepoRules(d1, repoId);
-  for (const rule of rules) {
-    if (ruleMatches(compiledOf(rule), branchName)) {
-      return rule;
-    }
-  }
-  return null;
+  return firstMatchInList(rules, branchName);
 }
 
 /**
@@ -497,6 +502,79 @@ export async function findRule(d1: D1Database, repoId: string, branchName: strin
 export function matchedBranchNamesForRule(ruleName: string, branchNames: readonly string[]): string[] {
   const compiled = compileRuleName(ruleName);
   return branchNames.filter((name) => ruleMatches(compiled, name));
+}
+
+// ---------------------------------------------------------------------------
+// The branch-rename interplay (RenameBranch's tx step 3, models/git/branch.go
+// :363-390). Upstream's tx answers exactly one of three ways for the rules:
+//   - an EXACT rule named `from` exists → rename that rule's name in place,
+//     unless a DIFFERENT rule already claims `to` exactly (:369-380 — the
+//     silent keep; upstream leaves the old-name rule dangling);
+//   - no exact rule, but SOME rule (plain or glob) MATCHES `from` → the whole
+//     rename tx aborts with ErrBranchIsProtected (:381-390 — no admin
+//     escape; wildcards are NEVER rewritten, a pattern containing the old
+//     name is a refusal, not a substitution);
+//   - neither → the rename proceeds untouched by the rules.
+// The split mirrors the split upstream forces on us: the refusal must fire
+// BEFORE our engine create-then-delete (no tx rollback), the rewrite rides
+// the D1 tail after the ref surgery — so the arms are separate functions the
+// two rename writers call around their mutation.
+// ---------------------------------------------------------------------------
+
+/**
+ * GetFirstMatchProtectedBranchRule over a LOADED list (the pure half of
+ * `findRule` — callers holding the rules from the pre-gates skip the re-read;
+ * the sort order of `listRepoRules` is preserved by iteration).
+ */
+export function firstMatchInList(rules: readonly ProtectedBranchRow[], branchName: string): ProtectedBranchRow | null {
+  for (const rule of rules) {
+    if (ruleMatches(compiledOf(rule), branchName)) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+/**
+ * GetProtectedBranchRuleByName (protected_branch.go:370-380) over a loaded
+ * rules list — the EXACT rule-name lookup: upstream is a raw SQL equality on
+ * `branch_name`, case-sensitive on SQLite/D1 (BINARY collation; plain-name
+ * MATCHING folds case, this lookup does not). Returns null (upstream's
+ * nilnil) when no rule carries the name.
+ */
+export function findRuleByName(rules: readonly ProtectedBranchRow[], ruleName: string): ProtectedBranchRow | null {
+  return rules.find((rule) => rule.ruleName === ruleName) ?? null;
+}
+
+/**
+ * The step-3 refuse arm (:381-390): with NO exact rule named `from`, a rule
+ * that MATCHES the old name aborts the rename (ErrBranchIsProtected — the
+ * 403/flash arm the writers map). An exact-named `from` NEVER takes this arm
+ * (upstream's else-branch — the rewrite arm below owns that case).
+ */
+export function renameRefusedByProtection(rules: readonly ProtectedBranchRow[], from: string, namedFrom: ProtectedBranchRow | null): boolean {
+  return namedFrom === null && firstMatchInList(rules, from) !== null;
+}
+
+/**
+ * The step-3 rewrite arm (:369-380): when `from` IS a rule's exact name, the
+ * rule renames in place (`rule_name` from → to — upstream's `.Cols(
+ * "branch_name")` update touches ONLY the name column; updated_unix keeps
+ * the admin's last deliberate edit, the same posture the deletion scrub's
+ * rewriteRuleConfig documents). The rewrite is SKIPPED — silently, exactly
+ * like upstream — when a DIFFERENT rule already claims `to` exactly (the
+ * UNIQUE(repo_id, rule_name) pair both stores guard); upstream's
+ * `existingRule.ID == protectedBranch.ID` self-match arm is carried for the
+ * case-insensitive-collation shapes its MySQL backend can produce. `rules`
+ * is the caller's pre-surgery snapshot (rules rows do not change across the
+ * engine mutation). Returns whether the row moved.
+ */
+export async function renameProtectedRuleName(d1: D1Database, rules: readonly ProtectedBranchRow[], namedFrom: ProtectedBranchRow | null, to: string): Promise<boolean> {
+  if (namedFrom === null) return false;
+  const existing = findRuleByName(rules, to);
+  if (existing !== null && existing.id !== namedFrom.id) return false;
+  await drizzle(d1).update(protectedBranches).set({ ruleName: to }).where(eq(protectedBranches.id, namedFrom.id));
+  return true;
 }
 
 // ---------------------------------------------------------------------------

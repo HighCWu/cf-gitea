@@ -1122,13 +1122,92 @@ describe("branch rename protection (upstream RenameBranch — services/repositor
     expect((await send(`${REPO_PATH}/branches/solo-named`, authed({ method: "GET" }))).status).toBe(200);
   });
 
-  it("the repo admin (owner) still renames a rule-named branch (branch.go:451 'admins are allowed to modify them')", async () => {
+  it("the repo admin (owner) still renames a rule-named branch (branch.go:451 'admins are allowed to modify them') — and tx step 3 rewrites the rule name in place (:369-380)", async () => {
     expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "admin-named" }))).status).toBe(201);
+    const before = (await drizzle(env.DB).select().from(protectedBranches).all()).find((rule) => rule.ruleName === "admin-named");
+    expect(before).toBeDefined();
     const res = await send(`${REPO_PATH}/branches/admin-named`, jsonInit("PATCH", { name: "admin-named-2" }));
     expect(res.status).toBe(204);
     const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
     expect(tips.has("refs/heads/admin-named")).toBe(false);
     expect(tips.has("refs/heads/admin-named-2")).toBe(true);
+    // The rewrite arm: the rule row followed the rename — SAME row (id), the
+    // name now the new branch, the config JSON and updated_unix untouched
+    // (upstream's .Cols("branch_name") update names only the rule column).
+    const after = await drizzle(env.DB).select().from(protectedBranches).all();
+    const moved = after.find((rule) => rule.ruleName === "admin-named-2");
+    expect(moved).toBeDefined();
+    expect(moved?.id).toBe(before?.id);
+    expect(moved?.rules).toBe(serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }));
+    expect(moved?.updatedAt?.getTime()).toBe(before?.updatedAt?.getTime());
+    // The unrelated rules stand exactly as seeded (solo-named from the
+    // beforeAll, release-* from the delete-protection suite).
+    expect(after.filter((rule) => rule.ruleName === "admin-named")).toHaveLength(0);
+    expect(after.some((rule) => rule.ruleName === "solo-named")).toBe(true);
+    expect(after.some((rule) => rule.ruleName === "release-*")).toBe(true);
+  });
+
+  it("a DIFFERENT exact rule claiming the target name keeps BOTH rules (the silent :375 arm — the old-name rule is left dangling)", async () => {
+    // keep-a and keep-b are both rule names, only keep-a is a branch: the
+    // rename lands (the target rule canPush-es for the admin) but upstream
+    // skips the rewrite when another rule owns `to` exactly — the keep-a
+    // rule stays dangling on the dead name, the keep-b rule untouched.
+    await drizzle(env.DB).insert(protectedBranches).values([
+      {
+        repoId,
+        ruleName: "keep-a",
+        priority: 5,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      {
+        repoId,
+        ruleName: "keep-b",
+        priority: 6,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "keep-a" }))).status).toBe(201);
+    const res = await send(`${REPO_PATH}/branches/keep-a`, jsonInit("PATCH", { name: "keep-b" }));
+    expect(res.status).toBe(204);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(tips.has("refs/heads/keep-b")).toBe(true);
+    const names = (await drizzle(env.DB).select({ ruleName: protectedBranches.ruleName }).from(protectedBranches).all()).map((row) => row.ruleName);
+    expect(names.filter((name) => name === "keep-a")).toHaveLength(1);
+    expect(names.filter((name) => name === "keep-b")).toHaveLength(1);
+    expect(names).not.toContain("keep-a-2");
+  });
+
+  it("a wildcard rule matching the OLD name refuses the rename — even for the admin (tx :381-390's ErrBranchIsProtected, no rewrite of the pattern)", async () => {
+    // No rule is exactly named wild-move, but wild-* MATCHES it: upstream's
+    // else-arm aborts the tx with ErrBranchIsProtected — unconditional (the
+    // admin escape exists only on the :451/:461 service gates above), and
+    // the pattern is NEVER rewritten to follow the branch.
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId,
+      ruleName: "wild-*",
+      priority: 7,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "wild-move" }))).status).toBe(201);
+    // The TO side also matches wild-* (canPush: true → the :461-468 gate
+    // passes for the admin), so the refusal below is the tx :381-390 arm.
+    const res = await send(`${REPO_PATH}/branches/wild-move`, jsonInit("PATCH", { name: "wild-open" }));
+    expect(res.status).toBe(403);
+    expect((await jsonBody(res)).message).toBe("Failed to rename branch due to branch protection rules.");
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(tips.has("refs/heads/wild-move")).toBe(true);
+    expect(tips.has("refs/heads/wild-open")).toBe(false);
+    // The pattern stands verbatim — substitution never happens upstream.
+    const names = (await drizzle(env.DB).select({ ruleName: protectedBranches.ruleName }).from(protectedBranches).all()).map((row) => row.ruleName);
+    expect(names).toContain("wild-*");
+    expect(names).not.toContain("wild-open");
+    expect(names).not.toContain("wild-move");
   });
 
   it("writer renaming the DEFAULT branch: 403 (branch.go:443-447) — runs last: a regression mutates the repo", async () => {

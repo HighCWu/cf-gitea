@@ -991,3 +991,85 @@ runs-page filter joins the same class: a bogus non-empty param filters
 the repo-level rows; our TEXT space cannot syntactically separate junk
 from a candidate id — the empty set IS upstream's answer for a
 numeric-but-nonexistent source).
+
+## As-built — the branch-rename protected-rule arm (2026-11-03)
+
+§2.3(b)'s rename half closes here: both rename writers now run RenameBranch's
+tx step 3 (models/git/branch.go:363-390) through the rule service. Upstream's
+step-3 semantics at the pin `fc4936884584`, derived from the tx and its
+service wrapper (services/repository/branch.go:416-496):
+
+- **Exact-name rules rename in place** (:369-380): `GetProtectedBranchRuleByName`
+  (protected_branch.go:370-380) is a raw SQL equality on the `branch_name`
+  column — case-SENSITIVE on SQLite/D1 (plain-name MATCHING folds case, this
+  lookup does not; upstream's MySQL collation would fold it, and the tx's
+  `existingRule.ID == protectedBranch.ID` self-match arm exists for that
+  collation shape — carried verbatim in the port). The rule's name column
+  updates from→to with `.Cols("branch_name")` — ONLY the name: updated_unix
+  keeps the admin's last deliberate edit (the same posture the deletion
+  scrub's config-only rewrite documents). When a DIFFERENT rule already
+  claims `to` exactly, the rewrite is SKIPPED SILENTLY (:375's else) — the
+  old-name rule is left dangling; both stores' UNIQUE(repo_id, rule_name)
+  pair is what the check guards.
+- **Wildcard patterns are NEVER rewritten** (:381-390): with no exact-named
+  rule for `from`, ANY rule (plain or glob) that MATCHES the old name aborts
+  the whole tx with ErrBranchIsProtected — there is no substitution inside
+  patterns and NO ADMIN ESCAPE on this arm (the admin escapes live on the
+  service gates :451-459 and, via CanUserPush, :461-468). A branch protected
+  only by a glob simply cannot be renamed upstream.
+- **Protected tags: the tx never touches them.** The full step sweep is
+  branch row (:342), default branch (:354), the protected-rule arm (:363),
+  unmerged-PR base/head strings (:393/:401), the renamed-branches log row
+  (:408), the git action (:417) — no protected_tag table step, so nothing to
+  port there.
+- **User-visible feedback: none for the rewrite.** The service returns `msg`
+  only for target_exist/from_not_exist; the exact-rule rewrite is silent and
+  the success flash is generic. The refusals surface as the 403
+  "Failed to rename branch due to branch protection rules." (API,
+  routers/api/v1/repo/branch.go:521-522) / the
+  `repo.branch.rename_protected_branch_failed` flash (web,
+  routers/web/repo/setting/protected_branch.go:410-412); the :451-459 admin
+  arm shares the `rename_default_or_protected_branch_error` message with the
+  default-branch arm (:443-447).
+
+**Landed (the unit's files):**
+
+- `services/branch-protection.ts` — the step-3 pair: `findRuleByName`
+  (GetProtectedBranchRuleByName over a loaded list — the exact equality),
+  `renameRefusedByProtection` (the :381-390 arm as a pure predicate over the
+  pre-gates' rules snapshot) and `renameProtectedRuleName` (the :369-380 arm
+  — the conditional `rule_name`-only update, silent keep included);
+  `firstMatchInList` extracts findRule's pure half so the writers answer
+  from the snapshot the gates already loaded. The refusal/rewrite split
+  mirrors the split upstream forces on us: upstream runs the whole arm
+  inside the tx (refusal aborts before step 4); our engine create-then-
+  delete has no tx rollback, so the refusal fires BEFORE the ref surgery and
+  the rewrite rides the D1 tail after it — a D1 failure there leaves the
+  rule on the old name, the same partial-rename window the default-branch
+  tail already discloses.
+- `api/routes/branches.ts` (PATCH writer) — the refuse arm added after the
+  landed :461-468 to-gate (same 403 body), the rewrite in the D1 tail before
+  the webhook pair; the landed exact-lookup gate now goes through
+  findRuleByName.
+- `ui/index.ts` (POST writer, branchRenameSubmit) — the writer's missing
+  gates ported in upstream's order so the two writers cannot drift: the
+  :451-459 admin arm (flash kind `default` — upstream's shared
+  rename_default_or_protected message), the :461-468 CanUserPush gate (new
+  flash kind `protected` — the rename_protected_branch_failed message), the
+  :381-390 refuse arm (same kind), the rewrite in the D1 tail after the
+  default-branch fixup. Recorded posture: this writer keys BOTH admin arms
+  on the site-admin flag, following the landed :443-447 pin in the same
+  handler (upstream keys perm.IsAdmin(), repo-admin — the API writer ports
+  that faithfully via principalAccessOf's admin); the branches page renders
+  no rename_error flashes yet, so the kinds ride the landed redirect
+  convention (?rename_error=kind&name=from) until the page's flash block
+  lands.
+- Tests — `api/engine-read.test.ts`: the admin rename pins the rewrite
+  (same row id, config JSON and updated_unix byte-identical, unrelated rules
+  standing), the different-exact-rule silent keep (:375), and the wildcard
+  refusal for the admin (:381-390's unconditional arm, pattern verbatim);
+  `ui/pages/branches.matrix.test.tsx`: the same trio on the UI writer — the
+  rewrite round-trip (site-admin session over the w100wr fixture), the
+  rule-named admin refusal (flash redirect, refs + rule unchanged), the
+  onto-protected-name refusal (:461-468 — the bypass this port closes), and
+  the wildcard refusal with the pattern never rewritten.

@@ -698,6 +698,16 @@ import { drizzle } from "drizzle-orm/d1";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
+import {
+  canUserPush,
+  findRuleByName,
+  firstMatchInList,
+  listRepoRules,
+  parseRuleConfig,
+  principalAccessOfRow,
+  renameProtectedRuleName,
+  renameRefusedByProtection,
+} from "../services/branch-protection";
 import { repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
@@ -9312,6 +9322,37 @@ async function branchRenameSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
     // Upstream RenameBranch's admin-only default arm (branch.go:443-447).
     return fail("default");
   }
+  // Upstream's remaining protection gates + tx step 3, in upstream's order
+  // (services/repository/branch.go:451-468, models/git/branch.go:363-390) —
+  // the API PATCH writer's gates (routes/branches.ts) ported to this UI
+  // writer so the two cannot drift:
+  //   :451-459  an EXACT rule named `from` needs admin — upstream's
+  //             rename_default_or_protected message covers BOTH admin arms,
+  //             so the landed "default" flash kind above carries this one
+  //             too (keyed on the same site-admin flag the landed :443
+  //             arm pins — upstream keys perm.IsAdmin(), repo-admin; the
+  //             SPEC's as-built records the posture);
+  //   :461-468  renaming ONTO a rule-matched name the doer cannot push to
+  //             → ErrBranchIsProtected;
+  //   tx :381-390  no exact rule named `from`, but a plain/glob rule
+  //             MATCHES it → refuse (wildcards are NEVER rewritten). Both
+  //             refusals share upstream's rename_protected_branch_failed
+  //             flash ("protected"). The engine surgery below has no tx
+  //             rollback, so every refusal runs BEFORE the ref mutation
+  //             (upstream: inside the tx, before step 4).
+  const renameRules = await listRepoRules(c.env.DB, repo.id);
+  const fromNamedRule = findRuleByName(renameRules, from);
+  if (fromNamedRule !== null && !viewer.isAdmin) {
+    return fail("default");
+  }
+  const renameAccess = await principalAccessOfRow(c.env.DB, repo, { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin });
+  const toRule = firstMatchInList(renameRules, to);
+  if (toRule !== null && !(await canUserPush(c.env.DB, parseRuleConfig(toRule.rules), renameAccess))) {
+    return fail("protected");
+  }
+  if (renameRefusedByProtection(renameRules, from, fromNamedRule)) {
+    return fail("protected");
+  }
   const cell = engineCell(c.env, pair.repo);
   const created = await cell.commitApiChange({ ref: branchRef(to), expectedOldOid: ZERO_OID, newOid: tip.target });
   if (created.tag !== "committed") {
@@ -9341,6 +9382,15 @@ async function branchRenameSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
     await productionSetDefaultBranch(c.env)(repo.id, to);
     await switchSchedulesToDefaultBranch(c.env, { ...repo, defaultBranch: to }, from);
   }
+  // The step-3 rewrite tail (models/git/branch.go:369-380): a rule exactly
+  // named `from` follows the rename (rule_name only — upstream's
+  // .Cols("branch_name") update leaves updated_unix at the admin's last
+  // deliberate edit), skipped silently when a DIFFERENT rule already claims
+  // `to` exactly (upstream leaves the old-name rule dangling). Upstream runs
+  // this inside the tx before the git action; ours rides the D1 tail after
+  // the ref surgery — a D1 failure leaves the rule on the old name (the same
+  // partial-rename window the default tail above discloses).
+  await renameProtectedRuleName(c.env.DB, renameRules, fromNamedRule, to);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?renamed=${encodeURIComponent(to)}` } }));
 }
 
