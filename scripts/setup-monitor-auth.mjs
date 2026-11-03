@@ -409,6 +409,14 @@ const persistAuth = async (filePath, auth, verdicts) => {
     },
   };
   const data = `${JSON.stringify(doc, null, 2)}\n`;
+  // Pre-tighten BEFORE the write: writeFile's mode option applies only at
+  // CREATION, so a pre-existing loose (e.g. 0644) file would receive the
+  // token bytes before the post-write chmod closes the window (FY2's nit).
+  try {
+    await fsp.chmod(filePath, 0o600);
+  } catch {
+    // Not existing yet — the creation-mode below covers it.
+  }
   await fsp.writeFile(filePath, data, { mode: 0o600 });
   await fsp.chmod(filePath, 0o600); // enforce even when the file pre-existed with a looser mode
   const st = await fsp.stat(filePath);
