@@ -1138,3 +1138,66 @@ never cited as suite-green (ADR-0006):
   `moveIssueToColumn(project, …)`).
 - The original_author DEFER-vs-LAND decision (§7.2) — the port unit's SPEC
   record states the choice; FN-9 remains the family carrier if deferred.
+
+## 9. FN-9 disposition — the original_author family: RECORD (intentional-recorded-absent)
+
+**Status: RECORD. Nothing to build; no migration is planned.** Derived by
+the FN-9 derivation-prep unit (GN, 2026-11-03) from the upstream pin
+`fc4936884584`; the full writer/reader matrix with file:line cites lives
+in `docs/research/table-alignment-audit.md` §7.11 (the normative
+column-level disposition). This section is the SPEC carrier per the
+FN-13 supersession rule (a divergence is intentional only once a SPEC
+records it).
+
+**The record.** Upstream's `original_author`/`original_author_id` pair
+(`issue`, `comment`, `review`, `reaction`, `release`) has exactly one
+writer: the forge-metadata migration importer's `remapUser`
+(`services/migrations/gitea_uploader.go:1007-1022`), reached through each
+struct's `RemapExternalUser` (issue.go:720-724, comment.go:1279-1283,
+review.go:1086-1090, reaction.go:91-95, release.go:495-499). It writes
+`("", 0)` for authors mapped to local users (the clear arm, :1020) or
+`(externalName, externalID)` for unmapped external authors (:1022); no
+native create/edit path ever writes the pair, so the mark is permanent.
+Every upstream reader (`ToAuthor`'s ghost fallback
+`services/convert/user.go:53-58` and its eight call sites; the
+`HasOriginalAuthor` role gates; the reaction pseudo-user and delete
+guards, reaction.go:221-233) keys off non-empty values and degrades to
+the plain local arm when the pair is `("", 0)`.
+
+Our surface has no forge-metadata importer and its single entry point
+refuses one: SPEC-0009 §1 scopes `POST /api/v1/repos/migrate` as
+git-data-only and records the forge-metadata migration as an
+out-of-scope deferral; §2.2 makes the refusal contractual (`422`
+"metadata migration is not supported for this service", implemented
+`src/services/migrate.ts:185-194`, pinned by
+`src/services/migrate.test.ts:574`). No SPEC, ledger, roadmap row, or
+open question schedules the importer. No reader exists here either
+(grep 0; our renders go straight to the poster row). With no writer that
+can ever fire and observable parity at the empty-columns arm, porting
+the columns would add permanently-NULL state — **the family is
+intentional-recorded-absent, not port-when-read**: the two arms share one
+trigger (imported content existing), and that trigger belongs to the
+deferred SPEC-0009 forge-metadata extension, not to an FN-9 port unit.
+
+Consequently:
+
+- **FN-2 resolution (§7.2's decision point, §7.7's open item): DEFER
+  wins.** The `comments.original_author`/`original_author_id` pair stays
+  out of FN-2's migration and out of every plan; the FN-2 port unit's
+  SPEC record cites this section. §4's comment-entry verdict cells for
+  the pair (port-when-read) are superseded by audit §7.11's record.
+- **The `issues` twin (schema.ts:676-678, present-but-unwritten) is
+  RESERVED, not dead drift** — same ground (no importer surface), house
+  precedent SPEC-0009's `lfs_enabled`/`lfs_endpoint` "created now and
+  reserved" (0009 §1 + §3.1). Kept: dropping two all-NULL columns costs a
+  table-rebuild migration to remove state that the importer extension
+  would re-add. §3.2's `issues` DDL line (:503-504) carries the pair;
+  this section adds its unwritten-by-design ground.
+- **The port trigger, named:** if the forge-metadata migration surface
+  is ever SPEC'd, that SPEC owns the family end-to-end — the additive
+  NULLable pairs on `comment`/`review`/`reaction`/`release` (verifying
+  the `issues` twin), the `remapUser`-equivalent writer, the `ToAuthor`
+  ghost arm at the poster render seams, and the reaction delete guards
+  + dedup-key widening (reaction.go:221-233; reaction.go:63-70). Until
+  that SPEC exists, the absence of the family is the recorded, correct
+  state.

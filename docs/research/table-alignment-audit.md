@@ -878,10 +878,23 @@ applies).
   monotonic index; pairs with the documented `commit_status_index`
   TODO in `api/services/commit-status.ts:88-91`). API-visible: upstream
   emits the per-sha index as the status `id`.
-- **FN-9: the original_author family.** `releases`, `reactions`,
-  `pull_reviews` each missing `original_author` + `original_author_id`
-  (release.go:75-76, reaction.go:70-71, review.go:131-132) — upstream's
-  columns for migrated/federated authorship. Additive NULLable ports.
+- **FN-9: the original_author family.** **STATUS: DISPOSITIONED as
+  intentional-recorded-absent (2026-11-03, §7.11 + SPEC-0005 §9 RECORD) —
+  the row is closed as a record; no migration is planned.** `releases`,
+  `reactions`, `pull_reviews` each missing `original_author` +
+  `original_author_id` (release.go:74-75, reaction.go:69-70,
+  review.go:130-131 — the original cites :75-76/:70-71/:131-132 were off
+  by one) — upstream's columns for migrated authorship, whose ONLY writer
+  is the forge-metadata migration importer's `RemapExternalUser` remap
+  (§7.11: every write path flows through
+  `services/migrations/gitea_uploader.go` `remapUser`). Our surface has
+  no importer (SPEC-0009 §1 out-of-scope bullet; §2.2 — the migrate
+  endpoint answers `422` on the metadata flags; implemented
+  `src/services/migrate.ts:185-194`, pinned by
+  `src/services/migrate.test.ts:574`) and no reader (grep 0), so a port
+  would add permanently-NULL state. The `issues` twin pair
+  (schema.ts:676-678, present-but-unwritten) is recorded RESERVED by the
+  same record.
 - **FN-10: issue_pins + issue_labels pk completion.** `issue_pins`: add
   `id`, `is_pull` (issue_pin.go:19,22) and settle the inverted
   nullability on `repo_id`/`issue_id`; `issue_labels`: add `id`
@@ -1307,3 +1320,166 @@ touches a pairing). The table-specific drift-column figure drops
 69 → 65: §4 now carries 32 MISSING + 21 RENAME + 5 OURS-EXTRA + 7 TYPE
 structural lines outside the `repositories` subsection (+1
 `issues.title` RENAME, −5 for the withdrawn false RENAMEs).
+
+### 7.11 FN-9 disposition — the original_author family is intentional-recorded-absent (FN-9 unit GN, 2026-11-03)
+
+The open question (§5's FN-9 row as dispatched): is the `original_author`
++ `original_author_id` family port-when-read or intentionally absent?
+Both arms were derived from the tree's own records; the verdict below is
+**intentional-recorded-absent**, and this §7.11 is the column-level
+disposition (SPEC-0005 §9 is the SPEC carrier, per FN-13's supersession
+rule — SPEC records own the divergence, ADR-0007's own test).
+
+**1. The upstream writer matrix — one writer, five surfaces, importer
+only.** Every write of the family is the `ExternalUserRemappable`
+implementation on each struct (`models/user/external_login_user.go:72-76`
+defines the interface), and every caller is the repo-migration
+uploader's `remapUser` (`services/migrations/gitea_uploader.go:1007-1022`)
+— the forge-metadata importer. No native create/edit path writes the
+pair (grep over `models/ services/ routers/ modules/` at the pin: the
+only `OriginalAuthor =` assignments are the five remaps plus
+`InsertReviews`'s struct copy, review.go:668-669, itself reachable only
+from the importer, gitea_uploader.go:975):
+
+| upstream table | fields (cite) | writer | remapUser call sites |
+|---|---|---|---|
+| `issue` | issue.go:61-62 | `Issue.RemapExternalUser` issue.go:720-724 | gitea_uploader.go:432 (issue), :583, :815 (PR issue) |
+| `comment` | comment.go:280-281 | `Comment.RemapExternalUser` comment.go:1279-1283 | gitea_uploader.go:549 (comment), :967 (review comment) |
+| `review` | review.go:130-131 | `Review.RemapExternalUser` review.go:1086-1090 | gitea_uploader.go:897 (review) |
+| `reaction` | reaction.go:69-70 | `Reaction.RemapExternalUser` reaction.go:91-95 | gitea_uploader.go:445 (issue), :559 (comment), :825 (PR) |
+| `release` | release.go:74-75 | `Release.RemapExternalUser` release.go:495-499 | gitea_uploader.go:299 (release) |
+
+**Lifecycle (the clear arm).** `remapUser` resolves the source author
+first: a mapped LOCAL user writes `("", 0)` plus the local id
+(`target.RemapExternalUser("", 0, userID)`, gitea_uploader.go:1020) — the
+columns are actively CLEARED; an unmapped external author writes
+`(externalName, externalID)` with `PosterID = g.doer.ID` (the migrating
+user, :1022). After import nothing touches the pair again (no other
+writer exists), so the "migrated-author" mark is permanent; `HasOriginalAuthor`
+(comment.go:1295-1298, issue.go:736-739) reads it as name ≠ "" AND id ≠ 0.
+
+**2. The upstream reader matrix — every arm keys off non-empty, and every
+arm degrades to the plain local arm when the pair is `("", 0)`.**
+
+- API renders: `ToAuthor`'s ghost fallback — originalAuthor "" → plain
+  `ToUser(poster)` (services/convert/user.go:53-58), fed at
+  convert/issue.go:53 (issue Poster), issue_comment.go:21,89 (comment
+  Poster), pull_review.go:26,107 (review Reviewer / comment Poster),
+  convert/release.go:31 (release Publisher), routers/api/v1/repo/
+  issue_reaction.go:90,303 (reaction User).
+- Web templates: `comments_authorlink.tmpl:1-4` + the avatar gate
+  `comments_avatarlink.tmpl:1`; `comments.tmpl:19,31,34,360,401`,
+  review name `:606-609`; issue header `view_content.tmpl:6,18,21`;
+  issue-list/card last-event labels `shared/issuelist.tmpl:53-54`,
+  `issue/card.tmpl:28-29`; reviewer sidebar `sidebar/reviewer_list.tmpl:96`;
+  release list `release/list.tmpl:49`.
+- Role/attribution gates: `roleDescriptor`'s `hasOriginalAuthor` arm —
+  migrated posters get no role badge (routers/web/repo/issue_view.go:47-49,
+  called :708, :808, :1127); `IsPoster` requires
+  `OriginalAuthorID == 0` (issue.go:437-439); migrated PRs render with
+  posterID 0 (issue_page_meta.go:384-385); label-comment merge guard
+  compares the name (issue_view.go:234).
+- Review aggregation: external reviewers keyed by `OriginalAuthorID`,
+  ghost-id rows disambiguated by name (models/issues/review_list.go:181-192);
+  review requests refused on migrated issues (`OriginalAuthorID == 0`
+  gates, services/issue/review_request.go:90,102); feed reviewer name
+  (services/feed/notifier.go:294-296).
+- Reaction arms: `HasUser` guard (reaction.go:257-263, the check :262),
+  user-id collection skips external rows (:278-282), `LoadUsers`
+  fabricates the "name(ServiceType)" pseudo-user (newMigrationOriginalUser
+  :287-290, used at :308-309), and the
+  issue/comment DELETE arms carry `original_author_id = 0` so a doer
+  cannot delete a migration-seeded row by id coincidence
+  (reaction.go:221-233; the release arm has no guard, :247-251 — ours
+  documents exactly this split, api/services/release-reactions.ts:108-112).
+
+**3. Our surface — no writer can fire, and no reader exists.**
+
+- Writer: our only migration surface is `POST /api/v1/repos/migrate`
+  (SPEC-0009), which is git-data-only by record: SPEC-0009 §1 scopes it
+  "git-data-only migration (no forge metadata)" and puts the forge-
+  metadata migration (issues/PRs/labels/milestones/releases/reviews) in
+  OUT-OF-SCOPE as a documented deferral (0009 §1, the first out-of-scope
+  bullet); §2.2 makes the refusal contractual — `issues/milestones/
+  labels/pull_requests/releases` set true answer `422` "metadata
+  migration is not supported for this service" (:135-143), implemented
+  `src/services/migrate.ts:185-194` and pinned by
+  `src/services/migrate.test.ts:574`. No other spec, ledger row, roadmap
+  row, or open question schedules the importer (grep over `specs/ docs/`:
+  SPEC-0009 is the sole mention; its §6 open questions track push mirrors
+  and webhook naming, not metadata migration; milestones M1-M4 contain
+  none).
+- Reader: grep 0 — no `originalAuthor` read in `src/api/`, `src/services/`,
+  `src/git-http/`; renders go straight to the poster row
+  (`toPoster`, api/services/issues.ts:259-267, feeding the issue render
+  :726 and the comment renders :879, :1343, :1417) with no ghost arm.
+- Presence: `issues` already carries the pair UNWRITTEN
+  (schema.ts:676-678, "Mirrored importer fields");
+  `pull_reviews`' table docstring already RECORDS the omission ground for
+  its table ("no cf-gitea migration surface writes reviews",
+  schema.ts:2491-2493); `comments`/`reactions`/`releases` carry no
+  counterpart (§4 rows, unchanged).
+
+**4. Verdict: intentional-recorded-absent.** Ground, explicitly: (a) the
+columns' only writer is the forge-metadata migration importer (§7.11 §1 —
+every write path flows through `remapUser`); (b) our surface has no
+importer and its single entry point refuses metadata migration with `422`
+(SPEC-0009 §1/§2.2, implemented + tested); (c) no tree record schedules
+the importer — the deferral carries no SPEC number, no open-question
+entry, no milestone; (d) observable parity holds at the empty-columns arm:
+100% of our rows are locally authored, every upstream reader falls to the
+plain local arm when the pair is `("", 0)` (§7.11 §2), and `ToAuthor("")`
+≡ `ToUser(poster)` — the render ours ships today. Porting the pair now
+would add permanently-NULL/0 state whose writer never runs: port-when-read
+and recorded-absent collapse into the same trigger (a reader needs
+non-empty values only if imported content exists), so the honest
+classification is the one that CLOSES the backlog row rather than parks
+it. The port trigger is named regardless: if the forge-metadata migration
+surface is ever SPEC'd (a SPEC-0009 extension), THAT SPEC owns the family
+— additive NULLable pairs on `comment`/`review`/`reaction`/`release`
+(plus verifying the `issues` twin), the `remapUser`-equivalent writer,
+and the reader arms below. FN-9 is not a waiting unit.
+
+**5. The trigger rider (what the importer SPEC would carry; our landing
+points, pre-derived):** the `ToAuthor` ghost arm rides the poster render
+seams (issues.ts:259-267 + the four call sites above; reviews
+api/routes/pull-reviews.ts:458 `ToPullReview`; releases
+api/services/releases.ts:961-963 — ours already Ghost-renders missing
+publishers); the reaction DELETE arms gain upstream's
+`original_author_id = 0` guard (reaction.go:221-233; ours is guardless
+today, api/services/issue-extras.ts:116-132 — vacuously correct while the
+column is absent); the reactions dedup key widens by the pair (upstream's
+UNIQUE(s) spans 7 columns, reaction.go:63-70; ours
+`onConflictDoNothing` targets 5, issue-extras.ts:109-110,
+release-reactions.ts:105-109); the role/attribution gates port only with
+the web surfaces they serve. This is a rider on the future SPEC, not a
+plan — nothing here is scheduled.
+
+**6. The `issues` twin (present-but-unwritten) is NOT dead drift —
+recorded RESERVED.** Ground: (a) the same no-importer record (§7.11 §3);
+(b) the house precedent — SPEC-0009 already creates columns ahead of
+their writer and calls it out (`lfs_enabled`/`lfs_endpoint` "created now
+and reserved", 0009 §1 + §3.1 table row); (c) the schema comment already
+names the ground ("Mirrored importer fields", schema.ts:676) and
+SPEC-0005 §3.2's DDL line carries the pair (:503-504). SPEC-0005 §9
+records it normatively. No removal: dropping two NULL columns costs a
+table-rebuild migration to delete state that costs nothing and that the
+importer SPEC would re-add. No flag for the next schema unit beyond the
+SPEC record itself.
+
+**7. Census-owner flags (NOT acted — those cells are the cite-audit
+owner's).** With this record standing, three tables whose ONLY §4 drift
+lines are this family are candidates to reclassify drift →
+intentional-recorded at the next cite-audit pass: `review` (§4 :569-575),
+`reaction` (:576-582), `release` (:583-589) — `comment` keeps its drift
+verdict on FN-2's five remaining columns. If folded, the Headline tally
+moves 46/23/26/22 → 46/26/23/22 (117 ✓; ours-extras 12 unchanged). The
+§4 subsections' missing-column lines also carry the family's off-by-one
+cites (review.go:131-132 → :130-131; reaction.go:70-71 → :69-70;
+release.go:75-76 → :74-75 — field lines verified at the pin this unit);
+the FN-9 backlog row's cites are corrected in place (see §5).
+
+**8. FN-2's decision point resolves.** SPEC-0005 §7.2's land-or-defer
+choice and §7.7's open item close on DEFER: the pair stays out of FN-2's
+migration, and the "family carrier" FN-9 named there is this record, not
+a future port unit. The FN-2 port unit's SPEC record cites SPEC-0005 §9.
