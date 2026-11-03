@@ -358,7 +358,9 @@ describe("GET /repos/search (repoSearch)", () => {
     ["?mode=source", 3],
     ["?mode=fork", 0],
     ["?mode=mirror", 0],
-    ["?mode=collaborative", 0],
+    // collaborative without uid: upstream skips the OwnerID block
+    // (repo_list.go:406) — the mode degrades to its Mirror=false half.
+    ["?mode=collaborative", 3],
   ])("applies mode %s against the fork-free registry", async (query, expected) => {
     const alice = await seedUser("Alice");
     await seedRepo(alice.usernameLower, "aaa");
@@ -399,13 +401,14 @@ describe("GET /repos/search (repoSearch)", () => {
     const unknownUid = await router()("/repos/search?uid=9999");
     expect(unknownUid.headers.get("X-Total-Count")).toBe("0");
 
-    // starredBy/team_id/topic: no backing tables (SPEC-0005) → empty matches
+    // starredBy/team_id/topic ride their landed tables now — these are the
+    // honest miss arms over an unstarred, team-less, topic-less registry.
     const starredBy = await router()(`/repos/search?starredBy=${alice.id}`);
-    expect(starredBy.headers.get("X-Total-Count")).toBe("0");
+    expect(starredBy.headers.get("X-Total-Count")).toBe("0"); // alice starred nothing
     const team = await router()("/repos/search?team_id=1");
-    expect(team.headers.get("X-Total-Count")).toBe("0");
+    expect(team.headers.get("X-Total-Count")).toBe("0"); // no team 1
     const topic = await router()("/repos/search?q=aaa&topic=true");
-    expect(topic.headers.get("X-Total-Count")).toBe("0");
+    expect(topic.headers.get("X-Total-Count")).toBe("0"); // repo aaa has no topics
 
     // template/archived: no rows match `true` (registry has neither)
     const template = await router()("/repos/search?template=true");

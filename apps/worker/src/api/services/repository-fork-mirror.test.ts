@@ -20,12 +20,14 @@
  *
  * Also pins the `/repos/search` `mode` arms the landed columns un-stub
  * (upstream repo.go:163-176 → repo_list.go:500-513): fork / mirror /
- * source filter their columns; `collaborative` still matches nothing.
- * The template/archived tri-state filters over the landed `is_template`/
- * `is_archived` columns (repo.go:155-157/181-183 → repo_list.go:391-393/
- * 520-522) and the `original_url` render (`SanitizedOriginalURL`,
- * convert/repository.go:215 → models/repo/repo.go:227-234) are pinned the
- * same way.
+ * source filter their columns; `collaborative` degrades to "not mirrors"
+ * without `uid` (upstream skips the OwnerID block at uid=0). The other
+ * search filters (topic/starredBy/team_id/uid-collaborate) have their own
+ * matrix suite (repository-search-filters.test.ts). The template/archived
+ * tri-state filters over the landed `is_template`/`is_archived` columns
+ * (repo.go:155-157/181-183 → repo_list.go:391-393/520-522) and the
+ * `original_url` render (`SanitizedOriginalURL`, convert/repository.go:215
+ * → models/repo/repo.go:227-234) are pinned the same way.
  */
 
 import { env } from "cloudflare:workers";
@@ -336,7 +338,7 @@ describe("toApiRepository — plain repos and the sync fork boolean", () => {
 });
 
 describe("/repos/search mode arms over the landed fork/mirror columns", () => {
-  it("mode=fork / mode=mirror / mode=source filter their columns; collaborative stays empty", async () => {
+  it("mode=fork / mode=mirror / mode=source filter their columns; collaborative degrades to not-mirrors without uid", async () => {
     const owner = await seedVerifiedUser({ username: "SearchOwner" });
     const baseId = await seedRepo(owner.id, "searchowner", "base", "public");
     await seedRepo(owner.id, "searchowner", "plain", "public");
@@ -356,11 +358,15 @@ describe("/repos/search mode arms over the landed fork/mirror columns", () => {
     expect(sourceMode.total).toBe(2);
     expect(sourceMode.items.map((p) => p.repo.slug).sort()).toEqual(["base", "plain"]);
 
+    // collaborative without uid: upstream skips the whole OwnerID block
+    // (repo_list.go:406), so `mode=collaborative` alone degrades to its
+    // Mirror=false half — everything except the mirror.
     const collaborative = await searchRepositories(env.DB, anonymous, {
       ...searchOpts,
       mode: "collaborative",
     });
-    expect(collaborative.total).toBe(0);
+    expect(collaborative.total).toBe(3);
+    expect(collaborative.items.map((p) => p.repo.slug).sort()).toEqual(["base", "forkling", "plain"]);
   });
 });
 

@@ -1,9 +1,11 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql, type SQL } from "drizzle-orm";
+import type { AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
 import {
   orgMembers,
+  releases,
   repoCollaborators,
   repoMirrors,
   repositories,
@@ -23,6 +25,7 @@ import { collaboratorModeOf } from "./repo-collaborators";
 import { renderGoDuration } from "./mirror";
 import type { RepoSettings } from "./repo-settings";
 import { listFollowers, listFollowing, type FollowViewer } from "./follows";
+import type { EngineReads } from "./engine";
 
 /**
  * Repo-metadata reads backing the tier-1 `Repository` routes (SPEC-0004
@@ -68,10 +71,23 @@ export function apiRepositoryUrl(pair: RepositoryWithOwner, origin: string): str
 }
 
 /** A repository row paired with its owner's user row (inner join — org-owned
- * repositories have no users row yet and stay invisible until orgs land). */
+ * repositories have no users row yet and stay invisible until orgs land).
+ * The two optional counts are the pair carrier for the serializer's live
+ * counters (`toApiRepository` renders them; a producer that did not resolve
+ * them leaves them unset and the wire shows the 0 default): */
 export interface RepositoryWithOwner {
   repo: RepositoryRow;
   owner: UserRow;
+  /** Non-draft, non-tag release rows (`release_counter`; upstream
+   * `db.Count[Release]` per serialize, services/convert/repository.go:161-166 —
+   * attached by `toApiRepositoryFull` and by the list services' correlated
+   * subquery). */
+  releaseCount?: number;
+  /** Branch count (`branch_count`; upstream `git_model.CountBranches` over
+   * the persisted `branch` cache table, models/git/branch.go:555-561 —
+   * attached by `toApiRepositoryFull` when the caller hands it the engine
+   * read slice; lists stay at the 0 default, see toApiRepositoryFull). */
+  branchCount?: number;
 }
 
 /**
@@ -711,8 +727,9 @@ export async function toApiRepositoryFull(
   pair: RepositoryWithOwner,
   settings?: RepoSettings,
   teamMode?: TeamAccessMode | null,
+  engine?: Pick<EngineReads, "listRefs">,
 ): Promise<Repository> {
-  const [parent, mirrorRow, licenseRows] = await Promise.all([
+  const [parent, mirrorRow, licenseRows, releaseCount, branchCount] = await Promise.all([
     resolveParentRepository(d1, viewer, pair.repo),
     pair.repo.isMirror ? findMirrorByRepoId(d1, pair.repo.id) : Promise.resolve(null),
     // Upstream resolves topics with the row itself (the denormalized column,
@@ -721,14 +738,67 @@ export async function toApiRepositoryFull(
     // single-repo AND list). The license arm rides this full resolver; the
     // query-flat list paths keep `[]` (see toApiRepository).
     getRepoLicenses(d1, pair.repo.id),
+    // Upstream counts releases per serialize (repository.go:161-166,
+    // FindReleasesOptions{IncludeDrafts: false, IncludeTags: false} — the
+    // live db.Count): one indexed COUNT here covers the single-repo wire;
+    // the list services fold the same count into their page query (see
+    // searchRepositories).
+    countVisibleReleases(d1, pair.repo.id),
+    // Upstream counts branches over its persisted `branch` cache table
+    // (CountBranches, branch.go:555) — a D1-borne counter, free at read
+    // time. Ours has no cache table (schema lane), so the real number costs
+    // one engine listRefs read: resolved ONLY here, on the single-repo GET,
+    // when the caller hands in the engine reads (routes/repo.ts passes
+    // `engineReads(c.env, found)`). Lists never pay it (a page of N rows
+    // would be N DO roundtrips — cost upstream does not pay either, its
+    // number is cache-borne); they render the 0 default (the documented
+    // list-shape divergence family). The refs/heads filter mirrors the
+    // branches route's listRefs shape (routes/branches.ts). `engineReads`
+    // resolves transport failures to null — a missing/empty engine cell
+    // counts 0, never throws.
+    engine === undefined
+      ? Promise.resolve(undefined)
+      : engine
+          .listRefs()
+          .then((refs) => (refs?.refs ?? []).filter((ref) => ref.name.startsWith("refs/heads/")).length),
   ]);
-  return toApiRepository(viewer, pair, settings, teamMode, {
-    parent,
-    mirrorRow,
-    // RepoLicenseList.StringList (license.go:30-35): the rows' license
-    // strings 1:1 — duplicates stay, the ASC order is the read's order.
-    licenses: licenseRows.map((row) => row.license),
-  });
+  return toApiRepository(
+    viewer,
+    // The pair copy carries the resolved live counters into the serializer
+    // (the caller's object is not mutated).
+    { ...pair, releaseCount, branchCount },
+    settings,
+    teamMode,
+    {
+      parent,
+      mirrorRow,
+      // RepoLicenseList.StringList (license.go:30-35): the rows' license
+      // strings 1:1 — duplicates stay, the ASC order is the read's order.
+      licenses: licenseRows.map((row) => row.license),
+    },
+  );
+}
+
+/** The release count the wire's `release_counter` renders (upstream
+ * `db.Count[repo_model.Release]` with `FindReleasesOptions{IncludeDrafts:
+ * false, IncludeTags: false}`, services/convert/repository.go:161-166 —
+ * releases.go ToConds: `is_draft = false AND is_tag = false`). Drafts are
+ * unpublished (published_unix 0) and pure tag rows carry no release
+ * metadata (SPEC-0005 §2.3) — neither counts. */
+export async function countVisibleReleases(d1: D1Database, repoId: string): Promise<number> {
+  const rows = await drizzle(d1)
+    .select({ value: sql<number>`count(*)` })
+    .from(releases)
+    .where(and(eq(releases.repoId, repoId), eq(releases.isDraft, false), eq(releases.isTag, false)));
+  return Number(rows[0]?.value ?? 0);
+}
+
+/** The correlated-scalar form of `countVisibleReleases` for list pages: one
+ * indexed subquery per row INSIDE the existing page query (no extra
+ * roundtrip) — upstream pays the same per-row cost as N separate db.Count
+ * calls on lists; ours folds them into the one query. */
+export function releaseCountSubquery(repoId: SQL | AnySQLiteColumn): SQL<number> {
+  return sql<number>`(SELECT COUNT(*) FROM ${releases} WHERE ${releases.repoId} = ${repoId} AND ${releases.isDraft} = 0 AND ${releases.isTag} = 0)`;
 }
 
 /**
@@ -879,14 +949,39 @@ export function toApiRepository(
     stars_count: row.numStars,
     forks_count: row.numForks,
     watchers_count: row.numWatches,
-    branch_count: 0, // TODO(SPEC-0001/0005): engine refs snapshot count
+    // Upstream `BranchCount: int(branchCount)` (services/convert/repository.go:222
+    // ← git_model.CountBranches, models/git/branch.go:555-561): a COUNT over
+    // upstream's PERSISTED `branch` cache table (is_deleted=false) — not a
+    // live git walk; the cache is maintained at push time. Our branches are
+    // engine-borne (R2/DO) with no D1 cache table (schema lane), so the real
+    // number costs one listRefs DO roundtrip — carried per repo by producers
+    // that resolved it (toApiRepositoryFull when handed the engine reads;
+    // see there), the 0 default elsewhere (the documented list-shape
+    // divergence family, same as the mirror schedule fields below).
+    branch_count: pair.branchCount ?? 0,
     // SPEC-0005 §3.2 maintained counters (updated by the issue/PR services).
     open_issues_count: row.numIssues,
     open_pr_counter: row.numPulls,
-    release_counter: 0, // TODO(SPEC-0005): releases table
+    // Upstream `Releases: int(numReleases)` (services/convert/repository.go:166
+    // — db.Count over FindReleasesOptions{IncludeDrafts: false, IncludeTags:
+    // false}): the LIVE count of non-draft, non-tag release rows — upstream
+    // runs it per serialize (single GETs AND lists). Our releases table
+    // carries the same is_draft/is_tag columns, so the pair's resolved count
+    // (toApiRepositoryFull's COUNT arm; the list services' correlated
+    // subquery — one indexed scalar per row inside the page query) renders
+    // it; producers that skipped the read keep the 0 default.
+    release_counter: pair.releaseCount ?? 0,
     default_branch: row.defaultBranch,
     created_at: createdIso,
-    updated_at: createdIso, // TODO(SPEC-0005): updated_unix column (starts == created)
+    // Upstream `Updated: repo.UpdatedUnix.AsTime()` (services/convert/
+    // repository.go:228) — the maintained column, stamped by the push settles
+    // (git-http/gate.ts .set({ ..., updatedAt: new Date() })), the lifecycle
+    // writes (rename/transfer/status), and the import settle. Our column is
+    // nullable (SQLite forbids non-constant ALTER ADD COLUMN defaults), so
+    // rows that never recorded a stamp render the creation instant — the
+    // same value the row shows in created_at, and what a fresh upstream row
+    // (created == updated) renders too.
+    updated_at: (row.updatedAt ?? row.createdAt).toISOString(),
     archived: row.isArchived,
     // FN-4: `ArchivedAt: repo.ArchivedUnix.AsTime()` (convert/repository.go:229)
     // — the SetArchiveRepoState stamp (archiver.go:160-162: now on archive, 0
@@ -1119,8 +1214,9 @@ export interface RepositoryListOptions {
  * Sort/order validation mirroring upstream `ResolveSortOrder` +
  * `repo_model.OrderByMap` (routers/api/v1/utils/sort.go): order is validated
  * only when `sort` is set, invalid values are 422s with Go-%q messages
- * (`JSON.stringify` matches %q for plain words). Sorts backed by columns the
- * D1 registry does not have yet (`updated`, `size`, `git_size`, `lfs_size`,
+ * (`JSON.stringify` matches %q for plain words). `updated` sorts the real
+ * `updated_at` column (upstream SearchOrderByLeastUpdated/RecentUpdated);
+ * sorts still backed by missing columns (`size`, `git_size`, `lfs_size`,
  * `stars`, `forks`) resolve to id order — CORRECTED (the fixed-id-seed
  * wave's CAST probe): `CAST(uuid AS INTEGER)` is NOT equal-zero (it parses
  * the leading digits — '550e…'→550, '123e…'→123, letters→0), so the id
@@ -1149,6 +1245,20 @@ export function repositoryOrderBy(sort: string, order: string): SQL[] {
     case "id":
       return [ascending ? asc(castIdNumber()) : desc(castIdNumber()), ascending ? asc(repositories.id) : desc(repositories.id)];
     case "updated":
+      // Upstream "updated_unix ASC|DESC" (OrderByMap → db.SearchOrderByLeast-
+      // Updated / SearchOrderByRecentUpdated, models/db/search.go:17-18) over
+      // the real column. Ours is nullable (the ALTER ADD COLUMN no-default
+      // constraint), so never-stamped rows coalesce to created_at — the same
+      // stamp the wire renders for a null column (upstream needs no coalesce:
+      // updated_unix is NOT NULL there). Without the coalesce, SQLite's
+      // NULLs-first ASC / NULLs-last DESC would also happen to order them
+      // "least updated", but the coalesce keeps the sort key IDENTICAL to
+      // the rendered field.
+      return [
+        ascending
+          ? asc(updatedSortKey())
+          : desc(updatedSortKey()),
+      ];
     case "size":
     case "git_size":
     case "lfs_size":
@@ -1169,6 +1279,12 @@ export function repositoryOrderBy(sort: string, order: string): SQL[] {
 /** Upstream orders by the int64 id; our text id sorts numerically via CAST. */
 function castIdNumber(): SQL {
   return sql`CAST(${repositories.id} AS INTEGER)`;
+}
+
+/** The `sort=updated` key: the mutation stamp, falling back to creation for
+ * the nullable pre-column rows — the exact value `updated_at` renders. */
+function updatedSortKey(): SQL {
+  return sql`COALESCE(${repositories.updatedAt}, ${repositories.createdAt})`;
 }
 
 /**
@@ -1247,6 +1363,86 @@ function teamGrantCondition(userId: number): SQL {
   )`;
 }
 
+/**
+ * The `/repos/search` `team_id` arm (repo.go:146 → repo_list.go:451-453):
+ * upstream is a plain `id IN (SELECT repo_id FROM team_repo WHERE team_id =
+ * ?)` with no mode check. Ours carries the same effective-grant shape as
+ * `teamGrantCondition` — the units collapse (upstream stores the real modes
+ * in `team_unit` and drops `authorize`; ours folds them into `units_map`) and
+ * the includes-all union the teams reads apply (repos created after the last
+ * fan-out have no materialized row) — so the filter never surfaces a repo the
+ * per-repo seam would 404. The searcher needs NO membership: visibility of
+ * each hit rides the base conditions (an anonymous caller gets the team's
+ * public repos only).
+ */
+function teamIdGrantsCondition(teamId: number): SQL {
+  return sql`EXISTS (
+    SELECT 1 FROM teams t
+    WHERE t.id = ${teamId}
+      AND t.org_id = ${repositories.ownerId}
+      AND (
+        t.authorize <> 'none'
+        OR EXISTS (
+          SELECT 1 FROM json_each(t.units_map) ju
+          WHERE ju.value IN ('read', 'write', 'admin', 'owner')
+        )
+      )
+      AND (
+        t.includes_all_repositories = 1
+        OR EXISTS (
+          SELECT 1 FROM team_repo_access tra
+          WHERE tra.team_id = t.id AND tra.repo_id = ${repositories.id}
+        )
+      )
+  )`;
+}
+
+/**
+ * The collaborate arm's third edge (repo_list.go:430 via
+ * `userOrgPublicRepoCondPrivate`, :342-356): public repos of PRIVATE
+ * organizations the uid belongs to (`org_members`; any membership counts,
+ * hidden or not — upstream joins `org_user` with no `is_public` filter).
+ */
+function publicInPrivateOrgCondition(userId: number): SQL {
+  return sql`(${repositories.visibility} = 'public' AND EXISTS (
+    SELECT 1 FROM org_members om
+    JOIN users org ON org.id = om.org_id
+    WHERE om.user_id = ${userId}
+      AND om.org_id = ${repositories.ownerId}
+      AND org.type = 'org' AND org.visibility = 'private'
+  ))`;
+}
+
+/**
+ * The `/repos/search` Collaborate=true arm (repo_list.go:415-437): repos the
+ * uid does NOT own but reaches as
+ *  - a collaborator (`collaboratorGrantCondition` — upstream's access-table
+ *    arm collapses onto it: access.go:225-251 keeps `access` = collaborators
+ *    ∪ team members, so the landed `repo_collaborators` row IS that edge),
+ *  - a team member of a granting team (`teamGrantCondition` —
+ *    `UserOrgTeamRepoCond`), or
+ *  - a member of a private org whose public repos are arm three above.
+ * In a public-only search (`!includePrivate` — upstream `!opts.Private`)
+ * the hidden-membership exclusion (:433-435) additionally drops every repo
+ * owned by an org where the uid's membership is `is_public=false`, so a
+ * public search cannot leak collaboration through a hidden org membership.
+ */
+function collaborateCondition(uid: number, usernameLower: string, includePrivate: boolean): SQL {
+  const arms = and(
+    ne(repositories.ownerNamespace, usernameLower),
+    or(collaboratorGrantCondition(uid), teamGrantCondition(uid), publicInPrivateOrgCondition(uid)),
+  ) as SQL;
+  if (includePrivate) {
+    return arms;
+  }
+  return and(
+    arms,
+    sql`${repositories.ownerId} NOT IN (
+      SELECT om.org_id FROM org_members om WHERE om.user_id = ${uid} AND om.is_public = 0
+    )`,
+  ) as SQL;
+}
+
 export interface RepoSearchOptions extends RepositoryListOptions {  keyword: string;
   topicOnly: boolean;
   includeDesc: boolean;
@@ -1269,21 +1465,28 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
 }
 
 /**
- * `/repos/search` mirroring `repo_model.SearchRepositoryCondition` on the
- * D1-only registry. Documented divergences (columns/tables that do not exist
- * yet — all TODO(SPEC-0005)):
- *  - `includeDesc`: no description column — keyword matches name only.
- *  - `topic=true`: no topics table — keyword never matches, results empty.
- *  - `starredBy`: no stars table — always empty.
- *  - `team_id`: no teams — always empty.
+ * `/repos/search` mirroring `repo_model.SearchRepositoryCondition`
+ * (repo_list.go:365-556) on the D1-only registry. The four former
+ * always-no-match filters ride their landed tables since this port:
+ * `topic=true` over `repo_topics` (exact-equality needles; upstream
+ * repo_list.go:455-491), `starredBy` over `stars` (:396-398), `team_id` over
+ * `teams`/`team_repo_access` (:451-453, effective-grant shape), and
+ * `mode=collaborative` over the Collaborate=true arm (:405-449). Remaining
+ * documented divergences:
+ *  - `includeDesc`: the description column landed (migration 0068) but the
+ *    keyword arm has not been re-based onto it yet — keyword matches names
+ *    and topics only (TODO: the includeDesc port).
  *  - `mode`: fork/mirror/source filter the landed columns (upstream
  *    repo.go:163-176 → repo_list.go:500-513): `fork` ≡ `is_fork` (our
  *    `fork_parent IS NOT NULL`), `mirror` ≡ `is_mirror`, `source` ≡ neither.
- *    `collaborative` (`is_mirror=false` + the collaborator edge upstream)
- *    still matches nothing — no collaborator edges (TODO below).
- *  - `template`/`archived`: the landed columns filter both directions —
- *    upstream repo.go:155-157/181-183 → repo_list.go:391-393/520-522.
- *  - `priority_owner_id`: implemented as a CASE-WHEN ordering prefix.
+ *    `collaborative` sets `is_mirror=false` (repo.go:172-174) plus the
+ *    Collaborate=true arm when `uid` is set — without `uid` upstream skips
+ *    the whole OwnerID block (repo_list.go:406), so bare `mode=collaborative`
+ *    degrades to "not mirrors".
+ *  - keyword needles: upstream matches with SQL LIKE (`%`/`_` act as
+ *    wildcards); ours uses instr() because D1 caps LIKE patterns at 50 bytes
+ *    (the documented user-search precedent, services/user.ts:81-97) —
+ *    needles match literally.
  */
 export async function searchRepositories(
   d1: D1Database,
@@ -1326,46 +1529,99 @@ export async function searchRepositories(
       break;
     case "collaborative":
       // Upstream: is_mirror=false AND Collaborate=true (repo.go:172-174) —
-      // the collaborator edge the list WHERE does not model yet.
-      conditions.push(noMatch);
+      // the Collaborate half rides the uid block below; without uid the
+      // whole OwnerID block is skipped (repo_list.go:406), so this arm
+      // alone degrades to "not mirrors".
+      conditions.push(eq(repositories.isMirror, false));
       break;
     case "":
       break;
   }
   if (opts.starredBy > 0) {
-    conditions.push(noMatch); // TODO(SPEC-0005): stars table
+    // repo.go:151 → repo_list.go:396-398. No permission gate on the starer:
+    // upstream filters purely by the `star` join for ANY caller (anonymous
+    // included) — a private-profile user's stars surface only the repos the
+    // searcher can already see (the base conditions do that gating).
+    conditions.push(
+      sql`EXISTS (
+        SELECT 1 FROM stars s
+        WHERE s.repo_id = ${repositories.id} AND s.user_id = ${opts.starredBy}
+      )`,
+    );
   }
   if (opts.teamId > 0) {
-    conditions.push(noMatch); // TODO(SPEC-0005): teams
+    conditions.push(teamIdGrantsCondition(opts.teamId));
   }
   if (opts.uid > 0) {
-    // Ownership is the only "owns or contributes to" edge that exists.
     const uidUser = await findUserById(d1, opts.uid);
-    conditions.push(uidUser === null ? noMatch : eq(repositories.ownerNamespace, uidUser.usernameLower));
+    if (uidUser === null) {
+      conditions.push(noMatch);
+    } else {
+      // The Collaborate tri-state (repo_list.go:405-449): `exclusive` =
+      // Some(false) → owned only (repo.go:159-161); `mode=collaborative` =
+      // Some(true) → the collaborate arm only (repo.go:172-174); the
+      // default (None) is ValueOrDefault(true) → owned OR collaborates.
+      const owns = eq(repositories.ownerNamespace, uidUser.usernameLower);
+      if (opts.exclusive) {
+        conditions.push(owns);
+      } else {
+        const collaborate = collaborateCondition(
+          opts.uid,
+          uidUser.usernameLower,
+          opts.includePrivate,
+        );
+        conditions.push(opts.mode === "collaborative" ? collaborate : (or(owns, collaborate) as SQL));
+      }
+    }
   }
-  if (opts.topicOnly) {
-    conditions.push(noMatch); // TODO(SPEC-0005): topics table
-  } else if (opts.keyword !== "") {
-    // Comma-separated keywords, case-insensitive substring match on the repo
-    // name; "owner/repo" (exactly one slash) also matches owner+name pairs.
-    // TODO(SPEC-0005): description column for includeDesc. NOT LIKE: D1 caps
-    // LIKE patterns at 50 bytes, so a long `?q=` part threw D1_ERROR and the
-    // route answered a plain 500. The substrings go through instr() instead
-    // — the documented user-search precedent (services/user.ts:81-97, the
-    // org-members 943e1e9 shape). The needles pre-lower for the
-    // case-insensitive pair (owner_namespace/slug are stored lowercase).
+  if (opts.keyword !== "") {
+    // Upstream keyword arm (repo_list.go:455-491): the comma-split needles
+    // match TOPIC names first — exact equality under `topic=true` (the
+    // needle lowercased; topics are stored lowercase), substring otherwise —
+    // and without `topic=true` the repo-name arms join the OR. `topic=true`
+    // with NO keyword adds no condition at all: every visible repo passes
+    // (upstream only builds this block for a non-empty keyword).
+    // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long `?q=` part
+    // threw D1_ERROR and the route answered a plain 500. The substrings go
+    // through instr() instead — the documented user-search precedent
+    // (services/user.ts:81-97, the org-members 943e1e9 shape); upstream's
+    // LIKE wildcards (`%`/`_`) match literally here. The needles pre-lower
+    // for the case-insensitive pairs (owner_namespace/slug/repo_topics.topic
+    // are stored lowercase).
     const keywordConditions: SQL[] = [];
     for (const part of opts.keyword.split(",")) {
-      keywordConditions.push(sql`instr(${repositories.slug}, ${part.toLowerCase()}) > 0`);
-      const slash = part.indexOf("/");
-      if (slash > 0 && part.indexOf("/", slash + 1) === -1) {
+      const needle = part.toLowerCase();
+      keywordConditions.push(
+        opts.topicOnly
+          ? sql`EXISTS (
+              SELECT 1 FROM repo_topics rt
+              WHERE rt.repo_id = ${repositories.id} AND rt.topic = ${needle}
+            )`
+          : sql`EXISTS (
+              SELECT 1 FROM repo_topics rt
+              WHERE rt.repo_id = ${repositories.id} AND instr(rt.topic, ${needle}) > 0
+            )`,
+      );
+    }
+    if (!opts.topicOnly) {
+      for (const part of opts.keyword.split(",")) {
+        keywordConditions.push(sql`instr(${repositories.slug}, ${part.toLowerCase()}) > 0`);
+      }
+      // The "owner/repo" pair arm splits the WHOLE keyword once and is
+      // skipped whenever team_id is set (repo_list.go:477: `opts.TeamID == 0
+      // && strings.Count(opts.Keyword, "/") == 1` — a team search pins the
+      // owner context, so the owner half would double-filter).
+      if (opts.teamId === 0 && (opts.keyword.match(/\//g) ?? []).length === 1) {
+        const slash = opts.keyword.indexOf("/");
         keywordConditions.push(
           and(
-            sql`instr(${repositories.ownerNamespace}, ${part.slice(0, slash).toLowerCase()}) > 0`,
-            sql`instr(${repositories.slug}, ${part.slice(slash + 1).toLowerCase()}) > 0`,
+            sql`instr(${repositories.ownerNamespace}, ${opts.keyword.slice(0, slash).toLowerCase()}) > 0`,
+            sql`instr(${repositories.slug}, ${opts.keyword.slice(slash + 1).toLowerCase()}) > 0`,
           ) as SQL,
         );
       }
+      // TODO(SPEC-0005): the description match for includeDesc — the column
+      // landed (migration 0068) but this arm has not been re-based onto it.
     }
     conditions.push(or(...keywordConditions) as SQL);
   }
@@ -1391,7 +1647,14 @@ export async function searchRepositories(
   }
 
   const items = await db
-    .select({ repo: repositories, owner: users })
+    .select({
+      repo: repositories,
+      owner: users,
+      // The wire's release_counter rides the page query as one indexed
+      // scalar subquery per row (releaseCountSubquery — the same live
+      // non-draft/non-tag count upstream runs per serialize).
+      releaseCount: releaseCountSubquery(repositories.id),
+    })
     .from(repositories)
     .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
     .where(where)
@@ -1399,7 +1662,14 @@ export async function searchRepositories(
     .limit(opts.limit)
     .offset((opts.page - 1) * opts.limit);
 
-  return { items, total };
+  return {
+    items: items.map((row) => ({
+      repo: row.repo,
+      owner: row.owner,
+      releaseCount: Number(row.releaseCount ?? 0),
+    })),
+    total,
+  };
 }
 
 /**
@@ -1423,7 +1693,13 @@ export async function listUserRepositories(
   const db = drizzle(d1);
   const totalRows = await db.select({ value: sql<number>`count(*)` }).from(repositories).where(where);
   const items = await db
-    .select({ repo: repositories, owner: users })
+    .select({
+      repo: repositories,
+      owner: users,
+      // release_counter per row (releaseCountSubquery — the live count,
+      // folded into the page query).
+      releaseCount: releaseCountSubquery(repositories.id),
+    })
     .from(repositories)
     .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
     .where(where)
@@ -1432,7 +1708,14 @@ export async function listUserRepositories(
     .orderBy(asc(castIdNumber()))
     .limit(opts.limit)
     .offset((opts.page - 1) * opts.limit);
-  return { items, total: Number(totalRows[0]?.value ?? 0) };
+  return {
+    items: items.map((row) => ({
+      repo: row.repo,
+      owner: row.owner,
+      releaseCount: Number(row.releaseCount ?? 0),
+    })),
+    total: Number(totalRows[0]?.value ?? 0),
+  };
 }
 
 /**
@@ -1453,12 +1736,25 @@ export async function listOwnedRepositories(
   const db = drizzle(d1);
   const totalRows = await db.select({ value: sql<number>`count(*)` }).from(repositories).where(where);
   const items = await db
-    .select({ repo: repositories, owner: users })
+    .select({
+      repo: repositories,
+      owner: users,
+      // release_counter per row (releaseCountSubquery — the live count,
+      // folded into the page query).
+      releaseCount: releaseCountSubquery(repositories.id),
+    })
     .from(repositories)
     .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
     .where(where)
     .orderBy(asc(repositories.slug))
     .limit(opts.limit)
     .offset((opts.page - 1) * opts.limit);
-  return { items, total: Number(totalRows[0]?.value ?? 0) };
+  return {
+    items: items.map((row) => ({
+      repo: row.repo,
+      owner: row.owner,
+      releaseCount: Number(row.releaseCount ?? 0),
+    })),
+    total: Number(totalRows[0]?.value ?? 0),
+  };
 }

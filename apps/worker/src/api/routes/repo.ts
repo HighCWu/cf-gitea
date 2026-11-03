@@ -438,7 +438,7 @@ export function registerRepoRoutes(
     // round trip); list/search paths keep the defaults (the settings row is
     // the not-yet-swept column store — see toApiRepository).
     const settings = await loadRepoSettings(c.env.DB, found.repo.id);
-    return c.json(await toApiRepositoryFull(c.env.DB, viewer, found, settings, teamMode), 200);
+    return c.json(await toApiRepositoryFull(c.env.DB, viewer, found, settings, teamMode, engineReads(c.env, found.repo)), 200);
   });
 
   app.openapi(searchReposRoute(optionalAuth), async (c) => {
@@ -482,7 +482,7 @@ export function registerRepoRoutes(
       throw new ApiError(404, "not found");
     }
     const settings = await loadRepoSettings(c.env.DB, found.repo.id);
-    return c.json(await toApiRepositoryFull(c.env.DB, viewer, found, settings, teamMode), 200);
+    return c.json(await toApiRepositoryFull(c.env.DB, viewer, found, settings, teamMode, engineReads(c.env, found.repo)), 200);
   });
 
   // -------------------------------------------------------------------------

@@ -21,7 +21,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
+import { releases, repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 import {
@@ -32,9 +32,12 @@ import {
   findRepositoryByPath,
   findUserByName,
   GO_ZERO_TIME,
+  repositoryOrderBy,
   repositoryPermissions,
   repositoryPermissionsWithTeams,
+  searchRepositories,
   toApiRepository,
+  toApiRepositoryFull,
   type Viewer,
 } from "./repository";
 import { saveUserProfileColumns } from "./user-settings";
@@ -385,5 +388,180 @@ describe("apiUserFromRow — the last_login authed gate (P3-7)", () => {
 
     const user_ = apiUserFromRow(row, viewerFor(row));
     expect(user_.last_login).toBe(GO_ZERO_TIME);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The repo wire counters (the stale-zero gap port): release_counter /
+// branch_count / updated_at over the landed data, and sort=updated over the
+// real column. Upstream derives all three per serialize
+// (services/convert/repository.go:161-166/222/228).
+// -----------------------------------------------------------------------------
+
+describe("the repo wire counters — release_counter / branch_count / updated_at / sort=updated", () => {
+  /** A release row with only the wire-relevant tri-state filled in. */
+  async function seedRelease(
+    repoId: string,
+    publisherId: number,
+    tag: string,
+    flags: { isDraft?: boolean; isTag?: boolean } = {},
+  ): Promise<void> {
+    await drizzle(env.DB)
+      .insert(releases)
+      .values({
+        repoId,
+        publisherId,
+        tagName: tag,
+        lowerTagName: tag.toLowerCase(),
+        isDraft: flags.isDraft ?? false,
+        isTag: flags.isTag ?? false,
+      });
+  }
+
+  it("release_counter counts the live non-draft, non-tag release rows (db.Count posture)", async () => {
+    const owner = await seedVerifiedUser({ username: "wire_releaser" });
+    const repoId = await seedRepo(owner.id, "wire_releaser", "released", "public");
+    await seedRelease(repoId, owner.id, "v1.0.0");
+    await seedRelease(repoId, owner.id, "v1.1.0");
+    // The FindReleasesOptions{IncludeDrafts: false, IncludeTags: false}
+    // exclusions (models/repo/release.go:276-281): an unpublished draft and a
+    // pure tag row (SPEC-0005 §2.3) carry no release.
+    await seedRelease(repoId, owner.id, "v2.0-wip", { isDraft: true });
+    await seedRelease(repoId, owner.id, "just-a-tag", { isTag: true });
+
+    const pair = await findRepositoryByPath(env.DB, "wire_releaser", "released");
+    if (pair === null) throw new Error("fixture repo missing");
+    const payload = await toApiRepositoryFull(env.DB, viewerFor(owner), pair);
+    expect(payload.release_counter).toBe(2);
+
+    // A producer that skipped the count (a bare pair — webhook payloads,
+    // pre-carrier list paths) renders the 0 default.
+    expect(toApiRepository(viewerFor(owner), { repo: pair.repo, owner: pair.owner }).release_counter).toBe(0);
+  });
+
+  it("release_counter rides the list pages as the correlated subquery (searchRepositories)", async () => {
+    const owner = await seedVerifiedUser({ username: "wire_lister" });
+    const withRelease = await seedRepo(owner.id, "wire_lister", "listed", "public");
+    await seedRepo(owner.id, "wire_lister", "bare", "public");
+    await seedRelease(withRelease, owner.id, "v9.9.9");
+
+    const res = await searchRepositories(env.DB, viewerFor(owner), {
+      keyword: "",
+      topicOnly: false,
+      includeDesc: false,
+      uid: 0,
+      exclusive: false,
+      priorityOwnerId: 0,
+      teamId: 0,
+      starredBy: 0,
+      includePrivate: false,
+      isPrivate: null,
+      template: null,
+      archived: null,
+      mode: "",
+      sort: "",
+      order: "",
+      page: 1,
+      limit: 50,
+    });
+    const byslug = new Map(res.items.map((item) => [item.repo.slug, item]));
+    expect(byslug.get("listed")?.releaseCount).toBe(1);
+    expect(byslug.get("bare")?.releaseCount).toBe(0);
+  });
+
+  it("updated_at renders the mutation stamp; a null column renders the creation instant", async () => {
+    const owner = await seedVerifiedUser({ username: "wire_updater" });
+    const pushed = await seedRepo(owner.id, "wire_updater", "pushed", "public");
+    await seedRepo(owner.id, "wire_updater", "fresh", "public");
+    // The push settle stamps exactly this column (git-http/gate.ts:
+    // `.set({ ..., updatedAt: new Date() })` on both settle legs) — the
+    // serializer must reflect it, not pin created_at.
+    const T1 = new Date("2026-06-01T12:00:00Z");
+    await drizzle(env.DB).update(repositories).set({ updatedAt: T1 }).where(eq(repositories.id, pushed));
+
+    const pair = await findRepositoryByPath(env.DB, "wire_updater", "pushed");
+    if (pair === null) throw new Error("fixture repo missing");
+    expect((await toApiRepositoryFull(env.DB, viewerFor(owner), pair)).updated_at).toBe("2026-06-01T12:00:00.000Z");
+
+    // The nullable pre-column rows (the ALTER ADD COLUMN no-default
+    // constraint) render the creation instant — NOW in this harness.
+    const freshPair = await findRepositoryByPath(env.DB, "wire_updater", "fresh");
+    if (freshPair === null) throw new Error("fixture repo missing");
+    expect((await toApiRepositoryFull(env.DB, viewerFor(owner), freshPair)).updated_at).toBe(NOW.toISOString());
+  });
+
+  it("branch_count rides the engine reads slice (refs/heads only); absent or failed reads stay 0", async () => {
+    const owner = await seedVerifiedUser({ username: "wire_brancher" });
+    await seedRepo(owner.id, "wire_brancher", "branched", "public");
+    const pair = await findRepositoryByPath(env.DB, "wire_brancher", "branched");
+    if (pair === null) throw new Error("fixture repo missing");
+
+    // Two heads + one tag — upstream CountBranches counts BRANCH rows only
+    // (is_deleted=false); the refs/heads filter mirrors the branches route.
+    const engine = {
+      listRefs: () =>
+        Promise.resolve({
+          head: "refs/heads/main",
+          refs: [
+            { name: "refs/heads/main", target: "aaaa" },
+            { name: "refs/heads/feature", target: "bbbb" },
+            { name: "refs/tags/v1", target: "cccc" },
+          ],
+        }),
+    };
+    expect(
+      (await toApiRepositoryFull(env.DB, viewerFor(owner), pair, undefined, null, engine)).branch_count,
+    ).toBe(2);
+
+    // No engine slice handed in → the 0 default (lists, pre-wiring callers).
+    expect((await toApiRepositoryFull(env.DB, viewerFor(owner), pair)).branch_count).toBe(0);
+
+    // engineReads' null-on-transport-failure contract → 0, never a throw.
+    const dead = { listRefs: () => Promise.resolve(null) };
+    expect(
+      (await toApiRepositoryFull(env.DB, viewerFor(owner), pair, undefined, null, dead)).branch_count,
+    ).toBe(0);
+  });
+
+  it("sort=updated orders the real updated_at column, nulls coalescing to created_at", async () => {
+    const owner = await seedVerifiedUser({ username: "wire_sorter" });
+    await seedRepo(owner.id, "wire_sorter", "sortold", "public");
+    const midId = await seedRepo(owner.id, "wire_sorter", "sortmid", "public");
+    const newId = await seedRepo(owner.id, "wire_sorter", "sortnew", "public");
+    // seedRepo stamps createdAt=NOW (2026-01-01) for all rows; the stamps
+    // order mid/new ahead, and `sortold` keeps a null updated_at — the
+    // coalesce keeps its sort key at the creation instant (the LEAST updated
+    // row, matching upstream's never-null column semantics).
+    await drizzle(env.DB).update(repositories).set({ updatedAt: new Date("2026-01-02T00:00:00Z") }).where(eq(repositories.id, midId));
+    await drizzle(env.DB).update(repositories).set({ updatedAt: new Date("2026-01-03T00:00:00Z") }).where(eq(repositories.id, newId));
+
+    const base = {
+      keyword: "",
+      topicOnly: false,
+      includeDesc: false,
+      // Owned-only (repo.go:159-161, exclusive): scopes the assertion to
+      // this test's three rows — public repos from sibling tests would
+      // otherwise ride in with equal (creation-instant) sort keys.
+      uid: owner.id,
+      exclusive: true,
+      priorityOwnerId: 0,
+      teamId: 0,
+      starredBy: 0,
+      includePrivate: false,
+      isPrivate: null,
+      template: null,
+      archived: null,
+      mode: "" as const,
+      page: 1,
+      limit: 50,
+    };
+    const asc = await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "updated", order: "asc" });
+    expect(asc.items.map((item) => item.repo.slug)).toEqual(["sortold", "sortmid", "sortnew"]);
+    const desc = await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "updated", order: "desc" });
+    expect(desc.items.map((item) => item.repo.slug)).toEqual(["sortnew", "sortmid", "sortold"]);
+
+    // The arm's SQL rides the COALESCE(updated_at, created_at) key — the
+    // same stamp the wire renders (shape pin alongside the ordering pin).
+    expect(repositoryOrderBy("updated", "asc").length).toBe(1);
   });
 });
