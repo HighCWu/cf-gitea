@@ -94,6 +94,7 @@ import {
   orgMembers,
   pullRequests,
   protectedBranches,
+  renamedBranches,
   repositories,
   stars,
   teamRepoAccess,
@@ -1195,6 +1196,12 @@ export class RepoService {
       // {RepoID: repoID}, services/repository/delete.go:171). The schema's
       // repo-scoped convention (no FK) already promised this sweep.
       this.db.delete(protectedBranches).where(eq(protectedBranches.repoId, repoId)),
+      // The renamed-branch log dies with the repo (upstream's DeleteBeans
+      // census carries &git_model.RenamedBranch{RepoID: repoID},
+      // services/repository/delete.go:164 — the row right after Branch).
+      // The schema's repo-scoped convention (no declared FK) already
+      // promised this sweep.
+      this.db.delete(renamedBranches).where(eq(renamedBranches.repoId, repoId)),
       // The scheduled-workflow registry dies with the repo (SPEC-0012 §D7's
       // cascade arm — upstream's DeleteBeans census carries
       // &actions_model.ActionScheduleSpec{RepoID: repoID} then

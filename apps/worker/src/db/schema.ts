@@ -5162,6 +5162,45 @@ export const deletedBranches = sqliteTable(
 );
 
 /**
+ * Renamed branches (upstream models/git/branch.go:293-299's RenamedBranch —
+ * the same file as deleted_branches above, migration 0071): the rename log
+ * both rename writers append (RenameBranch tx step 5, branch.go:407-413)
+ * and the stale-link redirect reads (services/context/repo.go:888-894's
+ * FindRenamedBranch walk + :1006-1016's redirect). Columns upstream-verbatim
+ * per the FN-6 column-faithful precedent: only repo_id carries NOT NULL
+ * (upstream's `xorm:"INDEX NOT NULL"`); from/to/created_unix are untagged
+ * upstream (nullable) — every writer populates all three. NO unique
+ * constraint: upstream tolerates duplicate `from` rows across rename chains
+ * (a→b then b→a then a→b leaves two from=a rows) and its FindRenamedBranch
+ * Get answers the unordered first row — ours pins that determinism as
+ * ORDER BY id ASC (the readers' chain-order note).
+ */
+export const renamedBranches = sqliteTable(
+  "renamed_branches",
+  {
+    /** Upstream `ID int64 pk autoincr` — non-referencing pk (the audit §2.1
+     *  id-family rule, the repo_units precedent). */
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `RepoID int64 INDEX NOT NULL` (branch.go:296) — the id
+     *  family's TEXT form; the repo-scoped convention (no declared FK)
+     *  with the explicit deleteRepository cascade arm (upstream
+     *  services/repository/delete.go:164). */
+    repoId: text("repo_id").notNull(),
+    /** Upstream `From` — the OLD branch name (SQL keyword; Drizzle
+     *  backtick-quotes it in the generated DDL — the schema test pins the
+     *  quoting). */
+    from: text("from"),
+    /** Upstream `To` — the NEW branch name (same keyword note as `from`). */
+    to: text("to"),
+    /** Upstream `CreatedUnix timeutil.TimeStamp xorm:"created"` (seconds) —
+     *  verbatim like FN-6's created_unix; NOT folded into the §2.5
+     *  created_at family (that family records EXISTING pairs). */
+    createdUnix: integer("created_unix"),
+  },
+  (t) => [index("renamed_branches_repo_idx").on(t.repoId)],
+);
+
+/**
  * Review state (upstream models/pull/review_state.go — the VIEWED-FILES
  * arm's substrate, migration 0059): the PR-files viewed tracking, one row
  * per (user, pull), updated to the latest commit sha as the reviewer marks

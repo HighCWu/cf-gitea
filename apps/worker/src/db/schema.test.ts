@@ -40,6 +40,7 @@ import {
   repoTopics,
   repoUnits,
   repoWatchers,
+  renamedBranches,
   repositories,
   reviewState,
   stars,
@@ -1783,5 +1784,52 @@ SET \`topics\` = COALESCE(
     expect(JSON.parse(withTopics?.topics ?? "null")).toEqual(["api", "ci", "web"]); // topic ASC — syncTopicsInRepository's order
     const noTopics = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "fn4e")).get();
     expect(noTopics?.topics).toBe("[]"); // upstream's empty-slice serialization
+  });
+});
+
+/**
+ * Migration 0071 — `renamed_branches` (upstream models/git/branch.go:
+ * 293-299's RenamedBranch, the deleted_branches sibling from the same file):
+ * the rename log both rename writers append (RenameBranch tx step 5,
+ * branch.go:407-413) and the stale-link redirect walks read
+ * (services/context/repo.go:888-894 + :1006-1016). Upstream created it in
+ * v197 (modelmigration/v1_16/v197.go — a bare xorm Sync of the model), so
+ * the column set is the model verbatim: only repo_id carries NOT NULL.
+ */
+describe("renamed_branches parity (migration 0071)", () => {
+  it("0071's DDL: the five upstream-verbatim columns with the keyword-quoted from/to", async () => {
+    const info = await tableColumns("renamed_branches");
+    expect(info.map((col) => col.name)).toEqual(["id", "repo_id", "from", "to", "created_unix"]);
+    expect(info).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "from", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 }, // upstream: untagged xorm string — nullable
+      { cid: 3, name: "to", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 4, name: "created_unix", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+    ]);
+    // The index (upstream `xorm:"INDEX NOT NULL"`'s INDEX half — NOT NULL
+    // rides the column above).
+    expect(await indexNames("renamed_branches")).toContain("renamed_branches_repo_idx");
+    // The DDL quoting pin: `from`/`to` are SQL keywords — Drizzle
+    // backtick-quotes every identifier, and the stored DDL must carry the
+    // quoted forms (an unquoted `from` would be a syntax error at CREATE).
+    const ddl = await env.DB
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'renamed_branches'")
+      .first<{ sql: string }>();
+    expect(ddl?.sql).toContain("`from` text");
+    expect(ddl?.sql).toContain("`to` text");
+  });
+
+  it("the duplicate-from shape upstream tolerates: rename chains leave two from rows (no unique constraint)", async () => {
+    // Upstream FindRenamedBranch (branch.go:302-304) is an unordered
+    // db.Get — first row by rowid. Our readers pin the parity as ORDER BY
+    // id ASC + first-wins; the TABLE's job is only to keep both rows.
+    const db = drizzle(env.DB);
+    await db.insert(renamedBranches).values([
+      { repoId: "rb-dup", from: "chain", to: "c1", createdUnix: 1_700_000_001 },
+      { repoId: "rb-dup", from: "chain", to: "c2", createdUnix: 1_700_000_002 },
+    ]);
+    const rows = await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, "rb-dup")).orderBy(asc(renamedBranches.id)).all();
+    expect(rows.map((row) => row.to)).toEqual(["c1", "c2"]); // both survive
   });
 });

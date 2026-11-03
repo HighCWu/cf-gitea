@@ -114,7 +114,7 @@ import { saveRepoSettings } from "../../api/services/repo-settings";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { actionSchedules, deletedBranches, issues, protectedBranches, pullRequests, repositories, users } from "../../db/schema";
+import { actionSchedules, deletedBranches, issues, protectedBranches, pullRequests, renamedBranches, repositories, users } from "../../db/schema";
 import { settleCreatingRepo } from "../../git-http/gate";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
@@ -797,6 +797,17 @@ describe("w100 quick-create write (POST /branches/_new/branch/{from})", () => {
 });
 
 describe("w100 rename write (POST /branches/rename)", () => {
+  /** The w100wr repo row id — the rename log's repo_id key. */
+  const w100wrRepoId = async (): Promise<string> =>
+    (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w100wr"))).get())!.id;
+  const renameRows = async (from: string) =>
+    drizzle(env.DB)
+      .select({ to: renamedBranches.to })
+      .from(renamedBranches)
+      .where(and(eq(renamedBranches.repoId, await w100wrRepoId()), eq(renamedBranches.from, from)))
+      .orderBy(renamedBranches.id)
+      .all();
+
   it("renames side onto side-two: the ref swaps at the old tip and the list renders the new name", async () => {
     // upstream branch.go RenameBranchPost (web.go:1486) — create-at-tip then
     // delete, the exact engine pair the Window-2e fold replays.
@@ -812,6 +823,9 @@ describe("w100 rename write (POST /branches/rename)", () => {
     expect(refs.find((ref) => ref.name === "refs/heads/side-two")?.target).toBe(tips[AHEAD_TIP]);
     const list = await get(`/${OWNER}/w100wr/branches`);
     expect(await list.text()).toContain(`href="/${OWNER}/w100wr/src/branch/side-two"`);
+    // THE LOG (RenameBranch tx step 5, models/git/branch.go:407-413): the
+    // UI writer's D1-tail insert — the API PATCH writer's twin arm.
+    expect(await renameRows("side")).toEqual([{ to: "side-two" }]);
   });
 
   it("refuses the default branch for the plain owner (branch.go:443-447's admin-only arm)", async () => {
@@ -849,6 +863,9 @@ describe("w100 rename write (POST /branches/rename)", () => {
     for (const res of [empty, missing, collides, self]) expect(res.status).toBe(303);
     const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
     expect(names).toEqual(["refs/heads/main", "refs/heads/side-two", "refs/heads/w100-made"]);
+    // Upstream's tx rollback arm: the refusals log NOTHING.
+    expect(await renameRows("ghost")).toEqual([]);
+    expect(await renameRows("side-two")).toEqual([]);
   });
 
   it("the SITE-admin default rename re-points the D1 default, moves HEAD, and fires the schedule switch (models RenameBranch :353-361 + branch.go:488-490)", async () => {
@@ -891,6 +908,9 @@ describe("w100 rename write (POST /branches/rename)", () => {
     expect((await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).head).toBe("refs/heads/main-two");
     // The switch's delete half ran (the registry row above is gone).
     expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
+    // The default rename logs like any other (tx step 5 is unconditional
+    // on isDefault).
+    expect(await renameRows("main")).toEqual([{ to: "main-two" }]);
   });
 });
 

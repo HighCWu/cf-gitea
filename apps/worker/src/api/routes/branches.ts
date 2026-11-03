@@ -4,7 +4,7 @@ import type { Context } from "hono";
 import { createRoute, z } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repositories } from "../../db/schema";
+import { renamedBranches, repositories } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import {
@@ -860,6 +860,20 @@ export function registerBranchRoutes(
       // surgery — a D1 failure leaves the rule on the old name (the same
       // partial-rename window the engine/D1 split discloses elsewhere).
       await renameProtectedRuleName(c.env.DB, renameRules, fromNamedRule, newName);
+
+      // RenameBranch tx step 5's renamed-branch log (models/git/branch.go:
+      // 407-413): the (repo, from, to) row the stale-link walks redirect
+      // through (services/context/repo.go:888-894's FindRenamedBranch arm +
+      // :1006-1016's redirect). Upstream inserts INSIDE the rename tx, after
+      // the rule rewrite and before the git action (step 6); ours rides the
+      // D1 tail in that same order — default fixup → rule rewrite → THIS
+      // insert → the webhook pair (upstream's notification order: the log
+      // row exists when the create event lands). The engine/D1 split has no
+      // cross-store tx: a D1 failure here leaves the rename unlogged (stale
+      // links fall through to the 404/default fallback instead of
+      // redirecting) — the same partial-rename window the default and rule
+      // tails above disclose.
+      await drizzle(c.env.DB).insert(renamedBranches).values({ repoId: pair.repo.id, from: oldName, to: newName });
 
       // Webhook: upstream fires DeleteRef(from) → CreateRef(to, the shared
       // tip) on a rename (services/repository/branch.go:492-493) — the same

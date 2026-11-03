@@ -57,7 +57,7 @@ import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../../db/schema";
+import { renamedBranches, repositories, users } from "../../db/schema";
 import { LfsStateService } from "../../services/lfs/state";
 import { RelayLfsStore, lfsKey } from "../../services/lfs/store";
 import { generatePointer } from "../../services/lfs/pointer";
@@ -529,5 +529,140 @@ describe("the 404 family (unresolvable refs and paths)", () => {
       const response = await fetchUi(path);
       expect(response.status).toBe(404);
     }
+  });
+});
+
+// --- the renamed-branch redirect (migration 0071) ------------------------------
+//
+// Upstream's stale-link arm (services/context/repo.go:888-894's
+// FindRenamedBranch walk + :1006-1016's redirect, fired by RepoRefByType for
+// BOTH the typed /{raw,media}/{branch}/* routes and the deprecated legacy
+// catch-alls — web.go:1709-1712/1701-1704): a renamed hit 303s onto the new
+// name's URL BEFORE any content — closing the legacy shape's divergence
+// (its default-branch fallback, upstream's FIXME'd repo.go:859-862 port,
+// resolved dead names against DEFAULT: wrong bytes on a real path
+// collision, a 404-divergence otherwise — upstream never reaches that
+// fallback past a renamed hit). The flash
+// (ctx.Flash.Info's repo.branch.renamed) is recorded-not-ported.
+
+describe("the renamed-branch redirect (RepoRefByType's IsRenamedBranch arm)", () => {
+  /** The redirect rows for the rawserve fixture (the rename WRITERS are
+   *  pinned in engine-read + branches.matrix; the reader arms here seed the
+   *  log rows directly — one INSERT per chain link, oldest first). */
+  beforeAll(async () => {
+    const { repoId } = await ensureFixtures();
+    await drizzle(env.DB).insert(renamedBranches).values([
+      { repoId, from: "side", to: "trunk", createdUnix: 1_700_000_100 }, // simple rename
+      { repoId, from: "feat/one", to: "f2", createdUnix: 1_700_000_200 }, // the cumulative-prefix walk
+      { repoId, from: "taggy", to: "zz", createdUnix: 1_700_000_300 }, // typed-tag never-consults pin
+      { repoId, from: "main", to: "zzz", createdUnix: 1_700_000_400 }, // branch-exists-first pin
+      { repoId, from: "chain", to: "c1", createdUnix: 1_700_000_500 }, // the duplicate-from chain
+      { repoId, from: "chain", to: "c2", createdUnix: 1_700_000_600 }, // (oldest row must win)
+    ]);
+  });
+
+  it("the legacy raw arm redirects the stale name onto the new name's URL (303, path-replace)", async () => {
+    const response = await fetchUi("/alice/rawserve/raw/side/README.md");
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/alice/rawserve/raw/trunk/README.md");
+    // Upstream's link is the REPLACED PATH ONLY (strings.Replace over
+    // EscapedPath, no query carried).
+    const withQuery = await fetchUi("/alice/rawserve/raw/side/README.md?x=1");
+    expect(withQuery.status).toBe(303);
+    expect(withQuery.headers.get("location")).toBe("/alice/rawserve/raw/trunk/README.md");
+  });
+
+  it("the typed raw branch arm redirects too (web.go:1709 runs the same RepoRefByType middleware)", async () => {
+    const response = await fetchUi("/alice/rawserve/raw/branch/side/README.md");
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/alice/rawserve/raw/branch/trunk/README.md");
+  });
+
+  it("both media shapes redirect (the LFS probe never runs past a renamed hit)", async () => {
+    const legacy = await fetchUi("/alice/rawserve/media/side/README.md");
+    expect(legacy.status).toBe(303);
+    expect(legacy.headers.get("location")).toBe("/alice/rawserve/media/trunk/README.md");
+    const typed = await fetchUi("/alice/rawserve/media/branch/side/README.md");
+    expect(typed.status).toBe(303);
+    expect(typed.headers.get("location")).toBe("/alice/rawserve/media/branch/trunk/README.md");
+  });
+
+  it("the walk is cumulative-prefix: a slashed from-name redirects with only its own segments swapped", async () => {
+    const response = await fetchUi("/alice/rawserve/raw/feat/one/README.md");
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/alice/rawserve/raw/f2/README.md");
+  });
+
+  it("branch-exists-first: a LIVE branch never redirects, even with a from-row under its name", async () => {
+    // Upstream order: IsBranchExist(s) wins inside getRefName (repo.go:
+    // 869-871) — the FindRenamedBranch walk only fires on the miss. (main
+    // exists in the seed; the from="main" row would redirect without the
+    // gate.)
+    const response = await fetchUi("/alice/rawserve/raw/main/README.md");
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("# rawserve");
+  });
+
+  it("typed tag/commit shapes never consult renamed rows (the walk lives only in the branch arm)", async () => {
+    // No tag named `taggy` exists — the typed tag arm 404s; a redirect here
+    // would mean the renamed walk leaked out of the branch arm.
+    const tag = await fetchUi("/alice/rawserve/raw/tag/taggy");
+    expect(tag.status).toBe(404);
+  });
+
+  it("the legacy arm's renamed hit outranks the tag walk and the default fallback (the wrong-content fix)", async () => {
+    // `taggy` is neither branch nor tag nor sha — the OLD walk fell through
+    // to the default-branch fallback (200 default-branch bytes for a dead
+    // name); upstream's getRefNameLegacy consults the renamed arm FIRST
+    // (it lives inside the branch getRefName, before the tag walk) and
+    // redirects.
+    const response = await fetchUi("/alice/rawserve/raw/taggy/README.md");
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/alice/rawserve/raw/zz/README.md");
+  });
+
+  it("duplicate from rows keep the OLDEST to (the chain-order parity pin)", async () => {
+    // Upstream FindRenamedBranch is an unordered Get — first row by rowid;
+    // ours pins that determinism as ORDER BY id ASC first-wins.
+    const response = await fetchUi("/alice/rawserve/raw/chain/README.md");
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/alice/rawserve/raw/c1/README.md");
+  });
+
+  it("a never-renamed dead branch keeps the landed answers: 404 on both shapes (the FIXME fallback runs, its tree path still misses)", async () => {
+    // The fallback resolves the DEFAULT branch with the whole tail as tree
+    // path (upstream repo.go:859-862 verbatim) — a tail that names no real
+    // path under the default 404s exactly as before (the fallback's
+    // content-serving arm needs a real path collision under default, which
+    // the renamed redirect now guards for renamed names).
+    const typed = await fetchUi("/alice/rawserve/raw/branch/ghost-branch/README.md");
+    expect(typed.status).toBe(404);
+    const legacy = await fetchUi("/alice/rawserve/raw/ghost-branch/README.md");
+    expect(legacy.status).toBe(404);
+  });
+
+  it("the /src family redirects both shapes (web.go:1750 typed + :1754 legacy catch-all)", async () => {
+    const typed = await fetchUi("/alice/rawserve/src/branch/side");
+    expect(typed.status).toBe(303);
+    expect(typed.headers.get("location")).toBe("/alice/rawserve/src/branch/trunk");
+    const legacy = await fetchUi("/alice/rawserve/src/side");
+    expect(legacy.status).toBe(303);
+    expect(legacy.headers.get("location")).toBe("/alice/rawserve/src/trunk");
+    // Slashed from-name through the /src typed walk too.
+    const slashed = await fetchUi("/alice/rawserve/src/branch/feat/one");
+    expect(slashed.status).toBe(303);
+    expect(slashed.headers.get("location")).toBe("/alice/rawserve/src/branch/f2");
+  });
+
+  it("the /src family never redirects a live branch (the gate above the redirect)", async () => {
+    const response = await fetchUi("/alice/rawserve/src/branch/main");
+    expect(response.status).toBe(200);
+  });
+
+  it("a never-renamed dead /src name keeps its landed answers (typed 404, legacy 404 — the pre-existing walk divergence stays)", async () => {
+    const typed = await fetchUi("/alice/rawserve/src/branch/ghost-branch");
+    expect(typed.status).toBe(404);
+    const legacy = await fetchUi("/alice/rawserve/src/ghost-branch");
+    expect(legacy.status).toBe(404);
   });
 });

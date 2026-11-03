@@ -26,12 +26,12 @@ import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repositories, protectedBranches, repoCollaborators, users, webhookDeliveries, webhooks } from "../db/schema";
+import { renamedBranches, repositories, protectedBranches, repoCollaborators, users, webhookDeliveries, webhooks } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
@@ -135,6 +135,23 @@ async function jsonBody(res: Response): Promise<Record<string, unknown>> {
   const parsed: unknown = JSON.parse(await res.text());
   return parsed as Record<string, unknown>;
 }
+
+/** The seed repo's id (the renamed-branch log's repo_id key). */
+async function seedRepoId(): Promise<string> {
+  const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, SLUG)).get();
+  if (row === undefined) throw new Error("seed repo missing");
+  return row.id;
+}
+
+/** The rename-log rows for one (repo, from) — ordered oldest first (the
+ *  chain-order parity pin: upstream's unordered Get answers the first). */
+const renameRowsFor = (repoId: string, from: string) =>
+  drizzle(env.DB)
+    .select({ to: renamedBranches.to })
+    .from(renamedBranches)
+    .where(and(eq(renamedBranches.repoId, repoId), eq(renamedBranches.from, from)))
+    .orderBy(renamedBranches.id)
+    .all();
 
 const authed = (init?: RequestInit): RequestInit => ({
   ...init,
@@ -264,10 +281,20 @@ describe("DELETE + PATCH /repos/{owner}/{repo}/branches/{branch}", () => {
     expect(tips.get("refs/heads/renamed")?.target).toBe(TIP1);
     expect(tips.get("refs/heads/at-v1")).toBeUndefined();
 
+    // THE LOG (RenameBranch tx step 5, models/git/branch.go:407-413): the
+    // (repo, from, to) row rides the D1 tail after the whole rename.
+    const repoId = await seedRepoId();
+    const rows = await renameRowsFor(repoId, "at-v1");
+    expect(rows).toEqual([{ to: "renamed" }]);
+
     const targetExists = await send(`${REPO_PATH}/branches/renamed`, jsonInit("PATCH", { name: "main" }));
     expect(targetExists.status).toBe(422);
     const missing = await send(`${REPO_PATH}/branches/at-v1`, jsonInit("PATCH", { name: "other" }));
     expect(missing.status).toBe(404);
+    // Upstream's tx rollback arm: the refused renames log NOTHING (still the
+    // single row, and no `from=renamed` row for the 422 arm).
+    expect(await renameRowsFor(repoId, "at-v1")).toEqual([{ to: "renamed" }]);
+    expect(await renameRowsFor(repoId, "renamed")).toEqual([]);
   });
 
   it("renames the default branch: setHead moves engine HEAD and D1 default_branch follows", async () => {
@@ -279,6 +306,11 @@ describe("DELETE + PATCH /repos/{owner}/{repo}/branches/{branch}", () => {
     expect(row?.defaultBranch).toBe("trunk");
     // rename back so later suites see the conventional default
     expect((await send(`${REPO_PATH}/branches/trunk`, jsonInit("PATCH", { name: "main" }))).status).toBe(204);
+    // BOTH default renames logged (tx step 5's insert is unconditional on
+    // isDefault — the default arm only adds the fixups).
+    const repoId = await seedRepoId();
+    expect(await renameRowsFor(repoId, "main")).toEqual([{ to: "trunk" }]);
+    expect(await renameRowsFor(repoId, "trunk")).toEqual([{ to: "main" }]);
   });
 
   it("deletes a branch (204); missing → 404", async () => {
@@ -292,6 +324,30 @@ describe("DELETE + PATCH /repos/{owner}/{repo}/branches/{branch}", () => {
 // ---------------------------------------------------------------------------
 // Tags
 // ---------------------------------------------------------------------------
+
+describe("PATCH rename's duplicate-from rows (the chain-order parity pin)", () => {
+  // Upstream tolerates duplicate `from` rows across rename chains (a→b then
+  // b→a then a→b leaves two from=a rows; models/git/branch.go inserts one
+  // row per rename, no unique constraint) and its FindRenamedBranch Get
+  // answers the UNORDERED first row. The writers only append — this pin
+  // holds the table shape the readers' ORDER BY id ASC reduction consumes
+  // (raw-files.ts findRenamedBranchMap's first-wins).
+  it("a→b, b→c, re-create a, a→d leaves two from=a rows with the oldest first", async () => {
+    const created = await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "chain-a" }));
+    expect(created.status).toBe(201);
+    expect((await send(`${REPO_PATH}/branches/chain-a`, jsonInit("PATCH", { name: "chain-b" }))).status).toBe(204);
+    expect((await send(`${REPO_PATH}/branches/chain-b`, jsonInit("PATCH", { name: "chain-c" }))).status).toBe(204);
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "chain-a" }))).status).toBe(201);
+    expect((await send(`${REPO_PATH}/branches/chain-a`, jsonInit("PATCH", { name: "chain-d" }))).status).toBe(204);
+    const repoId = await seedRepoId();
+    const aRows = await renameRowsFor(repoId, "chain-a");
+    expect(aRows.map((row) => row.to)).toEqual(["chain-b", "chain-d"]); // both rows, oldest first
+    expect(await renameRowsFor(repoId, "chain-b")).toEqual([{ to: "chain-c" }]);
+    // cleanup: later suites see the conventional branch set
+    expect((await send(`${REPO_PATH}/branches/chain-d`, authed({ method: "DELETE" }))).status).toBe(204);
+    expect((await send(`${REPO_PATH}/branches/chain-c`, authed({ method: "DELETE" }))).status).toBe(204);
+  });
+});
 
 describe("tags (repoListTags / repoCreateTag / repoGetTag / repoDeleteTag / GetAnnotatedTag)", () => {
   it("lists the pushed lightweight tag with pagination headers", async () => {
@@ -1112,6 +1168,8 @@ describe("branch rename protection (upstream RenameBranch — services/repositor
     expect(res.status).toBe(403);
     expect((await jsonBody(res)).message).toBe("Failed to rename branch due to branch protection rules.");
     expect((await send(`${REPO_PATH}/branches/wr-src`, authed({ method: "GET" }))).status).toBe(200);
+    // The refusal logs nothing (upstream's tx rollback arm).
+    expect(await renameRowsFor(await seedRepoId(), "wr-src")).toEqual([]);
   });
 
   it("writer renaming a branch whose name IS a rule name: 403 (admin-only, branch.go:451-459)", async () => {
@@ -1120,6 +1178,7 @@ describe("branch rename protection (upstream RenameBranch — services/repositor
     expect(res.status).toBe(403);
     expect((await jsonBody(res)).message).toBe("User must be a repo or site admin to rename default or protected branches.");
     expect((await send(`${REPO_PATH}/branches/solo-named`, authed({ method: "GET" }))).status).toBe(200);
+    expect(await renameRowsFor(await seedRepoId(), "solo-named")).toEqual([]); // refusal — no log
   });
 
   it("the repo admin (owner) still renames a rule-named branch (branch.go:451 'admins are allowed to modify them') — and tx step 3 rewrites the rule name in place (:369-380)", async () => {
@@ -1138,6 +1197,8 @@ describe("branch rename protection (upstream RenameBranch — services/repositor
     const moved = after.find((rule) => rule.ruleName === "admin-named-2");
     expect(moved).toBeDefined();
     expect(moved?.id).toBe(before?.id);
+    // The admin rename logs like any other (tx step 5 is gate-independent).
+    expect(await renameRowsFor(await seedRepoId(), "admin-named")).toEqual([{ to: "admin-named-2" }]);
     expect(moved?.rules).toBe(serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }));
     expect(moved?.updatedAt?.getTime()).toBe(before?.updatedAt?.getTime());
     // The unrelated rules stand exactly as seeded (solo-named from the

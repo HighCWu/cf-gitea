@@ -27,11 +27,12 @@
 
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { actions } from "../db/schema";
+import { actions, renamedBranches } from "../db/schema";
 import { ActionType, getFeedRows, recordAction } from "../api/services/activity-feeds";
 import { RepoService } from "./service";
 
@@ -44,6 +45,7 @@ beforeEach(async () => {
     "action",
     "personal_access_tokens",
     "protected_branches",
+    "renamed_branches",
     "repo_units",
     "repo_transfer",
     "repo_redirects",
@@ -216,5 +218,32 @@ describe("repo delete sweeps the repo's action rows (delete.go:157 DeleteBeans a
     const orgAfter = await orgFeed();
     expect(orgAfter.total).toBe(0);
     expect(orgAfter.rows).toEqual([]);
+  });
+});
+
+/**
+ * The renamed-branch log dies with the repo (upstream's DeleteBeans census
+ * carries &git_model.RenamedBranch{RepoID: repoID}, services/repository/
+ * delete.go:164 — the bean right after Branch). The schema's repo-scoped
+ * convention (no declared FK) promised this sweep as an explicit batch arm.
+ */
+describe("repo delete sweeps the repo's renamed_branches rows (delete.go:164 DeleteBeans arm)", () => {
+  it("hard-deletes the doomed repo's rename log and leaves the keeper's rows untouched", async () => {
+    const { doomedId, keeperId } = await seedFixture();
+    const db = drizzle(env.DB);
+    await db.insert(renamedBranches).values([
+      { repoId: doomedId, from: "old", to: "new", createdUnix: 1_700_000_100 },
+      { repoId: doomedId, from: "feat/one", to: "feat/two", createdUnix: 1_700_000_200 },
+      { repoId: keeperId, from: "side", to: "trunk", createdUnix: 1_700_000_300 },
+    ]);
+    expect((await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, doomedId)).all()).length).toBe(2);
+
+    await service().deleteRepository(doomedId);
+
+    // THE ARM: the doomed repo's log rows died in the delete batch; the
+    // keeper's row survives (repo-scoped, not a wipe).
+    expect((await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, doomedId)).all()).length).toBe(0);
+    const survivor = await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, keeperId)).all();
+    expect(survivor.map((row) => row.from)).toEqual(["side"]);
   });
 });

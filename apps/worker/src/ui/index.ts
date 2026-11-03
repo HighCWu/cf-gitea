@@ -713,7 +713,7 @@ import {
   renameProtectedRuleName,
   renameRefusedByProtection,
 } from "../services/branch-protection";
-import { repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
+import { renamedBranches, repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
@@ -729,7 +729,16 @@ import {
   releaseAttachmentResponse,
 } from "./pages/release-downloads";
 import { loadRenderFile, renderFileResponse, renderNotAvailableResponse, type RenderFileTarget } from "./pages/render-files";
-import { loadMediaBlob, loadRawBlob, mediaBlobResponse, rawBlobResponse, type RawMediaTarget } from "./pages/raw-files";
+import {
+  findRenamedBranchMap,
+  loadMediaBlob,
+  loadRawBlob,
+  mediaBlobResponse,
+  renamedBranchRedirect,
+  rawBlobResponse,
+  walkRenamedBranch,
+  type RawMediaTarget,
+} from "./pages/raw-files";
 import {
   canWriteRepo,
   commitFileFromForm,
@@ -7251,16 +7260,47 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   if (route.family === "src" || route.family === "commits" || route.family === "blame") {
     if (route.refSuffix !== null) {
       const split = splitRefSuffix(route.refSuffix);
-      if (split !== null) {
-        const refs = resolveHeadBranch(await engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`).listRefs(), repo.defaultBranch);
-        const resolvedRef = resolveRefSuffix(split.refType, split.rest, {
+      // Hoisted above the split gate: the renamed arm's legacy shape (split
+      // === null) needs the branches list for its branch-exist-first gate —
+      // upstream's legacy walk queries branch existence there too (its
+      // /src/* catch-all is the same deprecated shape).
+      const refs = resolveHeadBranch(await engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`).listRefs(), repo.defaultBranch);
+      const resolvedRef = split !== null
+        ? resolveRefSuffix(split.refType, split.rest, {
           branches: refs.branches,
           tags: refs.tags,
           defaultBranch: repo.defaultBranch,
-        });
-        if (resolvedRef !== null) {
-          resolved.ctx.branchName = resolvedRef.refType === "branch" ? resolvedRef.ref : "";
-          resolved.ctx.refTypeNameSubURL = `${resolvedRef.refType}/${resolvedRef.ref}`;
+        })
+        : null;
+      if (resolvedRef !== null) {
+        resolved.ctx.branchName = resolvedRef.refType === "branch" ? resolvedRef.ref : "";
+        resolved.ctx.refTypeNameSubURL = `${resolvedRef.refType}/${resolvedRef.ref}`;
+      }
+      // THE RENAMED-BRANCH REDIRECT (family src only — the /src group's
+      // typed route web.go:1750 AND its deprecated legacy catch-all :1754
+      // both run RepoRefByType, whose shared IsRenamedBranch arm 303s the
+      // stale link onto the new name's URL, services/context/repo.go:
+      // 1006-1016, fed by getRefName's FindRenamedBranch walk :888-894).
+      // Upstream's order: the branch walk FIRST (an existing branch never
+      // redirects), then the renamed query — mirrored by the gate below; a
+      // legacy shape additionally gates on the WHOLE branch walk missing
+      // (the same walk the typed arm's resolvedRef === null encodes). The
+      // D1 read pays only on a branch-walk miss. Empty repos skip (upstream
+      // RepoRefByType's IsEmpty early return). The flash
+      // (ctx.Flash.Info's repo.branch.renamed) has no render surface on
+      // this dispatch — recorded, not ported. Other RepoRefByType consumers
+      // (commits/blame) keep their landed 404s — the SPEC's recorded
+      // boundary.
+      if (route.family === "src" && !repo.isEmpty) {
+        const branchWalkMissed =
+          split === null
+            ? resolveRefSuffix("branch", route.refSuffix, { branches: refs.branches, tags: refs.tags, defaultBranch: repo.defaultBranch }) === null
+            : split.refType === "branch" && resolvedRef === null;
+        if (branchWalkMissed) {
+          const hit = walkRenamedBranch(split === null ? route.refSuffix : split.rest, await findRenamedBranchMap(c.env.DB, repo.id));
+          if (hit !== null) {
+            return { ok: false, response: resolved.respond(renamedBranchRedirect(resolved.url.pathname, hit.from, hit.to)) };
+          }
         }
       }
     }
@@ -9396,6 +9436,14 @@ async function branchRenameSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   // the ref surgery — a D1 failure leaves the rule on the old name (the same
   // partial-rename window the default tail above discloses).
   await renameProtectedRuleName(c.env.DB, renameRules, fromNamedRule, to);
+  // RenameBranch tx step 5's renamed-branch log (models/git/branch.go:407-413)
+  // — the API PATCH writer's twin arm (routes/branches.ts, same D1 tail
+  // order: default fixup → rule rewrite → THIS insert; the UI writer emits no
+  // webhook pair, so the insert is the tail's last statement). Upstream
+  // inserts inside the rename tx before the git action; the engine/D1 split's
+  // no-tx window is the disclosed partial-rename posture (a D1 failure leaves
+  // the rename unlogged — stale links fall through instead of redirecting).
+  await drizzle(c.env.DB).insert(renamedBranches).values({ repoId: repo.id, from, to });
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?renamed=${encodeURIComponent(to)}` } }));
 }
 
@@ -16607,7 +16655,7 @@ async function renderFileView(c: Context<{ Bindings: Env }>): Promise<Response> 
 async function rawMediaFile(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { route, ctx, respond, repo } = resolved;
+  const { url, route, ctx, respond, repo } = resolved;
   if (route.family !== "raw-file" && route.family !== "media-file") return respond(await c.notFound()); // drift guard
   let target: RawMediaTarget;
   if (route.sha !== undefined) target = { kind: "blob", sha: route.sha };
@@ -16623,10 +16671,12 @@ async function rawMediaFile(c: Context<{ Bindings: Env }>): Promise<Response> {
   const ifModifiedSince = c.req.header("if-modified-since") ?? null;
   if (route.family === "raw-file") {
     const load = await loadRawBlob(c.env, repo, target);
+    if (load.kind === "renamed") return respond(renamedBranchRedirect(url.pathname, load.from, load.to));
     if (load.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
     return respond(rawBlobResponse(load, { cacheIsPublic, ifNoneMatch, ifModifiedSince }));
   }
   const load = await loadMediaBlob(c.env, repo, target);
+  if (load.kind === "renamed") return respond(renamedBranchRedirect(url.pathname, load.from, load.to));
   if (load.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
   return respond(mediaBlobResponse(load, { cacheIsPublic, ifNoneMatch, ifModifiedSince }));
 }

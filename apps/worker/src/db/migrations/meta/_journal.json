@@ -498,6 +498,13 @@
    "when": 1793737487489,
    "tag": "0070_fn7-automerge-merged-commit-id",
    "breakpoints": true
+  },
+  {
+   "idx": 71,
+   "version": "6",
+   "when": 1793737487490,
+   "tag": "0071-renamed-branches",
+   "breakpoints": true
   }
  ]
 }

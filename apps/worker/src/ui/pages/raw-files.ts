@@ -90,10 +90,21 @@
  * - The TYPED ref arms + the deprecated guess arm ride the /src family's
  *   resolution: `resolveRefSuffix` per type, and the legacy arm re-issued
  *   over the same walk (upstream getRefNameLegacy, services/context/repo.go:
- *   844-864: branch walk → tag walk → 7..64-hex first segment → the DEFAULT
- *   BRANCH fallback with the whole tail as tree path — the FIXME'd old-code
- *   behavior; upstream's renamed-branch arm has no landed renamed_branches
- *   model and is not ported).
+ *   844-864: branch walk → RENAMED arm → tag walk → 7..64-hex first segment
+ *   → the DEFAULT BRANCH fallback with the whole tail as tree path — the
+ *   FIXME'd old-code behavior). The RENAMED arm IS ported (migration 0071's
+ *   renamed_branches): upstream's getRefName consults FindRenamedBranch
+ *   (repo.go:888-894) and RepoRefByType 303-redirects the stale link onto
+ *   the new name's URL (:1006-1016) BEFORE any content — closing the legacy
+ *   shape's divergence (its default-branch fallback resolved dead names
+ *   against DEFAULT: wrong bytes on a real path collision, a 404-divergence
+ *   otherwise — upstream's legacy arm runs the renamed walk before that
+ *   fallback ever fires).
+ *   The typed BRANCH arm redirects too (web.go:1709/1701's typed routes run
+ *   the same RepoRefByType middleware); the tag/commit arms never consult
+ *   renamed rows (the renamed walk lives only in getRefName's
+ *   RefTypeBranch arm). The ctx.Flash.Info arm is recorded-not-ported (no
+ *   cookie-flash machinery on these byte arms).
  * - The `/blob/{sha}` arms: the engine boundary has NO object-by-oid read
  *   (readBlob walks a ref's tree), so the arm answers the existence probe —
  *   an unresolvable sha is upstream's GetBlob not-exist 404, and a
@@ -153,6 +164,9 @@ import { contentDisposition, defaultLfsDeps, lfsRepoId } from "../../lfs/router"
 import { lfsKey } from "../../services/lfs/store";
 import { parsePointer, PointerTooLargeError } from "../../services/lfs/pointer";
 import { engineReads } from "../../api/services/engine";
+import { renamedBranches } from "../../db/schema";
+import { drizzle } from "drizzle-orm/d1";
+import { asc, eq } from "drizzle-orm";
 import type { BlobResult } from "@cf-gitea/git-engine";
 import {
   encodeContentDisposition,
@@ -200,26 +214,97 @@ export type RawMediaTarget =
 /**
  * Upstream `getRefNameLegacy` (services/context/repo.go:844-864) over the
  * /src family's resolution universes: branch walk (resolveRefSuffix's
- * shortest-prefix walk; its literal-HEAD arm included) → tag walk → the
+ * shortest-prefix walk; its literal-HEAD arm included) → the RENAMED arm
+ * (getRefName's FindRenamedBranch walk, repo.go:888-894 — the `renamed`
+ * map's oldest row per `from` wins, the chain-order pin) → tag walk → the
  * 7..64-hex first segment (no existence check — upstream's FIXME preserved)
  * → the default-branch fallback with the whole tail as tree path (the old
- * code's behavior — the FIXME note). The caller 404-shells the empty repo
- * before this runs.
+ * code's behavior — the FIXME note). A renamed hit short-circuits the whole
+ * walk (upstream's getRefName returns the FROM name with the IsRenamedBranch
+ * data set and RepoRefByType redirects before any content). The caller
+ * 404-shells the empty repo before this runs.
  */
+export type LegacyRefResolution =
+  | { kind: "resolved"; refType: RefType; ref: string; treePath: string }
+  | { kind: "renamed"; from: string; to: string };
+
 export function resolveLegacyRefSuffix(
   rest: string,
   refs: RefSuffixRefs,
-): { refType: RefType; ref: string; treePath: string } {
+  renamed: ReadonlyMap<string, string> = new Map(),
+): LegacyRefResolution {
   const branch = resolveRefSuffix("branch", rest, refs);
-  if (branch !== null) return branch;
+  if (branch !== null) return { kind: "resolved", ...branch };
+  const renamedHit = walkRenamedBranch(rest, renamed);
+  if (renamedHit !== null) return { kind: "renamed", ...renamedHit };
   const tag = resolveRefSuffix("tag", rest, refs);
-  if (tag !== null) return tag;
+  if (tag !== null) return { kind: "resolved", refType: "tag", ref: tag.ref, treePath: tag.treePath };
   const parts = rest.split("/");
   if (/^[0-9a-f]{7,64}$/i.test(parts[0] ?? "")) {
-    return { refType: "commit", ref: parts[0] as string, treePath: parts.slice(1).join("/") };
+    return { kind: "resolved", refType: "commit", ref: parts[0] as string, treePath: parts.slice(1).join("/") };
   }
   const fallback = refs.branches.includes(refs.defaultBranch) ? refs.defaultBranch : (refs.branches[0] ?? refs.defaultBranch);
-  return { refType: "branch", ref: fallback, treePath: rest };
+  return { kind: "resolved", refType: "branch", ref: fallback, treePath: rest };
+}
+
+/**
+ * Upstream `getRefNameFromPath`'s renamed arm (services/context/repo.go:
+ * 888-894): the same shortest-cumulative-prefix walk as the branch/tag
+ * walks, over the repo's renamed `from` rows — the FIRST matching prefix
+ * wins. The map is pre-reduced with the chain-order pin: duplicate `from`
+ * rows keep the OLDEST row's `to` (upstream FindRenamedBranch's unordered
+ * Get answers the lowest rowid — models/git/branch.go:302-304).
+ */
+export function walkRenamedBranch(rest: string, renamed: ReadonlyMap<string, string>): { from: string; to: string } | null {
+  const parts = rest.split("/");
+  for (let i = 0; i < parts.length; i++) {
+    const candidate = parts.slice(0, i + 1).join("/");
+    const to = renamed.get(candidate);
+    if (to !== undefined) return { from: candidate, to };
+  }
+  return null;
+}
+
+/**
+ * The repo's renamed `from` → `to` rows (one D1 read; the readers fetch it
+ * ONLY on a failed branch walk — upstream's FindRenamedBranch query fires on
+ * the same miss). Ordered by id ASC and first-wins so a rename chain's
+ * duplicate `from` rows keep the oldest `to` (the parity pin above).
+ */
+export async function findRenamedBranchMap(db: D1Database, repoId: string): Promise<Map<string, string>> {
+  const rows = await drizzle(db)
+    .select({ from: renamedBranches.from, to: renamedBranches.to })
+    .from(renamedBranches)
+    .where(eq(renamedBranches.repoId, repoId))
+    .orderBy(asc(renamedBranches.id));
+  const map = new Map<string, string>();
+  for (const row of rows) {
+    if (row.from !== null && row.to !== null && !map.has(row.from)) map.set(row.from, row.to);
+  }
+  return map;
+}
+
+/**
+ * Upstream RepoRefByType's renamed redirect (services/context/repo.go:
+ * 1006-1016): 303 (ctx.Redirect's default status, base.go:157's
+ * StatusSeeOther) onto the same path with the FIRST occurrence of the
+ * escaped old name swapped for the escaped new one (strings.Replace's
+ * count-1 over the escaped request path — the whole path, owner segment
+ * included, upstream's exact scope). The ctx.Flash.Info arm
+ * (repo.branch.renamed "Branch %s was renamed to %s.") has no render surface
+ * on these byte arms — recorded, not ported (no cookie-flash machinery here;
+ * the branches page's query-param convention is its HTML arm). The query
+ * string is dropped: upstream's link is the replaced path only.
+ */
+export function renamedBranchRedirect(pathname: string, from: string, to: string): Response {
+  // util.PathEscapeSegments escapes EACH segment and joins with literal
+  // slashes (modules/util/path.go) — a slashed from-name keeps its `/`s in
+  // the search pattern.
+  const escapeSegments = (name: string): string => name.split("/").map(encodeURIComponent).join("/");
+  return new Response(null, {
+    status: 303,
+    headers: { location: pathname.replace(escapeSegments(from), escapeSegments(to)) },
+  });
 }
 
 /** `path.Base` (Go): the final segment; "" and "." stay ".". */
@@ -229,21 +314,35 @@ function baseName(treePath: string): string {
   return base === "" ? "." : base;
 }
 
+/** The shared ref/blob resolution outcome: the blob with its ServeBlob
+ *  inputs, or the renamed-branch redirect outcome (upstream RepoRefByType's
+ *  IsRenamedBranch arm — a renamed hit NEVER serves content, it redirects:
+ *  services/context/repo.go:1006-1016). */
+type RefBlobResolution =
+  | { kind: "blob"; blob: BlobResult; treePath: string; lastModified: Date | null }
+  | { kind: "renamed"; from: string; to: string };
+
 /** The shared ref/blob resolution behind both families (download.go's
  *  getBlobForEntry over the middleware-ref arms): the ref resolves against
- *  the refs list; an empty treePath names no blob (upstream
- *  GetTreeEntryByPath("") is the root TREE entry → the NotFound arm); the
- *  engine's readBlob nulls on dirs and gitlinks (the entry.IsDir/
- *  IsSubModule 404 arm) and on misses. `latestCommitTime` runs the
- *  GetTreePathLatestCommit walk (download.go:91-99) — the first commit over
- *  the path at the resolved tip (listLog's path-filtered n=1 walk), null on
- *  the blob arm or a failed walk (the null-on-failure reduction). */
+ *  the refs list; a RENAMED hit short-circuits before any blob read —
+ *  upstream's getRefName answers the FROM name with the IsRenamedBranch data
+ *  set and RepoRefByType redirects (the typed BRANCH arm checks renames too:
+ *  web.go:1709/1701's typed routes run the same RepoRefByType middleware as
+ *  the deprecated legacy catch-alls, so both shapes redirect; the tag/commit
+ *  arms never consult renamed rows — upstream's renamed walk lives only in
+ *  getRefName's RefTypeBranch arm, repo.go:866-895); an empty treePath names
+ *  no blob (upstream GetTreeEntryByPath("") is the root TREE entry → the
+ *  NotFound arm); the engine's readBlob nulls on dirs and gitlinks (the
+ *  entry.IsDir/IsSubModule 404 arm) and on misses. `latestCommitTime` runs
+ *  the GetTreePathLatestCommit walk (download.go:91-99) — the first commit
+ *  over the path at the resolved tip (listLog's path-filtered n=1 walk),
+ *  null on the blob arm or a failed walk (the null-on-failure reduction). */
 async function resolveRefBlob(
   env: Env,
   repo: RawMediaRepo,
   target: RawMediaTarget,
   options: { latestCommitTime: boolean },
-): Promise<{ blob: BlobResult; treePath: string; lastModified: Date | null } | null> {
+): Promise<RefBlobResolution | null> {
   const reads = engineReads(env, repo);
   const refsResult = await reads.listRefs();
   if (refsResult === null) return null;
@@ -264,9 +363,23 @@ async function resolveRefBlob(
     return null;
   }
   if (target.kind === "legacy") {
-    resolved = resolveLegacyRefSuffix(target.refSuffix, refs);
+    // Upstream getRefNameLegacy's order: the branch walk FIRST (the renamed
+    // D1 read pays only on its miss — FindRenamedBranch's query-on-miss
+    // posture), then renamed → tag → sha → default fallback.
+    const branch = resolveRefSuffix("branch", target.refSuffix, refs);
+    if (branch !== null) {
+      resolved = branch;
+    } else {
+      const legacy = resolveLegacyRefSuffix(target.refSuffix, refs, await findRenamedBranchMap(env.DB, repo.id));
+      if (legacy.kind === "renamed") return { kind: "renamed", from: legacy.from, to: legacy.to };
+      resolved = { refType: legacy.refType, ref: legacy.ref, treePath: legacy.treePath };
+    }
   } else {
     resolved = resolveRefSuffix(target.refType, target.refSuffix, refs);
+    if (resolved === null && target.refType === "branch") {
+      const hit = walkRenamedBranch(target.refSuffix, await findRenamedBranchMap(env.DB, repo.id));
+      if (hit !== null) return { kind: "renamed", from: hit.from, to: hit.to };
+    }
   }
   if (resolved === null) return null; // "branch or tag not exist" (repo.go:976-979)
   if (resolved.treePath === "") return null; // GetTreeEntryByPath("") → the root tree → NotFound
@@ -279,14 +392,15 @@ async function resolveRefBlob(
     const commit = log?.commits[0];
     if (commit !== undefined) lastModified = new Date(commit.committer.time * 1000);
   }
-  return { blob, treePath: resolved.treePath, lastModified };
+  return { kind: "blob", blob, treePath: resolved.treePath, lastModified };
 }
 
 // ---------------------------------------------------------------------------
 // The RAW arm — load + response (common.ServeBlob's exact order)
 // ---------------------------------------------------------------------------
 
-/** The raw arm's load outcome: the blob + its ServeBlob inputs, or null —
+/** The raw arm's load outcome: the blob + its ServeBlob inputs, the
+ *  renamed-branch redirect (the stale-link arm — never content), or null —
  *  the 404 family (empty repo, unresolvable ref, missing blob path). */
 export type RawBlobLoad =
   | {
@@ -298,6 +412,7 @@ export type RawBlobLoad =
        *  failed walk (the null-on-failure reduction). */
       lastModified: Date | null;
     }
+  | { kind: "renamed"; from: string; to: string }
   | { kind: "not-found" };
 
 /**
@@ -309,6 +424,7 @@ export async function loadRawBlob(env: Env, repo: RawMediaRepo, target: RawMedia
   if (repo.isEmpty) return { kind: "not-found" }; // MustBeNotEmpty (web.go:1713's group gate)
   const found = await resolveRefBlob(env, repo, target, { latestCommitTime: target.kind !== "blob" });
   if (found === null) return { kind: "not-found" };
+  if (found.kind === "renamed") return { kind: "renamed", from: found.from, to: found.to };
   return { kind: "raw", blob: found.blob, filename: baseName(found.treePath), lastModified: found.lastModified };
 }
 
@@ -395,6 +511,7 @@ export function rawBlobResponse(
  *  the sniff prefix split off. */
 export type MediaFileLoad =
   | { kind: "blob"; raw: Extract<RawBlobLoad, { kind: "raw" }> }
+  | { kind: "renamed"; from: string; to: string }
   | {
       kind: "redirect";
       location: string;
@@ -436,6 +553,7 @@ export async function loadMediaBlob(env: Env, repo: RawMediaRepo, target: RawMed
   if (repo.isEmpty) return { kind: "not-found" }; // MustBeNotEmpty (web.go:1705's group gate)
   const found = await resolveRefBlob(env, repo, target, { latestCommitTime: target.kind !== "blob" });
   if (found === null) return { kind: "not-found" };
+  if (found.kind === "renamed") return { kind: "renamed", from: found.from, to: found.to };
   const raw: Extract<RawBlobLoad, { kind: "raw" }> = {
     kind: "raw",
     blob: found.blob,
@@ -495,7 +613,7 @@ export async function loadMediaBlob(env: Env, repo: RawMediaRepo, target: RawMed
  * (ServeUserContentByFile's Stat().ModTime).
  */
 export function mediaBlobResponse(
-  load: Exclude<MediaFileLoad, { kind: "not-found" }>,
+  load: Exclude<MediaFileLoad, { kind: "not-found" } | { kind: "renamed" }>,
   options: { cacheIsPublic: boolean; ifNoneMatch: string | null; ifModifiedSince: string | null },
 ): Response {
   if (load.kind === "blob") {
