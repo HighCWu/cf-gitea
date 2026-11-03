@@ -30,6 +30,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { packageVersions, packages, repositories, users } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
+import { goPathEscape, goQueryEscape } from "../../services/packages/npm";
 import { mintFor } from "../../auth/testing/seeds";
 
 beforeAll(async () => {
@@ -955,5 +956,42 @@ describe("npm auth/quota/repo-link arms", () => {
     const unlinked = await db().select().from(packages).all();
     expect(unlinked[0]?.repoId).toBeNull();
     void bob;
+  });
+});
+
+// --- the dist.tarball escapers (api.go:88 — the escaper-census port) --------
+
+describe("the npm URL escapers (api.go:88: QueryEscape(name) + PathEscape(version/file))", () => {
+  it("goPathEscape rides Go's segment class — `!'()*` encode, `$&+:=@` stay raw", () => {
+    expect(goPathEscape("foo (bar)!")).toBe("foo%20%28bar%29%21");
+    expect(goPathEscape("1.0.0+build.5")).toBe("1.0.0+build.5");
+    expect(goPathEscape("a$b&c:d;e=f@g")).toBe("a$b&c:d%3Be=f@g");
+  });
+
+  it("goQueryEscape keeps the query class — space becomes +, `!'()*` encode", () => {
+    expect(goQueryEscape("foo bar!")).toBe("foo+bar%21");
+  });
+});
+
+describe("the dist.tarball bytes for a build-metadata version (api.go:119-123 + creator.go:349)", () => {
+  it("publishes 1.0.0+build.5 and renders the stored tarball path with the RAW plus (PathEscape keeps it; encodeURIComponent escaped it)", async () => {
+    const owner = await seedUser("esc-npm");
+    const writer = await token(owner, "write:package");
+    const put = await publish("esc-npm", "@scope/pkg", "1.0.0+build.5", NPM_TARBALL, {}, authHeaders(writer));
+    expect(put.status).toBe(201);
+    await put.text();
+
+    const packument = await protocol()("/api/packages/esc-npm/npm/@scope%2Fpkg");
+    expect(packument.status).toBe(200);
+    const doc = rec(await packument.json());
+    const versionDoc = rec(rec(doc.versions)["1.0.0+build.5"]);
+    const dist = rec(versionDoc.dist);
+    // The stored gitea_tarball_path (creator.go:349 → goPathEscape): the
+    // canonical semver keeps its `+`, and Go's PathEscape keeps it RAW in
+    // both the packument URL and the download route's filename.
+    expect(dist.tarball).toBe("https://example.com/api/packages/esc-npm/npm/@scope/pkg/-/pkg-1.0.0+build.5.tgz");
+    const get = await protocol()("/api/packages/esc-npm/npm/@scope%2Fpkg/-/pkg-1.0.0%2Bbuild.5.tgz");
+    expect(get.status).toBe(200);
+    await get.arrayBuffer();
   });
 });

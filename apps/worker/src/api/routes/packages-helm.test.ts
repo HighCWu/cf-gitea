@@ -562,4 +562,27 @@ describe("helm auth/quota arms", () => {
     expect(upload.status).toBe(404);
     await upload.text();
   });
+
+});
+
+describe("the helm index filename escaper (helm.go:83 — the census port)", () => {
+  it("a divergent-byte chart name encodes per Go's segment class in the index urls", async () => {
+    // Upstream gates the chart name on non-emptiness only (metadata.go:122-124),
+    // so a name like 'demo (x)!' is legal; helm.go:83 rides url.PathEscape
+    // over createFilename — encodeURIComponent was the inverse class.
+    const owner = await seedUser("helm-esc");
+    const writer = await token(owner, "write:package");
+    const yaml = CHART_YAML({ name: "demo (x)!" });
+    const tgz = await makeChartTgzWithFiller("demo (x)!", yaml, CHART_PAYLOAD_FILLER);
+    const put = await pushChart("helm-esc", "demo (x)!", "0.1.0", tgz, authHeaders(writer));
+    expect(put.status).toBe(201);
+    await put.text();
+
+    const index = await protocol()("/api/packages/helm-esc/helm/index.yaml");
+    expect(index.status).toBe(200);
+    const doc = yamlParse(await index.text()) as { entries: Record<string, Array<Record<string, unknown>>> };
+    const entries = doc.entries["demo (x)!"] ?? [];
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.urls).toEqual(["https://example.com/api/packages/helm-esc/helm/demo%20%28x%29%21-0.1.0.tgz"]);
+  });
 });
