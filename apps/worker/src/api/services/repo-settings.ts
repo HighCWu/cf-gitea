@@ -498,7 +498,7 @@ async function fireActionsScheduleArm(
       }
       // newNotifyInputForSchedules (notifier_helper.go:82-85): Event =
       // HookEventSchedule, Payload = nil → EncodedPayload "null".
-      await detectAndHandleSchedules(scheduleArm.env, pair, { event: "schedule", eventPayload: "null" });
+      await detectAndHandleSchedules(scheduleArm.env, pair.repo, { event: "schedule", eventPayload: "null" });
     } else {
       // The post-transaction disable clean (setting.go:55-58).
       const cancelled = await cleanRepoScheduleTasks(d1, repoId);

@@ -177,6 +177,7 @@ import { ApiError } from "../../api/errors";
 import { engineReads } from "../../api/services/engine";
 import type { RepositoryWithOwner } from "../../api/services/repository";
 import { RepoService } from "../../repos/service";
+import { switchSchedulesToDefaultBranch } from "../../services/actions/schedule";
 import { protectedBranches, teams, users } from "../../db/schema";
 import {
   ACTIONS_USER_ID,
@@ -912,8 +913,11 @@ export type DefaultBranchResult =
 /** The production setDefaultBranch seam: RepoService with the engine's
  *  setHead RPC wired (the api/routes/repo.ts PATCH wiring shape — bare
  *  construction silently skips the DO head move; D1 is the metadata truth
- *  either way, the service header). */
-function productionSetDefaultBranch(env: Env): (repoId: string, branch: string) => Promise<unknown> {
+ *  either way, the service header). Exported for the RENAME arm's reuse
+ *  (ui/index.ts branchRenameSubmit — the same D1+head write the default
+ *  rename needs, upstream models RenameBranch :353-361 + git.SetDefaultBranch
+ *  inside the rename callback). */
+export function productionSetDefaultBranch(env: Env): (repoId: string, branch: string) => Promise<unknown> {
   const service = new RepoService(env.DB, {
     setHead: async (engineName, branch) => (await env.REPO.getByName(engineName).setHead(branch)).tag,
   });
@@ -935,21 +939,32 @@ function productionSetDefaultBranch(env: Env): (repoId: string, branch: string) 
  * 3. the landed service writes: D1 first (the metadata truth), the engine's
  *    setHead best-effort (an "invalid"/"not_found" rejection logs, never
  *    blocks — an empty repo may point at an unborn branch, the service
- *    header).
+ *    header);
+ * 4. SwitchSchedulesToDefaultBranch (services/actions/clear_tasks.go:65-77)
+ *    — upstream SetRepoDefaultBranch's post-commit tail (branch.go:729):
+ *    the registry rows delete, the OLD default's live schedule runs cancel,
+ *    the unit-gated re-register re-walks the NEW default. The row handed to
+ *    the switch carries the NEW default (upstream's model mutation,
+ *    branch.go:717). The switch is log-and-continue internally — it never
+ *    fails the write.
  *
- * `setDefaultBranch` is injectable so the seam tests assert the call's
- * arguments; the handler mounts the production wiring (the default).
+ * `setDefaultBranch` and `switchSchedules` are injectable so the seam tests
+ * assert the calls' arguments; the handler mounts the production wirings
+ * (the defaults).
  */
 export async function applyDefaultBranchForm(
   env: Env,
   repo: RepoRow,
   branch: string,
   setDefaultBranch: (repoId: string, branch: string) => Promise<unknown> = productionSetDefaultBranch(env),
+  switchSchedules: (repo: RepoRow, oldDefaultBranch: string) => Promise<void> = (row, old) =>
+    switchSchedulesToDefaultBranch(env, row, old),
 ): Promise<DefaultBranchResult> {
   if (branch !== repo.defaultBranch) {
     const names = await loadEngineBranchNames(env, repo);
     if (!names.includes(branch)) return { outcome: "missing", branch };
     await setDefaultBranch(repo.id, branch);
+    await switchSchedules({ ...repo, defaultBranch: branch }, repo.defaultBranch);
   }
   return { outcome: "applied", branch };
 }

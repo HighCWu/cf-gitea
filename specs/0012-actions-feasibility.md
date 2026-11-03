@@ -1460,7 +1460,8 @@ the registry holding the parsed specs.
      log-and-continue envelope); the arm's other upstream property holds by
      construction — the re-walk reads the TREE and repo row, never the unit
      rows, so post-commit firing is equivalent to upstream's in-tx position.
-  2. *CleanRepoScheduleTasks* — upstream `clear_tasks.go:59-62` →
+  2. *CleanRepoScheduleTasks* — upstream `clear_tasks.go:59-63` (the notify
+     wrapper) →
      `models/actions/schedule.go:104-123`: `DeleteScheduleTaskByRepo` +
      `CancelPreviousJobs(repo, default-branch ref, workflowID="", event=
      schedule)` (run_job.go:706-723 — the live-status set running/waiting/
@@ -1489,13 +1490,74 @@ the registry holding the parsed specs.
      per-repo with its own queue budget; both event seams' errors are
      log-and-continue exactly upstream, and the sweep is what heals a
      clean that threw.
-  - Not ported (recorded gaps, both reported): upstream's per-repo unit
-    re-save fires the re-walk for the ORG/USER-level surfaces too
-    (`UpdateRepositoryUnits`'s other callers) — our surface exposes only
-    the repo-level writers above, which is what was wired; and
-    `SwitchSchedulesToDefaultBranch` (clear_tasks.go:66-77 — the
-    default-branch RENAME cleanup) has no seam here yet (a default-branch
-    rename is a repositories-column write with no schedule hook today).
+  - **The 2026-11-03 follow-up wave closes both residual §D7 seams** (the
+    FZ report's two open records, plus the adversarial-review fix):
+    1. *The carve-out registration drift is FIXED*: FM's push-path port
+       had the Actions-user carve-out (notify `:138-152` →
+       `DetectAndHandleSchedules` `:147-148`) registering event `push`
+       through the push seam's fused twin. Upstream routes that carve-out
+       through the STANDALONE `DetectAndHandleSchedules` — whose
+       `newNotifyInputForSchedules` (`notifier_helper.go:82-85`)
+       registers event `schedule` with the nil payload's literal `null` —
+       while the REGULAR push path calls `handleSchedules` directly with
+       the push input (`:279-282`, event `push`, the push payload). The
+       two registrations never shared a path upstream; the port now
+       mirrors the split: the carve-out (trigger.ts handleActionsPushEvent)
+       goes through schedule.ts's standalone with `{event: "schedule",
+       eventPayload: "null"}`, the push path keeps the fused twin's
+       `push`/payload registration. THE DRIFT'S BLAST RADIUS (what the
+       stored event drives): `action_schedule.event` → the created run
+       rows' `event` column at consume (`CreateScheduleTaskBySpec` hands
+       the registration event to every run; `trigger_event` stays
+       `schedule`) → `github.event_name` in the claim context (a
+       `github.event_name == 'schedule'` gate saw `push`) and the
+       run's event label on the run surfaces. Webhooks are untouched
+       (the registration writes the two registry tables only). Latent in
+       v1 (runs never push, so `pusherId == ACTIONS_USER_ID` never
+       fires) — fixed for parity, pinned in trigger.test.ts. The carve-out
+       also moved ABOVE the unit gate (upstream's notify order `:138-152`
+       precedes `:162-166`; the FM port ran it after — unreachable in v1
+       for the same reason, now faithful). The standalone gained
+       upstream's zero-detection early return (`:675-677`): a refresh
+       finding no schedule workflows leaves existing rows UNTOUCHED
+       (only the push path's unconditional `handleSchedules` deletes on
+       empty — the REPLACE pin holds).
+    2. *`SwitchSchedulesToDefaultBranch` is PORTED AND WIRED*
+       (`services/actions/clear_tasks.go:65-77` — the brief's
+       `models/actions` cite corrected: the function lives in
+       services/actions): delete the registry rows (`:68-70`), cancel the
+       live schedule runs of the OLD default's ref (`:71-73`, through the
+       extracted `cancelPreviousScheduleJobs` — the same
+       `run_job.go:706-723` cancel machinery the clean uses), then the
+       actions-unit-gated re-register from the NEW default through the
+       standalone (`:74-77`, the schedule/null registration). Each step
+       log-and-continue (`:68-76`) — the switch never fails its caller.
+       Wired at ALL THREE upstream callers' ports: the API PATCH's
+       default_branch arm (`routes/repo.ts`, upstream `repo.go:726-733` —
+       fires when the change landed, empty repos included), the web
+       settings write (`branch-protection.tsx applyDefaultBranchForm`,
+       upstream `SetRepoDefaultBranch` `branch.go:729`), and the
+       default-branch RENAME (`ui/index.ts branchRenameSubmit`, upstream
+       `RenameBranch` `branch.go:489`, which fires only when the renamed
+       branch WAS the default). The rename arm's port also closes the
+       pre-existing gap the switch exposed: our rename never re-pointed
+       `repositories.default_branch` (upstream models `RenameBranch`
+       `:353-361` writes it in-tx) nor HEAD (`git.SetDefaultBranch` in the
+       service callback) — both now follow an admin default-rename through
+       the shared production wiring; the engine/D1 split keeps no
+       cross-store tx (a D1 failure mid-rename leaves the engine renamed
+       under a 500 — upstream's rollback window, disclosed). Recorded
+       divergence kept: `DeleteScheduleTaskByRepo` deletes specs-first
+       here where upstream's model deletes schedules-first
+       (`models/actions/schedule.go:90-102`) — FK-safer, same observable.
+    3. *Cron month/dow names are case-insensitive* (the adversarial-review
+       fix): robfig's `parseIntOrName` reads
+       `names[strings.ToLower(expr)]`, ours now lowercases the token
+       before the table probe — `0 9 * * MON` (the GitHub-docs spelling
+       class) registers where the case-sensitive lookup silently
+       registered no spec row (the parse-failure catch-continue swallowed
+       it). Descriptors and numeric fields stay case-sensitive exactly
+       upstream.
 
 
 **API surface:** none — the registry is internal (upstream exposes no
@@ -1515,4 +1577,13 @@ triggerEvent schedule, the Actions user, scheduleId set, payload.schedule =
 the spec, NO `schedule_unix` key); the disabled-workflow skip; the parser
 vectors re-homed (robfig descriptors, dayMatches OR/AND, the never-fire
 horizon) with cronNext pinned against `TZ=` zones (fixed-offset Tokyo; the
-New-York DST gap).
+New-York DST gap); the follow-up wave's pins — the carve-out's
+schedule/null registration (the drift pin), the standalone's
+zero-detection early return (rows survive), the switch end-to-end (rows
+re-registered from the NEW default with the schedule/null registration,
+the OLD default's live runs cancelled, the NEW default's standing), the
+switch's pure-D1 halves (delete + old-ref cancel + the unit-gate arm), the
+case-insensitive cron names, the API PATCH's switch tail, the web form's
+switch-seam arguments (new-default row + old default; never on the no-op
+and missing arms), and the site-admin default rename (D1 default + HEAD +
+the switch's delete half).

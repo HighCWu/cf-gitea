@@ -950,9 +950,41 @@ describe("the default-branch select (branches.tmpl's SetDefaultBranchPost arm)",
     const result = await applyDefaultBranchForm(env, repo, "feature/one", (repoId, branch): Promise<unknown> => {
       calls.push([repoId, branch]);
       return Promise.resolve();
-    });
+    }, (): Promise<void> => Promise.resolve());
     expect(result).toEqual({ outcome: "applied", branch: "feature/one" });
     expect(calls).toEqual([[repo.id, "feature/one"]]);
+  });
+
+  it("the schedule switch fires with the NEW-default row and the OLD default (clear_tasks.go:65-77 via SetRepoDefaultBranch branch.go:729)", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    const switchCalls: Array<{ rowId: string; newDefault: string; oldDefault: string }> = [];
+    const result = await applyDefaultBranchForm(env, repo, "feature/one", (): Promise<unknown> => Promise.resolve(), (row, old): Promise<void> => {
+      switchCalls.push({ rowId: row.id, newDefault: row.defaultBranch, oldDefault: old });
+      return Promise.resolve();
+    });
+    expect(result).toEqual({ outcome: "applied", branch: "feature/one" });
+    // Upstream's model is mutated BEFORE the switch reads it (branch.go:717):
+    // the row the switch receives carries the NEW default; the second
+    // argument is the caller's remembered OLD name.
+    expect(switchCalls).toEqual([{ rowId: repo.id, newDefault: "feature/one", oldDefault: "main" }]);
+  });
+
+  it("the schedule switch never fires on the same-name no-op or the missing branch", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    const switchCalls: string[] = [];
+    const sameName = await applyDefaultBranchForm(env, repo, "main", (): Promise<unknown> => Promise.resolve(), (): Promise<void> => {
+      switchCalls.push("same-name");
+      return Promise.resolve();
+    });
+    expect(sameName).toEqual({ outcome: "applied", branch: "main" });
+    const missing = await applyDefaultBranchForm(env, repo, "ghost", (): Promise<unknown> => Promise.resolve(), (): Promise<void> => {
+      switchCalls.push("missing");
+      return Promise.resolve();
+    });
+    expect(missing).toEqual({ outcome: "missing", branch: "ghost" });
+    expect(switchCalls).toEqual([]);
   });
 
   it("a branch the engine does not know is `missing` and the service is not called", async () => {

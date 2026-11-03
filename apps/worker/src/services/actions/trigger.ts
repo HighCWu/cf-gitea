@@ -78,10 +78,14 @@
  *   - Schedules (`on: schedule`) are WIRED through upstream's TWO-TABLE
  *     registry (SPEC-0012 §D7 — the 2026-11-03 user-ruled alignment that
  *     replaced W14's stateless design): every default-branch push refreshes
- *     action_schedule/action_schedule_spec through the tree half below
- *     (detectAndHandleSchedules, notifier_helper.go:654-685 — the registry
- *     writer lives in services/actions/schedule.ts), the 10-minute-step
- *     producer
+ *     action_schedule/action_schedule_spec through the fused tree half
+ *     below (the port of notify :279-282's direct handleSchedules call —
+ *     registration event "push", the push payload, exactly upstream's push
+ *     input), while the Actions-user carve-out (:138-152) and every
+ *     non-push registration seam route through schedule.ts's standalone
+ *     DetectAndHandleSchedules port (newNotifyInputForSchedules :82-85 —
+ *     event "schedule", payload "null"). The registry writer and the
+ *     10-minute-step producer
  *     (services/demo-sweep.ts enqueueDueActionScheduleScans) selects due
  *     spec rows and the spec-row consumer (schedule.ts
  *     handleActionsScheduleTrigger, re-exported at the bottom) advances the
@@ -151,8 +155,15 @@ import { findRule, listRepoRules, parseRuleConfig, type ProtectedBranchRow } fro
 // The two-table schedule registry (SPEC-0012 §D7): trigger.ts keeps the
 // TREE half below; the registry writer comes from schedule.ts. The reverse
 // edge (schedule.ts → insertTriggeredRunSplit) is function-body-only — the
-// update.ts cycle precedent.
-import { handleSchedules, type DetectedScheduleWorkflow } from "./schedule";
+// update.ts cycle precedent. The STANDALONE DetectAndHandleSchedules port
+// (aliased — this module's same-named export is the push seam's fused twin)
+// is the Actions-user carve-out's registration, upstream's own callee there
+// (notify :147-148 → DetectAndHandleSchedules :655-685).
+import {
+  detectAndHandleSchedules as detectAndHandleSchedulesStandalone,
+  handleSchedules,
+  type DetectedScheduleWorkflow,
+} from "./schedule";
 import { loadRepoActionsConfig } from "./config";
 import {
   DefaultStatusCheck,
@@ -3674,9 +3685,10 @@ export interface TriggerCellReads extends WorkflowTreeReads {
  *     zero-before payload shape, push.go:124-128).
  *
  * notify's gates (notifier_helper.go:136-172): the Actions-user cycle break
- * (:139-155 — our system id), empty/archived repos (:153-155), the unit gate
- * (:156-166), the default-branch fallback for default-branch-only events
- * (:174-185 — `delete` per github.go:31-58; wired here for delete events).
+ * + schedule carve-out (:138-152 — our system id), empty/archived repos
+ * (:153-155), the unit gate (:156-166), the default-branch fallback for
+ * default-branch-only events (:174-185 — `delete` per github.go:31-58;
+ * wired here for delete events).
  */
 export async function handleActionsPushEvent(
   env: ActionsTriggerEnv,
@@ -3685,9 +3697,9 @@ export async function handleActionsPushEvent(
 ): Promise<void> {
   try {
     if (event.updates.length === 0) return;
-    // The cycle break (notifier_helper.go:139-155): an Actions-user push
+    // The cycle break (notifier_helper.go:138-152): an Actions-user push
     // never re-triggers (v1 runs never push — the guard is carried), BUT the
-    // break's own carve-out stands (:144-151: "some schedule tasks may
+    // break's own carve-out stands (:144-148: "some schedule tasks may
     // update the repo periodically, so the refs of schedule tasks need to
     // be updated") — an Actions-user DEFAULT-BRANCH push still refreshes the
     // schedule registry below, then returns without triggering workflows.
@@ -3700,6 +3712,26 @@ export async function handleActionsPushEvent(
     const pair = await findRepositoryByPath(env.DB, owner, slug);
     if (pair === null) return;
     const repo = pair.repo;
+
+    // The Actions-user carve-out (notifier_helper.go:138-152): the registry
+    // refresh only — no workflow triggering — and upstream's arm runs FIRST,
+    // before the empty/archived skip (:153-155) and the unit gate (:162-166):
+    // the carve-out's skips are DetectAndHandleSchedules' own, empty/archived
+    // alone (:656-658). The registration routes through the STANDALONE
+    // DetectAndHandleSchedules (schedule.ts — upstream's own callee here,
+    // :147-148), whose newNotifyInputForSchedules (:82-85) registers
+    // Event "schedule" with the literal "null" payload — NOT the push input
+    // the notify body hands handleSchedules (:280-282), because no push
+    // happened. Each default-branch update refreshes once; a zero-NEW update
+    // (a deletion) reads no tip in the standalone and no-ops.
+    if (isActionsUserPush) {
+      for (const update of event.updates) {
+        if (update.ref === `refs/heads/${repo.defaultBranch}` && update.new !== PUSH_ZERO_OID) {
+          await detectAndHandleSchedulesStandalone(env, repo, { event: "schedule", eventPayload: "null" });
+        }
+      }
+      return;
+    }
 
     // archived (notifier_helper.go:153-155)
     if (repo.isArchived) return;
@@ -3727,23 +3759,6 @@ export async function handleActionsPushEvent(
     const reads: TriggerCellReads = cell;
     const appUrl = (env.APP_URL ?? options.origin ?? event.origin ?? "").replace(/\/+$/, "");
     const triggerUserId = event.pusherId ?? repo.ownerId ?? 0;
-
-    // The Actions-user carve-out (notifier_helper.go:141-155): the registry
-    // refresh only — no workflow triggering, no unit gate (upstream's arm
-    // runs DetectAndHandleSchedules directly, whose skips are
-    // empty/archived alone, :667-669).
-    if (isActionsUserPush) {
-        for (const update of event.updates) {
-        if (update.ref === `refs/heads/${repo.defaultBranch}` && update.new !== PUSH_ZERO_OID) {
-          // The schedule-input carries NO push payload upstream —
-          // EncodedPayload of the nil Payload is the literal "null"
-          // (notifier_helper.go:82-85 + :174-183), and the consumer's
-          // merge starts from a fresh map for exactly that byte.
-          await detectAndHandleSchedules(env, pair, reads, update, "null");
-        }
-      }
-      return;
-    }
 
     for (const update of event.updates) {
       // refs/pull/* never trigger (the webhook family's own filter;
@@ -3785,14 +3800,21 @@ async function repoActionsUnitEnabled(d1: D1Database, repoId: string): Promise<b
 }
 
 /**
- * DetectAndHandleSchedules — the TREE half (notifier_helper.go:654-685): the
- * empty/archived skips, the default-branch tip re-read, the
- * DetectScheduledWorkflows enumeration (workflows.go:242-279 — the
- * schedule-carrying workflows with their OnSchedule cron strings,
- * actionslib model/workflow.go:90-102), and the registry replace through
- * schedule.ts's handleSchedules (the writer half of :586-649). The caller
- * owns the push-event/default-branch gate and the [skip ci] short-circuit —
- * the refresh never runs past it, exactly upstream's notify order.
+ * DetectAndHandleSchedules — the PUSH seam's FUSED tree half. Upstream has
+ * no function of this shape on the push path: notify detects the schedule
+ * workflows inside DetectWorkflows (:202-212, shouldDetectSchedules :137)
+ * and calls handleSchedules DIRECTLY (:279-282) with the PUSH notifyInput —
+ * this port fuses that call's tree reads (the same enumeration
+ * DetectScheduledWorkflows performs, workflows.go:242-279). The REGISTRATION
+ * is the push input's verbatim: Event "push" and the push payload bytes
+ * (handleSchedules :629-644 stores input.Event + EncodedPayload; the push
+ * path's rows read event "push" upstream too — this is NOT a divergence).
+ * The Actions-user carve-out does NOT come through here: upstream routes it
+ * to the STANDALONE DetectAndHandleSchedules (:147-148), whose
+ * newNotifyInputForSchedules registers "schedule"/"null" (:82-85) — the
+ * schedule.ts port of exactly that function. The caller owns the
+ * push-event/default-branch gate and the [skip ci] short-circuit — the
+ * refresh never runs past it, exactly upstream's notify order.
  */
 export async function detectAndHandleSchedules(
   env: ActionsTriggerEnv,
@@ -3802,12 +3824,12 @@ export async function detectAndHandleSchedules(
   eventPayloadJson: string,
 ): Promise<void> {
   const repo = pair.repo;
-  // The empty/archived skips (notifier_helper.go:667-669)
+  // The empty/archived skips (notifier_helper.go:656-658)
   if (repo.isEmpty || repo.isArchived) return;
   const ref = `refs/heads/${repo.defaultBranch}`;
-  // The tip commit is the DEFAULT BRANCH's (:676 GetCommit(repo.DefaultBranch)
-  // — on this seam the applied update IS the tip; the read keeps the exact
-  // registration sha the run rows inherit).
+  // The tip commit is the DEFAULT BRANCH's (:667-670
+  // GetCommit(repo.DefaultBranch) — on this seam the applied update IS the
+  // tip; the read keeps the exact registration sha the run rows inherit).
   const commit = await reads.readCommit(ref);
   if (commit === null) return; // no default branch — nothing can be scheduled
   const workflowFiles = await listWorkflows(reads, ref);
@@ -3843,6 +3865,9 @@ export async function detectAndHandleSchedules(
       ref,
       commitSha: commit.oid,
       commitTitle: commit.subject,
+      // The PUSH input's registration (:280-282 → :629-644): event "push"
+      // with the push payload bytes — the carve-out's schedule/null
+      // registration lives in the schedule.ts standalone, never here.
       event: "push",
       eventPayload: eventPayloadJson,
     },

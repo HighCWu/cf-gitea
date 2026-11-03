@@ -41,6 +41,7 @@ import {
 } from "../services/repo-settings";
 import { deleteRepoTopics } from "../services/repo-topics";
 import { deleteRepoWatchers } from "../services/repo-watchers";
+import { switchSchedulesToDefaultBranch } from "../../services/actions/schedule";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
 import { engineCell, engineReads } from "../services/engine";
@@ -600,6 +601,17 @@ export function registerRepoRoutes(
         const tip = await engineReads(c.env, found.repo).readCommit(`refs/heads/${form.default_branch}`);
         if (found.repo.isEmpty || tip !== null) {
           const updated = await service.setDefaultBranch(found.repo.id, form.default_branch);
+          // The schedule-registry switch (services/actions/clear_tasks.go:
+          // 65-77) — upstream EditRepo's post-UpdateRepository tail
+          // (repo.go:726-733): the registry rows delete, the OLD default's
+          // live schedule runs cancel, the actions-unit-gated re-register
+          // re-walks the NEW default (updated's defaultBranch is already the
+          // new name — upstream's model mutation, repo.go:718). Fires for
+          // empty repos too (upstream gates only on oldDefaultBranch != ""
+          // — repo.go:732-733), which this block's landing condition already
+          // is. The switch is log-and-continue internally (each step's error
+          // is logged upstream, :68-76) — it never fails the PATCH.
+          await switchSchedulesToDefaultBranch(c.env, updated, found.repo.defaultBranch);
           // The default-branch license arm (repo.go:713-746): upstream's
           // enqueuer fires ONLY when the change LANDED — the target branch
           // exists (or the repo is empty) and the repo is non-empty (the

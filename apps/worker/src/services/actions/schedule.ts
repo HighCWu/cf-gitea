@@ -4,9 +4,9 @@
  * stateless tick-window design). Ported from the pin fc4936884584a41931906553d96c2601d750e6ef:
  *
  *   - models/actions/schedule.go — the ActionSchedule row +
- *     CreateScheduleTaskBySchedules (:42-79, insert schedule rows + one spec
+ *     CreateScheduleTaskBySchedules (:45-88, insert schedule rows + one spec
  *     row per parseable ever-occurring spec) + DeleteScheduleTaskByRepo
- *     (:82-93) + CleanRepoScheduleTasks' delete half;
+ *     (:90-102) + CleanRepoScheduleTasks' delete half;
  *   - models/actions/schedule_list.go — FindScheduleOptions
  *     (getSchedulesByRepo's read port);
  *   - models/actions/schedule_spec.go — ActionScheduleSpec + Parse()
@@ -62,7 +62,8 @@
  *     UpdateRepositoryUnits fires DeleteScheduleTaskByRepo +
  *     DetectAndHandleSchedules on every actions-unit write and
  *     CleanRepoScheduleTasks on the disable) and CleanRepoScheduleTasks
- *     (clear_tasks.go:59-62 + models/actions/schedule.go:104-123) are WIRED:
+ *     (services/actions/clear_tasks.go:59-63, the notify wrapper over
+ *     models/actions/schedule.go:104-123) are WIRED:
  *     the settings arm rides saveRepoSettings' has_actions write
  *     (api/services/repo-settings.ts) and the archive seam
  *     (setRepoArchived), and the clean rides the hourly
@@ -70,12 +71,23 @@
  *     clean_repo_schedule_tasks census arm, the residual-row sweep that
  *     covers the seams our surface lacks, upstream's own "app.ini will be
  *     changed manually" posture, notifier_helper.go:156-160).
+ *   - SwitchSchedulesToDefaultBranch (services/actions/clear_tasks.go:65-77)
+ *     is WIRED (the 2026-11-03 follow-up): the default-branch-change
+ *     cleanup — delete the registry rows, cancel the live schedule runs on
+ *     the OLD default's ref, then the actions-unit-gated re-register from
+ *     the NEW default through the standalone detectAndHandleSchedules
+ *     (the same newNotifyInputForSchedules registration, :82-85). Its three
+ *     upstream callers map to our three default-branch writers: the API
+ *     PATCH's default_branch arm (routes/repo.ts — repo.go:733), the web
+ *     settings write (branch-protection.tsx applyDefaultBranchForm —
+ *     SetRepoDefaultBranch, branch.go:729) and the default-branch RENAME
+ *     (ui/index.ts branchRenameSubmit — RenameBranch, branch.go:489).
  */
 
 import { and, asc, desc, eq, inArray, isNull, lte } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { findRepositoryById, type RepositoryWithOwner } from "../../api/services/repository";
+import { findRepositoryById, type RepositoryRow } from "../../api/services/repository";
 import { engineName } from "../../repos/service";
 import {
   actionRunJobs,
@@ -158,7 +170,10 @@ const CRON_DESCRIPTORS: Record<string, string> = {
 
 function parseIntOrName(token: string, names: Record<string, number> | undefined): number {
   if (names !== undefined) {
-    const named = names[token];
+    // robfig's lookup is CASE-INSENSITIVE (parser.go's parseIntOrName reads
+    // names[strings.ToLower(expr)]) — "MON", "Jan" and "sun" all parse; the
+    // lowercase table above is matched against the LOWERCASED token.
+    const named = names[token.toLowerCase()];
     if (named !== undefined) return named;
   }
   // strconv.Atoi's decimal arm: leading zeros parse ("07" = 7)
@@ -639,8 +654,13 @@ export async function createScheduleTaskBySchedules(d1: D1Database, ctx: Schedul
 }
 
 /**
- * DeleteScheduleTaskByRepo (schedule.go:82-93): the specs first, then the
- * schedules (upstream's own order; nothing reads one without the other).
+ * DeleteScheduleTaskByRepo (models/actions/schedule.go:90-102). Disclosed
+ * divergence: upstream's model deletes the SCHEDULE rows first and the spec
+ * rows second (:91-97), ours deletes specs first — the FK-safer order (a
+ * spec row referencing a gone schedule cannot outlive the delete batch) and
+ * the order the repo-delete cascade already uses (repos/service.ts's
+ * deleteRepository over delete.go:191-192). Nothing reads one table without
+ * the other, so the observable is identical either way.
  */
 export async function deleteScheduleTaskByRepo(d1: D1Database, repoId: string): Promise<void> {
   const db = drizzle(d1);
@@ -649,8 +669,10 @@ export async function deleteScheduleTaskByRepo(d1: D1Database, repoId: string): 
 }
 
 // ---------------------------------------------------------------------------
-// The settings-change arm (services/repository/setting.go:20-64 +
-// notifier_helper.go:654-685) and the clean (clear_tasks.go:59-62)
+// The settings-change arm (services/repository/setting.go:20-64), the clean
+// (services/actions/clear_tasks.go:59-63) and the default-branch switch
+// (clear_tasks.go:65-77) — the DetectAndHandleSchedules family
+// (notifier_helper.go:655-685)
 // ---------------------------------------------------------------------------
 
 /**
@@ -693,33 +715,45 @@ export async function detectScheduledWorkflows(reads: TriggerCellReads, ref: str
 }
 
 /**
- * DetectAndHandleSchedules, the STANDALONE entry (notifier_helper.go:654-685)
- * — the settings-change arm's re-walk (setting.go:39) and the shape behind
- * the future instance-level consumers. Upstream's body verbatim: the
- * empty/archived skips (:667-669), the DEFAULT-BRANCH tip re-read (:672-676
- * GetCommit(repo.DefaultBranch) — the caller passes no ref; the repo row's
- * defaultBranch IS the registration ref), the tree enumeration, and the
- * registry replace through handleSchedules. The caller owns the DO cell (the
- * git-repository read upstream opens itself) and the registration fields:
- * the settings path registers `newNotifyInputForSchedules` verbatim —
- * Event = HookEventSchedule "schedule" and the EncodedPayload of a nil
- * Payload, the literal "null" (notifier_helper.go:82-85) — NOT the push
- * payload, because no push happened. trigger.ts's same-named function is the
- * push seam's fusion (its caller owns the update/payload there).
+ * DetectAndHandleSchedules, the STANDALONE entry (notifier_helper.go:655-685)
+ * — the settings-change arm's re-walk (setting.go:39), the Actions-user
+ * carve-out's registration (notify :147-148) and the Switch's re-register
+ * (clear_tasks.go:75) — every caller upstream funnels through this one
+ * function. Upstream's body verbatim: the empty/archived skips (:656-658),
+ * the DEFAULT-BRANCH tip re-read (:667-670 GetCommit(repo.DefaultBranch) —
+ * the caller passes no ref; the repo row's defaultBranch IS the registration
+ * ref), the tree enumeration, the ZERO-DETECTION early return (:675-677 —
+ * nothing detected leaves the registry UNTOUCHED; the delete lives in
+ * handleSchedules and never runs, so a refresh that finds no schedule
+ * workflows cannot wipe existing rows — the settings path deletes
+ * explicitly first, so its net effect is unchanged), and the registry
+ * replace through handleSchedules. Upstream opens its own git handle
+ * (:660-664); ours opens its own DO cell reads for the same reason. The
+ * registration fields come from the caller: every current caller registers
+ * `newNotifyInputForSchedules` verbatim — Event = HookEventSchedule
+ * "schedule" and the EncodedPayload of a nil Payload, the literal "null"
+ * (notifier_helper.go:82-85) — NOT the push payload, because no push
+ * happened on these seams. trigger.ts's same-named function is the push
+ * seam's fusion (notify :280-282 hands handleSchedules the PUSH input —
+ * event "push", the push payload — and never routes through this
+ * standalone, exactly upstream's split).
  */
 export async function detectAndHandleSchedules(
   env: ActionsTriggerEnv,
-  pair: RepositoryWithOwner,
+  repo: RepositoryRow,
   registration: { event: string; eventPayload: string },
 ): Promise<void> {
-  const repo = pair.repo;
-  // The empty/archived skips (notifier_helper.go:667-669)
+  // The empty/archived skips (notifier_helper.go:656-658)
   if (repo.isEmpty || repo.isArchived) return;
   const ref = `refs/heads/${repo.defaultBranch}`;
   const reads: TriggerCellReads = env.REPO.getByName(engineName(repo.ownerNamespace, repo.slug));
   const commit = await reads.readCommit(ref);
   if (commit === null) return; // no default branch — nothing can be scheduled
   const detected = await detectScheduledWorkflows(reads, ref);
+  // The zero-detection early return (:675-677): upstream returns BEFORE
+  // building the notify input and calling handleSchedules, so existing rows
+  // survive a refresh that found nothing to register.
+  if (detected.length === 0) return;
   await handleSchedules(
     env.DB,
     {
@@ -736,38 +770,20 @@ export async function detectAndHandleSchedules(
 }
 
 /**
- * CleanRepoScheduleTasks (services/actions/clear_tasks.go:59-62 →
- * models/actions/schedule.go:104-123): the actions-unavailable cleanup —
- * DeleteScheduleTaskByRepo FIRST ("if actions disabled when there is
- * schedule task, this will remove the outdated schedule tasks", :105-106),
- * then CancelPreviousJobs of this repo's SCHEDULE runs on the DEFAULT
- * BRANCH (run_job.go:706-723: runs with trigger_event = schedule on the
- * ref, workflow filter EMPTY = every workflow — ToConds skips an empty
- * workflow_id — in status running/waiting/blocked/cancelling; their job
- * rows cancel per cancelOneJob, and each cancellation rides the
- * UpdateRunJob hook's live halves — the wake when pickable work remains and
+ * CancelPreviousJobs (models/actions/run_job.go:706-723) for the schedule
+ * family: the LIVE runs (running/waiting/blocked/cancelling) with
+ * trigger_event = schedule on the given ref, workflow filter EMPTY = every
+ * workflow — ToConds skips an empty workflow_id. Their job rows cancel per
+ * cancelOneJob, and each cancellation rides the UpdateRunJob hook's live
+ * halves — the wake when pickable work remains (the task-version bump) and
  * the run aggregate recompute — exactly the sweeps.ts cancelAbandonedJobs
- * precedent; the notifyAndEmitFinishedJobs tail stays the M3 emitter
- * family's staged arm). Errors PROPAGATE to the caller, whose log-and-
- * continue is upstream's own shape (setting.go:58-60 logs, the write
- * stands). Returns the cancelled run count.
+ * precedent (the notifyAndEmitFinishedJobs tail stays the M3 emitter
+ * family's staged arm, CleanRepoScheduleTasks' service wrapper only).
+ * Errors PROPAGATE to the caller, whose posture is upstream's own. Returns
+ * the cancelled job count.
  */
-export async function cleanRepoScheduleTasks(d1: D1Database, repoId: string): Promise<number> {
-  // The registry rows go first, verbatim (:108-110).
-  await deleteScheduleTaskByRepo(d1, repoId);
-  // The default-branch read is a DIRECT repositories probe, not the
-  // owner-joined findRepositoryById: the clean must not lose the cancel
-  // half to a dangling owner row (the join drops the row entirely), and
-  // upstream's clean needs only the repo's DefaultBranch.
-  const repoRows = await drizzle(d1)
-    .select({ defaultBranch: repositories.defaultBranch })
-    .from(repositories)
-    .where(eq(repositories.id, repoId))
-    .limit(1);
-  const defaultBranch = repoRows[0]?.defaultBranch;
-  if (defaultBranch === undefined) return 0; // rows gone; no default branch to cancel against
+export async function cancelPreviousScheduleJobs(d1: D1Database, repoId: string, ref: string): Promise<number> {
   const db = drizzle(d1);
-  const ref = `refs/heads/${defaultBranch}`;
   const liveRuns = await db
     .select({ id: actionRuns.id })
     .from(actionRuns)
@@ -819,6 +835,92 @@ export async function cleanRepoScheduleTasks(d1: D1Database, repoId: string): Pr
     cancelled += 1;
   }
   return cancelled;
+}
+
+/**
+ * CleanRepoScheduleTasks (services/actions/clear_tasks.go:59-63, the notify
+ * wrapper → models/actions/schedule.go:104-123): the actions-unavailable
+ * cleanup — DeleteScheduleTaskByRepo FIRST ("if actions disabled when there
+ * is schedule task, this will remove the outdated schedule tasks", :105-106),
+ * then CancelPreviousJobs of this repo's SCHEDULE runs on the DEFAULT
+ * BRANCH (:113-117). Errors propagate (upstream's wrapper returns them into
+ * the caller's log-and-continue — setting.go:57-60, notifier_helper.go:
+ * 157-159, repo.go's archive arm). Returns the cancelled job count.
+ */
+export async function cleanRepoScheduleTasks(d1: D1Database, repoId: string): Promise<number> {
+  // The registry rows go first, verbatim (:108-110).
+  await deleteScheduleTaskByRepo(d1, repoId);
+  // The default-branch read is a DIRECT repositories probe, not the
+  // owner-joined findRepositoryById: the clean must not lose the cancel
+  // half to a dangling owner row (the join drops the row entirely), and
+  // upstream's clean needs only the repo's DefaultBranch.
+  const repoRows = await drizzle(d1)
+    .select({ defaultBranch: repositories.defaultBranch })
+    .from(repositories)
+    .where(eq(repositories.id, repoId))
+    .limit(1);
+  const defaultBranch = repoRows[0]?.defaultBranch;
+  if (defaultBranch === undefined) return 0; // rows gone; no default branch to cancel against
+  return cancelPreviousScheduleJobs(d1, repoId, `refs/heads/${defaultBranch}`);
+}
+
+/**
+ * SwitchSchedulesToDefaultBranch (services/actions/clear_tasks.go:65-77):
+ * the default-branch-change cleanup — "cancels the running schedule runs of
+ * the old default branch and replaces the schedules with the ones on the
+ * current default branch" (:65-66). Three steps, each log-and-continue
+ * (upstream logs the step's error and moves to the next, :68-76 — the
+ * switch itself never fails):
+ *
+ *   1. DeleteScheduleTaskByRepo — the registry rows go (:68-70);
+ *   2. CancelPreviousJobs against the OLD default's ref — the live schedule
+ *      runs of the branch that STOPPED being default cancel (:71-73);
+ *   3. the actions-unit-gated re-register from the NEW default through the
+ *      standalone detectAndHandleSchedules (:74-77 — its
+ *      newNotifyInputForSchedules :82-85 registration, event "schedule" /
+ *      payload "null"). Upstream checks `repo.UnitEnabled` directly; ours
+ *      probes the repo_units actions row (the landed UnitEnabled reduction).
+ *
+ * `repo.defaultBranch` MUST already be the NEW default when this is called
+ * (upstream's model is mutated before the call — SetRepoDefaultBranch
+ * branch.go:717, EditRepo repo.go:718, models RenameBranch :353-361); the
+ * re-register reads it. `oldDefaultBranch` is the caller's remembered
+ * pre-write name. Wired at the three upstream callers' ports: the API PATCH
+ * default_branch arm (routes/repo.ts, repo.go:726-733), the web settings
+ * write (branch-protection.tsx applyDefaultBranchForm — SetRepoDefaultBranch
+ * branch.go:729) and the default-branch RENAME (ui/index.ts
+ * branchRenameSubmit — RenameBranch branch.go:489, which fires only when
+ * the renamed branch WAS the default).
+ */
+export async function switchSchedulesToDefaultBranch(env: ActionsTriggerEnv, repo: RepositoryRow, oldDefaultBranch: string): Promise<void> {
+  // 1. The registry rows go (:68-70).
+  try {
+    await deleteScheduleTaskByRepo(env.DB, repo.id);
+  } catch (error) {
+    console.error(
+      `[actions-schedule] switch-to-default ${repo.ownerNamespace}/${repo.slug}: DeleteScheduleTaskByRepo failed: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // 2. The OLD default's live schedule runs cancel (:71-73).
+  try {
+    await cancelPreviousScheduleJobs(env.DB, repo.id, `refs/heads/${oldDefaultBranch}`);
+  } catch (error) {
+    console.error(
+      `[actions-schedule] switch-to-default ${repo.ownerNamespace}/${repo.slug}: CancelPreviousJobs(${oldDefaultBranch}) failed: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // 3. The unit-gated re-register from the NEW default (:74-77).
+  if (!(await repoActionsUnitEnabled(env.DB, repo.id))) return;
+  try {
+    await detectAndHandleSchedules(env, repo, { event: "schedule", eventPayload: "null" });
+  } catch (error) {
+    console.error(
+      `[actions-schedule] switch-to-default ${repo.ownerNamespace}/${repo.slug}: DetectAndHandleSchedules failed: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /**

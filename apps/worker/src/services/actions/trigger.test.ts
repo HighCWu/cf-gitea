@@ -85,6 +85,11 @@ import {
   type WorkflowEvent,
   type WorkflowTreeReads,
 } from "./trigger";
+import {
+  createScheduleTaskBySchedules,
+  detectAndHandleSchedules as detectAndHandleSchedulesStandalone,
+  switchSchedulesToDefaultBranch,
+} from "./schedule";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -2548,8 +2553,129 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     const { schedules } = await registryRows(repoId);
     expect(schedules).toHaveLength(1);
     expect(schedules[0]?.commitSha).toBe(nextTip);
+    // The carve-out registers the SCHEDULES notify input verbatim
+    // (newNotifyInputForSchedules, notifier_helper.go:82-85): Event =
+    // HookEventSchedule "schedule" and the nil payload's "null" — the
+    // FM-port drift (event "push" on this seam) is the thing this pin
+    // holds closed. The rows' event is what the consumer stamps on every
+    // created run (github.event_name) — a carve-out-registered schedule
+    // run must not look like a push run.
+    expect(schedules[0]?.event).toBe("schedule");
     expect(schedules[0]?.eventPayload).toBe("null"); // the schedule-input's literal-null payload
     expect(await db().select().from(actionRuns)).toHaveLength(0);
+  });
+
+  it("the STANDALONE detect's zero-detection early return leaves existing rows (notifier_helper.go:675-677 — the carve-out/Switch/settings refresh posture)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-empty-standalone");
+    const token = (await mintFor(userId, "t-esa", "write:repository")).plaintext;
+    // The default branch carries a PLAIN workflow — a refresh detects ZERO
+    // schedule workflows.
+    const plain = "name: Plain\non: push\njobs:\n  ok:\n    runs-on: x\n    steps:\n      - run: y\n";
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/plain.yml", content: plain }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    expect(await db().select().from(actionRuns)).toHaveLength(1); // the push fired
+
+    // Manually registered rows (a prior registration state) must SURVIVE the
+    // standalone refresh that finds nothing: upstream returns BEFORE
+    // handleSchedules, whose count-gate delete is the only deleter here —
+    // the asymmetry against the push path (:279-282 calls handleSchedules
+    // unconditionally, so a push removing the last schedule workflow DOES
+    // empty the rows — pinned by the REPLACE test above).
+    await createScheduleTaskBySchedules(env.DB, {
+      repoId,
+      ownerId: userId,
+      ref: "refs/heads/main",
+      commitSha: tips[0]!,
+      commitTitle: "seed",
+      event: "schedule",
+      eventPayload: "null",
+    }, [{ entryName: "hourly.yml", content: "on:\n  schedule:\n    - cron: '0 * * * *'\n", specs: ["0 * * * *"] }]);
+    expect(await db().select().from(actionSchedules)).toHaveLength(1);
+
+    const row = (await db().select().from(repositories).where(eq(repositories.id, repoId)))[0]!;
+    await detectAndHandleSchedulesStandalone({ DB: env.DB, REPO: env.REPO }, row, { event: "schedule", eventPayload: "null" });
+    expect(await db().select().from(actionSchedules)).toHaveLength(1); // untouched
+    expect(await db().select().from(actionScheduleSpecs)).toHaveLength(1);
+  });
+
+  it("SwitchSchedulesToDefaultBranch end-to-end: rows re-register from the NEW default (schedule/null) and the OLD default's live runs cancel (clear_tasks.go:65-77)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-switch");
+    const token = (await mintFor(userId, "t-swi", "write:repository")).plaintext;
+    const mainWf = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const devWf = 'name: Noon\non:\n  schedule:\n    - cron: "30 12 * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "ci: main schedule", files: [{ path: ".gitea/workflows/hourly.yml", content: mainWf }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    // The develop branch carries the OTHER schedule workflow (a non-default
+    // push registers nothing — pinned by the REPLACE test).
+    const { tips: devTips, pack: devPack } = await buildChainPack(tips[0]!, [
+      { message: "ci: develop schedule", files: [{ path: ".gitea/workflows/noon.yml", content: devWf }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/develop", oid: devTips[0]! }], devPack, token);
+
+    // Live schedule runs on BOTH branches (direct seeds — the run rows the
+    // cancel half chooses between).
+    const runSeed = async (ref: string, index: number): Promise<{ runId: number; jobId: number }> => {
+      const run = await db()
+        .insert(actionRuns)
+        .values({ repoId, ownerId: userId, index, status: ACTION_STATUS_WAITING, ref, triggerEvent: "schedule", created: new Date(0), updated: new Date(0) })
+        .returning({ id: actionRuns.id });
+      const runId = run[0]!.id;
+      const job = await db()
+        .insert(actionRunJobs)
+        .values({
+          runId,
+          repoId,
+          ownerId: userId,
+          jobId: `job-${runId}`,
+          attempt: 1,
+          workflowPayload: new TextEncoder().encode("jobs: {}"),
+          status: ACTION_STATUS_WAITING,
+          taskId: 0,
+          created: new Date(0),
+          updated: new Date(0),
+        })
+        .returning({ id: actionRunJobs.id });
+      return { runId, jobId: job[0]!.id };
+    };
+    const liveOnMain = await runSeed("refs/heads/main", 90);
+    const liveOnDevelop = await runSeed("refs/heads/develop", 91);
+
+    // The actions unit arms the re-register (clear_tasks.go:74-77's gate).
+    await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
+    // (The settings arm itself re-registered from main — the pre-switch
+    // state this test's premise needs is "rows registered from main".)
+
+    // The default moves to develop FIRST (the D1 write the callers all do),
+    // then the switch reads the NEW default off the row — upstream's
+    // mutated-model shape (branch.go:717 / repo.go:718 / models RenameBranch
+    // :353-361).
+    await db().update(repositories).set({ defaultBranch: "develop" }).where(eq(repositories.id, repoId));
+    const row = (await db().select().from(repositories).where(eq(repositories.id, repoId)))[0]!;
+    await switchSchedulesToDefaultBranch({ DB: env.DB, REPO: env.REPO }, row, "main");
+
+    // The registry re-registered from the NEW default: one row, the develop
+    // workflow, the schedule/null registration (newNotifyInputForSchedules,
+    // :82-85 — the Switch's own DetectAndHandleSchedules callee).
+    const { schedules, specs } = await registryRows(repoId);
+    expect(schedules).toHaveLength(1);
+    expect(schedules[0]?.workflowId).toBe("noon.yml");
+    expect(schedules[0]?.event).toBe("schedule");
+    expect(schedules[0]?.eventPayload).toBe("null");
+    expect(schedules[0]?.ref).toBe("refs/heads/develop");
+    expect(schedules[0]?.commitSha).toBe(devTips[0]);
+    expect(schedules[0]?.triggerUserId).toBe(ACTIONS_USER_ID);
+    expect(specs.map((s) => s.spec)).toEqual(["30 12 * * *"]);
+
+    // The OLD default's live schedule run cancelled; the NEW default's
+    // stands (CancelPreviousJobs filters by the old ref, run_job.go:713).
+    const jobStatusOf = async (jobId: number): Promise<number> =>
+      (await db().select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)))[0]!.status;
+    expect(await jobStatusOf(liveOnMain.jobId)).toBe(ACTION_STATUS_CANCELLED);
+    expect(await jobStatusOf(liveOnDevelop.jobId)).toBe(ACTION_STATUS_WAITING);
   });
 
 });

@@ -113,7 +113,7 @@ import { ZERO_OID } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { deletedBranches, issues, pullRequests, repositories, users } from "../../db/schema";
+import { actionSchedules, deletedBranches, issues, pullRequests, repositories, users } from "../../db/schema";
 import { settleCreatingRepo } from "../../git-http/gate";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
@@ -848,6 +848,48 @@ describe("w100 rename write (POST /branches/rename)", () => {
     for (const res of [empty, missing, collides, self]) expect(res.status).toBe(303);
     const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
     expect(names).toEqual(["refs/heads/main", "refs/heads/side-two", "refs/heads/w100-made"]);
+  });
+
+  it("the SITE-admin default rename re-points the D1 default, moves HEAD, and fires the schedule switch (models RenameBranch :353-361 + branch.go:488-490)", async () => {
+    // Last test in this describe — the rename mutates the w100wr fixture
+    // (main → main-two) and later describes use their own repos.
+    await seedVerifiedUser({ username: "w100-root", isAdmin: true });
+    // A pre-existing registry row: the switch's delete half must sweep it
+    // (clear_tasks.go:68-70 — the observable that the tail actually ran).
+    await drizzle(env.DB).insert(actionSchedules).values({
+      title: "ci",
+      specs: JSON.stringify(["0 * * * *"]),
+      repoId: (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w100wr"))).get())!.id,
+      ownerId: 1,
+      workflowId: "ci.yml",
+      triggerUserId: -2,
+      ref: "refs/heads/main",
+      commitSha: "a".repeat(40),
+      event: "schedule",
+      eventPayload: "null",
+      content: "on: schedule",
+      created: new Date(0),
+      updated: new Date(0),
+    });
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "main", to: "main-two" }, await cookieFor("w100-root")),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?renamed=main-two`);
+    // The ref swap (the rename itself — the engine pair).
+    const refs = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs;
+    expect(refs.find((ref) => ref.name === "refs/heads/main")).toBeUndefined();
+    expect(refs.find((ref) => ref.name === "refs/heads/main-two")).toBeDefined();
+    // The default RE-POINTS (upstream's isDefault arm writes
+    // repositories.default_branch inside the rename — the gap this port
+    // carried before the §D7 switch wiring) and HEAD follows it
+    // (git.SetDefaultBranch's symbolic-ref in the service callback).
+    const row = (await drizzle(env.DB).select().from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w100wr"))).get())!;
+    expect(row.defaultBranch).toBe("main-two");
+    expect((await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).head).toBe("refs/heads/main-two");
+    // The switch's delete half ran (the registry row above is gone).
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
   });
 });
 

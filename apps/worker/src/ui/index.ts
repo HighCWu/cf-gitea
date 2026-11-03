@@ -754,6 +754,7 @@ import { approveRun } from "../services/actions/approve";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../services/actions/audit-arms";
 import { toggleRepoActionsWorkflow } from "../services/actions/config";
 import { deleteRun } from "../services/actions/retention";
+import { switchSchedulesToDefaultBranch } from "../services/actions/schedule";
 import { isDoneStatus } from "../services/actions/update";
 import { dispatchWorkflow } from "../services/actions/workflow-dispatch";
 import {
@@ -1784,6 +1785,7 @@ import {
   loadOwnerIsOrg,
   parseBranchProtectionForm,
   parsePriorityIds,
+  productionSetDefaultBranch,
   reorderRules,
   renderBranchProtectionEditPage,
   renderBranchProtectionListPage,
@@ -9321,6 +9323,23 @@ async function branchRenameSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
     const deleteError = deleteApiRefError(removed);
     if (deleteError !== null) throw deleteError;
     throw new ApiError(500, `rename cleanup failed: ${removed.tag}`);
+  }
+  // The DEFAULT-rename tail. Upstream models RenameBranch's isDefault arm
+  // re-points repositories.default_branch INSIDE the rename tx (:353-361)
+  // and the service callback moves HEAD (git.SetDefaultBranch's
+  // symbolic-ref, services/repository/branch.go:480-486); after the tx,
+  // SwitchSchedulesToDefaultBranch fires ONLY for this case (branch.go:
+  // 488-490). Ported in the engine-first order our rename already commits
+  // to: D1 default + engine head through the shared production wiring
+  // (errors propagate — upstream's tx fails the rename on this step), then
+  // the schedule switch (log-and-continue internally, clear_tasks.go:65-77 —
+  // the OLD default's live schedule runs cancel and the unit-gated
+  // re-register re-walks the NEW default `to`). The engine/D1 split has no
+  // cross-store tx: a D1 failure here leaves the engine renamed under a 500
+  // (the same partial-rename window upstream's rollback closes; disclosed).
+  if (from === repo.defaultBranch) {
+    await productionSetDefaultBranch(c.env)(repo.id, to);
+    await switchSchedulesToDefaultBranch(c.env, { ...repo, defaultBranch: to }, from);
   }
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?renamed=${encodeURIComponent(to)}` } }));
 }

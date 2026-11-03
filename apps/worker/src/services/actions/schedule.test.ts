@@ -18,7 +18,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { actionRunJobs, actionRuns, actionSchedules, actionScheduleSpecs, repositories } from "../../db/schema";
+import { actionRunJobs, actionRuns, actionSchedules, actionScheduleSpecs, repoUnits, repositories } from "../../db/schema";
 import { ACTION_STATUS_CANCELLED, ACTION_STATUS_RUNNING, ACTION_STATUS_SUCCESS, ACTION_STATUS_WAITING } from "./model";
 import { ACTIONS_USER_ID } from "./trigger";
 import {
@@ -34,6 +34,7 @@ import {
   isActionsScheduleCleanMessage,
   isActionsScheduleTriggerMessage,
   parseCronSpec,
+  switchSchedulesToDefaultBranch,
   withScheduleInEventPayload,
   type ScheduleRegistryContext,
 } from "./schedule";
@@ -61,6 +62,26 @@ const sec = (iso: string): number => Math.floor(Date.parse(iso) / 1000);
 // ---------------------------------------------------------------------------
 
 describe("parseCronSpec (robfig standard)", () => {
+  it("month/dow NAMES are case-insensitive (robfig's names[strings.ToLower(expr)] — 'MON', 'Jan', 'SUN' all parse)", () => {
+    // The GitHub-docs spelling class: a case-sensitive lookup would reject
+    // the spec at registration and the catch-continue in
+    // createScheduleTaskBySchedules would silently register NO spec row.
+    expect(parseCronSpec("0 9 * * MON").dow[1]).toBe(true);
+    expect(parseCronSpec("0 9 * * Sun").dow[0]).toBe(true);
+    expect(parseCronSpec("0 9 * * sat").dow[6]).toBe(true);
+    expect(parseCronSpec("0 9 1 JAN *").month[1]).toBe(true);
+    expect(parseCronSpec("0 9 1 Feb *").month[2]).toBe(true);
+    expect(parseCronSpec("0 9 1 DEC *").month[12]).toBe(true);
+    // The mixed form ("MON-FRI", a number/name range) rides the same
+    // lowercase probe on the high side — robfig parses it too.
+    const range = parseCronSpec("0 9 * * MON-FRI");
+    expect(range.dow[1]).toBe(true);
+    expect(range.dow[5]).toBe(true);
+    // Only the NAMES lowercase; unknown names and descriptors stay exact.
+    expect(() => parseCronSpec("0 9 * * XYZ")).toThrow();
+    expect(() => parseCronSpec("@EVERY 1h")).toThrow();
+  });
+
   it("the grammar: fields, names, steps, ranges, leading zeros, descriptors", () => {
     expect(parseCronSpec("0 * * * *")).not.toBeNull();
     expect(parseCronSpec("15,45 * * * *")).not.toBeNull();
@@ -442,6 +463,135 @@ describe("cleanRepoScheduleTasks (the §D7 wiring)", () => {
   it("an idempotent re-clean: no rows, no live runs → 0 again", async () => {
     await seedRepo();
     expect(await cleanRepoScheduleTasks(env.DB, CLEAN_REPO)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SwitchSchedulesToDefaultBranch (services/actions/clear_tasks.go:65-77) —
+// the default-branch-change cleanup. The re-register arm's TREE half needs a
+// real cell, so the full end-to-end (rows re-registered from the NEW default
+// with the schedule/null registration) lives in trigger.test.ts over the
+// receive-pack harness; these pins cover the pure-D1 halves.
+// ---------------------------------------------------------------------------
+
+const SWITCH_REPO = "repo-sched-switch";
+
+describe("switchSchedulesToDefaultBranch (the §D7 follow-up wiring)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare(`DELETE FROM ${CLEANUP_TABLES[0]}`).run();
+    await env.DB.prepare(`DELETE FROM ${CLEANUP_TABLES[1]}`).run();
+    await env.DB.prepare("DELETE FROM repo_units").run();
+    await env.DB.prepare("DELETE FROM action_run_jobs").run();
+    await env.DB.prepare("DELETE FROM action_runs").run();
+    await env.DB.prepare("DELETE FROM repositories").run();
+  });
+
+  let runIndex = 1000;
+
+  /** The fixture repo (defaultBranch defaults "main"; `default` overrides). */
+  async function seedRepo(defaultBranch?: string): Promise<void> {
+    await drizzle(env.DB).insert(repositories).values({
+      id: SWITCH_REPO,
+      storageKey: `r_${SWITCH_REPO}`,
+      ownerNamespace: "alice",
+      ownerId: 42,
+      slug: "switch",
+      visibility: "public",
+      ...(defaultBranch !== undefined ? { defaultBranch } : {}),
+      createdAt: new Date(0),
+    });
+  }
+
+  /** One run + one unclaimed job in the given statuses (the clean fixture's
+   *  shape, re-homed here so the two suites never share mutable counters). */
+  async function seedRunWithJob(opts: { triggerEvent: string; ref: string; runStatus: number; jobStatus: number }): Promise<{ runId: number; jobId: number }> {
+    runIndex += 1;
+    const run = await db()
+      .insert(actionRuns)
+      .values({
+        repoId: SWITCH_REPO,
+        ownerId: 42,
+        index: runIndex,
+        status: opts.runStatus,
+        ref: opts.ref,
+        triggerEvent: opts.triggerEvent,
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionRuns.id });
+    const runId = run[0]!.id;
+    const job = await db()
+      .insert(actionRunJobs)
+      .values({
+        runId,
+        repoId: SWITCH_REPO,
+        ownerId: 42,
+        jobId: `job-${runId}`,
+        attempt: 1,
+        workflowPayload: new TextEncoder().encode("jobs: {}"),
+        status: opts.jobStatus,
+        taskId: 0,
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionRunJobs.id });
+    return { runId, jobId: job[0]!.id };
+  }
+
+  const jobStatusOf = async (jobId: number): Promise<number> =>
+    (await db().select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)))[0]!.status;
+  const runStatusOf = async (runId: number): Promise<number> =>
+    (await db().select().from(actionRuns).where(eq(actionRuns.id, runId)))[0]!.status;
+
+  it("deletes the registry rows and cancels the live OLD-default-branch schedule runs (clear_tasks.go:68-73)", async () => {
+    await seedRepo("develop"); // the NEW default (the D1 row moved BEFORE the switch — upstream's mutated model)
+    await createScheduleTaskBySchedules(env.DB, { ...BASE_CTX, repoId: SWITCH_REPO }, [
+      { entryName: "hourly.yml", content: "x", specs: ["0 * * * *"] },
+    ]);
+    // The live schedule run on the OLD default's ref — the cancel's target.
+    const oldDefault = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/main", runStatus: ACTION_STATUS_WAITING, jobStatus: ACTION_STATUS_WAITING });
+    // A live schedule run on the NEW default's ref — NOT the target (the
+    // re-register may keep it; CancelPreviousJobs filters by the old ref).
+    const newDefault = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/develop", runStatus: ACTION_STATUS_WAITING, jobStatus: ACTION_STATUS_WAITING });
+    // A push run on the old ref — never a target (the trigger_event filter).
+    const push = await seedRunWithJob({ triggerEvent: "push", ref: "refs/heads/main", runStatus: ACTION_STATUS_RUNNING, jobStatus: ACTION_STATUS_WAITING });
+
+    // The actions unit is ABSENT — the re-register arm (:74-77) gates off,
+    // so this fixture exercises exactly the delete + cancel halves.
+    await switchSchedulesToDefaultBranch({ DB: env.DB, REPO: env.REPO }, (await db().select().from(repositories).where(eq(repositories.id, SWITCH_REPO)))[0]!, "main");
+
+    expect(await db().select().from(actionSchedules)).toHaveLength(0);
+    expect(await db().select().from(actionScheduleSpecs)).toHaveLength(0);
+    expect(await jobStatusOf(oldDefault.jobId)).toBe(ACTION_STATUS_CANCELLED);
+    expect(await runStatusOf(oldDefault.runId)).toBe(ACTION_STATUS_CANCELLED);
+    expect(await jobStatusOf(newDefault.jobId)).toBe(ACTION_STATUS_WAITING);
+    expect(await runStatusOf(newDefault.runId)).toBe(ACTION_STATUS_WAITING);
+    expect(await jobStatusOf(push.jobId)).toBe(ACTION_STATUS_WAITING);
+    expect(await runStatusOf(push.runId)).toBe(ACTION_STATUS_RUNNING);
+  });
+
+  it("is a harmless re-run: rows gone, no live runs — nothing throws, nothing cancels", async () => {
+    await seedRepo();
+    await switchSchedulesToDefaultBranch({ DB: env.DB, REPO: env.REPO }, (await db().select().from(repositories).where(eq(repositories.id, SWITCH_REPO)))[0]!, "main");
+    expect(await db().select().from(actionSchedules)).toHaveLength(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+  });
+
+  it("resolves (never rejects) with the actions unit present — the re-register arm runs and its engine miss is the log-and-continue envelope", async () => {
+    // The unit row arms step 3 (:74-77): the standalone re-walk runs against
+    // this repo's cell. The fixture has NO engine content, so the walk hits
+    // the GetCommit miss arm (readCommit null → return — notifier_helper.go:
+    // 667-670's shape) without registering anything; the observable is the
+    // resolved call plus empty tables (the registry was deleted in step 1
+    // and nothing re-registered). Upstream passes the in-memory model the
+    // same way — there is no D1 row re-read inside the switch to lose.
+    await seedRepo("develop");
+    await drizzle(env.DB).insert(repoUnits).values({ repoId: SWITCH_REPO, type: "actions" });
+    await expect(
+      switchSchedulesToDefaultBranch({ DB: env.DB, REPO: env.REPO }, (await db().select().from(repositories).where(eq(repositories.id, SWITCH_REPO)))[0]!, "main"),
+    ).resolves.toBeUndefined();
+    expect(await db().select().from(actionSchedules)).toHaveLength(0);
+    expect(await db().select().from(actionScheduleSpecs)).toHaveLength(0);
   });
 });
 

@@ -21,7 +21,8 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { orgMembers, repoRedirects, repoTransfer, repoUnits, repoWatchers, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { orgMembers, repoRedirects, repoTransfer, repoUnits, repoWatchers, actionRunJobs, actionRuns, actionSchedules, actionScheduleSpecs, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { ACTION_STATUS_CANCELLED, ACTION_STATUS_WAITING } from "../services/actions/model";
 import {
   createOptionalTokenAuthMiddleware,
   createStubAuthResolver,
@@ -585,6 +586,82 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default
     // An EXISTING branch lands (the tip read resolves — the repo's cell
     // carries the seeded pack from the license arm's flow is not needed; the
     // empty-repo arm already proves the apply path).
+  });
+
+  it("a landed default_branch PATCH runs SwitchSchedulesToDefaultBranch (clear_tasks.go:65-77 — repo.go:726-733's tail)", async () => {
+    // The registry rows + a live schedule run on the OLD default's ref: the
+    // switch must delete the rows and cancel that run. The actions unit is
+    // ABSENT, so the unit-gated re-register (:74-77) gates off — this pins
+    // the wiring + the two unconditional halves through the API seam; the
+    // re-register half is the trigger suite's end-to-end arm.
+    const schedule = await drizzle(env.DB)
+      .insert(actionSchedules)
+      .values({
+        title: "ci",
+        specs: JSON.stringify(["0 * * * *"]),
+        repoId: "7401",
+        ownerId: 1,
+        workflowId: "ci.yml",
+        triggerUserId: -2,
+        ref: "refs/heads/main",
+        commitSha: "a".repeat(40),
+        event: "schedule",
+        eventPayload: "null",
+        content: "on: schedule",
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionSchedules.id })
+      .all();
+    await drizzle(env.DB).insert(actionScheduleSpecs).values({
+      repoId: "7401",
+      scheduleId: schedule[0]!.id,
+      spec: "0 * * * *",
+      next: new Date(0),
+      prev: null,
+      created: new Date(0),
+      updated: new Date(0),
+    });
+    const run = await drizzle(env.DB)
+      .insert(actionRuns)
+      .values({
+        repoId: "7401",
+        ownerId: 1,
+        index: 1,
+        status: ACTION_STATUS_WAITING,
+        ref: "refs/heads/main",
+        triggerEvent: "schedule",
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionRuns.id })
+      .all();
+    const runId = run[0]!.id;
+    await drizzle(env.DB).insert(actionRunJobs).values({
+      runId,
+      repoId: "7401",
+      ownerId: 1,
+      jobId: "job-1",
+      attempt: 1,
+      workflowPayload: new TextEncoder().encode("jobs: {}"),
+      status: ACTION_STATUS_WAITING,
+      taskId: 0,
+      created: new Date(0),
+      updated: new Date(0),
+    });
+
+    const res = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ default_branch: "trunk" }) });
+    expect(res.status).toBe(200);
+    expect((await res.json<Record<string, unknown>>()).default_branch).toBe("trunk");
+    // The registry rows went (DeleteScheduleTaskByRepo, :68-70).
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(actionScheduleSpecs).all()).toHaveLength(0);
+    // The OLD default's live schedule run cancelled (CancelPreviousJobs,
+    // :71-73 — CancelJobs' direct arm + the run aggregate settle).
+    const job = await drizzle(env.DB).select().from(actionRunJobs).all();
+    expect(job).toHaveLength(1);
+    expect(job[0]!.status).toBe(ACTION_STATUS_CANCELLED);
+    expect((await drizzle(env.DB).select().from(actionRuns).all())[0]!.status).toBe(ACTION_STATUS_CANCELLED);
   });
 
   it("403s a non-admin, grants a collaborator-admin, and 422s a wrong-typed body", async () => {
