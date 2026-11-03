@@ -9,7 +9,10 @@
  * One committed home for the RECURRING REDEPLOY verification probes, so every
  * redeploy wave runs the same probes with less drift instead of hand-rolling
  * them per deploy. Batteries (all take --base-url + a PAT file, except the
- * D1-only cleanup-audit, which takes neither — REDEPLOY15 friction (a)):
+ * D1-only cleanup-audit, which takes neither — REDEPLOY15 friction (a) — and
+ * monitor-platform, whose HTTP goes to api.cloudflare.com with the
+ * CLOUDFLARE_* env / the persisted 0600 store, so --base-url/--token-file
+ * are optional for a monitor-only selection — SPEC-0021 §4):
  *
  *   p0             The P0 shallow trio + privacy tail against the user's
  *                  fixture repo (`<user>/p0-shallow` by default) — SELF-
@@ -405,7 +408,13 @@
  *                  platform API itself (the adapter class documented
  *                  admin-manual). It is the ONLY battery whose HTTP leaves
  *                  the deployment entirely (the probe host needs outbound
- *                  api.cloudflare.com reachability).
+ *                  api.cloudflare.com reachability). The CLI contract
+ *                  follows the wire: a MONITOR-ONLY selection takes
+ *                  --base-url/--token-file OPTIONALLY (a supplied token file
+ *                  is still validated + scrubbed; the PAT-identity preflight
+ *                  is skipped — nothing here addresses the deployment; any
+ *                  Worker-hitting battery in the selection still demands the
+ *                  pair).
  *                  AUTH-GATED, THE ONE-TIME-AUTHORIZATION MODEL (SPEC-0021
  *                  §4 as-built): credentials come from the probe's OWN env —
  *                  the SAME names the Worker carries as secrets
@@ -510,7 +519,8 @@
  *     follow-up arm. Mismatch = exit 2 BEFORE anything is created (one line
  *     naming the actual login, the requested --user, and both fixes); a match
  *     passes silently. One request per invocation (cached); the D1-only
- *     cleanup-audit has no HTTP surface and never triggers it.
+ *     cleanup-audit and the monitor-only monitor-platform never trigger it
+ *     (no Worker /api/v1 surface in the selection).
  *   - Red runs self-sweep (the consistency posture — REDEPLOY16's decision:
  *     the cleanup-audit battery exists precisely to prove zero leftovers, so
  *     deliberate red-run strays lost to the old lfs-e2e leave-for-debug
@@ -609,6 +619,16 @@ const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror",
  *  actually needs one; a SUPPLIED token file is still validated + scrubbed. */
 const D1_ONLY_BATTERIES = new Set(["cleanup-audit"]);
 
+/** Batteries whose HTTP rides NEITHER the deployment (--base-url) nor the PAT
+ *  (--token-file): monitor-platform talks to api.cloudflare.com with the
+ *  CLOUDFLARE_* env / the persisted 0600 store (SPEC-0021 §4 as-built). A
+ *  monitor-only selection therefore takes --base-url/--token-file OPTIONALLY
+ *  — a supplied token file is still validated + scrubbed (the cleanup-audit
+ *  precedent) and the PAT-identity preflight never fires (no Worker /api/v1
+ *  surface in the selection). Any Worker-hitting battery in the selection
+ *  (`all` included) still demands the pair. */
+const CF_API_ONLY_BATTERIES = new Set(["monitor-platform"]);
+
 /** Canonical fixture tip on the standing production repo (p0probe/p0-shallow). */
 const CANONICAL_FIXTURE_OID = "502abd2d5561536873088528a9f57f02cd1633e1";
 
@@ -695,11 +715,15 @@ const parseArgs = (argv) => {
   if (opts.battery === null) throw new Error(`a battery is required (one of: ${BATTERY_NAMES.join(", ")})`);
   // REDEPLOY15 friction (a): the D1-only batteries take neither --base-url nor
   // --token-file; a missing token errors only when the run makes HTTP calls.
-  const needsHttp = opts.battery === "all" || !D1_ONLY_BATTERIES.has(opts.battery);
-  if (!opts.dryRun && needsHttp) {
-    if (!opts.baseUrl) throw new Error("--base-url is required (the selected battery makes HTTP calls; the D1-only cleanup-audit takes none)");
+  // SPEC-0021 §4 (the one-time-auth cleanup): a monitor-only selection's HTTP
+  // goes to api.cloudflare.com with the env/store auth — the pair is optional
+  // there too (the gate used to demand a PAT the battery never reads).
+  const needsWorkerHttp = opts.battery === "all"
+    || (!D1_ONLY_BATTERIES.has(opts.battery) && !CF_API_ONLY_BATTERIES.has(opts.battery));
+  if (!opts.dryRun && needsWorkerHttp) {
+    if (!opts.baseUrl) throw new Error("--base-url is required (the selected battery makes Worker HTTP calls; the D1-only cleanup-audit and the monitor-only monitor-platform take none)");
     if (!/^https?:\/\//.test(opts.baseUrl)) throw new Error(`--base-url must be an http(s) URL: ${opts.baseUrl}`);
-    if (!opts.tokenFile) throw new Error("--token-file is required (mint a per-run PAT into a 0600 temp file; the D1-only cleanup-audit runs without one)");
+    if (!opts.tokenFile) throw new Error("--token-file is required (mint a per-run PAT into a 0600 temp file; the D1-only cleanup-audit and the monitor-only monitor-platform run without one)");
   }
   if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(opts.user)) throw new Error("--user must be 1-64 chars of [a-zA-Z0-9_.-]");
   if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive number");
@@ -718,7 +742,9 @@ const parseArgs = (argv) => {
 const usage = () =>
   "usage: node scripts/deploy-probes.mjs <battery> --base-url <url> --token-file <path>\n" +
   "                                     [--user p0probe] [--timeout-ms <n>] [--json]\n" +
-  "                                     (D1-only cleanup-audit: --base-url/--token-file optional)\n" +
+  "                                     (D1-only cleanup-audit and monitor-only monitor-platform: --base-url/--token-file optional —\n" +
+  "                                      monitor-platform's HTTP goes to api.cloudflare.com with the CLOUDFLARE_* env / the 0600 store;\n" +
+  "                                      a supplied token file is still validated)\n" +
   "       node scripts/deploy-probes.mjs <battery> --dry-run   (prints every probe + its canonical expectation)\n" +
   "\n" +
   `batteries: ${BATTERY_NAMES.join(", ")}\n` +
@@ -741,7 +767,7 @@ const usage = () =>
   "  packages-minor: (no extra options — pure HTTP + the run PAT, every fixture generated inline; the husk row sweep reuses --d1-scope and needs wrangler auth, the packages-registry precedent)\n" +
   "  packages-terraform: (no extra options — pure HTTP + the run PAT; the whole-state DELETE is its own row cascade, so unlike the other packages batteries there is NO D1 arm and no wrangler auth)\n" +
   "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
-  "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). Auth: the CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME env names (the same names the Worker carries as secrets), falling back to the persisted 0600 store scripts/setup-monitor-auth.mjs writes once (.monitor-auth.json; $MONITOR_AUTH_FILE relocates; env wins field-by-field); absent/unusable = the arm reports missing-auth [warn] (never fake-green — the four-way taxonomy is SPEC-0021 §5 as-built: permission-denied [fail] / api-unsupported [warn] / failure [fail]). HTTP goes to api.cloudflare.com, NOT the deployment (MONITOR_CF_API_BASE relocates the origin — a test/stub seam, point it only at a stub you own).\n" +
+  "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). Auth: the CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME env names (the same names the Worker carries as secrets), falling back to the persisted 0600 store scripts/setup-monitor-auth.mjs writes once (.monitor-auth.json; $MONITOR_AUTH_FILE relocates; env wins field-by-field); absent/unusable = the arm reports missing-auth [warn] (never fake-green — the four-way taxonomy is SPEC-0021 §5 as-built: permission-denied [fail] / api-unsupported [warn] / failure [fail]). HTTP goes to api.cloudflare.com, NOT the deployment (MONITOR_CF_API_BASE relocates the origin — a test/stub seam, point it only at a stub you own). A monitor-only invocation takes NO --base-url/--token-file (optional: the PAT preflight is skipped — nothing in this battery addresses the deployment; a supplied token file is still validated + scrubbed; any Worker-hitting battery or `all` still demands the pair).\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1 — the per-run probe token; 0 between runs)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -9394,7 +9420,7 @@ const dryRun = () => {
     }
   }
   log(``);
-  log(`${batteryList.length} battery/batteries planned — run with --base-url <url> --token-file <0600 path> to execute (the D1-only cleanup-audit needs neither).`);
+  log(`${batteryList.length} battery/batteries planned — run with --base-url <url> --token-file <0600 path> to execute (the D1-only cleanup-audit and the monitor-only monitor-platform need neither).`);
 };
 
 // ---------- main ----------
@@ -9405,8 +9431,9 @@ if (opts.dryRun) {
 }
 
 /** Load the per-run PAT: 0600 file, mint-per-run shape, never echoed. Only
- *  invoked when a selected battery makes HTTP calls — or when the operator
- *  supplied a token file anyway (it is validated + scrubbed regardless). */
+ *  invoked when a selected battery makes Worker HTTP calls — or when the
+ *  operator supplied a token file anyway (it is validated + scrubbed
+ *  regardless, the cleanup-audit/monitor-only precedent). */
 const loadToken = async () => {
   const st = await stat(opts.tokenFile);
   expect(st.isFile(), `--token-file is not a regular file: ${opts.tokenFile}`);
@@ -9454,17 +9481,25 @@ const preflightIdentity = async () => {
 
 const main = async () => {
   // REDEPLOY15 friction (a): the D1-only cleanup-audit runs WITHOUT a PAT —
-  // loadToken fires only when the run actually makes HTTP calls.
-  const httpBatteries = batteryList.some((name) => !D1_ONLY_BATTERIES.has(name));
-  if (httpBatteries || opts.tokenFile) {
+  // loadToken fires only when the run actually makes Worker HTTP calls (or
+  // the operator supplied a token file anyway — validated + scrubbed). The
+  // monitor-only selection never makes Worker HTTP either (SPEC-0021 §4):
+  // its auth is the CLOUDFLARE_* env / the 0600 store, so the PAT preflight
+  // is skipped there too — nothing in that battery addresses the deployment.
+  const workerHttpBatteries = batteryList.some((name) => !D1_ONLY_BATTERIES.has(name) && !CF_API_ONLY_BATTERIES.has(name));
+  if (workerHttpBatteries || opts.tokenFile) {
     TOKEN = await loadToken();
   }
   // The PAT-identity preflight runs BEFORE any battery step — a mismatched
   // --user must fail fast, not after repos were created. The D1-only audit
-  // (cleanup-audit alone, even with a supplied token) makes no HTTP calls and
-  // has no /api/v1 surface to ask, so it never triggers the preflight.
-  if (httpBatteries) await preflightIdentity();
-  log(`cf-gitea deploy probes — ${batteryList.join(" + ")} — ${opts.baseUrl ?? "(no --base-url: D1-only battery)"} (user ${opts.user})`);
+  // and the monitor-only selection (cleanup-audit / monitor-platform alone,
+  // even with a supplied token) make no Worker HTTP calls and have no
+  // /api/v1 surface to ask, so they never trigger the preflight.
+  if (workerHttpBatteries) await preflightIdentity();
+  const noBaseUrlNote = batteryList.every((n) => CF_API_ONLY_BATTERIES.has(n))
+    ? "(no --base-url: monitor-only — HTTP goes to api.cloudflare.com)"
+    : "(no --base-url: D1-only battery)";
+  log(`cf-gitea deploy probes — ${batteryList.join(" + ")} — ${opts.baseUrl ?? noBaseUrlNote} (user ${opts.user})`);
   for (const name of batteryList) {
     const battery = BATTERIES[name];
     const ctx = battery.context();

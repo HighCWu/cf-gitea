@@ -555,7 +555,7 @@ NEXT (the store arms the PROBE battery only — the deployed Worker's secrets ar
        wrangler secret put CLOUDFLARE_QUEUES_TOKEN
        wrangler secret put CLOUDFLARE_PROFILE_TOKEN
   3. re-validate any time (non-interactive): node scripts/setup-monitor-auth.mjs --check
-  4. run the battery: node scripts/deploy-probes.mjs monitor-platform --base-url <url> --token-file <pat>`);
+  4. run the battery: node scripts/deploy-probes.mjs monitor-platform`);
   if (verdicts.queuesVerdict.verdict !== "ok" || verdicts.profilerVerdict.verdict !== "ok") {
     console.log("The store was written with these verdicts recorded — fix the failing scope (its class above says whether the token, the account, or the network is at fault) and re-run --check until both scopes answer ok.");
   }

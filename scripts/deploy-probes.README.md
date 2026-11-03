@@ -12,6 +12,9 @@ non-zero iff any check FAILS.
 ```bash
 node scripts/deploy-probes.mjs <battery> --base-url https://<worker>.workers.dev \
   --token-file /tmp/pat-0600            # mint-per-run, mode 0600
+node scripts/deploy-probes.mjs monitor-platform       # monitor-only: NO --base-url/--token-file
+                                                      # (CF-API-only: its HTTP goes to api.cloudflare.com
+                                                      # with the env / persisted 0600 store, SPEC-0021 §4)
 node scripts/deploy-probes.mjs all --dry-run          # print every probe + its canonical expectation
 node scripts/deploy-probes.mjs p0 --dry-run           # single battery plan
 node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --expect-tokens 5
@@ -33,6 +36,15 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
   audit used to demand a PAT, forcing a scratch-mint + delete dance). A
   supplied token file is still validated (0600, mint shape) and scrubbed.
+- **The `monitor-platform` battery is CF-API-only** (its HTTP goes to
+  api.cloudflare.com, NOT the deployment; its credentials are the
+  `CLOUDFLARE_*` env names / the persisted 0600 store — SPEC-0021 §4): for a
+  monitor-only selection `--base-url`/`--token-file` are OPTIONAL — a
+  supplied token file is still validated (0600, mint shape) and scrubbed, and
+  the PAT-identity preflight never fires (nothing in the battery addresses
+  the deployment). Any Worker-hitting battery — and `all` — still demands the
+  pair. With no credentials configured the run still proceeds and the arms
+  report `missing-auth` `[warn]` (never fake-green).
 - **PAT-identity preflight**: before any HTTP battery runs, one
   `GET /api/v1/user` with the PAT compares its `login` to `--user`. Repo
   creation is doer-relative (`POST /user/repos` lands in the PAT's own
@@ -43,7 +55,8 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   both fixes (mint the PAT as that user, or pass the matching `--user`); a
   match passes silently. One request per invocation (cached); a refused PAT
   (`/user` → 401) fails fast in the same shape. The D1-only `cleanup-audit`
-  has no HTTP surface and never triggers it.
+  and the monitor-only `monitor-platform` never trigger it (no Worker
+  `/api/v1` surface in the selection).
 - Against LOCAL dev: `--base-url http://127.0.0.1:5173 --d1-scope local` for
   the HTTP batteries (the mirror row-settle arm and the packages-registry
   row sweep reuse `--d1-scope`); mint the
@@ -110,7 +123,7 @@ default 3):
 | `packages-minor` | 9 | the SPEC-0016 §7 minor six: chef (cookbook tar.gz → universe + search + cookbook/version metadata with the 1_0_1 knife quirk → download → protocol version delete) + composer (raw zip PUT ?version= → packages.json/list.json/p2 with the %2F dist url + sha1 → download → management delete) + conan (v2 recipe revision → revisions/latest + the pinned revision-files list {"conanfile.py":null} → pinned download → pinned v2 delete) + cran (DESCRIPTION tar.gz → PACKAGES(.gz) block with the EMPTY MD5sum → download → management delete) + pub (request-upload → multipart → finalize → the normalized enumerate → download → management delete) + vagrant (box PUT → HEAD probe → the provider array + sha512 → download → management delete) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `packages-terraform` | 13 | the SPEC-0016 §7 terraform state backend: anonymous write 401s + the anonymous read-through to the EMPTY 404, state upload → GET byte-parity round-trip (serial/lineage re-parsed off the wire, HEAD parity), duplicate-serial 409, latest-serial DELETE 403 + non-latest 204, lock set/locked 423 with the Go field-order JSON (the 423 body IS the lock read — no GET lock route in the pin), the PRE-BODY `?ID=` upload gate (mismatch 423 over a parse-hostile body, match 201, lock survives), whole-DELETE locked 423 plain, unlock mismatch 423 plain / right ID 200 + the freed re-lock proof, the lock's package allocation + protocol-husk cascade, the unknown-name DELETE 404 contrast, whole-state delete t+0 + repo delete | HTTP (no D1 arms — the whole-state DELETE is its own row cascade) |
 | `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
-| `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → PERSISTED-RESTORE snapshot → SAFE modify → GET-verify → finally-RESTORE → re-verify; the saved original config rides disk — 0600, outside the battery's scratch dir, no secrets, a hand-restore recipe inside — BEFORE the mutation, and the restore covers EVERY exit path: the restore steps on success/assertion-failure/throw, a SIGINT/SIGTERM guard that restores before exiting 130/143, a failure-tail retry for an unverified restore, and a hard kill leaving the snapshot for hand-restore; restore failure a BLOCKING red; the mutation never fires when the persist fails; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the direct-API class stands in by design: the admin `/set` UI fold has since LANDED (`applyAdminMonitorQueueSet` mounted in `ui/index.ts`), but the battery exercises the platform API itself, documented admin-manual) + the FOUR-WAY auth taxonomy (SPEC-0021 §5 as-built — the class word leads each detail; `missing-auth` `[warn]` = the pre-authorization state, never a release verdict and never "permanently closed" / `permission-denied` `[fail]` = 401/403 mis-scoped, never "platform unsupported" / `api-unsupported` `[warn]` = 405/415/410/451/501 or an entitlement-naming 403 / `failure` `[fail]` = network, 429-after-retries, 400, 404 unresolving id, read-back mismatch; the profile's no-live-instance answer stays the environment-condition `[warn]`) + credentials from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets) with the persisted 0600 store `.monitor-auth.json` written once by `scripts/setup-monitor-auth.mjs` (env wins field-by-field; absent/unusable = the `missing-auth` class, never fake-green) + the test seams `MONITOR_CF_API_BASE` / `MONITOR_AUTH_FILE` (point them only at a stub/path you own; `scripts/setup-monitor-auth.test.mjs` drives the battery's taxonomy/restore logic against a local stub) |
+| `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → PERSISTED-RESTORE snapshot → SAFE modify → GET-verify → finally-RESTORE → re-verify; the saved original config rides disk — 0600, outside the battery's scratch dir, no secrets, a hand-restore recipe inside — BEFORE the mutation, and the restore covers EVERY exit path: the restore steps on success/assertion-failure/throw, a SIGINT/SIGTERM guard that restores before exiting 130/143, a failure-tail retry for an unverified restore, and a hard kill leaving the snapshot for hand-restore; restore failure a BLOCKING red; the mutation never fires when the persist fails; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the direct-API class stands in by design: the admin `/set` UI fold has since LANDED (`applyAdminMonitorQueueSet` mounted in `ui/index.ts`), but the battery exercises the platform API itself, documented admin-manual) + the FOUR-WAY auth taxonomy (SPEC-0021 §5 as-built — the class word leads each detail; `missing-auth` `[warn]` = the pre-authorization state, never a release verdict and never "permanently closed" / `permission-denied` `[fail]` = 401/403 mis-scoped, never "platform unsupported" / `api-unsupported` `[warn]` = 405/415/410/451/501 or an entitlement-naming 403 / `failure` `[fail]` = network, 429-after-retries, 400, 404 unresolving id, read-back mismatch; the profile's no-live-instance answer stays the environment-condition `[warn]`) + credentials from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets) with the persisted 0600 store `.monitor-auth.json` written once by `scripts/setup-monitor-auth.mjs` (env wins field-by-field; absent/unusable = the `missing-auth` class, never fake-green) + the test seams `MONITOR_CF_API_BASE` / `MONITOR_AUTH_FILE` (point them only at a stub/path you own; `scripts/setup-monitor-auth.test.mjs` drives the battery's taxonomy/restore logic against a local stub) + **CF-API-only CLI**: a monitor-only selection takes NO `--base-url`/`--token-file` (optional — a supplied token file is still validated + scrubbed; the PAT preflight is skipped; Worker-hitting batteries and `all` still demand the pair) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
 | **`all`** | **253** | every battery in registry order, audit last | union of the above |
 
@@ -947,7 +960,12 @@ prints all of them verbatim.
   battery keeps exercising the platform API itself, the adapter class
   documented admin-manual. It is the only battery whose HTTP leaves the
   deployment entirely (the probe host needs outbound api.cloudflare.com
-  reachability). **Auth gating — the one-time-authorization model
+  reachability). **The CLI contract follows the wire:** a monitor-only
+  selection takes `--base-url`/`--token-file` OPTIONALLY (a supplied token
+  file is still validated 0600 + mint-shape and scrubbed; the PAT-identity
+  preflight is skipped — nothing here addresses the deployment; any
+  Worker-hitting battery or `all` still demands the pair). **Auth gating —
+  the one-time-authorization model
   (SPEC-0021 §4 as-built), never fake-green:** each arm reads the SAME env
   names the Worker carries as secrets, from the probe's OWN environment —
   `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`,
@@ -957,8 +975,9 @@ prints all of them verbatim.
   (`.monitor-auth.json` at the repo root, gitignored; `$MONITOR_AUTH_FILE`
   relocates) as the fallback when the env names are absent; env wins
   field-by-field when both exist. Absent/unusable credentials are the
-  `missing-auth` class — never a pass, never a network call beyond the PAT
-  preflight. Both platform tokens ride the run's scrub table.
+  `missing-auth` class — never a pass; the only network calls the battery
+  ever makes are the platform API calls the arms themselves drive. Both
+  platform tokens ride the run's scrub table.
   **Arm 1 — the `/set` closed loop, serial-locked:** ONE consumer per run
   (the allowlist's first entry, or `--monitor-consumer <key>`; the battery
   never targets two): read (GET the consumer's FULL config — the saved

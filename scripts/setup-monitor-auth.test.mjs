@@ -11,10 +11,16 @@
  * Both tools are driven as child processes against a LOCAL STUB of the
  * Cloudflare API (a node:http server on 127.0.0.1; the MONITOR_CF_API_BASE /
  * MONITOR_AUTH_FILE seams) — NO real api.cloudflare.com traffic, NO real
- * credentials. The stub records every request (method, path, bearer, body)
- * so the asserts pin what actually crossed the wire. The children are
- * spawned ASYNC: the stub lives in THIS process, and a synchronous spawn
- * would block the parent event loop so the stub could never answer.
+ * credentials. The battery invocations deliberately pass NO --base-url /
+ * --token-file: monitor-platform is the CF-API-only battery (its HTTP goes
+ * to MONITOR_CF_API_BASE with the env/store auth, SPEC-0021 §4), so the
+ * monitor-only CLI contract makes the pair optional and skips the PAT
+ * preflight (nothing in that battery addresses the deployment) — scenarios
+ * 5-13 double as the green/no-pair proof. The stub records every request
+ * (method, path, bearer, body) so the asserts pin what actually crossed the
+ * wire. The children are spawned ASYNC: the stub lives in THIS process, and
+ * a synchronous spawn would block the parent event loop so the stub could
+ * never answer.
  *
  *   1.  setup --help exits 0 offline;
  *   2.  setup --check with no store and no env → exit 3, "missing-auth";
@@ -24,8 +30,9 @@
  *   4.  setup --check against the persisted store → exit 0; the failure
  *       classes are distinct: permission-denied (403) / api-unsupported
  *       (405) / failure (network) each exit 1 with their class word;
- *   5.  the battery with NO credentials reports missing-auth [warn] on all
- *       six checks and exits 0 (warn never fails — the battery convention);
+ *   5.  the battery with NO credentials — and NO --base-url/--token-file —
+ *       reports missing-auth [warn] on all six checks and exits 0 (warn
+ *       never fails — the battery convention);
  *   6.  the battery's GREEN /set loop via env auth: 6 pass, exit 0, the wire
  *       carries exactly TWO consumer PUTs — modify (saved−1) then restore
  *       (the saved value verbatim, preserved fields intact) — and the
@@ -44,7 +51,12 @@
  *       downstream /set steps skip, the pprof arm still passes;
  *  12.  api-unsupported (405) on the consumer read → the honest [warn],
  *       exit 0 (warn never fails);
- *  13.  a dead API origin → the failure class, exit 1.
+ *  13.  a dead API origin → the failure class, exit 1;
+ *  14.  the CLI contract's other edge: a Worker-hitting battery (p0)
+ *       WITHOUT the pair still exits 2 with the pointed usage error;
+ *  15.  the pair stays ACCEPTED for monitor-only: a supplied token file is
+ *       still validated (a 0644 file is refused, exit 2, value never
+ *       echoed).
  *
  * The SIGKILL scenario intentionally leaves the battery's scratch dir (the
  * whole point is that its cleanup never ran); only the snapshot file is
@@ -154,10 +166,9 @@ const startStub = () => new Promise((resolve) => {
     req.on("end", () => {
       const record = { method: req.method, path: req.url, auth: req.headers.authorization ?? null, body };
       state.requests.push(record);
-      if (req.url.startsWith("/api/v1/user")) {
-        respondJson(res, 200, { login: "p0probe", id: 1 });
-        return;
-      }
+      // NOTE: no /api/v1/user route — the monitor-only contract skips the PAT
+      // preflight (nothing in the battery addresses the deployment), so the
+      // stub never sees a Worker-origin request.
       if (CONSUMER_RE.test(req.url) && req.url.includes(NIL)) {
         // the setup tool's dry-write target: authz ran, nothing exists there
         respondJson(res, 404, errorEnvelope(10001, "queue not found"));
@@ -233,9 +244,13 @@ const runNode = (scriptPath, args, env) => new Promise((resolve) => {
 
 const runSetup = async (args, over = {}) => runNode(SETUP, args, cleanEnv(over));
 
-const batteryArgs = (stubOrigin) => ["monitor-platform", "--base-url", stubOrigin, "--token-file", PAT_FILE, "--user", "p0probe", "--json"];
+/** The battery args carry NO --base-url/--token-file: the monitor-only CLI
+ *  contract makes the pair optional (the battery's HTTP is the platform API
+ *  via MONITOR_CF_API_BASE; the PAT preflight is skipped). --user stays to
+ *  pin that the arg keeps parsing for a monitor-only run. */
+const batteryArgs = () => ["monitor-platform", "--user", "p0probe", "--json"];
 const runBattery = async (stub, over = {}) =>
-  runNode(PROBES, batteryArgs(stub.origin), cleanEnv({ MONITOR_CF_API_BASE: stub.origin, ...over }));
+  runNode(PROBES, batteryArgs(), cleanEnv({ MONITOR_CF_API_BASE: stub.origin, ...over }));
 
 const batteryEnvAuth = {
   CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
@@ -425,7 +440,7 @@ await new Promise((resolve) => stub5.server.close(resolve));
 const runSigScenario = async (signal) => {
   const stub = await startStub();
   stub.state.holdAfterFirstPut = true;
-  const child = spawn(process.execPath, [PROBES, ...batteryArgs(stub.origin)], {
+  const child = spawn(process.execPath, [PROBES, ...batteryArgs()], {
     env: cleanEnv({ MONITOR_CF_API_BASE: stub.origin, ...batteryEnvAuth }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -515,10 +530,10 @@ const runSigScenario = async (signal) => {
   await new Promise((resolve) => stub.server.close(resolve));
 }
 {
-  // a LIVE stub answers --base-url (the PAT preflight must pass — only the
-  // PLATFORM origin is dead, which is the class under test)
-  const liveStub = await startStub();
-  const res = await runNode(PROBES, batteryArgs(liveStub.origin), cleanEnv({ MONITOR_CF_API_BASE: "http://127.0.0.1:9", ...batteryEnvAuth }));
+  // NO --base-url at all (the monitor-only contract — the PAT preflight is
+  // skipped, so nothing dials a Worker origin) and the PLATFORM origin is
+  // dead (nothing listens on :9), which is the class under test
+  const res = await runNode(PROBES, batteryArgs(), cleanEnv({ MONITOR_CF_API_BASE: "http://127.0.0.1:9", ...batteryEnvAuth }));
   const summary = JSON.parse(res.stdout || "{}");
   const byId = Object.fromEntries((summary.checks ?? []).map((c) => [c.id, c]));
   check(
@@ -526,7 +541,44 @@ const runSigScenario = async (signal) => {
     res.status === 1 && summary.summary?.fail === 2 && byId["mon-qset-consumer-read"]?.detail.startsWith("reading the consumer: failure"),
     `exit ${res.status} summary ${JSON.stringify(summary.summary ?? {})}`,
   );
-  await new Promise((resolve) => liveStub.server.close(resolve));
+}
+
+// ---------- 14-15: the CLI contract (the CF-API-only monitor-only selection) ----------
+
+{
+  // a Worker-hitting battery without the pair still exits 2 with the pointed
+  // usage error BEFORE any request fires
+  const res = await runNode(PROBES, ["p0", "--json"], cleanEnv());
+  check(
+    "a Worker-hitting battery (p0) without --base-url/--token-file exits 2 with the pointed usage error",
+    res.status === 2 && res.stderr.includes("--base-url is required") && res.stderr.includes("monitor-only monitor-platform"),
+    `exit ${res.status}: ${res.stderr.slice(0, 200)}`,
+  );
+}
+{
+  // the pair stays ACCEPTED for monitor-only: a supplied token file is
+  // validated (0600, mint shape) + scrubbed and the run still goes green
+  const stub = await startStub();
+  const res = await runNode(PROBES, [...batteryArgs(), "--token-file", PAT_FILE], cleanEnv({ MONITOR_CF_API_BASE: stub.origin, ...batteryEnvAuth }));
+  const summary = JSON.parse(res.stdout || "{}");
+  check(
+    "monitor-only with a SUPPLIED valid token file: validated + accepted, the run stays green",
+    res.status === 0 && summary.summary?.pass === 6 && summary.summary?.fail === 0,
+    `exit ${res.status} summary ${JSON.stringify(summary.summary ?? {})} stderr ${res.stderr.slice(-200)}`,
+  );
+  await new Promise((resolve) => stub.server.close(resolve));
+}
+{
+  // ...and a LOOSE supplied file is still refused before any request (the
+  // 0600 convention holds even where the file is optional)
+  const loosePat = path.join(scratchRoot, "pat-0644");
+  fs.writeFileSync(loosePat, "cfg_01234567_ABCDEFGHJKLMNPQRSTUVWXYZ23456789\n", { mode: 0o644 });
+  const res = await runNode(PROBES, [...batteryArgs(), "--token-file", loosePat], cleanEnv());
+  check(
+    "monitor-only with a SUPPLIED loose-mode token file: refused exit 2 (0600 convention), value never echoed",
+    res.status === 2 && res.stderr.includes("must be 0600") && !res.stderr.includes("cfg_"),
+    `exit ${res.status}: ${res.stderr.slice(0, 200)}`,
+  );
 }
 
 // ---------- summary ----------
