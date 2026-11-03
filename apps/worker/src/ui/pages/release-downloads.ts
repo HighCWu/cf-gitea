@@ -1,21 +1,28 @@
 /**
  * The releases download tail — the parity survey's row 2 (top-5 #1): the
- * web mux's release-asset serving routes over the landed release-assets
+ * web mux's release-asset serving route over the landed release-assets
  * service data, upstream
  *
  *   GET /{owner}/{repo}/releases/download/{vTag}/{fileName}
  *                                   web.go:1514 repo.RedirectDownload
  *                                   (routers/web/repo/repo.go:303-347)
- *   GET /{owner}/{repo}/releases/attachments/{uuid}
- *                                   web.go:1513 repo.GetAttachment
- *                                   (routers/web/repo/attachment.go:244-246
- *                                   → ServeAttachment attachment.go:220-336)
  *
- * both under the releases group's gates (web.go:1505-1514): `optSignIn`,
+ * under the releases group's gates (web.go:1505-1514): `optSignIn`,
  * `context.RepoAssignment` (the §2.5 prologue), `repo.MustBeNotEmpty` and
  * `reqRepoReleaseReader` — the landed `hasReleases` unit gate (the
  * releasesReadGate arm, the releases pages' own gate; a disabled unit is
  * upstream `perm.CanRead(TypeReleases)` false → 404).
+ *
+ * THE SIBLING SHAPE MOVED TO THE SHARED SEAM: upstream's second route in the
+ * pair, GET /{owner}/{repo}/releases/attachments/{uuid} (web.go:1513
+ * repo.GetAttachment → ServeAttachment, attachment.go:220-336), consolidated
+ * onto src/web/attachments-serving.ts's repo-scoped release twin — the full
+ * shared ServeAttachment pipeline (the landed sniffer/charset/CSP/304 arms)
+ * instead of this module's reduced serving port; the uiRouter registration
+ * and the release-attachment parse family are gone (ui/index.ts). This
+ * module keeps the RedirectDownload loader, the serving core it feeds
+ * (openReleaseAttachment below, the download arm's loader) and the response
+ * builders the raw/media byte families reuse.
  *
  * ## ServeAttachment, ported (attachment.go:220-336)
  *

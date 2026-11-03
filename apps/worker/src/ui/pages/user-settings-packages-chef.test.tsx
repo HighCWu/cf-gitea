@@ -216,6 +216,32 @@ describe("chefKeypairDownloadResponse (ctx.ServeContent's header set)", () => {
     expect(res.headers.get("last-modified")).toBeNull();
     expect(body).toContain("BEGIN RSA PRIVATE KEY");
   });
+
+  it("rides the caller's request through ServeContent's arms — a matching If-None-Match 412s on the POST, a Range 206s (the upstream POST download wire)", async () => {
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\nAAA\n-----END RSA PRIVATE KEY-----\n";
+    // The honest upstream POST download: ctx.ServeContent runs the
+    // preconditions over the private-key stream too. A matching
+    // If-None-Match on a NON-GET/HEAD is checkPreconditions' 412 arm
+    // (fs.go:655-662 — only GET/HEAD writeNotModified), so the once-only
+    // private PEM is withheld — the wire upstream itself produces.
+    const notModified = chefKeypairDownloadResponse(
+      aliceName,
+      pem,
+      new Request("https://test.local/u", { method: "POST", headers: { "if-none-match": "*" } }),
+    );
+    expect(notModified.status).toBe(412);
+    expect(notModified.headers.get("content-type")).toBe("application/x-pem-file");
+    expect(notModified.headers.get("last-modified")).toBeNull();
+
+    const range = chefKeypairDownloadResponse(
+      aliceName,
+      pem,
+      new Request("https://test.local/u", { method: "POST", headers: { range: "bytes=7-10" } }),
+    );
+    expect(range.status).toBe(206);
+    expect(range.headers.get("content-range")).toBe(`bytes 7-10/${new TextEncoder().encode(pem).byteLength}`);
+    expect((await range.arrayBuffer()).byteLength).toBe(4);
+  });
 });
 
 // --- the mounted route (index.ts: the POST + the 405 twin + the guards) -------

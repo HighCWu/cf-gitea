@@ -308,15 +308,13 @@ describe("wave-20 parser family (parseUiRoute / handlesUiRoute)", () => {
       repo: "hello",
     });
     expect(parseUiRoute("/octo/hello/releases/generate-notes")).toBeNull();
-    // Wave-41 disclosure: `/releases/attachments/{uuid}` left the unclaimed
-    // set (web.go:1513's download-tail family, pages/release-downloads.ts —
-    // the wave-41 test owns the shape); the write tails stay unclaimed.
-    expect(parseUiRoute("/octo/hello/releases/attachments/abc")).toEqual({
-      family: "release-attachment",
-      owner: "octo",
-      repo: "hello",
-      uuid: "abc",
-    });
+    // Wave-41 fold disclosure: `/releases/attachments/{uuid}` (web.go:1513)
+    // is the shared attachments-serving seam's repo-scoped twin now —
+    // parseUiRoute disowns the whole shape (the src/index.ts dispatcher carve
+    // hands the exact 5-segment GET to the seam before any ui consult, and
+    // no uiRouter registration claims it); only the `/download` half stays a
+    // ui family. The write tails stay unclaimed.
+    expect(parseUiRoute("/octo/hello/releases/attachments/abc")).toBeNull();
     expect(parseUiRoute("/octo/hello/releases/attachments")).toBeNull();
   });
 });

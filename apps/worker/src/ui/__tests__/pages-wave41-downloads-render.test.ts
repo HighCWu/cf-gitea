@@ -1,11 +1,17 @@
 /**
  * Pages wave 41 route tests — three survey arms in one wave:
  *
- *   1. the releases download tail (`/{owner}/{repo}/releases/attachments/
- *      {uuid}` + `/{owner}/{repo}/releases/download/{vTag}/{fileName}`,
- *      pages/release-downloads.ts — the survey's top-5 #1, upstream
- *      web.go:1513-1514: repo.GetAttachment → ServeAttachment +
- *      repo.RedirectDownload);
+ *   1. the releases download tail (`/{owner}/{repo}/releases/download/
+ *      {vTag}/{fileName}`, pages/release-downloads.ts — the survey's top-5
+ *      #1, upstream web.go:1514 repo.RedirectDownload). The sibling
+ *      `/releases/attachments/{uuid}` GET (web.go:1513 repo.GetAttachment)
+ *      consolidated onto the shared attachments-serving seam
+ *      (src/web/attachments-serving.ts's repo-scoped release twin), so its
+ *      arms below drive `attachmentsServingRouter` — the LIVE surface —
+ *      instead of the shadowed ui registration they were written against
+ *      (the fold moved three wire details, disclosed at the pins: the seam's
+ *      304 carries ETag/Last-Modified only, its 404s are the plain-text
+ *      family, and the 200's Last-Modified is the R2 object's mtime);
  *   2. the rendered blob views (`/{owner}/{repo}/render/{branch|tag|commit}/
  *      *` + `/render/blob/{sha}`, pages/render-files.ts — the survey's
  *      row 3, upstream web.go:1715-1719 repo.RenderFile);
@@ -17,13 +23,13 @@
  * Upstream contracts under test (the module docs carry the cites):
  * downloads — the ServeAttachment gates (uuid lookup, the URL-repo match,
  * the DRAFT gate riding release-write access), IncreaseDownloadCount, the
- * httpcache pair (`"{uuid}"` ETag, If-None-Match / If-Modified-Since → 304
- * with `private, max-age=21600`), the sniffed 200 matrix (text forced to
- * `text/plain` — user HTML never renders as a page — browsable binaries keep
- * their mime, the sandbox CSP with the audio/video deletion, nosniff, the
- * inline disposition encoding, the zero-option prod Cache-Control overwrite),
- * RedirectDownload's EXACT tag find (case-sensitive, tag-only rows excluded,
- * drafts for writers only) and the `latest` alias (GetLatestReleaseByRepoID);
+ * httpcache pair (`"{uuid}"` ETag, If-None-Match / If-Modified-Since → 304),
+ * the sniffed 200 matrix (text forced to `text/plain` — user HTML never
+ * renders as a page — browsable binaries keep their mime, the sandbox CSP
+ * with the audio/video deletion, nosniff, the inline disposition encoding,
+ * the zero-option prod Cache-Control overwrite), RedirectDownload's EXACT
+ * tag find (case-sensitive, tag-only rows excluded, drafts for writers only)
+ * and the `latest` alias (GetLatestReleaseByRepoID);
  * render — the standalone HTML fragment (`text/html; charset=utf-8`, the
  * MarkupRenderDefaultSandbox CSP), the markdown-family renderability set
  * (setting/markup.go:83's default), the "Unable to find renderer" 400 class
@@ -59,10 +65,18 @@ import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { blobRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "../pages/repo-home";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
+import { attachmentsServingRouter } from "../../web/attachments-serving";
 import { T0, uiEnv } from "./harness";
 
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+}
+
+/** The LIVE surface for the `/releases/attachments/{uuid}` shape (the seam
+ *  fold): the repo-scoped twin arm on attachmentsServingRouter, driven with
+ *  the same env the uiRouter harness uses. */
+async function fetchSeam(path: string, init?: RequestInit): Promise<Response> {
+  return attachmentsServingRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
 }
 
 const withCookie = (path: string, cookie: string): RequestInit => ({
@@ -307,22 +321,18 @@ beforeAll(async () => {
 // --- the parser (the single owner of the route shape) ---------------------------
 
 describe("wave-41 parser families (parseUiRoute / handlesUiRoute)", () => {
-  it("claims the attachment serve at the exact chi shape (one segment)", () => {
-    expect(parseUiRoute("/octo/hello/releases/attachments/abc-123")).toEqual({
-      family: "release-attachment",
-      owner: "octo",
-      repo: "hello",
-      uuid: "abc-123",
-    });
-    expect(parseUiRoute("/octo/hello/releases/attachments/a%2Fb")).toEqual({
-      family: "release-attachment",
-      owner: "octo",
-      repo: "hello",
-      uuid: "a/b",
-    });
-    // Deeper tails are upstream's pattern miss → engine-owned.
+  it("leaves the attachment serve to the shared seam (the fold: parseUiRoute disowns the shape)", () => {
+    // THE SEAM FOLD (the dead-twin consolidation): the `/releases/attachments/
+    // {uuid}` GET no longer claims as a ui family — the route consolidated
+    // onto web/attachments-serving.ts's repo-scoped twin (mounted before
+    // uiRouter; the src/index.ts dispatcher carve hands the exact 5-segment
+    // shape to it before any ui consult). Plain and %-encoded uuids alike
+    // stay unclaimed HERE; the live serve pins drive the seam below.
+    expect(parseUiRoute("/octo/hello/releases/attachments/abc-123")).toBeNull();
+    expect(parseUiRoute("/octo/hello/releases/attachments/a%2Fb")).toBeNull();
+    expect(handlesUiRoute("/octo/hello/releases/attachments/abc-123")).toBe(false);
+    // Deeper tails are upstream's pattern miss → engine-owned, unchanged.
     expect(parseUiRoute("/octo/hello/releases/attachments/abc/def")).toBeNull();
-    expect(handlesUiRoute("/octo/hello/releases/attachments/abc-123")).toBe(true);
   });
 
   it("claims the download redirect at the exact chi shape (two segments)", () => {
@@ -405,10 +415,19 @@ describe("fetch-action redirects (repo-home.tsx — base.go:153-156)", () => {
 
 // --- item 1: the releases download tail ------------------------------------------
 
-describe("release attachment serve (web.go:1513 → ServeAttachment)", () => {
+describe("release attachment serve (web.go:1513 → ServeAttachment, on the shared seam)", () => {
+  // The seam fold: these arms drive attachmentsServingRouter — the LIVE
+  // surface for the shape (ui's shadowed registration is gone). Three wire
+  // details moved with the fold, each disclosed at its pin: (1) the 304
+  // carries ETag + Last-Modified ONLY (the GP-fix shape — the ui twin's
+  // `private, max-age=21600` on the 304 is gone); (2) the 404s are the
+  // plain-text family (the documented error-page divergence — the ui twin
+  // shelled them with the §4.5 HTML page); (3) the 200's Last-Modified is
+  // the R2 object's mtime (serve.go:238), not the D1 row's created_unix.
+
   it("streams the asset with the sniffed text/plain matrix + nosniff + sandbox + inline disposition", async () => {
     const { txtUuid } = await fixture();
-    const res = await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`);
+    const res = await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
@@ -418,13 +437,13 @@ describe("release attachment serve (web.go:1513 → ServeAttachment)", () => {
     expect(res.headers.get("etag")).toBe(`"${txtUuid}"`);
     expect(res.headers.get("content-length")).toBe("17");
     expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
-    expect(res.headers.get("last-modified")).toMatch(/GMT$/);
+    expect(res.headers.get("last-modified")).toMatch(/GMT$/); // the R2 mtime (moved detail 3)
     expect(await res.text()).toBe("plain asset body\n");
   });
 
   it("forces user HTML to text/plain (the never-render-as-a-page rule)", async () => {
     const { htmlUuid } = await fixture();
-    const res = await fetchUi(`/alice/wave41dl/releases/attachments/${htmlUuid}`);
+    const res = await fetchSeam(`/alice/wave41dl/releases/attachments/${htmlUuid}`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
     expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
@@ -432,7 +451,7 @@ describe("release attachment serve (web.go:1513 → ServeAttachment)", () => {
 
   it("keeps browsable binaries inline with their mime (the png sniff)", async () => {
     const { pngUuid } = await fixture();
-    const res = await fetchUi(`/alice/wave41dl/releases/attachments/${pngUuid}`);
+    const res = await fetchSeam(`/alice/wave41dl/releases/attachments/${pngUuid}`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("image/png");
     expect(res.headers.get("content-disposition")).toBe("inline; filename=pic.png");
@@ -442,52 +461,59 @@ describe("release attachment serve (web.go:1513 → ServeAttachment)", () => {
     const { txtUuid } = await fixture();
     const db = drizzle(env.DB);
     const before = (await db.select().from(releaseAssets).where(eq(releaseAssets.uuid, txtUuid)).get())?.downloadCount ?? 0;
-    await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`);
+    await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`);
     const after = (await db.select().from(releaseAssets).where(eq(releaseAssets.uuid, txtUuid)).get())?.downloadCount ?? 0;
     expect(after).toBe(before + 1);
   });
 
-  it("answers the httpcache pair: If-None-Match → 304 with the 6h private cache; If-Modified-Since too", async () => {
+  it("answers the httpcache pair: If-None-Match → 304 (ETag + Last-Modified only); If-Modified-Since too", async () => {
     const { txtUuid } = await fixture();
-    const inm = await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
+    const inm = await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
       headers: { "if-none-match": `"${txtUuid}"` },
     });
     expect(inm.status).toBe(304);
-    expect(inm.headers.get("cache-control")).toBe("private, max-age=21600");
+    // Moved detail 1: the seam's 304 headers are exactly ETag +
+    // Last-Modified (httpcache.go's return-before-set) — the ui twin's
+    // `private, max-age=21600` stamp is gone with the fold.
+    expect(inm.headers.get("cache-control")).toBeNull();
     expect(inm.headers.get("etag")).toBe(`"${txtUuid}"`);
     // The comma-list + W/ tolerance (checkIfNoneMatchIsValid).
-    const list = await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
+    const list = await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
       headers: { "if-none-match": `W/"other", "${txtUuid}"` },
     });
     expect(list.status).toBe(304);
     // If-Modified-Since (ignored when INM is present — httpcache.go:104-113);
-    // the timestamp round-trips through the 200's own Last-Modified header.
-    const fresh = await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`);
+    // the timestamp round-trips through the 200's own Last-Modified header
+    // (the R2 mtime — later than the row's fixed created_unix, so the
+    // second-precision compare still 304s).
+    const fresh = await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`);
     const lastModified = fresh.headers.get("last-modified") ?? "";
-    const ims = await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
+    const ims = await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
       headers: { "if-modified-since": lastModified },
     });
     expect(ims.status).toBe(304);
-    const stale = await fetchUi(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
+    const stale = await fetchSeam(`/alice/wave41dl/releases/attachments/${txtUuid}`, {
       headers: { "if-modified-since": "Mon, 01 Jan 1990 00:00:00 GMT" },
     });
     expect(stale.status).toBe(200);
   });
 
-  it("404-shells the unknown uuid, the foreign-repo uuid and the draft's uuid for anonymous", async () => {
+  it("404s the unknown uuid, the foreign-repo uuid and the draft's uuid for anonymous (plain-text family)", async () => {
     const { draftUuid } = await fixture();
-    const unknown = await fetchUi("/alice/wave41dl/releases/attachments/nope-0000");
+    const unknown = await fetchSeam("/alice/wave41dl/releases/attachments/nope-0000");
     expect(unknown.status).toBe(404);
-    expect(await unknown.text()).toContain('<div class="status-page-error">');
-    const foreign = await fetchUi(`/alice/wave41empty/releases/attachments/${draftUuid}`);
-    expect(foreign.status).toBe(404);
-    const draft = await fetchUi(`/alice/wave41dl/releases/attachments/${draftUuid}`);
+    // Moved detail 2: the seam answers Go's http.Error plain text — the ui
+    // twin's §4.5 HTML shell is gone with the fold.
+    expect(await unknown.text()).toBe("Not Found\n");
+    const foreign = await fetchSeam(`/alice/wave41empty/releases/attachments/${draftUuid}`);
+    expect(foreign.status).toBe(404); // the MustBeNotEmpty gate
+    const draft = await fetchSeam(`/alice/wave41dl/releases/attachments/${draftUuid}`);
     expect(draft.status).toBe(404); // the draft gate (attachment.go:295-311)
   });
 
   it("serves the draft's asset to a release-writer (the write-grant arm)", async () => {
     const { draftUuid, aliceCookie } = await fixture();
-    const res = await fetchUi(`/alice/wave41dl/releases/attachments/${draftUuid}`, withCookie(`/alice/wave41dl/releases/attachments/${draftUuid}`, aliceCookie));
+    const res = await fetchSeam(`/alice/wave41dl/releases/attachments/${draftUuid}`, withCookie(`/alice/wave41dl/releases/attachments/${draftUuid}`, aliceCookie));
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("draft only\n");
   });
@@ -526,13 +552,15 @@ describe("release download redirect (web.go:1514 → RedirectDownload)", () => {
     expect(await res.text()).toContain('<div class="status-page-error">');
   });
 
-  it("404s when the releases unit is disabled (reqRepoReleaseReader)", async () => {
+  it("404s when the releases unit is disabled (reqRepoReleaseReader) on both tails' surfaces", async () => {
     const { repoId } = await fixture();
     await saveRepoSettings(env.DB, repoId, { hasReleases: false }, new Date());
     try {
       const res = await fetchUi("/alice/wave41dl/releases/download/v41/notes.txt");
       expect(res.status).toBe(404);
-      const attach = await fetchUi("/alice/wave41dl/releases/attachments/x");
+      // The attachment twin rides the seam's canReadReleasesUnit gate — the
+      // same unit, the same verdict (plain-text 404 there).
+      const attach = await fetchSeam("/alice/wave41dl/releases/attachments/x");
       expect(attach.status).toBe(404);
     } finally {
       await saveRepoSettings(env.DB, repoId, { hasReleases: true }, new Date());

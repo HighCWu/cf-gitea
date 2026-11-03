@@ -569,19 +569,24 @@
  *                                          tplRepoViewList standalone
  *                                          fragment the view_list loader
  *                                          fetches)
- *   /:owner/:repo/releases/attachments/{uuid}
  *   /:owner/:repo/releases/download/{vTag}/{fileName}
  *                                          the releases download tail, GET
  *                                          (pages/release-downloads.ts —
  *                                          wave 41; the survey's top-5 #1,
- *                                          upstream web.go:1513
- *                                          repo.GetAttachment + web.go:1514
+ *                                          upstream web.go:1514
  *                                          repo.RedirectDownload — the
  *                                          streamed asset serve over the
  *                                          landed release-assets data, the
  *                                          ServeAttachment header matrix +
  *                                          the `latest` alias; the module
- *                                          doc carries the ledger)
+ *                                          doc carries the ledger). The
+ *                                          sibling /releases/attachments/
+ *                                          {uuid} shape (web.go:1513)
+ *                                          consolidated onto the shared
+ *                                          attachments-serving seam
+ *                                          (src/web/attachments-serving.ts
+ *                                          — the repo-scoped twin arm); the
+ *                                          ui parser no longer claims it.
  *   /:owner/:repo/render/{branch|tag|commit}/*
  *   /:owner/:repo/render/blob/{sha}        the rendered blob views, GET
  *                                          (pages/render-files.ts — wave
@@ -721,9 +726,7 @@ import { clearSessionSetCookie, lookupValidSession, sameOriginGuard, sessionCook
 import { blobRedirectResponse, fetchActionRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
 import {
   loadReleaseDownload,
-  openReleaseAttachment,
   releaseAttachmentResponse,
-  type ReleaseAttachmentServe,
 } from "./pages/release-downloads";
 import { loadRenderFile, renderFileResponse, renderNotAvailableResponse, type RenderFileTarget } from "./pages/render-files";
 import { loadMediaBlob, loadRawBlob, mediaBlobResponse, rawBlobResponse, type RawMediaTarget } from "./pages/raw-files";
@@ -2452,13 +2455,15 @@ export interface ReleasesRoute {
 }
 
 /** The wave-41 releases download tail (pages/release-downloads.ts): upstream
- *  web.go:1513's `m.Get("/releases/attachments/{uuid}",
- *  repo.GetAttachment)` and web.go:1514's
- *  `m.Get("/releases/download/{vTag}/{fileName}", repo.RedirectDownload)` —
- *  the parity survey's top-5 #1, the serving half of the landed
- *  release-assets data (the download pages' links answer here). Both are
- *  binary serves, not pages; the routes sit in the releases group's gates
- *  (MustBeNotEmpty + reqRepoReleaseReader — the hasReleases unit gate). */
+ *  web.go:1514's `m.Get("/releases/download/{vTag}/{fileName}",
+ *  repo.RedirectDownload)` — the parity survey's top-5 #1, the serving half
+ *  of the landed release-assets data (the download pages' links answer here).
+ *  A binary serve, not a page; the route sits in the releases group's gates
+ *  (MustBeNotEmpty + reqRepoReleaseReader — the hasReleases unit gate). The
+ *  sibling web.go:1513 `/releases/attachments/{uuid}` GET is the shared
+ *  attachments-serving seam's repo-scoped twin (src/web/attachments-serving.ts
+ *  — mounted before uiRouter, claimed by the src/index.ts dispatcher carve);
+ *  this parser deliberately disowns that shape. */
 /** POST /{owner}/{repo}/releases/{id}/reactions/{action} (web.go:1515's
  *  reaction mount inside the releases group — reqSignIn +
  *  RepoMustNotBeArchived over reqRepoReleaseReader+MustBeNotEmpty; the
@@ -2473,13 +2478,11 @@ export interface ReleaseReactionRoute {
 }
 
 export interface ReleaseDownloadRoute {
-  family: "release-attachment" | "release-download";
+  family: "release-download";
   owner: string;
   repo: string;
-  /** The decoded uuid segment (the attachments family). */
-  uuid?: string;
-  /** The decoded {vTag}/{fileName} pair (the download family — chi's
-   *  single-segment params, so a literal slash in either 404s upstream). */
+  /** The decoded {vTag}/{fileName} pair (chi's single-segment params, so a
+   *  literal slash in either 404s upstream). */
   vTag?: string;
   fileName?: string;
 }
@@ -6435,9 +6438,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // `/releases/tag/v1.0/rc` links re-parse to the same route). Wave 33 (the
   // survey's top-5 #4) lifts the write group's `/edit/{tail}` (the same
   // wildcard decode — the URL-keyed tag) and `/delete` literals out of the
-  // unclaimed set (web.go:1519-1520 + 1523). Wave 41 lifts the group's two
-  // GET download routes out of the unclaimed set (web.go:1513-1514 — the
-  // download-tail families below). The feed tails upstream registers
+  // unclaimed set (web.go:1519-1520 + 1523). Wave 41 lifted the group's two
+  // GET download routes out of the unclaimed set (web.go:1513-1514); the
+  // `/attachments/{uuid}` GET half later consolidated onto the shared
+  // attachments-serving seam (src/web/attachments-serving.ts's repo-scoped
+  // twin — the src/index.ts dispatcher carve hands it the exact 5-segment
+  // shape before this parser is consulted), so only the `/download` family
+  // claims here. The feed tails upstream registers
   // (`.rss`/`.atom` — the dotted-head claims just above), the
   // `/generate-notes` and the `/attachments`+`/attachments/remove` POST
   // write tails stay unclaimed → the engine's 404.
@@ -6497,19 +6504,17 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       }
     }
     // Wave-41 download tail (pages/release-downloads.ts — upstream
-    // web.go:1513-1514's two GETs, the parity survey's top-5 #1): the
-    // `/attachments/{uuid}` serve and the `/download/{vTag}/{fileName}`
-    // redirect arm. BOTH are chi SINGLE-segment params (no wildcard — a
-    // literal slash in the file name 404s upstream), so the claims are the
-    // exact 3- and 4-segment shapes and every deeper tail stays unclaimed →
-    // the engine's 404.
-    if (rest.length === 2 && rest[0] === "attachments") {
-      try {
-        return { family: "release-attachment", owner, repo, uuid: decodeURIComponent(rest[1] as string) };
-      } catch {
-        return null;
-      }
-    }
+    // web.go:1514's GET, the parity survey's top-5 #1): the
+    // `/download/{vTag}/{fileName}` redirect arm. A chi SINGLE-segment param
+    // pair (no wildcard — a literal slash in the file name 404s upstream), so
+    // the claim is the exact 4-segment shape and every deeper tail stays
+    // unclaimed → the engine's 404. The sibling `/attachments/{uuid}` GET
+    // (web.go:1513) rides the shared attachments-serving seam
+    // (src/web/attachments-serving.ts's repo-scoped twin) — the shape is NOT
+    // claimed here: the src/index.ts dispatcher carve
+    // (isRepoScopedAttachment) hands the exact 5-segment shape to the seam
+    // before any ui consult, and a ui claim would re-parent route truth the
+    // sub-app no longer serves.
     if (rest.length === 3 && rest[0] === "download") {
       try {
         return {
@@ -11370,7 +11375,9 @@ async function userPackagesChefRegenerateKeypair(c: Context<{ Bindings: Env }>):
   const user = await readProfileRowForPackages(c, p.viewer.id);
   if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
   const privatePem = await regenerateChefKeypair(c.env.DB, user.id);
-  return p.respond(chefKeypairDownloadResponse(user.username, privatePem));
+  // SERVE's fold: the third arg arms the conditional arms (If-None-Match /
+  // Range over the shared seam); the bare-GET default stays byte-identical.
+  return p.respond(chefKeypairDownloadResponse(user.username, privatePem, c.req.raw));
 }
 
 /** POST /user/settings/packages/cargo/{initialize,rebuild} (web.go:714-717 →
@@ -16442,34 +16449,31 @@ async function branchesListAuxJson(c: Context<{ Bindings: Env }>): Promise<Respo
 // ---------------------------------------------------------------------------
 
 /**
- * GET /{owner}/{repo}/releases/attachments/{uuid} and GET
- * /{owner}/{repo}/releases/download/{vTag}/{fileName}: the release-asset
- * binary serves (not pages). Upstream's group gates (web.go:1505-1514):
+ * GET /{owner}/{repo}/releases/download/{vTag}/{fileName}: the release-asset
+ * binary serve (not a page). Upstream's group gates (web.go:1505-1514):
  * the §2.5 prologue answers the visibility arm, `releasesReadGate` the
  * MustBeNotEmpty + reqRepoReleaseReader pair (a disabled releases unit is
  * upstream CanRead(TypeReleases) false → 404), the module doc carries the
- * ServeAttachment/RedirectDownload ledger; the 404 family answers the §4.5
- * shell like every ui download.
+ * RedirectDownload ledger; the 404 family answers the §4.5 shell like every
+ * ui download. The sibling `/releases/attachments/{uuid}` GET upstream route
+ * (web.go:1513) is NOT served here — it consolidated onto the shared
+ * attachments-serving seam (src/web/attachments-serving.ts's repo-scoped
+ * release twin, the full shared ServeAttachment pipeline); this tail keeps
+ * only the RedirectDownload shape the seam does not claim.
  */
 async function releaseDownloadTail(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { route, ctx, respond, viewer, repo } = resolved;
-  if (route.family !== "release-attachment" && route.family !== "release-download") {
+  if (route.family !== "release-download") {
     return respond(await c.notFound()); // registration/parser drift guard
   }
   if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
   // The draft gate's write arm (attachment.go:295-311's perm.CanWrite
   // (TypeReleases) — the same grant the releases pages render controls by).
   const canWriteReleases = await canWriteRepo(c.env, repo, viewer);
-  let serve: ReleaseAttachmentServe;
-  if (route.family === "release-download") {
-    if (route.vTag === undefined || route.fileName === undefined) return respond(await c.notFound()); // drift guard
-    serve = await loadReleaseDownload(c.env.REPO_PACKS, c.env.DB, repo, route.vTag, route.fileName, { canWriteReleases });
-  } else {
-    if (route.uuid === undefined) return respond(await c.notFound()); // drift guard
-    serve = await openReleaseAttachment(c.env.REPO_PACKS, c.env.DB, repo, route.uuid, { canWriteReleases });
-  }
+  if (route.vTag === undefined || route.fileName === undefined) return respond(await c.notFound()); // drift guard
+  const serve = await loadReleaseDownload(c.env.REPO_PACKS, c.env.DB, repo, route.vTag, route.fileName, { canWriteReleases });
   if (serve.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
   return respond(
     releaseAttachmentResponse(serve, {
@@ -20313,20 +20317,23 @@ uiRouter.post("/:owner/-/projects/:id/workflows/:wid", (c) => ownerProjectWorkfl
 uiRouter.post("/:owner/-/projects/:id/workflows/:wid/delete", (c) => ownerProjectWorkflowDeleteSubmit(c));
 uiRouter.get("/:owner/-/projects/:id/workflows/:wid/delete", () => methodNotAllowed("POST"));
 // Wave-41 releases download tail + rendered blob views (parseUiRoute claims
-// exactly these shapes — upstream web.go:1513's `/releases/attachments/{uuid}`
-// + web.go:1514's `/releases/download/{vTag}/{fileName}` (both chi
-// single-segment params, so the claims are the exact 3-/4-segment shapes) and
-// web.go:1715-1719's `/render` group (the three typed sub-routes are the /src
-// family's wildcard shape, the `/blob/{sha}` arm the exact 2-segment one);
-// the JSON/binary handlers run the resolveUiRequest prologue like every GET
-// page). No earlier registration can absorb these: the "download" and
-// "attachments" literals under /releases match shapes the wave-20 lines do
-// not carry (`/releases/tag/*` matches only the "tag" head), the "render"
-// head is a literal no registered pattern carries, and unclaimed shapes
-// never reach the sub-app — the dispatcher consults handlesUiRoute first.
+// exactly these shapes — upstream web.go:1514's `/releases/download/{vTag}/
+// {fileName}` (chi single-segment params, so the claim is the exact 4-segment
+// shape) and web.go:1715-1719's `/render` group (the three typed sub-routes
+// are the /src family's wildcard shape, the `/blob/{sha}` arm the exact
+// 2-segment one); the JSON/binary handlers run the resolveUiRequest prologue
+// like every GET page). The wave-41 `/releases/attachments/{uuid}` GET was
+// consolidated onto the shared attachments-serving seam
+// (src/web/attachments-serving.ts's repo-scoped twin — mounted before
+// uiRouter and handed the exact 5-segment shape by the src/index.ts
+// dispatcher carve), so NO uiRouter registration exists for it. No earlier
+// registration can absorb the survivors: the "download" literal under
+// /releases matches a shape the wave-20 lines do not carry
+// (`/releases/tag/*` matches only the "tag" head), the "render" head is a
+// literal no registered pattern carries, and unclaimed shapes never reach
+// the sub-app — the dispatcher consults handlesUiRoute first.
 uiRouter.post("/:owner/:repo/releases/:id/reactions/:action", (c) => releaseReactionSubmit(c));
 uiRouter.get("/:owner/:repo/releases/:id/reactions/:action", () => methodNotAllowed("POST"));
-uiRouter.get("/:owner/:repo/releases/attachments/:uuid", (c) => releaseDownloadTail(c));
 uiRouter.get("/:owner/:repo/releases/download/:vtag/:filename", (c) => releaseDownloadTail(c));
 uiRouter.get("/:owner/:repo/render/branch/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/tag/*", (c) => renderFileView(c));

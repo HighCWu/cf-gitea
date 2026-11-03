@@ -4,22 +4,35 @@
  * (services/context/base.go:186-190), CONSOLIDATED onto the shared serve
  * pipeline (`src/web/attachments-serving.ts`, the serve.go port): the header
  * SET and the Content-Disposition encoding ride that module's exports
- * (`serveSetHeaders`, `encodeContentDisposition`, `goPathBase`) — the same
- * ServeSetHeaders (serve.go:77-105) family the web attachments route, the API
- * blob GET, and the archive ride — instead of this module's former private
- * copy (the copy's derivation drifts are recorded in the test battery).
+ * (`serveSetHeaders` + its encoder family) — the same ServeSetHeaders
+ * (serve.go:77-105) family the web attachments route, the API blob GET, and
+ * the archive ride — instead of this module's former private copy (the
+ * copy's derivation drifts are recorded in the test battery). Every
+ * upstream ctx.ServeContent download arm composes through
+ * `servePackageFileResponse` here: the generic file family
+ * (helper.ServePackageFile), the debian/alpine/rpm/arch repository-key
+ * arms, the chef .priv download, and the swift manifest pair.
  *
  * What remains here is the packages arm upstream genuinely separates:
  *
  *  1. The packages-specific INPUTS — the registry's own Content-Type override
  *     (maven's jar/xml pair maven.go:206-214, swift's "text/x-swift", the
- *     debian/alpine/rpm key arms) and the file row's created time — are
+ *     debian/alpine/rpm/arch key arms) and the file row's created time — are
  *     carried by the callers and fed through the shared table: the CSP branch
  *     (serve.go:62-73) keys off the resolved type, the zero value floors to
  *     application/octet-stream (serve.go:58), and the disposition word is
  *     ServeSetHeaders' IfZero ATTACHMENT default (serve.go:91). The routes'
  *     own permission/quota arms (protocolContext, the sentinels) stay at the
- *     callers, exactly where upstream separates them.
+ *     callers, exactly where upstream separates them. `created` is OPTIONAL:
+ *     every ctx.ServeContent arm that passes no LastModified (the
+ *     debian.go:38-41 / alpine.go:57-60 / rpm.go:62-65 / arch.go:38-40
+ *     repository-key arms, the chef .priv download setting/packages.go:113-118,
+ *     rubygems' SetServeHeaders pair rubygems.go:82-84/:122-124) rides the
+ *     ZERO-MODTIME posture — no Last-Modified header, and If-Unmodified-Since
+ *     / If-Modified-Since inert (Go isZeroTime, fs.go:618-621: the zero time
+ *     AND the Unix epoch are both "unspecified"), while a date-form If-Range
+ *     never matches on the strict zero (fs.go:601-603's IsZero arm — an
+ *     epoch-zero modtime still compares).
  *  2. The BYTE-SERVING machinery of Go net/http's ServeContent (RFC 7232 §6 /
  *     RFC 7233): If-Match / If-Unmodified-Since / If-None-Match /
  *     If-Modified-Since → 412/304, If-Range gating, `Accept-Ranges: bytes`,
@@ -39,17 +52,28 @@
  * single-range resume shape `curl -C -` and browsers issue). Mirrors the
  * minimal-range posture upstream's own ServeUserContentByReader takes for
  * UI-served files (serve.go ServeUserContentByReader: "no support for
- * multiple range").
+ * multiple range"). The REST of the ServeContent family is the exact Go
+ * port (fs.go at gitea's go 1.27 toolchain): the preconditions order, the
+ * strconv.ParseInt-exact range grammar (whole-string decimal, optional
+ * sign, int64 bounds — `Number.parseInt`'s prefix tolerance would serve
+ * "12abc"/"0x10" ranges Go rejects), the ASCII-space trims of
+ * textproto.TrimString, the If-Range method gate (fs.go:585-587), and the
+ * error-path header surgery — serveError (fs.go:188-211) DELETES
+ * Cache-Control/Content-Encoding/Etag/Last-Modified before http.Error
+ * (server.go:2337-2357) resets Content-Type/Content-Length/nosniff (the
+ * GODEBUG=httpservecontentkeepheaders default; gitea's build sets no
+ * override, and writeNotModified, fs.go:627-642, also drops
+ * Content-Encoding). Accept-Ranges: bytes lands AFTER the range switch
+ * (fs.go:396) — 200/206 only, never on the 304/412/416 error arms.
  *
- * The date validation mirrors the shared module's Go time.Parse port
+ * The date validation is the shared module's Go time.Parse port
  * (parseHttpTimeFormat — strict IMF-fixdate, range-checked: "31 Feb 2024"
- * errors where JS `Date.parse` silently rolls over into March). It is a
- * LOCAL MIRROR only because the shared module does not export that helper
- * yet — the export hunk is reported to the orchestrator; once it lands this
- * helper folds to the import (the two tables are byte-identical decisions).
+ * errors where JS `Date.parse` silently rolls over into March), imported from
+ * the shared serve pipeline — one parser for both consumers (the former local
+ * mirror's code was byte-identical; only its doc prose differed).
  */
 
-import { encodeContentDisposition, goPathBase, serveSetHeaders } from "../../web/attachments-serving";
+import { parseHttpTimeFormat, serveSetHeaders } from "../../web/attachments-serving";
 
 // ---------------------------------------------------------------------------
 // ServeSetHeaders — the shared pipeline's header set (serve.go:56-105 +
@@ -65,8 +89,12 @@ export interface ServeFileHeaderOptions {
    *  (serve.go:58) inside the shared table. */
   contentType?: string;
   size: number;
-  /** The file row's creation time → Last-Modified. */
-  created: Date;
+  /** The file row's creation time → Last-Modified. ABSENT = upstream's zero
+   *  ServeHeaderOptions.LastModified (the repository-key arms, the chef .priv
+   *  download): no Last-Modified header, the If-(Un)Modified-Since checks
+   *  inert (Go isZeroTime — the zero time and Unix epoch both), and a
+   *  date-form If-Range never matches. */
+  created?: Date;
 }
 
 /**
@@ -77,67 +105,16 @@ export interface ServeFileHeaderOptions {
  * the `Access-Control-Expose-Headers` echo, the zero-duration Cache-Control
  * prod posture (`max-age=0, private, must-revalidate`, httpcache.go:31-35 —
  * packages never set IsPublic or a MaxAge), Content-Length, and Last-Modified
- * from the file row.
+ * from the file row (skipped when `created` is absent — setLastModified's
+ * isZeroTime arm).
  */
 export function serveFileHeaderSet(opts: ServeFileHeaderOptions): Record<string, string> {
   return serveSetHeaders({
     filename: opts.filename,
     contentType: opts.contentType,
     contentLength: opts.size,
-    lastModified: opts.created,
+    lastModified: opts.created ?? null,
   });
-}
-
-// ---------------------------------------------------------------------------
-// The strict HTTP-date validation — the local mirror of the shared module's
-// Go time.Parse port (fold to the import once parseHttpTimeFormat is
-// exported; see the module note)
-// ---------------------------------------------------------------------------
-
-/** Strict IMF-fixdate (Go's http.TimeFormat layout) — other legal HTTP date
- *  spellings fail time.Parse upstream and must fail here too. */
-const IMF_FIXDATE_RE = /^([A-Z][a-z]{2}), (\d{2}) ([A-Z][a-z]{2}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
-const SHORT_MONTHS: Record<string, number> = {
-  Jan: 0,
-  Feb: 1,
-  Mar: 2,
-  Apr: 3,
-  May: 4,
-  Jun: 5,
-  Jul: 6,
-  Aug: 7,
-  Sep: 8,
-  Oct: 9,
-  Nov: 10,
-  Dec: 11,
-};
-const SHORT_DAYS = new Set(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]);
-
-/**
- * Go time.Parse(http.TimeFormat, …) — the fixdate shape AND Go's range
- * validation: the weekday one of the seven shorts, the month a real short
- * name, the day in range for that month (leap years included — "31 Feb 2024"
- * errors upstream, where JS Date.parse would silently roll over), hour ≤ 23,
- * minute/second ≤ 59. Returns epoch ms.
- */
-function parseHttpTimeFormat(value: string): number | null {
-  const match = IMF_FIXDATE_RE.exec(value);
-  if (match === null) return null;
-  const dayName = match[1] ?? "";
-  const month = SHORT_MONTHS[match[3] ?? ""];
-  if (!SHORT_DAYS.has(dayName) || month === undefined) return null;
-  const day = Number(match[2]);
-  const year = Number(match[4]);
-  const hour = Number(match[5]);
-  const minute = Number(match[6]);
-  const second = Number(match[7]);
-  if (hour > 23 || minute > 59 || second > 59 || day < 1) return null;
-  if (day > new Date(Date.UTC(year, month + 1, 0)).getUTCDate()) return null;
-  // Date.UTC maps years 0-99 onto 1900+y — setUTCFullYear keeps them literal.
-  const date = new Date(0);
-  date.setUTCFullYear(year, month, day);
-  date.setUTCHours(hour, minute, second, 0);
-  return date.getTime();
 }
 
 // ---------------------------------------------------------------------------
@@ -189,43 +166,82 @@ interface ByteRange {
   length: number;
 }
 
+/** textproto.TrimString (textproto.go:127-136): ASCII space only — SP, TAB,
+ *  LF, VT, FF, CR. JS String.trim's Unicode set is wider and would accept
+ *  spec forms Go rejects. */
+function trimAsciiSpace(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && " \t\n\v\f\r".includes(text.charAt(start))) start++;
+  while (end > start && " \t\n\v\f\r".includes(text.charAt(end - 1))) end--;
+  return text.slice(start, end);
+}
+
+/**
+ * strconv.ParseInt(text, 10, 64) — whole-string decimal, optional +/- sign,
+ * int64 bounds (`[-2^63, 2^63-1]`, out-of-range is an error like any other
+ * invalid form). `Number.parseInt` is prefix-tolerant ("12abc" → 12, "0x10"
+ * → 0, "1e3" → 1000) and would serve byte-ranges Go answers 416 to; the
+ * result rides BigInt so the int64 magnitudes a real size never reaches
+ * (hence exactness never matters downstream) still pass the range check like
+ * Go's.
+ */
+function parseGoInt64(text: string): bigint | null {
+  const match = /^[+-]?[0-9]+$/.exec(text);
+  if (match === null) return null;
+  const value = BigInt(text);
+  if (value > 2n ** 63n - 1n || value < -(2n ** 63n)) return null;
+  return value;
+}
+
 /** `parseRange` (net/http/fs.go) reduced to the single-range shape (the
  *  multi-range multipart answer is the documented divergence — the caller
- *  falls back to the full 200). */
+ *  falls back to the full 200). Each arm carries fs.go's cite; the integer
+ *  grammar is ParseInt-exact (the helper above), the trims are
+ *  textproto.TrimString-exact. */
 function parseSingleRange(header: string, size: number): ByteRange[] | "invalid" | "no-overlap" {
   const prefix = "bytes=";
   if (!header.startsWith(prefix)) return "invalid";
   const ranges: ByteRange[] = [];
   let noOverlap = false;
   for (const segment of header.slice(prefix.length).split(",")) {
-    const raw = segment.trim();
+    const raw = trimAsciiSpace(segment);
     if (raw === "") continue;
+    // strings.Cut at the FIRST dash: a second dash rides into endText and
+    // fails the integer parse ("5-10-15" is invalid, never a nested range).
     const dash = raw.indexOf("-");
     if (dash < 0) return "invalid";
-    const startText = raw.slice(0, dash).trim();
-    const endText = raw.slice(dash + 1).trim();
+    const startText = trimAsciiSpace(raw.slice(0, dash));
+    const endText = trimAsciiSpace(raw.slice(dash + 1));
     if (startText === "") {
-      // Suffix form `bytes=-N`: the last N bytes (clamped at the size).
-      if (endText === "" || endText[0] === "-") return "invalid";
-      const suffix = Number.parseInt(endText, 10);
-      if (!Number.isSafeInteger(suffix) || suffix < 0) return "invalid";
-      const clamped = Math.min(suffix, size);
-      ranges.push({ start: size - clamped, length: size - (size - clamped) });
-      continue;
-    }
-    const start = Number.parseInt(startText, 10);
-    if (Number.isNaN(start) || !Number.isSafeInteger(start) || start < 0) return "invalid";
-    if (start >= size) {
-      noOverlap = true;
-      continue;
-    }
-    if (endText === "") {
+      // Suffix form `bytes=-N`: the last N bytes, clamped at the size — the
+      // explicit `end[0] == '-'` gate fires before the parse (fs.go:1043-1046).
+      if (endText === "" || endText.charAt(0) === "-") return "invalid";
+      const suffix = parseGoInt64(endText);
+      if (suffix === null || suffix < 0n) return "invalid";
+      const clamped = suffix > size ? BigInt(size) : suffix;
+      const start = size - Number(clamped);
       ranges.push({ start, length: size - start });
       continue;
     }
-    const end = Number.parseInt(endText, 10);
-    if (Number.isNaN(end) || !Number.isSafeInteger(end) || start > end) return "invalid";
-    ranges.push({ start, length: Math.min(end, size - 1) - start + 1 });
+    const startValue = parseGoInt64(startText);
+    if (startValue === null || startValue < 0n) return "invalid";
+    if (startValue >= size) {
+      // The range begins after the size of the content — no overlap.
+      noOverlap = true;
+      continue;
+    }
+    // `startValue < size` (≤ MAX_SAFE_INTEGER in practice) — exact as a number.
+    const start = Number(startValue);
+    if (endText === "") {
+      // No end: the range extends to the end of the file.
+      ranges.push({ start, length: size - start });
+      continue;
+    }
+    const endValue = parseGoInt64(endText);
+    if (endValue === null || start > endValue) return "invalid";
+    const clampedEnd = endValue >= size ? BigInt(size - 1) : endValue;
+    ranges.push({ start, length: Number(clampedEnd) - start + 1 });
   }
   if (noOverlap && ranges.length === 0) return "no-overlap";
   return ranges;
@@ -238,17 +254,25 @@ function parseSingleRange(header: string, size: number): ByteRange[] | "invalid"
  * (whose presence SUPPRESSES If-Modified-Since — including an EMPTY-valued
  * If-None-Match, which `Header.Get` reports as "" and therefore still
  * consults If-Modified-Since, exactly like the shared module's gate), then
- * If-Range gating the Range header. Second-truncation of the modtime mirrors
- * Go's `modtime.Truncate(time.Second)`; the date validation is Go
- * time.Parse-exact (the strict fixdate parser above — a rolled "31 Feb" must
- * not 304/412 where Go serves 200).
+ * If-Range gating the Range header (GET/HEAD only — fs.go:585-587; any other
+ * method honors the Range regardless). Second-truncation of the modtime
+ * mirrors Go's `modtime.Truncate(time.Second)`; the date validation is Go
+ * time.Parse-exact (the shared module's strict fixdate parser,
+ * parseHttpTimeFormat — a rolled "31 Feb" must not 304/412 where Go serves
+ * 200). `created` absent = the zero modtime: If-Unmodified-Since /
+ * If-Modified-Since go condNone (fs.go's isZeroTime covers the zero time AND
+ * the Unix epoch) and a date-form If-Range never matches (fs.go:601-603
+ * checks the STRICT IsZero — an epoch-zero modtime still compares).
  */
-export function planByteServing(request: Request, size: number, created: Date): ByteServingPlan {
+export function planByteServing(request: Request, size: number, created?: Date): ByteServingPlan {
   const method = request.method;
   const isGetOrHead = method === "GET" || method === "HEAD";
   const headers = request.headers;
   // Last-Modified truncates sub-second precision; compare in whole seconds.
-  const modSec = Math.floor(created.getTime() / 1000);
+  // `null` = Go's zero time (the created-less arms). The If-(Un)Modified-Since
+  // arms additionally treat epoch zero as unspecified (isZeroTime,
+  // fs.go:618-621 — the zero time AND the Unix epoch).
+  const modSec = created === undefined ? null : Math.floor(created.getTime() / 1000);
 
   // 1. If-Match; If-Unmodified-Since only when If-Match is absent.
   const ifMatch = headers.get("If-Match") ?? "";
@@ -256,7 +280,7 @@ export function planByteServing(request: Request, size: number, created: Date): 
     if (!etagListMatches(ifMatch)) return { kind: "precondition-failed" };
   } else {
     const ifUnmodifiedSince = headers.get("If-Unmodified-Since") ?? "";
-    if (ifUnmodifiedSince !== "") {
+    if (ifUnmodifiedSince !== "" && modSec !== null && modSec !== 0) {
       const date = parseHttpTimeFormat(ifUnmodifiedSince);
       if (date !== null && modSec > Math.floor(date / 1000)) return { kind: "precondition-failed" };
     }
@@ -270,20 +294,22 @@ export function planByteServing(request: Request, size: number, created: Date): 
     }
   } else if (isGetOrHead) {
     const ifModifiedSince = headers.get("If-Modified-Since") ?? "";
-    if (ifModifiedSince !== "") {
+    if (ifModifiedSince !== "" && modSec !== null && modSec !== 0) {
       const date = parseHttpTimeFormat(ifModifiedSince);
       if (date !== null && modSec <= Math.floor(date / 1000)) return { kind: "not-modified" };
     }
   }
 
   // 3. Range, gated by If-Range (an ETag-shaped If-Range never matches our
-  //    ETag-less files; a date If-Range matches on whole seconds).
+  //    ETag-less files; a date If-Range matches on whole seconds; the strict
+  //    zero modtime never matches — fs.go:601-603; non-GET/HEAD skips the
+  //    gate entirely — fs.go:585-587).
   let rangeHeader = headers.get("Range") ?? "";
-  if (rangeHeader !== "") {
+  if (rangeHeader !== "" && isGetOrHead) {
     const ifRange = headers.get("If-Range") ?? "";
     if (ifRange !== "") {
       const asEtag = scanEtag(ifRange);
-      const date = asEtag === null ? parseHttpTimeFormat(ifRange) : null;
+      const date = asEtag === null && modSec !== null ? parseHttpTimeFormat(ifRange) : null;
       if (asEtag !== null || date === null || Math.floor(date / 1000) !== modSec) rangeHeader = "";
     }
   }
@@ -382,10 +408,13 @@ export function servePackageFileResponse(
   const plan = planByteServing(request, opts.size, opts.created);
 
   if (plan.kind === "not-modified") {
-    // writeNotModified (fs.go): drop the representation headers, keep the rest.
+    // writeNotModified (fs.go:627-642): drop the representation headers
+    // (Content-Type, Content-Length, Content-Encoding), keep the rest —
+    // Last-Modified survives (no ETag on files).
     const notModified = new Headers(headers);
     notModified.delete("content-type");
     notModified.delete("content-length");
+    notModified.delete("content-encoding");
     return new Response(null, { status: 304, headers: notModified });
   }
   if (plan.kind === "precondition-failed") {
@@ -393,10 +422,17 @@ export function servePackageFileResponse(
     return new Response(null, { status: 412, headers: new Headers(headers) });
   }
   if (plan.kind === "range-unsatisfiable") {
-    // serveError → http.Error (server.go): CL deleted, CT reset, nosniff,
-    // `message\n` body; the earlier headers (Cache-Control, disposition,
-    // Last-Modified, the `bytes */size` Content-Range) stand.
+    // serveError (fs.go:188-211) THEN http.Error (server.go:2337-2357): the
+    // success-oriented Cache-Control/Content-Encoding/Etag/Last-Modified are
+    // deleted first (the GODEBUG=httpservecontentkeepheaders default — gitea's
+    // go 1.27 build sets no override), then CL deleted, CT reset, nosniff and
+    // the `message\n` body. The CSP, the disposition and the `bytes */size`
+    // Content-Range survive (in neither delete list).
     const unsatisfiable = new Headers(headers);
+    unsatisfiable.delete("cache-control");
+    unsatisfiable.delete("content-encoding");
+    unsatisfiable.delete("etag");
+    unsatisfiable.delete("last-modified");
     unsatisfiable.delete("content-length");
     unsatisfiable.set("content-type", "text/plain; charset=utf-8");
     unsatisfiable.set("x-content-type-options", "nosniff");
@@ -424,13 +460,8 @@ export function servePackageFileResponse(
 }
 
 // ---------------------------------------------------------------------------
-// Re-exports for the packages route files' DIRECT disposition sites (the
-// debian/alpine/rpm repository-key arms build bare two-header responses where
-// upstream rides ctx.ServeContent — the consolidation keeps their wire shape
-// but routes the encoding through the shared table, so a bare-key download
-// cannot drift from the family again). The canonical seam is the direct
-// import (archive.ts / actions-artifacts.ts precedent); this re-export keeps
-// the packages routes' single import line.
+// (The former re-export block for the routes' direct disposition sites is
+// gone: the debian/alpine/rpm/arch repository-key arms and the chef .priv
+// download now ride servePackageFileResponse themselves — upstream's
+// ctx.ServeContent — so no direct disposition site remains to share it.)
 // ---------------------------------------------------------------------------
-
-export { encodeContentDisposition, goPathBase };

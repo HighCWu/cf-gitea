@@ -170,6 +170,21 @@ describe("serveFileHeaderSet", () => {
       serveFileHeaderSet({ filename: "a/b/kit-1.0.tgz", size: 1, created: CREATED })["Content-Disposition"],
     ).toBe("attachment; filename=kit-1.0.tgz");
   });
+
+  it("omits Last-Modified when no created rides (the key arms' zero-modtime posture)", () => {
+    // The debian.go:38-41 / alpine.go:57-60 / rpm.go:62-65 / arch.go:38-40
+    // key arms, the chef .priv download and rubygems' SetServeHeaders pair
+    // pass no LastModified — setLastModified's isZeroTime skips the header.
+    const headers = serveFileHeaderSet({
+      filename: "repository.key",
+      contentType: "application/pgp-keys",
+      size: 5,
+    });
+    expect(headers["Last-Modified"]).toBeUndefined();
+    expect(headers["Content-Type"]).toBe("application/pgp-keys");
+    expect(headers["Cache-Control"]).toBe("max-age=0, private, must-revalidate");
+    expect(headers["Content-Length"]).toBe("5");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -328,6 +343,132 @@ describe("planByteServing", () => {
       planByteServing(request({ Range: "bytes=2-", "If-Range": "Wed, 28 Oct 2026 00:00:00 GMT" }), 10, CREATED),
     ).toEqual(serve);
     expect(planByteServing(request({ Range: "bytes=2-", "If-Range": `"somewhere"` }), 10, CREATED)).toEqual(serve);
+    // The gate itself is GET/HEAD-only (fs.go:585-587): any other method
+    // honors the Range regardless of a mismatched If-Range.
+    expect(planByteServing(request({ Range: "bytes=2-", "If-Range": `"somewhere"` }, "POST"), 10, CREATED)).toEqual({
+      kind: "serve",
+      status: 206,
+      start: 2,
+      length: 8,
+      contentRange: "bytes 2-9/10",
+    });
+    // HEAD is still gated (GET || HEAD pass the method check).
+    expect(planByteServing(request({ Range: "bytes=2-", "If-Range": `"somewhere"` }, "HEAD"), 10, CREATED)).toEqual(
+      serve,
+    );
+  });
+
+  // -- the zero-modtime posture (created-less arms: the key downloads) -----
+
+  it("an absent created makes If-(Un)Modified-Since inert (isZeroTime) while * still 304s", () => {
+    // fs.go:618-621 — the zero modtime is "unspecified": the date checks go
+    // condNone even for a stale/valid date; If-None-Match: * is
+    // ETag-independent and still not-modifies.
+    expect(planByteServing(request({ "If-Modified-Since": "Wed, 28 Oct 2026 00:00:00 GMT" }), 10)).toEqual(serve);
+    expect(planByteServing(request({ "If-Modified-Since": "Fri, 30 Oct 2026 00:00:00 GMT" }), 10)).toEqual(serve);
+    expect(planByteServing(request({ "If-Unmodified-Since": "Wed, 28 Oct 2026 00:00:00 GMT" }), 10)).toEqual(serve);
+    expect(planByteServing(request({ "If-None-Match": "*" }), 10)).toEqual({ kind: "not-modified" });
+    // A date-form If-Range never matches the strict zero (fs.go:601-603) —
+    // the Range drops; Range alone still 206s.
+    expect(planByteServing(request({ Range: "bytes=2-", "If-Range": CREATED_RFC1123 }), 10)).toEqual(serve);
+    expect(planByteServing(request({ Range: "bytes=2-" }), 10)).toEqual({
+      kind: "serve",
+      status: 206,
+      start: 2,
+      length: 8,
+      contentRange: "bytes 2-9/10",
+    });
+  });
+
+  it("an epoch-zero created behaves like the unspecified time for IMS/IUS but compares in If-Range", () => {
+    // isZeroTime covers Unix epoch 0 for setLastModified/IMS/IUS
+    // (fs.go:618-621), while checkIfRange tests the STRICT IsZero
+    // (fs.go:601-603) — an epoch-zero modtime still compares there.
+    const epoch = new Date(0);
+    expect(planByteServing(request({ "If-Modified-Since": "Fri, 30 Oct 2026 00:00:00 GMT" }), 10, epoch)).toEqual(
+      serve,
+    );
+    expect(planByteServing(request({ "If-Unmodified-Since": "Wed, 28 Oct 2026 00:00:00 GMT" }), 10, epoch)).toEqual(
+      serve,
+    );
+    expect(planByteServing(request({ Range: "bytes=2-", "If-Range": "Thu, 01 Jan 1970 00:00:00 GMT" }), 10, epoch)).toEqual({
+      kind: "serve",
+      status: 206,
+      start: 2,
+      length: 8,
+      contentRange: "bytes 2-9/10",
+    });
+    expect(planByteServing(request({ Range: "bytes=2-", "If-Range": "Fri, 02 Jan 1970 00:00:00 GMT" }), 10, epoch)).toEqual(
+      serve,
+    );
+  });
+
+  // -- the strconv.ParseInt-exact range grammar -----------------------------
+
+  it("byte-ranges are ParseInt-exact — trailing junk, hex, float and double-dash forms are 416s", () => {
+    // Number.parseInt's prefix tolerance would serve these; Go ParseInt
+    // consumes the WHOLE string and errors.
+    for (const range of ["bytes=2-5junk", "bytes=0x2-5", "bytes=2-0x5", "bytes=1e2-", "bytes=+2--5", "bytes=2-10-15"]) {
+      expect(planByteServing(request({ Range: range }), 10, CREATED)).toEqual({
+        kind: "range-unsatisfiable",
+        contentRange: null,
+        message: "invalid range",
+      });
+    }
+    // The optional sign is VALID grammar (strconv.ParseInt("+2") = 2).
+    expect(planByteServing(request({ Range: "bytes=+2-5" }), 10, CREATED)).toEqual({
+      kind: "serve",
+      status: 206,
+      start: 2,
+      length: 4,
+      contentRange: "bytes 2-5/10",
+    });
+    // textproto.TrimString is ASCII-space only — an NBSP is grammar garbage
+    // (JS String.trim would have trimmed it into a serving range).
+    expect(planByteServing(request({ Range: "bytes=\u00A02-5" }), 10, CREATED)).toEqual({
+      kind: "range-unsatisfiable",
+      contentRange: null,
+      message: "invalid range",
+    });
+    expect(planByteServing(request({ Range: "bytes= 2-5 " }), 10, CREATED)).toEqual({
+      kind: "serve",
+      status: 206,
+      start: 2,
+      length: 4,
+      contentRange: "bytes 2-5/10",
+    });
+  });
+
+  it("int64 bounds follow ParseInt, not Number safety — out-of-int64 is invalid, beyond-2^53 no-overlaps", () => {
+    // Beyond int64: ParseInt errors → the bare invalid 416 (no Content-Range).
+    expect(planByteServing(request({ Range: "bytes=9223372036854775808-" }), 10, CREATED)).toEqual({
+      kind: "range-unsatisfiable",
+      contentRange: null,
+      message: "invalid range",
+    });
+    // Between 2^53 and 2^63: ParseInt succeeds → start >= size → the
+    // no-overlap 416 WITH `bytes */size` (the former isSafeInteger gate
+    // answered the wrong shape here).
+    expect(planByteServing(request({ Range: "bytes=9007199254740993-" }), 10, CREATED)).toEqual({
+      kind: "range-unsatisfiable",
+      contentRange: "bytes */10",
+      message: "invalid range: failed to overlap",
+    });
+    // A suffix beyond 2^53 but inside int64 clamps to the whole file (the
+    // former gate 416'd it).
+    expect(planByteServing(request({ Range: "bytes=-9007199254740993" }), 10, CREATED)).toEqual({
+      kind: "serve",
+      status: 206,
+      start: 0,
+      length: 10,
+      contentRange: "bytes 0-9/10",
+    });
+    // A suffix beyond int64 is invalid.
+    expect(planByteServing(request({ Range: "bytes=-9223372036854775809" }), 10, CREATED)).toEqual({
+      kind: "range-unsatisfiable",
+      contentRange: null,
+      message: "invalid range",
+    });
   });
 });
 
@@ -387,15 +528,59 @@ describe("servePackageFileResponse", () => {
     expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
   });
 
-  it("416 resets the error shape per http.Error and keeps Content-Range + metadata", async () => {
+  it("416 runs serveError's header surgery then http.Error — metadata deleted, disposition/CSP/Content-Range kept", async () => {
+    // serveError (fs.go:188-211, the GODEBUG=httpservecontentkeepheaders
+    // default; gitea builds go 1.27 with no override) deletes the
+    // success-oriented Cache-Control/Content-Encoding/Etag/Last-Modified;
+    // http.Error (server.go:2337-2357) then deletes Content-Length, resets
+    // Content-Type and nosniff. The CSP, the disposition and the
+    // `bytes */size` Content-Range are in neither delete list and survive;
+    // Accept-Ranges never lands (fs.go:396 is after the error return).
     const res = servePackageFileResponse(request({ Range: "bytes=50-" }), streamOf(["hello world"]), opts);
     expect(res.status).toBe(416);
     expect(res.headers.get("content-range")).toBe("bytes */11");
     expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
     expect(res.headers.get("content-length")).toBeNull();
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
-    expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(res.headers.get("cache-control")).toBeNull();
+    expect(res.headers.get("last-modified")).toBeNull();
+    expect(res.headers.get("content-disposition")).toBe("attachment; filename=test.txt");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(res.headers.get("accept-ranges")).toBeNull();
     expect(await res.text()).toBe("invalid range: failed to overlap\n");
+
+    // The bare invalid-range 416 (no Content-Range to keep) carries the same
+    // error shape.
+    const garbage = servePackageFileResponse(request({ Range: "zap=1-2" }), streamOf(["hello world"]), opts);
+    expect(garbage.status).toBe(416);
+    expect(garbage.headers.get("content-range")).toBeNull();
+    expect(garbage.headers.get("cache-control")).toBeNull();
+    expect(await garbage.text()).toBe("invalid range\n");
+  });
+
+  it("a created-less download (the key arms' shape) serves the full set with NO Last-Modified", () => {
+    const keyRes = servePackageFileResponse(request(), streamOf(["-----KEY-----"]), {
+      filename: "repository.key",
+      contentType: "application/pgp-keys",
+      size: 11,
+    });
+    expect(keyRes.status).toBe(200);
+    expect(keyRes.headers.get("content-type")).toBe("application/pgp-keys");
+    expect(keyRes.headers.get("content-disposition")).toBe("attachment; filename=repository.key");
+    expect(keyRes.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(keyRes.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(keyRes.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(keyRes.headers.get("accept-ranges")).toBe("bytes");
+    expect(keyRes.headers.get("content-length")).toBe("11");
+    // The zero-modtime arm: no Last-Modified, and a stale If-Modified-Since
+    // cannot 304 (the date checks are inert).
+    expect(keyRes.headers.get("last-modified")).toBeNull();
+    const stale = servePackageFileResponse(request({ "If-Modified-Since": "Sat, 01 Jan 2050 00:00:00 GMT" }), null, {
+      filename: "repository.key",
+      contentType: "application/pgp-keys",
+      size: 11,
+    });
+    expect(stale.status).toBe(200);
   });
 
   it("206 slices the body and answers HEAD with the status alone", async () => {

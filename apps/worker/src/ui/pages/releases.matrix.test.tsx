@@ -77,6 +77,7 @@ import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "..
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import type { RepoRow } from "../ui-context";
+import { attachmentsServingRouter } from "../../web/attachments-serving";
 
 // --- the minted-session route harness (the notifications 28b71b9 pattern) --------
 
@@ -103,6 +104,16 @@ const routeEnv: RouteEnv = {
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   const context = createExecutionContext();
   const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** The LIVE surface for the `/releases/attachments/{uuid}` shape (the seam
+ *  fold): the repo-scoped twin arm on attachmentsServingRouter, same env +
+ *  context discipline as fetchUi. */
+async function fetchSeam(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await attachmentsServingRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
   await waitOnExecutionContext(context);
   return response;
 }
@@ -790,21 +801,27 @@ describe("the query-param flash and the attachment route gates", () => {
     const attachmentPath = `/relmx-owner/rel/releases/attachments/${asset.uuid}`;
     const downloadPath = "/relmx-owner/rel/releases/download/v1/notes.txt";
 
-    // Baseline: both tails serve over the real R2 object.
-    const served = await fetchUi(attachmentPath, { headers: { cookie: ownerCookie } });
+    // Baseline: both tails serve over the real R2 object. MOVED PIN (the
+    // seam fold): the attachment shape answers at attachmentsServingRouter
+    // now (its shared serve pipeline; the bytes are identical) — the ui
+    // twin's shadowed registration is gone; the download shape stays
+    // uiRouter.
+    const served = await fetchSeam(attachmentPath, { headers: { cookie: ownerCookie } });
     expect(served.status).toBe(200);
     expect(await served.text()).toBe("relmx asset body\n");
     expect((await fetchUi(downloadPath)).status).toBe(200);
 
-    // The unit gate (releasesReadGate's hasReleases arm) shells both.
+    // The unit gate shells both: ui's releasesReadGate on the download arm,
+    // the seam's canReadReleasesUnit twin on the attachment arm — the same
+    // hasReleases setting, the same verdict.
     await saveRepoSettings(env.DB, repo.id, { hasReleases: false }, at(110));
-    expect((await fetchUi(attachmentPath)).status).toBe(404);
+    expect((await fetchSeam(attachmentPath)).status).toBe(404);
     expect((await fetchUi(downloadPath)).status).toBe(404);
 
     // Restoring the unit restores the serves (the gate, not the rows, was
     // refusing).
     await saveRepoSettings(env.DB, repo.id, { hasReleases: true }, at(111));
-    expect((await fetchUi(attachmentPath)).status).toBe(200);
+    expect((await fetchSeam(attachmentPath)).status).toBe(200);
     expect((await fetchUi(downloadPath)).status).toBe(200);
   });
 });

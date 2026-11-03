@@ -37,13 +37,15 @@
  *     `content-security-policy` (serve.go:56-75 — not pdf/audio/video),
  *     `content-disposition: attachment; filename=…` (ContentDisposition
  *     zero → attachment, serve.go:91; path.Base + mime encoding over the
- *     shared encodeContentDisposition port), the
- *     `access-control-expose-headers` echo (serve.go:93), `cache-control:
- *     max-age=0, private, must-revalidate` (httpcache.go:31-35 — zero
- *     MaxAge, not public), NO `last-modified` (upstream passes no
+ *     shared table), the `access-control-expose-headers` echo (serve.go:93),
+ *     `cache-control: max-age=0, private, must-revalidate` (httpcache.go:31-35
+ *     — zero MaxAge, not public), NO `last-modified` (upstream passes no
  *     LastModified — the zero time skips serve.go:101-104), and
  *     `accept-ranges: bytes` + `content-length` from http.ServeContent's
- *     seekable-reader walk.
+ *     seekable-reader walk. The download composes through
+ *     services/packages/serve-content.ts's servePackageFileResponse — the
+ *     same seam as the API key arms — so the 304/206/412/416 arms ride the
+ *     request too (no hand-carried header literals left).
  *   - The SECTION (packages.tmpl:6-21 — the user frame's
  *     `user-setting-content`, after the cleanup_rules/list + cargo
  *     templates): an `h4.ui.top.attached.header` carrying
@@ -133,7 +135,7 @@
  * route harness).
  */
 
-import { encodeContentDisposition, goPathBase } from "../../services/packages/serve-content";
+import { servePackageFileResponse } from "../../services/packages/serve-content";
 import {
   generateChefKeyPair,
   getChefPublicPem,
@@ -202,37 +204,29 @@ export async function regenerateChefKeypair(d1: D1Database, userId: number): Pro
 /**
  * ServeContent(strings.NewReader(priv), {ContentType:
  * "application/x-pem-file", Filename: ctx.Doer.Name + ".priv"})
- * (setting/packages.go:113-118 → base.go:178-181): ServeSetHeaders'
- * content block + the attachment disposition + the zero-MaxAge private
- * cache posture (each line's cite inline), then net/http ServeContent's
- * seekable-reader `accept-ranges` + `content-length`. NO last-modified —
- * upstream passes no LastModified (serve.go:101's zero-time skip). The
- * body is the PRIVATE PEM verbatim, generated fresh, persisted nowhere.
+ * (setting/packages.go:113-118 → base.go:178-181) through the shared
+ * serve-content seam: the created-less zero-modtime arm — the full
+ * ServeSetHeaders set (nosniff, the sandbox CSP, the attachment disposition
+ * over path.Base, the expose-headers echo, the zero-MaxAge private cache
+ * posture, content-length) with NO Last-Modified, plus net/http
+ * ServeContent's `accept-ranges` and the 304/206/412/416 arms riding the
+ * request (upstream's handler runs the same machinery over the POST
+ * download). The body is the PRIVATE PEM verbatim, generated fresh,
+ * persisted nowhere. `request` is the mounted handler's c.req.raw; the
+ * default (a bare headerless GET) keeps the two-arg call sites byte-shape
+ * identical while the caller hunk lands (index.ts passes c.req.raw).
  */
-export function chefKeypairDownloadResponse(username: string, privatePem: string): Response {
+export function chefKeypairDownloadResponse(username: string, privatePem: string, request?: Request): Response {
   const body = new TextEncoder().encode(privatePem);
-  return new Response(body, {
-    status: 200,
-    headers: {
-      // serveSetHeaderContentRelated (serve.go:56-75 — the non-pdf,
-      // non-audio/video CSP default).
-      "content-type": "application/x-pem-file",
-      "x-content-type-options": "nosniff",
-      "content-security-policy": "sandbox allow-scripts allow-modals allow-popups allow-downloads",
-      // ServeSetHeaders' filename arm (serve.go:90-93): ContentDisposition
-      // zero → attachment; path.Base + the mime encoding ride the shared
-      // encodeContentDisposition port (the Go-oracle-verified shape).
-      "content-disposition": encodeContentDisposition("attachment", goPathBase(`${username}.priv`)),
-      "access-control-expose-headers": "Content-Disposition",
-      // SetCacheControlInHeader (httpcache.go:31-35): CacheDuration zero,
-      // IsPublic false — the prod posture.
-      "cache-control": "max-age=0, private, must-revalidate",
-      // http.ServeContent (base.go:178-181's second step — the seekable
-      // reader advertises the byte range posture).
-      "accept-ranges": "bytes",
-      "content-length": String(body.byteLength),
+  return servePackageFileResponse(
+    request ?? new Request("https://localhost/", { method: "GET" }),
+    new Response(body).body,
+    {
+      filename: `${username}.priv`,
+      contentType: "application/x-pem-file",
+      size: body.byteLength,
     },
-  });
+  );
 }
 
 // ---------------------------------------------------------------------------

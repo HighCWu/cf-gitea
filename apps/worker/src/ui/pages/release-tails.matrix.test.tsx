@@ -19,9 +19,11 @@
  *     — parser-unclaimed per wave20:310, so the request engine-404s; the
  *     anonymous probe 404s too, never 303ing onto login) and POST
  *     /releases/attachments + /releases/attachments/remove (web.go:1522-1524
- *     — the URL shape lands in the wave-41 GET serve family as the plain
- *     uuid "remove", but the registration is GET-only, index.ts:10005, so
- *     the POSTs 404 at the sub-app with the rows untouched);
+ *     — no ui registration carries the shape at all since the GET
+ *     consolidated onto the shared attachments-serving seam, so the POSTs
+ *     404 at the sub-app with the rows untouched); the GET shape of the
+ *     path answers at the SEAM now — those pins drive
+ *     attachmentsServingRouter below (the fold disclosure lives there);
  *   - the claim pins nobody carries: the compare dotted download feeds
  *     (`/compare/{range}.diff|.patch` — index.ts:3176-3181's compare-feed
  *     family; wave13 pins the PAGE shapes only, compare.matrix declines the
@@ -58,6 +60,7 @@ import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "..
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import type { RepoRow } from "../ui-context";
+import { attachmentsServingRouter } from "../../web/attachments-serving";
 
 // --- the minted-session route harness (the releases-matrix abd7130 pattern) ------
 
@@ -84,6 +87,16 @@ const routeEnv: RouteEnv = {
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   const context = createExecutionContext();
   const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** The LIVE surface for the `/releases/attachments/{uuid}` shape (the seam
+ *  fold): the repo-scoped twin arm on attachmentsServingRouter, same env +
+ *  context discipline as fetchUi. */
+async function fetchSeam(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await attachmentsServingRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
   await waitOnExecutionContext(context);
   return response;
 }
@@ -262,17 +275,16 @@ describe("the unpinned claim pins (compare dotted feeds + the attachments/remove
     expect(handlesUiRoute("/octo/hello/compare/main...feature/x.patch")).toBe(true);
   });
 
-  it("parses the attachments/remove literal into the wave-41 GET serve family (the unmount is method-level)", () => {
-    // The write tail's URL shape is a chi single-segment param like any other
-    // uuid (web.go:1513's shape): the PARSER claims it as the attachment
-    // family — the unmounted write tail diverges at the METHOD level (the
-    // GET-only registration below pins the end-to-end).
-    expect(parseUiRoute("/octo/hello/releases/attachments/remove")).toEqual({
-      family: "release-attachment",
-      owner: "octo",
-      repo: "hello",
-      uuid: "remove",
-    });
+  it("leaves the attachments/remove literal to the shared seam (the fold: parseUiRoute disowns the shape)", () => {
+    // THE SEAM FOLD (the dead-twin consolidation): the whole
+    // `/releases/attachments/{uuid}` GET family — the literal "remove"
+    // segment included — moved off the ui parser onto the shared
+    // attachments-serving seam (web/attachments-serving.ts's repo-scoped
+    // twin). parseUiRoute now returns null for every segment; the GET on the
+    // live wire is the seam's plain-uuid lookup (404 for "remove", pinned on
+    // the seam below) and the POST write tail stays unmounted.
+    expect(parseUiRoute("/octo/hello/releases/attachments/remove")).toBeNull();
+    expect(handlesUiRoute("/octo/hello/releases/attachments/remove")).toBe(false);
   });
 });
 
@@ -345,7 +357,7 @@ describe("the unmounted write tails (web.go:1521-1524 — the dead-link divergen
     expect((await drizzle(env.DB).select({ id: releases.id }).from(releases).all()).length).toBe(1);
   });
 
-  it("404s the attachment upload/remove POSTs at the sub-app (GET-only registration), rows untouched", async () => {
+  it("404s the attachment upload/remove POSTs at the sub-app (no ui registration), rows untouched", async () => {
     const { repo, ownerCookie } = await theFixture();
     const seeded = await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Asset host", now: at(100) });
     const bytes = new TextEncoder().encode("relt asset body\n");
@@ -363,8 +375,11 @@ describe("the unmounted write tails (web.go:1521-1524 — the dead-link divergen
       now: at(105),
     });
 
-    // web.go:1522-1524's upload/remove writes never landed: the claimed
-    // URL shape reaches the sub-app but only GET registrations exist.
+    // web.go:1522-1524's upload/remove writes never landed, and the fold left
+    // the ui sub-app with NO registration for the shape at all: the POSTs
+    // 404 at uiRouter (the write tails stay unmounted where upstream mounts
+    // them; on the live wire the GET shape's seam answers non-GET verbs with
+    // its 405 arm — the twins suite pins that verb shape).
     expect((await postForm("/relt-owner/relt/releases/attachments", ownerCookie, { id: String(seeded.id) })).status).toBe(404);
     expect(
       (await postForm("/relt-owner/relt/releases/attachments/remove", ownerCookie, { uuid: asset.uuid })).status,
@@ -375,10 +390,15 @@ describe("the unmounted write tails (web.go:1521-1524 — the dead-link divergen
       (await drizzle(env.DB).select({ id: releaseAssets.id }).from(releaseAssets).where(eq(releaseAssets.releaseId, seeded.id)).all())
         .length,
     ).toBe(1);
-    // The GET shape with the literal "remove" segment is the plain uuid
-    // "remove" (the claim pin above): no asset carries it → the loader's 404.
-    expect((await fetchUi("/relt-owner/relt/releases/attachments/remove")).status).toBe(404);
-    // The real asset still serves (the dead POST tails touched nothing).
-    expect((await fetchUi(`/relt-owner/relt/releases/attachments/${asset.uuid}`)).status).toBe(200);
+    // The GET pins MOVED TO THE SEAM (the fold — these drove the shadowed ui
+    // registration before): the literal "remove" segment is the plain uuid
+    // "remove" — no asset carries it → the seam's plain-text 404 (the ui
+    // twin's HTML shell is gone with the fold).
+    const removed = await fetchSeam("/relt-owner/relt/releases/attachments/remove");
+    expect(removed.status).toBe(404);
+    expect(await removed.text()).toBe("Not Found\n");
+    // The real asset still serves (the dead POST tails touched nothing) —
+    // the seam's shared serve pipeline now.
+    expect((await fetchSeam(`/relt-owner/relt/releases/attachments/${asset.uuid}`)).status).toBe(200);
   });
 });

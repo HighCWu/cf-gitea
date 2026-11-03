@@ -292,8 +292,10 @@ const SHORT_DAYS = new Set(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]);
  * month a real short name, the day in range for that month (leap years
  * included — "31 Feb 2024" errors upstream, where JS Date.parse would
  * silently roll over), hour ≤ 23, minute/second ≤ 59. Returns epoch ms.
+ * Shared: the packages ServeContent port (services/packages/serve-content.ts)
+ * rides this same parser for its If-(Un-)Modified-Since / If-Range dates.
  */
-function parseHttpTimeFormat(value: string): number | null {
+export function parseHttpTimeFormat(value: string): number | null {
   const match = IMF_FIXDATE_RE.exec(value);
   if (match === null) return null;
   const dayName = match[1] ?? "";
@@ -1567,8 +1569,9 @@ attachmentsServingRouter.on(["POST", "PUT", "DELETE", "PATCH"], "/attachments/:u
 // against the workspace hono), so this arm answers the shape and the wave-41
 // route registration becomes the shadowed dead twin for it; the sibling
 // `/releases/download/{vTag}/{fileName}` arm stays ui-owned (no claim overlap).
-// The wave-41 tests drive uiRouter and the page module directly, so they stay
-// green; the UI module remains the raw/media + download carrier.
+// [TAILS, consolidated 2026-11-04] the dead twin is DELETED (ui/index.ts's
+// registration + parse-claim removed; the wave-41 suites drive THIS seam);
+// the UI module remains the download carrier.
 //
 // PERMANENCE/REDIRECT SEMANTICS: none on either twin — upstream serves bytes
 // in place (ServeAttachment has no redirect arm; ServeDirect's presigned

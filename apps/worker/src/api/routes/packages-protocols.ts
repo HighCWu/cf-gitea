@@ -118,12 +118,7 @@ import {
 import { getPackageProperties } from "../../services/packages/protocol-common";
 import { PackageSizeMismatchError, PackageBlobTooLargeError, packageBlobContentKey } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
-import {
-  encodeContentDisposition,
-  goPathBase,
-  serveFileHeaderSet,
-  servePackageFileResponse,
-} from "../../services/packages/serve-content";
+import { serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
 import {
   PypiFormError,
   PypiHashMismatchError,
@@ -1520,13 +1515,15 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
     try {
       const { owner } = await protocolContext(c, "read");
       const key = await buildDebianRepositoryKey(c.env.DB, owner.id);
-      return new Response(key, {
-        status: 200,
-        headers: {
-          "content-type": "application/pgp-keys",
-          "content-disposition": encodeContentDisposition("attachment", goPathBase("repository.key")),
-        },
-      });
+      // GetRepositoryKey (debian.go:31-43): ctx.ServeContent over the armored
+      // key — pgp-keys, filename repository.key, NO LastModified (the
+      // created-less zero-modtime arm): the full header set + the 304/206 arms.
+      const bytes = new TextEncoder().encode(key);
+      return servePackageFileResponse(
+        c.req.raw,
+        c.req.method === "HEAD" ? null : new Response(bytes).body,
+        { filename: "repository.key", contentType: "application/pgp-keys", size: bytes.byteLength },
+      );
     } catch (error) {
       return debianErrorResponse(error);
     }
@@ -1657,18 +1654,19 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
     try {
       const { owner } = await protocolContext(c, "read");
       const key = await buildAlpineRepositoryKey(c.env.DB, owner.id);
-      // GetRepositoryKey (alpine.go:32-61): the PEM with the fingerprint
-      // filename (`{lower}@{fingerprint}.rsa.pub`).
-      return new Response(key.publicPem, {
-        status: 200,
-        headers: {
-          "content-type": "application/x-pem-file",
-          "content-disposition": encodeContentDisposition(
-            "attachment",
-            goPathBase(`${owner.usernameLower}@${key.fingerprint}.rsa.pub`),
-          ),
+      // GetRepositoryKey (alpine.go:32-61): ctx.ServeContent over the PEM with
+      // the fingerprint filename (`{lower}@{fingerprint}.rsa.pub`),
+      // application/x-pem-file, NO LastModified (the created-less arm).
+      const bytes = new TextEncoder().encode(key.publicPem);
+      return servePackageFileResponse(
+        c.req.raw,
+        c.req.method === "HEAD" ? null : new Response(bytes).body,
+        {
+          filename: `${owner.usernameLower}@${key.fingerprint}.rsa.pub`,
+          contentType: "application/x-pem-file",
+          size: bytes.byteLength,
         },
-      });
+      );
     } catch (error) {
       return debianErrorResponse(error);
     }
@@ -1816,16 +1814,16 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
 
       switch (target.arm) {
         case "key": {
-          // GetRepositoryKey (rpm.go:55-66): the armored transferable public
-          // key, application/pgp-keys, filename repository.key.
+          // GetRepositoryKey (rpm.go:55-66): ctx.ServeContent over the armored
+          // transferable public key, application/pgp-keys, filename
+          // repository.key, NO LastModified (the created-less arm).
           const key = await buildRpmRepositoryKey(c.env.DB, owner.id);
-          return new Response(key, {
-            status: 200,
-            headers: {
-              "content-type": "application/pgp-keys",
-              "content-disposition": encodeContentDisposition("attachment", goPathBase("repository.key")),
-            },
-          });
+          const bytes = new TextEncoder().encode(key);
+          return servePackageFileResponse(
+            c.req.raw,
+            c.req.method === "HEAD" ? null : new Response(bytes).body,
+            { filename: "repository.key", contentType: "application/pgp-keys", size: bytes.byteLength },
+          );
         }
         case "repo-config":
           return rpmRepoConfig(c, target.group);
@@ -1949,10 +1947,15 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   const archKey = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
     try {
       const { owner } = await protocolContext(c, "read");
-      // GetRepositoryKey (arch.go:31-41): application/pgp-keys, ServeContent
-      // with no filename — no attachment disposition.
+      // GetRepositoryKey (arch.go:31-41): ctx.ServeContent — application/pgp-keys
+      // with NO filename (no attachment disposition) and NO LastModified (the
+      // created-less zero-modtime arm).
       const key = await buildArchRepositoryKey(c.env.DB, owner.id);
-      return new Response(key, { status: 200, headers: { "content-type": "application/pgp-keys" } });
+      const bytes = new TextEncoder().encode(key);
+      return servePackageFileResponse(c.req.raw, c.req.method === "HEAD" ? null : new Response(bytes).body, {
+        contentType: "application/pgp-keys",
+        size: bytes.byteLength,
+      });
     } catch (error) {
       return debianErrorResponse(error);
     }
@@ -4364,22 +4367,17 @@ function rubygemsEmptyDetail(status: 404 | 501): Response {
 }
 
 /** SetServeHeaders({Filename}) + the compressed archive bytes — the exact
- *  upstream header set: octet-stream + nosniff + the sandbox CSP
- *  (serveSetHeaderContentRelated), the prod Cache-Control posture
+ *  upstream header set through the shared table (serveFileHeaderSet — the
+ *  consolidation's one-table decision): octet-stream + nosniff + the sandbox
+ *  CSP (serveSetHeaderContentRelated), the prod Cache-Control posture
  *  (httpcache.go:31-35), the attachment disposition + expose-headers echo
  *  (serve.go:87-94), and NO Last-Modified (a zero ServeHeaderOptions time —
- *  serve.go:101-104's skip). */
+ *  serve.go:101-104's skip). Upstream writes the bytes DIRECTLY (never
+ *  ctx.ServeContent) — no accept-ranges, no byte-serving, always 200. */
 function rubygemsArchiveResponse(filename: string, body: Uint8Array): Response {
   return new Response(body.slice(), {
     status: 200,
-    headers: {
-      "content-type": "application/octet-stream",
-      "x-content-type-options": "nosniff",
-      "content-security-policy": "sandbox allow-scripts allow-modals allow-popups allow-downloads",
-      "cache-control": "max-age=0, private, must-revalidate",
-      "content-disposition": encodeContentDisposition("attachment", goPathBase(filename)),
-      "access-control-expose-headers": "Content-Disposition",
-    },
+    headers: serveFileHeaderSet({ filename, size: body.byteLength }),
   });
 }
 
