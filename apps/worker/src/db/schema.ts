@@ -584,12 +584,12 @@ export const authFailures = sqliteTable("auth_failures", {
 // ---------------------------------------------------------------------------
 
 /** `pull_requests.status` — upstream `PullRequestStatus`
- *  (gitea/models/issues/pull.go:44–57). */
+ *  (gitea/models/issues/pull.go:100–107, iota order verbatim). */
 export const PRStatus = {
   Conflict: 0,
   Checking: 1,
-  ManuallyMerged: 2,
-  Mergeable: 3,
+  Mergeable: 2,
+  ManuallyMerged: 3,
   Error: 4,
   Empty: 5,
   Ancestor: 6,

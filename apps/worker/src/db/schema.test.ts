@@ -20,15 +20,18 @@
  */
 
 import { env } from "cloudflare:workers";
-import { and, eq, inArray, lte, ne } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { mergeableOfRow, statusFromMergeability } from "../api/services/pull-engine";
 import {
   follows,
   lfsObjects,
   orgMembers,
+  PRStatus,
+  pullRequests,
   repoCollaborators,
   repoMirrors,
   repoSettings,
@@ -864,5 +867,140 @@ describe("repo_mirrors parity (the mirror wave's pinned §3.1 DDL, migration 001
         .where(and(lte(repoMirrors.nextSyncAt, 9000), ne(repoMirrors.nextSyncAt, 0), eq(repoMirrors.syncState, "idle")))
         .all(),
     ).toEqual([]);
+  });
+});
+
+/**
+ * ADR-0007 FN-1 (migration 0064): our `pull_requests.status` constant was
+ * written with ManuallyMerged/Mergeable swapped relative to upstream's
+ * `PullRequestStatus` iota, so stored rows carried swapped semantics. The
+ * constant now follows the iota verbatim and 0064 re-keyed the data.
+ */
+describe("PRStatus upstream alignment (ADR-0007 FN-1, migration 0064)", () => {
+  it("pins the constants to upstream's PullRequestStatus iota verbatim (gitea/models/issues/pull.go:100-107)", () => {
+    expect(PRStatus).toEqual({
+      Conflict: 0, // iota 0
+      Checking: 1, // iota 1
+      Mergeable: 2, // iota 2 — ManuallyMerged held this slot before 0064
+      ManuallyMerged: 3, // iota 3 — Mergeable held this slot before 0064
+      Error: 4, // iota 4
+      Empty: 5, // iota 5
+      Ancestor: 6, // iota 6
+    });
+  });
+
+  it("carries the post-swap semantics end-to-end: creation stays checking, the mergeability transition stores upstream's Mergeable=2, and the derived boolean follows", async () => {
+    const db = drizzle(env.DB);
+
+    // The creation storage shape: a row inserted WITHOUT an explicit status
+    // lands on the declared default — Checking (the real creation write seeds
+    // the same value explicitly, webhooks-push.ts status: PRStatus.Checking).
+    await db.insert(pullRequests).values({
+      issueId: 8_640_001,
+      index: 1,
+      headRepoId: "pr-status-r",
+      baseRepoId: "pr-status-r",
+      headBranch: "feature",
+      baseBranch: "main",
+    });
+    let raw: { status: number; has_merged?: number } | null = await env.DB
+      .prepare("SELECT status FROM pull_requests WHERE issue_id = 8640001")
+      .first<{ status: number }>();
+    expect(raw?.status).toBe(1); // stays checking — position-stable through the swap
+    expect(raw?.status).toBe(PRStatus.Checking);
+
+    // Force the mergeable transition through the REAL transition mapper (the
+    // lazy check's CAS write arm, pull-engine.ts statusFromMergeability) and
+    // pin the STORED number: upstream's Mergeable is 2 — the exact drift 0064
+    // repairs (pre-swap rows we wrote as 2 read as manually-merged upstream).
+    await db
+      .update(pullRequests)
+      .set({ status: statusFromMergeability("mergeable") })
+      .where(eq(pullRequests.issueId, 8_640_001));
+    raw = await env.DB.prepare("SELECT status FROM pull_requests WHERE issue_id = 8640001").first<{ status: number }>();
+    expect(raw?.status).toBe(PRStatus.Mergeable);
+    expect(raw?.status).toBe(2);
+    expect(mergeableOfRow((await db.select().from(pullRequests).where(eq(pullRequests.issueId, 8_640_001)).get())!, false)).toBe(true);
+
+    // The other half of the swap: a manually-merged row stores upstream's 3 —
+    // distinct from Mergeable — and still renders pr.Mergeable TRUE (upstream's
+    // filter excludes only Checking/Conflict/Error, pull.go:751-756).
+    await db
+      .update(pullRequests)
+      .set({ status: PRStatus.ManuallyMerged, hasMerged: true, mergerId: 1 })
+      .where(eq(pullRequests.issueId, 8_640_001));
+    raw = await env.DB.prepare("SELECT status, has_merged FROM pull_requests WHERE issue_id = 8640001").first<{
+      status: number;
+      has_merged: number;
+    }>();
+    expect(raw?.status).toBe(3);
+    expect(raw?.status).toBe(PRStatus.ManuallyMerged);
+    expect(raw?.has_merged).toBe(1);
+    expect(mergeableOfRow((await db.select().from(pullRequests).where(eq(pullRequests.issueId, 8_640_001)).get())!, false)).toBe(true);
+    // A mergeable-querying consumer (eq on the upstream symbol) must NOT
+    // match the manually-merged row — the distinction the old swap erased.
+    // (Scoped to this test's row: sibling tests in the file may leave their
+    // own rows behind when the plugin's storage persists across tests.)
+    expect(
+      await db
+        .select({ id: pullRequests.id })
+        .from(pullRequests)
+        .where(and(eq(pullRequests.status, PRStatus.Mergeable), eq(pullRequests.issueId, 8_640_001)))
+        .all(),
+    ).toEqual([]);
+  });
+
+  it("0064 re-keys rows written under the pre-swap mapping (the migration's UPDATE, replayed verbatim)", async () => {
+    const db = drizzle(env.DB);
+
+    // Rows as the PRE-0064 code wrote them: 2 = manually-merged (has_merged),
+    // 3 = mergeable, 0/1/4 position-stable.
+    await env.DB
+      .prepare(
+        `INSERT INTO pull_requests (issue_id, \`index\`, status, head_repo_id, base_repo_id, head_branch, base_branch, has_merged)
+         VALUES (8640011, 1, 2, 'pr-status-r', 'pr-status-r', 'old-manual', 'main', 1),
+                (8640012, 2, 3, 'pr-status-r', 'pr-status-r', 'old-mergeable', 'main', 0),
+                (8640013, 3, 0, 'pr-status-r', 'pr-status-r', 'old-conflict', 'main', 0),
+                (8640014, 4, 1, 'pr-status-r', 'pr-status-r', 'old-checking', 'main', 0),
+                (8640015, 5, 4, 'pr-status-r', 'pr-status-r', 'old-error', 'main', 0)`,
+      )
+      .run();
+
+    // Migration 0064's statement verbatim
+    // (src/db/migrations/0064_pr-status-upstream-alignment.sql).
+    await env.DB
+      .prepare("UPDATE `pull_requests` SET `status` = CASE `status` WHEN 2 THEN 3 WHEN 3 THEN 2 ELSE `status` END")
+      .run();
+
+    const statuses = await env.DB
+      .prepare("SELECT issue_id, status, has_merged FROM pull_requests WHERE issue_id BETWEEN 8640011 AND 8640015 ORDER BY issue_id")
+      .all<{ issue_id: number; status: number; has_merged: number }>();
+    expect(statuses.results).toEqual([
+      { issue_id: 8640011, status: 3, has_merged: 1 }, // old 2 → ManuallyMerged, identity kept
+      { issue_id: 8640012, status: 2, has_merged: 0 }, // old 3 → Mergeable
+      { issue_id: 8640013, status: 0, has_merged: 0 }, // position-stable: Conflict
+      { issue_id: 8640014, status: 1, has_merged: 0 }, // position-stable: Checking
+      { issue_id: 8640015, status: 4, has_merged: 0 }, // position-stable: Error
+    ]);
+
+    // Post-swap, a consumer querying by the upstream symbol finds exactly the
+    // row whose SEMANTICS are mergeable — the old mapping would have handed
+    // back the manually-merged row here. (Scoped to this test's id range:
+    // sibling tests in the file may leave their own rows behind when the
+    // plugin's storage persists across tests.)
+    expect(
+      await db
+        .select({ issueId: pullRequests.issueId })
+        .from(pullRequests)
+        .where(and(eq(pullRequests.status, PRStatus.Mergeable), gt(pullRequests.issueId, 8_640_010)))
+        .all(),
+    ).toEqual([{ issueId: 8_640_012 }]);
+    expect(
+      await db
+        .select({ issueId: pullRequests.issueId })
+        .from(pullRequests)
+        .where(and(eq(pullRequests.status, PRStatus.ManuallyMerged), gt(pullRequests.issueId, 8_640_010)))
+        .all(),
+    ).toEqual([{ issueId: 8_640_011 }]);
   });
 });

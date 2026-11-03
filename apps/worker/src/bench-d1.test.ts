@@ -101,6 +101,7 @@ import {
   personalAccessTokens,
   projectColumns,
   projects,
+  PRStatus,
   protectedBranches,
   pullRequests,
   pullReviews,
@@ -511,7 +512,7 @@ async function seedFixtures(db: DrizzleD1Database): Promise<Fixtures> {
   await db.insert(pullRequests).values({
     issueId: prIssue.id,
     index: prIssue.index,
-    status: 1,
+    status: PRStatus.Checking,
     headRepoId: repoId,
     baseRepoId: repoId,
     headBranch: "bench",
@@ -1724,7 +1725,7 @@ describe("index witness (migration 0037 — the audit's P2 wave)", () => {
       .map((issue) => ({
         issueId: issue.id,
         index: issue.index,
-        status: 3,
+        status: PRStatus.Mergeable,
         headRepoId: otherRepo,
         baseRepoId: targetRepo,
         headBranch: `p2-h-${issue.index}`,
@@ -1736,7 +1737,7 @@ describe("index witness (migration 0037 — the audit's P2 wave)", () => {
       .map((issue) => ({
         issueId: issue.id,
         index: issue.index,
-        status: 3,
+        status: PRStatus.Mergeable,
         headRepoId: targetRepo,
         baseRepoId: otherRepo,
         headBranch: `p2-ho-${issue.index}`,
