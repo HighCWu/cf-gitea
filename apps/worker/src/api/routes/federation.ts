@@ -83,15 +83,19 @@
  *          the RSA-3072 keypair lazily generated in user_settings_kv).
  *   POST /api/v1/activitypub/user-id/{id}/inbox   → ReqHTTPSignature
  *          (reqsignature.go, ported in services/federation/httpsig.ts) →
- *          PersonInbox: a verified Follow answers 200 with an inline
- *          Accept activity AND persists the follower
- *          (services/federation/followers.ts — the federation_followers
- *          table, migration 0063; the S-1 store, idempotent on re-Follow;
- *          SPEC §5/§6.2 as-built, the ADR-0007 migration grant); a verified
- *          Undo of a Follow removes the stored row (still the 204 black-hole
+ *          PersonInbox: a verified Follow whose actor IS the verified
+ *          signer answers 200 with an inline Accept activity AND persists
+ *          the follower (services/federation/followers.ts — the
+ *          federation_followers table, migration 0063; the S-1 store,
+ *          idempotent on re-Follow; SPEC §5/§6.2 as-built, the ADR-0007
+ *          migration grant); a verified Undo whose removal key IS the
+ *          verified signer removes the stored row (still the 204 black-hole
  *          response — the removal is silent, upstream PersonInbox never
- *          parsed anything); every other verified activity keeps upstream's
- *          204 black hole (person.go:81-96).
+ *          parsed anything); a claimed actor that misses the verified
+ *          signer is the SAME silent 204 on both arms — nothing persisted,
+ *          nothing removed, no Accept answered (the signature, not the
+ *          body's actor field, is the identity); every other verified
+ *          activity keeps upstream's 204 black hole (person.go:81-96).
  *
  * chi-exact dispatch per armed path (the Group-folds-middleware mechanics
  * from the Tier A header): chiUnknownMethodGuard (the pre-tree bare 405) →
@@ -503,6 +507,20 @@ function activityActorIri(activity: Record<string, unknown>): string | null {
 }
 
 /**
+ * The bare actor IRI behind a fragment-carrying IRI: an ActivityPub keyId
+ * conventionally hangs the key off the actor IRI (`{actorIRI}#main-key` —
+ * the deleted client.go signer's own keyId shape), and an activity's
+ * `actor` field may itself carry a fragment. Both sides of the inbox's
+ * signer binding normalize through this — everything from the FIRST `#`
+ * is fragment (an IRI has at most one) — so the comparison is on actor
+ * identity, not on key-vs-actor spelling.
+ */
+function bareActorIri(iri: string): string {
+  const hash = iri.indexOf("#");
+  return hash < 0 ? iri : iri.slice(0, hash);
+}
+
+/**
  * The inbox (person.go:81-96's PersonInbox behind reqsignature.go's
  * middleware, in upstream's middleware order — UserIDAssignmentAPI runs
  * BEFORE the signature, so an unknown target 404s without any verification
@@ -511,19 +529,26 @@ function activityActorIri(activity: Record<string, unknown>): string | null {
  *      the body; ours must, and the read is the streamed-bounded posture);
  *   2. verifyHttpSignature — error arm → thrown (house 500, upstream
  *      APIErrorInternal), rejected arm → the exact 403 body (:91-93);
- *   3. the Follow → Accept ladder (the user's completion directive) — the
- *      Accept rides the RESPONSE unchanged AND the follower row is
- *      persisted (the federation_followers store, migration 0063 — ledger
- *      S-1; the idempotent re-Follow upserts as a no-op; an actorless
- *      Follow has no key and stores nothing); a verified Undo drops the
- *      row keyed by the embedded Follow's actor (falling back to the
- *      Undo's own actor when the cargo is a bare IRI) — the removal is
- *      silent, the 204 black-hole response byte-identical (upstream
- *      PersonInbox never parsed the body, so any richer arm would be
- *      invention); every other activity keeps the upstream 204 black hole.
- *      Malformed JSON → 400 (an arm the black hole never needed; it never
- *      looked). The response shapes are EXACTLY the pre-S-1 as-built's —
- *      the store adds no observable difference to any response.
+ *   3. the Follow → Accept ladder (the user's completion directive), both
+ *      arms BOUND TO THE VERIFIED SIGNER (the 2026-11-03 pre-freeze fix):
+ *      the accepted outcome's keyId — normalized to its bare actor IRI
+ *      (the `{actorIRI}#main-key` fragment convention) — is the only
+ *      identity the body's claims are judged against. The Follow persists
+ *      and answers the 200 Accept ONLY when its actor's bare IRI equals
+ *      the signer's (the federation_followers store, migration 0063 —
+ *      ledger S-1; the idempotent re-Follow upserts as a no-op); a
+ *      verified Undo drops the row keyed by the embedded Follow's actor
+ *      (falling back to the Undo's own actor when the cargo is a bare IRI)
+ *      ONLY when that key equals the signer's — the ActivityPub contract
+ *      makes an Undo's actor the author of the undone activity. A mismatch
+ *      — or an actorless Follow, which has no identity to bind — is the
+ *      SAME silent 204 on both arms: nothing persisted, nothing removed,
+ *      no Accept answered, no existence leak (upstream PersonInbox never
+ *      parsed the body at all — the black hole is its posture; no upstream
+ *      cite exists for the binding itself, SPEC §5 records the derivation).
+ *      Every other activity keeps the upstream 204 black hole. Malformed
+ *      JSON → 400 (an arm the black hole never needed; it never looked).
+ *      The valid-path response shapes are EXACTLY the pre-S-1 as-built's.
  */
 async function inboxHandler(c: Context<ApiEnv>, opts: { fetchImpl?: typeof fetch }): Promise<Response> {
   const id = parseActorIdParam(c.req.param("id"));
@@ -550,6 +575,11 @@ async function inboxHandler(c: Context<ApiEnv>, opts: { fetchImpl?: typeof fetch
   if (outcome.kind === "rejected") {
     throw new ApiError(403, "request signature verification failed");
   }
+  // The verified keyId — normalized to the signer's bare actor IRI (the
+  // `#main-key` fragment convention) — is the identity every inbox decision
+  // below binds to. The body's actor field carries no trust of its own: a
+  // signature proves WHO signed, never WHAT they claimed to be.
+  const signerIri = bareActorIri(outcome.keyId);
 
   const appUrl = federationAppUrl(federationEnvOf(c).APP_URL, new URL(c.req.url).origin);
   const actorIri = actorIriOf(appUrl, user.id);
@@ -563,37 +593,51 @@ async function inboxHandler(c: Context<ApiEnv>, opts: { fetchImpl?: typeof fetch
   if (typeof activity === "object" && activity !== null) {
     const record = activity as Record<string, unknown>;
     if (record.type === "Follow") {
-      const follower = activityActorIri(record);
-      // The S-1 store (specs/federation.md §5 as-built): the verified Follow
-      // persists — idempotent (the UNIQUE pair upserts as a no-op), keyed to
-      // THIS inbox's user (the object field stays unparsed, the landed
-      // ladder's posture); an actorless Follow has no key and stores nothing.
-      if (follower !== null) {
+      // The signer binding (specs/federation.md §5 as-built): the claimed
+      // actor — bare-IRI normalized, since it may itself carry a fragment —
+      // must BE the verified signer, else the Follow is fabricated
+      // attribution (a validly signed M could otherwise persist a victim's
+      // row by naming it) and earns nothing: no row, no Accept — the silent
+      // 204 below (upstream's own black-hole posture for an unparsed inbox).
+      const claimed = activityActorIri(record);
+      const follower = claimed === null ? null : bareActorIri(claimed);
+      // The S-1 store (specs/federation.md §5 as-built): the signer-bound
+      // Follow persists — idempotent (the UNIQUE pair upserts as a no-op),
+      // keyed to THIS inbox's user (the object field stays unparsed, the
+      // landed ladder's posture).
+      if (follower !== null && follower === signerIri) {
         await upsertFollower(c.env.DB, user.id, follower, new Date());
+        const accept: Record<string, unknown> = {
+          "@context": "https://www.w3.org/ns/activitystreams",
+          id: `${actorIri}#accepts/${crypto.randomUUID()}`,
+          type: "Accept",
+          actor: actorIri,
+          to: follower,
+          object: record,
+        };
+        return c.body(JSON.stringify(accept), 200, { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE });
       }
-      const accept: Record<string, unknown> = {
-        "@context": "https://www.w3.org/ns/activitystreams",
-        id: `${actorIri}#accepts/${crypto.randomUUID()}`,
-        type: "Accept",
-        actor: actorIri,
-        ...(follower === null ? {} : { to: follower }),
-        object: record,
-      };
-      return c.body(JSON.stringify(accept), 200, { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE });
     }
     if (record.type === "Undo") {
       // The Undo cargo is an embedded Follow activity (the ActivityPub norm —
       // the Accept's own `object` echo is exactly this shape) or a bare IRI;
-      // the follower key comes from the embedded activity's actor, falling
-      // back to the Undo's own actor. The pair key bounds the removal to THIS
-      // inbox's rows; a stranger's Undo is a no-op.
+      // the removal key comes from the embedded activity's actor, falling
+      // back to the Undo's own actor. The signer binding gates the removal:
+      // the key — bare-IRI normalized — must BE the verified signer, because
+      // the ActivityPub contract makes an Undo's actor the author of the
+      // undone activity; a signed M naming a victim forges nothing but a
+      // no-op. (The (user_id, follower_iri) pair key bounds removals to THIS
+      // inbox's rows — the inbox OWNER, never the sender; the signer check is
+      // what bounds the sender.) The 204 is silent either way — no existence
+      // leak.
       const cargo = record.object;
       const embedded =
         typeof cargo === "object" && cargo !== null && (cargo as Record<string, unknown>).type === "Follow"
           ? activityActorIri(cargo as Record<string, unknown>)
           : null;
-      const follower = embedded ?? activityActorIri(record);
-      if (follower !== null) {
+      const claimed = embedded ?? activityActorIri(record);
+      const follower = claimed === null ? null : bareActorIri(claimed);
+      if (follower !== null && follower === signerIri) {
         await removeFollower(c.env.DB, user.id, follower);
       }
     }

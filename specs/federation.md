@@ -397,15 +397,36 @@ surface instead (ADR-0007's intentional-recorded-with-predecessor class,
 predecessor = this SPEC), reusing the local `follows` table's conventions
 (models/user/follow.go's port family) keyed on the remote actor IRI. The
 inbox's verified Follow **persists** (idempotent: the UNIQUE pair makes a
-re-Follow a no-op, `created_at` keeps the FIRST verified Follow; an
-actorless Follow has no key and stores nothing) and a verified **Undo**
-drops the row — the removal key comes from the embedded Follow's `actor`
-falling back to the Undo's own `actor` when the cargo is a bare IRI, and
-the (user_id, follower_iri) pair key bounds a stranger's Undo to a no-op —
-with the 204 black-hole response byte-identical. Every RESPONSE byte is the
-pre-S-1 as-built's (the store is response-invisible). No reads land: the
-surface renders no follower views (the don't-invent rule, §1) — the rows
-are the delivery lane's substrate (OQ-5, still unbuilt).
+re-Follow a no-op, `created_at` keeps the FIRST verified Follow) and a
+verified **Undo** drops the row — the removal key comes from the embedded
+Follow's `actor`, falling back to the Undo's own `actor` when the cargo is
+a bare IRI. **Both arms are bound to the verified HTTP-signature keyId**
+(corrected as-built 2026-11-03, the pre-freeze review): the accepted
+outcome's `keyId`, normalized to its bare actor IRI (the
+`{actorIRI}#main-key` fragment convention — the deleted client.go signer's
+own keyId shape; the claimed `actor` is normalized identically, since it
+may itself carry a fragment), is the only identity the body's claims are
+judged against. The Follow persists and answers the 200 Accept ONLY when
+its `actor`'s bare IRI equals the signer's — an actorless Follow has no
+identity to bind and earns the silent 204 (no Accept, no row); the Undo
+removes ONLY when its removal key equals the signer's. A mismatch is the
+same silent 204 on both arms — nothing persisted, nothing removed, no
+existence leak. The earlier claim here — that the (user_id, follower_iri)
+pair key alone bounds a stranger's Undo to a no-op — was WRONG: the pair
+key bounds removals to THIS inbox's rows (the inbox OWNER), never to the
+sender; without the signer equality a validly signed M could name a victim
+in either arm's key (fabricated Follow attribution, or silent deletion of
+the victim's stored row). No upstream cite exists for the binding:
+upstream's PersonInbox was a 204 black hole — it never parsed bodies — so
+the derivation target is this SPEC's own fallback arm plus the ActivityPub
+contract that an Undo's actor is the undone activity's author; the signer
+equality is the Workers-side enforcement of exactly that contract, the
+HTTP signature being the only actor identity this server verifies. The
+black-hole response stays byte-identical on every non-accepting path, and
+every valid-path RESPONSE byte is the pre-S-1 as-built's (the store is
+response-invisible). No reads land: the surface renders no follower views
+(the don't-invent rule, §1) — the rows are the delivery lane's substrate
+(OQ-5, still unbuilt).
 
 ---
 

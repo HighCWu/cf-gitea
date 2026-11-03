@@ -4,9 +4,10 @@
  * 2026-11-01 completion directive): the Person actor, the signature-
  * verified inbox with the Follow→Accept ladder, the keypair store, and the
  * chi-exact method tree — with the S-1 follower store on top (migration
- * 0063, the ADR-0007 grant: the Follow persists, the Undo removes, the
- * re-Follow is a no-op, the user-delete cascade drops the rows; every
- * response byte stays the pre-S-1 as-built's). Both routers driven
+ * 0063, the ADR-0007 grant: the signer-bound Follow persists, the Undo
+ * removes, the re-Follow is a no-op, the user-delete cascade drops the
+ * rows; every valid-path response byte stays the pre-S-1 as-built's). Both
+ * routers driven
  * standalone (the HANDOFF mounts in src/index.ts + api/router.ts are the
  * orchestrator's; the sub-apps are mounted verbatim, so these pins carry
  * over unchanged).
@@ -35,9 +36,9 @@
  *     GET /activitypub/user-id/{id} → the Person actor (person.go:20-79),
  *     POST /activitypub/user-id/{id}/inbox → ReqHTTPSignature + PersonInbox
  *     (reqsignature.go; the Follow→Accept ladder is the user directive's
- *     arm now durable through the S-1 store — the verified Follow persists
- *     into federation_followers and the Undo removes, everything else the
- *     204 black hole), every other /activitypub/*
+ *     arm now durable through the S-1 store — the signer-bound Follow
+ *     persists into federation_followers and the Undo removes, everything
+ *     else the 204 black hole), every other /activitypub/*
  *     path UNREGISTERED → the router's native 404 (incl. the deprecated
  *     /user/{username} form, api.go's own "remove in 1.20" note). The
  *     inline activitypub scope gate: anonymous passes (api.go:281-283), a
@@ -239,8 +240,15 @@ const scopeForbidden = (required: string, tokenScope: string): Record<string, st
 let remotePair: CryptoKeyPair;
 let foreignPair: CryptoKeyPair;
 let remotePem: string;
+let malloryPem: string;
 const REMOTE_KEY_ID = "https://remote.example/actors/bob#main-key";
 const REMOTE_ACTOR_IRI = "https://remote.example/actors/bob";
+// The second signer's identity — a fully-verified remote actor (her own
+// keypair, keyId, and actor document) the signature gate PASSES; the
+// signer-binding battery below pins that the activity's actor field still
+// cannot borrow another actor's identity through her valid signature.
+const MALLORY_KEY_ID = "https://remote.example/actors/mallory#main-key";
+const MALLORY_ACTOR_IRI = "https://remote.example/actors/mallory";
 
 async function generateRsa3072Pair(): Promise<CryptoKeyPair> {
   const pair = await crypto.subtle.generateKey(
@@ -269,6 +277,9 @@ beforeAll(async () => {
   const spki = await crypto.subtle.exportKey("spki", remotePair.publicKey);
   if (!(spki instanceof ArrayBuffer)) throw new Error("unexpected key export form");
   remotePem = pemEncode("PUBLIC KEY", new Uint8Array(spki));
+  const mallorySpki = await crypto.subtle.exportKey("spki", foreignPair.publicKey);
+  if (!(mallorySpki instanceof ArrayBuffer)) throw new Error("unexpected key export form");
+  malloryPem = pemEncode("PUBLIC KEY", new Uint8Array(mallorySpki));
 });
 
 /**
@@ -290,6 +301,10 @@ async function signedInbox(
     digest?: string | null;
     algorithm?: string;
     signature?: string;
+    /** The publicKeyPem the served actor document carries — defaults to
+     *  bob's (remotePem); mallory's requests pass her own (malloryPem) so
+     *  her signature verifies against her document. */
+    pem?: string;
     docBody?: string;
     docStatus?: number;
     fetchError?: boolean;
@@ -318,12 +333,20 @@ async function signedInbox(
     signature,
   });
   const keyId = opts.keyId ?? REMOTE_KEY_ID;
-  const doc = opts.docBody ?? remoteActorDoc(keyId, remotePem);
+  const doc = opts.docBody ?? remoteActorDoc(keyId, opts.pem ?? remotePem);
   const fetchImpl: typeof fetch = opts.fetchImpl ??
     (opts.fetchError
       ? () => Promise.reject(new Error("network down"))
       : () => Promise.resolve(new Response(doc, { status: opts.docStatus ?? 200 })));
   return api(path, { method: "POST", body, headers }, { federation: "true", auth: opts.auth, fetchImpl });
+}
+
+/** Mallory — a second fully-verified remote signer: her key signs, her keyId
+ *  fetches, her document's publicKey.id matches, the verifier answers
+ *  `verified` with HER IRI. The signer-binding battery drives her against
+ *  bodies that claim other actors' identities. */
+function malloryInbox(path: string, body: string): Promise<Response> {
+  return signedInbox(path, body, { keyPair: foreignPair, keyId: MALLORY_KEY_ID, pem: malloryPem });
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,23 +1075,21 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder, t
     expect((accept.id as string).startsWith(`${actorIri}#accepts/`)).toBe(true);
   });
 
-  it("a Follow with an embedded actor object reads `to` from its id; no actor → no `to`", async () => {
+  it("a Follow with an embedded actor object reads `to` from its id (the signer-bound embedded form)", async () => {
     const alice = await seedUser({ username: "alice" });
     const path = `/activitypub/user-id/${alice.id}/inbox`;
 
+    // The embedded-object actor form carrying the SIGNER's own IRI — the
+    // valid shape; `to` reads the embedded `id`. (An embedded actor naming
+    // someone else is the cross-actor mismatch — pinned in the signer-
+    // binding battery below.)
     const embedded = await signedInbox(path, JSON.stringify({
       type: "Follow",
-      actor: { type: "Person", id: "https://remote.example/actors/carol" },
+      actor: { type: "Person", id: REMOTE_ACTOR_IRI },
       object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
     }));
     expect(embedded.status).toBe(200);
-    expect((await embedded.json<Record<string, unknown>>()).to).toBe("https://remote.example/actors/carol");
-
-    const actorless = await signedInbox(path, JSON.stringify({ type: "Follow" }));
-    expect(actorless.status).toBe(200);
-    const accept = await actorless.json<Record<string, unknown>>();
-    expect(accept.to).toBeUndefined();
-    expect(accept.type).toBe("Accept");
+    expect((await embedded.json<Record<string, unknown>>()).to).toBe(REMOTE_ACTOR_IRI);
   });
 
   it("every other verified activity keeps the upstream 204 black hole (PersonInbox verbatim)", async () => {
@@ -1143,13 +1164,15 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder, t
     expect(second).toEqual(first);
   });
 
-  it("an actorless Follow stores nothing (no key to persist) — the Accept ladder unchanged", async () => {
+  it("an actorless Follow binds to nothing — the silent 204, no Accept, no row", async () => {
     const alice = await seedUser({ username: "alice" });
     const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, JSON.stringify({ type: "Follow" }));
-    expect(response.status).toBe(200);
-    const accept = await response.json<Record<string, unknown>>();
-    expect(accept.type).toBe("Accept");
-    expect(accept.to).toBeUndefined();
+    // No actor = no identity to bind to the verified signer (the pre-freeze
+    // fix: the old actorless arm answered an `Accept` with no `to` — a
+    // response no verified actor earned). Nothing persists, nothing is
+    // answered — upstream's own black-hole posture.
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
     const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
     expect(count?.n).toBe(0);
   });
@@ -1183,10 +1206,14 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder, t
     const follow = JSON.stringify({ type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` });
     expect((await signedInbox(path, follow)).status).toBe(200);
 
-    // A stranger's Undo (signed by bob's key — upstream's deleted middleware
-    // verified the HTTP layer only; the activity's actor field is the body's
-    // business): the pair key bounds the removal to the named follower, so
-    // bob's row survives.
+    // A stranger's Undo naming the stranger (mallory's actor in both the
+    // Undo and its embedded Follow, signed by BOB's key): bob's row
+    // survives — twice over, as-built. The signer gate rejects it first
+    // (the removal key mallory ≠ the verified signer bob), and a
+    // mallory-SIGNED variant would fail the same equality identically; the
+    // (user_id, follower_iri) pair key bounds removals to THIS inbox's rows
+    // (the inbox OWNER) — it never bounded the sender. The signer-naming-
+    // victim arms are pinned directly in the battery below.
     const strangerUndo = JSON.stringify({
       type: "Undo",
       actor: "https://remote.example/actors/mallory",
@@ -1223,5 +1250,118 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder, t
     await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(alice.id).run();
     const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
     expect(after?.n).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The signer binding (the 2026-11-03 pre-freeze fix): the inbox's accepted
+// verification outcome carries the VERIFIED keyId; both arms — the Follow's
+// persist+Accept and the Undo's removal — bind their keys to that signer
+// identity, bare-IRI normalized on BOTH sides (the `{actorIRI}#main-key`
+// fragment stripped from the keyId, and from the claimed actor, which may
+// itself carry a fragment). A mismatch is the same silent 204 on both arms.
+// No upstream cite exists for the binding (upstream's inbox was a 204 black
+// hole — it never parsed bodies); the derivation is our SPEC's fallback arm
+// plus the ActivityPub contract that an Undo's actor is the undone
+// activity's author (specs/federation.md §5 as-built).
+// ---------------------------------------------------------------------------
+
+describe("POST /activitypub/user-id/{id}/inbox — the signer binding", () => {
+  it("a cross-actor Follow persists nothing — the claimed actor must BE the verified signer", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+
+    // Mallory signs validly; the body names BOB. Before the binding this
+    // persisted bob's row (fabricated follow attribution); now: no Accept,
+    // no row — the silent 204.
+    const stringForm = await malloryInbox(path, JSON.stringify({
+      type: "Follow",
+      actor: REMOTE_ACTOR_IRI,
+      object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
+    }));
+    expect(stringForm.status).toBe(204);
+    expect(await stringForm.text()).toBe("");
+
+    // The embedded-object actor form is bound the same way.
+    const embeddedForm = await malloryInbox(path, JSON.stringify({
+      type: "Follow",
+      actor: { type: "Person", id: REMOTE_ACTOR_IRI },
+      object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
+    }));
+    expect(embeddedForm.status).toBe(204);
+    expect(await embeddedForm.text()).toBe("");
+
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(count?.n).toBe(0);
+
+    // The control: the same signer naming HERSELF is the valid path — the
+    // gate is the mismatch, not the signer.
+    const self = await malloryInbox(path, JSON.stringify({
+      type: "Follow",
+      actor: MALLORY_ACTOR_IRI,
+      object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
+    }));
+    expect(self.status).toBe(200);
+    const accept = await self.json<Record<string, unknown>>();
+    expect(accept.type).toBe("Accept");
+    expect(accept.to).toBe(MALLORY_ACTOR_IRI);
+    const rows = await env.DB.prepare("SELECT follower_iri FROM federation_followers").all<{ follower_iri: string }>();
+    expect(rows.results).toEqual([{ follower_iri: MALLORY_ACTOR_IRI }]);
+  });
+
+  it("a cross-actor embedded Undo cannot delete the victim's row — the removal key must BE the signer", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+    const follow = JSON.stringify({ type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` });
+    expect((await signedInbox(path, follow)).status).toBe(200);
+
+    // Mallory signs validly; the embedded Follow names BOB. Before the
+    // binding this silently deleted bob's stored row; now the removal key
+    // (bob) misses the verified signer (mallory) — a no-op, the same silent
+    // 204, no existence leak either way.
+    const forged = await malloryInbox(path, JSON.stringify({
+      type: "Undo",
+      actor: MALLORY_ACTOR_IRI,
+      object: { type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` },
+    }));
+    expect(forged.status).toBe(204);
+    expect(await forged.text()).toBe("");
+
+    let rows = await env.DB.prepare("SELECT follower_iri FROM federation_followers").all<{ follower_iri: string }>();
+    expect(rows.results).toEqual([{ follower_iri: REMOTE_ACTOR_IRI }]);
+
+    // The row survived intact and removable: bob's OWN undo still drops it.
+    const own = await signedInbox(path, JSON.stringify({
+      type: "Undo",
+      actor: REMOTE_ACTOR_IRI,
+      object: { type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` },
+    }));
+    expect(own.status).toBe(204);
+    rows = await env.DB.prepare("SELECT follower_iri FROM federation_followers").all<{ follower_iri: string }>();
+    expect(rows.results).toEqual([]);
+  });
+
+  it("the #main-key keyId normalizes to its bare actor IRI; the actor side may carry the fragment too", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+
+    // Canonical direction (implicitly pinned by every valid test above):
+    // keyId = `…/bob#main-key`, body actor = bare `…/bob` — the sides match
+    // on the bare IRI. The mirrored direction here: the body's actor ITSELF
+    // carries a fragment — same bare IRI, still the signer, still valid;
+    // the persisted row and the Accept's `to` carry the BARE IRI (the
+    // stored identity, so a fragment-carrying re-Follow stays the same row
+    // and a fragment-carrying Undo still removes it).
+    const response = await signedInbox(path, JSON.stringify({
+      type: "Follow",
+      actor: `${REMOTE_ACTOR_IRI}#main-key`,
+      object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
+    }));
+    expect(response.status).toBe(200);
+    const accept = await response.json<Record<string, unknown>>();
+    expect(accept.type).toBe("Accept");
+    expect(accept.to).toBe(REMOTE_ACTOR_IRI);
+    const rows = await env.DB.prepare("SELECT follower_iri FROM federation_followers").all<{ follower_iri: string }>();
+    expect(rows.results).toEqual([{ follower_iri: REMOTE_ACTOR_IRI }]);
   });
 });
