@@ -194,7 +194,7 @@
  *                      (orgCleanupRuleEditDataFromForm(org, false, parsed))
  *                      : applyOrgCleanupRuleCreate → "duplicate-type"
  *                      re-renders with errType + the banner text;
- *                      "created" 303s onto `/${org.username}/settings/
+ *                      "created" 303s onto `/org/${org.username}/settings/
  *                      packages/rules/${ruleId}` (upstream :133).
  *        GET  edit:    prologue + drift guard (the edit family's id) →
  *                      loadOrgCleanupRuleEditPageData(c.env.DB, org, id) →
@@ -205,7 +205,7 @@
  *                      shared/packages.go:210-213) →
  *                      applyOrgCleanupRuleEdit(c.env.DB, org.id, ruleId,
  *                      parsed, new Date()): "missing" → the 404 shell;
- *                      "removed" → 303 onto `/${org.username}/settings/
+ *                      "removed" → 303 onto `/org/${org.username}/settings/
  *                      packages`; "updated" → 303 onto the rule URL;
  *                      "invalid" → re-render via
  *                      loadOrgCleanupRuleEditPageData(c.env.DB, org, ruleId)

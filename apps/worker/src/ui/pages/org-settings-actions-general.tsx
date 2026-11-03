@@ -656,7 +656,7 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
 //          if (outcome.outcome === "repo-not-exist") {
 //            return respond(new Response(JSON.stringify(OWNER_ACTIONS_REPO_NOT_EXIST_ERROR), { status: 400, headers: { "content-type": "application/json;charset=utf-8" } }));
 //          }
-//          return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/general` } }));
+//          return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/general` } }));
 //        }
 //
 //        async function userActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {

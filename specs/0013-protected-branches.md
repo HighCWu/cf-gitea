@@ -900,14 +900,14 @@ is_scoped_run=false arm).
 DR-1(c)):**
 
 - The scoped dispatch banner (prepareWorkflowDispatchTemplate's isScoped
-  branch, `actions.go:407-423` + loadScopedWorkflowModel `:372-406` →
+  branch, `actions.go:407-423` + loadScopedWorkflowModel `:371-398` →
   ScopedWorkflowContent `scoped_workflow_cache.go:73-85`) and the sidebar's
   scoped-workflow groups (sidebar.tmpl:17-34, prepareScopedWorkflows
   `actions.go:296-366`) — the two surfaces that bullet recorded as NOT
   staged. THE DERIVED SEMANTICS, by the pin: the banner renders for a
   writer whose SELECTED workflow declares `workflow_dispatch` where the
   selection is `(workflow, scoped_workflow_source_repo_id)` — the scoped
-  arm first gates on IsScopedWorkflowOptedOut (:409-417 — a REQUIRED
+  arm first gates on IsScopedWorkflowOptedOut (:408-417 — a REQUIRED
   workflow's stale disabled flag never hides the form), then resolves the
   content from the SOURCE repo's DEFAULT-BRANCH scoped walk
   (SCOPED_WORKFLOW_DIRS, entry-name match; upstream through the
@@ -946,7 +946,7 @@ DR-1(c)):**
   shape: EVERY failed arm (unthreaded seam included) renders the
   template's not-found message over HTTP 200 (prepareWorkflowDispatchTemplate's
   early returns leave CurWorkflowExists unset), a BROKEN source file
-  answers not-found too (ReadWorkflow's error → nil, `actions.go:401-403`)
+  answers not-found too (ReadWorkflow's error → nil, `actions.go:393-395`)
   — unlike the producer, which surfaces the light-validation text — while
   a valid-but-no-dispatch source file keeps CurWorkflowExists and renders
   the has_no_workflow_dispatch message; the ErrMsg alert still reads the
