@@ -88,6 +88,60 @@
  * `repo.branch.deletion_success` / `default_deletion_failed` /
  * `protected_deletion_failed` / `deletion_failed`.
  *
+ * ## The flash block — base/alert's ONE surface, every arm derived at the pin
+ *
+ * Upstream renders every flash on this page through a single surface:
+ * list.tmpl:5 `{{template "base/alert" .}}` (the container's first child)
+ * whose arms (base/alert.tmpl:1-4) push ErrorMsg/WarningMsg/InfoMsg/
+ * SuccessMsg through RenderFlashMessage (modules/templates/util_render.go:
+ * 263-294) — `ui {negative|positive} message flash-message flash-{error|
+ * success}` with a `tw-text-center` line (error→negative, success→positive,
+ * the "legacy logic" mapping; every message this family carries is
+ * single-line). There are NO inline error arms on the branches page — the
+ * template's only flash/error surface IS the banner — and success flashes
+ * DO render (the positive banner): delete/restore/create/rename success all
+ * ride `ctx.Flash.Success` (branch.go:94/:147, CreateBranch's tail,
+ * protected_branch.go:433), every refusal `ctx.Flash.Error`/`JSONError`.
+ * The landed bare `ui info|negative message` classes were an approximation;
+ * the block now emits RenderFlashMessage's exact DOM for ALL families.
+ *
+ * The rename family (RenameBranchPost, routers/web/repo/setting/
+ * protected_branch.go:389-438, over services/repository/branch.go:417+'s
+ * RenameBranch and models/git/branch.go's tx) keyed per GT's landed
+ * redirect kinds (`?rename_error={kind}&name={from}` / `?renamed={to}`):
+ * `default` → the ErrUserDoesNotHaveAccessToRepo arm's
+ * repo.branch.rename_default_or_protected_branch_error ("Only admins can
+ * rename default or protected branches." — upstream's shared message covers
+ * BOTH admin arms, the :443 default and the :451 exact-named rule, so GT's
+ * single kind carries both); `protected` → the ErrBranchIsProtected arm's
+ * repo.branch.rename_protected_branch_failed ("Failed to rename branch due
+ * to branch protection rules." — the :461 onto-protected and the tx :381
+ * wildcard arms' shared message); `missing` → the "from_not_exist" msg arm's
+ * repo.settings.rename_branch_failed_not_exist(from); `exists` → the
+ * "target_exist" msg arm's repo.settings.rename_branch_failed_exist
+ * (upstream interpolates form.To — the redirect carries from, exact in the
+ * from==to arm, the colliding-target arm discloses the budget reduction);
+ * `empty` → the ctx.HasError → GetErrMsg arm, whose text is
+ * BuildValidationErrorForUser's ErrRequired message ("form.require_error" =
+ * "%s cannot be empty.") over the forms' raw Go field names — no `form`/
+ * `locale` tags on RenameBranchForm, so "From cannot be empty." first (the
+ * binding's first error is the struct's first field), else "To cannot be
+ * empty.". The success arm renders repo.settings.rename_branch_success —
+ * upstream interpolates (from, to); `?renamed={to}` carries the target
+ * only, so the message renders the target-only reduction until a fold
+ * extends the redirect with `&name={from}` (the arm renders the exact
+ * two-name message when a from-name is present).
+ *
+ * The create family (CreateBranch, routers/web/repo/branch.go:152-232, per
+ * the landed `?created=`/`?create_error=` kinds): `empty` → the HasError
+ * arm over NewBranchForm ("NewBranchName cannot be empty."); `exists` → the
+ * IsErrBranchAlreadyExists arm's repo.branch.branch_already_exists(name);
+ * `missing`/`error` render NOTHING — upstream answers those states with the
+ * RepoRefByType 404 middleware and ctx.ServerError (branch.go:223)
+ * respectively, neither flashes text, and an invented banner would be a
+ * divergence (the write arm's ghost-redirect reduction is the disclosure).
+ * Success → repo.branch.create_success ("Branch \"%s\" has been created.").
+ *
  * ## The deleted-branch rows + the restore POST — census gap #10(a):
  *    the recorded REDUCTION's 3-step reopen trigger, gone REAL
  *
@@ -364,6 +418,28 @@ export const branchesLocale = {
   restore_success: (name: string): string => `Branch "${name}" has been restored.`, // "repo.branch.restore_success"
   restore_failed: (name: string): string => `Failed to restore branch "${name}".`, // "repo.branch.restore_failed"
   already_exists: (name: string): string => `A branch named "${name}" already exists.`, // "repo.branch.already_exists"
+  create_success: (name: string): string => `Branch "${name}" has been created.`, // "repo.branch.create_success"
+  branch_already_exists: (name: string): string => `Branch "${name}" already exists in this repository.`, // "repo.branch.branch_already_exists"
+  // The form-binding arms (RenameBranchPost/CreateBranch's ctx.HasError →
+  // GetErrMsg): BuildValidationErrorForUser's ErrRequired message over the
+  // forms' raw Go field names — neither form carries a `form` or `locale`
+  // tag, so the display name IS the field name (binding.go
+  // getFieldDisplayNameForMessage's fallback), "form.require_error" =
+  // "%s cannot be empty.".
+  create_empty: "NewBranchName cannot be empty.", // form.require_error(NewBranchForm.NewBranchName)
+  rename_empty_from: "From cannot be empty.", // form.require_error(RenameBranchForm.From — the struct's first field, the binding's first error)
+  rename_empty_to: "To cannot be empty.", // form.require_error(RenameBranchForm.To)
+  rename_branch_success: (from: string, to: string): string => `Branch ${from} was successfully renamed to ${to}.`, // "repo.settings.rename_branch_success"
+  // The same key reduced to the landed redirect's target-only budget: the
+  // success redirect (?renamed={to}) structurally carries no from-name, so
+  // the exact two-name message cannot interpolate. If the orchestrator's
+  // fold ever extends the redirect with &name={from}, the exact message
+  // above renders (the arm checks). cf-gitea reduction — the block doc.
+  rename_branch_success_redirect: (to: string): string => `Branch was successfully renamed to ${to}.`,
+  rename_branch_failed_exist: (name: string): string => `Cannot rename branch because target branch ${name} exists.`, // "repo.settings.rename_branch_failed_exist"
+  rename_branch_failed_not_exist: (name: string): string => `Cannot rename branch ${name} because it does not exist.`, // "repo.settings.rename_branch_failed_not_exist"
+  rename_default_or_protected_branch_error: "Only admins can rename default or protected branches.", // "repo.branch.rename_default_or_protected_branch_error"
+  rename_protected_branch_failed: "Failed to rename branch due to branch protection rules.", // "repo.branch.rename_protected_branch_failed"
 } as const;
 
 /** Upstream `setting.Git.BranchesRangeSize` (modules/setting/git.go:45). */
@@ -1174,13 +1250,66 @@ export function BranchesPagination(props: { basePath: string; keyword: string; p
   );
 }
 
-/** The flash block (the display-only-param reduction — `?deleted=` /
- *  `?delete_error=&name=` carry upstream DeleteBranchPost's texts; the
- *  restore arms ride `?restored=` / `?restore_error=already_exists|failed
- *  &name=` — RestoreBranchPost's texts, the same convention). The restore
- *  params are OPTIONAL so the current index.ts call site compiles
- *  unchanged; the orchestrator's fold wires the two reads (the module
- *  header's HANDOFF). */
+/** One flash banner — RenderFlashMessage's exact DOM at the pin
+ *  (modules/templates/util_render.go:263-294, base/alert.tmpl:1-4): error
+ *  maps to `negative` and success to `positive` ("legacy logic"), the class
+ *  pair `flash-message flash-{error|success}` rides along, and a single-line
+ *  message gets the `tw-text-center` wrapper (every message this page
+ *  carries is single-line). Every flash the branches family renders goes
+ *  through the ONE surface — list.tmpl:5's `{{template "base/alert" .}}`,
+ *  the container's first child — there are no inline error arms on this
+ *  page. */
+function FlashBanner(props: { kind: "error" | "success"; text: string }) {
+  const cls = props.kind === "error" ? "negative" : "positive"; // RenderFlashMessage's legacy mapping
+  return (
+    <div class={`ui ${cls} message flash-message flash-${props.kind}`}>
+      <div class="tw-text-center">{props.text}</div>
+    </div>
+  );
+}
+
+/** The flash block (the display-only-param reduction — the four landed
+ *  writers' kinds, keyed per upstream's own flash calls):
+ *
+ * - delete: `?deleted={name}` (DeleteBranchPost's Flash.Success
+ *   repo.branch.deletion_success) / `?delete_error={default|protected|
+ *   failed}&name=` (its JSONError texts).
+ * - restore: `?restored={name}` (RestoreBranchPost's Flash.Success
+ *   repo.branch.restore_success) / `?restore_error=already_exists|failed
+ *   &name=` (its JSONError texts; the protected-name push refusal folds
+ *   into `failed` — no dedicated key upstream).
+ * - create: `?created={name}` (CreateBranch's Flash.Success
+ *   repo.branch.create_success) / `?create_error={empty|missing|exists|
+ *   error}&name=` — `empty` is the ctx.HasError → GetErrMsg arm
+ *   (form.require_error over the form's raw field name), `exists` its
+ *   repo.branch.branch_already_exists arm; `missing`/`error` render
+ *   NOTHING — upstream answers those states with the RepoRefByType 404
+ *   middleware and ctx.ServerError respectively, neither of which flashes
+ *   any text, and an invented banner would be a divergence (the write
+ *   arm's ghost-redirect reduction stays the module header's disclosure).
+ * - rename: `?renamed={to}` (RenameBranchPost's Flash.Success
+ *   repo.settings.rename_branch_success — upstream interpolates (from, to);
+ *   the redirect carries the target only, so the from-name is absent from
+ *   the rendered message — the display-param budget's disclosed reduction) /
+ *   `?rename_error={empty|missing|exists|default|protected}&name={from}`:
+ *   `empty` the HasError arm ("From cannot be empty." when the carried
+ *   from-name is empty — the binding's first error is the struct's first
+ *   field — else "To cannot be empty."), `missing` the
+ *   from_not_exist → repo.settings.rename_branch_failed_not_exist(from),
+ *   `exists` the target_exist → repo.settings.rename_branch_failed_exist
+ *   (upstream interpolates form.To; the redirect carries from — the
+ *   from==to arm is exact, the colliding-target arm discloses the same
+ *   budget reduction), `default` the ErrUserDoesNotHaveAccessToRepo →
+ *   repo.branch.rename_default_or_protected_branch_error (upstream's shared
+ *   message covers BOTH admin arms — the default and the exact-named rule —
+ *   GT's landed "default" flash kind), `protected` the ErrBranchIsProtected
+ *   → repo.branch.rename_protected_branch_failed (the onto-protected and
+ *   the wildcard-matched arms' shared message).
+ *
+ * The create/rename params are OPTIONAL so the current index.ts call site
+ * compiles unchanged; the orchestrator's fold wires the four reads (the
+ * restore params' two-stage convention). Until the fold the arms render
+ * from direct GET params — the render half is fully live. */
 export interface BranchesFlashParams {
   deleted: string | null;
   errorKind: string | null;
@@ -1191,29 +1320,85 @@ export interface BranchesFlashParams {
    *  failure arms (the protected-name refusal folds into `failed`, the
    *  module's mapping). */
   restoreError?: string | null;
+  /** `?created={name}` — CreateBranch's create_success flash. */
+  created?: string | null;
+  /** `?create_error={empty|missing|exists|error}&name={name}` — `missing`
+   *  and `error` render nothing (upstream's 404/ServerError postures carry
+   *  no flash text). */
+  createError?: string | null;
+  /** `?renamed={to}` — the rename_branch_success flash (the target only;
+   *  see the block doc for the from-name disclosure). */
+  renamed?: string | null;
+  /** `?rename_error={empty|missing|exists|default|protected}&name={from}` —
+   *  the five rename refusal kinds, keyed per upstream's flash calls. */
+  renameError?: string | null;
 }
 
 export function BranchesFlash(props: BranchesFlashParams) {
+  // The delete family (the landed order — success first per family, the
+  // convention the display-param reduction landed with).
   if (props.deleted !== null) {
-    return <div class="ui info message">{branchesLocale.deletion_success(props.deleted)}</div>;
+    return <FlashBanner kind="success" text={branchesLocale.deletion_success(props.deleted)} />;
   }
   if (props.errorKind === "default") {
-    return <div class="ui negative message">{branchesLocale.default_deletion_failed(props.errorName)}</div>;
+    return <FlashBanner kind="error" text={branchesLocale.default_deletion_failed(props.errorName)} />;
   }
   if (props.errorKind === "protected") {
-    return <div class="ui negative message">{branchesLocale.protected_deletion_failed(props.errorName)}</div>;
+    return <FlashBanner kind="error" text={branchesLocale.protected_deletion_failed(props.errorName)} />;
   }
   if (props.errorKind === "failed") {
-    return <div class="ui negative message">{branchesLocale.deletion_failed(props.errorName)}</div>;
+    return <FlashBanner kind="error" text={branchesLocale.deletion_failed(props.errorName)} />;
   }
+  // The restore family.
   if (props.restored != null && props.restored !== "") {
-    return <div class="ui info message">{branchesLocale.restore_success(props.restored)}</div>;
+    return <FlashBanner kind="success" text={branchesLocale.restore_success(props.restored)} />;
   }
   if (props.restoreError === "already_exists") {
-    return <div class="ui negative message">{branchesLocale.already_exists(props.errorName)}</div>;
+    return <FlashBanner kind="error" text={branchesLocale.already_exists(props.errorName)} />;
   }
   if (props.restoreError === "failed") {
-    return <div class="ui negative message">{branchesLocale.restore_failed(props.errorName)}</div>;
+    return <FlashBanner kind="error" text={branchesLocale.restore_failed(props.errorName)} />;
+  }
+  // The create family.
+  if (props.created != null && props.created !== "") {
+    return <FlashBanner kind="success" text={branchesLocale.create_success(props.created)} />;
+  }
+  if (props.createError === "empty") {
+    return <FlashBanner kind="error" text={branchesLocale.create_empty} />;
+  }
+  if (props.createError === "exists") {
+    return <FlashBanner kind="error" text={branchesLocale.branch_already_exists(props.errorName)} />;
+  }
+  // `create_error=missing` / `=error`: upstream's RepoRefByType 404 and
+  // ctx.ServerError arms — no flash text exists upstream for either state;
+  // silence IS the parity answer (the block doc).
+  // The rename family.
+  if (props.renamed != null && props.renamed !== "") {
+    // The exact two-name message when a from-name rides along (a future
+    // fold's &name={from}); the target-only reduction otherwise (the
+    // success redirect structurally carries no from-name — the locale note).
+    const text =
+      props.errorName !== ""
+        ? branchesLocale.rename_branch_success(props.errorName, props.renamed)
+        : branchesLocale.rename_branch_success_redirect(props.renamed);
+    return <FlashBanner kind="success" text={text} />;
+  }
+  if (props.renameError === "empty") {
+    // The binding's first error answers the struct's first empty field:
+    // an empty carried from-name means From failed; otherwise To did.
+    return <FlashBanner kind="error" text={props.errorName === "" ? branchesLocale.rename_empty_from : branchesLocale.rename_empty_to} />;
+  }
+  if (props.renameError === "missing") {
+    return <FlashBanner kind="error" text={branchesLocale.rename_branch_failed_not_exist(props.errorName)} />;
+  }
+  if (props.renameError === "exists") {
+    return <FlashBanner kind="error" text={branchesLocale.rename_branch_failed_exist(props.errorName)} />;
+  }
+  if (props.renameError === "default") {
+    return <FlashBanner kind="error" text={branchesLocale.rename_default_or_protected_branch_error} />;
+  }
+  if (props.renameError === "protected") {
+    return <FlashBanner kind="error" text={branchesLocale.rename_protected_branch_failed} />;
   }
   return null;
 }
@@ -1242,7 +1427,7 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
   return (
     <BaseLayout ctx={ctx} title={branchesLocale.page_title} pageClass="ui repository branches" activeTab="code">
       <div class="ui container">
-        <BranchesFlash deleted={props.flash.deleted} errorKind={props.flash.errorKind} errorName={props.flash.errorName} />
+        <BranchesFlash deleted={props.flash.deleted} errorKind={props.flash.errorKind} errorName={props.flash.errorName} restored={props.flash.restored} restoreError={props.flash.restoreError} created={props.flash.created} createError={props.flash.createError} renamed={props.flash.renamed} renameError={props.flash.renameError} />
 
         {/* --- The Default Branch section (list.tmpl:7-77) --- */}
         <h4 class="ui top attached header">
