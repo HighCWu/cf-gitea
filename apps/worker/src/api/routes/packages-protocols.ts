@@ -118,7 +118,12 @@ import {
 import { getPackageProperties } from "../../services/packages/protocol-common";
 import { PackageSizeMismatchError, PackageBlobTooLargeError, packageBlobContentKey } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
-import { contentDispositionAttachment, serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
+import {
+  encodeContentDisposition,
+  goPathBase,
+  serveFileHeaderSet,
+  servePackageFileResponse,
+} from "../../services/packages/serve-content";
 import {
   PypiFormError,
   PypiHashMismatchError,
@@ -1519,7 +1524,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         status: 200,
         headers: {
           "content-type": "application/pgp-keys",
-          "content-disposition": contentDispositionAttachment("repository.key"),
+          "content-disposition": encodeContentDisposition("attachment", goPathBase("repository.key")),
         },
       });
     } catch (error) {
@@ -1658,7 +1663,10 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         status: 200,
         headers: {
           "content-type": "application/x-pem-file",
-          "content-disposition": contentDispositionAttachment(`${owner.usernameLower}@${key.fingerprint}.rsa.pub`),
+          "content-disposition": encodeContentDisposition(
+            "attachment",
+            goPathBase(`${owner.usernameLower}@${key.fingerprint}.rsa.pub`),
+          ),
         },
       });
     } catch (error) {
@@ -1815,7 +1823,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
             status: 200,
             headers: {
               "content-type": "application/pgp-keys",
-              "content-disposition": contentDispositionAttachment("repository.key"),
+              "content-disposition": encodeContentDisposition("attachment", goPathBase("repository.key")),
             },
           });
         }
@@ -4362,7 +4370,6 @@ function rubygemsEmptyDetail(status: 404 | 501): Response {
  *  (serve.go:87-94), and NO Last-Modified (a zero ServeHeaderOptions time —
  *  serve.go:101-104's skip). */
 function rubygemsArchiveResponse(filename: string, body: Uint8Array): Response {
-  const base = filename.slice(filename.lastIndexOf("/") + 1);
   return new Response(body.slice(), {
     status: 200,
     headers: {
@@ -4370,7 +4377,7 @@ function rubygemsArchiveResponse(filename: string, body: Uint8Array): Response {
       "x-content-type-options": "nosniff",
       "content-security-policy": "sandbox allow-scripts allow-modals allow-popups allow-downloads",
       "cache-control": "max-age=0, private, must-revalidate",
-      "content-disposition": contentDispositionAttachment(base),
+      "content-disposition": encodeContentDisposition("attachment", goPathBase(filename)),
       "access-control-expose-headers": "Content-Disposition",
     },
   });

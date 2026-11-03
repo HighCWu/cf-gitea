@@ -1,20 +1,34 @@
 /**
- * The file-download serving seam (parity review §3 / D-6). Upstream's
- * `helper.ServePackageFile` → `ctx.ServeContent`
- * (services/context/base.go:186-190) is two steps:
+ * The file-download serving seam (parity review §3 / D-6) — the port of
+ * upstream's `helper.ServePackageFile` → `ctx.ServeContent`
+ * (services/context/base.go:186-190), CONSOLIDATED onto the shared serve
+ * pipeline (`src/web/attachments-serving.ts`, the serve.go port): the header
+ * SET and the Content-Disposition encoding ride that module's exports
+ * (`serveSetHeaders`, `encodeContentDisposition`, `goPathBase`) — the same
+ * ServeSetHeaders (serve.go:77-105) family the web attachments route, the API
+ * blob GET, and the archive ride — instead of this module's former private
+ * copy (the copy's derivation drifts are recorded in the test battery).
  *
- *  1. `httplib.ServeSetHeaders` (modules/httplib/serve.go:77-95) — the
- *     Content-Type/nosniff/CSP block (serveSetHeaderContentRelated,
- *     serve.go:56-75), the attachment disposition with the RFC 5987
- *     `filename*` twin (content_disposition.go:47-67 over Go's
- *     mime.FormatMediaType), the `Access-Control-Expose-Headers` echo, the
- *     `max-age=0, private, must-revalidate` Cache-Control
- *     (httpcache.go:23-38, the prod posture packages never override), and
- *     Last-Modified from the file row;
- *  2. Go `net/http` ServeContent's precondition + range machinery
- *     (RFC 7232 §6 / RFC 7233): If-Match / If-Unmodified-Since / If-None-Match
- *     / If-Modified-Since → 412/304, If-Range gating, `Accept-Ranges: bytes`,
- *     single-range 206 + Content-Range, 416 for non-overlapping ranges.
+ * What remains here is the packages arm upstream genuinely separates:
+ *
+ *  1. The packages-specific INPUTS — the registry's own Content-Type override
+ *     (maven's jar/xml pair maven.go:206-214, swift's "text/x-swift", the
+ *     debian/alpine/rpm key arms) and the file row's created time — are
+ *     carried by the callers and fed through the shared table: the CSP branch
+ *     (serve.go:62-73) keys off the resolved type, the zero value floors to
+ *     application/octet-stream (serve.go:58), and the disposition word is
+ *     ServeSetHeaders' IfZero ATTACHMENT default (serve.go:91). The routes'
+ *     own permission/quota arms (protocolContext, the sentinels) stay at the
+ *     callers, exactly where upstream separates them.
+ *  2. The BYTE-SERVING machinery of Go net/http's ServeContent (RFC 7232 §6 /
+ *     RFC 7233): If-Match / If-Unmodified-Since / If-None-Match /
+ *     If-Modified-Since → 412/304, If-Range gating, `Accept-Ranges: bytes`,
+ *     single-range 206 + Content-Range, 416 for non-overlapping ranges. This
+ *     is deliberately NOT the web attachment chain
+ *     (HandleGenericETagPrivateCache + ServeUserContentByFile): upstream
+ *     packages never sniffs and never runs that machinery — conflating the
+ *     two would change the wire (sniffed types, INLINE disposition, ETag 304s
+ *     packages never emits).
  *
  * Package files carry NO ETag upstream (review §3: "none on files"), so
  * `If-None-Match` only ever matches the `*` wildcard and specific tags fall
@@ -26,98 +40,29 @@
  * minimal-range posture upstream's own ServeUserContentByReader takes for
  * UI-served files (serve.go ServeUserContentByReader: "no support for
  * multiple range").
+ *
+ * The date validation mirrors the shared module's Go time.Parse port
+ * (parseHttpTimeFormat — strict IMF-fixdate, range-checked: "31 Feb 2024"
+ * errors where JS `Date.parse` silently rolls over into March). It is a
+ * LOCAL MIRROR only because the shared module does not export that helper
+ * yet — the export hunk is reported to the orchestrator; once it lands this
+ * helper folds to the import (the two tables are byte-identical decisions).
  */
 
-/** `application/octet-stream` — typesniffer.MimeTypeApplicationOctetStream (serve.go:60). */
-const DEFAULT_CONTENT_TYPE = "application/octet-stream";
+import { encodeContentDisposition, goPathBase, serveSetHeaders } from "../../web/attachments-serving";
 
 // ---------------------------------------------------------------------------
-// Content-Disposition — content_disposition.go over mime.FormatMediaType
+// ServeSetHeaders — the shared pipeline's header set (serve.go:56-105 +
+// httpcache.go:23-38), fed with the packages-specific inputs
 // ---------------------------------------------------------------------------
-
-/** `needsEncodingRune` (content_disposition.go:18-20): outside printable ASCII, tab exempt. */
-function needsEncodingRune(char: string): boolean {
-  const code = char.codePointAt(0) ?? 0;
-  return (code < 0x20 || code > 0x7e) && code !== 0x09;
-}
-
-/** RFC 2045 tspecials — the characters that bar a value from the bare-token form. */
-const T_SPECIALS = new Set([...`()<>@,;:\\"/[]?=`]);
-
-function isTokenChar(char: string): boolean {
-  const code = char.codePointAt(0) ?? 0;
-  return code > 0x20 && code < 0x7f && !T_SPECIALS.has(char);
-}
-
-/** The mime.FormatMediaType value forms, verified against the Go oracle:
- *  a token renders bare, any other printable+tab value renders quoted with
- *  backslash escapes, and anything else takes the RFC 2231 ext-value form. */
-function formatMediaTypeValue(value: string): string {
-  const chars = Array.from(value);
-  if (chars.every(isTokenChar)) return value;
-  if (chars.every((char) => char === "\t" || (char.codePointAt(0) ?? 0) >= 0x20 && (char.codePointAt(0) ?? 0) <= 0x7e)) {
-    return `"${value.replace(/[\\"]/g, "\\$&")}"`;
-  }
-  return `utf-8''${encodeRfc5987(value)}`;
-}
-
-/** RFC 5987 ext-value: attr-chars stay raw, every other UTF-8 byte pct-encodes
- *  (uppercase hex — the Go oracle's `%C3%BC` / `%7F` / `%3A` spellings). */
-function encodeRfc5987(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let out = "";
-  for (const byte of bytes) {
-    const char = String.fromCharCode(byte);
-    if (isTokenChar(char)) {
-      out += char;
-    } else {
-      out += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
-    }
-  }
-  return out;
-}
-
-/**
- * `encodeContentDisposition(ContentDispositionAttachment, …)`
- * (content_disposition.go:47-67): the safe name (non-printables → `_`,
- * tab exempt) renders in the bare/quoted token form, and when the ORIGINAL
- * name carried any non-printable rune the `; filename*=utf-8''…` twin of the
- * original joins it. Go's guard clause (the mime-package panic arm) is
- * unreachable in the port by construction.
- */
-export function contentDispositionAttachment(filename: string): string {
-  const safeName = Array.from(filename)
-    .map((char) => (needsEncodingRune(char) ? "_" : char))
-    .join("");
-  let result = `attachment; filename=${formatMediaTypeValue(safeName)}`;
-  if (Array.from(filename).some(needsEncodingRune)) {
-    result += `; filename*=utf-8''${encodeRfc5987(filename)}`;
-  }
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// ServeSetHeaders — serve.go:56-95 + httpcache.go:23-38
-// ---------------------------------------------------------------------------
-
-/** The upstream CSP constants (serve.go:32-45). */
-const CSP_DEFAULT = "sandbox allow-scripts allow-modals allow-popups allow-downloads";
-const CSP_PDF = "default-src 'none'; style-src 'unsafe-inline'";
-
-/** `serveSetHeaderContentRelated` (serve.go:56-75): nosniff + the CSP branch
- *  on the EFFECTIVE content type (pdf → the render-sandbox variant,
- *  audio/video → no CSP at all, everything else → the sandbox default). */
-function contentSecurityPolicy(contentType: string): string | null {
-  if (contentType.startsWith("application/pdf")) return CSP_PDF;
-  if (contentType.startsWith("video/") || contentType.startsWith("audio/")) return null;
-  return CSP_DEFAULT;
-}
 
 export interface ServeFileHeaderOptions {
   /** Unset = no disposition and no expose-headers echo (the maven HEAD
    *  posture, maven.go:216-219 — SetServeHeaders runs before Filename lands). */
   filename?: string;
-  /** Defaults to application/octet-stream. */
+  /** The registry's own override (maven's jar/xml, swift's text/x-swift, the
+   *  key arms' pgp-keys/pem); unset/"" floors to application/octet-stream
+   *  (serve.go:58) inside the shared table. */
   contentType?: string;
   size: number;
   /** The file row's creation time → Last-Modified. */
@@ -125,31 +70,74 @@ export interface ServeFileHeaderOptions {
 }
 
 /**
- * `ServeSetHeaders` (serve.go:77-95): the header SET every package-file
- * download carries. Cache-Control is the prod posture
- * (`max-age=0, private, must-revalidate` — packages never set IsPublic or a
- * MaxAge, httpcache.go:31-35); the dev X-Gitea-Debug variant has no
- * RUN_MODE counterpart here. Last-Modified renders http.TimeFormat
- * (JS `toUTCString` is the same RFC 1123 GMT shape). `path.Base` runs before
- * the disposition encoding (serve.go:87).
+ * `ServeSetHeaders` (serve.go:77-105) through the shared pipeline: the header
+ * SET every package-file download carries — nosniff, the CSP branch on the
+ * resolved type, the ATTACHMENT disposition over `path.Base(filename)`
+ * (serve.go:92) with the RFC 2231 `filename*` twin (content_disposition.go),
+ * the `Access-Control-Expose-Headers` echo, the zero-duration Cache-Control
+ * prod posture (`max-age=0, private, must-revalidate`, httpcache.go:31-35 —
+ * packages never set IsPublic or a MaxAge), Content-Length, and Last-Modified
+ * from the file row.
  */
 export function serveFileHeaderSet(opts: ServeFileHeaderOptions): Record<string, string> {
-  const contentType = opts.contentType === undefined || opts.contentType === "" ? DEFAULT_CONTENT_TYPE : opts.contentType;
-  const headers: Record<string, string> = {
-    "content-type": contentType,
-    "x-content-type-options": "nosniff",
-    "content-length": String(opts.size),
-    "cache-control": "max-age=0, private, must-revalidate",
-    "last-modified": opts.created.toUTCString(),
-  };
-  const csp = contentSecurityPolicy(contentType);
-  if (csp !== null) headers["content-security-policy"] = csp;
-  if (opts.filename !== undefined && opts.filename !== "") {
-    const base = opts.filename.slice(opts.filename.lastIndexOf("/") + 1);
-    headers["content-disposition"] = contentDispositionAttachment(base);
-    headers["access-control-expose-headers"] = "Content-Disposition";
-  }
-  return headers;
+  return serveSetHeaders({
+    filename: opts.filename,
+    contentType: opts.contentType,
+    contentLength: opts.size,
+    lastModified: opts.created,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The strict HTTP-date validation — the local mirror of the shared module's
+// Go time.Parse port (fold to the import once parseHttpTimeFormat is
+// exported; see the module note)
+// ---------------------------------------------------------------------------
+
+/** Strict IMF-fixdate (Go's http.TimeFormat layout) — other legal HTTP date
+ *  spellings fail time.Parse upstream and must fail here too. */
+const IMF_FIXDATE_RE = /^([A-Z][a-z]{2}), (\d{2}) ([A-Z][a-z]{2}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
+const SHORT_MONTHS: Record<string, number> = {
+  Jan: 0,
+  Feb: 1,
+  Mar: 2,
+  Apr: 3,
+  May: 4,
+  Jun: 5,
+  Jul: 6,
+  Aug: 7,
+  Sep: 8,
+  Oct: 9,
+  Nov: 10,
+  Dec: 11,
+};
+const SHORT_DAYS = new Set(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]);
+
+/**
+ * Go time.Parse(http.TimeFormat, …) — the fixdate shape AND Go's range
+ * validation: the weekday one of the seven shorts, the month a real short
+ * name, the day in range for that month (leap years included — "31 Feb 2024"
+ * errors upstream, where JS Date.parse would silently roll over), hour ≤ 23,
+ * minute/second ≤ 59. Returns epoch ms.
+ */
+function parseHttpTimeFormat(value: string): number | null {
+  const match = IMF_FIXDATE_RE.exec(value);
+  if (match === null) return null;
+  const dayName = match[1] ?? "";
+  const month = SHORT_MONTHS[match[3] ?? ""];
+  if (!SHORT_DAYS.has(dayName) || month === undefined) return null;
+  const day = Number(match[2]);
+  const year = Number(match[4]);
+  const hour = Number(match[5]);
+  const minute = Number(match[6]);
+  const second = Number(match[7]);
+  if (hour > 23 || minute > 59 || second > 59 || day < 1) return null;
+  if (day > new Date(Date.UTC(year, month + 1, 0)).getUTCDate()) return null;
+  // Date.UTC maps years 0-99 onto 1900+y — setUTCFullYear keeps them literal.
+  const date = new Date(0);
+  date.setUTCFullYear(year, month, day);
+  date.setUTCHours(hour, minute, second, 0);
+  return date.getTime();
 }
 
 // ---------------------------------------------------------------------------
@@ -162,13 +150,6 @@ export type ByteServingPlan =
   | { kind: "precondition-failed" }
   | { kind: "range-unsatisfiable"; contentRange: string | null; message: string }
   | { kind: "serve"; status: 200 | 206; start: number; length: number; contentRange: string | null };
-
-/** Go's ParseTime is lenient over the three HTTP date forms; the requests
- *  these registries see are RFC 1123 (what Last-Modified itself renders). */
-function parseHttpDate(value: string): number | null {
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? null : parsed;
-}
 
 /** `scanETag` (net/http/fs.go): a `W/"…"` / `"…"` token over the etag-octet
  *  alphabet, closed by the terminal quote; null on any garbage. */
@@ -254,9 +235,13 @@ function parseSingleRange(header: string, size: number): ByteRange[] | "invalid"
  * `checkPreconditions` + the range arm of `serveContent`
  * (net/http/fs.go, RFC 7232 §6): the exact Go order — If-Match, then
  * If-Unmodified-Since (only in If-Match's absence), then If-None-Match
- * (whose presence SUPPRESSES If-Modified-Since), then If-Range gating the
- * Range header. Second-truncation of the modtime mirrors Go's
- * `modtime.Truncate(time.Second)`.
+ * (whose presence SUPPRESSES If-Modified-Since — including an EMPTY-valued
+ * If-None-Match, which `Header.Get` reports as "" and therefore still
+ * consults If-Modified-Since, exactly like the shared module's gate), then
+ * If-Range gating the Range header. Second-truncation of the modtime mirrors
+ * Go's `modtime.Truncate(time.Second)`; the date validation is Go
+ * time.Parse-exact (the strict fixdate parser above — a rolled "31 Feb" must
+ * not 304/412 where Go serves 200).
  */
 export function planByteServing(request: Request, size: number, created: Date): ByteServingPlan {
   const method = request.method;
@@ -272,7 +257,7 @@ export function planByteServing(request: Request, size: number, created: Date): 
   } else {
     const ifUnmodifiedSince = headers.get("If-Unmodified-Since") ?? "";
     if (ifUnmodifiedSince !== "") {
-      const date = parseHttpDate(ifUnmodifiedSince);
+      const date = parseHttpTimeFormat(ifUnmodifiedSince);
       if (date !== null && modSec > Math.floor(date / 1000)) return { kind: "precondition-failed" };
     }
   }
@@ -286,7 +271,7 @@ export function planByteServing(request: Request, size: number, created: Date): 
   } else if (isGetOrHead) {
     const ifModifiedSince = headers.get("If-Modified-Since") ?? "";
     if (ifModifiedSince !== "") {
-      const date = parseHttpDate(ifModifiedSince);
+      const date = parseHttpTimeFormat(ifModifiedSince);
       if (date !== null && modSec <= Math.floor(date / 1000)) return { kind: "not-modified" };
     }
   }
@@ -298,7 +283,7 @@ export function planByteServing(request: Request, size: number, created: Date): 
     const ifRange = headers.get("If-Range") ?? "";
     if (ifRange !== "") {
       const asEtag = scanEtag(ifRange);
-      const date = asEtag === null ? parseHttpDate(ifRange) : null;
+      const date = asEtag === null ? parseHttpTimeFormat(ifRange) : null;
       if (asEtag !== null || date === null || Math.floor(date / 1000) !== modSec) rangeHeader = "";
     }
   }
@@ -383,10 +368,10 @@ export function sliceByteRange(
 }
 
 /**
- * The composed `ctx.ServeContent` (base.go:186-190): ServeSetHeaders first,
- * then the precondition/range machinery. `body === null` is the HEAD arm —
- * Go's server discards the handler's writes for HEAD while the status and
- * headers (including a 304/206 outcome) stand.
+ * The composed `ctx.ServeContent` (base.go:186-190): ServeSetHeaders first —
+ * through the shared pipeline — then the precondition/range machinery.
+ * `body === null` is the HEAD arm — Go's server discards the handler's writes
+ * for HEAD while the status and headers (including a 304/206 outcome) stand.
  */
 export function servePackageFileResponse(
   request: Request,
@@ -437,3 +422,15 @@ export function servePackageFileResponse(
   const out = plan.status === 206 ? sliceByteRange(body, plan.start, plan.length) : body;
   return new Response(out, { status: plan.status, headers: serving });
 }
+
+// ---------------------------------------------------------------------------
+// Re-exports for the packages route files' DIRECT disposition sites (the
+// debian/alpine/rpm repository-key arms build bare two-header responses where
+// upstream rides ctx.ServeContent — the consolidation keeps their wire shape
+// but routes the encoding through the shared table, so a bare-key download
+// cannot drift from the family again). The canonical seam is the direct
+// import (archive.ts / actions-artifacts.ts precedent); this re-export keeps
+// the packages routes' single import line.
+// ---------------------------------------------------------------------------
+
+export { encodeContentDisposition, goPathBase };

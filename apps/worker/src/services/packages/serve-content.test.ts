@@ -1,22 +1,26 @@
 /**
- * The serve-content unit battery (parity review D-6): the port of upstream's
- * modules/httplib serve.go + content_disposition.go + httpcache.go and the
- * net/http ServeContent precondition/range subset. The disposition table
- * mirrors upstream's own TestContentDisposition
+ * The serve-content unit battery (parity review D-6): the packages arm of
+ * upstream's ctx.ServeContent — base.go:186-190 = ServeSetHeaders +
+ * net/http ServeContent's precondition/range subset. CONSOLIDATED onto the
+ * shared serve pipeline (src/web/attachments-serving.ts, GP's serve.go
+ * port): the header set rides `serveSetHeaders`, the disposition encoding
+ * rides `encodeContentDisposition` + `goPathBase` — this battery pins that
+ * the PACKAGES path carries the SAME decision table (the equivalence pin),
+ * plus the byte shapes of upstream's own TestContentDisposition
  * (modules/httplib/content_disposition_test.go) attachment-flavored, byte for
- * byte; the conditional/range arms pin Go's checkPreconditions + parseRange
- * wire shapes (the ETag-less package file: only `If-None-Match: *` matches).
+ * byte. MOVED PINS (the consolidation): the plain-object header keys are the
+ * canonical MIME spellings the shared table emits — Go writes exactly those
+ * via header.Set (serve.go:59-104); the wire is unchanged (Headers
+ * normalize). The conditional/range arms pin Go's checkPreconditions +
+ * parseRange wire shapes (the ETag-less package file: only `If-None-Match: *`
+ * matches), including the strict Go time.Parse date validation (a rolled
+ * "31 Feb" must not 304/412) and the empty-If-None-Match gate.
  */
 
 import { describe, expect, it } from "vitest";
 
-import {
-  contentDispositionAttachment,
-  planByteServing,
-  serveFileHeaderSet,
-  servePackageFileResponse,
-  sliceByteRange,
-} from "./serve-content";
+import { encodeContentDisposition, goPathBase, serveSetHeaders } from "../../web/attachments-serving";
+import { planByteServing, serveFileHeaderSet, servePackageFileResponse, sliceByteRange } from "./serve-content";
 
 const CREATED = new Date("2026-10-29T12:00:00Z");
 const CREATED_RFC1123 = "Thu, 29 Oct 2026 12:00:00 GMT";
@@ -24,38 +28,44 @@ const request = (headers: Record<string, string> = {}, method = "GET"): Request 
   new Request("https://example.com/x", { method, headers });
 
 // ---------------------------------------------------------------------------
-// contentDispositionAttachment — content_disposition.go:47-67
+// the shared disposition through the packages path — content_disposition.go
+// (the upstream TestContentDisposition table), byte-identical to the former
+// private copy
 // ---------------------------------------------------------------------------
 
-describe("contentDispositionAttachment (the upstream TestContentDisposition table)", () => {
+describe("encodeContentDisposition attachment word (the upstream TestContentDisposition table)", () => {
   it("renders token-safe names bare and leaves ASCII names twin-free", () => {
-    expect(contentDispositionAttachment("test.txt")).toBe("attachment; filename=test.txt");
-    expect(contentDispositionAttachment("mytool-1.0.0.tar.gz")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("test.txt"))).toBe("attachment; filename=test.txt");
+    expect(encodeContentDisposition("attachment", goPathBase("mytool-1.0.0.tar.gz"))).toBe(
       "attachment; filename=mytool-1.0.0.tar.gz",
     );
-    expect(contentDispositionAttachment('"test.txt')).toBe('attachment; filename="\\"test.txt"');
-    expect(contentDispositionAttachment("hello\tworld.txt")).toBe('attachment; filename="hello\tworld.txt"');
+    expect(encodeContentDisposition("attachment", goPathBase('"test.txt'))).toBe(
+      'attachment; filename="\\"test.txt"',
+    );
+    expect(encodeContentDisposition("attachment", goPathBase("hello\tworld.txt"))).toBe(
+      'attachment; filename="hello\tworld.txt"',
+    );
   });
 
   it("pairs the safe name with the RFC 5987 filename* twin for non-ASCII names", () => {
-    expect(contentDispositionAttachment("test❌.txt")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("test❌.txt"))).toBe(
       "attachment; filename=test_.txt; filename*=utf-8''test%E2%9D%8C.txt",
     );
-    expect(contentDispositionAttachment("test ❌.txt")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("test ❌.txt"))).toBe(
       'attachment; filename="test _.txt"; filename*=utf-8\'\'test%20%E2%9D%8C.txt',
     );
     // The unicode-name package shape from the review gate: `ü` → `_` quoted-side,
     // pct-encoded twin over the UTF-8 bytes (uppercase hex).
-    expect(contentDispositionAttachment("nü-tool-1.0.pkg")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("nü-tool-1.0.pkg"))).toBe(
       "attachment; filename=n_-tool-1.0.pkg; filename*=utf-8''n%C3%BC-tool-1.0.pkg",
     );
   });
 
   it("encodes control runes and keeps the quoted tab verbatim", () => {
-    expect(contentDispositionAttachment("hello\nworld.txt")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("hello\nworld.txt"))).toBe(
       "attachment; filename=hello_world.txt; filename*=utf-8''hello%0Aworld.txt",
     );
-    expect(contentDispositionAttachment("hello\rworld.txt")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("hello\rworld.txt"))).toBe(
       "attachment; filename=hello_world.txt; filename*=utf-8''hello%0Dworld.txt",
     );
   });
@@ -63,51 +73,102 @@ describe("contentDispositionAttachment (the upstream TestContentDisposition tabl
   it("percent-encodes every non-attr-char byte, uppercase hex", () => {
     // The safe name still carries spaces/colons → the quoted form; the twin
     // encodes the ORIGINAL runes.
-    expect(contentDispositionAttachment("café steep: ü.pkg")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("café steep: ü.pkg"))).toBe(
       'attachment; filename="caf_ steep: _.pkg"; filename*=utf-8\'\'caf%C3%A9%20steep%3A%20%C3%BC.pkg',
     );
-    expect(contentDispositionAttachment("del\u007f.txt")).toBe(
+    expect(encodeContentDisposition("attachment", goPathBase("del\u007f.txt"))).toBe(
       "attachment; filename=del_.txt; filename*=utf-8''del%7F.txt",
+    );
+  });
+
+  it("carries the consolidation's drift closures the former private copy lacked", () => {
+    // Go's RFC 2045 bitmap EXCLUDES { } from the token set (grammar.go — the
+    // printable non-tspecials c1d91fd's shared-port fix pinned) → the
+    // quoted-string arm; the former packages copy bare-tokened them.
+    expect(encodeContentDisposition("attachment", goPathBase("a{b}.txt"))).toBe(
+      'attachment; filename="a{b}.txt"',
+    );
+    expect(encodeContentDisposition("attachment", goPathBase("{leading}.bin"))).toBe(
+      'attachment; filename="{leading}.bin"',
+    );
+    // The RFC 2231 ext-value is an attr-char walk: '*', "'" and '%' are
+    // NOT attr-chars (content_disposition.go's byte checks) — the former
+    // copy's isTokenChar-based walk kept them raw. The safe names stay
+    // bare tokens ('*', "'", '%' are IN Go's token bitmap).
+    expect(encodeContentDisposition("attachment", goPathBase("a*b✓.txt"))).toBe(
+      "attachment; filename=a*b_.txt; filename*=utf-8''a%2Ab%E2%9C%93.txt",
+    );
+    expect(encodeContentDisposition("attachment", goPathBase("it's✓.txt"))).toBe(
+      "attachment; filename=it's_.txt; filename*=utf-8''it%27s%E2%9C%93.txt",
+    );
+    expect(encodeContentDisposition("attachment", goPathBase("50%✓.txt"))).toBe(
+      "attachment; filename=50%_.txt; filename*=utf-8''50%25%E2%9C%93.txt",
+    );
+    // path.Base cuts at the serve site (serve.go:92) — a slash-carrying name
+    // serves its final element (the former copy's lastIndexOf reduction
+    // agrees here; goPathBase also carries Go's trailing-slash/'' edges).
+    expect(encodeContentDisposition("attachment", goPathBase("pkg/dir/kit-1.0.tgz"))).toBe(
+      "attachment; filename=kit-1.0.tgz",
     );
   });
 });
 
 // ---------------------------------------------------------------------------
-// serveFileHeaderSet — serve.go:56-95 + httpcache.go:23-38
+// serveFileHeaderSet — the shared ServeSetHeaders table (serve.go:56-105 +
+// httpcache.go:23-38) fed with the packages inputs
 // ---------------------------------------------------------------------------
 
 describe("serveFileHeaderSet", () => {
   it("mounts the full upstream set for a named file", () => {
     const headers = serveFileHeaderSet({ filename: "test.txt", size: 7, created: CREATED });
-    expect(headers["content-type"]).toBe("application/octet-stream");
-    expect(headers["x-content-type-options"]).toBe("nosniff");
-    expect(headers["content-security-policy"]).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
-    expect(headers["cache-control"]).toBe("max-age=0, private, must-revalidate");
-    expect(headers["content-length"]).toBe("7");
-    expect(headers["last-modified"]).toBe(CREATED_RFC1123);
-    expect(headers["content-disposition"]).toBe("attachment; filename=test.txt");
-    expect(headers["access-control-expose-headers"]).toBe("Content-Disposition");
+    expect(headers["Content-Type"]).toBe("application/octet-stream");
+    expect(headers["X-Content-Type-Options"]).toBe("nosniff");
+    expect(headers["Content-Security-Policy"]).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(headers["Cache-Control"]).toBe("max-age=0, private, must-revalidate");
+    expect(headers["Content-Length"]).toBe("7");
+    expect(headers["Last-Modified"]).toBe(CREATED_RFC1123);
+    expect(headers["Content-Disposition"]).toBe("attachment; filename=test.txt");
+    expect(headers["Access-Control-Expose-Headers"]).toBe("Content-Disposition");
+  });
+
+  it("IS the shared table's output — the consolidation equivalence pin", () => {
+    // The packages path rides attachments-serving's serveSetHeaders verbatim;
+    // this pin makes any future drift between the seams a test failure.
+    expect(serveFileHeaderSet({ filename: "pkg.bin", size: 7, created: CREATED })).toEqual(
+      serveSetHeaders({ filename: "pkg.bin", contentLength: 7, lastModified: CREATED }),
+    );
+    // The registry's Content-Type override (maven's jar, swift's
+    // text/x-swift, the key arms' pgp-keys) is the same table's type entry.
+    expect(serveFileHeaderSet({ filename: "k.pkg", size: 1, created: CREATED, contentType: "application/pgp-keys" })).toEqual(
+      serveSetHeaders({ filename: "k.pkg", contentLength: 1, lastModified: CREATED, contentType: "application/pgp-keys" }),
+    );
   });
 
   it("omits the disposition and the expose echo when no filename rides (maven HEAD)", () => {
     const headers = serveFileHeaderSet({ size: 7, created: CREATED, contentType: "application/java-archive" });
-    expect(headers["content-type"]).toBe("application/java-archive");
-    expect(headers["content-disposition"]).toBeUndefined();
-    expect(headers["access-control-expose-headers"]).toBeUndefined();
-    expect(headers["cache-control"]).toBe("max-age=0, private, must-revalidate");
-    expect(headers["x-content-type-options"]).toBe("nosniff");
+    expect(headers["Content-Type"]).toBe("application/java-archive");
+    expect(headers["Content-Disposition"]).toBeUndefined();
+    expect(headers["Access-Control-Expose-Headers"]).toBeUndefined();
+    expect(headers["Cache-Control"]).toBe("max-age=0, private, must-revalidate");
+    expect(headers["X-Content-Type-Options"]).toBe("nosniff");
   });
 
   it("branches the CSP on the content type (pdf variant, audio/video bare)", () => {
-    expect(serveFileHeaderSet({ size: 1, created: CREATED, contentType: "application/pdf" })["content-security-policy"]).toBe(
+    expect(serveFileHeaderSet({ size: 1, created: CREATED, contentType: "application/pdf" })["Content-Security-Policy"]).toBe(
       "default-src 'none'; style-src 'unsafe-inline'",
     );
     expect(
-      serveFileHeaderSet({ size: 1, created: CREATED, contentType: "audio/mpeg" })["content-security-policy"],
+      serveFileHeaderSet({ size: 1, created: CREATED, contentType: "audio/mpeg" })["Content-Security-Policy"],
     ).toBeUndefined();
     expect(
-      serveFileHeaderSet({ size: 1, created: CREATED, contentType: "video/mp4" })["content-security-policy"],
+      serveFileHeaderSet({ size: 1, created: CREATED, contentType: "video/mp4" })["Content-Security-Policy"],
     ).toBeUndefined();
+  });
+
+  it("cuts the disposition through path.Base (serve.go:92)", () => {
+    expect(
+      serveFileHeaderSet({ filename: "a/b/kit-1.0.tgz", size: 1, created: CREATED })["Content-Disposition"],
+    ).toBe("attachment; filename=kit-1.0.tgz");
   });
 });
 
@@ -135,6 +196,28 @@ describe("planByteServing", () => {
     expect(planByteServing(request({ "If-Modified-Since": "not a date" }), 10, CREATED)).toEqual(serve);
   });
 
+  it("dates are Go time.Parse-strict — a rolled '31 Feb' must not 304/412", () => {
+    // JS Date.parse rolls Feb 31 into March; Go time.Parse errors and the
+    // precondition is ignored (condNone) — serve 200 in every arm.
+    expect(planByteServing(request({ "If-Modified-Since": "Wed, 31 Feb 2024 00:00:00 GMT" }), 10, CREATED)).toEqual(
+      serve,
+    );
+    expect(planByteServing(request({ "If-Unmodified-Since": "Wed, 31 Feb 2024 00:00:00 GMT" }), 10, CREATED)).toEqual(
+      serve,
+    );
+    // A garbage If-Range date drops the range (Go's checkIfRange condNone).
+    expect(planByteServing(request({ Range: "bytes=2-", "If-Range": "Wed, 31 Feb 2024 00:00:00 GMT" }), 10, CREATED)).toEqual(
+      serve,
+    );
+    // Out-of-range day/time components fail the same way.
+    expect(planByteServing(request({ "If-Modified-Since": "Thu, 00 Oct 2026 00:00:00 GMT" }), 10, CREATED)).toEqual(
+      serve,
+    );
+    expect(planByteServing(request({ "If-Modified-Since": "Thu, 29 Oct 2026 24:00:00 GMT" }), 10, CREATED)).toEqual(
+      serve,
+    );
+  });
+
   it("If-None-Match: * matches the ETag-less file; specific tags never do", () => {
     expect(planByteServing(request({ "If-None-Match": "*" }), 10, CREATED)).toEqual({ kind: "not-modified" });
     expect(planByteServing(request({ "If-None-Match": `"abc"` }), 10, CREATED)).toEqual(serve);
@@ -143,6 +226,15 @@ describe("planByteServing", () => {
     expect(planByteServing(request({ "If-None-Match": "*" }, "POST"), 10, CREATED)).toEqual({
       kind: "precondition-failed",
     });
+  });
+
+  it("an EMPTY-valued If-None-Match still consults If-Modified-Since (Header.Get semantics)", () => {
+    // The shared pipeline's gate (GP's predecessor-defect fix, httpcache.go
+    // :102-104) on the packages path: Header.Get reports an empty value as
+    // "" — indistinguishable from absent on the IMS gate.
+    expect(
+      planByteServing(request({ "If-None-Match": "", "If-Modified-Since": CREATED_RFC1123 }), 10, CREATED),
+    ).toEqual({ kind: "not-modified" });
   });
 
   it("a present If-None-Match suppresses If-Modified-Since (RFC 7232 §6)", () => {

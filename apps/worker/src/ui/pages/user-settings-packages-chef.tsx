@@ -37,7 +37,7 @@
  *     `content-security-policy` (serve.go:56-75 — not pdf/audio/video),
  *     `content-disposition: attachment; filename=…` (ContentDisposition
  *     zero → attachment, serve.go:91; path.Base + mime encoding over the
- *     landed contentDispositionAttachment port), the
+ *     shared encodeContentDisposition port), the
  *     `access-control-expose-headers` echo (serve.go:93), `cache-control:
  *     max-age=0, private, must-revalidate` (httpcache.go:31-35 — zero
  *     MaxAge, not public), NO `last-modified` (upstream passes no
@@ -133,7 +133,7 @@
  * route harness).
  */
 
-import { contentDispositionAttachment } from "../../services/packages/serve-content";
+import { encodeContentDisposition, goPathBase } from "../../services/packages/serve-content";
 import {
   generateChefKeyPair,
   getChefPublicPem,
@@ -220,9 +220,9 @@ export function chefKeypairDownloadResponse(username: string, privatePem: string
       "x-content-type-options": "nosniff",
       "content-security-policy": "sandbox allow-scripts allow-modals allow-popups allow-downloads",
       // ServeSetHeaders' filename arm (serve.go:90-93): ContentDisposition
-      // zero → attachment; path.Base + the mime encoding ride the landed
-      // contentDispositionAttachment port (the Go-oracle-verified shape).
-      "content-disposition": contentDispositionAttachment(`${username}.priv`),
+      // zero → attachment; path.Base + the mime encoding ride the shared
+      // encodeContentDisposition port (the Go-oracle-verified shape).
+      "content-disposition": encodeContentDisposition("attachment", goPathBase(`${username}.priv`)),
       "access-control-expose-headers": "Content-Disposition",
       // SetCacheControlInHeader (httpcache.go:31-35): CacheDuration zero,
       // IsPublic false — the prod posture.
