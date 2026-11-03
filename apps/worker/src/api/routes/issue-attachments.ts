@@ -7,9 +7,9 @@ import { z } from "zod";
 
 import { IssueNotExistError } from "../../issues/errors";
 import { issueAttachments, comments, issues } from "../../db/schema";
-// The serve-site basename cut — the single httplib port copy (web/
-// attachments-serving owns the encodeContentDisposition path.Base family).
-import { encodeContentDisposition, goPathBase } from "../../web/attachments-serving";
+// The serve pipeline (web/attachments-serving — the single httplib port
+// copy: sniffed content type + the shared disposition word + the header set).
+import { serveUserContent } from "../../web/attachments-serving";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { attachmentSchema } from "../models/release";
@@ -1304,24 +1304,31 @@ export function registerIssueAttachmentRoutes(
       .update(issueAttachments)
       .set({ downloadCount: sql`${issueAttachments.downloadCount} + 1` })
       .where(eq(issueAttachments.id, row.id));
-    // path.Base at serve (modules/httplib/serve.go:92, ServeSetHeaders) — a
-    // stored name carrying "/" serves its final element only — then the
-    // Go-exact Content-Disposition composition (content_disposition.go:47-65:
-    // the safe-name arm plus the RFC 2231 filename* twin ONLY when a rune
-    // needed masking; the former hand-roll emitted both arms always, masked
-    // differently, spelled the charset `UTF-8''` and rode encodeURIComponent's
-    // inverted class). The DISPOSITION WORD stays "attachment" (upstream's
-    // ServeUserContentByReader/serveSetHeadersByUserContent pipeline sniffs
-    // and defaults inline for non-SVG — a serve-pipeline divergence recorded
-    // for the serve unit, not an escaper byte); serve.go:93's expose-headers
-    // companion rides too.
-    const servedName = goPathBase(row.name);
-    return c.newResponse(object.body, 200, {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": String(object.size),
-      "Content-Disposition": encodeContentDisposition("attachment", servedName),
-      "Access-Control-Expose-Headers": "Content-Disposition",
-      ETag: object.httpEtag,
+    // The serve pipeline ride (web/attachments-serving serveUserContent —
+    // ServeUserContentByReader minus the Range arm, serve.go:148-175): the
+    // sniffed content type (browsable mime / forced text/plain + the utf-8
+    // charset arm / the octet-stream floor, serve.go:116-127) and the SHARED
+    // disposition word — INLINE by default (serve.go:135-141), with the only
+    // download arm an SVG attachment under a disabled ENABLE_RENDER (dead at
+    // the frozen default, setting/ui.go:120-124). The former hardcoded
+    // "attachment" word + application/octet-stream pair was the pre-pipeline
+    // divergence this seam recorded "for the serve unit" — that unit is this
+    // wiring. The same header set carries nosniff, the sandbox CSP
+    // (octet-stream/text are neither pdf nor audio/video), the zero-duration
+    // prod Cache-Control (httpcache.go:29-31), expose-headers
+    // (serve.go:93), path.Base over the stored name (serve.go:92) and the
+    // R2 uploaded instant as Last-Modified (the ByFile mtime, serve.go:238).
+    // The dropped `ETag: object.httpEtag` had no upstream basis: the ETag/
+    // 304 pair lives in the route handlers' pre-serve cache call
+    // (attachment.go:226-228 — `"<uuid>"` on the site route), not in the
+    // serve pipeline itself (serve.go:148-240); this worker-internal relay
+    // GET rides the pipeline only. (The platform types R2 stream elements as
+    // `any`; the wire contract is bytes.)
+    const { headers, body } = await serveUserContent(object.body as ReadableStream<Uint8Array>, {
+      filename: row.name,
+      contentLength: object.size,
+      lastModified: object.uploaded,
     });
+    return c.newResponse(body, 200, headers);
   });
 }

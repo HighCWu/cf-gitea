@@ -761,8 +761,18 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     const got = await makeApp()(blobUrl);
     expect(got.status).toBe(200);
     expect(new Uint8Array(await got.arrayBuffer())).toEqual(payload);
-    expect(got.headers.get("Content-Type")).toBe("application/octet-stream");
-    expect(got.headers.get("Content-Disposition")).toContain("relay.bin");
+    // the serve-pipeline ride (web/attachments-serving serveUserContent —
+    // ServeUserContentByReader, serve.go:148-175): the sniffed content type
+    // (serve.go:116-127 — ASCII text forces bare "text/plain" + the utf-8
+    // charset arm) and the SHARED disposition word — INLINE (serve.go:135-141;
+    // the former hardcoded "attachment" + octet-stream pair moved this wave
+    // to the pipeline). The header set also carries nosniff, the sandbox CSP
+    // and the zero-duration Cache-Control.
+    expect(got.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(got.headers.get("Content-Disposition")).toBe("inline; filename=relay.bin");
+    expect(got.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(got.headers.get("Content-Security-Policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(got.headers.get("Cache-Control")).toBe("max-age=0, private, must-revalidate");
     expect(await drizzle(env.DB).select().from(issueAttachments).then((rows) => rows[0]?.downloadCount)).toBe(1);
     const again = await makeApp()(blobUrl);
     expect(again.status).toBe(200);
@@ -798,8 +808,11 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     expect(got.status).toBe(200);
     // The Go-exact composition (content_disposition.go:47-65): a token-safe
     // name emits the SINGLE unquoted token arm — the former hand-roll always
-    // emitted both arms with an uppercase charset (the disclosed pin move).
-    expect(got.headers.get("Content-Disposition")).toBe(`attachment; filename=relay.bin`);
+    // emitted both arms with an uppercase charset (the disclosed pin move) —
+    // and the WORD is the sniff pipeline's INLINE default (serve.go:135-141;
+    // the text payload resolves text/plain → the SVG-disabled download arm
+    // cannot fire), not the former hardcoded "attachment" (moved this wave).
+    expect(got.headers.get("Content-Disposition")).toBe(`inline; filename=relay.bin`);
   });
 
   it("an accented stored name masks the safe arm and appends the lowercase RFC 2231 twin (the Go bytes)", async () => {
@@ -824,9 +837,11 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     const got = await makeApp()(blobUrl);
     expect(got.status).toBe(200);
     // getSafeName masks é→_ (quotes: () are printable non-token → quoted arm,
-    // riding raw inside the quotes); the twin re-encodes the RAW name.
+    // riding raw inside the quotes); the twin re-encodes the RAW name. The
+    // word is the pipeline's INLINE (the text payload's resolved type;
+    // serve.go:135-141 — moved from the former hardcoded "attachment").
     expect(got.headers.get("Content-Disposition")).toBe(
-      `attachment; filename="rapport (final)_.bin"; filename*=utf-8''rapport%20%28final%29%C3%A9.bin`,
+      `inline; filename="rapport (final)_.bin"; filename*=utf-8''rapport%20%28final%29%C3%A9.bin`,
     );
   });
 

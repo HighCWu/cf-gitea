@@ -39,7 +39,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import { buildArchive, parseArchiveName, resolveArchiveRef } from "../services/archive";
 import { engineReads, refTipMap } from "../services/engine";
 import { requireVisibleRepo } from "../services/repo-access";
-import { encodeContentDisposition } from "../../web/attachments-serving";
+import { handleGenericEtagPrivateCache, serveSetHeaders } from "../../web/attachments-serving";
 
 const notFoundResponse = {
   description: "notFound",
@@ -97,20 +97,54 @@ async function serveArchive(c: Context<ApiEnv>, owner: string, repo: string, arc
   const origin = new URL(c.req.url).origin;
   const ownerEnc = encodeURIComponent(pair.repo.ownerNamespace);
   const slugEnc = encodeURIComponent(pair.repo.slug);
-  const contentType = parsed.format === "zip" ? "application/zip" : "application/gzip";
-  // ServeSetHeaders with the attachment default (archiver.go:374 → serve.go:
-  // 88-94 → content_disposition.go:47-65): the downloadName carries the REF
-  // short name (slashes already dashed), which legally contains `"`/`\`/non-
-  // ASCII — the raw quoted interpolation was header-breakable there; the
-  // Go-exact composition masks per getSafeName and adds the RFC 2231 twin
-  // only when encoding is needed.
+  const link = `<${origin}/api/v1/repos/${ownerEnc}/${slugEnc}/archive/${commit.oid}.${parsed.format}?rev=${commit.oid}>; rel="immutable"`;
+
+  // The pre-serve weak-ETag cache arm (archiver.go:367-373): the path-less
+  // stream ride only — `W/"%s-%s-%t"` over CommitID, ArchiveType.String()
+  // (the bare extension: "tar.gz"/"zip", models/repo/archiver.go:40-48) and
+  // PrefixArchiveFiles (default TRUE, modules/setting/repository.go:153; our
+  // downloadName always prefixes, so the %t arm is the constant "true").
+  // Upstream sets the ETag into the ResponseWriter on BOTH paths (:89), the
+  // 304 returning before anything else — so the miss path's ServeSetHeaders
+  // must carry it too (the serve headers never touch ETag), exactly like the
+  // attachment router's pass-through. The miss path's private-static
+  // Cache-Control (httpcache.go:115) is immediately overwritten by the serve
+  // headers (serve.go:96-99). Upstream sets the Link header BEFORE the cache
+  // handler, so its 304 carries ETag + Link.
+  let weakEtag: string | undefined;
+  if (subPaths.length === 0) {
+    weakEtag = `W/"${commit.oid}-${parsed.format}-true"`;
+    const cached = handleGenericEtagPrivateCache(c.req.raw, weakEtag, null);
+    if (cached !== null) {
+      cached.headers.set("Link", link);
+      return cached;
+    }
+  }
+
+  // ServeSetHeaders' zero-option form — archiver.go:374
+  // `ServeSetHeaders(ctx.Resp, ServeHeaderOptions{Filename: downloadName})`;
+  // the non-stream arm rides ctx.ServeContent (base.go:176-180), which calls
+  // the same ServeSetHeaders and thereby pre-empts http.ServeContent's own
+  // extension sniff with the same already-set type. So Content-Type is the
+  // IfZero application/octet-stream floor (serve.go:58) — NOT
+  // application/gzip|application/zip (the former hardcoded pair, moved this
+  // wave to the pin). The disposition word is ServeSetHeaders' IfZero
+  // ATTACHMENT default (serve.go:91) — upstream's own word at this site, not
+  // the sniffed INLINE pipeline the attachment byte-serves ride; the
+  // downloadName (REF slashes already dashed) legally carries `"`/`\`/non-
+  // ASCII, and the Go-exact composition masks per getSafeName with the RFC
+  // 2231 twin only when encoding is needed (content_disposition.go:47-65),
+  // cut at path.Base inside serveSetHeaders (serve.go:92). The same header
+  // set carries nosniff (serve.go:60), the sandbox CSP (serve.go:62-73 —
+  // octet-stream is neither pdf nor audio/video), expose-headers (:93) and
+  // the zero-duration prod Cache-Control (:96-99 → httpcache.go:29-31).
+  // No Content-Length (upstream passes none while streaming) and no
+  // Last-Modified in this arm (:374 passes none; the non-stream arm's file
+  // mtime belongs to storage this route does not touch).
+  const headers = serveSetHeaders({ filename: stream.downloadName, etag: weakEtag ?? null });
   return new Response(stream.body, {
     status: 200,
-    headers: {
-      "Content-Type": contentType,
-      "Content-Disposition": encodeContentDisposition("attachment", stream.downloadName),
-      Link: `<${origin}/api/v1/repos/${ownerEnc}/${slugEnc}/archive/${commit.oid}.${parsed.format}?rev=${commit.oid}>; rel="immutable"`,
-    },
+    headers: { ...headers, Link: link },
   });
 }
 

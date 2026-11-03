@@ -267,7 +267,50 @@ function ifNoneMatchMatches(header: string, etag: string): boolean {
 
 /** Strict IMF-fixdate (Go's http.TimeFormat layout) — other legal HTTP dates
  *  fail time.Parse upstream and must fail here too. */
-const IMF_FIXDATE_RE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+const IMF_FIXDATE_RE = /^([A-Z][a-z]{2}), (\d{2}) ([A-Z][a-z]{2}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
+const SHORT_MONTHS: Record<string, number> = {
+  Jan: 0,
+  Feb: 1,
+  Mar: 2,
+  Apr: 3,
+  May: 4,
+  Jun: 5,
+  Jul: 6,
+  Aug: 7,
+  Sep: 8,
+  Oct: 9,
+  Nov: 10,
+  Dec: 11,
+};
+const SHORT_DAYS = new Set(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]);
+
+/**
+ * Go time.Parse(http.TimeFormat, …) — the fixdate shape AND Go's range
+ * validation: the weekday must be one of the seven shorts (time.Parse's
+ * lookup, though it never cross-checks the weekday against the date), the
+ * month a real short name, the day in range for that month (leap years
+ * included — "31 Feb 2024" errors upstream, where JS Date.parse would
+ * silently roll over), hour ≤ 23, minute/second ≤ 59. Returns epoch ms.
+ */
+function parseHttpTimeFormat(value: string): number | null {
+  const match = IMF_FIXDATE_RE.exec(value);
+  if (match === null) return null;
+  const dayName = match[1] ?? "";
+  const month = SHORT_MONTHS[match[3] ?? ""];
+  if (!SHORT_DAYS.has(dayName) || month === undefined) return null;
+  const day = Number(match[2]);
+  const year = Number(match[4]);
+  const hour = Number(match[5]);
+  const minute = Number(match[6]);
+  const second = Number(match[7]);
+  if (hour > 23 || minute > 59 || second > 59 || day < 1) return null;
+  if (day > new Date(Date.UTC(year, month + 1, 0)).getUTCDate()) return null;
+  // Date.UTC maps years 0-99 onto 1900+y — setUTCFullYear keeps them literal.
+  const date = new Date(0);
+  date.setUTCFullYear(year, month, day);
+  date.setUTCHours(hour, minute, second, 0);
+  return date.getTime();
+}
 
 /**
  * handleGenericETagTimeCache's decision (httpcache.go:87-117): returns the
@@ -288,12 +331,15 @@ function genericEtagTimeCache(
     return new Response(null, { status: 304, headers });
   }
   // "A recipient MUST ignore If-Modified-Since if the request contains an
-  // If-None-Match header field" (httpcache.go:102-104).
-  if (lastModified !== null && ifNoneMatch === null) {
+  // If-None-Match header field" (httpcache.go:102-104) — upstream's gate is
+  // `Header.Get("If-None-Match") == ""`, so an EMPTY-VALUED If-None-Match
+  // still consults If-Modified-Since (Headers.get returns "" for it here,
+  // indistinguishable from absent on this platform).
+  if (lastModified !== null && (ifNoneMatch === null || ifNoneMatch === "")) {
     const ifModifiedSince = request.headers.get("if-modified-since");
-    if (ifModifiedSince !== null && IMF_FIXDATE_RE.test(ifModifiedSince)) {
-      const since = Date.parse(ifModifiedSince);
-      if (!Number.isNaN(since) && Math.floor(lastModified.getTime() / 1000) <= Math.floor(since / 1000)) {
+    if (ifModifiedSince !== null) {
+      const since = parseHttpTimeFormat(ifModifiedSince);
+      if (since !== null && Math.floor(lastModified.getTime() / 1000) <= Math.floor(since / 1000)) {
         return new Response(null, { status: 304, headers });
       }
     }
@@ -302,6 +348,18 @@ function genericEtagTimeCache(
   // (httpcache.go:115); the serve headers below overwrite it, so the value
   // never reaches the wire — the const is the documented intermediate.
   return null;
+}
+
+/**
+ * HandleGenericETagPrivateCache (httpcache.go:81-83) — the public wrapper the
+ * route handlers call before the serve pipeline (the site attachment route,
+ * routers/web/repo/attachment.go:226-228, and the archive stream arm,
+ * services/repository/archiver.go:369-373 with its weak `W/"commit-type-…"`
+ * etag). Returns the 304 response when handled; the caller then also carries
+ * whatever headers it had already set upstream-style (the archive's Link).
+ */
+export function handleGenericEtagPrivateCache(request: Request, etag: string, lastModified: Date | null): Response | null {
+  return genericEtagTimeCache(request, etag, lastModified);
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +837,197 @@ function detectEncodingUtf8(content: Uint8Array): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// The serve pipeline (modules/httplib/serve.go) — the SHARED serve decision
+// every byte-serving consumer rides: this module's site router, the API
+// issue-attachment blob GET (routes/issue-attachments.ts) and the archive
+// download (routes/archive.ts). Two entry points mirror upstream's split:
+//   - serveSetHeaders — ServeSetHeaders (serve.go:77-105): the caller-resolved
+//     Content-Type (octet-stream floor) + the IfZero ATTACHMENT disposition
+//     default; the shape the archive ride uses (archiver.go:374).
+//   - serveUserContentHeaders — serveSetHeadersByUserContent (serve.go:107-144):
+//     the sniffed Content-Type + the INLINE default (the SVG-disabled arm is
+//     the only download word); the shape the attachment/blob rides use
+//     (ServeUserContentByReader/ByFile).
+// The exact header set each emits (cite: serve.go lines):
+//   Content-Type (:59, octet-stream floor :58), X-Content-Type-Options: nosniff
+//   (:60), Content-Security-Policy (:62-73 — sandbox default :44, the PDF
+//   variant :50, DELETED for video/*|audio/*), Content-Length (:87-89),
+//   Content-Disposition over path.Base(filename) (:90-92),
+//   Access-Control-Expose-Headers: Content-Disposition (:93), Cache-Control
+//   via SetCacheControlInHeader (:96-99 — prod zero-duration form
+//   "max-age=0, private, must-revalidate", httpcache.go:29-39), Last-Modified
+//   (:101-104). The gzhttp no-compression hint (:80-83) is upstream's internal
+//   contract with its gzip wrapper — not emitted (no gzip wrapper on Workers;
+//   Cloudflare compresses at the edge); MimeTypeMap (serve.go:110-114) is
+//   disabled by default — skipped.
+// ---------------------------------------------------------------------------
+
+/** typesniffer.MimeTypeApplicationOctetStream — serveSetHeaderContentRelated's
+ *  IfZero floor (serve.go:58) and serveSetHeadersByUserContent's fallback
+ *  (:125). */
+export const MIME_APPLICATION_OCTET_STREAM = MIME_TYPE_OCTET_STREAM;
+
+export interface ServeSetHeadersOptions {
+  /** path.Base-cut at serve (serve.go:92); empty/undefined → no
+   *  Content-Disposition / expose-headers pair (serve.go:90-94). */
+  filename?: string;
+  /** "" / undefined → the octet-stream floor (serve.go:58). */
+  contentType?: string;
+  /** undefined → ServeSetHeaders' IfZero default ATTACHMENT (serve.go:91). */
+  contentDisposition?: ContentDispositionType;
+  contentLength?: number | null;
+  /** Pass-through of the pre-serve cache handler's ETag (not part of
+   *  upstream's ServeSetHeaders — its callers run HandleGenericETag*
+   *  BEFORE, which sets it on both the 304 and the miss-then-serve paths). */
+  etag?: string | null;
+  cacheIsPublic?: boolean;
+  cacheDurationSeconds?: number;
+  lastModified?: Date | null;
+}
+
+/** SetCacheControlInHeader's prod shapes (httpcache.go:29-39): MaxAge 0 →
+ *  "max-age=0, private, must-revalidate" (IsPublic ignored), else
+ *  `<public|private>, max-age=N`. */
+function cacheControlHeader(isPublic: boolean, durationSeconds: number): string {
+  if (durationSeconds === 0) {
+    return SERVE_CACHE_CONTROL;
+  }
+  return `${isPublic ? "public" : "private"}, max-age=${durationSeconds}`;
+}
+
+/** serveSetHeaderContentRelated (serve.go:56-74) folded into ServeSetHeaders
+ *  (serve.go:77-105) — one function emitting the exact header set. */
+export function serveSetHeaders(options: ServeSetHeadersOptions = {}): Record<string, string> {
+  const headers: Record<string, string> = {};
+
+  const contentType =
+    options.contentType === undefined || options.contentType === ""
+      ? MIME_APPLICATION_OCTET_STREAM
+      : options.contentType;
+  headers["Content-Type"] = contentType;
+  headers["X-Content-Type-Options"] = "nosniff";
+  // CSP class by resolved type prefix (serve.go:62-73); audio/video DELETES
+  // the header ("Gitea <= 1.25 behavior", serve.go:52-53).
+  const csp = contentType.startsWith("application/pdf")
+    ? CSP_PDF
+    : contentType.startsWith("video/") || contentType.startsWith("audio/")
+      ? null
+      : CSP_SANDBOX;
+  if (csp !== null) {
+    headers["Content-Security-Policy"] = csp;
+  }
+
+  if (options.contentLength !== undefined && options.contentLength !== null) {
+    headers["Content-Length"] = String(options.contentLength);
+  }
+  if (options.filename !== undefined && options.filename !== "") {
+    const word = options.contentDisposition ?? "attachment";
+    headers["Content-Disposition"] = encodeContentDisposition(word, goPathBase(options.filename));
+    headers["Access-Control-Expose-Headers"] = "Content-Disposition";
+  }
+
+  headers["Cache-Control"] = cacheControlHeader(
+    options.cacheIsPublic ?? false,
+    options.cacheDurationSeconds ?? 0,
+  );
+  if (options.etag !== undefined && options.etag !== null) {
+    headers["ETag"] = options.etag;
+  }
+  if (options.lastModified !== undefined && options.lastModified !== null) {
+    headers["Last-Modified"] = options.lastModified.toUTCString();
+  }
+  return headers;
+}
+
+/**
+ * serve.go:135-141's disposition decision over the RESOLVED content type
+ * (serveSetHeadersByUserContent reads it back through
+ * typesniffer.FromContentType): INLINE, with the SVG image type demoted to
+ * ATTACHMENT only when SVG rendering is DISABLED (setting.UI.SVG.Enabled /
+ * ENABLE_RENDER, default TRUE, modules/setting/ui.go:120-124 — the XSS
+ * boundary: a disabled site serves SVGs as downloads, an enabled one
+ * sandboxes them inline via the CSP). `svgRenderEnabled` is the setting
+ * surface for pinning both arms; every route rides the frozen default.
+ */
+export function contentDispositionWord(contentType: string, svgRenderEnabled: boolean = SVG_RENDER_ENABLED): ContentDispositionType {
+  return contentType.includes(MIME_TYPE_IMAGE_SVG) && !svgRenderEnabled ? "attachment" : "inline";
+}
+
+export interface ServeUserContentHeadersOptions {
+  /** The sniff window — ServeUserContentByReader's 1024-byte pre-read
+   *  (serve.go:146, :152-161). */
+  prefix: Uint8Array;
+  filename: string;
+  contentLength?: number;
+  etag?: string;
+  cacheIsPublic?: boolean;
+  cacheDurationSeconds?: number;
+  lastModified?: Date | null;
+}
+
+/** serveSetHeadersByUserContent (serve.go:107-144): resolve the content type
+ *  from the sniff window (browsable binary keeps its mime :117-119; text is
+ *  forced to bare "text/plain" — never render user HTML as a page :120-123 —
+ *  plus the DetectEncoding utf-8 fast path :129-133; everything else the
+ *  octet-stream floor :125), then the disposition decision over the resolved
+ *  type, then the ServeSetHeaders header set. */
+export function serveUserContentHeaders(options: ServeUserContentHeadersOptions): Record<string, string> {
+  const sniffed = detectContentType(options.prefix);
+  let contentType: string;
+  if (sniffed.isBrowsableBinaryType()) {
+    contentType = sniffed.getMimeType();
+  } else if (sniffed.isText()) {
+    // intentionally not the sniffed text/* type — user HTML must not render
+    // as a page (serve.go:120-123)
+    contentType = "text/plain";
+    const charset = detectEncodingUtf8(options.prefix);
+    if (charset !== null) {
+      contentType += `; charset=${charset}`;
+    }
+  } else {
+    contentType = MIME_APPLICATION_OCTET_STREAM;
+  }
+  return serveSetHeaders({
+    filename: options.filename,
+    contentType,
+    contentDisposition: contentDispositionWord(contentType),
+    contentLength: options.contentLength,
+    etag: options.etag,
+    cacheIsPublic: options.cacheIsPublic,
+    cacheDurationSeconds: options.cacheDurationSeconds,
+    lastModified: options.lastModified,
+  });
+}
+
+/**
+ * ServeUserContentByReader's serving core (serve.go:148-175) minus the
+ * minimal Range arm — the landed divergence (bodies stream whole from R2, the
+ * avatar-serving precedent; upstream's 206 shape is a separate parity unit):
+ * the 1024-byte pre-read feeds the sniffed headers, then the prefix is
+ * re-attached ahead of the untouched tail (io.MultiReader, :164) so the body
+ * streams exactly as stored.
+ */
+export async function serveUserContent(
+  body: ReadableStream<Uint8Array>,
+  options: {
+    filename: string;
+    contentLength?: number;
+    etag?: string;
+    lastModified?: Date | null;
+  },
+): Promise<{ headers: Record<string, string>; body: ReadableStream<Uint8Array> }> {
+  const { prefix, rest } = await prefixAndRest(body, MIME_DETECTION_BUFFER_LEN);
+  const headers = serveUserContentHeaders({
+    prefix,
+    filename: options.filename,
+    contentLength: options.contentLength,
+    etag: options.etag,
+    lastModified: options.lastModified,
+  });
+  return { headers, body: rest === null ? streamOf(prefix) : prependPrefix(prefix, rest) };
+}
+
+// ---------------------------------------------------------------------------
 // Serving resolution
 // ---------------------------------------------------------------------------
 
@@ -1199,63 +1448,23 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
     return respond(cached);
   }
 
-  // 11. ServeUserContentByFile (serve.go:232-240) — sniff, headers, stream.
-  // (The platform types R2 stream elements as `any`; the wire contract is
-  // bytes — the landed cast discipline, routes/issue-attachments.ts.)
-  const { prefix, rest } = await prefixAndRest(
-    object.body as ReadableStream<Uint8Array>,
-    MIME_DETECTION_BUFFER_LEN,
-  );
-  const sniffed = detectContentType(prefix);
-  let contentType: string;
-  if (sniffed.isBrowsableBinaryType()) {
-    contentType = sniffed.getMimeType();
-  } else if (sniffed.isText()) {
-    // intentionally not the sniffed text/* type — user HTML must not render
-    // as a page (serve.go:120-123)
-    contentType = "text/plain";
-    const charset = detectEncodingUtf8(prefix);
-    if (charset !== null) {
-      contentType += `; charset=${charset}`;
-    }
-  } else {
-    contentType = MIME_TYPE_OCTET_STREAM;
-  }
-  // ContentDisposition default (serve.go:135-141): INLINE; the only
-  // attachment arm is SVG-with-render-disabled (default enabled → dead arm,
-  // kept as the constant's complement).
-  const dispositionType: ContentDispositionType =
-    SVG_RENDER_ENABLED || !sniffed.isSvgImage() ? "inline" : "attachment";
-  // path.Base at serve (modules/httplib/serve.go:92) — a stored name carrying
-  // "/" serves its final element only.
-  const disposition = encodeContentDisposition(dispositionType, goPathBase(resolved.row.name));
-
-  const headers: Record<string, string> = {
-    // SetCacheControlInHeader (serve.go:96-99) overwrites the etag handler's
-    // value — the ETag pair revalidates every time.
-    "Cache-Control": SERVE_CACHE_CONTROL,
-    ETag: etag,
-    "Content-Type": contentType,
-    "X-Content-Type-Options": "nosniff",
-    "Content-Length": String(object.size),
-    "Content-Disposition": disposition,
-    "Access-Control-Expose-Headers": "Content-Disposition",
-    // The FILE mtime (serve.go:238) overwrites the CreatedUnix value.
-    "Last-Modified": object.uploaded.toUTCString(),
-  };
-  const csp = contentType.startsWith("application/pdf")
-    ? CSP_PDF
-    : contentType.startsWith("video/") || contentType.startsWith("audio/")
-      ? null
-      : CSP_SANDBOX;
-  if (csp !== null) {
-    headers["Content-Security-Policy"] = csp;
-  }
+  // 11. ServeUserContentByFile (serve.go:232-240) — the SHARED serve
+  // pipeline (this router, the API blob GET and the archive ride the same
+  // decision table: sniffed content type, the INLINE default with the dead
+  // SVG arm, nosniff/CSP, the zero-duration cache form, path.Base +
+  // encodeContentDisposition over the stored name). (The platform types R2
+  // stream elements as `any`; the wire contract is bytes — the landed cast
+  // discipline, routes/issue-attachments.ts.)
+  const { headers, body } = await serveUserContent(object.body as ReadableStream<Uint8Array>, {
+    filename: resolved.row.name,
+    contentLength: object.size,
+    etag,
+    lastModified: object.uploaded,
+  });
 
   if (c.req.method === "HEAD") {
     return respond(new Response(null, { status: 200, headers }));
   }
-  const body = rest === null ? streamOf(prefix) : prependPrefix(prefix, rest);
   return respond(new Response(body, { status: 200, headers }));
 });
 
@@ -1265,22 +1474,23 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
 // disabled — the default — web.go:79-82 explicitly denies every OPTIONS with
 // bare 405 "to avoid the next GET/POST handler being incorrectly called by
 // the OPTIONS request", i.e. a preflight must not re-run the download and
-// double-count it). The house 405 shape (index.ts's methodNotAllowed twin,
-// replicated module-locally like issue-write-tails.ts): empty body + Allow.
+// double-count it). Upstream's deny writes ONLY the status —
+// `w.WriteHeader(http.StatusMethodNotAllowed)`, no Allow header, no body —
+// unlike the chi 405 twin below, which sets Allow.
 // ---------------------------------------------------------------------------
-attachmentsServingRouter.on(["OPTIONS"], "/attachments/:uuid", () =>
-  new Response(null, { status: 405, headers: { allow: "GET, OPTIONS" } }),
-);
+attachmentsServingRouter.on(["OPTIONS"], "/attachments/:uuid", () => new Response(null, { status: 405 }));
 
 // ---------------------------------------------------------------------------
 // POST-class verbs on /attachments/{uuid} — chi's method-mismatch arm
 // (web.go:912 registers the path for `Methods("GET, OPTIONS")` ONLY, so any
 // other verb misses every method-specific handler and chi answers its
 // MethodNotAllowed — 405, never the 404 an unregistered path would take).
-// The uncovered mutators (POST/PUT/DELETE/PATCH — POST the observed
-// residual: a bare POST previously fell to Hono's 404) ride the same house
-// 405 shape as the OPTIONS twin above: empty body + the route's declared
-// methods, module-locally since the router is this module's.
+// chi's methodNotAllowedHandler sets Allow from the node's registered
+// methods (mux.go: one Add per method — Go writes one line each; the comma
+// form is the merged wire equivalent). The uncovered mutators
+// (POST/PUT/DELETE/PATCH — POST the observed residual: a bare POST
+// previously fell to Hono's 404) ride that shape module-locally: empty body
+// + the route's declared methods.
 // ---------------------------------------------------------------------------
 attachmentsServingRouter.on(["POST", "PUT", "DELETE", "PATCH"], "/attachments/:uuid", () =>
   new Response(null, { status: 405, headers: { allow: "GET, OPTIONS" } }),

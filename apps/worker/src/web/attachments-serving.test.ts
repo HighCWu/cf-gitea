@@ -30,12 +30,14 @@ import { mintSession, REMEMBER_MAX_AGE_SECONDS, SESSION_COOKIE_NAME } from "../u
 import { uploadIssueAttachment } from "../api/routes/issue-attachments";
 import {
   attachmentsServingRouter,
+  contentDispositionWord,
   detectContentType,
   encodeContentDisposition,
   goDetectContentType,
   goPathBase,
   PRIVATE_STATIC_CACHE_CONTROL,
   SERVE_CACHE_CONTROL,
+  serveSetHeaders,
 } from "./attachments-serving";
 
 const PUBLIC_REPO_ID = "9101";
@@ -347,6 +349,57 @@ describe("goPathBase (Go path.Base port for the serve sites)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The SHARED serve decision (serve.go pipeline units) — the table every
+// byte-serving consumer rides: this router, the API blob GET
+// (routes/issue-attachments.ts) and the archive download (routes/archive.ts).
+// ---------------------------------------------------------------------------
+
+describe("the shared serve decision (serve.go pipeline units)", () => {
+  it("contentDispositionWord: benign image, unknown-type and text all fall back INLINE; only the SVG-disabled arm downloads", () => {
+    // serve.go:135-141 over the RESOLVED content type
+    // (typesniffer.FromContentType, :136): INLINE is the default word; the
+    // only download arm is an SVG attachment under a disabled
+    // setting.UI.SVG.Enabled / ENABLE_RENDER (modules/setting/ui.go:120-124,
+    // default TRUE — dead at frozen settings, reachable only through the
+    // svgRenderEnabled surface).
+    expect(contentDispositionWord("image/png")).toBe("inline");
+    expect(contentDispositionWord("application/octet-stream")).toBe("inline"); // the unknown-type fallback word
+    expect(contentDispositionWord("text/plain; charset=utf-8")).toBe("inline");
+    expect(contentDispositionWord("image/svg+xml")).toBe("inline"); // render enabled — the frozen default
+    expect(contentDispositionWord("image/svg+xml", false)).toBe("attachment"); // the dead arm via the setting surface
+  });
+
+  it("serveSetHeaders: the archive arm — the octet-stream floor, the IfZero ATTACHMENT word, the sandbox CSP", () => {
+    // archiver.go:374 passes ONLY Filename — the IfZero octet floor
+    // (serve.go:58) and the IfZero ContentDispositionAttachment default
+    // (serve.go:91) are upstream's own words at the archive site; octet-
+    // stream is neither pdf nor audio/video → the sandbox CSP
+    // (serve.go:62-73); the zero-duration prod Cache-Control
+    // (httpcache.go:29-31); no Content-Length / Last-Modified (nothing
+    // passed while streaming).
+    const headers = serveSetHeaders({ filename: "repo-main.tar.gz" });
+    expect(headers["Content-Type"]).toBe("application/octet-stream");
+    expect(headers["Content-Disposition"]).toBe("attachment; filename=repo-main.tar.gz");
+    expect(headers["X-Content-Type-Options"]).toBe("nosniff");
+    expect(headers["Content-Security-Policy"]).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(headers["Cache-Control"]).toBe(SERVE_CACHE_CONTROL);
+    expect(headers["Access-Control-Expose-Headers"]).toBe("Content-Disposition");
+    expect(headers["Content-Length"]).toBeUndefined();
+    expect(headers["Last-Modified"]).toBeUndefined();
+    // the RFC 2231 twin rides only when a rune needs masking
+    // (content_disposition.go:47-65), cut at path.Base (serve.go:92)
+    const encoded = serveSetHeaders({ filename: "x/y/rapport (final)é.tar.gz" });
+    expect(encoded["Content-Disposition"]).toBe(
+      `attachment; filename="rapport (final)_.tar.gz"; filename*=utf-8''rapport%20%28final%29%C3%A9.tar.gz`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The route: resolution matrix, headers, 404 arms, dispositions
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // The route: resolution matrix, headers, 404 arms, dispositions
 // ---------------------------------------------------------------------------
 
@@ -447,8 +500,10 @@ describe("GET /attachments/{uuid} — resolution matrix", () => {
 
     const options = await serve(path, { method: "OPTIONS" });
     expect(options.status).toBe(405);
-    // the house 405 shape — empty body + the route's declared methods
-    expect(options.headers.get("allow")).toBe("GET, OPTIONS");
+    // upstream's deny writes ONLY the status — `w.WriteHeader(405)` with no
+    // Allow header and no body (web.go:81-82). The house Allow header the
+    // former twin emitted moved this wave to the pin.
+    expect(options.headers.get("allow")).toBeNull();
     expect((await options.arrayBuffer()).byteLength).toBe(0);
     // the deny arm's point: the OPTIONS request did NOT re-run the download
     expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
@@ -482,7 +537,9 @@ describe("GET /attachments/{uuid} — resolution matrix", () => {
     for (const method of ["POST", "PUT", "DELETE", "PATCH"] as const) {
       const res = await serve(path, { method });
       expect(res.status, method).toBe(405);
-      // the house 405 shape — empty body + the route's declared methods
+      // chi's methodNotAllowedHandler sets Allow from the node's registered
+      // methods (one Add per method — Go writes one line each; the comma form
+      // is the merged wire equivalent) — unlike the bare OPTIONS deny above
       expect(res.headers.get("allow"), method).toBe("GET, OPTIONS");
       expect((await res.arrayBuffer()).byteLength, method).toBe(0);
     }
@@ -784,6 +841,36 @@ describe("GET /attachments/{uuid} — cache arms", () => {
     // the intermediate private-static value never reaches the wire
     expect(PRIVATE_STATIC_CACHE_CONTROL).toBe("private, max-age=21600");
   });
+
+  it("rejects a non-fixdate or impossible-calendar If-Modified-Since like Go's time.Parse (no 304)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const issue = await seedIssue(PUBLIC_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: issue.id,
+      name: "shot.png",
+      content: pngPayload(),
+    });
+    const serve200 = async (ims: string): Promise<void> => {
+      const res = await serve(`/attachments/${row.uuid}`, { headers: { "if-modified-since": ims } });
+      expect(res.status, ims).toBe(200); // the miss path, never a rolled-over 304
+    };
+    // an impossible calendar date parses upstream as "day out of range" —
+    // JS Date.parse would silently roll it over into a matching instant
+    await serve200("Mon, 31 Feb 2026 03:04:05 GMT");
+    await serve200("Mon, 30 Feb 2027 03:04:05 GMT"); // 2027 is not a leap year
+    await serve200("Mon, 02 Mar 2026 24:00:00 GMT"); // hour out of range
+    await serve200("Mon, 02 Mar 2026 03:60:00 GMT"); // minute out of range
+    await serve200("Xyz, 02 Mar 2026 03:04:05 GMT"); // not one of the seven short days
+    await serve200("mon, 02 Mar 2026 03:04:05 GMT"); // Go's day lookup is case-sensitive
+    await serve200("02 Mar 2026 03:04:05 GMT"); // missing the weekday arm entirely
+    // the weekday never cross-checks the date upstream — a mismatched but
+    // well-formed name parses fine and still hits the second-precision 304
+    const hit = await serve(`/attachments/${row.uuid}`, { headers: { "if-modified-since": `Tue, 02 Mar 2026 03:04:05 GMT` } });
+    expect(hit.status).toBe(304);
+  });
 });
 
 describe("GET /attachments/{uuid} — sniffed content types and dispositions", () => {
@@ -838,6 +925,34 @@ describe("GET /attachments/{uuid} — sniffed content types and dispositions", (
     const res = await serve(`/attachments/${row.uuid}`);
     expect(res.headers.get("content-type")).toBe("application/pdf");
     expect(res.headers.get("content-security-policy")).toBe("default-src 'none'; style-src 'unsafe-inline'");
+  });
+
+  it("serves an SVG attachment INLINE under the sandbox CSP — ENABLE_RENDER's default keeps the attachment arm dead", async () => {
+    const owner = await seedUser("attach-svg-owner");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const issue = await seedIssue(PUBLIC_REPO_ID, owner.id);
+    // the typesniffer SVG family: detectByHTML (text/plain sniff) + the
+    // svgTagRegex over the comment-stripped, trimmed bytes
+    const payload = new TextEncoder().encode(
+      `<?xml version="1.0"?><!-- generator --><svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4"/></svg>`,
+    );
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: issue.id,
+      name: "icon.svg",
+      content: payload,
+    });
+    const res = await serve(`/attachments/${row.uuid}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml");
+    // serve.go:135-141: the disposition word reads image/svg+xml only to
+    // DEMOTE it when setting.UI.SVG.Enabled is false (ui.go:120-124 — the
+    // default TRUE keeps the word inline); the XSS boundary is the sandbox
+    // CSP, not a download word.
+    expect(res.headers.get("content-disposition")).toBe("inline; filename=icon.svg");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(payload);
   });
 
   it("encodes the display name (RFC 2231 twin for non-ASCII names)", async () => {

@@ -397,10 +397,29 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
   it("streams a tar.gz of the branch: ustar entries under the lowercase repo prefix, gzip magic, commit-time mtimes", async () => {
     const res = await fetchRoute(`${REPO_PATH}/archive/main.tar.gz`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("Content-Type")).toBe("application/gzip");
+    // ServeSetHeaders' zero-option form (archiver.go:374): Content-Type is
+    // the IfZero application/octet-stream floor (serve.go:58) — the former
+    // application/gzip|zip hardcode moved this wave to the pin (the
+    // non-stream arm's ctx.ServeContent, base.go:176-180, pre-sets the same
+    // floor and thereby disables http.ServeContent's extension sniff).
+    expect(res.headers.get("Content-Type")).toBe("application/octet-stream");
+    // the same header set: nosniff, the sandbox CSP (octet-stream is neither
+    // pdf nor audio/video, serve.go:62-73) and the zero-duration prod
+    // Cache-Control (serve.go:96-99 → httpcache.go:29-31)
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(res.headers.get("Content-Security-Policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
+    expect(res.headers.get("Cache-Control")).toBe("max-age=0, private, must-revalidate");
     // Go's FormatMediaType emits the TOKEN arm (unquoted) for a token-safe
-    // name — the former hand-roll quoted everything (the disclosed pin move).
+    // name — the former hand-roll quoted everything (the disclosed pin
+    // move) — and the WORD is ServeSetHeaders' IfZero ATTACHMENT default
+    // (serve.go:91), upstream's own word at this site (archiver.go:374
+    // passes no ContentDisposition).
     expect(res.headers.get("Content-Disposition")).toBe(`attachment; filename=${SLUG}-main.tar.gz`);
+    // the pre-serve weak-ETag cache arm (archiver.go:368-373): `W/"CommitID-
+    // Type-PrefixArchiveFiles"`, Type = ArchiveType.String() (the bare
+    // extension, models/repo/archiver.go:40-48), PrefixArchiveFiles default
+    // TRUE (setting/repository.go:153)
+    expect(res.headers.get("ETag")).toMatch(new RegExp(`^W/"[0-9a-f]{40}-tar\\.gz-true"$`));
 
     const gz = new Uint8Array(await res.arrayBuffer());
     expect(gz[0]).toBe(0x1f); // gzip magic
@@ -429,7 +448,10 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
   it("streams a zip of the branch: DEFLATE entries (git archive's method 8), central directory, exec modes preserved", async () => {
     const res = await fetchRoute(`${REPO_PATH}/archive/main.zip`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("Content-Type")).toBe("application/zip");
+    // the octet-stream IfZero floor (serve.go:58 over archiver.go:374) — the
+    // former application/zip hardcode moved this wave to the pin
+    expect(res.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(res.headers.get("ETag")).toMatch(new RegExp(`^W/"[0-9a-f]{40}-zip-true"$`));
     const zipBytes = new Uint8Array(await res.arrayBuffer());
     const entries = await parseZip(zipBytes);
     expect(entries.map((e) => e.name).sort()).toEqual([
@@ -450,12 +472,34 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
   it("filters by the `path` subpath query (git archive pathspec semantics, full paths kept)", async () => {
     const res = await fetchRoute(`${REPO_PATH}/archive/main.tar.gz?path=src`);
     expect(res.status).toBe(200);
+    // the weak-ETag arm is the path-less ride only (archiver.go:370: the
+    // HandleGenericETagPrivateCache guard sits inside `len(Paths) == 0`)
+    expect(res.headers.get("ETag")).toBeNull();
     const gz = new Uint8Array(await res.arrayBuffer());
     const tarBytes = new Uint8Array(
       await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer(),
     );
     const entries = parseTar(tarBytes);
     expect(entries.map((e) => e.name)).toEqual([`${SLUG}/src/lib.py`]);
+  });
+
+  it("answers If-None-Match on the path-less ride with a 304 carrying ETag + Link (no Last-Modified, no Cache-Control)", async () => {
+    const first = await fetchRoute(`${REPO_PATH}/archive/main.tar.gz`);
+    const etag = first.headers.get("ETag") ?? "";
+    expect(etag).toMatch(new RegExp(`^W/"[0-9a-f]{40}-tar\\.gz-true"$`));
+    const link = first.headers.get("Link") ?? "";
+    expect(link).toContain(`rel="immutable"`);
+    const res = await fetchRoute(`${REPO_PATH}/archive/main.tar.gz`, { headers: { "If-None-Match": etag } });
+    expect(res.status).toBe(304);
+    expect(res.headers.get("ETag")).toBe(etag);
+    // upstream adds the Link header BEFORE the cache handler
+    // (archiver.go:365-373), so its 304 carries it beside the ETag
+    expect(res.headers.get("Link")).toBe(link);
+    // the 304 path returns before httpcache's Cache-Control set
+    // (handleGenericETagTimeCache, :113-116), and the cache call passes a
+    // nil Last-Modified (archiver.go:371)
+    expect(res.headers.get("Cache-Control")).toBeNull();
+    expect(res.headers.get("Last-Modified")).toBeNull();
   });
 
   it("serves multi-segment refs through the wildcard catchall", async () => {
@@ -472,6 +516,8 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
 
     const res = await fetchRoute(`${REPO_PATH}/archive/feature/one.tar.gz`);
     expect(res.status).toBe(200);
+    // the IfZero ATTACHMENT word (serve.go:91) over the dashed multi-segment
+    // ref — the Go-exact composition unchanged from the escaper wave's pin
     expect(res.headers.get("Content-Disposition")).toBe(`attachment; filename=${SLUG}-feature-one.tar.gz`);
     const gz = new Uint8Array(await res.arrayBuffer());
     const tarBytes = new Uint8Array(
