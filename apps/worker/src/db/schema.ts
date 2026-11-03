@@ -337,10 +337,27 @@ export const repoTransfer = sqliteTable(
  * Per-repo units (SPEC-0003 §3.1, minimal: 'code' only; extended in 0005).
  * `anonymous_access_mode` backs ACL rows 4/5 (upstream
  * `RepoUnit.AnonymousAccessMode`, git_smart_http_test.go:163-189).
+ *
+ * ADR-0007 FN-6 (migration 0066) completed the column port against upstream
+ * `RepoUnit` (models/repo/repo_unit.go:42-50): the `id` surrogate pk, the
+ * `created_unix` insert stamp, and the `everyone_access_mode` signed-in-user
+ * grant — column order follows the upstream struct verbatim (the pk swap
+ * rebuilds the table, so upstream's order costs nothing). The composite
+ * natural key (repo_id, type) — this table's original pk — survives as the
+ * uniqueIndex below: ours-stricter than upstream's non-unique `INDEX(s)`
+ * (repo_unit.go:44-45) and the ON CONFLICT target every unit write arm
+ * upserts through.
  */
 export const repoUnits = sqliteTable(
   "repo_units",
   {
+    /** Upstream `RepoUnit.ID int64` (repo_unit.go:43). Non-referencing pk —
+     *  the audit's id family keeps those INTEGER autoincrement, same family
+     *  as upstream's pk autoincr (ADR-0007 audit §2.1; no TEXT id-space
+     *  inheritance — this id references nothing). Upstream gives it no
+     *  reader either (rows are addressed by repo_id+type everywhere); the
+     *  column is shape parity, stamped by the engine. */
+    id: integer("id").primaryKey({ autoIncrement: true }),
     repoId: text("repo_id").notNull(),
     /**
      * Unit type; SPEC-0016 M2 (ratification 7) extends the enum with
@@ -365,10 +382,6 @@ export const repoUnits = sqliteTable(
     type: text("type", {
       enum: ["code", "packages", "actions", "pull_requests", "projects"],
     }).notNull().default("code"),
-    /** What anonymous visitors may do on this unit: 'none' | 'read'. */
-    anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
-      .notNull()
-      .default("none"),
     /**
      * SPEC-0012's ActionsConfig store (upstream `RepoUnit.Config`,
      * models/repo/repo_unit.go:32 — `Config convert.Conversion xorm:"TEXT"`,
@@ -387,8 +400,52 @@ export const repoUnits = sqliteTable(
      * reset.
      */
     config: text("config"),
+    /** Upstream `CreatedUnix timeutil.TimeStamp xorm:"INDEX CREATED"`
+     *  (repo_unit.go:47) — xorm's CREATED auto-fill: stamped at insert,
+     *  read by nobody upstream (grep: no RepoUnit.CreatedUnix consumer) and
+     *  nobody ours (port-when-read; landing the stamp IS upstream parity).
+     *  Nullable with no SQL default — SQLite forbids non-constant defaults
+     *  in ALTER ADD COLUMN (the repositories.updated_at precedent), so the
+     *  writers stamp it explicitly (the create seed in repos/service.ts,
+     *  the settings toggles) and migration 0066 backfills the pre-0066 rows
+     *  from the parent repositories.created_at (a unit row never predates
+     *  its repo). SQL name is upstream's `created_unix` verbatim — this
+     *  table carries no pre-existing timestamp column whose recorded family
+     *  name could override it (the audit §7.2 rename-declined family binds
+     *  only tables that already diverged). */
+    createdAt: integer("created_unix", { mode: "timestamp" }),
+    /** What anonymous visitors may do on this unit: 'none' | 'read'. */
+    anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
+      .notNull()
+      .default("none"),
+    /** Upstream `EveryoneAccessMode perm.AccessMode xorm:"NOT NULL DEFAULT 0"`
+     *  (repo_unit.go:50 — upstream migration v1_22 v297
+     *  AddRepoUnitEveryoneAccessMode): what any SIGNED-IN user may do on
+     *  this unit regardless of a repo grant — upstream's permission
+     *  calculator folds it into the everyone ladder
+     *  (models/perm/access/repo_permission.go:231-234,
+     *  applyPublicAccessPermission at :206-213: mode >= Read wins into
+     *  `perm.everyoneAccessMode` unless setting.Repository.ForcePrivate).
+     *  Value space is upstream's AccessMode under the §2.3 TEXT-enum
+     *  convention: none|read|write — `write` is real upstream space (the
+     *  wiki unit's everyone-write flip, routers/web/repo/setting/
+     *  public_access.go:42). DEFAULT 'none' = upstream's DEFAULT 0
+     *  (AccessModeNone), which also covers every pre-0066 row. NO writer
+     *  and NO reader exist in our surface yet — recorded port-when-read in
+     *  SPEC-0003 §3.1 as-built (the flip arm is upstream's PublicAccessPost,
+     *  public_access.go:134-153 via UpdateRepoUnitPublicAccess
+     *  repo_unit.go:374-378; do not invent consumers). */
+    everyoneAccessMode: text("everyone_access_mode", { enum: ["none", "read", "write"] })
+      .notNull()
+      .default("none"),
   },
-  (t) => [primaryKey({ columns: [t.repoId, t.type] })],
+  (t) => [
+    // The natural key, kept from the pre-0066 pk: the ON CONFLICT target of
+    // every unit write arm (the toggles' upserts, the create seed's
+    // idempotence). Unique where upstream's INDEX(s) is not — ours-stricter,
+    // load-bearing (the audit §2.7 strictness record covers the direction).
+    uniqueIndex("repo_units_repo_type_uq").on(t.repoId, t.type),
+  ],
 );
 
 // ---------------------------------------------------------------------------

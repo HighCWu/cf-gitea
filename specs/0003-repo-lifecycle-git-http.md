@@ -497,6 +497,74 @@ in the POST response), `state`
 now), `anonymous_access_mode` (`none|read`) — backs ACL row #4/#5 (upstream
 `RepoUnit.AnonymousAccessMode`, test `:178`).
 
+**As-built — the FN-6 column completion (ADR-0007 drift class, migration
+`0066_repo-unit-parity-columns.sql`, 2026-11-03).** The table now carries
+upstream `RepoUnit` (models/repo/repo_unit.go:42-50) column-for-column, in
+the upstream struct's order:
+
+- `id` INTEGER pk autoincrement — upstream `ID int64` (repo_unit.go:43).
+  The audit's id-family record (ADR-0007 item 2 + audit §2.1) does NOT make
+  this column recorded-absent: that record governs the TEXT `repositories.id`
+  id-space inheritance, while this id references nothing — §2.1's own rule
+  ("non-referencing pks stay INTEGER autoincrement, same family as
+  upstream's pk autoincr, no drift") lands it as the additive port. The
+  composite `(repo_id, type)` key — the table's pre-0066 pk — stays as the
+  unique index `repo_units_repo_type_uq`: ours-stricter than upstream's
+  non-unique `INDEX(s)` (repo_unit.go:44-45) and load-bearing (it is the ON
+  CONFLICT target of every unit write arm — the create seed's idempotence
+  and the settings toggles' upserts). Upstream enforces one row per
+  (repo_id, type) at the application level (UpdateRepositoryUnits'
+  delete-then-reinsert, services/repository/setting.go:19-48); ours enforces
+  it in the DDL.
+- `created_unix` INTEGER nullable, no SQL default — upstream `CreatedUnix
+  timeutil.TimeStamp xorm:"INDEX CREATED"` (repo_unit.go:47), xorm's
+  CREATED auto-fill: stamped at insert, read by nobody upstream and nobody
+  ours (port-when-read). SQLite forbids non-constant defaults in ALTER ADD
+  COLUMN (the `repositories.updated_at` precedent), so the writers stamp it
+  explicitly — the create seed passes the batch's shared `createdAt`
+  (repos/service.ts, the same instant the repo row carries) — and migration
+  0066 backfills the carried rows from the parent
+  `repositories.created_at` (a unit row never predates its repo;
+  toggle-created rows get the repo's creation instant — an approximation,
+  acceptable with no reader). SQL name is upstream's verbatim: the table
+  carried no pre-existing timestamp column whose recorded family name could
+  override it (audit §7.2 binds only already-diverged tables).
+- `everyone_access_mode` TEXT `none|read|write` NOT NULL DEFAULT 'none' —
+  upstream `EveryoneAccessMode perm.AccessMode xorm:"NOT NULL DEFAULT 0"`
+  (repo_unit.go:49, upstream migration v1_22 v297): what any signed-in user
+  may do on the unit regardless of a repo grant. The TEXT enum is the §2.3
+  convention; the value space carries upstream's `write` (real space — the
+  wiki unit's everyone-write flip, routers/web/repo/setting/
+  public_access.go:42) even though our surface cannot produce it yet.
+  **Port-when-read, both arms recorded:** no WRITER exists here (upstream's
+  flip arm is `PublicAccessPost`, public_access.go:134-153, writing both
+  access-mode columns by `(repo_id, type)` via `UpdateRepoUnitPublicAccess`,
+  repo_unit.go:374-378; our settings surface has no public-access page, and
+  the sibling-owned `api/services/repo-settings.ts` toggle arms are where
+  the `created_unix` stamps land when that file's in-flight wave closes) and
+  no READER (upstream's permission calculator folds it into the everyone
+  ladder — `finalProcessRepoUnitPermission`'s
+  `applyPublicAccessPermission(u.Type, u.EveryoneAccessMode, ...)`,
+  models/perm/access/repo_permission.go:231-234, gated on mode >= Read and
+  `setting.Repository.ForcePrivate`; our ACL matrix has no unit-level
+  everyone arm). No consumer is invented; the arms land when our settings /
+  permission surfaces grow them (the ADR-0007 grant applies at that day).
+- Migration notes: 0066 rebuilds the table (SQLite cannot ALTER a pk into
+  existence). Two hand-corrections to drizzle's generated text, both
+  observed on the local apply: the generated copy selected the NEW columns
+  (`id`, `created_unix`, `everyone_access_mode`) from the OLD table by
+  double-quoted name, and SQLite's double-quoted-string rule silently
+  turned them into the literal strings `'created_unix'` /
+  `'everyone_access_mode'` in the carried rows (typeof = text) — the copy
+  now references only the columns the pre-0066 table has, so `id`
+  autoincrements, `created_unix` stays NULL for the backfill, and
+  `everyone_access_mode` takes its DEFAULT 'none'.
+
+The FN-6 tests live in `src/db/schema.test.ts` (the DDL pin, the pre-0066
+writer shape + backfill replay, the natural-key upsert arbitration) and
+`src/repos/lifecycle.test.ts` (the create seed's `created_unix` stamp equal
+to the repo's `created_at`; the everyone grant reading `'none'`).
+
 Not modeled: upstream's `repository.num_stars/num_forks/watch` counters and issue
 tables (0004/0005).
 

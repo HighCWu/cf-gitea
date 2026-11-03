@@ -439,7 +439,13 @@ export class RepoService {
           hasActions: posture.actions,
           updatedAt: createdAt,
         }),
-        ...(posture.actions ? [this.db.insert(repoUnits).values({ repoId: id, type: "actions" })] : []),
+        // The FN-6 stamp: upstream `RepoUnit.CreatedUnix` (repo_unit.go:47,
+        // xorm `INDEX CREATED`) auto-fills at insert — the create seed stamps
+        // it with the batch's shared `createdAt` so the unit row's creation
+        // instant IS the repo's (the same instant the settings row carries).
+        ...(posture.actions
+          ? [this.db.insert(repoUnits).values({ repoId: id, type: "actions", createdAt })]
+          : []),
         // §4.11: creating at a live redirect consumes it (redirect rows are
         // not part of the repo namespace; upstream's IsUsableRepoName ignores
         // them, and NewRedirect's delete-first keeps at most one row).

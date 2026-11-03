@@ -285,7 +285,7 @@ classes only.
 | `watch` | models/repo/watch.go:39 | schema.ts:1475 `repo_watchers` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `release` | models/repo/release.go:67 | schema.ts:930 `releases` | drift | missing original_author, original_author_id |
 | `language_stat` | models/repo/language_stats.go:19 | — | missing-table | on-demand extension-sum reduction; SPEC-0004 divergence note (api/services/languages.ts:1-15) |
-| `repo_unit` | models/repo/repo_unit.go:42 | schema.ts:341 `repo_units` | drift | missing id, created_unix, everyone_access_mode |
+| `repo_unit` | models/repo/repo_unit.go:42 | schema.ts:341 `repo_units` | drift — LANDED by FN-6 (2026-11-03, migration 0066; `id`/`created_unix`/`everyone_access_mode` ported, the SPEC record is the SPEC-0003 §3.1 as-built block) | was: missing id, created_unix, everyone_access_mode (repo_unit.go:43,47,49 — the original cites here and in §4 were off by one, corrected at landing) |
 | `repo_redirect` | models/repo/redirect.go:38 | schema.ts:277 `repo_redirects` | intentional-recorded | owner_namespace routing column added; SPEC-0003 (schema.ts:277) |
 | `repo_indexer_status` | models/repo/repo_indexer.go:27 | — | missing-table | indexer-class store DEFERRED with reopen triggers; SPEC-0019 §3/§4.2 |
 | `star` | models/repo/star.go:17 | schema.ts:1584 `stars` | aligned | blanket families only (id / timestamp-name / strictness) |
@@ -658,13 +658,16 @@ upstream: models/repo/transfer.go (struct `RepoTransfer`)
 
 ### `repo_unit` → `repo_units` schema.ts:341
 
-upstream: models/repo/repo_unit.go (struct `RepoUnit`)
+upstream: models/repo/repo_unit.go (struct `RepoUnit`) — all three MISSING
+lines below LANDED by FN-6 (2026-11-03, migration
+`0066_repo-unit-parity-columns.sql`; the SPEC record is the SPEC-0003 §3.1
+as-built block)
 
-- MISSING `created_unix` (integer) — upstream models/repo/repo_unit.go:48 (`CreatedUnix`); no ours counterpart
-- MISSING `everyone_access_mode` (integer NOT NULL, DEFAULT 0) — upstream models/repo/repo_unit.go:50 (`EveryoneAccessMode`); no ours counterpart
-- MISSING `id` (integer) — upstream models/repo/repo_unit.go:44 (`ID`); no ours counterpart
-- TYPE `anonymous_access_mode`: upstream integer (models/repo/repo_unit.go:49) vs ours text (schema.ts:369 (`repo_units`))
-- TYPE `type`: upstream integer (models/repo/repo_unit.go:46) vs ours text (schema.ts:365 (`repo_units`))
+- MISSING `created_unix` (integer) — upstream models/repo/repo_unit.go:47 (`CreatedUnix`, xorm `INDEX CREATED`; the audit's :48 was off by one) — **LANDED by FN-6**: nullable INTEGER (the ALTER-ADD-COLUMN non-constant-default constraint), stamped by the writers (repos/service.ts create seed; the settings toggles' stamps recorded — GE's in-flight file), 0066 backfills the carried rows from the parent repositories.created_at
+- MISSING `everyone_access_mode` (integer NOT NULL, DEFAULT 0) — upstream models/repo/repo_unit.go:49 (`EveryoneAccessMode`, upstream migration v1_22 v297; the audit's :50 was off by one) — **LANDED by FN-6** as the §2.3 TEXT enum `none|read|write` NOT NULL DEFAULT 'none' (= DEFAULT 0, AccessModeNone; `write` is upstream's real space — the wiki unit's everyone-write flip, public_access.go:42); NO writer and NO reader in our surface yet — port-when-read (SPEC-0003 §3.1 as-built cites upstream's flip arm PublicAccessPost, public_access.go:134-153, and the calculator's everyone ladder, repo_permission.go:231-234)
+- MISSING `id` (integer) — upstream models/repo/repo_unit.go:43 (`ID`; the audit's :44 was off by one) — **LANDED by FN-6** as the INTEGER autoincrement pk (the audit §2.1 non-referencing-pk family — same family as upstream's pk autoincr, no drift; the id-family TEXT record does NOT reach it: this id references nothing); the natural (repo_id, type) pk — the table's pre-0066 key — became the uniqueIndex `repo_units_repo_type_uq`, ours-stricter than upstream's non-unique `INDEX(s)` (repo_unit.go:44-45) and the ON CONFLICT target every unit write arm upserts through
+- TYPE `anonymous_access_mode`: upstream integer (models/repo/repo_unit.go:48) vs ours text (schema.ts:369 (`repo_units`)) — the §2.3 TEXT-enum blanket, recorded, stays
+- TYPE `type`: upstream integer (models/repo/repo_unit.go:45) vs ours text (schema.ts:365 (`repo_units`)) — the §2.3 TEXT-enum blanket, recorded, stays
 
 ### `collaboration` → `repo_collaborators` schema.ts:1500
 
@@ -845,10 +848,28 @@ applies).
   `hash_*` quartet — were WITHDRAWN (2026-11-03, §7.8): explicit
   first-token column overrides mean upstream already has the plain names;
   every surviving member was re-verified against the §1 override rule.
-- **FN-6: repo_units completion.** Missing `id`, `created_unix`,
-  `everyone_access_mode` (repo_unit.go:44,48,50 — the 2026 upstream
-  everyone-permission column is a real capability gap). Enum-text family
-  (`type`, `anonymous_access_mode`) stays under §2.3.
+- **FN-6: repo_units completion.** **STATUS: LANDED (2026-11-03, migration
+  `0066_repo-unit-parity-columns` + the SPEC-0003 §3.1 as-built block — the
+  rest of this row is the original scope, kept for the cites; the §3.1 row
+  and the §4 repo_unit section carry the LANDED annotations).** Missing
+  `id`, `created_unix`, `everyone_access_mode` (repo_unit.go:43,47,49 — the
+  original cites said :44,48,50, off by one, corrected at landing; the 2026
+  upstream everyone-permission column is a real capability gap). Landed as:
+  the INTEGER autoincrement `id` pk (the §2.1 non-referencing-pk family)
+  with the natural (repo_id, type) key kept as `repo_units_repo_type_uq`
+  (ours-stricter vs upstream's non-unique INDEX(s) — the toggles' ON
+  CONFLICT target); nullable `created_unix` stamped by the create seed
+  (repos/service.ts) and backfilled by 0066 from repositories.created_at —
+  the rebuild's generated copy had to be corrected (it selected the new
+  columns from the old table and SQLite's double-quoted-string rule turned
+  them into the literal strings 'created_unix'/'everyone_access_mode';
+  caught by the local-apply gate, fixed in the migration text); and the
+  `everyone_access_mode` TEXT enum `none|read|write` NOT NULL DEFAULT
+  'none' with NO writer and NO reader in our surface yet (port-when-read —
+  upstream's flip arm is PublicAccessPost, public_access.go:134-153 via
+  UpdateRepoUnitPublicAccess repo_unit.go:374-378; its reader is the
+  calculator's everyone ladder, repo_permission.go:231-234). Enum-text
+  family (`type`, `anonymous_access_mode`) stays under §2.3.
 - **FN-7: pull_auto_merges completion.** Missing `merged_commit_id`
   (automerge.go:27 — the recorded merge result); ours-extra `sha` (the
   head-sha gate) stays as a recorded addition. Rides FN-5's renames.

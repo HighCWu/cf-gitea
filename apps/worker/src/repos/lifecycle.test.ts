@@ -11,7 +11,7 @@
 
 import { SELF, env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
@@ -2116,6 +2116,27 @@ describe("creation default-units seeding (the 2026-10-29 upstream-parity flip, c
     // has_projects stays the documented house divergence (upstream arms it).
     expect(settings.hasProjects).toBe(false);
     expect(await actionsRow(repo.id)).toBe(true);
+  });
+
+  it("the FN-6 stamp: the actions unit row's created_unix is the repo's creation instant (upstream CreatedUnix, repo_unit.go:47 — xorm `INDEX CREATED` auto-fill)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "unit-stamped");
+
+    const db = drizzle(env.DB);
+    const repoRow = await db
+      .select({ createdAt: repositories.createdAt })
+      .from(repositories)
+      .where(eq(repositories.id, repo.id))
+      .get();
+    const unit = await db
+      .select({ createdAt: repoUnits.createdAt, everyoneAccessMode: repoUnits.everyoneAccessMode })
+      .from(repoUnits)
+      .where(and(eq(repoUnits.repoId, repo.id), eq(repoUnits.type, "actions")))
+      .get();
+    expect(unit?.createdAt).toEqual(repoRow?.createdAt);
+    // The everyone grant reads upstream's DEFAULT 0 (AccessModeNone) — the
+    // flip arms don't exist in our surface (SPEC-0003 §3.1 as-built).
+    expect(unit?.everyoneAccessMode).toBe("none");
   });
 
   it("a fork-kind create leaves actions and packages off with no actions row (DefaultForkRepoUnits, unit.go:80-83)", async () => {

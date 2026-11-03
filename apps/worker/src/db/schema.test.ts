@@ -37,6 +37,7 @@ import {
   repoMirrors,
   repoSettings,
   repoTopics,
+  repoUnits,
   repoWatchers,
   repositories,
   reviewState,
@@ -1088,5 +1089,135 @@ describe("review_state.updated_files parity (ADR-0007 FN-3, migration 0065)", ()
     expect(parseUpdatedFiles("{not json")).toEqual({});
     expect(parseUpdatedFiles('{"a.ts":"viewed"}')).toEqual({ "a.ts": UNVIEWED });
     expect(parseUpdatedFiles('{"a.ts":2,"b.ts":1,"c.ts":9}')).toEqual({ "a.ts": VIEWED, "b.ts": HAS_CHANGED, "c.ts": UNVIEWED });
+  });
+});
+
+/**
+ * ADR-0007 FN-6 (migration 0066): upstream `RepoUnit`
+ * (models/repo/repo_unit.go:42-50) carries three columns ours lacked — the
+ * `id` surrogate pk (repo_unit.go:43), the `created_unix` insert stamp
+ * (:47, xorm `INDEX CREATED`), and the `everyone_access_mode` signed-in-user
+ * grant (:50, `NOT NULL DEFAULT 0` — upstream migration v1_22 v297). 0066
+ * rebuilds the table (SQLite cannot ALTER a pk into existence): the
+ * composite (repo_id, type) pk — the landed table's original key — survives
+ * as `repo_units_repo_type_uq`, the ON CONFLICT target every unit write arm
+ * upserts through. `everyone_access_mode` has NO writer and NO reader in our
+ * surface yet (recorded port-when-read, SPEC-0003 §3.1 as-built); the tests
+ * below pin the shape, the migration's effect on pre-0066 rows, and the
+ * write shapes the landed arms use.
+ */
+describe("repo_units parity completion (ADR-0007 FN-6, migration 0066)", () => {
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+  });
+
+  it("0066's DDL: upstream's column order and shapes, the pk on id, the natural key kept unique", async () => {
+    const info = await tableColumns("repo_units");
+    // Column order follows the upstream struct verbatim (repo_unit.go:43-50)
+    // — the rebuild made the order free, so it is upstream's.
+    expect(info.map((col) => col.name)).toEqual([
+      "id",
+      "repo_id",
+      "type",
+      "config",
+      "created_unix",
+      "anonymous_access_mode",
+      "everyone_access_mode",
+    ]);
+    // id: INTEGER pk autoincrement (audit §2.1: non-referencing pks stay the
+    // upstream pk-autoincr family); created_unix nullable, no default (the
+    // ALTER-ADD-COLUMN non-constant-default constraint — writers stamp it);
+    // everyone_access_mode NOT NULL DEFAULT 'none' = upstream's DEFAULT 0.
+    expect(info).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "type", type: "TEXT", notnull: 1, dflt_value: "'code'", pk: 0 },
+      { cid: 3, name: "config", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 4, name: "created_unix", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 5, name: "anonymous_access_mode", type: "TEXT", notnull: 1, dflt_value: "'none'", pk: 0 },
+      { cid: 6, name: "everyone_access_mode", type: "TEXT", notnull: 1, dflt_value: "'none'", pk: 0 },
+    ]);
+    // The natural key survives as the unique index (the upserts' ON CONFLICT
+    // target); upstream's INDEX(s) is non-unique — ours-stricter,
+    // load-bearing (the settings toggles' arbitration).
+    expect(await indexNames("repo_units")).toContain("repo_units_repo_type_uq");
+  });
+
+  it("the pre-0066 writer shape still lands; 0066's backfill recovers created_unix from the parent repositories.created_at", async () => {
+    // A repositories row with a known creation instant.
+    await env.DB
+      .prepare(
+        "INSERT INTO repositories (id, storage_key, owner_namespace, slug, visibility, created_at) VALUES ('fn6repo', 'r_fn6repo', 'fn6owner', 'fn6repo', 'private', 1700000000)",
+      )
+      .run();
+    // Exactly the shape the pre-0066 arms wrote: repo_id/type (+ the old
+    // columns) — id, created_unix, everyone_access_mode omitted; the new
+    // table's defaults cover what the DDL covers and leave created_unix NULL.
+    await env.DB
+      .prepare("INSERT INTO repo_units (repo_id, type, anonymous_access_mode) VALUES ('fn6repo', 'code', 'read')")
+      .run();
+
+    const raw = await env.DB
+      .prepare("SELECT id, created_unix, everyone_access_mode, anonymous_access_mode FROM repo_units WHERE repo_id = 'fn6repo'")
+      .first<{ id: number; created_unix: number | null; everyone_access_mode: string; anonymous_access_mode: string }>();
+    expect(raw?.id).toBeGreaterThan(0); // the rebuild assigned a fresh autoincrement id
+    expect(raw?.created_unix).toBeNull();
+    // The DEFAULT-0 parity: a pre-0066 row reads AccessModeNone on both
+    // grant columns — nobody granted anything (the flip arms don't exist here).
+    expect(raw?.everyone_access_mode).toBe("none");
+    expect(raw?.anonymous_access_mode).toBe("read"); // the pre-0066 column keeps its value through the rebuild
+
+    // Migration 0066's backfill statement verbatim
+    // (src/db/migrations/0066_repo-unit-parity-columns.sql).
+    await env.DB
+      .prepare(
+        "UPDATE repo_units SET created_unix = (SELECT r.created_at FROM repositories r WHERE r.id = repo_units.repo_id) WHERE created_unix IS NULL",
+      )
+      .run();
+    const backfilled = await env.DB
+      .prepare("SELECT created_unix FROM repo_units WHERE repo_id = 'fn6repo'")
+      .first<{ created_unix: number }>();
+    expect(backfilled?.created_unix).toBe(1700000000);
+
+    // The drizzle reader over the same row: mode-timestamp decode.
+    const db = drizzle(env.DB);
+    const unit = await db.select().from(repoUnits).where(eq(repoUnits.repoId, "fn6repo")).get();
+    expect(unit?.createdAt).toEqual(new Date(1_700_000_000_000));
+    expect(unit?.everyoneAccessMode).toBe("none");
+    expect(unit?.anonymousAccessMode).toBe("read");
+  });
+
+  it("the natural key still arbitrates: a duplicate (repo_id, type) insert conflicts, the upsert updates config in place", async () => {
+    const db = drizzle(env.DB);
+    // First arm lands a fresh row with the create-seed shape (the settings
+    // toggle's enable arm + the FN-6 createdUnix stamp).
+    await db
+      .insert(repoUnits)
+      .values({ repoId: "fn6repo", type: "actions", createdAt: new Date(1_700_000_500_000) })
+      .onConflictDoNothing();
+    // A second enable arm: the ON CONFLICT target is the unique index, not
+    // a pk — the upsert updates config and leaves the row (and its id and
+    // created_unix) alone.
+    await db
+      .insert(repoUnits)
+      .values({ repoId: "fn6repo", type: "actions", config: '{"a":1}', createdAt: new Date(1_700_000_600_000) })
+      .onConflictDoUpdate({ target: [repoUnits.repoId, repoUnits.type], set: { config: '{"a":1}' } });
+
+    const rows = await db.select().from(repoUnits).where(and(eq(repoUnits.repoId, "fn6repo"), eq(repoUnits.type, "actions"))).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.config).toBe('{"a":1}');
+    // The stamp survived the upsert (created_unix is NOT in the set clause).
+    expect(rows[0]?.createdAt).toEqual(new Date(1_700_000_500_000));
+    // The column stamps round-trip: everyone mode accepts upstream's
+    // everyone-write value space (the wiki flip, public_access.go:42) even
+    // though no flip arm writes it here yet.
+    await db
+      .update(repoUnits)
+      .set({ everyoneAccessMode: "write" })
+      .where(and(eq(repoUnits.repoId, "fn6repo"), eq(repoUnits.type, "actions")));
+    expect(
+      (await db.select().from(repoUnits).where(and(eq(repoUnits.repoId, "fn6repo"), eq(repoUnits.type, "actions"))).get())
+        ?.everyoneAccessMode,
+    ).toBe("write");
   });
 });
