@@ -79,7 +79,7 @@
  * deleted tree ever carried:
  *
  *   GET  /api/v1/activitypub/user-id/{id}         → the Person actor
- *          (person.go:20-79; services/federation/activitypub.ts builds it,
+ *          (person.go:21-86 at `1592576fa5^`; services/federation/activitypub.ts builds it,
  *          the RSA-3072 keypair lazily generated in user_settings_kv).
  *   POST /api/v1/activitypub/user-id/{id}/inbox   → ReqHTTPSignature
  *          (reqsignature.go, ported in services/federation/httpsig.ts) →
@@ -95,7 +95,7 @@
  *          signer is the SAME silent 204 on both arms — nothing persisted,
  *          nothing removed, no Accept answered (the signature, not the
  *          body's actor field, is the identity); every other verified
- *          activity keeps upstream's 204 black hole (person.go:81-96).
+ *          activity keeps upstream's 204 black hole (person.go:89-106 at `1592576fa5^`, the 204 at :105).
  *
  * chi-exact dispatch per armed path (the Group-folds-middleware mechanics
  * from the Tier A header): chiUnknownMethodGuard (the pre-tree bare 405) →
@@ -476,7 +476,7 @@ function actorIriOf(appUrl: string, userId: number): string {
 }
 
 /**
- * The Person actor (person.go:20-79 at `1592576fa5^`): UserIDAssignmentAPI
+ * The Person actor (person.go:21-86 at `1592576fa5^`): UserIDAssignmentAPI
  * first — garbage id → 0, unknown id → ApiError 404 with ErrUserNotExist's
  * exact text — then the document (keypair lazily generated on first serve)
  * at the ActivityStreams content type. `checkTokenPublicOnly()` (the
@@ -521,7 +521,7 @@ function bareActorIri(iri: string): string {
 }
 
 /**
- * The inbox (person.go:81-96's PersonInbox behind reqsignature.go's
+ * The inbox (person.go:89-106's PersonInbox at `1592576fa5^`, behind reqsignature.go's
  * middleware, in upstream's middleware order — UserIDAssignmentAPI runs
  * BEFORE the signature, so an unknown target 404s without any verification
  * work):
