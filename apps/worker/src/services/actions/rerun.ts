@@ -76,6 +76,7 @@ import {
   type RunAttemptRow,
   type RunJobRow,
   type RunRow,
+  updateRepoRunsNumbers,
 } from "./model";
 import { aggregateJobStatus, isDoneStatus, isRunningStatus } from "./update";
 import {
@@ -800,6 +801,11 @@ async function updateAttemptStatusAndMirrorRun(
     .update(actionRuns)
     .set({ status: next, started: cols.started ?? attempt.started, stopped: cols.stopped ?? attempt.stopped, updated: now })
     .where(eq(actionRuns.id, run.id)); // run_attempt.go:186-189
+  // FY4/M3: the rerun path recounts too (rerun.go:391 ->
+  // NotifyWorkflowJobsAndRunsStatusUpdate -> notify.go:90's per-run loop);
+  // without this, num_closed_action_runs rides stale-high for the rerun's
+  // duration (self-healing only at the settle chokepoint).
+  await updateRepoRunsNumbers(d1, run.repoId);
 }
 
 // ---------------------------------------------------------------------------

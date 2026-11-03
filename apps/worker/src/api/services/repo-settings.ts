@@ -398,7 +398,11 @@ export async function saveRepoSettings(
           .set({
             ...(patch.description !== undefined ? { description: patch.description } : {}),
             ...(patch.website !== undefined ? { website: patch.website } : {}),
-            updatedAt: now,
+            // FY4/M1: NO updatedAt stamp — upstream's settings save is
+            // NoAutoTime (repository.go:267-269, e.ID(...).NoAutoTime()
+            // .AllCols().Update(repo)); editing description/website does NOT
+            // bump Updated. The stamp entered silently with 5afe965 and its
+            // a606ecc justification cited a nonexistent upstream function.
           })
           .where(eq(repositories.id, repoId)),
       ]

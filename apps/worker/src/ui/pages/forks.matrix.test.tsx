@@ -374,10 +374,9 @@ describe("the forks list shapes on /fsx-owner/paint/forks", () => {
     const html = await res.text();
     const described = forkRow(html, "/fsx-owner/p-one");
     expect(described).toContain('<div class="item-body">First helper fork.</div>');
-    // FN-4/0068: saveRepoSettings writes the repositories row in the same
-    // batch (description moved there) and stamps updated_at — upstream's
-    // UpdateRepositorySettings semantics; the row's Updated line renders.
-    expect(described).toContain("Updated <");
+    // FY4/M1: upstream's settings save is NoAutoTime (repository.go:267-269)
+    // — a description edit does NOT bump Updated; no time line renders.
+    expect(described).not.toContain("Updated <");
     const updated = forkRow(html, "/fsx-owner/p-four");
     expect(updated).toContain('<div class="item-body">Updated <relative-time'); // T0 stamp
   });
