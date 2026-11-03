@@ -5033,3 +5033,50 @@ export const webauthnCredentials = sqliteTable(
     uniqueIndex("webauthn_credentials_credential_id_uq").on(t.credentialId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// The ActivityPub follower store (the federation SPEC's durable tier —
+// specs/federation.md §5 as-built, ledger S-1, migration 0063; the ADR-0007
+// migration grant). Upstream has NO table to port: the entire follow
+// architecture was never merged into mainline (services/federation/ has zero
+// commits in the pin's whole history; PR #36789 `1592576fa5` reduced
+// person.go's PersonInbox to the 204 black hole), so this table implements
+// the PRE-DELETION shape our landed federation surface already cites — the
+// intentional-recorded-with-predecessor classification (ADR-0007 §2,
+// predecessor = specs/federation.md).
+// ---------------------------------------------------------------------------
+
+/**
+ * The remote-follower registry (specs/federation.md §5's sanctioned store,
+ * migration 0063): one row per (local user, remote actor IRI) the inbox has
+ * verified a Follow from. The inbox's Follow arm upserts (the idempotent
+ * re-follow), its Undo arm removes; nothing reads it yet — the landed
+ * surface renders no follower views (SPEC §1's don't-invent rule), the rows
+ * are the remaining federation tier's substrate (the delivery lane, OQ-5).
+ *
+ * Shape: follows the local `follows` table's conventions (models/user/
+ * follow.go's port) — the same references/cascade/unique-composite/created_at
+ * posture, keyed on the follower's actor IRI instead of a local user id:
+ *   - `user_id` — the inbox target (users.id), ON DELETE CASCADE: the
+ *     user-delete purge needs no per-table cascade lines.
+ *   - `follower_iri` — the remote actor IRI (the Follow activity's `actor`,
+ *     string form or embedded-object `id`). Not a users FK: remote actors
+ *     have no local row (upstream never cached actor documents either —
+ *     fetch-per-verification, SPEC §6.2.1 D4).
+ *   - UNIQUE (user_id, follower_iri) — the re-Follow is a no-op, the Undo
+ *     removal and any future follower listing share this one lookup.
+ *   - `created_at` — the first verified Follow (a re-Follow does not touch
+ *     it, matching the local follows table's insert-only semantics).
+ */
+export const federationFollowers = sqliteTable(
+  "federation_followers",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    followerIri: text("follower_iri").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [uniqueIndex("federation_followers_user_iri_uq").on(t.userId, t.followerIri)],
+);

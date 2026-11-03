@@ -4,7 +4,9 @@ Status: **draft** (v1.4 queue; written 2026-10-31, not yet ratified).
 **Tier A (W-A1) LANDED as-built 2026-10-31 — see §6.1.1. Tier B LANDED as-built
 2026-11-01 under the user's completion directive (the OQ-1 park overtaken by
 dispatch; the data plane scoped to the pre-stub surface, no new storage) —
-see §6.2.1. W-B1 (nodeinfo data) and W-B5 (delivery) remain unbuilt.**
+see §6.2.1. The S-1 follower store LANDED 2026-11-03 under the ADR-0007
+migration grant — see §5's S-1 as-built (migration 0063).
+W-B1 (nodeinfo data) and W-B5 (delivery) remain unbuilt.**
 Pin: `fc493688` (gitea v1.22.0-rc1-3919).
 
 ---
@@ -382,6 +384,29 @@ OQ-5), no R2, no Durable Objects. Zero schema deltas, zero binding deltas;
 the keypair lazy-generate race is handled the debian.ts way (upsert + re-read,
 the stored pair authoritative).
 
+**AS-BUILT (2026-11-03, S-1): the follower store landed.** The ADR-0007
+migration grant (`docs/decisions/0007-upstream-table-alignment.md`) supplied
+the sanctioned home the 2026-11-01 build lacked — ledger S-1, migration
+`0063_bright_gwen_stacy`: `federation_followers` (`id`, `user_id` →
+`users.id` **ON DELETE CASCADE** — the user-delete purge needs no per-table
+cascade lines, `follower_iri` TEXT, `created_at`; UNIQUE (`user_id`,
+`follower_iri`)). Upstream has **no table to port**: `services/federation/`
+has zero commits across the pin's whole history and #36789 reduced
+`PersonInbox` to the 204 black hole — the shape completes our own landed
+surface instead (ADR-0007's intentional-recorded-with-predecessor class,
+predecessor = this SPEC), reusing the local `follows` table's conventions
+(models/user/follow.go's port family) keyed on the remote actor IRI. The
+inbox's verified Follow **persists** (idempotent: the UNIQUE pair makes a
+re-Follow a no-op, `created_at` keeps the FIRST verified Follow; an
+actorless Follow has no key and stores nothing) and a verified **Undo**
+drops the row — the removal key comes from the embedded Follow's `actor`
+falling back to the Undo's own `actor` when the cargo is a bare IRI, and
+the (user_id, follower_iri) pair key bounds a stranger's Undo to a no-op —
+with the 204 black-hole response byte-identical. Every RESPONSE byte is the
+pre-S-1 as-built's (the store is response-invisible). No reads land: the
+surface renders no follower views (the don't-invent rule, §1) — the rows
+are the delivery lane's substrate (OQ-5, still unbuilt).
+
 ---
 
 ## 6. Wave decomposition
@@ -626,6 +651,10 @@ Build-time decisions, each a recorded divergence (none silent):
    verified activity keeps upstream's 204 black hole (PersonInbox verbatim).
    A signed-but-malformed JSON body answers 400 `Bad Request` (an arm the
    black hole never needed — it never read the body).
+   **SUPERSEDED IN PART 2026-11-03 (S-1)**: the store half landed —
+   `federation_followers` (migration 0063, the ADR-0007 grant; the Follow
+   persists idempotently, the Undo removes, response bytes unchanged; §5's
+   S-1 as-built). The delivery lane remains unbuilt (OQ-5).
 2. **Three fail-closed verify arms beyond upstream's bare verifier**, each
    §3.1/§7-committed: a present `Digest` header must carry a matching
    `SHA-256=` entry (the tampered-body gate; absent Digest leaves the body
@@ -747,6 +776,10 @@ table is empty after the Accept).
    Follow activities now earn an inline Accept (§6.2.1 D1), but the durable
    tier this OQ guards (a followers store + the delivery lane) is still
    unbuilt and still needs its own SPEC + migration grant.**
+   **UPDATE 2026-11-03 (S-1): the store half is built** —
+   `federation_followers` (migration 0063, the ADR-0007 grant; §5's S-1
+   as-built). What remains OQ-5-gated is the DELIVERY lane (W-B5) and any
+   follower-reading surface.
 6. **OQ-6 — webfinger scope parity footnote.** Upstream webfinger resolves
    `mailto:` against the users table (an instance-enumeration vector bounded
    only by the visibility gate). Port faithfully (Tier A) or drop the mailto

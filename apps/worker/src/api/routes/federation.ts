@@ -84,11 +84,14 @@
  *   POST /api/v1/activitypub/user-id/{id}/inbox   → ReqHTTPSignature
  *          (reqsignature.go, ported in services/federation/httpsig.ts) →
  *          PersonInbox: a verified Follow answers 200 with an inline
- *          Accept activity (the user's completion directive — NO follower
- *          store: no sanctioned table exists and no migration is granted,
- *          so the acceptance is NOT persisted; see SPEC §6.2 as-built);
- *          every other verified activity keeps upstream's 204 black hole
- *          (PersonInbox's entire body, person.go:81-96).
+ *          Accept activity AND persists the follower
+ *          (services/federation/followers.ts — the federation_followers
+ *          table, migration 0063; the S-1 store, idempotent on re-Follow;
+ *          SPEC §5/§6.2 as-built, the ADR-0007 migration grant); a verified
+ *          Undo of a Follow removes the stored row (still the 204 black-hole
+ *          response — the removal is silent, upstream PersonInbox never
+ *          parsed anything); every other verified activity keeps upstream's
+ *          204 black hole (person.go:81-96).
  *
  * chi-exact dispatch per armed path (the Group-folds-middleware mechanics
  * from the Tier A header): chiUnknownMethodGuard (the pre-tree bare 405) →
@@ -143,6 +146,7 @@ import {
   readBodyBounded,
   verifyHttpSignature,
 } from "../../services/federation/httpsig";
+import { removeFollower, upsertFollower } from "../../services/federation/followers";
 
 /**
  * The env slice the family reads. `FEDERATION_ENABLED` rides wrangler `vars`
@@ -507,12 +511,19 @@ function activityActorIri(activity: Record<string, unknown>): string | null {
  *      the body; ours must, and the read is the streamed-bounded posture);
  *   2. verifyHttpSignature — error arm → thrown (house 500, upstream
  *      APIErrorInternal), rejected arm → the exact 403 body (:91-93);
- *   3. the Follow → Accept ladder (the user's completion directive; the
- *      Accept rides the RESPONSE — no follower store is sanctioned and no
- *      delivery lane exists, so nothing is persisted and nothing is sent
- *      outbound; SPEC §6.2 as-built records the remaining tier) — every
- *      other activity keeps the upstream 204 black hole. Malformed JSON →
- *      400 (an arm the black hole never needed; it never looked).
+ *   3. the Follow → Accept ladder (the user's completion directive) — the
+ *      Accept rides the RESPONSE unchanged AND the follower row is
+ *      persisted (the federation_followers store, migration 0063 — ledger
+ *      S-1; the idempotent re-Follow upserts as a no-op; an actorless
+ *      Follow has no key and stores nothing); a verified Undo drops the
+ *      row keyed by the embedded Follow's actor (falling back to the
+ *      Undo's own actor when the cargo is a bare IRI) — the removal is
+ *      silent, the 204 black-hole response byte-identical (upstream
+ *      PersonInbox never parsed the body, so any richer arm would be
+ *      invention); every other activity keeps the upstream 204 black hole.
+ *      Malformed JSON → 400 (an arm the black hole never needed; it never
+ *      looked). The response shapes are EXACTLY the pre-S-1 as-built's —
+ *      the store adds no observable difference to any response.
  */
 async function inboxHandler(c: Context<ApiEnv>, opts: { fetchImpl?: typeof fetch }): Promise<Response> {
   const id = parseActorIdParam(c.req.param("id"));
@@ -549,18 +560,43 @@ async function inboxHandler(c: Context<ApiEnv>, opts: { fetchImpl?: typeof fetch
   } catch {
     throw new ApiError(400, "Bad Request");
   }
-  if (typeof activity === "object" && activity !== null && (activity as Record<string, unknown>).type === "Follow") {
-    const follow = activity as Record<string, unknown>;
-    const follower = activityActorIri(follow);
-    const accept: Record<string, unknown> = {
-      "@context": "https://www.w3.org/ns/activitystreams",
-      id: `${actorIri}#accepts/${crypto.randomUUID()}`,
-      type: "Accept",
-      actor: actorIri,
-      ...(follower === null ? {} : { to: follower }),
-      object: follow,
-    };
-    return c.body(JSON.stringify(accept), 200, { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE });
+  if (typeof activity === "object" && activity !== null) {
+    const record = activity as Record<string, unknown>;
+    if (record.type === "Follow") {
+      const follower = activityActorIri(record);
+      // The S-1 store (specs/federation.md §5 as-built): the verified Follow
+      // persists — idempotent (the UNIQUE pair upserts as a no-op), keyed to
+      // THIS inbox's user (the object field stays unparsed, the landed
+      // ladder's posture); an actorless Follow has no key and stores nothing.
+      if (follower !== null) {
+        await upsertFollower(c.env.DB, user.id, follower, new Date());
+      }
+      const accept: Record<string, unknown> = {
+        "@context": "https://www.w3.org/ns/activitystreams",
+        id: `${actorIri}#accepts/${crypto.randomUUID()}`,
+        type: "Accept",
+        actor: actorIri,
+        ...(follower === null ? {} : { to: follower }),
+        object: record,
+      };
+      return c.body(JSON.stringify(accept), 200, { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE });
+    }
+    if (record.type === "Undo") {
+      // The Undo cargo is an embedded Follow activity (the ActivityPub norm —
+      // the Accept's own `object` echo is exactly this shape) or a bare IRI;
+      // the follower key comes from the embedded activity's actor, falling
+      // back to the Undo's own actor. The pair key bounds the removal to THIS
+      // inbox's rows; a stranger's Undo is a no-op.
+      const cargo = record.object;
+      const embedded =
+        typeof cargo === "object" && cargo !== null && (cargo as Record<string, unknown>).type === "Follow"
+          ? activityActorIri(cargo as Record<string, unknown>)
+          : null;
+      const follower = embedded ?? activityActorIri(record);
+      if (follower !== null) {
+        await removeFollower(c.env.DB, user.id, follower);
+      }
+    }
   }
   // Upstream PersonInbox: `ctx.Status(http.StatusNoContent)` — the black hole.
   return c.body(null, 204);

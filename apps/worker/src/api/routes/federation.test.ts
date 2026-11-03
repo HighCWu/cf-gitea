@@ -3,9 +3,13 @@
  * discovery pair on real D1 — plus Tier B as-built (W-B2/W-B3/W-B4, the
  * 2026-11-01 completion directive): the Person actor, the signature-
  * verified inbox with the Follow→Accept ladder, the keypair store, and the
- * chi-exact method tree. Both routers driven standalone (the HANDOFF mounts
- * in src/index.ts + api/router.ts are the orchestrator's; the sub-apps are
- * mounted verbatim, so these pins carry over unchanged).
+ * chi-exact method tree — with the S-1 follower store on top (migration
+ * 0063, the ADR-0007 grant: the Follow persists, the Undo removes, the
+ * re-Follow is a no-op, the user-delete cascade drops the rows; every
+ * response byte stays the pre-S-1 as-built's). Both routers driven
+ * standalone (the HANDOFF mounts in src/index.ts + api/router.ts are the
+ * orchestrator's; the sub-apps are mounted verbatim, so these pins carry
+ * over unchanged).
  *
  * Arms pinned, each with its upstream cite:
  *   - the FEDERATION_ENABLED gate: strict "true" polarity; disabled web
@@ -31,7 +35,9 @@
  *     GET /activitypub/user-id/{id} → the Person actor (person.go:20-79),
  *     POST /activitypub/user-id/{id}/inbox → ReqHTTPSignature + PersonInbox
  *     (reqsignature.go; the Follow→Accept ladder is the user directive's
- *     arm, everything else the 204 black hole), every other /activitypub/*
+ *     arm now durable through the S-1 store — the verified Follow persists
+ *     into federation_followers and the Undo removes, everything else the
+ *     204 black hole), every other /activitypub/*
  *     path UNREGISTERED → the router's native 404 (incl. the deprecated
  *     /user/{username} form, api.go's own "remove in 1.20" note). The
  *     inline activitypub scope gate: anonymous passes (api.go:281-283), a
@@ -95,6 +101,9 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM email_addresses").run();
   await env.DB.prepare("DELETE FROM user_settings").run();
   await env.DB.prepare("DELETE FROM sessions").run();
+  // The S-1 store wipes via the users cascade too — the explicit run keeps
+  // the suite independent of FK ordering.
+  await env.DB.prepare("DELETE FROM federation_followers").run();
   await env.DB.prepare("DELETE FROM users").run();
 });
 
@@ -921,8 +930,10 @@ describe("the actor keypair — lazy RSA-3072 in user_settings_kv (user_settings
 // TIER B — the inbox (person.go:81-96 behind reqsignature.go at
 // `1592576fa5^`): the deleted test's MissingPersonInbox posture re-armed
 // (unsigned → the 500 error arm; verified → the 204 black hole), with the
-// completion directive's Follow→Accept ladder on top (NO persistence — no
-// sanctioned follower store exists; SPEC §6.2 as-built)
+// completion directive's Follow→Accept ladder on top — durable since S-1
+// (the federation_followers store, migration 0063: the verified Follow
+// persists, the Undo removes, the re-Follow is a no-op; every RESPONSE byte
+// stays the pre-S-1 as-built's — the store is response-invisible)
 // ---------------------------------------------------------------------------
 
 describe("POST /activitypub/user-id/{id}/inbox — the signature gate", () => {
@@ -1016,7 +1027,7 @@ describe("POST /activitypub/user-id/{id}/inbox — the signature gate", () => {
   });
 });
 
-describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder and the black hole", () => {
+describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder, the S-1 store, and the black hole", () => {
   it("a verified Follow answers 200 with the inline Accept — actor, to, and the verbatim object echo", async () => {
     const alice = await seedUser({ username: "alice" });
     const actorIri = `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`;
@@ -1066,6 +1077,10 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder an
 
     for (const activity of [
       { type: "Create", object: { type: "Note", content: "hi" } },
+      // The Undo is in this list as a RESPONSE pin: with nothing stored its
+      // removal arm is a no-op and the bytes stay the black hole's (the
+      // stored-row removal is pinned in the S-1 tests below in this
+      // describe).
       { type: "Undo", object: { type: "Follow", actor: REMOTE_ACTOR_IRI, object: REMOTE_KEY_ID } },
       { type: "Delete", object: REMOTE_ACTOR_IRI },
     ]) {
@@ -1082,7 +1097,7 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder an
     expect((await response.json<{ message: string }>()).message).toBe("Bad Request");
   });
 
-  it("a verified Follow is NOT persisted — no follower store exists (no sanctioned table, no migration)", async () => {
+  it("a verified Follow PERSISTS the follower (S-1, migration 0063) — the Accept bytes unchanged", async () => {
     const alice = await seedUser({ username: "alice" });
     const follow = {
       type: "Follow",
@@ -1090,11 +1105,123 @@ describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder an
       object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
     };
     const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, JSON.stringify(follow));
+    // The response is EXACTLY the pre-S-1 as-built's — the store is
+    // response-invisible (status, content-type, the Accept shape above).
     expect(response.status).toBe(200);
-    // The whole database holds no trace of the follower — the Accept lives
-    // only in the response; the remaining tier (a sanctioned store + the
-    // delivery lane) is recorded in SPEC §6.2 as-built.
-    const kv = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_settings_kv").first<{ n: number }>();
-    expect(kv?.n).toBe(0);
+    expect(response.headers.get("content-type")).toBe(ACTIVITY_STREAMS_CONTENT_TYPE);
+    const accept = await response.json<Record<string, unknown>>();
+    expect(accept.type).toBe("Accept");
+    expect(accept.to).toBe(REMOTE_ACTOR_IRI);
+    expect(accept.object).toEqual(follow);
+
+    // The store: one row, keyed to the inbox's user and the actor IRI.
+    const rows = await env.DB.prepare(
+      "SELECT user_id, follower_iri FROM federation_followers",
+    ).all<{ user_id: number; follower_iri: string }>();
+    expect(rows.results).toEqual([{ user_id: alice.id, follower_iri: REMOTE_ACTOR_IRI }]);
+  });
+
+  it("a re-Follow is idempotent: still ONE row, the original untouched (no delete-and-reinsert)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+    const follow = JSON.stringify({ type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` });
+    expect((await signedInbox(path, follow)).status).toBe(200);
+
+    const first = await env.DB.prepare(
+      "SELECT id, created_at FROM federation_followers WHERE follower_iri = ?",
+    ).bind(REMOTE_ACTOR_IRI).first<{ id: number; created_at: number }>();
+    expect(first).not.toBeNull();
+
+    // The re-Follow: same 200 Accept ladder, but the UNIQUE pair makes the
+    // write a no-op — the original row (id + created_at) survives verbatim.
+    expect((await signedInbox(path, follow)).status).toBe(200);
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(count?.n).toBe(1);
+    const second = await env.DB.prepare(
+      "SELECT id, created_at FROM federation_followers WHERE follower_iri = ?",
+    ).bind(REMOTE_ACTOR_IRI).first<{ id: number; created_at: number }>();
+    expect(second).toEqual(first);
+  });
+
+  it("an actorless Follow stores nothing (no key to persist) — the Accept ladder unchanged", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, JSON.stringify({ type: "Follow" }));
+    expect(response.status).toBe(200);
+    const accept = await response.json<Record<string, unknown>>();
+    expect(accept.type).toBe("Accept");
+    expect(accept.to).toBeUndefined();
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(count?.n).toBe(0);
+  });
+
+  it("a verified Undo removes the stored row — silent 204, byte-identical to the black hole", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+    const follow = JSON.stringify({ type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` });
+    expect((await signedInbox(path, follow)).status).toBe(200);
+    const before = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(before?.n).toBe(1);
+
+    // The Undo carries the Follow verbatim (the Accept's own object echo is
+    // exactly this shape) — the removal is keyed to the embedded actor.
+    const undo = JSON.stringify({
+      type: "Undo",
+      actor: REMOTE_ACTOR_IRI,
+      object: { type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` },
+    });
+    const response = await signedInbox(path, undo);
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+
+    const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(after?.n).toBe(0);
+  });
+
+  it("an Undo with a bare-IRI cargo keys on the Undo's own actor; a stranger's Undo touches nothing", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+    const follow = JSON.stringify({ type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` });
+    expect((await signedInbox(path, follow)).status).toBe(200);
+
+    // A stranger's Undo (signed by bob's key — upstream's deleted middleware
+    // verified the HTTP layer only; the activity's actor field is the body's
+    // business): the pair key bounds the removal to the named follower, so
+    // bob's row survives.
+    const strangerUndo = JSON.stringify({
+      type: "Undo",
+      actor: "https://remote.example/actors/mallory",
+      object: { type: "Follow", actor: "https://remote.example/actors/mallory", object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` },
+    });
+    const stranger = await signedInbox(path, strangerUndo);
+    expect(stranger.status).toBe(204);
+    let count = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(count?.n).toBe(1);
+
+    // The bare-IRI cargo (no embedded Follow): the fallback key is the
+    // Undo's own actor — bob's own undo removes bob's row.
+    const bareUndo = JSON.stringify({
+      type: "Undo",
+      actor: REMOTE_ACTOR_IRI,
+      object: "https://remote.example/activities/1",
+    });
+    const bare = await signedInbox(path, bareUndo);
+    expect(bare.status).toBe(204);
+    count = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(count?.n).toBe(0);
+  });
+
+  it("the user-delete cascade drops the follower rows (ON DELETE CASCADE, schema.ts)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+    const follow = JSON.stringify({ type: "Follow", actor: REMOTE_ACTOR_IRI, object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}` });
+    expect((await signedInbox(path, follow)).status).toBe(200);
+    const before = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(before?.n).toBe(1);
+
+    // The user purge path needs no per-table cascade lines — the declared
+    // FK carries the deletion (the schema.test.ts cascade-pin posture).
+    await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(alice.id).run();
+    const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM federation_followers").first<{ n: number }>();
+    expect(after?.n).toBe(0);
   });
 });
