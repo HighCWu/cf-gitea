@@ -32,6 +32,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { ActionType } from "../../api/services/activity-feeds";
+import { pathEscape } from "../../api/services/releases";
 import {
   USER_FEED_CONTENT_TYPES,
   formatRfc1123z,
@@ -400,5 +401,61 @@ describe("user feed xml query-shape witness (query-shape-audit C2, the xml mirro
     const preFixRead = preFix.meta?.rows_read ?? 0;
     expect(preFixRead).toBeGreaterThanOrEqual(C2_XML_CORPUS_ISSUES);
     expect(fixedRead).toBeLessThan(preFixRead);
+  });
+});
+
+// --- the link escaper class pins (the convert.go:url.PathEscape port) ---------
+
+describe("the feed link escaper pins (convert.go:38-43 url.PathEscape)", () => {
+  it("issue/pull link infos[0] rides url.PathEscape — the char-class differential vs encodeURIComponent", async () => {
+    await seedBaseFixtures();
+    await insertAction(ActionType.CreateIssue, {
+      // infos[0] = the head before "|" — deliberately carrying BOTH halves of
+      // the divergent byte set (encodeURIComponent keeps !'()* raw and
+      // escapes $&+:;=@; url.PathEscape is the inverse, ; alone common).
+      content: "7:x!(y)$&;:z=w|exotic title",
+      createdAt: T0,
+    });
+
+    const data = await loadUserFeedData(env.DB, aliceSubject, anonymous, ORIGIN, new URLSearchParams());
+    expect(data.items).toHaveLength(1);
+    // Go 1.25.1: url.PathEscape("7:x!(y)$&;:z=w") = "7:x%21%28y%29$&%3B:z=w"
+    // (: $ & = @ kept; ! ( ) ; encoded). The old encodeURIComponent spelled
+    // the inverse class ("7%3Ax!(y)%24%26%3B%3Az%3Dw") — byte-divergent.
+    const item = data.items[0];
+    expect(item?.link).toBe(`${ORIGIN}/alice/demo/issues/7:x%21%28y%29$&%3B:z=w`);
+    // The envelope XML-escapes the `&` of the kept class → `&amp;`.
+    const rss = renderUserFeedRss(data);
+    expect(rss).toContain("/issues/7:x%21%28y%29$&amp;%3B:z=w");
+    expect(rss).not.toContain("%24");
+  });
+
+  it("repoHref's owner/name segments ride the gated charset — encodeURIComponent ≡ url.PathEscape there", () => {
+    // GetRepoAbsoluteLink (activities/action.go:286-288) spells
+    // url.PathEscape per segment; our segments only ever come out of the
+    // validation gates — VALID_USERNAME `^[\da-zA-Z][-.\w]*$`
+    // (services/orgs/orgs.ts:128) and VALID_REPO_NAME `^[-.\w]+$`
+    // (src/repos/service.ts:122) — whose charset is disjoint from the
+    // divergent byte set, so the builtin was byte-identical there.
+    const USERNAME = /^[\da-zA-Z][-.\w]*$/;
+    const REPO_NAME = /^[-.\w]+$/;
+    for (const sample of ["alice", "a.b-c_d", "0.9", "x-y.z_1"]) {
+      expect(USERNAME.test(sample) && REPO_NAME.test(sample)).toBe(true);
+      expect(encodeURIComponent(sample)).toBe(pathEscape(sample));
+    }
+    // Single-char repo slugs legally include the non-alnum gate chars.
+    for (const char of "._-") {
+      expect(REPO_NAME.test(char)).toBe(true);
+      expect(encodeURIComponent(char)).toBe(pathEscape(char));
+    }
+    // No gate ever admits a divergent byte, and outside the gate the two
+    // encoders genuinely disagree (the `!'()*` vs `$&+:=@` inversion; `;` is
+    // the one byte both escape identically, so it stays out of this loop).
+    for (const char of "!'()*$&+:=@") {
+      expect(USERNAME.test(char)).toBe(false);
+      expect(REPO_NAME.test(char)).toBe(false);
+      expect(encodeURIComponent(char)).not.toBe(pathEscape(char));
+    }
+    expect(encodeURIComponent(";")).toBe(pathEscape(";"));
   });
 });

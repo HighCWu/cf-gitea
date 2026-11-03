@@ -166,6 +166,7 @@ import type { Viewer as ApiViewer } from "../../api/services/repository";
 import { orgMembers, repositories } from "../../db/schema";
 import type { Viewer } from "../viewer";
 import { pathEscapeSegments } from "../page-data";
+import { pathEscape } from "../../api/services/releases";
 import { ellipsisDisplay, issueIndexOf, issueInfos } from "./activity-feeds";
 
 // ---------------------------------------------------------------------------
@@ -344,8 +345,11 @@ export function feedItemFromActivity(
       : `${repoHref}/${liveIssue.isPull ? "pulls" : "issues"}/${index}`;
   let link = activity.comment?.html_url ?? (issueUrl ?? "#");
 
-  const issueLink = `${repoHref}/issues/${encodeURIComponent(rawIndex)}`; // toIssueLink
-  const pullLink = `${repoHref}/pulls/${encodeURIComponent(rawIndex)}`; // toPullLink
+  // toIssueLink/toPullLink (convert.go:38-43) — url.PathEscape per value
+  // (the single-segment port, NOT the segments one: upstream encodes a
+  // "/" in the raw infos[0] as %2F).
+  const issueLink = `${repoHref}/issues/${pathEscape(rawIndex)}`; // toIssueLink
+  const pullLink = `${repoHref}/pulls/${pathEscape(rawIndex)}`; // toPullLink
   // toReleaseLink — GetBranch does NOT strip the tag prefix (the quirk note);
   // the tail escapes through util.PathEscapeSegments (routers/web/feed/
   // convert.go:50), i.e. the ONE Go-parity port in api/services/releases.ts

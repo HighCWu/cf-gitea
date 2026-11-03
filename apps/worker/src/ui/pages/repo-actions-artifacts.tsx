@@ -101,6 +101,7 @@ import {
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { pathEscapeSegments } from "../page-data";
+import { pathEscape } from "../../api/services/releases";
 
 type D1 = D1Database;
 
@@ -566,13 +567,9 @@ export function artifactPreviewContentType(filename: string, sniffed: string): s
   return sniffed;
 }
 
-/** getSafeName + encodeContentDisposition (content_disposition.go:16-65):
- *  the ASCII-safe quoted form, plus the RFC 2231 filename* twin when any
- *  rune needed masking. `kind` is the disposition word — upstream carries it
- *  as ContentDispositionType (inline for the preview content, attachment for
- *  the download arms: ServeSetHeaders' default and the zip-compose set,
- *  view.go:1245). */
-function encodeContentDisposition(kind: "inline" | "attachment", filename: string): string {
+/** getSafeName (content_disposition.go:25-36): non-printable/non-ASCII runes
+ *  (tab kept) mask to '_'; the flag decides the filename* twin. */
+function getSafeName(filename: string): { safe: string; needsEncoding: boolean } {
   let safe = "";
   let needsEncoding = false;
   for (const char of filename) {
@@ -584,13 +581,63 @@ function encodeContentDisposition(kind: "inline" | "attachment", filename: strin
       safe += char;
     }
   }
-  const quoted = (value: string): string =>
-    // mime.FormatMediaType quotes any value beyond Go's isTokenChar set
-    // (RFC 2045 token chars: the specials !#$%&'*+-.^_`|~ plus alnum).
-    /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(value) ? value : `"${value.replaceAll(`"`, `\\"`)}"`;
-  const base = `${kind}; filename=${quoted(safe)}`;
+  return { safe, needsEncoding };
+}
+
+/** isTSpecial (mime/grammar.go): `()<>@,;:\"/[]?=`. */
+function isTSpecial(char: string): boolean {
+  return `()<>@,;:\\"/[]?=`.includes(char);
+}
+
+/** mime.FormatMediaType's one-parameter shape over "filename" (mime/
+ *  mediatype.go): token values ride raw, everything else quotes with `"`
+ *  and `\` backslash-escaped. The token set is Go's RFC 2045 isTokenChar
+ *  bitmap (alnum + `!#$%&'*+-.^_`|~`) — `{ }` are printable non-tspecials
+ *  yet NOT token chars, so they still quote. Go 1.25.1 probe truth table:
+ *  `a b.txt` → `"a b.txt"`, `back\slash{x}.bin` → `"back\\slash{x}.bin"`,
+ *  `bang!(x)*.txt` → `"bang!(x)*.txt"` (the ( ) tspecials force quoting but
+ *  ride raw inside the quotes). */
+function formatMediaTypeFilename(kind: string, value: string): string {
+  if (/^[A-Za-z0-9!#$%&'*+.^_`|~]+$/.test(value)) return `${kind}; filename=${value}`;
+  return `${kind}; filename="${value.replace(/["\\]/g, "\\$&")}"`;
+}
+
+/** The RFC 2231 §4/§7 extended-value escaper (mediatype.go's needEnc arm):
+ *  percent-encode space/controls, 0x7f+, and the attribute-reserved
+ *  `*'%"` + tspecials; everything else rides raw (one %XX per UTF-8 byte,
+ *  uppercase hex, Go's len/value[index] walk). This is NEITHER class of
+ *  url.PathEscape (`!` PathEscape-escapes and RFC 2231 keeps it; `@` the
+ *  other way) NOR encodeURIComponent (the inverse on `!'()*` vs `$&+:;=@`):
+ *  Go 1.25.1 probe — `résumé$(file)*.log` →
+ *  `r%C3%A9sum%C3%A9$%28file%29%2A.log` ($ kept, ()* escaped). */
+function rfc2231Escape(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let out = "";
+  for (const byte of bytes) {
+    const char = String.fromCharCode(byte);
+    if (byte <= 0x20 || byte >= 0x7f || `*'%`.includes(char) || isTSpecial(char)) {
+      out += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    } else {
+      out += char;
+    }
+  }
+  return out;
+}
+
+/** encodeContentDisposition (content_disposition.go:47-65): the safe-name
+ *  form, plus the `; filename*=utf-8''…` suffix cut from the raw-name
+ *  FormatMediaType shape like upstream's TrimPrefix. The filename* twin
+ *  spells the charset LOWERCASE and percent-encodes per the RFC 2231 class
+ *  above — encodeURIComponent was byte-divergent here (charset case, and
+ *  the `!'()*` vs `$&+:;=@` class inversion). `kind` is the disposition
+ *  word — upstream carries it as ContentDispositionType (inline for the
+ *  preview content, attachment for the download arms: ServeSetHeaders'
+ *  default and the zip-compose set, view.go:1245). */
+function encodeContentDisposition(kind: "inline" | "attachment", filename: string): string {
+  const { safe, needsEncoding } = getSafeName(filename);
+  const base = formatMediaTypeFilename(kind, safe);
   if (!needsEncoding) return base;
-  return `${base}; filename*=UTF-8''${encodeURIComponent(filename)}`;
+  return `${base}; filename*=utf-8''${rfc2231Escape(filename)}`;
 }
 
 /** EncodeContentDispositionInline (content_disposition.go:35). */
@@ -783,7 +830,10 @@ export async function loadArtifactPreviewPageData(
     runIndex: run.index,
     runAttempt: 0,
     artifactName: artifact.artifactName,
-    downloadUrl: `${runUrl}/artifacts/${encodeURIComponent(artifact.artifactName)}`,
+    // url.PathEscape(artifact.ArtifactName) (view_artifact.go:366) — the
+    // single-segment port from api/services/releases (R2-L2); a slash in an
+    // artifact name encodes %2F (unlike PathEscapeSegments).
+    downloadUrl: `${runUrl}/artifacts/${pathEscape(artifact.artifactName)}`,
     previewContentUrl: "",
     requestedPathMissing: false,
     previewTooLarge: !isArtifactPreviewSizeAllowed(artifactsTotalSize(artifacts)),

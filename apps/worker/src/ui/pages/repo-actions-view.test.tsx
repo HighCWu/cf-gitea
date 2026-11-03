@@ -62,6 +62,7 @@ import {
   artifactPreviewLocale,
   artifactPreviewRawLink,
   artifactPreviewSignature,
+  encodeContentDispositionAttachment,
   encodeContentDispositionInline,
   formatPreviewCount,
   insertArtifactPreviewHelperScript,
@@ -1948,6 +1949,26 @@ describe("the C4 arms — the preview page module (pages/repo-actions-artifacts.
     expect(missing.data.previewContentUrl).toBe("");
   });
 
+  it("downloadUrl pins the url.PathEscape class on the artifact name (view_artifact.go:366)", async () => {
+    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
+    // runAttemptId 0 keeps the attempt arm (the `?attempt=` suffix) out of
+    // the URL so the pin isolates the escaper bytes.
+    const first = await seedArtifact({
+      runId: seeded.run.id,
+      runAttemptId: 0,
+      name: "bang$(x)*.zip",
+      path: "a/b.txt",
+      size: 7,
+    });
+    const outcome = await loadArtifactPreviewPageData(env, repo, first.id, "");
+    expect(outcome.outcome).toBe("ok");
+    if (outcome.outcome !== "ok") return;
+    // Go 1.25.1: url.PathEscape("bang$(x)*.zip") = "bang$%28x%29%2A.zip" —
+    // `$` KEPT raw while `( ) *` encode; encodeURIComponent was the inverse
+    // ("bang%24(x)*.zip": `$` encoded, `( ) *` kept).
+    expect(outcome.data.downloadUrl).toBe(`/alice/demo/actions/runs/${seeded.run.id}/artifacts/bang$%28x%29%2A.zip`);
+  });
+
   it("the raw serving: legacy rows (plain + gzip-on-store) and the document redirect", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
     const plain = await seedArtifact({ runId: seeded.run.id, runAttemptId: seeded.attempt.id, name: "dist", path: "b.txt", size: 7 });
@@ -2215,6 +2236,24 @@ describe("the C4 arms — the preview page module (pages/repo-actions-artifacts.
     expect(encodeContentDispositionInline("with space.txt")).toBe(`inline; filename="with space.txt"`);
     const exotic = encodeContentDispositionInline("résumé.txt");
     expect(exotic).toContain("filename=r_sum_.txt");
-    expect(exotic).toContain(`filename*=UTF-8''r%C3%A9sum%C3%A9.txt`);
+    expect(exotic).toContain(`filename*=utf-8''r%C3%A9sum%C3%A9.txt`);
+  });
+
+  it("the RFC 2231 filename* twin pins the Go mime.FormatMediaType char class (go1.25.1 probe)", () => {
+    // The differential against encodeURIComponent: Go keeps `$&+` raw and
+    // escapes `'()*` in the extended value (charset lowercase `utf-8''`).
+    expect(encodeContentDispositionAttachment("résumé$(file)*.log")).toBe(
+      `attachment; filename="r_sum_$(file)*.log"; filename*=utf-8''r%C3%A9sum%C3%A9$%28file%29%2A.log`,
+    );
+    // The safe-name arm never percent-encodes: tspecials force the quoted
+    // form and ride raw inside the quotes.
+    expect(encodeContentDispositionAttachment("bang!(x)*.txt")).toBe(`attachment; filename="bang!(x)*.txt"`);
+    expect(encodeContentDispositionAttachment("dollar$&+:;=@.txt")).toBe(`attachment; filename="dollar$&+:;=@.txt"`);
+    // { } are printable non-tspecials yet NOT RFC 2045 token chars — they
+    // quote; the quoted arm backslash-escapes `"` and `\`.
+    expect(encodeContentDispositionAttachment("back\\slash{x}.bin")).toBe(
+      'attachment; filename="back\\\\slash{x}.bin"',
+    );
+    expect(encodeContentDispositionAttachment("brace{|}^~`tick.txt")).toBe(`attachment; filename="brace{|}^~\`tick.txt"`);
   });
 });
