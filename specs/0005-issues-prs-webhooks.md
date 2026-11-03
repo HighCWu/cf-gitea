@@ -575,6 +575,73 @@ num_closed_pulls, num_milestones`) are maintained columns (SPEC-0004 §3.2
 recommendation) updated in the same D1 batch as the state change; label and milestone
 counts likewise (`updateIssueNumbers` pattern).
 
+**As-built: the schema-wide divergence families (ADR-0007 FN-13 record,
+2026-11-03).** ADR-0007 classifies every schema divergence from upstream as
+platform-adapted / intentional-recorded / drift, and a divergence without a SPEC
+record is drift — so the three schema-wide naming/strictness families are
+recorded HERE as intentional-recorded (this block owns the largest D1 table set
+and the schema.ts conventions header points here). The per-column census and
+verification cites live in `docs/research/table-alignment-audit.md` §7 (the
+audit's FN-13 disposition); this note is the normative record:
+
+1. **NOT-NULL strictness, ours stricter — kept.** Upstream xorm leaves a column
+   nullable unless its struct tag says `NOT NULL` (~269 of ~1081 columns at the
+   pin); ours declares `notNull()` far more widely (~715 of 1010). The stricter
+   shape is kept, not relaxed: xorm INSERTs write every mapped field with Go
+   zero values (no model-layer NULLs in upstream's effective row shape), and
+   xorm reads SQL NULL back as the Go zero value — no ADR-0002-frozen API
+   surface can observe the difference. **The inverse arm is NOT blessed**: where
+   OURS is the nullable side against upstream `NOT NULL`, that stays drift
+   unless separately recorded. Known members: `issue_subscriptions.created_unix`/
+   `updated_unix` (upstream `IssueWatch.CreatedUnix/UpdatedUnix NOT NULL`,
+   `models/issues/issue_watch.go:20-21`; schema.ts:999-1000 — drift, queued for
+   tightening, audit FN-12) and `issue_pins.repo_id` (upstream NOT NULL int64,
+   `models/issues/issue_pin.go:20`; ours nullable TEXT id-family column,
+   schema.ts:1096 — drift, audit FN-10). `users.email` /
+   `users.avatar_email` are separately recorded (SPEC-0002 §4.6 item 16).
+2. **Timestamp column names — upstream's `*_unix` names are the rule; the
+   `*_at` tables are the recorded exception.** Upstream renders its timestamp
+   columns `created_unix`/`updated_unix` (GonicMapper of `CreatedUnix`/
+   `UpdatedUnix`) and literally `created`/`updated` on the whole actions family
+   (fields `Created`/`Updated`, `models/actions/run.go:74-75` et al.); the
+   SPEC-0005 block above and every later port follow those names verbatim — the
+   table sketches above are that record, and the `*_at` suffixes on the Drizzle
+   PROPERTY names never reach SQL. The exception is the early-instance tables
+   that kept `created_at`/`updated_at` SQL names where upstream has the
+   `*_unix` names — recorded, NOT renamed (no API surface reads SQL column
+   names; a ~16-table rename buys nothing): `repositories`, `repo_transfer`,
+   `users` (incl. `last_login_at` ← upstream `last_login_unix`,
+   `models/user/user.go:124`), `personal_access_tokens`, `lfs_objects`,
+   `lfs_locks` (upstream column is `created`, `models/git/lfs_lock.go:27`),
+   `repo_watchers`, `repo_collaborators`, `follows`, `stars`, `repo_mirrors`
+   (incl. `next_sync_at`/`last_sync_at`), `notification_states` (updated_at),
+   `user_blocking`, `push_mirrors.next_sync_at` (its `created_unix` is parity).
+   Ours-extra tables/columns with `-_at` names (`repo_settings`, `repo_imports`,
+   `email_outbox`, `email_inbound`, `sessions`, `federation_followers`,
+   `repo_redirects.created_at`, `user_redirects.created_at`, PAT
+   `last_used_at`/`expires_at`) have no upstream counterpart — convention
+   members, not divergences.
+3. **`uid` → `user_id` — recorded rename.** Upstream's `UID int64` columns
+   render `uid` under GonicMapper (confirmed by upstream's own SQL:
+   `models/repo/star.go:73` `builder.Eq{"uid": …}`, `models/auth/
+   twofactor.go:161`); ours renames them `user_id` in `personal_access_tokens`
+   (SPEC-0002 §3), `stars`, `org_members`, `issue_user`, `team_members`,
+   `email_addresses`, `two_factor` — clearer name (upstream's own newer tables
+   use `UserID`: `models/user/follow.go:17`), zero API surface. `follow` is NOT
+   a member (upstream `Follow.UserID` is already `user_id`), and
+   `oauth2_application.uid` keeps upstream's name verbatim (parity exception).
+4. **Association-table renames recorded** (upstream table → ours, beyond the
+   plural rule): `hook_task` → `webhook_deliveries` (§3.6), `issue_watch` →
+   `issue_subscriptions`, `review` → `pull_reviews`, `collaboration` →
+   `repo_collaborators`, `watch` → `repo_watchers`, `team_user` →
+   `team_members`, `team_repo` → `team_repo_access`, `org_user` →
+   `org_members`, `mirror` → `repo_mirrors` (SPEC-0009 §3), `lfs_meta_object`
+   → `lfs_objects` (SPEC-0006 §3), `upload`/`attachment` → `issue_attachments`
+   + `release_assets` (§3.2 above), `notice` → `system_notices` (SPEC-0018
+   §4.1), `access_token` → `personal_access_tokens` (SPEC-0002 §2.7),
+   `user_setting` → `user_settings_kv` (user-notification-settings.md),
+   `notification` → `notification_states` (email-outbound.md).
+
 ### 3.3 R2 key layout (additions)
 
 ```

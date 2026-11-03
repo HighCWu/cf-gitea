@@ -174,7 +174,7 @@ classes only.
 | `commit_status_summary` | models/git/commit_status_summary.go:17 | — | missing-table | no reader in worker (grep 0) |
 | `commit_status` | models/git/commit_status.go:37 | schema.ts:1066 `commit_statuses` | drift | missing context_hash, index |
 | `commit_status_index` | models/git/commit_status.go:330 | — | missing-table | no table; autoincrement id substitutes, documented TODO(SPEC-0005) (api/services/commit-status.ts:88-91,143-145) |
-| `lfs_lock` | models/git/lfs_lock.go:21 | schema.ts:1281 `lfs_locks` | drift | ours-extra lower_path (schema.ts:1293, unrecorded case-fold lookup); created rename family |
+| `lfs_lock` | models/git/lfs_lock.go:21 | schema.ts:1281 `lfs_locks` | drift | ours-extra lower_path (schema.ts:1293, unrecorded case-fold lookup; FN-12 records it); `created` → `created_at` is the FN-13 §7.2 recorded timestamp-name family |
 | `package_blob` | models/packages/package_blob.go:30 | schema.ts:3693 `package_blobs` | drift | hash_m_d5/sh_a1/sh_a256/sh_a512 gonic renames |
 | `package` | models/packages/package.go:191 | schema.ts:3613 `packages` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `lfs_meta_object` | models/git/lfs.go:80 | schema.ts:1241 `lfs_objects` | intentional-recorded | lfs_objects state machine, bare keys; SPEC-0006 §3 (schema.ts:1241) |
@@ -216,7 +216,7 @@ classes only.
 | `action_run_job` | models/actions/run_job.go:32 | schema.ts:4106 `action_run_jobs` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `project_workflow` | models/project/workflows.go:160 | schema.ts:3070 `project_workflows` | drift | workflow_event/filters/actions → event/filters/actions renames |
 | `project` | models/project/project.go:85 | schema.ts:2936 `projects` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `hook_task` | models/webhook/hooktask.go:58 | schema.ts:1175 `webhook_deliveries` | intentional-recorded | Queues-based delivery redesign; SPEC-0005 §3.7 (schema.ts:1175) |
+| `hook_task` | models/webhook/hooktask.go:58 | schema.ts:1175 `webhook_deliveries` | intentional-recorded | Queues-based delivery redesign; SPEC-0005 §3.6 (schema.ts:1175) — §7.5 erratum: the old cite said §3.7, a section that does not exist |
 | `webhook` | models/webhook/webhook.go:123 | schema.ts:1132 `webhooks` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `dbfs_meta` | models/dbfs/dbfs.go:48 | — | missing-table | platform: R2 replaces dbfs (schema.ts:3906,4439) |
 | `dbfs_data` | models/dbfs/dbfs.go:57 | — | missing-table | platform: R2 replaces dbfs (schema.ts:3906,4439) |
@@ -225,7 +225,7 @@ classes only.
 | `public_key` | models/asymkey/ssh_key.go:39 | schema.ts:2327 `public_keys` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `gpg_key_import` | models/asymkey/gpg_key_import.go:28 | — | missing-table | recorded unmodeled — raw armor not kept (schema.ts:2272-2273,2366) |
 | `audit_event` | models/audit/audit_event.go:22 | schema.ts:3517 `audit_event` | drift | timestamp_unix → created_unix rename; enum-text family; scope_id TEXT (id-adjacent) |
-| `issue_pin` | models/issues/issue_pin.go:17 | schema.ts:1093 `issue_pins` | drift | missing id, is_pull; pin_order/repo_id nullability inverted |
+| `issue_pin` | models/issues/issue_pin.go:17 | schema.ts:1093 `issue_pins` | drift | missing id, is_pull (issue_pin.go:19,22); repo_id ours-NULLable TEXT vs upstream NOT NULL int64 (issue_pin.go:20 vs schema.ts:1096 — §7.1); FN-10 carries; §7.1 erratum: pin_order/issue_id are NOT inversions (ours is the stricter side) |
 | `reaction` | models/issues/reaction.go:62 | schema.ts:894 `reactions` | drift | missing original_author, original_author_id |
 | `review` | models/issues/review.go:123 | schema.ts:2438 `pull_reviews` | drift | missing original_author, original_author_id |
 | `issue_assignees` | models/issues/assignees.go:17 | schema.ts:1863 `issue_assignees` | aligned | blanket families only (id / timestamp-name / strictness) |
@@ -238,7 +238,7 @@ classes only.
 | `tracked_time` | models/issues/tracked_time.go:22 | schema.ts:1913 `tracked_time` | drift | time → seconds column rename (unit kept seconds) |
 | `issue_dependency` | models/issues/dependency.go:101 | schema.ts:1885 `issue_dependency` | drift | missing updated_unix |
 | `issue_user` | models/issues/issue_user.go:15 | schema.ts:1034 `issue_user` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `issue_watch` | models/issues/issue_watch.go:17 | schema.ts:992 `issue_subscriptions` | aligned | blanket families only (id / timestamp-name / strictness) |
+| `issue_watch` | models/issues/issue_watch.go:17 | schema.ts:992 `issue_subscriptions` | drift | FN-13 §7.1: created_unix/updated_unix ours-NULLable vs upstream NOT NULL (issue_watch.go:20-21 vs schema.ts:999-1000) — the ours-looser arm, NOT covered by the strictness record; recommended carrier FN-12; table name + the rest are the FN-13 §7.2/§7.5 recorded families |
 | `task` | models/admin/task.go:26 | — | missing-table | platform: admin task queue rides Cloudflare Queues/REPO_TASKS (SPEC-0020) |
 | `label` | models/issues/label.go:81 | schema.ts:812 `labels` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `issue_label` | models/issues/issue_label.go:19 | schema.ts:840 `issue_labels` | drift | missing id pk (composite PK used) |
@@ -256,7 +256,7 @@ classes only.
 | `oauth2_grant` | models/auth/oauth2.go:504 | schema.ts:3215 `oauth2_grant` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `mirror` | models/repo/mirror.go:23 | schema.ts:1720 `repo_mirrors` | intentional-recorded | sync-state/credentials restructure; SPEC-0009 §3 (schema.ts:1720) |
 | `repo_archiver` | models/repo/archiver.go:65 | — | missing-table | archives built on demand and streamed; SPEC-0004 §2.4 (api/services/archive.ts:1-8) |
-| `collaboration` | models/repo/collaboration.go:20 | schema.ts:1500 `repo_collaborators` | drift | missing id, created_unix, updated_unix |
+| `collaboration` | models/repo/collaboration.go:20 | schema.ts:1500 `repo_collaborators` | drift | missing id (FN-12); created_unix/updated_unix are PRESENT as created_at/updated_at (FN-13 §7.2 recorded family — the old reason miscounted them missing); mode is the TEXT-enum blanket (§2.3) |
 | `watch` | models/repo/watch.go:39 | schema.ts:1475 `repo_watchers` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `release` | models/repo/release.go:67 | schema.ts:930 `releases` | drift | missing original_author, original_author_id |
 | `language_stat` | models/repo/language_stats.go:19 | — | missing-table | on-demand extension-sum reduction; SPEC-0004 divergence note (api/services/languages.ts:1-15) |
@@ -280,7 +280,7 @@ classes only.
 | `user_redirect` | models/user/redirect.go:37 | schema.ts:1407 `user_redirects` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `badge` | models/user/badge.go:17 | schema.ts:3296 `badge` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `user_badge` | models/user/badge.go:25 | schema.ts:3309 `user_badge` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `user` | models/user/user.go:95 | schema.ts:429 `users` | intentional-recorded | account-security internals dropped; SPEC-0002 §3 (users reduced "to what cf-gitea needs today", schema.ts:429-433) |
+| `user` | models/user/user.go:95 | schema.ts:429 `users` | intentional-recorded | account-security internals dropped; SPEC-0002 §3 (users reduced "to what cf-gitea needs today", schema.ts:429-433); email/avatar_email NULLable vs upstream NOT NULL now recorded via SPEC-0002 §4.6 item 16 (FN-13 §7.1) |
 | `user_setting` | models/user/setting.go:23 | schema.ts:1673 `user_settings_kv` | aligned | faithful KV port; profile prefs live in ours-extra user_settings (user-notification-settings.md) |
 | `action_run_index` | models/actions/run.go:369 | — | missing-table | function covered by repo_counters.run_index (schema.ts:417) |
 | `issue_index` | models/issues/issue.go:119 | — | missing-table | function covered by repo_counters.issue_index (schema.ts:417; SPEC-0012) |
@@ -716,15 +716,20 @@ applies).
   `updated_unix` (transfer.go:76,79), `repo_collaborators.id` +
   timestamp arm (collaboration.go:22), `lfs_locks.lower_path` record
   (ours-extra — keep, record in SPEC-0006).
-- **FN-13: the record unit (no DDL).** ADR-0007 appendix recording: (a)
-  the NOT-NULL strictness inversion (§2.7, 386 columns — ours stricter,
-  keep); (b) the timestamp-name family (`created_at`/`updated_at` vs
-  `created_unix`/`updated_unix` + actions `created`/`updated`) and the
-  `uid`→`user_id` family — record as accepted, OR queue the mass rename
-  as its own low-priority migration (recommend record: ~30 tables renamed
-  for zero API gain); (c) the id-family extension rule (§2.1 corollary);
-  (d) `issue_subscriptions`/`webhook_deliveries`/`repo_mirrors`-family
-  table names that intentionally differ.
+- **FN-13: the record unit (no DDL) — DISPOSITIONED (2026-11-03), see §7.**
+  The backlog's "ADR-0007 appendix" phrasing is superseded: ADR-0007's own
+  test is "if the SPEC does not record it, it is drift", so the records
+  landed in SPEC extensions (SPEC-0005 §3.2 as-built block; SPEC-0002
+  §3 conventions + §4.6 item 16), with this §7 as the column-level
+  disposition and errata to §2.5/§2.6/§2.7. Net result: (a) the
+  strictness inversion (ours-stricter arm) → intentional-recorded;
+  (b) timestamp-name + `uid` families → intentional-recorded, the mass
+  rename declined; (c) the id-family extension rule → cites ADR-0007
+  item 2 + §2.1, no new text; (d) the differing table names → per-table
+  SPEC records + §7.5. Two ours-looser nullability inversions stay DRIFT:
+  `issue_subscriptions.created_unix/updated_unix` (recommended carrier
+  FN-12) and `issue_pins.repo_id` (FN-10); `users.email`/`avatar_email`
+  become intentional-recorded via SPEC-0002 §4.6 item 16.
 - **FN-14: the no-reader arm (port-when-read).** `user_open_id`,
   `team_invite`, `renamed_branch`, `commit_status_summary`, `app_state` —
   each ported as its own migration + SPEC only when a reader needs it
@@ -748,3 +753,278 @@ independent; FN-4 is the only large one and is purely additive.
 - The lost FN report's numbers (~115/60/4) are superseded by this census's
   117/69+blanket/22; where the lost report is cited elsewhere (ADR-0007
   consequence 2), this file is the durable replacement.
+
+## 7. FN-13 disposition — the record-not-migrate families (FN-13 unit, 2026-11-03)
+
+FN-13 is the record unit: no DDL. ADR-0007's vocabulary is
+platform-adapted / intentional-recorded / drift, and its test is "if the
+SPEC does not record it, it is drift" — so each family below was
+re-verified against both sources (schema.ts at this worktree, the
+`gitea/` pin), classified, and recorded where the record must live: the
+normative SPEC text landed as an as-built block in **SPEC-0005 §3.2**
+(schema-wide family record; SPEC-0005 owns the largest D1 block and the
+schema.ts conventions header points there) and in **SPEC-0002 §3 +
+§4.6 item 16** (the users/PAT block's own members). This §7 is the
+column-level disposition, the member census, and the errata to §2.
+
+### 7.1 The NOT-NULL strictness inversion (ours-stricter arm) — intentional-recorded
+
+Classification: **intentional-recorded**, via the SPEC-0005 §3.2 as-built
+block. Explicitly NOT platform-adapted: D1/SQLite expresses column
+nullability fine — the ground is effective-shape parity, not capability.
+The recorded grounds: (1) upstream xorm INSERTs write every mapped field
+with Go zero values, so upstream's effective row shape carries no
+model-layer NULLs; (2) xorm reads SQL NULL back as the Go zero value, so
+upstream's nullable DDL is indistinguishable from ours' NOT NULL +
+default at every surface the ADR-0002 contract freezes — no reader can
+observe the difference; (3) relaxing ours to upstream's DDL letter would
+only weaken integrity, for zero parity gain. The census counts stand as
+the §1 parser produced them (386 inverted columns; ~269 upstream `NOT
+NULL` tags over 1081 columns vs ~715 ours `.notNull()` over 1010 — this
+unit re-counted the two totals as corroboration, spot-checked the
+per-column list at §7.7, and did NOT re-derive it column-by-column).
+
+The ours-looser arm is a different thing and is NOT blessed by this
+record. Verified members:
+
+| column | ours | upstream | disposition |
+|---|---|---|---|
+| `issue_subscriptions.created_unix` / `.updated_unix` | NULLable (schema.ts:999-1000) | `NOT NULL` (models/issues/issue_watch.go:20-21) | **stays DRIFT** — tightening queued; recommended carrier FN-12 (small completions, same-table DDL); census row §3.1 reclassified aligned → drift |
+| `issue_pins.repo_id` | NULLable TEXT (schema.ts:1096) | `int64 UNIQUE(s) NOT NULL` (models/issues/issue_pin.go:20) | **stays DRIFT** — rides FN-10 (also a TEXT id-family column, §2.1) |
+| `users.email` / `users.avatar_email` | NULLable (schema.ts:440, 457) | `NOT NULL` (models/user/user.go:101, 149) | **intentional-recorded** via SPEC-0002 §4.6 item 16 — part of the recorded users reduction: orgs ARE user rows here and the org-create surface writes `email: input.email ?? null`, `avatarEmail: null` (services/orgs/orgs.ts:430-437); upstream's org-as-user-row survives the same NOT NULL only because xorm writes the Go zero `''` for the never-set fields (CreateOrganization, models/organization/org.go:316-337, sets no Email) — ours models "no email" as NULL where upstream stores `''`; same information, different zero convention |
+| `repo_transfer.created_at` | NOT NULL DEFAULT unixepoch (schema.ts:314-316) | `INDEX NOT NULL created` (models/repo/transfer.go:77) | parity-strict — checked because §2.7's itemization hinted at it; no inversion |
+
+Errata to §2.7's minority-arm itemization (recorded here; §2's text left
+as written): `issue_pins.issue_id` is NOT inverted (ours is the
+composite PK, NOT NULL — schema.ts:1095 — vs upstream `NOT NULL`,
+issue_pin.go:19: same strictness); the §3.1 census row's `pin_order`
+claim is likewise withdrawn (ours NOT NULL — schema.ts:1097 — vs
+upstream nullable `DEFAULT 0`, issue_pin.go:22: that direction is the
+ours-stricter blanket, not an inversion).
+
+### 7.2 The timestamp-name family — intentional-recorded; mass rename declined
+
+Erratum to §2.5 first: the family as §2.5 sketched it is wrong on two of
+three arms, and the true divergence is SMALLER than "~30 tables":
+
+1. **The actions family (`created`/`updated`) is NOT a divergence.**
+   Upstream's fields are literally `Created`/`Updated`
+   `timeutil.TimeStamp` with the xorm auto-fill tags — models/actions/
+   run.go:74-75, run_job.go:135-136, task.go:57-58, task_step.go:32-33,
+   runner.go:70-71, runner_token.go:39-40, run_attempt.go:38-39,
+   run_job_summary.go:52-53, schedule.go:36-37, schedule_spec.go:33-34,
+   artifact.go:87-88, tasks_version.go:23-24, scoped_workflow.go:30-31,
+   variable.go:38-39 — and GonicMapper renders those field names as the
+   column names `created`/`updated`. Ours matches verbatim
+   (schema.ts:3980-3981, 4015-4016, 4076-4077, 4158-4159, 4198-4199,
+   4251-4252, 4294-4295, 4342-4343, 4380-4381, 4422-4423, 4509-4510,
+   4538-4539). Parity — removed from the family.
+2. **The SPEC-0005-era tables already carry upstream's `*_unix` names.**
+   `issues` schema.ts:638-639, `comments` :775-776, `labels` :877-878,
+   `reactions` :904, `releases` :949, `release_assets` :978,
+   `issue_subscriptions` :999-1000, `commit_statuses` :1081-1082,
+   `webhooks` :1158-1159, `webhook_deliveries` :1200,
+   `issue_dependency` :1895, `tracked_time` :1923, `stopwatch` :1947,
+   `issue_attachments` :2113, `public_keys` :2349-2352, `gpg_keys`
+   :2394, `pull_reviews` :2462-2463, `protected_branches` :2502-2503,
+   `deploy_keys` :2575-2578, `secrets` :2640, `action_variables`
+   :2681-2684, `projects` :2964-2966, `oauth2_application` :3186-3188 —
+   parity names; the `*_at` suffixes there are Drizzle PROPERTY names
+   (camelCase, schema-side only) and never the SQL name.
+3. **The true divergence — 16 paired tables where ours uses
+   `created_at`/`updated_at` (or bare-`created` counterparts) SQL names
+   against upstream's `created_unix`/`updated_unix`/`created`:**
+
+| our table (ours cite) | upstream cite | upstream names | ours names |
+|---|---|---|---|
+| `repositories` (schema.ts:79,85) | models/repo/repo.go:219-220 | created_unix, updated_unix | created_at, updated_at |
+| `repo_transfer` (schema.ts:314) | models/repo/transfer.go:77 | created_unix (updated_unix MISSING on ours — FN-12) | created_at |
+| `users` (schema.ts:488,529) | models/user/user.go:122-124 | created_unix, updated_unix, last_login_unix | created_at, last_login_at |
+| `personal_access_tokens` (schema.ts:566) | models/auth/access_token.go:30-31 | created_unix, updated_unix | created_at (no updated column on ours — upstream `updated_unix` feeds only `HasUsed`/`HasRecentActivity`, replaced by the SPEC-0002 §2.7/§4.6 items 5+13 last-used-throttle record) |
+| `lfs_objects` (schema.ts:1252-1253) | models/git/lfs.go:84-85 | created_unix, updated_unix | created_at, updated_at |
+| `lfs_locks` (schema.ts:1294) | models/git/lfs_lock.go:27 | created | created_at |
+| `user_redirects` (schema.ts:1392) | models/user/redirect.go:38-42 — NO timestamp columns upstream | — | created_at (ours-extra column, not a rename) |
+| `repo_redirects` (schema.ts:289) | models/repo/redirect.go:39-43 — NO timestamp columns upstream | — | created_at (ours-extra column, not a rename) |
+| `repo_watchers` (schema.ts:1480) | models/repo/watch.go:44 | created_unix | created_at |
+| `repo_collaborators` (schema.ts:1506-1507) | models/repo/collaboration.go:25-26 | created_unix, updated_unix | created_at, updated_at |
+| `follows` (schema.ts:1560) | models/user/follow.go:17 | created_unix | created_at |
+| `stars` (schema.ts:1592) | models/repo/star.go:21 | created_unix | created_at |
+| `repo_mirrors` (schema.ts:1753-1765) | models/repo/mirror.go:30-32 | updated_unix, next_update_unix, last_sync_unix (NO created column upstream) | updated_at, next_sync_at, last_sync_at (ours created_at is an ours-extra column — upstream `Mirror` has no created field) |
+| `notification_states` (schema.ts:1823) | models/activities/notification.go:71-72 | created_unix, updated_unix (both NOT NULL) | updated_at (ours created arm absent — rides the row's residual) |
+| `user_blocking` (schema.ts:2798) | models/user/block.go:31 | created_unix | created_at |
+| `push_mirrors` (schema.ts:2894) | models/repo/pushmirror.go:30 | last_update_unix | next_sync_at (its `created_unix` at schema.ts:2865 is parity — the table mixes both families) |
+
+Decision: **record, not rename** (the backlog's alternative is
+declined). Grounds: no API surface reads SQL column names (the ADR-0002
+freeze is HTTP-level; renderers name their own fields); a mass rename is
+16 tables of migration + re-verified renderer/index rewrites for zero
+behavior or parity-of-behavior gain; the VALUE convention (unix seconds,
+`integer` + `mode: "timestamp"`) is already uniform and recorded
+(schema.ts header; SPEC-0002 §3; SPEC-0005 §3.2 opening line). The
+record's normative home is the SPEC-0005 §3.2 as-built block; the table
+above is the member census. Knock-on dispositions: FN-4's
+"`created_unix`/`updated_unix` arm" for `repositories` is superseded —
+when FN-4 lands, do NOT port those as new columns; the existing
+`created_at`/`updated_at` carry the values. FN-12's new timestamp
+columns (`repo_transfer.updated_unix`, `issue_dependency.updated_unix`
+is already parity-named) land under the RECORDED family names of their
+table, not upstream's literal names.
+
+Not members (parity `*_unix`/`created` names already): `two_factor`
+(schema.ts:5032-5033), `webauthn_credentials` (:5116-5118),
+`login_source` (:4861-4862), `external_login_user` block, `pull_auto_merges`
+(:5005), `review_state` (:4975), `system_notices` (:3891), `audit_event`
+(:3552 — upstream's own name is `timestamp_unix`, audit_event.go:38;
+that stays FN-5's table-specific rename), `system_keystore`
+(:4600-4603), `cron_state`, `oauth2_grant`/`oauth2_authorization_code`
+(:3236-3237; upstream oauth2.go:512-513), `milestones.deadline_unix`/
+`closed_date_unix` (schema.ts:879-880), `labels.archived_unix` (:823),
+`issues.deadline_unix`/`closed_unix` (:648-650). Ours-extra tables with
+`-_at` names have no upstream counterpart and are convention members,
+not divergences: `repo_settings` (:1534), `repo_imports.heartbeat_at`
+(:1350), `email_outbox.sent_at` (:4703), `email_inbound` (:4774-4775),
+`sessions` (:1993-1997 — SPEC-0010's recorded redesign names),
+`federation_followers` (:5168), PAT `last_used_at`/`expires_at`
+(:562,565 — SPEC-0002 §4.6 items 4-5 additions).
+
+### 7.3 The `uid` → `user_id` family — intentional-recorded
+
+Erratum to §2.6 first: **`follow` is NOT a member.** Upstream
+`Follow.UserID int64 xorm:"UNIQUE(follow)"` (models/user/follow.go:17)
+renders `user_id` under GonicMapper, and upstream's own queries bind
+`user_id` (follow.go `builder.Eq{"user_id": …}`); ours `follows.user_id`
+(schema.ts:1554) is parity. The census row for `follow` ("aligned") was
+already right; §2.6's member list was not.
+
+Upstream's `UID int64` columns render `uid` (the GonicMapper result,
+confirmed by upstream's own SQL: models/repo/star.go:73
+`builder.Eq{"uid": …}`, models/auth/access_token.go:66,
+models/auth/twofactor.go:161, models/organization/team_user.go:28).
+The members where ours renames to `user_id`:
+
+| upstream table (cite) | ours (cite) | recorded at |
+|---|---|---|
+| `access_token` (access_token.go:22) | `personal_access_tokens.user_id` (schema.ts:549) | SPEC-0002 §3 |
+| `star` (star.go:19) | `stars.user_id` (schema.ts:1588) | SPEC-0005 §3.2 block |
+| `org_user` (org_user.go:28) | `org_members.user_id` (schema.ts:1384) | SPEC-0007 §3.3 + SPEC-0005 §3.2 block |
+| `issue_user` (issue_user.go:17) | `issue_user.user_id` (schema.ts:1039) | SPEC-0005 §3.2 block; schema.ts doc comment already records "UID maps to user_id per the tree convention" |
+| `team_user` (team_user.go:20) | `team_members.user_id` (schema.ts:2224) | SPEC-0007 + SPEC-0005 §3.2 block |
+| `email_address` (email_address.go:85) | `email_addresses.user_id` (schema.ts:2295) | SPEC-0005 §3.2 block |
+| `two_factor` (twofactor.go:54) | `two_factor.user_id` (schema.ts:5024) | SPEC-0022 + SPEC-0005 §3.2 block |
+
+Classification: **intentional-recorded** — `uid` is Gitea-legacy
+shorthand (upstream's own newer tables use `UserID`: follow.go:17,
+watch.go, notification.go, webauthn.go), `user_id` is the clearer name,
+and no API surface crosses SQL names. Rename declined (same grounds as
+§7.2). Parity members, for the record: `oauth2_application.uid` keeps
+upstream's name verbatim (oauth2.go:41 vs schema.ts:3173) — the one
+table where the rename was NOT applied; and `follow`/`watch` upstream
+columns are already `user_id`. `user_openid`'s UID (openid.go:20) sits
+in the missing-table arm (§3.3), not here.
+
+### 7.4 FN-13(c): the id-family extension rule — already recorded
+
+No new record text needed: the rule IS ADR-0007 item 2 (the TEXT
+`repositories.id` id space, the K11 fact pinned in `3ed025d`) plus §2.1's
+corollary flag, which states the extension rule. Restated once for this
+unit's cite: every NEW table/column joining the TEXT id family inherits
+the intentional-recorded classification; any TEXT id NOT derived from
+`repositories.id` is candidate drift and needs its own record. (A live
+example of the boundary working: `issue_pins.repo_id` above — TEXT and
+id-family-derived, so its TEXT-ness inherits the record; its NULLability
+does not, and queues as FN-10.)
+
+### 7.5 FN-13(d): table names that intentionally differ — recorded per table
+
+Already recorded (census cites verified): `hook_task` →
+`webhook_deliveries` (SPEC-0005 §3.6 — erratum: the §3.1 row said §3.7,
+a section that does not exist; corrected), `mirror` → `repo_mirrors`
+(SPEC-0009 §3), `push_mirror` → `push_mirrors` (SPEC
+push-mirror-outbound), `lfs_meta_object` → `lfs_objects` (SPEC-0006 §3),
+`notice` → `system_notices` (SPEC-0018 §4.1 — plural + int type),
+`access_token` → `personal_access_tokens` (SPEC-0002 §2.7/§3),
+`user_setting` → `user_settings_kv` (specs/user-notification-settings.md),
+`notification` → `notification_states` (specs/email-outbound.md +
+user-notification-settings.md), `session` → `sessions` redesign
+(SPEC-0010), `upload`/`attachment` → `issue_attachments` +
+`release_assets` (SPEC-0005 §3.2 records the split rationale),
+`user_setting`-adjacent profile store → `user_settings` (§3.2 row).
+
+Newly recorded by the SPEC-0005 §3.2 block (association renames with no
+prior upstream-mapping record): `issue_watch` → `issue_subscriptions`,
+`review` → `pull_reviews`, `collaboration` → `repo_collaborators`,
+`watch` → `repo_watchers`, `team_user` → `team_members`, `team_repo` →
+`team_repo_access`, `org_user` → `org_members` (SPEC-0007 §3.3 records
+the table's role enum; the name mapping rides the block record). Not
+members: `follows`/`stars` are §2.2's plural rule; `deleted_branches`
+has no upstream counterpart (§3.2's own flag stands — not a name
+divergence).
+
+### 7.6 Census cells changed by this unit
+
+- §3.1 `issue_watch` row: **aligned → drift** — the ours-looser
+  timestamp nullability (§7.1); recommended carrier FN-12.
+- §3.1 `user` row: reason extended — email/avatar_email nullability now
+  carries its SPEC-0002 §4.6 item 16 record (verdict unchanged:
+  intentional-recorded).
+- §3.1 `issue_pin` row: reason corrected — only `repo_id` inverts;
+  `pin_order`/`issue_id` claims withdrawn (§7.1 errata); verdict
+  unchanged (drift, FN-10).
+- §3.1 `collaboration` row: reason corrected — `created_unix`/
+  `updated_unix` are PRESENT as `created_at`/`updated_at` (§7.2); only
+  `id` is missing (FN-12); verdict unchanged (drift).
+- §3.1 `lfs_lock` row: reason annotated — `created` → `created_at` is
+  the §7.2 recorded family; verdict unchanged (drift: ours-extra
+  `lower_path`, FN-12).
+- §3.1 `hook_task` row: SPEC cite corrected §3.7 → §3.6 (the §7.5
+  erratum); verdict unchanged.
+- §5 FN-13 bullet: replaced with the disposition pointer (top of §7).
+- No other verdict cells moved: the "aligned — blanket families only"
+  rows stay aligned now that the blanket families carry records
+  (SPEC-0005 §3.2 block + §2's own cites), and every remaining drift row
+  keeps its structural reason, queued FN-1..FN-12 as before.
+
+### 7.7 Spot-verification (both-side cites checked at the pin)
+
+| # | column | ours | upstream | result |
+|---|---|---|---|---|
+| 1 | `comments.type` | notNull (schema.ts:745) | `Type CommentType` untagged → nullable (models/issues/comment.go:275) | ours-stricter ✓ |
+| 2 | `comments.issue_id` | notNull (schema.ts:747) | `IssueID int64 xorm:"INDEX"` → nullable (comment.go:284) | ours-stricter ✓ |
+| 3 | `comments.invalidated` | notNull default false (schema.ts:768) | `Invalidated bool` → nullable (comment.go `Invalidated` field) | ours-stricter ✓ |
+| 4 | `issues.title` | notNull (schema.ts:624) | `Title string xorm:"name"` → nullable (models/issues/issue.go:63) | ours-stricter ✓ — and a SIDE-FIND, see below |
+| 5 | `issue_pins.repo_id` | nullable TEXT (schema.ts:1096) | `int64 UNIQUE(s) NOT NULL` (issue_pin.go:20) | ours-looser inversion ✓ |
+| 6 | `issue_subscriptions.created_unix` / `.updated_unix` | nullable (schema.ts:999-1000) | `created NOT NULL` / `updated NOT NULL` (issue_watch.go:20-21) | ours-looser inversion ✓ |
+| 7 | `users.email` / `.avatar_email` | nullable (schema.ts:440,457) | `NOT NULL` (user.go:101,149) | ours-looser inversion ✓ — recorded, SPEC-0002 §4.6 item 16 |
+| 8 | `follows.user_id` | `user_id` (schema.ts:1554) | `UserID` → `user_id` (follow.go:17; query binds `user_id`) | parity ✓ — §2.6 erratum |
+| 9 | `stars.user_id` | `user_id` (schema.ts:1588) | `UID` → `uid` (star.go:19; query binds `uid` at star.go:73) | rename member ✓ |
+| 10 | `action_runs.created` / `.updated` | `created`/`updated` (schema.ts:4076-4077) | `Created`/`Updated` fields → `created`/`updated` columns (run.go:74-75) | parity ✓ — §2.5 erratum |
+| 11 | `repo_transfer.created_at` | NOT NULL DEFAULT unixepoch (schema.ts:314-316) | `INDEX NOT NULL created` (transfer.go:77) | parity-strict ✓ (checked, no inversion) |
+| 12 | `reactions.user_id`/`.type` | notNull (schema.ts:897-905) | `UNIQUE(s) NOT NULL` (reaction.go:66-72) | parity-strict ✓ (the blanket is not universal — parity-strict columns exist and are not family members) |
+
+Side-find (NOT a FN-13 family — flagging for the census owner):
+`issues.title` (schema.ts:624) vs upstream column **`name`** —
+`Issue.Title string xorm:"name"` (issue.go:63) is a column-NAME tag;
+upstream edits the title via `UpdateIssueCols(ctx, issue, "name")`
+(models/issues/issue_update.go:198) and searches it as `` `name` ``
+(issue.go:536). `milestones.name` (schema.ts:871) and `labels.name`
+(schema.ts:817) ARE parity. The `issues` census row's "aligned" verdict
+and §4 (which has no `issues` subsection) miss this rename; FN-5's
+rename batch is the natural carrier if the census owner queues it.
+This unit did NOT reclassify the `issues` row — outside FN-13's
+families and outside this unit's cell ownership.
+
+Corroboration counts (not a re-derivation): upstream `NOT NULL` xorm
+tags ≈ 269 over 1081 census columns; ours `.notNull()` = 715 over 1010
+(schema.ts grep, PK columns excluded by their own declaration shape).
+Direction and magnitude corroborate §2.7; the 386 figure stays the §1
+parser's census number.
+
+Errata index (recorded here; the §2/§4 text left as written by the
+census owner to fold): §2.5 actions arm is parity, not divergence, and
+the SPEC-0005-era claim is inverted (those tables are the parity side);
+§2.6 `follow` is not a member, and `org_user`/`access_token`/
+`two_factor` are missing members; §2.7's itemization overstates the
+ours-looser arm (`issue_id`/`pin_order` withdrawn); §4 `repo_transfer`
+cites transfer.go:79 for `updated_unix` — the field is at :78 (:76
+`RecipientAccessGranted` is correct); §3.1 `hook_task` row cites
+SPEC-0005 §3.7 — the delivery section is §3.6.
