@@ -1521,15 +1521,16 @@ Consequently:
   that SPEC exists, the absence of the family is the recorded, correct
   state.
 
-## 10. FN-8 port plan — the `commit_statuses.context_hash` + `index` completion — PLAN ONLY
+## 10. FN-8 port — the `commit_statuses.context_hash` + `index` completion — AS-BUILT
 
-**Status: PLAN ONLY. Nothing is built; no migration has been generated.**
-Derived by the FN-8-prep unit (2026-11-04) from the upstream pin
-`fc4936884584`; the full derivation record (upstream writer/reader
-semantics, ours-surface inventory, the id-semantics blast-radius table,
-and the migration-shape evidence) is the audit doc's §7.12. This section
-is the port unit's normative plan. Cites below are upstream
-models/git/commit_status.go unless another file is named.
+**Status: LANDED (the FN-8 port unit, 2026-11-04).** Derived by the
+FN-8-prep unit from the upstream pin `fc4936884584`; the full derivation
+record (upstream writer/reader semantics, ours-surface inventory, the
+id-semantics blast-radius table, and the migration-shape evidence) is
+the audit doc's §7.12. This section began as the port unit's normative
+plan; the **As-built** notes at the end of each subsection record what
+shipped and where the port deviated or decided. Cites below are
+upstream models/git/commit_status.go unless another file is named.
 
 ### 10.1 Scope — two columns on `commit_statuses` + one counter table
 
@@ -1630,6 +1631,22 @@ Gate: post-generate eyeball (ALTERs + CREATE INDEX/TABLE only, no DROP
 COLUMN, no table rebuild), then `pnpm db:migrate:local` against a seeded
 dev D1 proving rows survive and the ordinals match per-sha row counts.
 
+**As-built (migration 0072).** Hand-authored via `drizzle-kit generate
+--custom` per the 0064/0069 precedent — `0072_fn8-commit-status-index-hash.sql`
+carries exactly the eleven statements above (2 ALTERs, CREATE TABLE +
+2 counter indexes, the backfill UPDATE, the v195-seed INSERT, the 3
+status-table indexes, backtick-quoting `index` on every raw surface) —
+and `meta/0072_snapshot.json` hand-moved to the post-add state (0069's
+recorded procedure; the custom generate copies 0071's snapshot verbatim).
+Both gates run with the port's own eyes: `pnpm db:migrate:local` against
+a dev D1 SEEDED WITH PRE-PORT ROWS (explicit ids inserted out of order,
+one created second) — the backfill reconstructed 1,2,3 by id ASC and the
+second sha restarted at 1; the counter seeded max_index 3/1; PRAGMA
+confirms the appended nullable columns (cid 10 `context_hash` TEXT, cid
+11 `index` INTEGER) and the unique index's stored DDL carries the
+backticked `index`. The vitest battery replays the UPDATE and the INSERT
+verbatim (schema.test.ts's FN-8 block, the 0064 replay pattern).
+
 ### 10.4 Write seams to thread
 
 - API POST (`/repos/{owner}/{repo}/statuses/{sha}`,
@@ -1662,6 +1679,25 @@ dev D1 proving rows survive and the ordinals match per-sha row counts.
   become parity notes (no TODO text remains — census row 222's cite
   clears).
 
+**As-built (writers and reads).** `createCommitStatus` (api/services/
+commit-status.ts) allocates through the planned upsert whose
+`.returning()` row the insert reads back via a subselect
+(`SELECT max_index FROM commit_status_indexes WHERE repo_id = ? AND
+sha = ?`) — the pair rides ONE D1 batch, which is transactional (the
+same atomicity as upstream's WithTx; the d1 batch-result extraction
+follows the issues.ts:2060 house convention). `CreateCommitStatusInput`
+gains the optional pre-computed `contextHash` (the :526-528 "derive only
+when unset" contract — empty/absent derives sha1(context)); the Actions
+writer passes its mixed hash through it and reuses the shared writer
+whole (upstream's CreateCommitStatus → NewCommitStatus shape), so the
+counter allocation exists in exactly one place. The Actions arm ports
+the adoption loop verbatim over `allLatestCommitStatuses` (new exported
+helper — `db.ListOptionsAll`'s exhaustion loop; the same shape the two
+merge-gate twins already carry). Reads: the sort orders and the
+latest-per-context grouping swap as planned, with one DELIBERATE
+addition — the group key is `coalesce(context_hash, context)`, not bare
+`context_hash` (see §10.6.1).
+
 ### 10.5 The id-semantics flip (the API-visible change) and its blast radius
 
 The REST `id` field changes VALUE SEMANTICS on every `CommitStatus`
@@ -1685,22 +1721,67 @@ context; the backfill reconstructs ordinals from seed order (fixture:
 resumes at max(`index`); two same-named workflows keep separate latest
 rows at one sha; a pre-port legacy-hash row is adopted and superseded.
 
-### 10.6 Open items for the port unit
+**As-built (pins).** All eight landed: the ordinals/restart/id-flip +
+hash-storage pins ride the POST describe (statuses.test.ts), the REST-id
+vs webhook-id asymmetry rides the emit test (payload `id` = row pk,
+REST `id` = `index`), the sort matrix seeds now carry indices
+DELIBERATELY ≠ id order (b=3 > a=2 > c=1 — the `index`-keyed sorts
+answer by column, not id stand-in), the hash-grouping pin seeds one
+context string across two hashes AND one hash across two contexts, the
+backfill + counter-resume pins ride schema.test.ts's FN-8 block (the
+0064 verbatim-replay pattern; also the DDL PRAGMA pins, the unique-index
+enforcement pin, the degradation/repair pin, and the
+HashCommitStatusContext byte-parity pin), and the two Actions pins ride
+trigger.test.ts's status-arm describe (the #35699 split-groups pin
+asserts per-group supersede; the adoption pin covers both the adopt arm
+and its Actions-user-only guard, seeding the counter row so the fixture
+mirrors the migrated-state shape). Two raw-seeding sites BEYOND the
+audit's table needed the same MUST-EDIT (writer-shaped seeds): the
+repo-list aux fixtures (search-aux.smoke.test.tsx, aux-json.matrix.test.tsx)
+— the grouped read feeds their `latest_commit_status` shells; and the
+delete-actions cascade fixture gained the counter-twin arm.
 
-1. The lazy hash repair's placement (read path vs a first-write sweep) —
-   the SPEC pins the contract (converges, bounded, waitUntil); the unit
-   picks the seam.
-2. Whether `getPullRequestCommitStatusState`'s paging exhaust loop
-   (branch-protection.ts:848) needs a bound change once groups key
-   on hash — grouping cardinality only shrinks for API rows (equal or
-   fewer groups); verify no fixture depended on the raw-context
-   collapse.
-3. SPEC-0004 §2.4 (:270-272) gains the id-semantics note ("`id` is the
-   per-sha ordinal, not the row pk; webhook `id` is the row pk") when
-   this plan lands.
-4. The census flips at landing: audit rows 221 (`drift` → `aligned`)
-   and 222 (`missing-table` → `aligned`), and the §3.1 ours-cite stays
-   schema.ts-pinned.
+### 10.6 Open items for the port unit — RESOLVED at landing
+
+1. **The lazy hash repair's placement — CHOSEN: a synchronous first-read
+   sweep inside `latestCommitStatuses`** (api/services/commit-status.ts,
+   `repairNullContextHashes`), not a first-write sweep and not the plan's
+   `ctx.waitUntil` arm. Scope: the (repo, sha) being grouped, at most
+   REPAIR_SWEEP_BOUND = 200 distinct contexts per read, one NULL-guarded
+   idempotent UPDATE per context (sequential — each statement stands
+   alone, a partial pass just leaves the remainder to the next read).
+   Deviation rationale (recorded, per §10.3.5's "the unit picks the
+   seam"): (a) the read that touches a pre-port scope answers with
+   upstream-faithful grouping IMMEDIATELY — the merge gates act on THIS
+   read, and a waitUntil repair could land after the gate decision,
+   leaving a stale 405/200 until the next request; (b) the gate and
+   repo-list consumers call the service directly with no executionCtx to
+   thread, so the waitUntil arm would have forced a signature change
+   through four call sites; (c) the sweep is bounded by per-commit
+   status volume (small), so keeping it on the request path costs one
+   indexed NULL-probe per grouped read in the steady state. The
+   convergence guarantee is STRENGTHENED beyond the plan's: the group
+   key is `coalesce(context_hash, context)`, so an unrepaired NULL-hash
+   row groups by its RAW context — exactly today's observable — instead
+   of collapsing every legacy context into SQL's single NULL group.
+   Degradation is therefore never-worse row-by-row, not just in
+   aggregate. OUTSIDE the contract: NULL-`index` rows (production
+   writers always persist the ordinal; only raw seeding fixtures could
+   omit it, and all of them were made writer-shaped at landing).
+2. **The paging exhaust loop (branch-protection.ts / pull-automerge.ts
+   twins) — NO bound change.** Grouping cardinality for API rows shrinks
+   or stays (hash groups ≤ context groups); the coalesce key keeps
+   legacy rows at exactly today's cardinality. Both gate suites run
+   green unmodified (60/60 + 15/15) and no fixture depended on a
+   raw-context collapse.
+3. **SPEC-0004 §2.4's id-semantics note — OPEN for the orchestrator**
+   (SPEC-0004 sits outside the port unit's file ownership). The note to
+   add at :270-272: "`id` is the per-sha ordinal, not the row pk;
+   webhook `id` is the row pk".
+4. **The census flips — DONE** in the audit doc: row 221 `drift` →
+   `aligned`, row 222 `missing-table` → `aligned` (with the TODO cites
+   dissolved), the FN-8 row LANDED, and §7.12's header points at this
+   section as as-built.
 
 ## 11. ISSUE-TEMPLATE pipeline (web UI) — derivation + as-built port (TEMPLATES unit, 2026-11-04)
 

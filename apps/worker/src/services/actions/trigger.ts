@@ -115,10 +115,12 @@
  *     never-wrapped lines — upstream's marshalYAML discipline,
  *     jobparser/model.go:117-120), not go.yaml's byte layout. The runner
  *     parses YAML; byte identity is not load-bearing.
- *   - The commit-status dedupe uses `context` directly (the landed
- *     commit_statuses table has no context_hash/index columns — the same
- *     reduction api/services/commit-status.ts:22-30 records); the
- *     legacy-hash adoption arm (commit_status.go:292-302) is unreachable here.
+ *   - The commit-status writer dedupes through the shared commit-status
+ *     service's `context_hash` groups (SPEC-0005 §10 as-built): the workflow
+ *     file path is mixed into the hash (actions/commit_status.go:282, #35699)
+ *     and the legacy (Context-only) hash adoption arm (:288-302) adopts a
+ *     pre-fix Actions-owned latest row so stale pending statuses still
+ *     supersede; the per-sha ordinal rides the same counter as the API writer.
  *   - Per-isolate emitter: upstream drives checkJobsByRunID through its
  *     `actions_ready_job` queue (job_emitter.go:29-41); the pass runs inline
  *     and the producer call sites (insert tail, update.ts's aggregate seam —
@@ -132,7 +134,7 @@
  *     table is recorded as the store-gap divergence.
  */
 
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { parseDocument, Document, YAMLMap, isMap, isScalar, isSeq, type Node as YamlNode } from "yaml";
 
@@ -143,13 +145,13 @@ import {
   actionRuns,
   actionTaskOutputs,
   actionVariables,
-  commitStatuses,
   repoCounters,
   repoUnits,
   repositories,
   users,
 } from "../../db/schema";
 import { findRepositoryByPath, type RepositoryWithOwner } from "../../api/services/repository";
+import { allLatestCommitStatuses, createCommitStatus, hashCommitStatusContext } from "../../api/services/commit-status";
 import { engineName } from "../../repos/service";
 import { findRule, listRepoRules, parseRuleConfig, type ProtectedBranchRow } from "../branch-protection";
 // The two-table schedule registry (SPEC-0012 §D7): trigger.ts keeps the
@@ -206,6 +208,15 @@ import {
   type RunRow,
 } from "./model";
 import { refreshRunStatus, stopTask } from "./update";
+// The Actions webhook emissions (GAPS #7) — webhook-events imports nothing
+// from this module (its WORKFLOW_DIRS/SCOPED_WORKFLOW_DIRS are local copies
+// with the setting.go cite), so this import stays a clean DAG edge.
+import {
+  emitWorkflowJobsAndRunStatus,
+  emitWorkflowJobStatus,
+  emitWorkflowRunStatus,
+  type ActionsWebhookContext,
+} from "./webhook-events";
 
 /** The bindings/vars the trigger touches (webhooks-push.ts's picked-Env rule). */
 export interface ActionsTriggerEnv extends Pick<Env, "DB" | "REPO"> {
@@ -2139,13 +2150,19 @@ export async function requiredStatusContextGlobs(d1: D1Database, repoId: string)
 }
 
 /**
- * createWorkflowCommitStatus (commit_status.go:284-332) on the landed table:
- * the identical-state short-circuit, the onlyReplace-no-previous skip, and
- * the workflow-path-mixed dedupe key reduction (the table groups by `context`
- * alone — the module-header disclosure; upstream mixes the workflow path into
- * a context hash, commit_status.go:285-291, so two same-named workflows
- * sharing a job name supersede each other here where upstream keeps both).
- * The legacy-hash adoption arm (:292-302) is unreachable (no hash column).
+ * createWorkflowCommitStatus (commit_status.go:278-332): the workflow file
+ * path is mixed into the dedupe hash so two workflow files sharing the same
+ * `name:`/job name produce distinct checks even though they render
+ * identically (actions/commit_status.go:280-284, issue #35699). Pre-fix rows
+ * were hashed from Context alone; the legacy-hash adoption arm (:285-302)
+ * adopts that Context-only hash from a LATEST row the Actions user itself
+ * created (never from an external integration — that would collapse two
+ * same-named workflows back into one check) so a pre-upgrade in-flight
+ * run's stale pending status still gets superseded. The identical-state
+ * short-circuit and the onlyReplace-no-previous skip ride the same
+ * latest-per-context scan (:304-315), and the insert goes through the shared
+ * createCommitStatus — the counter ordinal + hash storage in one D1 batch
+ * (upstream: CreateCommitStatus → NewCommitStatus's single WithTx).
  */
 export async function createWorkflowCommitStatus(
   d1: D1Database,
@@ -2160,32 +2177,39 @@ export async function createWorkflowCommitStatus(
     onlyReplace: boolean;
   },
 ): Promise<void> {
-  const db = drizzle(d1);
-  const existing = await db
-    .select()
-    .from(commitStatuses)
-    .where(and(eq(commitStatuses.repoId, input.repoId), eq(commitStatuses.sha, input.commitId), eq(commitStatuses.context, input.ctxName)))
-    .orderBy(desc(commitStatuses.id))
-    .limit(1);
-  const previous = existing[0];
-  if (previous !== undefined) {
-    if (previous.state === input.state && previous.targetUrl === input.targetUrl && previous.description === input.description) {
-      return;
+  let ctxHash = await hashCommitStatusContext(`${input.ctxName}\x00${input.workflowId}`);
+  const legacyHash = await hashCommitStatusContext(input.ctxName);
+  const statuses = await allLatestCommitStatuses(d1, input.repoId, input.commitId);
+  for (const v of statuses) {
+    // Only adopt the legacy (Context-only) hash from a row the Actions user
+    // itself created before the #35699 fix, i.e. a pre-upgrade in-flight run.
+    if (v.contextHash === legacyHash && v.context === input.ctxName && v.creatorId === ACTIONS_USER_ID) {
+      ctxHash = legacyHash;
+      break;
     }
-  } else if (input.onlyReplace) {
+  }
+  let hasPrevious = false;
+  for (const v of statuses) {
+    if (v.contextHash === ctxHash) {
+      if (v.state === input.state && v.targetUrl === input.targetUrl && v.description === input.description) {
+        return;
+      }
+      hasPrevious = true;
+      break;
+    }
+  }
+  if (input.onlyReplace && !hasPrevious) {
     return;
   }
-  const now = new Date();
-  await db.insert(commitStatuses).values({
+  await createCommitStatus(d1, {
     repoId: input.repoId,
     sha: input.commitId,
     state: input.state,
     targetUrl: input.targetUrl,
     description: input.description,
     context: input.ctxName,
+    contextHash: ctxHash,
     creatorId: ACTIONS_USER_ID,
-    createdAt: now,
-    updatedAt: now,
   });
 }
 
@@ -2346,6 +2370,17 @@ export interface TriggeredRunInput {
   repoOwnerNamespace: string;
   repoSlug: string;
   appUrl: string;
+  /**
+   * The Actions webhook emission context (GAPS #7). PrepareRunAndInsert's
+   * tail notifies the run ("requested") and its jobs ("queued") through the
+   * webhook notifiers (run.go:56 → NotifyWorkflowJobsAndRunsStatusUpdate);
+   * this input carries the bindings + origin that fan-out needs. Absent →
+   * the emissions still run with a DB-only bindings view: job-level events
+   * fire (they need no engine reads), run-level events stay silent until a
+   * caller threads REPO (the schedule consumer's pending widening — the
+   * coverage doc's workflow_run row records the posture).
+   */
+  webhook?: ActionsWebhookContext;
 }
 
 export interface TriggerRunOutcome {
@@ -2412,6 +2447,12 @@ export async function insertTriggeredRunSplit(
   // PrepareRunAndInsert's shared pre-insert reads (run.go:34-37): vars;
   // inputs stay nil on the push family (workflow_dispatch resolves its own).
   const vars = await loadActionsVariables(d1, input.ownerId, input.repoId);
+
+  // The webhook emission context (GAPS #7): every producer's creation notify
+  // rides the shared tail below; callers holding the engine bindings thread
+  // them here, the rest degrade to the DB-only view (run-level emissions
+  // stay silent until REPO arrives — the TriggeredRunInput.webhook note).
+  const webhook: ActionsWebhookContext = input.webhook ?? { bindings: { DB: d1 }, origin: input.appUrl };
 
   /**
    * The transaction-abort reproduction: drop the rows the failed insert
@@ -2812,11 +2853,11 @@ export async function insertTriggeredRunSplit(
       // (createCommitStatusesForJobsByRun, job_emitter.go:135-151).
       const needPostCommitEmit = jobRows.some((j) => j.status === ACTION_STATUS_SKIPPED || j.status === ACTION_STATUS_FAILURE);
       if (needPostCommitEmit) {
-        await checkJobsOfRun(d1, run.id);
+        await checkJobsOfRun(d1, run.id, webhook);
       }
       if (affectedByCancel.length > 0) {
         for (const affectedRunId of affectedByCancel) {
-          await checkJobsOfRun(d1, affectedRunId);
+          await checkJobsOfRun(d1, affectedRunId, webhook);
         }
         await createCommitStatusesForJobsByRun(d1, affectedByCancel);
       }
@@ -2832,7 +2873,25 @@ export async function insertTriggeredRunSplit(
       // notify.go:90). Placed after the post-commit kicks — a skipped/failed
       // insert already terminalized THIS run's status through checkJobsOfRun.
       await updateRepoRunsNumbers(d1, input.repoId);
-      return { run, jobs: freshJobRows.length > 0 ? freshJobRows : jobRows };
+
+      // The creation webhook emissions (GAPS #7, run.go:53-56): after the
+      // commit statuses, the reloaded jobs notify — the run
+      // ("requested"/"in_progress"/"completed" per the post-kick aggregate)
+      // then each job ("queued", skipped → "completed"+conclusion; the
+      // requested/pending announce filter drops pending-needs and
+      // approval-blocked jobs inside the emitter). Upstream fires the same
+      // notify for every producer (push/dispatch/schedule/scoped) because
+      // they all funnel through PrepareRunAndInsert; ours funnels here, so
+      // the schedule arm's emissions ride this one seam.
+      const emittedJobs = freshJobRows.length > 0 ? freshJobRows : jobRows;
+      await emitWorkflowJobsAndRunStatus(
+        webhook.bindings,
+        { origin: webhook.origin },
+        input.repoId,
+        run.id,
+        emittedJobs.map((j) => j.id),
+      );
+      return { run, jobs: emittedJobs };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!message.includes("UNIQUE constraint failed: action_runs.repo_id")) {
@@ -2907,8 +2966,14 @@ function toAggregateJob(job: RunJobRow): { status: number; continueOnError: bool
  * The E-tier arms (evaluateJobIf on a non-empty `if:` — helper.go:123-131,
  * concurrency, deferred matrices, reusable callers) stage: a non-empty bare
  * `if:` defaults to START (the module-header divergence).
+ *
+ * `webhook` (GAPS #7) threads the Actions webhook emission context: upstream's
+ * checkJobsByRunID tail notifies the flipped jobs, the concurrency-cancelled
+ * jobs, and — when a run's last job settles — the run
+ * (job_emitter.go:97/111/122-131). Absent → no emissions from this pass
+ * (the caller had no bindings; updateTask's optional-bindings param decides).
  */
-export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<void> {
+export async function checkJobsOfRun(d1: D1Database, runId: number, webhook?: ActionsWebhookContext): Promise<void> {
   const db = drizzle(d1);
   const runRows = await db.select().from(actionRuns).where(eq(actionRuns.id, runId)).limit(1);
   const run = runRows[0];
@@ -3133,7 +3198,7 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
         });
         if (outcome === "claimed") {
           // the placeholder row changed under us — restart with DB truth
-          await checkJobsOfRun(d1, run.id);
+          await checkJobsOfRun(d1, run.id, webhook);
           return;
         }
         if (outcome === "failed") {
@@ -3143,7 +3208,7 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
           continue;
         }
         // "expanded" (siblings inserted): the fresh rows must join the pass
-        await checkJobsOfRun(d1, run.id);
+        await checkJobsOfRun(d1, run.id, webhook);
         return;
       }
 
@@ -3259,7 +3324,13 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
     }
   }
 
-  if (updatedJobIds.length === 0) return;
+  // GAPS #7: a pass that only CONCURRENTLY-CANCELLED jobs (no flips) still
+  // reaches the settle/emission tail — upstream's notifyAndEmitFinishedJobs
+  // runs unconditionally over result.CancelledJobs (job_emitter.go:97), and
+  // the cancelled jobs' emissions below need this tail. With no flips AND no
+  // cancels the pass is a no-op (the creation kick's all-skipped insert lands
+  // here — nothing was flipped at pass time, so no creation double-fire).
+  if (updatedJobIds.length === 0 && cancelledByConcurrency.length === 0) return;
 
   // The task-version wake (UpdateRunJob run_job.go:496-521): a job returning
   // to waiting, or a terminal job with waiting work remaining.
@@ -3306,12 +3377,33 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
     await db.update(actionRuns).set(runPatch).where(eq(actionRuns.id, run.id));
   }
 
+  // The pass's webhook emissions (GAPS #7, job_emitter.go:97-131): the
+  // flipped jobs ("queued" for a needs-release, "completed"+conclusion for a
+  // skip) and the concurrency-cancelled jobs ("completed"+cancelled), with
+  // the run event when the pass settled the run's last job (upstream's
+  // runUpdated arm — jobs updated AND all done — plus the cancelled batch's
+  // own run reload). The other runs' cancelled jobs emit their job events
+  // here and their run events in their own passes (the recursions below now
+  // run for cancelled-only passes too).
+  if (webhook !== undefined && (updatedJobIds.length > 0 || cancelledByConcurrency.length > 0)) {
+    const sameRunCancels = cancelledByConcurrency.filter((j) => j.runId === run.id);
+    const allDone = freshJobs.length > 0 && freshJobs.every((j) => isDoneStatus(j.status));
+    if (allDone && (updatedJobIds.length > 0 || sameRunCancels.length > 0)) {
+      await emitWorkflowRunStatus(webhook.bindings, { origin: webhook.origin }, run.repoId, run.id);
+    }
+    const emitIds = new Set<number>(updatedJobIds);
+    for (const c of cancelledByConcurrency) emitIds.add(c.id);
+    for (const id of emitIds) {
+      await emitWorkflowJobStatus(webhook.bindings, { origin: webhook.origin }, run.repoId, id);
+    }
+  }
+
   // The concurrency-cancelled jobs settle the way the insert tail's
   // affectedByCancel arm does (notifyAndEmitFinishedJobs, run.go:155-160):
   // an emitter pass per affected run, then their statuses re-post.
   for (const cancelled of cancelledByConcurrency) {
     if (cancelled.runId !== run.id) {
-      await checkJobsOfRun(d1, cancelled.runId);
+      await checkJobsOfRun(d1, cancelled.runId, webhook);
     }
   }
   if (cancelledByConcurrency.length > 0) {
@@ -3322,7 +3414,7 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
   // r.gateDeferred (job_emitter.go:655-657): a job stayed blocked on a group
   // this pass already admitted — one more pass lets the next entrant in.
   if (gateDeferred) {
-    await checkJobsOfRun(d1, run.id);
+    await checkJobsOfRun(d1, run.id, webhook);
   }
 
   // checkRunConcurrency (job_emitter.go:181-234): this pass's run may hold
@@ -3338,7 +3430,7 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
     for (const group of passGroups) {
       const woken = await findConcurrencyWaiterToWake(d1, run.repoId, run.id, group);
       if (woken !== null) {
-        await checkJobsOfRun(d1, woken);
+        await checkJobsOfRun(d1, woken, webhook);
       }
     }
   }
@@ -4048,6 +4140,7 @@ async function triggerForEvent(
           repoOwnerNamespace: repo.ownerNamespace,
           repoSlug: repo.slug,
           appUrl,
+          webhook: { bindings: env, origin: appUrl },
         },
         file.content,
         readWorkflowRawConcurrency(file.content),

@@ -68,6 +68,7 @@ import {
   actionScheduleSpecs,
   comments,
   commitStatuses,
+  commitStatusIndexes,
   issueLabels,
   issuePins,
   issueSubscriptions,
@@ -1106,6 +1107,9 @@ export class RepoService {
       this.db.delete(releases).where(eq(releases.repoId, repoId)),
       this.db.delete(releaseAssets).where(eq(releaseAssets.repoId, repoId)),
       this.db.delete(commitStatuses).where(eq(commitStatuses.repoId, repoId)),
+      // the per-(repo, sha) counter rows go with the statuses (upstream's
+      // CommitStatus bean sweep covers commit_status_index the same way).
+      this.db.delete(commitStatusIndexes).where(eq(commitStatusIndexes.repoId, repoId)),
       this.db.delete(issuePins).where(eq(issuePins.repoId, repoId)),
       this.db.delete(webhooks).where(eq(webhooks.repoId, repoId)),
       this.db.delete(webhookDeliveries).where(eq(webhookDeliveries.repoId, repoId)),

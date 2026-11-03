@@ -19,6 +19,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import type { User } from "../api/models/user";
+import { hashCommitStatusContext } from "../api/services/commit-status";
 import {
   canBypassBranchProtection,
   canUserDelete,
@@ -466,14 +467,30 @@ describe("checkPullBranchProtections status-check arm (commit_status.go:73-101)"
   let repoId: string;
   let pull: { issueId: number; index: number };
   const HEAD = "d".repeat(40);
+  // the writer-shaped seed state: the per-sha ordinal + the dedupe hash the
+  // real writers persist (migration 0072) — the grouping read keys on them
+  let nextIndexBySha: Map<string, number>;
 
   beforeEach(async () => {
     repoId = await seedRepo();
     pull = await seedPull(repoId);
+    nextIndexBySha = new Map();
   });
 
   async function seedStatus(context: string, state: "pending" | "success" | "failure" | "warning" | "skipped" | "error", sha = HEAD): Promise<void> {
-    await db().insert(commitStatuses).values({ repoId, sha, context, state, description: "", createdAt: new Date(), updatedAt: new Date() });
+    const index = (nextIndexBySha.get(sha) ?? 0) + 1;
+    nextIndexBySha.set(sha, index);
+    await db().insert(commitStatuses).values({
+      repoId,
+      sha,
+      context,
+      state,
+      contextHash: await hashCommitStatusContext(context),
+      index,
+      description: "",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
   }
 
   it("a required context with a success status merges (null)", async () => {
@@ -597,13 +614,28 @@ describe("checkPullBranchProtections status-check arm (commit_status.go:73-101)"
 describe("mergeRequiredContextsCommitStatus (commit_status.go:19-71) directly", () => {
   let repoId: string;
   const HEAD = "f".repeat(40);
+  // the writer-shaped seed state (see the sibling describe above)
+  let nextIndexBySha: Map<string, number>;
 
   beforeEach(async () => {
     repoId = await seedRepo();
+    nextIndexBySha = new Map();
   });
 
   async function seedStatus(context: string, state: "pending" | "success" | "failure" | "warning" | "skipped" | "error", sha = HEAD): Promise<void> {
-    await db().insert(commitStatuses).values({ repoId, sha, context, state, description: "", createdAt: new Date(), updatedAt: new Date() });
+    const index = (nextIndexBySha.get(sha) ?? 0) + 1;
+    nextIndexBySha.set(sha, index);
+    await db().insert(commitStatuses).values({
+      repoId,
+      sha,
+      context,
+      state,
+      contextHash: await hashCommitStatusContext(context),
+      index,
+      description: "",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
   }
 
   it("skipped counts toward success; error and warning are failure-family; the dom/dow-free states combine", async () => {

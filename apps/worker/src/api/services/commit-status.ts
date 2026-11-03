@@ -1,7 +1,7 @@
-import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { commitStatuses, users, type CommitStatusRow } from "../../db/schema";
+import { commitStatuses, commitStatusIndexes, users, type CommitStatusRow } from "../../db/schema";
 import type { CommitStatusState, CommitStatus } from "../models/commit-status";
 import { GO_ZERO_TIME, apiUserFromRow, type Viewer } from "./repository";
 
@@ -24,12 +24,19 @@ import { GO_ZERO_TIME, apiUserFromRow, type Viewer } from "./repository";
  *    (gitea/modules/commitstatus/commit_status.go:67–82) aggregates
  *    worst-of: any error/failure/warning → "failure"; otherwise all-success
  *    (success/skipped only, at least one) → "success"; else "pending".
- *    Our schema has no `context_hash`/`index` columns (READ-ONLY this wave):
- *    `context` groups 1:1 with its hash, and the global autoincrement `id`
- *    is order-equivalent to the per-sha index within one (repo, sha).
+ *  - writes: `NewCommitStatus` (commit_status.go:497–537) allocates the
+ *    per-(repo, sha) ordinal from the `commit_status_indexes` counter
+ *    (MAX+1, :125–181) inside ONE transaction — ours is one D1 batch
+ *    (transactional, same atomicity) — and derives `context_hash` =
+ *    sha1 hex of the context (HashCommitStatusContext :550–552) when the
+ *    caller left it empty. Pre-port rows carry NULL hash (D1 SQL has no
+ *    sha1(); migration 0072 backfills `index` only): the grouping read
+ *    repairs them on first touch (SPEC-0005 §10.3), and until then
+ *    `coalesce(context_hash, context)` keeps their grouping identical to
+ *    the pre-port raw-context behavior.
  */
 
-/** D1 rows are ordered by the global autoincrement id — see the module comment. */
+/** Upstream's ToOrders (`index` tie-breakers keep paging stable past 1s resolution). */
 type StatusOrderBy = SQL[];
 
 /**
@@ -39,19 +46,19 @@ type StatusOrderBy = SQL[];
 export function commitStatusOrderBy(sort: string): StatusOrderBy {
   switch (sort) {
     case "oldest":
-      return [asc(commitStatuses.createdAt), asc(commitStatuses.id)];
+      return [asc(commitStatuses.createdAt), asc(commitStatuses.index)];
     case "recentupdate":
-      return [desc(commitStatuses.updatedAt), desc(commitStatuses.id)];
+      return [desc(commitStatuses.updatedAt), desc(commitStatuses.index)];
     case "leastupdate":
-      return [asc(commitStatuses.updatedAt), asc(commitStatuses.id)];
+      return [asc(commitStatuses.updatedAt), asc(commitStatuses.index)];
     case "leastindex":
-      return [desc(commitStatuses.id)];
+      return [desc(commitStatuses.index)];
     case "highestindex":
-      return [asc(commitStatuses.id)];
+      return [asc(commitStatuses.index)];
     default:
       // upstream default: "created_unix DESC, `index` DESC — timestamps have
       // 1s resolution, `index` keeps paging stable".
-      return [desc(commitStatuses.createdAt), desc(commitStatuses.id)];
+      return [desc(commitStatuses.createdAt), desc(commitStatuses.index)];
   }
 }
 
@@ -74,6 +81,17 @@ export function isFullLengthCommitId(sha: string): boolean {
   return /^[0-9a-f]{40}$/.test(sha);
 }
 
+/**
+ * `HashCommitStatusContext` (commit_status.go:550–552) — the lowercase hex
+ * sha1 the `context_hash` dedupe key carries. Callers that need same-display
+ * contexts separated mix extra data into the input (the Actions writer joins
+ * `ctxName + "\x00" + workflowId`, actions/commit_status.go:282, #35699).
+ */
+export async function hashCommitStatusContext(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function isoOrGoZero(date: Date | null): string {
   return date === null ? GO_ZERO_TIME : date.toISOString();
 }
@@ -87,14 +105,15 @@ export interface CommitStatusWireContext {
 /**
  * `convert.ToCommitStatus` (gitea/services/convert/status.go:17–35) — note
  * two pinned-commit quirks kept faithful: `id` carries the per-sha status
- * INDEX (our D1 table has no index column — the autoincrement id takes its
- * place; TODO(SPEC-0005): commit_status_index), and `updated_at` is rendered
- * from CreatedUnix, i.e. it always equals `created_at`.
+ * INDEX (convert/status.go:24 `ID: status.Index` — NOT the row pk; the
+ * webhook payload keeps the pk, notifier.go:942 — upstream's own asymmetry),
+ * and `updated_at` is rendered from CreatedUnix, i.e. it always equals
+ * `created_at`.
  */
 export function toApiCommitStatus(row: CommitStatusRow, ctx: CommitStatusWireContext): CommitStatus {
   const created = isoOrGoZero(row.createdAt);
   return {
-    id: row.id, // upstream emits the per-sha index here (see module comment)
+    id: row.index ?? 0, // upstream emits the per-sha index here (see module comment)
     status: row.state,
     target_url: row.targetUrl ?? "",
     description: row.description ?? "",
@@ -136,32 +155,64 @@ export interface CreateCommitStatusInput {
   targetUrl: string;
   description: string;
   context: string;
+  /**
+   * Callers may pre-compute the dedupe hash to keep same-display contexts
+   * separated (upstream NewCommitStatus:526–528 — "only derive from Context
+   * when unset"; the Actions writer mixes the workflow file path in,
+   * actions/commit_status.go:282). Empty/absent → derived from `context`.
+   */
+  contextHash?: string;
   creatorId: number | null;
 }
 
 /**
- * `NewCommitStatus` insert side: xorm's `created`/`updated` auto-columns
- * become explicit timestamps; upstream's separate `commit_status_index`
- * counter (per-sha monotonic index) has no D1 counterpart yet — the
- * autoincrement id doubles as the sort/aggregation key (module comment).
+ * `NewCommitStatus` insert side (commit_status.go:497–537): xorm's
+ * `created`/`updated` auto-columns become explicit timestamps. The per-sha
+ * ordinal comes from the `commit_status_indexes` counter — GetNextCommitStatusIndex's
+ * MAX+1 (:125–181; the first status of a sha gets 1, the counter restarts per
+ * (repo, sha)) — as a postgres-arm-shaped upsert (`max_index = max_index + 1`
+ * on conflict, RETURNING via the insert's subselect reading the updated row).
+ * Counter bump + row insert ride ONE D1 batch, which is transactional — the
+ * same atomicity as upstream's single WithTx (:506–536); a crash between the
+ * pair would burn an ordinal, harmless, upstream identical.
+ * `context_hash` = sha1(context) (the :526–528 default; API callers never
+ * pre-compute).
  */
 export async function createCommitStatus(d1: D1Database, input: CreateCommitStatusInput): Promise<CommitStatusRow> {
   const now = new Date();
-  const rows = await drizzle(d1)
-    .insert(commitStatuses)
-    .values({
-      repoId: input.repoId,
-      sha: input.sha,
-      state: input.state,
-      targetUrl: input.targetUrl,
-      description: input.description,
-      context: input.context,
-      creatorId: input.creatorId,
-      createdAt: now,
-      updatedAt: now,
-    })
-    .returning();
-  const row = rows[0];
+  const db = drizzle(d1);
+  const contextHash = input.contextHash || (await hashCommitStatusContext(input.context));
+  const results = await db.batch(
+    [
+      db
+        .insert(commitStatusIndexes)
+        .values({ repoId: input.repoId, sha: input.sha, maxIndex: 1 })
+        .onConflictDoUpdate({
+          target: [commitStatusIndexes.repoId, commitStatusIndexes.sha],
+          set: { maxIndex: sql`${commitStatusIndexes.maxIndex} + 1` },
+        }),
+      db
+        .insert(commitStatuses)
+        .values({
+          repoId: input.repoId,
+          sha: input.sha,
+          // reads the counter row the batch's first statement just upserted —
+          // one round trip keeps the pair atomic (upstream's WithTx).
+          index: sql`(SELECT \`max_index\` FROM \`commit_status_indexes\` WHERE \`repo_id\` = ${input.repoId} AND \`sha\` = ${input.sha})`,
+          contextHash,
+          state: input.state,
+          targetUrl: input.targetUrl,
+          description: input.description,
+          context: input.context,
+          creatorId: input.creatorId,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning(),
+    ] as const,
+  );
+  const inserted = results[1];
+  const row = inserted[0];
   if (row === undefined) {
     throw new Error("commit status insert committed without returning rows");
   }
@@ -203,9 +254,51 @@ export async function listCommitStatuses(
 }
 
 /**
+ * The lazy `context_hash` repair seam (SPEC-0005 §10.6.1 — the port's
+ * choice): a first-read sweep scoped to the (repo, sha) being grouped, run
+ * synchronously BEFORE the grouping queries inside `latestCommitStatuses`,
+ * so the read that touches a pre-port (NULL-hash) scope already answers with
+ * upstream-faithful grouping — no waitUntil convergence lag (the merge gates
+ * act on THIS read; a post-response repair could leave the gate answer stale
+ * until the next request, and the gates have no executionCtx to defer
+ * through). Bounded: the sweep touches only the scope's NULL-hash rows, at
+ * most REPAIR_SWEEP_BOUND per read (per-commit statuses are small; a
+ * pathological sha converges over successive reads), one idempotent
+ * NULL-guarded UPDATE per distinct context riding one D1 batch. Writers
+ * always persist a hash, so post-port rows never enter the sweep.
+ */
+const REPAIR_SWEEP_BOUND = 200;
+
+/** The exhaustion-loop transport page for `db.ListOptionsAll` reads. */
+const STATUS_ALL_PAGE_SIZE = 100;
+
+async function repairNullContextHashes(d1: D1Database, scoped: SQL): Promise<void> {
+  const db = drizzle(d1);
+  const stale = await db
+    .select({ context: commitStatuses.context })
+    .from(commitStatuses)
+    .where(and(scoped, isNull(commitStatuses.contextHash)))
+    .groupBy(commitStatuses.context)
+    .limit(REPAIR_SWEEP_BOUND);
+  // sequential idempotent UPDATEs — each is NULL-guarded, so a partial pass
+  // just leaves the remainder to the next read.
+  for (const row of stale) {
+    const hash = await hashCommitStatusContext(row.context);
+    await db
+      .update(commitStatuses)
+      .set({ contextHash: hash })
+      .where(and(scoped, eq(commitStatuses.context, row.context), isNull(commitStatuses.contextHash)));
+  }
+}
+
+/**
  * `GetLatestCommitStatus` + `CountLatestCommitStatus` — the latest status per
- * context, newest context first, plus the distinct-context count that feeds
- * the CombinedStatus `total_count`/`X-Total-Count`.
+ * context (max `index` per `context_hash`, commit_status.go:343–366), newest
+ * context first, plus the distinct-context count that feeds the CombinedStatus
+ * `total_count`/`X-Total-Count`. Pre-port NULL-hash rows group by their raw
+ * context instead (`coalesce`) — SQL's per-value NULL handling keeps their
+ * grouping exactly the pre-port observable, so the repair arm above is a pure
+ * convergence pass, never a behavior change.
  */
 export async function latestCommitStatuses(
   d1: D1Database,
@@ -214,27 +307,45 @@ export async function latestCommitStatuses(
   page: number,
   limit: number,
 ): Promise<CommitStatusListResult> {
-  const scoped = and(eq(commitStatuses.repoId, repoId), eq(commitStatuses.sha, sha));
-  // max id per context = upstream's max(index) per context_hash.
-  const latestIdsPerContext = drizzle(d1)
-    .select({ value: sql<number>`max(${commitStatuses.id})` })
+  const scoped = and(eq(commitStatuses.repoId, repoId), eq(commitStatuses.sha, sha)) as SQL;
+  await repairNullContextHashes(d1, scoped);
+  const groupKey = sql`coalesce(${commitStatuses.contextHash}, ${commitStatuses.context})`;
+  // max index per context_hash = upstream's GetLatestCommitStatus indices query.
+  const latestIndicesPerContext = drizzle(d1)
+    .select({ value: sql<number>`max(${commitStatuses.index})` })
     .from(commitStatuses)
     .where(scoped)
-    .groupBy(commitStatuses.context);
+    .groupBy(groupKey);
   const db = drizzle(d1);
   const items = await db
     .select()
     .from(commitStatuses)
-    .where(and(scoped, inArray(commitStatuses.id, latestIdsPerContext)))
-    .orderBy(desc(commitStatuses.id))
+    .where(and(scoped, inArray(commitStatuses.index, latestIndicesPerContext)))
+    .orderBy(desc(commitStatuses.index))
     .limit(limit)
     .offset((page - 1) * limit);
   const contextRows = await db
     .select({ value: sql<number>`count(*)` })
     .from(commitStatuses)
     .where(scoped)
-    .groupBy(commitStatuses.context);
+    .groupBy(groupKey);
   return { items, total: contextRows.length };
+}
+
+/**
+ * `GetLatestCommitStatus(…, db.ListOptionsAll)` (commit_status.go:343–359 with
+ * models/db/list.go:40) — every latest-per-context row at the sha, paged to
+ * exhaustion (the same loop shape the merge gates carry). The Actions writer
+ * consumes this for its identical-state short-circuit and its legacy-hash
+ * adoption arm.
+ */
+export async function allLatestCommitStatuses(d1: D1Database, repoId: string, sha: string): Promise<CommitStatusRow[]> {
+  const out: CommitStatusRow[] = [];
+  for (let page = 1; ; page++) {
+    const { items } = await latestCommitStatuses(d1, repoId, sha, page, STATUS_ALL_PAGE_SIZE);
+    out.push(...items);
+    if (items.length < STATUS_ALL_PAGE_SIZE) return out;
+  }
 }
 
 /**

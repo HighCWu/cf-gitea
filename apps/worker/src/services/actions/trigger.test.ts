@@ -21,6 +21,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { parseDocument } from "yaml";
 
+import { hashCommitStatusContext } from "../../api/services/commit-status";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import {
   actionRunJobSummaries,
@@ -32,6 +33,7 @@ import {
   actionSchedules,
   actionScheduleSpecs,
   commitStatuses,
+  commitStatusIndexes,
   repoCounters,
   repoUnits,
   repositories,
@@ -1710,6 +1712,118 @@ describe("createWorkflowCommitStatus + the skipped-status arm", () => {
       onlyReplace: true,
     });
     expect(await db().select().from(commitStatuses)).toHaveLength(0);
+  });
+
+  it("two same-named workflows keep separate latest rows at one sha (the #35699 observable — the mixed-path hash)", async () => {
+    await seedRepo();
+    const sha = "c".repeat(40); // own sha: the per-sha counter restarts at 1
+    const base = {
+      repoId: REPO_ID,
+      commitId: sha,
+      ctxName: "CI / build (push)", // the SAME display context for both files
+      state: "pending" as const,
+      targetUrl: "",
+      description: "Waiting to run",
+      onlyReplace: false,
+    };
+    await createWorkflowCommitStatus(env.DB, { ...base, workflowId: ".github/workflows/a.yml" });
+    await createWorkflowCommitStatus(env.DB, { ...base, workflowId: ".github/workflows/b.yml" });
+    // scoped to THIS sha — sibling tests in this file leave their own rows behind
+    const shaOf = (row: typeof commitStatuses.$inferSelect) => row.sha === sha;
+    const rows = (await db().select().from(commitStatuses)).filter(shaOf);
+    expect(rows).toHaveLength(2); // NOT collapsed into one check
+
+    // each row carries its own mixed hash (sha1(ctxName + "\x00" + workflowId),
+    // actions/commit_status.go:282) and its own counter ordinal
+    const hashA = await hashCommitStatusContext(`CI / build (push)\x00.github/workflows/a.yml`);
+    const hashB = await hashCommitStatusContext(`CI / build (push)\x00.github/workflows/b.yml`);
+    expect(new Set(rows.map((row) => row.contextHash))).toEqual(new Set([hashA, hashB]));
+    expect(rows.map((row) => row.index).sort()).toEqual([1, 2]);
+
+    // a re-report from workflow A supersedes ONLY its own group (B's row keeps
+    // its distinct hash — the old raw-context dedupe would have replaced it)
+    await createWorkflowCommitStatus(env.DB, { ...base, workflowId: ".github/workflows/a.yml", state: "success" });
+    const after = (await db().select().from(commitStatuses)).filter(shaOf);
+    expect(after).toHaveLength(3);
+    const groupA = after.filter((row) => row.contextHash === hashA);
+    expect(groupA.map((row) => row.state)).toEqual(["pending", "success"]); // both A rows kept; latest wins
+    expect(after.filter((row) => row.contextHash === hashB)).toHaveLength(1); // B untouched
+  });
+
+  it("a pre-port legacy-hash row is adopted and superseded (commit_status.go:288-302)", async () => {
+    await seedRepo();
+    // The pre-#35699 shape: an Actions-owned row hashed from Context alone,
+    // with the counter seeded to it (the migrated-state shape — 0072's backfill
+    // + v195 seed). What the lazy repair would produce for a NULL-hash row.
+    const sha = "d".repeat(40); // own sha: the per-sha counter restarts at 1
+    const legacyHash = await hashCommitStatusContext("CI / build (push)");
+    await db().insert(commitStatuses).values({
+      repoId: REPO_ID,
+      sha,
+      context: "CI / build (push)",
+      contextHash: legacyHash,
+      index: 1,
+      state: "pending",
+      targetUrl: "",
+      description: "Waiting to run",
+      creatorId: ACTIONS_USER_ID,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db().insert(commitStatusIndexes).values({ repoId: REPO_ID, sha, maxIndex: 1 });
+    // A NEW workflow (different file path → mixed hash ≠ legacyHash) reports
+    // success. Without the adoption arm the new row would land in its own
+    // group and the stale pending would stay stuck forever.
+    await createWorkflowCommitStatus(env.DB, {
+      repoId: REPO_ID,
+      commitId: sha,
+      ctxName: "CI / build (push)",
+      workflowId: ".github/workflows/renamed.yml",
+      state: "success",
+      targetUrl: "https://x/runs/2/jobs/1",
+      description: "done",
+      onlyReplace: false,
+    });
+    const rows = (await db().select().from(commitStatuses)).filter((row) => row.sha === sha);
+    expect(rows).toHaveLength(2);
+    // THE ADOPTION: the new row joined the LEGACY group (both rows share the
+    // Context-only hash), so the latest-per-context read sees success only.
+    expect(rows.every((row) => row.contextHash === legacyHash)).toBe(true);
+    expect(rows.filter((row) => row.state === "success")).toHaveLength(1);
+    expect(rows.map((row) => row.index).sort()).toEqual([1, 2]);
+
+    // The adoption is Actions-owned rows only: an EXTERNAL row carrying the
+    // legacy hash is NOT adopted (its group stays separate — the :295-297
+    // guard that keeps two same-named workflows from re-collapsing).
+    const shaExternal = "e".repeat(40);
+    await db().insert(commitStatuses).values({
+      repoId: REPO_ID,
+      sha: shaExternal,
+      context: "CI / build (push)",
+      contextHash: legacyHash,
+      index: 1,
+      state: "pending",
+      targetUrl: "",
+      description: "external",
+      creatorId: 42,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db().insert(commitStatusIndexes).values({ repoId: REPO_ID, sha: shaExternal, maxIndex: 1 });
+    await createWorkflowCommitStatus(env.DB, {
+      repoId: REPO_ID,
+      commitId: shaExternal,
+      ctxName: "CI / build (push)",
+      workflowId: ".github/workflows/renamed.yml",
+      state: "success",
+      targetUrl: "https://x/runs/2/jobs/2",
+      description: "done",
+      onlyReplace: false,
+    });
+    const guarded = (await db().select().from(commitStatuses)).filter((row) => row.sha === shaExternal);
+    const mixedHash = await hashCommitStatusContext(`CI / build (push)\x00.github/workflows/renamed.yml`);
+    expect(guarded.filter((row) => row.contextHash === mixedHash)).toHaveLength(1); // kept its own group
+    expect(guarded.filter((row) => row.contextHash === legacyHash)).toHaveLength(1); // external row untouched
   });
 
   it("CreateSkippedCommitStatusForFilteredWorkflow: a required context posts Skipped, a non-required one posts nothing", async () => {

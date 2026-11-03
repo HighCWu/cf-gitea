@@ -65,6 +65,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
+import { hashCommitStatusContext } from "../../api/services/commit-status";
 import { commitStatuses, repoTopics, repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import type { UiManifest } from "../manifest";
@@ -198,6 +199,10 @@ async function ensureAuxJsonFixture(): Promise<AuxJsonFixture> {
       sha: tip,
       targetUrl: "https://ci.example/auxjson/1",
       context: "ci/auxjson",
+      // the writer-shaped seed (migration 0072): the grouping read keys on
+      // the hash + per-sha ordinal the real writers persist
+      contextHash: await hashCommitStatusContext("ci/auxjson"),
+      index: 1,
       state: "success",
       creatorId: ownerRow.id,
       createdAt: new Date(T0 * 1000),

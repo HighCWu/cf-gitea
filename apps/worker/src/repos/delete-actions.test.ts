@@ -32,7 +32,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { actions, deletedBranches, renamedBranches } from "../db/schema";
+import { actions, commitStatuses, commitStatusIndexes, deletedBranches, renamedBranches } from "../db/schema";
 import { ActionType, getFeedRows, recordAction } from "../api/services/activity-feeds";
 import { RepoService } from "./service";
 
@@ -47,6 +47,8 @@ beforeEach(async () => {
     "protected_branches",
     "deleted_branches",
     "renamed_branches",
+    "commit_statuses",
+    "commit_status_indexes",
     "repo_units",
     "repo_transfer",
     "repo_redirects",
@@ -243,6 +245,18 @@ describe("repo delete sweeps the repo's renamed_branches rows (delete.go:164 Del
       { repoId: doomedId, name: "stale-deleted", commitId: "a".repeat(40), deletedById: 1, deletedUnix: 1_700_000_150 },
       { repoId: keeperId, name: "keeper-deleted", commitId: "b".repeat(40), deletedById: 1, deletedUnix: 1_700_000_250 },
     ]);
+    // The CommitStatus bean's analog (the commit_status sweep, delete.go:157)
+    // plus its FN-8 counter twin (commit_status_index rows are repo-scoped;
+    // SPEC-0005 §10.4's cascade arm).
+    const sha = "c".repeat(40);
+    await db.insert(commitStatuses).values([
+      { repoId: doomedId, sha, context: "ci", state: "success", index: 1, createdAt: new Date(1_700_000_100_000), updatedAt: new Date(1_700_000_100_000) },
+      { repoId: keeperId, sha, context: "ci", state: "pending", index: 1, createdAt: new Date(1_700_000_100_000), updatedAt: new Date(1_700_000_100_000) },
+    ]);
+    await db.insert(commitStatusIndexes).values([
+      { repoId: doomedId, sha, maxIndex: 1 },
+      { repoId: keeperId, sha, maxIndex: 4 },
+    ]);
     expect((await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, doomedId)).all()).length).toBe(2);
 
     await service().deleteRepository(doomedId);
@@ -255,5 +269,11 @@ describe("repo delete sweeps the repo's renamed_branches rows (delete.go:164 Del
     // The deleted-arm substrate swept identically (the Branch-bean analog).
     expect((await db.select().from(deletedBranches).where(eq(deletedBranches.repoId, doomedId)).all()).length).toBe(0);
     expect((await db.select().from(deletedBranches).where(eq(deletedBranches.repoId, keeperId)).all()).length).toBe(1);
+    // The commit-status pair swept identically: rows AND the counter twin.
+    expect((await db.select().from(commitStatuses).where(eq(commitStatuses.repoId, doomedId)).all()).length).toBe(0);
+    expect((await db.select().from(commitStatuses).where(eq(commitStatuses.repoId, keeperId)).all()).length).toBe(1);
+    expect((await db.select().from(commitStatusIndexes).where(eq(commitStatusIndexes.repoId, doomedId)).all()).length).toBe(0);
+    const countersLeft = await db.select().from(commitStatusIndexes).where(eq(commitStatusIndexes.repoId, keeperId)).all();
+    expect(countersLeft.map((row) => row.maxIndex)).toEqual([4]);
   });
 });

@@ -24,6 +24,7 @@ import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { hashCommitStatusContext } from "../../api/services/commit-status";
 import { commitStatuses, repoTopics, repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
@@ -101,6 +102,10 @@ async function ensureSmokeFixture(): Promise<{ repo1Id: string; repo2Id: string;
       sha: tip,
       targetUrl: "https://ci.example/run/1",
       context: "ci/smoke",
+      // the writer-shaped seed (migration 0072): the grouping read keys on
+      // the hash + per-sha ordinal the real writers persist
+      contextHash: await hashCommitStatusContext("ci/smoke"),
+      index: 1,
       state: "success",
       creatorId: alice.id,
       createdAt: new Date(T0 * 1000),

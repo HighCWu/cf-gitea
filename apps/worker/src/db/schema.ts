@@ -1259,10 +1259,29 @@ export const commitStatuses = sqliteTable(
     id: integer("id").primaryKey({ autoIncrement: true }),
     repoId: text("repo_id").notNull(),
     sha: text("sha").notNull(),
+    /**
+     * Per-(repo, sha) 1-based creation ordinal (upstream `Index`, commit_status.go:41)
+     * — allocated from the `commit_status_indexes` counter (MAX+1), the REST `id`
+     * renders it (convert/status.go:24) while the webhook payload keeps the row pk.
+     * `index` is a SQLite reserved word: drizzle quotes the identifier; every raw
+     * SQL surface backtick-quotes it, exactly like upstream (:315-325, :346, :357).
+     */
+    index: integer("index"),
     targetUrl: text("target_url"),
     description: text("description").default(""),
     /** Status context (e.g. `ci/test`); 'default' when absent. */
     context: text("context").notNull().default("default"),
+    /**
+     * Lowercase sha1 hex of the dedupe key (upstream `ContextHash` VARCHAR(64),
+     * commit_status.go:50; HashCommitStatusContext :550-552) — derived from
+     * `context` at write, except the Actions writer mixes the workflow file path
+     * in (actions/commit_status.go:282, issue #35699). Internal-only: no json tag
+     * upstream — never rendered on the REST wire or the webhook payload; its only
+     * observable is the latest-per-context grouping it keys. Nullable: pre-port
+     * rows backfill lazily (D1 SQL has no sha1(); the read path repairs —
+     * SPEC-0005 §10.3).
+     */
+    contextHash: text("context_hash"),
     /** pending|success|failure|warning|skipped|error. */
     state: text("state", {
       enum: ["pending", "success", "failure", "warning", "skipped", "error"],
@@ -1271,7 +1290,38 @@ export const commitStatuses = sqliteTable(
     createdAt: integer("created_unix", { mode: "timestamp" }),
     updatedAt: integer("updated_unix", { mode: "timestamp" }),
   },
-  (t) => [index("commit_statuses_repo_sha_idx").on(t.repoId, t.sha)],
+  (t) => [
+    index("commit_statuses_repo_sha_idx").on(t.repoId, t.sha),
+    index("commit_statuses_ctx_hash_idx").on(t.contextHash),
+    index("commit_statuses_index_idx").on(t.index),
+    // Upstream's UNIQUE(repo_sha_index) tag (commit_status.go:41) in INDEX form
+    // — D1 ADD COLUMN cannot add table constraints and a UNIQUE constraint would
+    // force a table rebuild (the FN-6/0066 lesson); NULLs are distinct, so
+    // un-backfilled rows never violate.
+    uniqueIndex("commit_statuses_repo_sha_index_uq").on(t.repoId, t.sha, t.index),
+  ],
+);
+
+/**
+ * `CommitStatusIndex` (commit_status.go:329-335) — the per-(repo, sha) max-index
+ * counter every NewCommitStatus allocates from (MAX+1, GetNextCommitStatusIndex
+ * :125-181); seeded from max(`index`) GROUP BY (upstream's v195 backfill).
+ * Table name pluralized per the §7.5 family (upstream singular
+ * `commit_status_index` — the same pattern that made `commit_status` →
+ * `commit_statuses`).
+ */
+export const commitStatusIndexes = sqliteTable(
+  "commit_status_indexes",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: text("repo_id").notNull(),
+    sha: text("sha").notNull(),
+    maxIndex: integer("max_index").notNull(),
+  },
+  (t) => [
+    uniqueIndex("commit_status_indexes_repo_sha_uq").on(t.repoId, t.sha),
+    index("commit_status_indexes_max_index_idx").on(t.maxIndex),
+  ],
 );
 
 // Canonical row types for consumers (API/services); feature modules may

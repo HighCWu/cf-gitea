@@ -32,6 +32,7 @@ import { createTokenAuthMiddleware } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerStatusRoutes } from "./routes/statuses";
+import { hashCommitStatusContext } from "./services/commit-status";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 
@@ -127,9 +128,14 @@ interface SeedStatusInput {
   targetUrl?: string;
   description?: string;
   creatorId?: number | null;
+  /** The per-sha ordinal (migration 0072) — sort/latest keys ride it. */
+  index?: number;
+  /** The dedupe hash (defaults to sha1(context) when grouping matters). */
+  contextHash?: string;
 }
 
 async function seedStatus(repoId: string, input: SeedStatusInput): Promise<number> {
+  const contextHash = input.contextHash ?? (await hashCommitStatusContext(input.context));
   const rows = await db()
     .insert(commitStatuses)
     .values({
@@ -137,6 +143,8 @@ async function seedStatus(repoId: string, input: SeedStatusInput): Promise<numbe
       sha: input.sha,
       state: input.state as "pending",
       context: input.context,
+      contextHash,
+      index: input.index ?? null,
       targetUrl: input.targetUrl ?? "",
       description: input.description ?? "",
       creatorId: input.creatorId ?? null,
@@ -192,6 +200,37 @@ describe("POST /repos/{owner}/{repo}/statuses/{sha} (repoCreateStatus)", () => {
     const stored = await db().select().from(commitStatuses).all();
     expect(stored).toHaveLength(1);
     expect(stored[0]).toMatchObject({ repoId, sha: SHA, state: "success", context: "ci/test" });
+  });
+
+  it("assigns per-sha ordinals 1,2,… (the counter restarts on a second sha) and the REST id is the ordinal, NOT the row pk", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "visible");
+
+    const post = async (sha: string): Promise<number> => {
+      const res = await router()(`/repos/alice/visible/statuses/${sha}`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ state: "success", context: "ci/test" }),
+      });
+      expect(res.status).toBe(201);
+      return (await res.json<{ id: number }>()).id;
+    };
+    expect(await post(SHA)).toBe(1); // first status of a sha gets index 1
+    expect(await post(SHA)).toBe(2); // the ordinal increments per (repo, sha)
+    expect(await post(SHA_OTHER)).toBe(1); // the counter RESTARTS per sha
+
+    // convert/status.go:24 `ID: status.Index` — the REST id is the per-sha
+    // index, while the stored row pk keeps its own global sequence.
+    const stored = await db().select().from(commitStatuses).all();
+    expect(stored).toHaveLength(3);
+    expect(stored.map((row) => row.index)).toEqual([1, 2, 1]);
+    expect(new Set(stored.map((row) => row.id)).size).toBe(3); // distinct pks
+    for (const row of stored) {
+      expect(row.id).not.toBe(row.index); // the flip: id ≠ the ordinal
+    }
+    // the writer derives context_hash = sha1 hex of the context (:526-528)
+    const expectedHash = await hashCommitStatusContext("ci/test");
+    expect(stored.every((row) => row.contextHash === expectedHash)).toBe(true);
   });
 
   it.each(["warning", "skipped"])("accepts the %s state of the contract enum", async (state) => {
@@ -296,9 +335,9 @@ describe("GET /repos/{owner}/{repo}/statuses/{sha} (repoListStatuses)", () => {
   it("lists a commit's statuses newest-first by default with the contract field set", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "a", createdAt: "2026-01-01T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "pending", context: "b", createdAt: "2026-01-02T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA_OTHER, state: "success", context: "a", createdAt: "2026-01-03T00:00:00Z" });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "a", createdAt: "2026-01-01T00:00:00Z", index: 1 });
+    await seedStatus(repoId, { sha: SHA, state: "pending", context: "b", createdAt: "2026-01-02T00:00:00Z", index: 2 });
+    await seedStatus(repoId, { sha: SHA_OTHER, state: "success", context: "a", createdAt: "2026-01-03T00:00:00Z", index: 1 });
 
     const res = await router()(`/repos/alice/visible/statuses/${SHA}`);
 
@@ -307,25 +346,27 @@ describe("GET /repos/{owner}/{repo}/statuses/{sha} (repoListStatuses)", () => {
     expect(res.headers.get("Link")).toBeNull();
     const body = await res.json<Array<Record<string, unknown>>>();
     expect(Object.keys(body[0]!).sort()).toEqual(COMMIT_STATUS_FIELDS);
-    // default order: created_unix DESC (then index DESC → newest id first)
+    // default order: created_unix DESC, then `index` DESC (b's index 2 > a's 1)
     expect(body.map((s) => s.context)).toEqual(["b", "a"]);
   });
 
   it.each([
     // ToOrders (gitea/models/git/commit_status.go): a=created 03-01/updated 01-05,
-    // b=created 02-01/updated 01-04, c=created 01-01/updated 01-06 (ids a<b<c).
-    ["oldest", ["c", "b", "a"]], // created_unix ASC, index ASC
-    ["recentupdate", ["c", "a", "b"]], // updated_unix DESC, index DESC
+    // b=created 02-01/updated 01-04, c=created 01-01/updated 01-06 (ids a<b<c,
+    // SEEDED indices b=3 > a=2 > c=1 — deliberately NOT id order, so the
+    // `index`-keyed sorts prove the column is load-bearing, not an id stand-in).
+    ["oldest", ["c", "b", "a"]], // created_unix ASC, index ASC (no created ties)
+    ["recentupdate", ["c", "a", "b"]], // updated_unix DESC, index DESC (no updated ties)
     ["leastupdate", ["b", "a", "c"]], // updated_unix ASC, index ASC
-    ["leastindex", ["c", "b", "a"]], // index DESC — the inverted upstream name
-    ["highestindex", ["a", "b", "c"]], // index ASC
+    ["leastindex", ["b", "a", "c"]], // `index` DESC — the inverted upstream name, b=3,a=2,c=1
+    ["highestindex", ["c", "a", "b"]], // `index` ASC — c=1 < a=2 < b=3 (≠ id order)
     ["bogus", ["a", "b", "c"]], // unknown sorts silently take the default
   ])("applies the sort=%s order", async (sort, expected) => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "a", createdAt: "2026-03-01T00:00:00Z", updatedAt: "2026-01-05T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "b", createdAt: "2026-02-01T00:00:00Z", updatedAt: "2026-01-04T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "c", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-06T00:00:00Z" });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "a", createdAt: "2026-03-01T00:00:00Z", updatedAt: "2026-01-05T00:00:00Z", index: 2 });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "b", createdAt: "2026-02-01T00:00:00Z", updatedAt: "2026-01-04T00:00:00Z", index: 3 });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "c", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-06T00:00:00Z", index: 1 });
 
     const res = await router()(`/repos/alice/visible/statuses/${SHA}?sort=${sort}`);
     expect(res.status).toBe(200);
@@ -421,8 +462,8 @@ describe("GET /repos/{owner}/{repo}/commits/{ref}/status (repoGetCombinedStatusB
   it("returns the CombinedStatus shape with the exact contract field set", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/build", createdAt: "2026-01-01T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "pending", context: "ci/test", createdAt: "2026-01-02T00:00:00Z" });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/build", createdAt: "2026-01-01T00:00:00Z", index: 1 });
+    await seedStatus(repoId, { sha: SHA, state: "pending", context: "ci/test", createdAt: "2026-01-02T00:00:00Z", index: 2 });
 
     const res = await router()(`/repos/alice/visible/commits/${SHA}/status`);
 
@@ -459,7 +500,8 @@ describe("GET /repos/{owner}/{repo}/commits/{ref}/status (repoGetCombinedStatusB
     const repoId = await seedRepo(owner.usernameLower, "visible");
     let i = 0;
     for (const state of states) {
-      await seedStatus(repoId, { sha: SHA, state, context: `c${i++}`, createdAt: "2026-01-01T00:00:00Z" });
+      await seedStatus(repoId, { sha: SHA, state, context: `c${i}`, createdAt: "2026-01-01T00:00:00Z", index: i + 1 });
+      i++;
     }
 
     const res = await router()(`/repos/alice/visible/commits/${SHA}/status`);
@@ -467,18 +509,41 @@ describe("GET /repos/{owner}/{repo}/commits/{ref}/status (repoGetCombinedStatusB
     expect(await res.json()).toMatchObject({ state: expected, total_count: states.length });
   });
 
-  it("aggregates only the LATEST status per context", async () => {
+  it("aggregates only the LATEST status per context (max `index` per context_hash)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
-    // ci/flaky reports success, then failure — the failure wins the combine.
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/flaky", createdAt: "2026-01-01T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "failure", context: "ci/flaky", createdAt: "2026-01-02T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/green", createdAt: "2026-01-03T00:00:00Z" });
+    // ci/flaky reports success, then failure — the failure (index 2) wins the combine.
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/flaky", createdAt: "2026-01-01T00:00:00Z", index: 1 });
+    await seedStatus(repoId, { sha: SHA, state: "failure", context: "ci/flaky", createdAt: "2026-01-02T00:00:00Z", index: 2 });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/green", createdAt: "2026-01-03T00:00:00Z", index: 3 });
 
     const res = await router()(`/repos/alice/visible/commits/${SHA}/status`);
     expect(res.status).toBe(200);
     // total_count counts DISTINCT contexts (CountLatestCommitStatus), rows total 3.
     expect(await res.json()).toMatchObject({ state: "failure", total_count: 2 });
+  });
+
+  it("groups by context_hash, not raw context (#35699: same display context, distinct hashes stay separate; same hash groups)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    // Two rows rendering the SAME context keep separate groups when their
+    // hashes differ (the Actions mixed-path hash)…
+    const hashA = await hashCommitStatusContext("ci/dup\x00.github/workflows/a.yml");
+    const hashB = await hashCommitStatusContext("ci/dup\x00.github/workflows/b.yml");
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "ci/dup", createdAt: "2026-01-01T00:00:00Z", index: 1, contextHash: hashA });
+    await seedStatus(repoId, { sha: SHA, state: "failure", context: "ci/dup", createdAt: "2026-01-02T00:00:00Z", index: 2, contextHash: hashB });
+    // …and a DIFFERENT display context joins the group when its hash matches
+    // (the hash, not the string, is the dedupe key).
+    await seedStatus(repoId, { sha: SHA, state: "pending", context: "ci/renamed", createdAt: "2026-01-03T00:00:00Z", index: 3, contextHash: hashA });
+
+    const res = await router()(`/repos/alice/visible/commits/${SHA}/status`);
+    expect(res.status).toBe(200);
+    const body = await res.json<{ state: string; total_count: number; statuses: Array<{ context: string; status: string }> }>();
+    expect(body.total_count).toBe(2); // hash groups, not contexts (would be 3) and not collapsed (would be 1)
+    expect(body.statuses.map((s) => [s.context, s.status])).toEqual([
+      ["ci/renamed", "pending"], // hashA's latest = index 3
+      ["ci/dup", "failure"], // hashB's latest = index 2
+    ]);
   });
 
   it("renders pending with empty statuses for a commit without any", async () => {
@@ -493,8 +558,8 @@ describe("GET /repos/{owner}/{repo}/commits/{ref}/status (repoGetCombinedStatusB
   it("paginates the per-context list", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "a", createdAt: "2026-01-01T00:00:00Z" });
-    await seedStatus(repoId, { sha: SHA, state: "success", context: "b", createdAt: "2026-01-02T00:00:00Z" });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "a", createdAt: "2026-01-01T00:00:00Z", index: 1 });
+    await seedStatus(repoId, { sha: SHA, state: "success", context: "b", createdAt: "2026-01-02T00:00:00Z", index: 2 });
 
     const res = await router()(`/repos/alice/visible/commits/${SHA}/status?limit=1`);
     expect(res.headers.get("X-Total-Count")).toBe("2");
@@ -618,6 +683,7 @@ describe("POST /repos/{owner}/{repo}/statuses/{sha} webhook emissions (status)",
       description: "tests passed",
     }));
     expect(res.status).toBe(201);
+    const restId = (await res.json<{ id: number }>()).id;
 
     const deliveries = await db().select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
     expect(deliveries).toHaveLength(1);
@@ -626,6 +692,14 @@ describe("POST /repos/{owner}/{repo}/statuses/{sha} webhook emissions (status)",
     expect(delivery.eventGroup).toBe("status"); // not in EVENT_GROUPS → identity group
     expect(delivery.state).toBe("pending");
     const payload = JSON.parse(delivery.payloadContent) as Record<string, unknown>;
+    // Upstream's own id asymmetry (notifier.go:942 `ID: status.ID` vs
+    // convert/status.go:24 `ID: status.Index`): the WEBHOOK payload carries
+    // the row pk; the REST body's id carried the per-sha ordinal.
+    const stored = await db().select().from(commitStatuses).all();
+    expect(stored).toHaveLength(1);
+    expect(restId).toBe(stored[0]!.index); // REST id = the ordinal
+    expect(payload.id).toBe(stored[0]!.id); // webhook id = the row pk
+    expect(stored[0]!.id).not.toBe(stored[0]!.index);
     // §2.7 CommitStatusPayload (hook.go:647): NO `action` field.
     expect(Object.keys(payload).sort()).toEqual([
       "commit",

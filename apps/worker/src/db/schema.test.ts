@@ -25,10 +25,12 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { createCommitStatus, hashCommitStatusContext, latestCommitStatuses } from "../api/services/commit-status";
 import { mergeableOfRow, statusFromMergeability } from "../api/services/pull-engine";
 import { HAS_CHANGED, parseUpdatedFiles, UNVIEWED, updateReviewStateAtHead, VIEWED } from "../ui/pages/pull-files";
 import {
   comments,
+  commitStatuses,
   follows,
   lfsObjects,
   orgMembers,
@@ -1831,5 +1833,194 @@ describe("renamed_branches parity (migration 0071)", () => {
     ]);
     const rows = await db.select().from(renamedBranches).where(eq(renamedBranches.repoId, "rb-dup")).orderBy(asc(renamedBranches.id)).all();
     expect(rows.map((row) => row.to)).toEqual(["c1", "c2"]); // both survive
+  });
+});
+
+describe("commit_statuses context_hash + index parity (ADR-0007 FN-8, migration 0072)", () => {
+  const SHA = "c".repeat(40);
+
+  /** sha1 lowercase hex, computed independently of the service under test. */
+  const sha1Hex = async (input: string): Promise<string> =>
+    [...new Uint8Array(await crypto.subtle.digest("SHA-1", new TextEncoder().encode(input)))]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+
+  it("0072's DDL: the two nullable columns append (upstream tags carry no NOT NULL) and the counter table mirrors CommitStatusIndex (:329-335)", async () => {
+    const info = await tableColumns("commit_statuses");
+    expect(info.map((col) => col.name)).toEqual([
+      "id",
+      "repo_id",
+      "sha",
+      "target_url",
+      "description",
+      "context",
+      "state",
+      "creator_id",
+      "created_unix",
+      "updated_unix",
+      // appended per the ALTER ADD COLUMN convention — in the migration's order
+      "context_hash",
+      "index",
+    ]);
+    expect(info.filter((col) => ["context_hash", "index"].includes(col.name))).toEqual([
+      { cid: 10, name: "context_hash", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 11, name: "index", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+    ]);
+    expect(await indexNames("commit_statuses")).toEqual(
+      expect.arrayContaining(["commit_statuses_repo_sha_idx", "commit_statuses_ctx_hash_idx", "commit_statuses_index_idx", "commit_statuses_repo_sha_index_uq"]),
+    );
+    const counter = await tableColumns("commit_status_indexes");
+    expect(counter).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "sha", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "max_index", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    expect(await indexNames("commit_status_indexes")).toEqual(
+      expect.arrayContaining(["commit_status_indexes_repo_sha_uq", "commit_status_indexes_max_index_idx"]),
+    );
+    // The reserved-word pin: `index` is a SQLite keyword — the stored DDL
+    // carries the quoted form (upstream backticks it too, :315-325, :346).
+    const uniqueDdl = await env.DB
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'commit_statuses_repo_sha_index_uq'")
+      .first<{ sql: string }>();
+    expect(uniqueDdl?.sql).toContain("`index`");
+  });
+
+  it("0072 reconstructs the per-sha ordinal from id order (the backfill UPDATE replayed verbatim) and the counter seed resumes (v195's INSERT replayed verbatim)", async () => {
+    // Pre-port rows: NULL index, NULL hash, one created second, explicit ids
+    // INSERTED OUT OF ORDER — the reconstruction must key on id ASC (creation
+    // order), not insertion order.
+    await env.DB
+      .prepare(
+        `INSERT INTO commit_statuses (id, repo_id, sha, context, state, created_unix, updated_unix) VALUES
+          (8671002, 'fn8-bf', ?, 'late-first',  'success', 1700000000, 1700000000),
+          (8671001, 'fn8-bf', ?, 'early',       'pending',  1700000000, 1700000000),
+          (8671003, 'fn8-bf', ?, 'late-second', 'failure',  1700000000, 1700000000)`,
+      )
+      .bind(SHA, SHA, SHA)
+      .run();
+    // A second sha in the same repo — its counter must RESTART at 1.
+    await env.DB
+      .prepare(
+        `INSERT INTO commit_statuses (id, repo_id, sha, context, state, created_unix, updated_unix) VALUES
+          (8671004, 'fn8-bf', ?, 'other', 'success', 1700000000, 1700000000)`,
+      )
+      .bind("d".repeat(40))
+      .run();
+
+    // Migration 0072's statements verbatim
+    // (src/db/migrations/0072_fn8-commit-status-index-hash.sql).
+    await env.DB
+      .prepare(
+        "UPDATE `commit_statuses` SET `index` = (SELECT COUNT(*) FROM `commit_statuses` c2 WHERE c2.`repo_id` = `commit_statuses`.`repo_id` AND c2.`sha` = `commit_statuses`.`sha` AND c2.`id` <= `commit_statuses`.`id`)",
+      )
+      .run();
+    await env.DB
+      .prepare("INSERT INTO `commit_status_indexes` (`repo_id`, `sha`, `max_index`) SELECT `repo_id`, `sha`, max(`index`) FROM `commit_statuses` GROUP BY `repo_id`, `sha`")
+      .run();
+
+    const ordinals = await env.DB
+      .prepare("SELECT id, \"index\" AS idx, context FROM commit_statuses WHERE repo_id = 'fn8-bf' AND sha = ? ORDER BY id")
+      .bind(SHA)
+      .all<{ id: number; idx: number; context: string }>();
+    expect(ordinals.results).toEqual([
+      { id: 8671001, idx: 1, context: "early" }, // lowest id = first created, whatever the insert order
+      { id: 8671002, idx: 2, context: "late-first" },
+      { id: 8671003, idx: 3, context: "late-second" },
+    ]);
+    const counters = await env.DB
+      .prepare("SELECT sha, max_index FROM commit_status_indexes WHERE repo_id = 'fn8-bf' ORDER BY sha")
+      .all<{ sha: string; max_index: number }>();
+    expect(counters.results).toEqual([
+      { sha: SHA, max_index: 3 },
+      { sha: "d".repeat(40), max_index: 1 },
+    ]);
+
+    // The counter RESUMES: the real writer allocates 4 on the seeded sha and
+    // 1 on a fresh sha (GetNextCommitStatusIndex's MAX+1, first status = 1).
+    const next = await createCommitStatus(env.DB, {
+      repoId: "fn8-bf",
+      sha: SHA,
+      state: "success",
+      targetUrl: "",
+      description: "",
+      context: "ci/next",
+      creatorId: null,
+    });
+    expect(next.index).toBe(4);
+    expect(next.contextHash).toBe(await sha1Hex("ci/next"));
+    const fresh = await createCommitStatus(env.DB, {
+      repoId: "fn8-bf",
+      sha: "e".repeat(40),
+      state: "pending",
+      targetUrl: "",
+      description: "",
+      context: "ci/first",
+      creatorId: null,
+    });
+    expect(fresh.index).toBe(1); // the counter restarts per (repo, sha)
+  });
+
+  it("the unique (repo_id, sha, `index`) index enforces ordinal uniqueness (INDEX form — D1 ADD COLUMN cannot add table constraints)", async () => {
+    let violated = false;
+    try {
+      await env.DB
+        .prepare("INSERT INTO commit_statuses (repo_id, sha, `index`, context, state, created_unix, updated_unix) VALUES ('fn8-uq', ?, 1, 'dup', 'success', 1700000000, 1700000000)")
+        .bind(SHA)
+        .run();
+      await env.DB
+        .prepare("INSERT INTO commit_statuses (repo_id, sha, `index`, context, state, created_unix, updated_unix) VALUES ('fn8-uq', ?, 1, 'dup-again', 'pending', 1700000000, 1700000000)")
+        .bind(SHA)
+        .run();
+    } catch {
+      violated = true;
+    }
+    expect(violated).toBe(true);
+  });
+
+  it("NULL-hash rows degrade to raw-context grouping and the first read repairs them (the lazy seam; convergence = upstream's v88 posture)", async () => {
+    const db = drizzle(env.DB);
+    // Pre-port rows: NULL context_hash, explicit ordinals 1..3 across two
+    // contexts at one sha.
+    await db.insert(commitStatuses).values([
+      { repoId: "fn8-repair", sha: SHA, context: "ci/one", state: "pending", index: 1, createdAt: new Date(1_700_000_000_000), updatedAt: new Date(1_700_000_000_000) },
+      { repoId: "fn8-repair", sha: SHA, context: "ci/two", state: "success", index: 2, createdAt: new Date(1_700_000_000_000), updatedAt: new Date(1_700_000_000_000) },
+      { repoId: "fn8-repair", sha: SHA, context: "ci/one", state: "success", index: 3, createdAt: new Date(1_700_000_000_000), updatedAt: new Date(1_700_000_000_000) },
+    ]);
+
+    const before = await db
+      .select({ context: commitStatuses.context, contextHash: commitStatuses.contextHash })
+      .from(commitStatuses)
+      .where(eq(commitStatuses.repoId, "fn8-repair"));
+    expect(before.every((row) => row.contextHash === null)).toBe(true);
+
+    // FIRST grouping read: coalesce(context_hash, context) keeps today's
+    // two-group observable (the degradation contract), the repair arm fires,
+    // and the latest-per-context row is the max-`index` one (ci/one → the
+    // index-3 success, NOT the index-1 pending).
+    const { items, total } = await latestCommitStatuses(env.DB, "fn8-repair", SHA, 1, 30);
+    expect(total).toBe(2);
+    // newest context first (desc `index`): ci/one's latest is index 3, ci/two's is 2
+    expect(items.map((row) => [row.context, row.state])).toEqual([["ci/one", "success"], ["ci/two", "success"]]);
+
+    const after = await db.select({ context: commitStatuses.context, contextHash: commitStatuses.contextHash }).from(commitStatuses).where(eq(commitStatuses.repoId, "fn8-repair"));
+    expect(after.filter((row) => row.context === "ci/one").map((row) => row.contextHash)).toEqual([await sha1Hex("ci/one"), await sha1Hex("ci/one")]);
+    expect(after.filter((row) => row.context === "ci/two").map((row) => row.contextHash)).toEqual([await sha1Hex("ci/two")]);
+    // the sha1-hex format pin (upstream HashCommitStatusContext, %x of sha1.Sum)
+    expect(after.every((row) => /^[0-9a-f]{40}$/.test(row.contextHash ?? ""))).toBe(true);
+
+    // Convergence: the second read is group-identical with the repair a no-op.
+    const again = await latestCommitStatuses(env.DB, "fn8-repair", SHA, 1, 30);
+    expect(again.total).toBe(2);
+    expect(again.items.map((row) => row.id)).toEqual(items.map((row) => row.id));
+  });
+
+  it("the hash helper reproduces upstream's HashCommitStatusContext byte-for-byte", async () => {
+    expect(await hashCommitStatusContext("ci/test")).toBe(await sha1Hex("ci/test"));
+    expect(await hashCommitStatusContext("CI / build (push)\x00.github/workflows/ci.yml")).toBe(
+      await sha1Hex("CI / build (push)\x00.github/workflows/ci.yml"),
+    );
+    expect(await hashCommitStatusContext("ci/test")).toMatch(/^[0-9a-f]{40}$/);
   });
 });
