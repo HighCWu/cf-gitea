@@ -437,6 +437,13 @@
       "breakpoints": true
     },
     {
+      "idx": 62,
+      "version": "6",
+      "when": 1793676839941,
+      "tag": "0062_perpetual_archangel",
+      "breakpoints": true
+    },
+    {
       "idx": 63,
       "version": "6",
       "when": 1793678843901,

@@ -64,6 +64,8 @@ import { AuditActions, auditEventInsert, type AuditOrigin } from "../services/au
 import { OrgService } from "../services/orgs/orgs";
 import {
   actions,
+  actionSchedules,
+  actionScheduleSpecs,
   comments,
   commitStatuses,
   issueLabels,
@@ -1145,6 +1147,14 @@ export class RepoService {
       // {RepoID: repoID}, services/repository/delete.go:171). The schema's
       // repo-scoped convention (no FK) already promised this sweep.
       this.db.delete(protectedBranches).where(eq(protectedBranches.repoId, repoId)),
+      // The scheduled-workflow registry dies with the repo (SPEC-0012 §D7's
+      // cascade arm — upstream's DeleteBeans census carries
+      // &actions_model.ActionScheduleSpec{RepoID: repoID} then
+      // &actions_model.ActionSchedule{RepoID: repoID} in that order,
+      // services/repository/delete.go:191-192; DeleteScheduleTaskByRepo's
+      // own order, schedule.go:82-93).
+      this.db.delete(actionScheduleSpecs).where(eq(actionScheduleSpecs.repoId, repoId)),
+      this.db.delete(actionSchedules).where(eq(actionSchedules.repoId, repoId)),
       // Activity rows die with the repo — the REDEPLOY11/12 carried issue
       // (probe operators hand-swept orphan `action` rows twice). Upstream's
       // DeleteBeans census carries `&activities_model.Action{RepoID:

@@ -21,7 +21,7 @@
  * per entry mirror handleScheduledCron's dispatch EXACTLY
  * (services/demo-sweep.ts — the mount record in its module header):
  *
- *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries NINE producer
+ *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries EIGHT producer
  *     arms: demo_sweep (SPEC-0014), delete_old_audit_events (SPEC-0015
  *     §4.3), cleanup_packages (SPEC-0016 §4.4), cleanup_actions
  *     (SPEC-0012 §4.5), auto_merge_due_scan (the 58f9890 fold — upstream's
@@ -29,18 +29,20 @@
  *     the due scan needs a tick), cancel_abandoned_jobs and
  *     cleanup_ephemeral_runners (SPEC-0012 §4.5's parity-review sweeps —
  *     the dispatcher's actions-abandoned + ephemeral block, its SIXTH
- *     sanctioned extension), cleanup_hook_task_table (SPEC-0005 §4.9
+ *     sanctioned extension), and cleanup_hook_task_table (SPEC-0005 §4.9
  *     as-built, the 870c9b3 landing — the dispatcher's webhook-maintenance
- *     block), and start_schedule_tasks (SPEC-0012's schedule producer,
- *     upstream's own registered task — the dispatcher's actions-schedule
- *     block, mounted LAST on the entry);
+ *     block);
  *   - EVERY OTHER entry (today the standing 10-minute step) carries the
- *     FOUR unconditional arms: update_mirrors + update_push_mirrors
+ *     FIVE unconditional arms: update_mirrors + update_push_mirrors
  *     (SPEC-0009 §2.6 / specs/push-mirror-outbound.md), stop_zombie_tasks
  *     and stop_endless_tasks (SPEC-0012 §4.5/§5.6, the parity-review §5's
- *     stop family — the dispatcher's FOURTH/FIFTH sanctioned extensions) —
- *     matching the dispatcher's unconditional else (a future config entry
- *     runs the step arms, never the hourly ones).
+ *     stop family — the dispatcher's FOURTH/FIFTH sanctioned extensions),
+ *     and start_schedule_tasks (SPEC-0012 §D7 — upstream's own registered
+ *     task, MOVED here from the hourly entry by the 2026-11-03 two-table
+ *     registry alignment: the due action_schedule_spec SELECT + chunked
+ *     sendBatch on the cadence closest to its @every 1m; the 1m→10m floor
+ *     recorded) — matching the dispatcher's unconditional else (a future
+ *     config entry runs the step arms, never the hourly ones).
  *
  * Names are upstream's registered task name where a faithful twin exists at
  * the pin (tasks_basic.go:31 update_mirrors; tasks_actions.go:27
@@ -135,6 +137,15 @@ export const CRON_ARMS: readonly CronArm[] = [
   // (SPEC-0012 §4.5's stop family, the FIFTH sanctioned extension), same
   // always-on placement logic as the zombie arm (the dispatcher's own note).
   { arm: "stop_endless_tasks", spec: STEP_ENTRY_CRON },
+  // upstream tasks_actions.go:55-67 (@every 1m, RunAtStart false) — the
+  // actions-schedule producer (SPEC-0012's SEVENTH sanctioned extension,
+  // the W14 landing). SPEC-0012 §D7 (the 2026-11-03 two-table registry
+  // alignment) MOVED it to the step entry: the registry holds the parsed
+  // specs, so the producer is the due-row SELECT + chunked sendBatch on the
+  // cadence closest to upstream's @every 1m (the 1m→10m recorded floor —
+  // W14's hourly floor retired with the stateless design); never var-gated
+  // (upstream's arm is enabled default with no knob).
+  { arm: "start_schedule_tasks", spec: STEP_ENTRY_CRON },
   // --- the hourly entry (DEMO_SWEEP_CRON ONLY) ----------------------------
   // SPEC-0014 §3.1 — the demo sweep producer; NO upstream task (the
   // sanctioned extension, self-gated on DEMO_MODE).
@@ -167,12 +178,6 @@ export const CRON_ARMS: readonly CronArm[] = [
   // producer (SPEC-0005 §4.9 as-built, the 870c9b3 landing), probe-gated
   // and NOT demo-gated (the packages shape).
   { arm: "cleanup_hook_task_table", spec: DEMO_SWEEP_CRON },
-  // upstream tasks_actions.go:55-67 (@every 1m, RunAtStart false) — the
-  // actions-schedule producer (SPEC-0012's SEVENTH sanctioned extension,
-  // the W14 landing), probe-shaped and never var-gated (upstream's arm is
-  // enabled default with no knob); mounted as the dispatcher's LAST hourly
-  // block, so its census row closes the list (the 2b15f6f row shape).
-  { arm: "start_schedule_tasks", spec: DEMO_SWEEP_CRON },
 ];
 
 /** The entry's arms (the census filter — the hourly entry is matched EXACTLY

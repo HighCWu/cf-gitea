@@ -29,6 +29,8 @@ import {
   actionRunAttempts,
   actionTaskOutputs,
   actionVariables,
+  actionSchedules,
+  actionScheduleSpecs,
   commitStatuses,
   repoCounters,
   repoUnits,
@@ -64,14 +66,11 @@ import {
   evaluateRunConcurrency,
   filterPatterns,
   getEventsFromContent,
-  cronOccurrenceInWindow,
   handleActionsScheduleTrigger,
   insertTriggeredRun,
-  isActionsScheduleTriggerMessage,
   isWorkflowPath,
   listWorkflows,
   marshalRawConcurrency,
-  parseCronSpec,
   matchPushEvent,
   parseRawOn,
   readWorkflowRawConcurrency,
@@ -95,6 +94,8 @@ beforeAll(async () => {
 });
 
 const CLEANUP_TABLES = [
+  "action_schedule_spec",
+  "action_schedule",
   "personal_access_tokens",
   "webhook_deliveries",
   "webhooks",
@@ -1754,7 +1755,7 @@ import { gitHttpGate } from "../../git-http/gate";
 import { authorize } from "../../git-http/authorize";
 import { RepoService } from "../../repos/service";
 import { seedVerifiedUser, mintFor, basicTokenHeader } from "../../auth/testing/seeds";
-import { buildReceivePackBody, ZERO_OID } from "../../repos/testing/git-pack";
+import { buildReceivePackBody, pktLine, ZERO_OID } from "../../repos/testing/git-pack";
 import { handleUserPushEvent } from "../webhooks-push";
 import { handleActionsPushEvent } from "./trigger";
 
@@ -1933,7 +1934,7 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     owner: string,
     slug: string,
     engine: DurableGitHandler<Env>,
-    updates: Array<{ ref: string; oid: string }>,
+    updates: Array<{ ref: string; oid: string; old?: string }>,
     pack: Uint8Array,
     token: string,
   ): Promise<Response> {
@@ -1945,11 +1946,23 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
       engine,
     );
     expect(advert.status).toBe(200);
+    // A non-create update carries its LIVE tip as old (the gate.test.ts
+    // delete shape): old=ZERO on an existing ref classifies as a CREATE and
+    // the finalize rejects it — the ref would never move.
+    const body =
+      updates.some((u) => u.old !== undefined)
+        ? concatBytes(
+            new TextEncoder().encode(
+              updates.map((u) => pktLine(`${u.old ?? ZERO_OID} ${u.oid} ${u.ref}\0report-status side-band-64k`)).join("") + "0000",
+            ),
+            pack,
+          )
+        : buildReceivePackBody(updates, pack);
     const response = await gitHttpGate(
       new Request(`${base}/git-receive-pack`, {
         method: "POST",
         headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
-        body: buildReceivePackBody(updates, pack),
+        body,
       }),
       env,
       ctx,
@@ -2188,166 +2201,191 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     void ZERO_OID;
   });
 
-  // -- the schedule pass (handleActionsScheduleTrigger) over the real tree --
+  // -- the schedule registry lifecycle over the real tree (SPEC-0012 §D7) --
+  // Registration rides the PUSH SEAM now: every default-branch push replaces
+  // the repo's action_schedule/action_schedule_spec rows from the tree
+  // (handleSchedules' count → delete → re-insert, notifier_helper.go:601-615),
+  // and the spec-row consumer (schedule.ts handleActionsScheduleTrigger)
+  // advances the row CAS-FIRST then inserts the run — the F7 serialization.
 
-  it("an on:schedule workflow fires at the due hour; the non-due one waits (㉕-C)", async () => {
+  /** Read the repo's spec rows joined with their schedules, spec text asc. */
+  async function registryRows(repoId: string) {
+    const schedules = await db().select().from(actionSchedules).where(eq(actionSchedules.repoId, repoId)).orderBy(actionSchedules.id);
+    const specs = await db().select().from(actionScheduleSpecs).where(eq(actionScheduleSpecs.repoId, repoId)).orderBy(actionScheduleSpecs.id);
+    return { schedules, specs };
+  }
+
+  /** Park a spec's next a minute into the past — the state the producer's
+   *  SELECT hands the consumer (registration computes next in the future;
+   *  the consume-side tests simulate the moment it comes due). */
+  async function makeDue(specId: number): Promise<void> {
+    await db().update(actionScheduleSpecs).set({ next: new Date(Date.now() - 60_000) }).where(eq(actionScheduleSpecs.id, specId));
+  }
+
+  it("a default-branch push REGISTERS the two-table registry; the push itself inserts no runs", async () => {
     const { owner, slug, repoId, userId } = await seedE2eRepo("scheduled");
     const token = (await mintFor(userId, "t-sched", "write:repository")).plaintext;
     const hourly = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
     const dailyNoon = 'name: Noon\non:\n  schedule:\n    - cron: "0 12 * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const plain = "name: Plain\non: push\njobs:\n  ok:\n    runs-on: x\n    steps:\n      - run: y\n";
     const { tips, pack } = await buildChainPack(null, [
       {
         message: "ci: schedule workflows",
         files: [
           { path: ".gitea/workflows/hourly.yml", content: hourly },
           { path: ".gitea/workflows/noon.yml", content: dailyNoon },
+          { path: ".gitea/workflows/plain.yml", content: plain },
         ],
       },
     ]);
-    // the registering push itself inserts NOTHING (schedules never match push)
-    const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    const tip = tips[0]!;
+    const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tip }], pack, token);
     expect(response.status).toBe(200);
-    expect(await db().select().from(actionRuns)).toHaveLength(0);
 
-    // tick 12:00 — the window (11:00, 12:00] holds BOTH specs' occurrences
-    const tickNoon = Math.floor(Date.UTC(2026, 5, 1, 12, 0, 0) / 1000);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tickNoon })).toBe(2);
-    let runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
-    expect(runs).toHaveLength(2);
-    // schedule_tasks.go:130's WorkflowID rides dwf.EntryName — dir-relative.
-    expect(runs[0]?.workflowId).toBe("hourly.yml");
-    expect(runs[1]?.workflowId).toBe("noon.yml");
-    for (const run of runs) {
-      expect(run.triggerEvent).toBe("schedule");
-      expect(run.event).toBe("push"); // upstream CreateScheduleTaskBySpec's Event: cron.Event
-      expect(run.commitSha).toBe(tips[0]);
-      expect(run.ref).toBe("refs/heads/main");
-      expect(run.title).toBe("ci: schedule workflows");
-      expect(run.triggerUserId).toBe(ACTIONS_USER_ID);
-      const payload = JSON.parse(run.eventPayload) as { schedule?: string; schedule_unix?: number; head_commit?: { id?: string } };
-      expect(payload.head_commit?.id).toBe(tips[0]);
-      expect(payload.schedule_unix).toBe(tickNoon);
-    }
-    expect(runs[1] && (JSON.parse(runs[1].eventPayload) as { schedule?: string }).schedule).toBe("0 12 * * *");
-
-    // tick 14:00 — only the hourly spec is due (noon's 12:00 < 13:00)
-    const tick14 = Math.floor(Date.UTC(2026, 5, 1, 14, 0, 0) / 1000);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick14 })).toBe(1);
-    runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
-    expect(runs).toHaveLength(3);
-    expect(runs[2]?.workflowId).toBe("hourly.yml");
-
-    // the noon workflow never fired at the 14:00 tick — the mission's
-    // non-due arm, asserted on the rows
-    expect(runs.filter((r) => r.workflowId === "noon.yml")).toHaveLength(1);
-    expect(runs.filter((r) => r.workflowId === "hourly.yml")).toHaveLength(2);
-  });
-
-  it("a redelivered tick message inserts nothing (the schedule_unix dedupe)", async () => {
-    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-dedupe");
-    const token = (await mintFor(userId, "t-dedupe", "write:repository")).plaintext;
-    const wf = 'name: Hourly\non:\n  schedule:\n    - cron: "*/5 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
-    const { tips, pack } = await buildChainPack(null, [
-      { message: "seed", files: [{ path: ".gitea/workflows/every5.yml", content: wf }] },
-    ]);
-    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
-    const tick = Math.floor(Date.UTC(2026, 5, 1, 9, 0, 0) / 1000);
-    const message = { kind: "actions-trigger" as const, repoId, scheduledUnix: tick };
-    expect(await handleActionsScheduleTrigger(env, message)).toBe(1);
-    // the sub-hourly spec collapses to ONE run per window, and the exact
-    // same message (a queue redelivery) inserts NOTHING more
-    expect(await handleActionsScheduleTrigger(env, message)).toBe(0);
-    const runs = await db().select().from(actionRuns);
-    expect(runs).toHaveLength(1);
-    // a DIFFERENT tick is a new window — the next run lands
-    expect(await handleActionsScheduleTrigger(env, { ...message, scheduledUnix: tick + 3600 })).toBe(1);
-    expect(await db().select().from(actionRuns)).toHaveLength(2);
-  });
-
-  it("an invalid spec logs and skips; the pass continues to the next workflow", async () => {
-    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-invalid");
-    const token = (await mintFor(userId, "t-inv", "write:repository")).plaintext;
-    const broken = 'name: Broken\non:\n  schedule:\n    - cron: "99 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
-    const good = 'name: Good\non:\n  schedule:\n    - cron: "@hourly"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
-    const { tips, pack } = await buildChainPack(null, [
-      {
-        message: "seed",
-        files: [
-          { path: ".gitea/workflows/broken.yml", content: broken },
-          { path: ".gitea/workflows/good.yml", content: good },
-        ],
-      },
-    ]);
-    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
-    const tick = Math.floor(Date.UTC(2026, 5, 1, 20, 0, 0) / 1000);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick })).toBe(1);
-    const runs = await db().select().from(actionRuns);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.workflowId).toBe("good.yml");
-    expect((JSON.parse(runs[0]?.eventPayload ?? "{}") as { schedule?: string }).schedule).toBe("@hourly");
-  });
-
-  it("archived and empty repos skip the pass before any tree read", async () => {
-    await db().insert(users).values({ id: 4242, username: "arch", usernameLower: "arch", status: "active", createdAt: new Date(0) });
-    await db().insert(repositories).values({
-      id: "repo-sched-arch",
-      storageKey: "r_repo-sched-arch",
-      ownerNamespace: "arch",
-      ownerId: 4242,
-      slug: "dead",
-      visibility: "public",
-      isArchived: true,
-    });
-    await db().insert(repositories).values({
-      id: "repo-sched-empty",
-      storageKey: "r_repo-sched-empty",
-      ownerNamespace: "arch",
-      ownerId: 4242,
-      slug: "blank",
-      visibility: "public",
-      isEmpty: true,
-    });
-    const tick = Math.floor(Date.UTC(2026, 5, 1, 8, 0, 0) / 1000);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-arch", scheduledUnix: tick })).toBe(0);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-empty", scheduledUnix: tick })).toBe(0);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-missing", scheduledUnix: tick })).toBe(0);
-  });
-
-  // -- the R1-F1 id-space pins: the settings-page toggle writes the BARE
-  // entry name (the runs-page link id) and the disabled checks must compare
-  // that same space — the full-path split kept disabled workflows running. --
-
-  it("a settings-page disable suppresses the matching push run (the bare-name flag actually arms)", async () => {
-    const { owner, slug, repoId, userId } = await seedE2eRepo("disabled-push");
-    const token = (await mintFor(userId, "t-dis", "write:repository")).plaintext;
-    const wfV1 = "name: CI\non: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n";
-    const wfV2 = "name: CI\non: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: z\n";
-    const { tips, pack } = await buildChainPack(null, [
-      { message: "ci: add workflow", files: [{ path: ".gitea/workflows/ci.yml", content: wfV1 }] },
-      { message: "ci: tweak workflow", files: [{ path: ".gitea/workflows/ci.yml", content: wfV2 }] },
-    ]);
-    const first = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
-    expect(first.status).toBe(200);
+    // The push MATCHED the plain workflow (one push run) and REGISTERED the
+    // two schedule workflows (schedule runs never match push).
     expect(await db().select().from(actionRuns)).toHaveLength(1);
 
-    // the workflow-list toggle arm writes the BARE name (view.go:1324-1375's
-    // DisableWorkflow over cfg.DisabledWorkflows; the UI posts entry.Name())
-    await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
-    expect(
-      await toggleRepoActionsWorkflow(env.DB, repoId, userId, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: "" }),
-    ).toBe("saved");
+    const { schedules, specs } = await registryRows(repoId);
+    expect(schedules).toHaveLength(2);
+    // The registration fields (notifier_helper.go:632-644's row shape).
+    for (const schedule of schedules) {
+      expect(schedule.repoId).toBe(repoId);
+      expect(schedule.ownerId).toBe(userId);
+      expect(schedule.triggerUserId).toBe(ACTIONS_USER_ID);
+      expect(schedule.ref).toBe("refs/heads/main");
+      expect(schedule.commitSha).toBe(tip);
+      expect(schedule.event).toBe("push");
+      expect(schedule.title).toBe("ci: schedule workflows");
+      expect(schedule.content).toContain("schedule:"); // the workflow SOURCE stored at registration
+    }
+    expect(schedules.map((s) => s.workflowId)).toEqual(["hourly.yml", "noon.yml"]);
 
-    // the second push inserts NOTHING — the disabled check now compares the
-    // run's bare workflowId space against the stored flag
-    // (notifier_helper.go:223's IsWorkflowDisabled(wf.EntryName)).
-    const second = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[1]! }], pack, token);
-    expect(second.status).toBe(200);
-    const runs = await db().select().from(actionRuns);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.workflowId).toBe("ci.yml");
+    // One spec row per cron spec, Next = the next occurrence at registration,
+    // Prev = never (NULL). The push landed in the TEST's real clock; the
+    // hourly next is the top of the NEXT hour — assert the relation, not the
+    // wall clock.
+    expect(specs).toHaveLength(2);
+    const hourlySpec = specs.find((s) => s.spec === "0 * * * *");
+    const noonSpec = specs.find((s) => s.spec === "0 12 * * *");
+    expect(hourlySpec).toBeDefined();
+    expect(noonSpec).toBeDefined();
+    expect(hourlySpec?.prev).toBeNull();
+    expect(noonSpec?.prev).toBeNull();
+    expect(hourlySpec?.next).not.toBeNull();
+    expect(noonSpec?.next).not.toBeNull();
+    expect(hourlySpec!.scheduleId).toBe(schedules[0]?.id);
+    expect(noonSpec!.scheduleId).toBe(schedules[1]?.id);
+    const hourlyNext = new Date(hourlySpec!.next!).getTime() / 1000;
+    expect(hourlyNext % 3600).toBe(0);
+    expect(hourlyNext).toBeGreaterThan(Math.floor(Date.now() / 1000) - 1);
   });
 
-  it("the same bare-name flag suppresses the schedule tick (the schedule twin)", async () => {
+  it("the due spec consumer inserts the CreateScheduleTaskBySpec run verbatim; the row advances (prev=old next)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-consume");
+    const token = (await mintFor(userId, "t-cons", "write:repository")).plaintext;
+    const hourly = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "ci: schedule workflow", files: [{ path: ".gitea/workflows/hourly.yml", content: hourly }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    await db().delete(actionRuns); // clear the push run — the schedule pass stands alone
+    const { schedules, specs } = await registryRows(repoId);
+    const schedule = schedules[0]!;
+    const spec = specs[0]!;
+    await makeDue(spec.id); // the producer only delivers DUE rows
+    const oldNext = (await db().select().from(actionScheduleSpecs).where(eq(actionScheduleSpecs.id, spec.id)))[0]!.next!;
+
+    expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "https://example.com" }, { kind: "actions-trigger", specId: spec.id })).toBe(1);
+    const runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
+    expect(runs).toHaveLength(1);
+    const run = runs[0]!;
+    // CreateScheduleTaskBySpec's verbatim field set (schedule_tasks.go:117-145).
+    expect(run.triggerEvent).toBe("schedule");
+    expect(run.event).toBe("push"); // Event: cron.Event — the registration's
+    expect(run.repoId).toBe(repoId);
+    expect(run.ownerId).toBe(userId);
+    expect(run.workflowId).toBe("hourly.yml");
+    expect(run.triggerUserId).toBe(ACTIONS_USER_ID);
+    expect(run.scheduleId).toBe(schedule.id);
+    expect(run.ref).toBe("refs/heads/main");
+    expect(run.commitSha).toBe(tips[0]);
+    expect(run.title).toBe("ci: schedule workflow");
+    expect(run.status).toBe(ACTION_STATUS_WAITING);
+    expect(run.workflowRepoId).toBe(repoId); // WorkflowRepoID: cron.RepoID
+    expect(run.workflowCommitSha).toBe(tips[0]); // WorkflowCommitSHA: cron.CommitSHA
+    const payload = JSON.parse(run.eventPayload) as { schedule?: string; schedule_unix?: unknown; head_commit?: { id?: string } };
+    // withScheduleInEventPayload merged the spec into the registration payload...
+    expect(payload.schedule).toBe("0 * * * *");
+    expect(payload.head_commit?.id).toBe(tips[0]);
+    // ...and the W14 `schedule_unix` dedupe key is GONE (upstream has no such key).
+    expect("schedule_unix" in payload).toBe(false);
+
+    // The advance (startTask, schedule_tasks.go:66-72): prev = the old next,
+    // next = cron.Next(now+1m) — strictly past the occurrence just consumed.
+    const [advanced] = await db().select().from(actionScheduleSpecs).where(eq(actionScheduleSpecs.id, spec.id));
+    expect(advanced?.prev?.getTime()).toBe(oldNext.getTime());
+    // Next(now+1m) can LEGITIMATELY equal the registration's next when no
+    // occurrence lies between (a same-hour consume of "0 * * * *").
+    expect(advanced?.next!.getTime()).toBeGreaterThanOrEqual(oldNext.getTime());
+  });
+
+  it("THE F7 PIN: two concurrent deliveries of the same spec insert exactly one run (the CAS loses one)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-f7");
+    const token = (await mintFor(userId, "t-f7", "write:repository")).plaintext;
+    const wf = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/hourly.yml", content: wf }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    await db().delete(actionRuns);
+    const { specs } = await registryRows(repoId);
+    const spec = specs[0]!;
+    const message = { kind: "actions-trigger" as const, specId: spec.id };
+    const consumerEnv = { d1: env.DB, appUrl: "https://example.com" };
+    await makeDue(spec.id);
+
+    // Both deliveries read the same row (same prev/next), then race the
+    // advance UPDATE — D1 serializes them; the loser's WHERE matches 0 rows
+    // and it skips the insert (startTask's advance-before-insert with the
+    // row UPDATE as the serialization, the mission's disclosed CAS).
+    const results = await Promise.all([
+      handleActionsScheduleTrigger(consumerEnv, message),
+      handleActionsScheduleTrigger(consumerEnv, message),
+    ]);
+    expect(results).toHaveLength(2);
+    expect(results[0] + results[1]).toBe(1);
+    expect(await db().select().from(actionRuns)).toHaveLength(1);
+
+    // A SEQUENTIAL redelivery after the winner acked inserts nothing either —
+    // the row's prev/next moved under the first delivery.
+    expect(await handleActionsScheduleTrigger(consumerEnv, message)).toBe(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(1);
+  });
+
+  it("archived repos skip the run but the spec row still advanced (startTask's post-advance skip)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-arch");
+    const token = (await mintFor(userId, "t-arch", "write:repository")).plaintext;
+    const wf = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/hourly.yml", content: wf }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    await db().update(repositories).set({ isArchived: true }).where(eq(repositories.id, repoId));
+    const { specs } = await registryRows(repoId);
+    const spec = specs[0]!;
+    await makeDue(spec.id);
+    const oldNext = (await db().select().from(actionScheduleSpecs).where(eq(actionScheduleSpecs.id, spec.id)))[0]!.next!;
+    // schedule_tasks.go:97-99 — only the run is skipped; the advance at
+    // :66-72 already happened (rows churn on archived repos, upstream too).
+    expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "" }, { kind: "actions-trigger", specId: spec.id })).toBe(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+    const [advanced] = await db().select().from(actionScheduleSpecs).where(eq(actionScheduleSpecs.id, spec.id));
+    expect(advanced?.prev?.getTime()).toBe(oldNext.getTime());
+    expect(advanced?.next!.getTime()).toBeGreaterThanOrEqual(oldNext.getTime());
+  });
+
+  it("the settings-page disable suppresses the consume run; re-enabling resumes the schedule", async () => {
     const { owner, slug, repoId, userId } = await seedE2eRepo("disabled-sched");
     const token = (await mintFor(userId, "t-dis2", "write:repository")).plaintext;
     const hourly = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
@@ -2355,85 +2393,158 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
       { message: "ci: schedule workflow", files: [{ path: ".gitea/workflows/hourly.yml", content: hourly }] },
     ]);
     await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
-
+    await db().delete(actionRuns);
     await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
     expect(
       await toggleRepoActionsWorkflow(env.DB, repoId, userId, { workflowId: "hourly.yml", isEnable: false, scopedWorkflowSourceRepoId: "" }),
     ).toBe("saved");
 
-    // schedule_tasks.go:122-125's disabled-workflow skip fires on the bare
-    // name — the tick inserts nothing.
-    const tick = Math.floor(Date.UTC(2026, 5, 1, 12, 0, 0) / 1000);
-    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick })).toBe(0);
+    const { specs } = await registryRows(repoId);
+    const spec = specs[0]!;
+    await makeDue(spec.id);
+    // schedule_tasks.go:122-125's disabled-workflow skip — post-advance.
+    expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "" }, { kind: "actions-trigger", specId: spec.id })).toBe(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+    // Re-enable, then the NEXT occurrence comes due (a fresh delivery of a
+    // due row): the flag no longer suppresses it.
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, repoId, userId, { workflowId: "hourly.yml", isEnable: true, scopedWorkflowSourceRepoId: "" }),
+    ).toBe("saved");
+    await makeDue(spec.id);
+    expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "https://example.com" }, { kind: "actions-trigger", specId: spec.id })).toBe(1);
+    expect(await db().select().from(actionRuns)).toHaveLength(1);
+  });
+
+  it("the registry REPLACE: an edited workflow re-registers fresh rows; a removal empties them; other-branch and [skip ci] pushes leave them", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-replace");
+    const token = (await mintFor(userId, "t-rep", "write:repository")).plaintext;
+    const wfV1 = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const wfV2 = 'name: Noon\non:\n  schedule:\n    - cron: "30 12 * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "ci: v1", files: [{ path: ".gitea/workflows/hourly.yml", content: wfV1 }] },
+      { message: "ci: v2", files: [{ path: ".gitea/workflows/hourly.yml", content: wfV2 }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    const first = await registryRows(repoId);
+    expect(first.schedules).toHaveLength(1);
+    expect(first.specs.map((s) => s.spec)).toEqual(["0 * * * *"]);
+
+    // The default-branch push REPLACES the rows (count → delete → re-insert,
+    // notifier_helper.go:601-615); the new spec carries the new cron and a
+    // fresh id — the old spec id is GONE (a stale consumer message no-ops).
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[1]!, old: tips[0]! }], pack, token);
+    const second = await registryRows(repoId);
+    expect(second.schedules).toHaveLength(1);
+    expect(second.schedules[0]!.workflowId).toBe("hourly.yml");
+    expect(second.specs.map((s) => s.spec)).toEqual(["30 12 * * *"]);
+    expect(second.specs[0]!.id).not.toBe(first.specs[0]!.id);
+    const staleId = first.specs[0]!.id;
+    expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "" }, { kind: "actions-trigger", specId: staleId })).toBe(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+
+    // A NON-default-branch push registers nothing (handleSchedules'
+    // ref gate, :591-594) and leaves the rows untouched.
+    const { tips: featTips, pack: featPack } = await buildChainPack(tips[1]!, [
+      { message: "feature: schedule on a branch", files: [{ path: ".gitea/workflows/feature.yml", content: wfV1 }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/feature", oid: featTips[0]! }], featPack, token);
+    const third = await registryRows(repoId);
+    expect(third.schedules).toHaveLength(1);
+    expect(third.specs.map((s) => s.spec)).toEqual(["30 12 * * *"]);
+    expect(await db().select().from(actionSchedules).where(eq(actionSchedules.workflowId, "feature.yml"))).toHaveLength(0);
+
+    // A [skip ci] default-branch push does NOT refresh the registry (the
+    // skipWorkflows gate short-circuits notify BEFORE handleSchedules).
+    const { tips: skipTips, pack: skipPack } = await buildChainPack(tips[1]!, [
+      { message: "chore: tweak [skip ci]", files: [{ path: ".gitea/workflows/hourly.yml", content: wfV1 }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: skipTips[0]!, old: tips[1]! }], skipPack, token);
+    const fourth = await registryRows(repoId);
+    expect(fourth.specs.map((s) => s.spec)).toEqual(["30 12 * * *"]);
+
+    // Removing the SCHEDULE from the default branch empties BOTH tables (the
+    // count gate deletes first, the empty detection returns — :601-615's
+    // exact shape). The workflow file itself stays (now a plain on: push
+    // workflow — no schedule event to register).
+    const plainWf = "name: Plain\non: push\njobs:\n  ok:\n    runs-on: x\n    steps:\n      - run: y\n";
+    const { tips: rmTips, pack: rmPack } = await buildChainPack(skipTips[0]!, [
+      { message: "chore: drop schedule wf", files: [{ path: ".gitea/workflows/hourly.yml", content: plainWf }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: rmTips[0]!, old: skipTips[0]! }], rmPack, token);
+    const fifth = await registryRows(repoId);
+    expect(fifth.schedules).toHaveLength(0);
+    expect(fifth.specs).toHaveLength(0);
+  });
+
+  it("an unparsable spec registers the schedule row but NO spec row; a stale id no-ops", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-invalid");
+    const token = (await mintFor(userId, "t-inv", "write:repository")).plaintext;
+    const broken = 'name: Broken\non:\n  schedule:\n    - cron: "99 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/broken.yml", content: broken }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    const { schedules, specs } = await registryRows(repoId);
+    // CreateScheduleTaskBySchedules inserts the schedule row; the parse-
+    // failing spec registers nothing (schedule.go:63-66).
+    expect(schedules).toHaveLength(1);
+    expect(specs).toHaveLength(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+    // A spec id that never existed (or was deleted) is a silent no-op
+    // (startTasks' gone-row skip, schedule_tasks.go:74-78).
+    expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "" }, { kind: "actions-trigger", specId: 999999 })).toBe(0);
+  });
+
+  it("the Actions-user carve-out: an Actions-user default-branch push refreshes the registry and triggers nothing", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-actionsuser");
+    const token = (await mintFor(userId, "t-au", "write:repository")).plaintext;
+    const wf = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const pushWf = "name: Pushy\non: push\njobs:\n  ok:\n    runs-on: x\n    steps:\n      - run: y\n";
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/hourly.yml", content: wf }] },
+    ]);
+    const firstTip = tips[0]!;
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: firstTip }], pack, token);
+    await db().delete(actionRuns);
+    await db().delete(actionSchedules);
+    await db().delete(actionScheduleSpecs);
+
+    // The ref moves through the REAL receive-pack first (the engine's ref is
+    // what detectAndHandleSchedules reads; a fabricated event alone would
+    // find the OLD tip). That real push registers rows and fires the on-push
+    // workflow — both are wiped below so the CARVE-OUT's effects stand alone.
+    // The harness's commit trees are per-commit (NOT cumulative): the robot
+    // commit lists BOTH files so the tip tree still carries the schedule
+    // workflow.
+    const { tips: nextTips, pack: nextPack } = await buildChainPack(firstTip, [
+      {
+        message: "robot: mirror-style update",
+        files: [
+          { path: ".gitea/workflows/pushy.yml", content: pushWf },
+          { path: ".gitea/workflows/hourly.yml", content: wf },
+        ],
+      },
+    ]);
+    const nextTip = nextTips[0]!;
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: nextTip, old: firstTip }], nextPack, token);
+    expect(await db().select().from(actionRuns)).toHaveLength(1); // pushy.yml fired on the real push
+    await db().delete(actionRuns);
+    await db().delete(actionSchedules);
+    await db().delete(actionScheduleSpecs);
+
+    // The Actions-user push (pusherId = ACTIONS_USER_ID, the v1 runs-never-
+    // push guard's doer) carries the SAME default-branch update: the
+    // carve-out (notifier_helper.go:141-155) refreshes the registry — and
+    // runs NO workflow.
+    await handleActionsPushEvent(
+      { DB: env.DB, REPO: env.REPO, APP_URL: "https://example.com" },
+      { repo: `${owner}/${slug}`, origin: "https://example.com", pusherId: ACTIONS_USER_ID, updates: [{ ref: "refs/heads/main", old: firstTip, new: nextTip }] },
+    );
+    const { schedules } = await registryRows(repoId);
+    expect(schedules).toHaveLength(1);
+    expect(schedules[0]?.commitSha).toBe(nextTip);
+    expect(schedules[0]?.eventPayload).toBe("null"); // the schedule-input's literal-null payload
     expect(await db().select().from(actionRuns)).toHaveLength(0);
   });
-});
 
-// ---------------------------------------------------------------------------
-// The schedule matcher (robfig/cron v3 ParseStandard + the tick-window probe)
-// ---------------------------------------------------------------------------
-
-describe("parseCronSpec + cronOccurrenceInWindow (robfig standard)", () => {
-  const sec = (iso: string): number => Math.floor(Date.parse(iso) / 1000);
-  // June 2026: the 1st is a Monday, the 5th a Friday, the 7th a Sunday.
-  const due = (spec: string, startIso: string, endIso: string): boolean =>
-    cronOccurrenceInWindow(parseCronSpec(spec), sec(startIso), sec(endIso));
-
-  it("the mission's pair: '0 * * * *' fires at the hour, '0 12 * * *' does not at 14:00", () => {
-    expect(parseCronSpec("0 * * * *")).not.toBeNull();
-    expect(due("0 * * * *", "2026-06-01T13:00:00Z", "2026-06-01T14:00:00Z")).toBe(true);
-    expect(due("0 12 * * *", "2026-06-01T13:00:00Z", "2026-06-01T14:00:00Z")).toBe(false);
-  });
-
-  it("minute-precision specs land in the window that holds their occurrence", () => {
-    expect(due("30 2 * * *", "2026-06-01T02:00:00Z", "2026-06-01T03:00:00Z")).toBe(true);
-    expect(due("30 2 * * *", "2026-06-01T03:00:00Z", "2026-06-01T04:00:00Z")).toBe(false);
-    expect(due("15,45 * * * *", "2026-06-01T10:00:00Z", "2026-06-01T11:00:00Z")).toBe(true);
-    expect(due("10-12 * * * *", "2026-06-01T10:09:00Z", "2026-06-01T11:11:00Z")).toBe(true); // 10:10..10:12, 11:10
-    expect(due("10-12 * * * *", "2026-06-01T10:13:00Z", "2026-06-01T11:09:00Z")).toBe(false); // neither end holds a fire
-    expect(due("*/15 * * * *", "2026-06-01T10:16:00Z", "2026-06-01T10:44:00Z")).toBe(true); // 10:30
-    expect(due("*/15 * * * *", "2026-06-01T10:16:00Z", "2026-06-01T10:29:00Z")).toBe(false);
-  });
-
-  it("dayMatches: restricted dom+dow OR; a starred arm ANDs", () => {
-    // dom 13 + dow Friday restricted → fires every Friday OR the 13th
-    expect(due("0 0 13 * 5", "2026-06-04T23:00:00Z", "2026-06-05T00:30:00Z")).toBe(true); // a Friday (dow)
-    expect(due("0 0 13 * 5", "2026-06-12T23:00:00Z", "2026-06-13T00:30:00Z")).toBe(true); // the 13th (dom; a Saturday)
-    expect(due("0 0 13 * 5", "2026-06-09T23:00:00Z", "2026-06-10T00:30:00Z")).toBe(false); // Wednesday the 10th
-    // dom 1 with a starred dow → AND (dow=* matches every day, dom gates)
-    expect(due("0 0 1 * *", "2026-05-31T23:00:00Z", "2026-06-01T00:30:00Z")).toBe(true);
-    expect(due("0 0 1 * *", "2026-06-01T23:00:00Z", "2026-06-02T00:30:00Z")).toBe(false);
-  });
-
-  it("descriptors and @every (robfig descriptors.go, the stateless divergence)", () => {
-    expect(due("@hourly", "2026-06-01T06:00:00Z", "2026-06-01T07:00:00Z")).toBe(true);
-    expect(due("@daily", "2026-05-31T23:00:00Z", "2026-06-01T00:30:00Z")).toBe(true);
-    expect(due("@daily", "2026-06-01T00:30:00Z", "2026-06-01T01:30:00Z")).toBe(false);
-    expect(due("@weekly", "2026-06-06T23:00:00Z", "2026-06-07T00:30:00Z")).toBe(true); // Sunday
-    expect(due("@annually", "2026-12-31T23:00:00Z", "2027-01-01T00:30:00Z")).toBe(true);
-    expect(parseCronSpec("@every 30m")).toMatchObject({ every: true });
-    expect(cronOccurrenceInWindow(parseCronSpec("@every 30m"), 1000, 2000)).toBe(true);
-  });
-
-  it("the grammar: names, steps, ranges, leading zeros, dow 7, month boundaries", () => {
-    expect(due("0 0 1 jan *", "2026-12-31T23:00:00Z", "2027-01-01T00:30:00Z")).toBe(true);
-    expect(due("0 0 1 jan *", "2025-12-31T23:00:00Z", "2026-01-01T00:30:00Z")).toBe(true);
-    expect(due("07 * * * *", "2026-06-01T05:06:00Z", "2026-06-01T05:07:30Z")).toBe(true);
-    expect(due("0 0 ? * mon", "2026-05-31T23:00:00Z", "2026-06-01T00:30:00Z")).toBe(true); // Monday the 1st
-    // robfig's dow range caps at 6 — 7 is a parse error
-    expect(() => parseCronSpec("0 0 * * 7")).toThrow();
-    expect(() => parseCronSpec("* * * *")).toThrow(); // 4 fields
-    expect(() => parseCronSpec("60 * * * *")).toThrow(); // minute above max
-    expect(() => parseCronSpec("0 0 30 2 *")).not.toThrow(); // parses; never fires (Feb 30)
-    expect(due("0 0 30 2 *", "2026-02-01T00:00:00Z", "2027-02-01T00:00:00Z")).toBe(false);
-    expect(() => parseCronSpec("")).toThrow();
-    expect(() => parseCronSpec("@fortnightly")).toThrow();
-  });
-
-  it("the message guard narrows the producer's shape", () => {
-    expect(isActionsScheduleTriggerMessage({ kind: "actions-trigger", repoId: "r1", scheduledUnix: 5 })).toBe(true);
-    expect(isActionsScheduleTriggerMessage({ kind: "demo-sweep", repoId: "r1" })).toBe(false);
-    expect(isActionsScheduleTriggerMessage({ kind: "actions-trigger", repoId: "r1" })).toBe(false);
-    expect(isActionsScheduleTriggerMessage(null)).toBe(false);
-  });
 });

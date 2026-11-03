@@ -1,0 +1,820 @@
+/**
+ * The scheduled-workflow registry — upstream's TWO-TABLE design
+ * (SPEC-0012 §D7, the 2026-11-03 user-ruled alignment that replaced W14's
+ * stateless tick-window design). Ported from the pin fc4936884584a41931906553d96c2601d750e6ef:
+ *
+ *   - models/actions/schedule.go — the ActionSchedule row +
+ *     CreateScheduleTaskBySchedules (:42-79, insert schedule rows + one spec
+ *     row per parseable ever-occurring spec) + DeleteScheduleTaskByRepo
+ *     (:82-93) + CleanRepoScheduleTasks' delete half;
+ *   - models/actions/schedule_list.go — FindScheduleOptions
+ *     (getSchedulesByRepo's read port);
+ *   - models/actions/schedule_spec.go — ActionScheduleSpec + Parse()
+ *     (:34-46, robfig/cron v3 with the UTC default, `schedule_spec.go:22-45`)
+ *     + UpdateScheduleSpec (:48-54);
+ *   - services/actions/schedule_tasks.go — the ticker half: startTasks
+ *     (:31-59, `WHERE next > 0 AND next <= now`, one failing spec never
+ *     aborts the pass), startTask (:62-110, ADVANCE PREV/NEXT FIRST —
+ *     "a failed update cannot duplicate the run", :61 — then the schedule/
+ *     repo/archived/unit/disabled skips), CreateScheduleTaskBySpec
+ *     (:113-166, the run's verbatim fields) and withScheduleInEventPayload
+ *     (:169-206);
+ *   - services/actions/notifier_helper.go — handleSchedules' registry
+ *     replace (:586-649: default-branch only, count → delete → re-insert
+ *     from the tree, rows stamped with the Actions user + the push payload).
+ *
+ * The tree-reading half of DetectAndHandleSchedules (notifier_helper.go:654-685)
+ * lives in trigger.ts, which owns the workflow enumeration; the registry
+ * writes and the ticker live HERE. The module boundary mirrors upstream's
+ * models/services split (schedule.ts imports only the run-insert port from
+ * trigger.ts; trigger.ts imports the registry writer from here — a
+ * function-body-only cycle, the update.ts precedent).
+ *
+ * ## The recorded divergences (each SPEC §D7; nothing else deviates)
+ *
+ *   - IDs: upstream int64 repo ids → TEXT repositories.id; owner/user ids
+ *     stay INTEGER (users.id).
+ *   - Cadence floor: upstream's `start_schedule_tasks` runs @every 1m
+ *     (cron/tasks_actions.go:59); ours rides the standing 10-minute step
+ *     entry (the every-ten-minutes cron, Workers cron floor, 30 s CPU
+ *     budget — the producer is one indexed SELECT + chunked sendBatch).
+ *     Minute-resolution specs fire at most once
+ *     per scan; this REPLACES W14's recorded 60 m floor. A 1-minute entry
+ *     is a future
+ *     config knob.
+ *   - The CAS: upstream's ticker is process-exclusive, so
+ *     UpdateScheduleSpec's plain prev/next UPDATE is just bookkeeping. Our
+ *     consumers are queue deliveries — the advance UPDATE carries the read
+ *     prev/next in its WHERE (an optimistic CAS): changes=1 wins and
+ *     inserts the run, 0 rows changed loses and skips. The racy
+ *     `json_extract(event_payload,'$.schedule_unix')` check-then-insert
+ *     probe is RETIRED with it (upstream has no payload dedupe key).
+ *   - TZ=/CRON_TZ= specs honor their zone through workerd's Intl timezone
+ *     data (upstream Parse keeps the parsed location, schedule_spec.go:36-39;
+ *     no-prefix specs are forced UTC exactly upstream). DST gaps round up
+ *     through the transition (robfig's instant-stepping); DST folds take the
+ *     EARLIER occurrence — robfig's wall-walk fires a folded hour twice, we
+ *     fire it once (the §D7 micro-divergence).
+ *   - Consume-side `now`: startTask's `now` is the ticker's clock; ours is
+ *     the delivery's (the advance and its `Next(now+1m)` evaluate at consume
+ *     time; the producer's tick only selects due rows).
+ *   - The settings-change arm (services/repository/setting.go:27-40) and
+ *     CleanRepoScheduleTasks (clear_tasks.go:75) have no cf-gitea seam yet —
+ *     the registry refreshes on default-branch pushes only (the §D7 tail).
+ */
+
+import { and, asc, desc, eq, isNull, lte } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+
+import { findRepositoryById } from "../../api/services/repository";
+import { actionScheduleSpecs, actionSchedules, repoUnits } from "../../db/schema";
+import { loadRepoActionsConfig } from "./config";
+import { ellipsisDisplayString } from "./model";
+import { ACTIONS_USER_ID, insertTriggeredRunSplit } from "./trigger";
+
+// ---------------------------------------------------------------------------
+// The robfig/cron v3 grammar (models/actions/schedule_spec.go Parse +
+// parser.go/spec.go — the W14 parser carried forward with the two pieces the
+// stateless design could discard: the @every delay as REAL phase state and
+// the TZ= zone).
+// ---------------------------------------------------------------------------
+
+/**
+ * A parsed spec — SpecSchedule's five field sets plus the two star flags the
+ * dayMatches OR rule reads (parser.go:284-296: a STARRED (unstepped
+ * star-or-question-mark) dom or dow ANDs both fields; two restricted fields
+ * OR — and a stepped star clears the star bit, "if step greater than 1,
+ * extra = 0"). `every` carries the `@every <duration>` form
+ * (ConstantDelaySchedule, parser.go:430-437 → Every(), constantdelay.go:14-22:
+ * the delay truncates to whole seconds) — its DELAY is load-bearing phase
+ * state now (the spec row's next anchors it). `zone` is the TZ=/CRON_TZ=
+ * location (undefined = the forced UTC default, schedule_spec.go:41-45).
+ */
+export interface CronSchedule {
+  every: boolean;
+  /** The `@every` delay in seconds (0 unless `every`). */
+  everyDelaySeconds: number;
+  minute: boolean[]; // 0-59
+  hour: boolean[]; // 0-23
+  dom: boolean[]; // 1-31
+  domStar: boolean;
+  month: boolean[]; // 1-12
+  dow: boolean[]; // 0-6 (0 = Sunday — JS getUTCDay's own base)
+  dowStar: boolean;
+  /** The IANA zone the fields match in; undefined = UTC. */
+  zone?: string;
+}
+
+/** The robfig month/dow name tables (parser.go's monthChars/dowChars — the
+ *  three-letter, lowercase forms ParseStandard accepts; names match
+ *  case-insensitively, parseIntOrName:322-328). */
+const CRON_MONTH_NAMES: Record<string, number> = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const CRON_DOW_NAMES: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+/** The descriptor table (robfig descriptors.go), normalized to the five-field
+ *  form (upstream's six-field constants lead with the seconds 0). */
+const CRON_DESCRIPTORS: Record<string, string> = {
+  "@yearly": "0 0 1 1 *",
+  "@annually": "0 0 1 1 *",
+  "@monthly": "0 0 1 * *",
+  "@weekly": "0 0 * * 0",
+  "@daily": "0 0 * * *",
+  "@midnight": "0 0 * * *",
+  "@hourly": "0 * * * *",
+};
+
+function parseIntOrName(token: string, names: Record<string, number> | undefined): number {
+  if (names !== undefined) {
+    const named = names[token];
+    if (named !== undefined) return named;
+  }
+  // strconv.Atoi's decimal arm: leading zeros parse ("07" = 7)
+  if (!/^\d+$/.test(token)) {
+    throw new Error(`failed to parse int or name ${token}`);
+  }
+  return Number(token);
+}
+
+/** getField (parser.go:243-258): the comma-list split, each part through
+ *  getRange, the bit sets OR'd (a star part keeps the star flag). */
+function parseCronField(field: string, min: number, max: number, names: Record<string, number> | undefined, bits: boolean[]): boolean {
+  let star = false;
+  for (const expr of field.split(",")) {
+    if (parseCronRange(expr, min, max, names, bits)) star = true;
+  }
+  return star;
+}
+
+/** getRange (parser.go:260-322) over a boolean set — the errors verbatim. */
+function parseCronRange(expr: string, min: number, max: number, names: Record<string, number> | undefined, bits: boolean[]): boolean {
+  const rangeAndStep = expr.split("/");
+  if (rangeAndStep.length > 2) throw new Error(`too many slashes: ${expr}`);
+  const lowAndHigh = rangeAndStep[0]!.split("-");
+  if (lowAndHigh.length > 2) throw new Error(`too many hyphens: ${expr}`);
+  const singleDigit = lowAndHigh.length === 1;
+  let star = false;
+  let start: number;
+  let end: number;
+  if (lowAndHigh[0] === "*" || lowAndHigh[0] === "?") {
+    start = min;
+    end = max;
+    star = true;
+  } else {
+    start = parseIntOrName(lowAndHigh[0]!, names);
+    switch (lowAndHigh.length) {
+      case 1:
+        end = start;
+        break;
+      case 2:
+        end = parseIntOrName(lowAndHigh[1]!, names);
+        break;
+      default:
+        throw new Error(`too many hyphens: ${expr}`);
+    }
+  }
+  let step = 1;
+  if (rangeAndStep.length === 2) {
+    if (!/^\d+$/.test(rangeAndStep[1]!)) throw new Error(`failed to parse int: ${rangeAndStep[1]}`);
+    step = Number(rangeAndStep[1]);
+    // Special handling: "N/step" means "N-max/step".
+    if (singleDigit) end = max;
+    if (step > 1) star = false; // the starBit clear
+  }
+  if (start < min) throw new Error(`beginning of range (${start}) below minimum (${min}): ${expr}`);
+  if (end > max) throw new Error(`end of range (${end}) above maximum (${max}): ${expr}`);
+  if (start > end) throw new Error(`beginning of range (${start}) beyond end of range (${end}): ${expr}`);
+  if (step <= 0) throw new Error(`step of range should be a positive number: ${expr}`);
+  for (let v = start; v <= end; v += step) bits[v] = true;
+  return star;
+}
+
+/** time.ParseDuration's simple forms for the `@every` delay (parser.go:433's
+ *  ParseDuration): sign, decimal value, compound units (ns us µs ms s m h).
+ *  Every() truncates the result to whole seconds (constantdelay.go:17-21). */
+function parseDurationSeconds(raw: string): number {
+  let rest = raw;
+  let sign = 1;
+  if (rest.startsWith("-")) {
+    sign = -1;
+    rest = rest.slice(1);
+  } else if (rest.startsWith("+")) {
+    rest = rest.slice(1);
+  }
+  if (rest === "") throw new Error(`time: invalid duration "${raw}"`);
+  const units: Array<[string, number]> = [
+    ["ns", 1e-9],
+    ["us", 1e-6],
+    ["µs", 1e-6],
+    ["ms", 1e-3],
+    ["s", 1],
+    ["m", 60],
+    ["h", 3600],
+  ];
+  let total = 0;
+  while (rest.length > 0) {
+    const match = /^(\d+(?:\.\d*)?)/.exec(rest);
+    if (match === null) throw new Error(`time: invalid duration "${raw}"`);
+    const value = Number(match[1]!);
+    rest = rest.slice(match[1]!.length);
+    const unit = units.find(([u]) => rest.startsWith(u));
+    if (unit === undefined) {
+      throw new Error(`time: unknown unit "${rest[0] ?? ""}" in duration "${raw}"`);
+    }
+    rest = rest.slice(unit[0].length);
+    total += value * unit[1];
+  }
+  return Math.trunc(sign * total);
+}
+
+/** robfig parser.go:84-92's TZ extraction: the prefix, the first space, the
+ *  name between; a bad zone is a parse error ("provided bad location").
+ *  workerd carries the ICU tzdata, so Intl validates the IANA name. */
+function extractZone(spec: string): { zone: string; rest: string } {
+  const spaceAt = spec.indexOf(" ");
+  const eqAt = spec.indexOf("=");
+  const name = spec.slice(eqAt + 1, spaceAt === -1 ? spec.length : spaceAt);
+  try {
+    // The validation probe (time.LoadLocation's arm): an unknown zone throws.
+    new Intl.DateTimeFormat("en-US", { timeZone: name, hour12: false });
+  } catch {
+    throw new Error(`provided bad location ${name}`);
+  }
+  return { zone: name, rest: spaceAt === -1 ? "" : spec.slice(spaceAt).trim() };
+}
+
+/**
+ * cron.ParseStandard (robfig/cron v3 parser.go:84-146): the TZ prefix, the
+ * descriptor forms, else exactly five whitespace-separated fields (minute
+ * hour dom month dow — ParseStandard carries no seconds field), each through
+ * getRange. A parse failure THROWS — the registry skips the spec at
+ * insert-time (schedule.go:63-66) and the consumer skips without advancing
+ * (the same observable as upstream's per-occurrence error log).
+ */
+export function parseCronSpec(raw: string): CronSchedule {
+  if (raw.trim() === "") throw new Error("empty spec string");
+  let zone: string | undefined;
+  let spec = raw.trim();
+  // The TZ= / CRON_TZ= prefix (parser.go:84-92) — the REST of the spec is
+  // matched in that zone; without a prefix Parse() forces UTC
+  // (schedule_spec.go:41-45).
+  if (spec.startsWith("TZ=") || spec.startsWith("CRON_TZ=")) {
+    const extracted = extractZone(spec);
+    zone = extracted.zone;
+    spec = extracted.rest;
+  }
+  if (spec.startsWith("@")) {
+    const schedule: CronSchedule = {
+      every: false,
+      everyDelaySeconds: 0,
+      minute: new Array<boolean>(60).fill(false),
+      hour: new Array<boolean>(24).fill(false),
+      dom: new Array<boolean>(32).fill(false),
+      domStar: false,
+      month: new Array<boolean>(13).fill(false),
+      dow: new Array<boolean>(7).fill(false),
+      dowStar: false,
+      zone,
+    };
+    // Descriptors are case-SENSITIVE (parser.go:365's exact switch); the
+    // @every prefix likewise (:429).
+    if (spec.startsWith("@every ")) {
+      schedule.every = true;
+      schedule.everyDelaySeconds = parseDurationSeconds(spec.slice("@every ".length));
+      return schedule;
+    }
+    const mapped = CRON_DESCRIPTORS[spec];
+    if (mapped === undefined) throw new Error(`unrecognized descriptor: ${spec}`);
+    return parseCronSpec(mapped);
+  }
+  const fields = spec.split(/\s+/);
+  if (fields.length !== 5) throw new Error(`expected exactly 5 fields, found ${fields.length}: ${raw}`);
+  const schedule: CronSchedule = {
+    every: false,
+    everyDelaySeconds: 0,
+    minute: new Array<boolean>(60).fill(false),
+    hour: new Array<boolean>(24).fill(false),
+    dom: new Array<boolean>(32).fill(false),
+    domStar: false,
+    month: new Array<boolean>(13).fill(false),
+    dow: new Array<boolean>(7).fill(false),
+    dowStar: false,
+    zone,
+  };
+  parseCronField(fields[0]!, 0, 59, undefined, schedule.minute);
+  parseCronField(fields[1]!, 0, 23, undefined, schedule.hour);
+  schedule.domStar = parseCronField(fields[2]!, 1, 31, undefined, schedule.dom);
+  parseCronField(fields[3]!, 1, 12, CRON_MONTH_NAMES, schedule.month);
+  schedule.dowStar = parseCronField(fields[4]!, 0, 6, CRON_DOW_NAMES, schedule.dow);
+  return schedule;
+}
+
+/** dayMatches (spec.go:148-159) over one wall day: restricted dom+dow OR; a
+ *  starred arm ANDs. */
+function cronDayMatches(s: CronSchedule, dayOfMonth: number, dayOfWeek: number): boolean {
+  const domMatch = s.dom[dayOfMonth] === true;
+  const dowMatch = s.dow[dayOfWeek] === true;
+  if (s.domStar || s.dowStar) return domMatch && dowMatch;
+  return domMatch || dowMatch;
+}
+
+/** The UTC offset (seconds) of `zone` at the given instant. */
+function zoneOffsetSeconds(zone: string, epochSeconds: number): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(epochSeconds * 1000));
+  const get = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? "0");
+  const asUTC = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour") % 24, get("minute"), get("second")) / 1000;
+  return Math.round(asUTC - epochSeconds);
+}
+
+/**
+ * robfig's Next (spec.go:44-146 + constantdelay.go:26-29) at the minute
+ * granularity the standard grammar constrains (the seconds field is the
+ * parser's implicit 0, so Next lands on minute boundaries strictly after the
+ * given instant): the ConstantDelay arm adds the phase delay verbatim
+ * (startTask's +1m look-ahead is the CALLER's, schedule_tasks.go:69), the
+ * SpecSchedule arm jumps month → day → hour → minute in wall-calendar order
+ * with the five-year horizon (spec.go:58-60). Returns the epoch second, or
+ * null for the never-occurring spec ("0 0 30 2 *" — upstream's own example,
+ * schedule.go:69-71). UTC specs (the forced default) skip the zone
+ * materialization entirely.
+ */
+export function cronNext(s: CronSchedule, afterUnixSeconds: number): number | null {
+  if (s.every) {
+    // ConstantDelaySchedule.Next(after) = after.Add(delay) (the sub-second
+    // part was truncated at parse, constantdelay.go:26-29).
+    return Math.floor(afterUnixSeconds) + s.everyDelaySeconds;
+  }
+
+  // The wall-minute search space: UTC specs iterate true epoch minutes; a
+  // zoned spec iterates WALL minutes expressed as pseudo-epoch (wall-as-UTC),
+  // materialized back through the zone at the end.
+  const wallStart =
+    s.zone === undefined ? Math.floor(afterUnixSeconds / 60) : wallPseudoMinute(s.zone, afterUnixSeconds);
+  let candidate = wallStart + 1;
+  // The five-year horizon (spec.go:58-60: yearLimit = t.Year() + 5).
+  const capMinutes = wallStart + 5 * 366 * 24 * 60;
+
+  while (candidate <= capMinutes) {
+    const fields = wallFieldsOf(candidate);
+    const { year, month, day, hour, minute } = fields;
+    // month[] is 1-based (the parse table) over getUTCMonth's 0-based read.
+    if (s.month[month + 1] !== true) {
+      // Jump to the first minute of the next month (spec.go:65-77's month
+      // loop); the year wrap is the cap's business.
+      candidate = minuteOfWall(year, month + 1, 1, 0, 0);
+      continue;
+    }
+    if (!cronDayMatches(s, day, dowOfWall(year, month, day))) {
+      candidate = minuteOfWall(year, month, day + 1, 0, 0);
+      continue;
+    }
+    if (s.hour[hour] !== true) {
+      candidate = minuteOfWall(year, month, day, hour + 1, 0);
+      continue;
+    }
+    if (s.minute[minute] !== true) {
+      candidate += 1;
+      continue;
+    }
+    return s.zone === undefined ? candidate * 60 : materializeWall(s.zone, afterUnixSeconds, candidate);
+  }
+  return null;
+}
+
+/** The pseudo-minute of `zone`'s wall time at the given instant. */
+function wallPseudoMinute(zone: string, epochSeconds: number): number {
+  const offset = zoneOffsetSeconds(zone, epochSeconds);
+  return Math.floor((epochSeconds + offset) / 60);
+}
+
+/** Calendar reads over the pseudo-minute space (UTC arithmetic on wall
+ *  fields — the fields themselves are the zone's wall time). */
+function wallFieldsOf(pseudoMinute: number): { year: number; month: number; day: number; hour: number; minute: number } {
+  const d = new Date(pseudoMinute * 60_000);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth(), day: d.getUTCDate(), hour: d.getUTCHours(), minute: d.getUTCMinutes() };
+}
+
+function dowOfWall(year: number, month: number, day: number): number {
+  return new Date(Date.UTC(year, month, day)).getUTCDay();
+}
+
+/** The pseudo-minute of a wall field tuple; month/day overflow (the jump
+ *  targets' +1 forms) normalize like the calendar (day 32 → next month). */
+function minuteOfWall(year: number, month: number, day: number, hour: number, minute: number): number {
+  return Math.floor(Date.UTC(year, month, day, hour, minute) / 60_000);
+}
+
+/**
+ * Wall → epoch through the zone, the fold/gap arms of the §D7 record:
+ * candidate offsets are the ones live within ±24 h of the search instant;
+ * a wall time stable under one offset materializes there (a FOLD takes the
+ * EARLIER instant — min of the valid epochs; robfig's wall-walk returns the
+ * first match too); a wall time stable under NONE is a DST GAP and rounds up
+ * through the transition (wall - the smaller offset — robfig's instant
+ * stepping crosses the gap at the same wall minute).
+ */
+function materializeWall(zone: string, afterUnixSeconds: number, pseudoMinute: number): number {
+  const wallSeconds = pseudoMinute * 60;
+  const offsets = [...new Set([zoneOffsetSeconds(zone, afterUnixSeconds), zoneOffsetSeconds(zone, afterUnixSeconds - 86_400), zoneOffsetSeconds(zone, afterUnixSeconds + 86_400)])];
+  const valid: number[] = [];
+  for (const off of offsets) {
+    const epoch = wallSeconds - off;
+    if (zoneOffsetSeconds(zone, epoch) === off) valid.push(epoch);
+  }
+  if (valid.length > 0) return Math.min(...valid);
+  // The gap arm: no offset reproduces the wall time; round up through the
+  // transition (the smaller offset maps the wall minute onto the first
+  // instant after the jump — the same wall minute, one offset later).
+  return wallSeconds - Math.min(...offsets);
+}
+
+// ---------------------------------------------------------------------------
+// The queue contract (the producer/consumer split — the message carries the
+// SPEC ROW id, upstream's row-passing shape: startTasks iterates rows and
+// startTask re-reads each row's live state at consume time).
+// ---------------------------------------------------------------------------
+
+export interface ActionsScheduleTriggerMessage {
+  kind: "actions-trigger";
+  /** The action_schedule_spec row id. */
+  specId: number;
+}
+
+export function isActionsScheduleTriggerMessage(value: unknown): value is ActionsScheduleTriggerMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as ActionsScheduleTriggerMessage).kind === "actions-trigger" &&
+    typeof (value as ActionsScheduleTriggerMessage).specId === "number"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The registry (models/actions/schedule.go + notifier_helper.go handleSchedules)
+// ---------------------------------------------------------------------------
+
+/** One detected schedule workflow — the handleSchedules input (upstream's
+ *  DetectedWorkflow reduced to what the registry stores). */
+export interface DetectedScheduleWorkflow {
+  /** The dir-relative entry name (the run/workflow identity). */
+  entryName: string;
+  /** The workflow source stored on the row (the consume-time run content). */
+  content: string;
+  /** The cron strings (OnSchedule, actionslib model/workflow.go:90-102 — the
+   *  cron-keyed entries only). */
+  specs: string[];
+}
+
+/** The registration context (upstream's notifyInput + commit, reduced). */
+export interface ScheduleRegistryContext {
+  repoId: string;
+  ownerId: number;
+  /** The full ref (the default branch). */
+  ref: string;
+  /** The tip commit the registry is built from. */
+  commitSha: string;
+  /** commit.MessageTitle() (notifier_helper.go:634 — the run title source). */
+  commitTitle: string;
+  /** The registration event ("push" on the push seam — schedule_tasks.go:132
+   *  hands it verbatim to every run). */
+  event: string;
+  /** The event payload captured at registration (the push payload the runs
+   *  merge `schedule` into at consume time, schedule_tasks.go:169-206). */
+  eventPayload: string;
+}
+
+export type ScheduleSpecRow = typeof actionScheduleSpecs.$inferSelect;
+export type ScheduleRow = typeof actionSchedules.$inferSelect;
+
+/**
+ * handleSchedules (notifier_helper.go:586-649): the registry REPLACE — if
+ * rows exist, `DeleteScheduleTaskByRepo` first ("replacing the schedules
+ * leaves their in-progress runs alone, as GitHub does", :601-607), then one
+ * schedule row per detected workflow through `createScheduleTaskBySchedules`
+ * (specs that fail parse or never occur simply register no spec row,
+ * schedule.go:63-71). Returns the number of schedule rows created. The
+ * caller owns the default-branch gate and the tree detection (trigger.ts's
+ * DetectAndHandleSchedules half).
+ */
+export async function handleSchedules(d1: D1Database, ctx: ScheduleRegistryContext, detected: DetectedScheduleWorkflow[]): Promise<number> {
+  // The count gate precedes the replace (:598-607) — and the empty
+  // detection (:609-612) returns only AFTER that delete: a push removing the
+  // last schedule workflow empties the registry.
+  if (await hasAnySchedule(d1, ctx.repoId)) {
+    await deleteScheduleTaskByRepo(d1, ctx.repoId);
+  }
+  if (detected.length === 0) return 0;
+  return createScheduleTaskBySchedules(d1, ctx, detected);
+}
+
+/** handleSchedules' count (db.Count over FindScheduleOptions, :598). */
+async function hasAnySchedule(d1: D1Database, repoId: string): Promise<boolean> {
+  const rows = await drizzle(d1)
+    .select({ id: actionSchedules.id })
+    .from(actionSchedules)
+    .where(eq(actionSchedules.repoId, repoId))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/**
+ * CreateScheduleTaskBySchedules (schedule.go:42-79): one schedule row per
+ * workflow (Title ellipsized to 255 at insert, :50), then one spec row per
+ * cron spec — parse failures skip (:63-66), specs that can never occur
+ * (`next.IsZero()`, the five-year horizon) skip (:69-71), the rest store
+ * Next = cron.Next(registration instant) with Prev unset (never processed).
+ * Returns the schedule rows created.
+ */
+export async function createScheduleTaskBySchedules(d1: D1Database, ctx: ScheduleRegistryContext, detected: DetectedScheduleWorkflow[]): Promise<number> {
+  if (detected.length === 0) return 0;
+  const db = drizzle(d1);
+  const now = new Date();
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  let created = 0;
+  for (const wf of detected) {
+    const inserted = await db
+      .insert(actionSchedules)
+      .values({
+        // util.EllipsisDisplayString(row.Title, 255) (schedule.go:50)
+        title: ellipsisDisplayString(ctx.commitTitle, 255),
+        specs: JSON.stringify(wf.specs),
+        repoId: ctx.repoId,
+        ownerId: ctx.ownerId,
+        workflowId: wf.entryName,
+        // user_model.ActionsUserID (notifier_helper.go:635)
+        triggerUserId: ACTIONS_USER_ID,
+        ref: ctx.ref,
+        commitSha: ctx.commitSha,
+        event: ctx.event,
+        eventPayload: ctx.eventPayload,
+        content: wf.content,
+        created: now,
+        updated: now,
+      })
+      .returning({ id: actionSchedules.id });
+    const scheduleId = inserted[0]?.id;
+    if (scheduleId === undefined) throw new Error("actions: schedule insert returned no row");
+    created += 1;
+    for (const specText of wf.specs) {
+      let next: number | null;
+      try {
+        next = cronNext(parseCronSpec(specText), nowSeconds);
+      } catch {
+        continue; // schedule.go:63-66 — a parse-failing spec registers no row
+      }
+      if (next === null) continue; // schedule.go:69-71 — the never-occurring skip
+      await db.insert(actionScheduleSpecs).values({
+        repoId: ctx.repoId,
+        scheduleId,
+        spec: specText,
+        next: new Date(next * 1000),
+        prev: null,
+        created: now,
+        updated: now,
+      });
+    }
+  }
+  return created;
+}
+
+/**
+ * DeleteScheduleTaskByRepo (schedule.go:82-93): the specs first, then the
+ * schedules (upstream's own order; nothing reads one without the other).
+ */
+export async function deleteScheduleTaskByRepo(d1: D1Database, repoId: string): Promise<void> {
+  const db = drizzle(d1);
+  await db.delete(actionScheduleSpecs).where(eq(actionScheduleSpecs.repoId, repoId));
+  await db.delete(actionSchedules).where(eq(actionSchedules.repoId, repoId));
+}
+
+/**
+ * The FindScheduleOptions port (models/actions/schedule_list.go:14-35): the
+ * repo/owner filter and upstream's `id DESC` order (ToOrders, :32-34). At
+ * the pin the only consumer is handleSchedules' count — this is the read
+ * port for the future UI/API family.
+ */
+export async function getSchedulesByRepo(d1: D1Database, repoId: string, opts: { ownerId?: number } = {}): Promise<ScheduleRow[]> {
+  const db = drizzle(d1);
+  const conditions = [eq(actionSchedules.repoId, repoId)];
+  if (opts.ownerId !== undefined) conditions.push(eq(actionSchedules.ownerId, opts.ownerId));
+  return db
+    .select()
+    .from(actionSchedules)
+    .where(and(...conditions))
+    .orderBy(desc(actionSchedules.id));
+}
+
+// ---------------------------------------------------------------------------
+// The ticker half (services/actions/schedule_tasks.go over the queue split)
+// ---------------------------------------------------------------------------
+
+/**
+ * The producer's SELECT (startTasks' iterate predicate, schedule_tasks.go:38-40:
+ * `next > 0 AND next <= now` — the NULL rows (never-scheduled) drop out of
+ * the SQLite comparison exactly as the 0-sentinel drops out of upstream's
+ * builder.Gt). Ordered by id for a stable scan.
+ */
+export async function dueScheduleSpecIds(d1: D1Database, nowUnixSeconds: number): Promise<number[]> {
+  const db = drizzle(d1);
+  const rows = await db
+    .select({ id: actionScheduleSpecs.id })
+    .from(actionScheduleSpecs)
+    .where(lte(actionScheduleSpecs.next, new Date(nowUnixSeconds * 1000)))
+    .orderBy(asc(actionScheduleSpecs.id));
+  return rows.map((row) => row.id);
+}
+
+/**
+ * startTask's advance (schedule_tasks.go:66-72 + UpdateScheduleSpec,
+ * schedule_spec.go:48-54) with the §D7 CAS: the UPDATE carries the READ
+ * prev/next in its WHERE, so of two concurrent deliveries only one reports
+ * changes=1 — the winner proceeds to the run insert, the loser skips. True
+ * = this delivery owns the occurrence.
+ */
+export async function advanceScheduleSpecCAS(d1: D1Database, spec: ScheduleSpecRow, newNextUnixSeconds: number): Promise<boolean> {
+  const db = drizzle(d1);
+  const prevCondition =
+    spec.prev === null ? isNull(actionScheduleSpecs.prev) : eq(actionScheduleSpecs.prev, spec.prev);
+  // The producer only selects non-NULL next rows, but the type keeps the
+  // column's full shape — the NULL arm never fires and never matches.
+  const nextCondition =
+    spec.next === null ? isNull(actionScheduleSpecs.next) : eq(actionScheduleSpecs.next, spec.next);
+  const result = await db
+    .update(actionScheduleSpecs)
+    .set({ prev: spec.next, next: new Date(newNextUnixSeconds * 1000), updated: new Date() })
+    .where(and(eq(actionScheduleSpecs.id, spec.id), prevCondition, nextCondition));
+  return (result.meta.changes ?? 0) > 0;
+}
+
+/**
+ * The consumer arm (startTasks/startTask/CreateScheduleTaskBySpec over one
+ * queue delivery — upstream's row-passing shape): one message = one spec
+ * row = at most one run. The advance happens FIRST (a failing update cannot
+ * duplicate the run, :61; our CAS makes a duplicate delivery lose), then the
+ * skips — schedule gone, repo gone, archived (:74-99), the unit gate and the
+ * disabled-workflow list (:101-125) — then the run insert through the SAME
+ * PrepareRunAndInsert port the push family uses with CreateScheduleTaskBySpec's
+ * verbatim fields (Event from the registration, TriggerEvent "schedule",
+ * ScheduleID set, the workflow content from REGISTRATION time — upstream's
+ * stale-content FIXME, :160). A parse-failing spec, a static-invalid
+ * workflow and a failed insert log and consume the occurrence (the spec row
+ * already advanced; :42-46's own one-failing-spec posture); only a SYSTEMIC
+ * failure (the reads or the advance throwing) propagates for the queue's
+ * retry, which the CAS absorbs idempotently. Returns 1 when a run was
+ * inserted, 0 otherwise.
+ */
+export async function handleActionsScheduleTrigger(env: ActionsScheduleConsumerEnv, message: ActionsScheduleTriggerMessage): Promise<number> {
+  const { d1 } = env;
+  const specRow = await getScheduleSpecById(d1, message.specId);
+  if (specRow === null) return 0; // schedule_tasks.go:74-78's own gone-row skip
+
+  const nowSeconds = Math.floor(new Date().getTime() / 1000);
+  // The producer's predicate re-checked at consume (startTasks'
+  // `next <= now`, :38-40): a redelivery of an already-consumed occurrence
+  // arrives with the row's next advanced INTO THE FUTURE — not due, skip.
+  // (Upstream never sees such a row — its ticker selects due rows only; our
+  // queue arm re-applies the gate so the CAS's exactly-once covers the
+  // sequential redelivery too, not just the concurrent twin.)
+  if (specRow.next === null || specRow.next.getTime() / 1000 > nowSeconds) return 0;
+
+  let cronSchedule: CronSchedule;
+  let newNext: number | null;
+  try {
+    cronSchedule = parseCronSpec(specRow.spec);
+    // startTask's +1m look-ahead (:69 — Next(now.Add(time.Minute))).
+    newNext = cronNext(cronSchedule, nowSeconds + 60);
+  } catch (err) {
+    // A spec that parsed at registration but fails now: log and leave the
+    // row due — upstream reports it on every occurrence (:42-46).
+    console.error(`[actions-schedule] spec ${specRow.id}: parse "${specRow.spec}" failed: ${err instanceof Error ? err.message : String(err)}`);
+    return 0;
+  }
+  if (newNext === null) {
+    // A spec whose next-occurrence search hit the five-year horizon — the
+    // advance has nowhere to go; park it far out so the producer stops
+    // selecting it (upstream's Next.IsZero() arm zeroes the search — the
+    // row-equivalent of the never-occurring skip, schedule.go:69-71).
+    await advanceScheduleSpecCAS(d1, specRow, nowSeconds + 10 * 366 * 24 * 3600);
+    return 0;
+  }
+
+  // THE F7 FIX: advance before insert; a concurrent delivery of the same
+  // occurrence loses the CAS and skips.
+  const won = await advanceScheduleSpecCAS(d1, specRow, newNext);
+  if (!won) return 0;
+
+  // schedule_tasks.go:74-99 — a spec whose schedule or repo row is gone is
+  // skipped silently (the advance already happened, exactly upstream).
+  const scheduleRow = await getScheduleById(d1, specRow.scheduleId);
+  if (scheduleRow === null) return 0;
+  const repo = await findRepositoryById(d1, scheduleRow.repoId);
+  if (repo === null) return 0;
+  // Only archived repos are skipped (:97-99 — mirrors keep their schedules).
+  if (repo.repo.isArchived) return 0;
+  // The unit gate (:101-121).
+  if (!(await repoActionsUnitEnabled(d1, repo.repo.id))) return 0;
+  // The disabled-workflow list (:122-125) — the bare entry name space.
+  const cfg = await loadRepoActionsConfig(d1, repo.repo.id);
+  if (cfg.disabledWorkflows.includes(scheduleRow.workflowId)) return 0;
+
+  try {
+    // CreateScheduleTaskBySpec (:113-166): the payload merge
+    // (withScheduleInEventPayload, :169-206 — the `schedule` key into the
+    // registration payload; the repository/sender objects upstream merges
+    // are served by buildGithubContext's dedicated reads on our side) and
+    // the run's verbatim field set.
+    const eventPayloadJson = withScheduleInEventPayload(scheduleRow.eventPayload, specRow.spec);
+    await insertTriggeredRunSplit(
+      d1,
+      {
+        repoId: scheduleRow.repoId,
+        ownerId: scheduleRow.ownerId,
+        workflowId: scheduleRow.workflowId,
+        triggerUserId: scheduleRow.triggerUserId,
+        ref: scheduleRow.ref,
+        commitSha: scheduleRow.commitSha,
+        isForkPullRequest: false,
+        event: scheduleRow.event,
+        eventPayloadJson,
+        triggerEvent: "schedule",
+        scheduleId: scheduleRow.id,
+        title: scheduleRow.title,
+        repoOwnerNamespace: repo.repo.ownerNamespace,
+        repoSlug: repo.repo.slug,
+        appUrl: env.appUrl,
+      },
+      scheduleRow.content,
+    );
+    return 1;
+  } catch (err) {
+    // The occurrence is consumed (the spec advanced); the push path's
+    // failed-run arm belongs to pushes (:148-156 returns the error into
+    // startTasks' log-and-count).
+    console.error(
+      `[actions-schedule] ${repo.repo.ownerNamespace}/${repo.repo.slug}: run for spec ${specRow.id} (${scheduleRow.workflowId}) failed: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return 0;
+  }
+}
+
+/** withScheduleInEventPayload (schedule_tasks.go:169-206): merge the
+ *  `schedule` key into the registration payload; a nil/empty/unparseable
+ *  stored payload starts from a fresh map so the key still lands. */
+export function withScheduleInEventPayload(eventPayload: string, spec: string): string {
+  if (spec === "") return eventPayload;
+  let event: Record<string, unknown>;
+  if (eventPayload !== "") {
+    try {
+      const parsed: unknown = JSON.parse(eventPayload);
+      event = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      event = {};
+    }
+  } else {
+    event = {};
+  }
+  event["schedule"] = spec;
+  return JSON.stringify(event);
+}
+
+/** The read ports (startTask's GetByID loads, :74-84). */
+export async function getScheduleSpecById(d1: D1Database, id: number): Promise<ScheduleSpecRow | null> {
+  const db = drizzle(d1);
+  const rows = await db.select().from(actionScheduleSpecs).where(eq(actionScheduleSpecs.id, id)).limit(1);
+  return rows[0] ?? null;
+}
+
+export async function getScheduleById(d1: D1Database, id: number): Promise<ScheduleRow | null> {
+  const db = drizzle(d1);
+  const rows = await db.select().from(actionSchedules).where(eq(actionSchedules.id, id)).limit(1);
+  return rows[0] ?? null;
+}
+
+/** The consumer's env slice (the d1 + the app-url base the github context
+ *  needs; the REPO binding is NOT touched — the run content comes from the
+ *  registration row). */
+export interface ActionsScheduleConsumerEnv {
+  d1: D1Database;
+  appUrl: string;
+}
+
+/** The unit gate's readback (notifier_helper.go:162-166 → UnitEnabled): the
+ *  repo_units actions row's existence — one indexed probe, kept local so the
+ *  consumer pulls no push-family internals in. */
+async function repoActionsUnitEnabled(d1: D1Database, repoId: string): Promise<boolean> {
+  const rows = await drizzle(d1)
+    .select({ repoId: repoUnits.repoId })
+    .from(repoUnits)
+    .where(and(eq(repoUnits.repoId, repoId), eq(repoUnits.type, "actions")))
+    .limit(1);
+  return rows.length > 0;
+}

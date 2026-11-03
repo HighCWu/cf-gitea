@@ -3904,8 +3904,8 @@ export const systemNotices = sqliteTable(
 // runner_token,run,run_job,run_attempt,task,task_step,task_output,
 // tasks_version,artifact,run_job_summary}.go; action_log_chunks is OUR DBFS
 // analog, §4.3 — upstream scopes its log chunks inside the generic `dbfs`
-// table). The schedule pair (action_schedules + action_schedule_specs) is
-// deferred to the scheduled-workflows milestone (SPEC §1.4 — no reader);
+// table). The schedule pair (action_schedule + action_schedule_spec)
+// LANDED with the two-table registry (SPEC §D7, migration 0062);
 // `secrets` + `action_variables` + `commit_statuses` already exist and are
 // shared, not re-created.
 //
@@ -4455,6 +4455,95 @@ export const actionLogChunks = sqliteTable(
   (t) => [
     uniqueIndex("action_log_chunks_task_seq_uq").on(t.taskId, t.seq),
     index("action_log_chunks_task_id_idx").on(t.taskId),
+  ],
+);
+
+/**
+ * The scheduled-workflow registry (SPEC-0012 §D7 — the column-for-column port
+ * of upstream's two-table design, migration 0062): `ActionSchedule`
+ * (models/actions/schedule.go:20-36 — one row per workflow file carrying
+ * `on: schedule`, re-created wholesale on every default-branch push that
+ * changes the registry, notifier_helper.go:601-615) and `ActionScheduleSpec`
+ * (models/actions/schedule_spec.go:15-28 — one row per cron spec, the
+ * producer's SELECT surface via `next`). The house adaptations ride the
+ * §4.1 census conventions: `repo_id` is TEXT, `owner_id` stays INTEGER,
+ * `next`/`prev` are nullable with NULL = never (upstream's zero TimeStamp
+ * sentinel — SQLite's NULL-comparison semantics exclude unscheduled rows
+ * from the producer's `next <= now` predicate exactly as upstream's
+ * `builder.Gt{next: 0}` excludes the 0 sentinel), and the LONGTEXT/LONGBLOB
+ * payloads land as TEXT (the workflow source is UTF-8 text).
+ */
+export const actionSchedules = sqliteTable(
+  "action_schedule",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The run title the schedule's runs inherit (upstream ellipsizes to 255
+     *  runes at insert, schedule.go:50 — the run insert ellipsizes again). */
+    title: text("title").notNull().default(""),
+    /** Write-only parity column (upstream `Specs []string`, schedule.go:24):
+     *  the cron list at registration, JSON — the spec ROWS carry the live
+     *  copies; nothing reads this back at the pin. */
+    specs: text("specs").notNull().default("[]"),
+    /** TEXT repositories.id (upstream `RepoID int64 xorm:"index"`). */
+    repoId: text("repo_id").notNull(),
+    /** users.id (upstream `OwnerID int64 xorm:"index"`). */
+    ownerId: integer("owner_id").notNull(),
+    /** The workflow entry name (dir-relative path). */
+    workflowId: text("workflow_id").notNull().default(""),
+    /** users.id — always the Actions user at registration
+     *  (notifier_helper.go:635, user_model.ActionsUserID). */
+    triggerUserId: integer("trigger_user_id").notNull().default(0),
+    /** The registration ref (the default branch's full ref). */
+    ref: text("ref").notNull().default(""),
+    /** The tip commit the registry was built from. */
+    commitSha: text("commit_sha").notNull().default(""),
+    /** The registration event (upstream `webhook_module.HookEventType` — the
+     *  push family stores "push"; the schedule runs inherit it verbatim,
+     *  schedule_tasks.go:132 `Event: cron.Event`). */
+    event: text("event").notNull().default(""),
+    /** The push payload captured at registration (LONGTEXT). */
+    eventPayload: text("event_payload").notNull().default(""),
+    /** The workflow source at registration (LONGBLOB) — the consume-time
+     *  run content (upstream's stale-content FIXME, schedule_tasks.go:160). */
+    content: text("content").notNull().default(""),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream `RepoID int64 xorm:"index"` + `OwnerID int64 xorm:"index"`.
+    index("action_schedule_repo_id_idx").on(t.repoId),
+    index("action_schedule_owner_id_idx").on(t.ownerId),
+  ],
+);
+
+export const actionScheduleSpecs = sqliteTable(
+  "action_schedule_spec",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** TEXT repositories.id (upstream `RepoID int64 xorm:"index"`). */
+    repoId: text("repo_id").notNull(),
+    /** The parent schedule row (upstream `ScheduleID int64 xorm:"index"`). */
+    scheduleId: integer("schedule_id").notNull(),
+    /** Next fire (unix seconds; upstream `Next timeutil.TimeStamp
+     *  xorm:"index"`) — NULL = never (unsatisfiable specs are dropped at
+     *  registration, schedule.go:69-71; NULL persists only until the row is
+     *  consumed or re-registered). */
+    next: integer("next", { mode: "timestamp" }),
+    /** The occurrence this spec was last processed for (upstream `Prev`) —
+     *  NULL = never processed. The advance CAS reads it. */
+    prev: integer("prev", { mode: "timestamp" }),
+    /** The verbatim cron string (TZ= prefixes ride verbatim — the consumer
+     *  re-parses the row each delivery, schedule_tasks.go:64). */
+    spec: text("spec").notNull().default(""),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream `RepoID xorm:"index"` + `ScheduleID xorm:"index"` +
+    // `Next xorm:"index"` (the producer's predicate).
+    index("action_schedule_spec_repo_id_idx").on(t.repoId),
+    index("action_schedule_spec_schedule_id_idx").on(t.scheduleId),
+    index("action_schedule_spec_next_idx").on(t.next),
   ],
 );
 

@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "afb998ef-ca1a-405f-ac0c-434dce462662",
-  "prevId": "03bf22bc-6185-4acd-8189-620e88a5a6b3",
+  "id": "1271f873-5f18-4ea3-ae98-dd6848b1f2b5",
+  "prevId": "bc049c30-3e5c-44b6-85cc-3a6aae96c9ce",
   "tables": {
     "action_artifacts": {
       "name": "action_artifacts",
@@ -1467,8 +1467,8 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "action_schedule_specs": {
-      "name": "action_schedule_specs",
+    "action_schedule_spec": {
+      "name": "action_schedule_spec",
       "columns": {
         "id": {
           "name": "id",
@@ -1529,22 +1529,22 @@
         }
       },
       "indexes": {
-        "action_schedule_specs_repo_id_idx": {
-          "name": "action_schedule_specs_repo_id_idx",
+        "action_schedule_spec_repo_id_idx": {
+          "name": "action_schedule_spec_repo_id_idx",
           "columns": [
             "repo_id"
           ],
           "isUnique": false
         },
-        "action_schedule_specs_schedule_id_idx": {
-          "name": "action_schedule_specs_schedule_id_idx",
+        "action_schedule_spec_schedule_id_idx": {
+          "name": "action_schedule_spec_schedule_id_idx",
           "columns": [
             "schedule_id"
           ],
           "isUnique": false
         },
-        "action_schedule_specs_next_idx": {
-          "name": "action_schedule_specs_next_idx",
+        "action_schedule_spec_next_idx": {
+          "name": "action_schedule_spec_next_idx",
           "columns": [
             "next"
           ],
@@ -1556,8 +1556,8 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "action_schedules": {
-      "name": "action_schedules",
+    "action_schedule": {
+      "name": "action_schedule",
       "columns": {
         "id": {
           "name": "id",
@@ -1668,15 +1668,15 @@
         }
       },
       "indexes": {
-        "action_schedules_repo_id_idx": {
-          "name": "action_schedules_repo_id_idx",
+        "action_schedule_repo_id_idx": {
+          "name": "action_schedule_repo_id_idx",
           "columns": [
             "repo_id"
           ],
           "isUnique": false
         },
-        "action_schedules_owner_id_idx": {
-          "name": "action_schedules_owner_id_idx",
+        "action_schedule_owner_id_idx": {
+          "name": "action_schedule_owner_id_idx",
           "columns": [
             "owner_id"
           ],

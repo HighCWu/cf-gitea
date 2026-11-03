@@ -103,10 +103,11 @@ upstream's own suites exercise the protocol.
 - **The managed runner** (§1.2) — product question, no milestone.
 - **Marketplace/action hosting** beyond documenting that runners fetch `uses:`
   actions from GitHub by default (`modules/setting/actions.go:50,76-88`).
-- **Scheduled (`on: schedule`) workflows** — the `action_schedule` +
-  `action_schedule_spec` tables and the cron machinery
-  (`services/actions/schedule_tasks.go`, 195 lines) stage as an M3 follow-up
-  riding our existing cron entries; not in M1/M3's first cut.
+- **Scheduled (`on: schedule`) workflows** — LANDED (superseded): W14's
+  stateless tick-window design shipped first and was replaced by upstream's
+  two-table registry in the 2026-11-03 user-ruled alignment wave — the
+  as-built record is §D7 below (the tables, the producer/consumer rework,
+  the CAS serialization, and the recorded platform divergences).
 - **Scoped workflows** (`modules/actions/scoped_workflows.go`,
   `action_scoped_workflow_source` table) and **reusable-workflow call expansion**
   (`services/actions/reusable_workflow.go`, 562 lines) — v2; the schema columns
@@ -500,8 +501,12 @@ tables below (the schedule pair is deferred, §1.4); two already exist:
   `id` pk; `task_id` idx; `seq` int (append order); `bytes` BLOB.
   UNIQUE(`task_id`, `seq`) guards the append order; rows are deleted when the
   log seals to R2.
-- **`action_schedule_specs`** / **`action_schedules`** — deferred to the
-  scheduled-workflows milestone (§1.4); NOT in the M1a migration (no reader).
+- **`action_schedule`** / **`action_schedule_spec`** — LANDED (migration
+  0062, §D7): the column-for-column port of `ActionSchedule`
+  (`models/actions/schedule.go:20-36`) and `ActionScheduleSpec`
+  (`models/actions/schedule_spec.go:15-28`), with the house id adaptations
+  (`repo_id` TEXT, `next`/`prev` nullable with NULL = never) and the
+  xorm-tag indexes mirrored.
 - **Already exist** (verified `apps/worker/src/db/schema.ts`): `secrets`
   (`schema.ts:2292` — upstream-parity columns incl. the owner/repo scope
   encoding and the documented plaintext divergence) and `action_variables`
@@ -1307,3 +1312,148 @@ call-sites in `cf-gitea:apps/worker/src/services/actions/trigger.ts`:
   already notes this), not the evaluator.
 - The `[skip ci]` arm, cycle break, and commit statuses are **P-tier** with
   zero expression dependencies — no OQ-1 residue attaches to them.
+
+### D7. As-built — the scheduled-workflows registry (the two-table alignment, 2026-11-03)
+
+The user-ruled upstream alignment ("对齐 gitea，除平台实在做不到的") replaced
+W14's stateless schedule design (v1.5.3's hourly tree-scan producer + the
+run-payload `schedule_unix` dedupe probe) with upstream's TWO-TABLE registry,
+crossing the migration threshold the F7 recording had gated on
+(`docs/RELEASE-NOTES-v1.5.5.md` §4). Everything derives from the pin
+`fc493688`; the stateless arms are retired with their racy probe.
+
+**Upstream surface (file:line at the pin → our port home):**
+
+| Upstream | What | Ours |
+| --- | --- | --- |
+| `models/actions/schedule.go:20-36` | `ActionSchedule` (one row per workflow carrying `on:schedule`) | `action_schedule` (schema.ts, migration 0062 — the singular upstream RegisterModel names, ADR-0007) |
+| `models/actions/schedule.go:42-79` | `CreateScheduleTaskBySchedules` — insert schedule rows + one spec row per parseable, ever-occurring spec (`Next = schedule.Next(now)`; the never-occurring skip `0 0 30 2 *`, `schedule_spec.go:110`'s own example) | `createScheduleTaskBySchedules` (`services/actions/schedule.ts`) |
+| `models/actions/schedule.go:82-93` | `DeleteScheduleTaskByRepo` | `deleteScheduleTaskByRepo` |
+| `models/actions/schedule_list.go:14-35` | `FindScheduleOptions` (repo/owner filter, `id DESC` order) | `getSchedulesByRepo` |
+| `models/actions/schedule_spec.go:15-28` | `ActionScheduleSpec` (one row per cron spec; `Next` idx, `Prev` = the occurrence last processed) | `action_schedule_spec` |
+| `models/actions/schedule_spec.go:34-46` | `Parse()` — robfig v3, **UTC default** (`schedule_spec.go:22-45` forces `Location = time.UTC` when the spec carries no `TZ=`/`CRON_TZ=` prefix) | `parseCronSpec` (moved from trigger.ts) + `cronNext` (robfig `SpecSchedule.Next`, spec.go:44-146, minute granularity + `ConstantDelaySchedule.Next`, constantdelay.go:26-29) |
+| `models/actions/schedule_spec.go:48-54` | `UpdateScheduleSpec(spec, cols...)` | `advanceScheduleSpecCAS` (see the CAS note below) |
+| `services/actions/notifier_helper.go:141-155` | `notify`'s schedule arm: `shouldDetectSchedules = push ∧ default branch`; the **Actions-user doer runs ONLY the schedule refresh** (the cycle break's own carve-out) | trigger.ts `handleActionsPushEvent` + `detectAndHandleSchedules` |
+| `services/actions/notifier_helper.go:586-649` | `handleSchedules` — default-branch only; **count → `DeleteScheduleTaskByRepo` → re-insert from the tree** (a full replace; "replacing the schedules leaves their in-progress runs alone, as GitHub does", `:601-607`); rows carry title = `commit.MessageTitle()`, TriggerUserID = the Actions user, the push payload, the workflow content | `handleSchedules` (schedule.ts) — the trigger.ts tree half feeds it detected workflows |
+| `services/actions/notifier_helper.go:654-685` | `DetectAndHandleSchedules` — empty/archived skips, default-branch commit, `DetectScheduledWorkflows` | trigger.ts `detectAndHandleSchedules` (our tree readers already live there) |
+| `services/actions/notifier_helper.go:198-211` + `:280-282` | the refresh rides `notify`'s own order: AFTER `[skip ci]`, BEFORE `handleInvalidWorkflows`/`handleWorkflows` | the call sits at that exact position in triggerForEvent |
+| `services/actions/schedule_tasks.go:31-59` | `startTasks` — iterate specs `WHERE next > 0 AND next <= now`; one failing spec never aborts the pass | the */10 producer's SELECT (see the cadence note) + per-message consumer |
+| `services/actions/schedule_tasks.go:62-110` | `startTask` — **advance `Prev=Next; Next=cron.Next(now+1m)` and UPDATE FIRST** ("a failed update cannot duplicate the run", `:61`), THEN schedule/repo loads (gone → silent skip), archived skip, unit gate, disabled-workflow skip | `runDueScheduleSpec` (schedule.ts) — the consumer behind `handleActionsScheduleTrigger` |
+| `services/actions/schedule_tasks.go:113-166` | `CreateScheduleTaskBySpec` — merge `schedule` into the stored payload (`withScheduleInEventPayload`, `:169-206`); the run: `Event: cron.Event`, `TriggerEvent: HookEventSchedule`, `ScheduleID: cron.ID`, `WorkflowRepoID/CommitSHA` = the registration's | the `insertTriggeredRunSplit` call in `runDueScheduleSpec` (scheduleId rides `TriggeredRunInput`) |
+| `services/cron/tasks_actions.go:55-67` | `start_schedule_tasks` — **@every 1m**, enabled default, RunAtStart false | the */10 step entry's `actions-schedule-scan` producer block (see the cadence note) |
+| `services/repository/delete.go:191-192` | the delete cascade sweeps both tables | repos/service.ts's delete batch (two lines) |
+
+**Data model (migration 0062, drizzle-kit generated):** column-for-column
+with the house adaptations — `repo_id` TEXT (the repositories.id UUID),
+`owner_id` INTEGER (users.id), `specs` JSON TEXT (upstream's `[]string`
+column, write-only parity), `event_payload` TEXT (LONGTEXT), `content` TEXT
+(LONGBLOB — the workflow source); the timestamp columns are `created`/
+`updated` (unix-seconds INTEGER) — the §4.1 actions-family convention, which
+matches upstream's own actions tables (every other family in this repo
+carries `created_unix`/`updated_unix`; the actions census keeps upstream's
+shorter spelling);
+`next`/`prev` nullable with **NULL = never** (the house TimeStamp-sentinel
+rule; upstream's `xorm:"index"` on Next is mirrored). The producer's
+predicate `next <= now` excludes NULL rows in SQLite exactly as upstream's
+`builder.Gt{next: 0}` excludes the zero sentinel.
+
+**The CAS serialization (the F7 fix, disclosed):** upstream's ticker is a
+single in-process cron, so `UpdateScheduleSpec`'s plain prev/next UPDATE
+relies on process exclusivity. Our consumers are queue deliveries — the same
+spec message can redeliver — so the advance UPDATE carries the read
+prev/next in its WHERE (an optimistic CAS): the winner's UPDATE reports
+changes=1 and proceeds to the run insert; a concurrent delivery's UPDATE
+reports 0 rows changed and the delivery SKIPS the run. This is
+startTask's advance-before-insert with the row UPDATE promoted from
+bookkeeping to the serialization point — the racy `json_extract` check-
+then-insert probe is RETIRED with it (upstream has no payload dedupe key).
+
+**Producer/consumer cadence (the platform divergences, each recorded):**
+
+1. **The 1m → 10m floor.** Upstream's `start_schedule_tasks` runs `@every
+   1m` (`tasks_actions.go:59`); Workers cron entries floor at the standing
+   */10 step entry (30 s CPU budget; the producer is one indexed SELECT +
+   chunked sendBatch). Consequence: minute-resolution and sub-10-minute
+   specs (`* * * * *`, `*/5`, `@every 5m`) fire at most once per scan —
+   upstream fires each occurrence. This REPLACES W14's recorded 60 m floor.
+   `*/1` remains a future config knob (the consumer/advance semantics need
+   no change).
+2. **Skip-between-scans.** Upstream's per-minute ticker never misses an
+   occurrence (`Next(now+1m)` always lands before the next tick for
+   minute-grained specs). At the 10 m cadence, occurrences falling between
+   two scans are consumed as ONE run on the following scan (the advance
+   jumps `Next` past them) — upstream's own shape when its ticker is
+   stopped longer than a spec's period; surfaced by the same
+   one-run-per-advance mechanism.
+3. **Consume-side `now`.** `startTask`'s `now` is the ticker's; ours is the
+   consumer delivery's clock (the advance's `Next(now+1m)` and the CAS are
+   evaluated at consume time). The producer's tick only selects due rows.
+
+**Registry maintenance (the push seam):** the refresh rides the EXISTING
+push trigger chain — triggerForEvent calls `detectAndHandleSchedules` at
+upstream's exact notify position (after `[skip ci]`, before the invalid/
+matched arms) for `push` events on the default branch, including the
+Actions-user carve-out (`notifier_helper.go:141-155`: an Actions-user
+default-branch push refreshes the registry and triggers nothing else — the
+arm W14's early-return cycle break never reached). No separate tree scan
+exists anymore; W14's producer read the tree per tick and is retired with
+the registry holding the parsed specs.
+
+**Edge cases and failure modes (all upstream-verbatim):**
+
+- A parse-failing spec never registers (`CreateScheduleTaskBySchedules`'s
+  per-spec `continue`, `schedule.go:63-66`); a spec row whose stored spec
+  fails re-parse at consume logs and skips WITHOUT advancing — upstream
+  reports it on every occurrence (`startTasks`' `:42-46` posture).
+- A never-occurring spec (`0 0 30 2 *`) is dropped at registration
+  (`schedule.go:69-71`); the 5-year horizon returns zero (`spec.go:58-60`).
+- Gone schedule/repo rows and archived repos skip SILENTLY but only AFTER
+  the advance (`schedule_tasks.go:74-99`) — rows keep churning on archived
+  repos, exactly upstream.
+- The unit gate and the disabled-workflow list skip after the advance
+  (`schedule_tasks.go:101-125`) — a re-enabled workflow resumes on its
+  schedule.
+- Static-invalid workflow content at consume: the error logs and the
+  occurrence is consumed (the spec already advanced; the push path's
+  failed-run arm belongs to pushes — `schedule_tasks.go:148-156` returns
+  the error into `startTasks`' log-and-count).
+- A failed run insert AFTER the advance loses that occurrence until the
+  next one (upstream identical: the advance is committed before
+  `PrepareRunAndInsert`; a systemic failure — the advance/SELECT throwing —
+  still throws for the queue's retry, which the CAS absorbs idempotently).
+- `TZ=`/`CRON_TZ=` specs honor their zone through workerd's Intl timezone
+  data (upstream `Parse()` keeps the parsed location, `schedule_spec.go:36-39`;
+  no-prefix specs are forced UTC exactly upstream). DST gap: a nonexistent
+  wall time rounds UP to the transition instant (robfig's instant-stepping
+  behavior). DST fold: the EARLIER occurrence is taken — a schedule naming
+  a folded hour fires ONCE per day where robfig fires twice (the one
+  micro-divergence in this section; recorded, DST zones only, one hour per
+  year).
+- A push removing every schedule workflow: the count>0 delete runs first,
+  the empty detection returns — the repo's rows are gone
+  (`notifier_helper.go:601-615`).
+- Out of scope (recorded, not regressed): the settings-change arm
+  (`services/repository/setting.go:27-40` — DeleteScheduleTaskByRepo +
+  DetectAndHandleSchedules on the actions-unit toggle) and
+  `CleanRepoScheduleTasks` (`clear_tasks.go:75`) have no cf-gitea seam yet
+  (the unit toggle lives outside this unit's ownership); the registry
+  refreshes on default-branch pushes only, upstream's dominant path.
+
+**API surface:** none — the registry is internal (upstream exposes no
+schedule API at the pin; `FindScheduleOptions`' only consumer is the
+handleSchedules count). `getSchedulesByRepo` lands as the read port for the
+future UI/API family.
+
+**Testing plan (as-built):** the lifecycle on the real receive-pack harness
+(register on push; replace on change; delete on removal; non-default-branch
+pushes untouched); the F7 pin (concurrent double delivery → exactly one
+run; the loser's CAS reports 0); the advance order (prev=old next, next
+computed; a redelivered message inserts nothing); the archived skip (0 runs,
+rows still advanced); the */10 producer's enqueue shape (due ids only, NULL
+next excluded, chunked sends, the hourly entry no longer arms it); the
+consumer's run shape (`CreateScheduleTaskBySpec` verbatim: event push,
+triggerEvent schedule, the Actions user, scheduleId set, payload.schedule =
+the spec, NO `schedule_unix` key); the disabled-workflow skip; the parser
+vectors re-homed (robfig descriptors, dayMatches OR/AND, the never-fire
+horizon) with cronNext pinned against `TZ=` zones (fixed-offset Tokyo; the
+New-York DST gap).

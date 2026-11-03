@@ -224,13 +224,13 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     delivery sweep FIRST (unblocks the §3.6 redelivery paths a crashed
  *     consumer wedged), then the delivery-log cleanup (upstream
  *     CleanupHookTaskTable parity), one idempotent pass per message.
- *   - actions schedule triggers ({kind: "actions-trigger", repoId,
- *     scheduledUnix}, SPEC-0012 — upstream `start_schedule_tasks`): the
- *     hourly producer's per-repo pass (services/demo-sweep.ts
- *     enqueueDueActionSchedules) — handleActionsScheduleTrigger re-derives
- *     the due `on: schedule` workflows from the default-branch tree and
- *     inserts their runs; the payload-stamped `schedule_unix` key absorbs
- *     redelivery.
+ *   - actions schedule triggers ({kind: "actions-trigger", specId},
+ *     SPEC-0012 §D7 — upstream `start_schedule_tasks`): the step-entry
+ *     producer's per-spec pass (services/demo-sweep.ts
+ *     enqueueDueActionScheduleScans) — handleActionsScheduleTrigger
+ *     (services/actions/schedule.ts) advances the spec row CAS-first (the
+ *     F7 serialization — a redelivery or duplicate enqueue loses the CAS
+ *     and acks as a no-op), then inserts the run from the registration row.
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -452,17 +452,18 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
       }
       continue;
     }
-    // Actions schedule trigger (SPEC-0012 — upstream start_schedule_tasks'
-    // consumer half): one message = one repo = one due-window pass over the
-    // default-branch tree's `on: schedule` workflows (handleActionsScheduleTrigger,
-    // services/actions/trigger.ts — the run inserts ride the same
-    // PrepareRunAndInsert port as the push family). The payload-stamped
-    // `schedule_unix` dedupe makes redelivery a no-op when the inserts
-    // landed; a throw retries THAT message (the mirror-sync posture).
+    // Actions schedule trigger (SPEC-0012 §D7 — upstream start_schedule_tasks'
+    // consumer half): one message = one due action_schedule_spec row
+    // (handleActionsScheduleTrigger, services/actions/schedule.ts — the run
+    // insert rides the same PrepareRunAndInsert port as the push family).
+    // The advance CAS makes a redelivery/duplicate enqueue a no-op when the
+    // first delivery won; a SYSTEMIC throw retries THAT message (the
+    // mirror-sync posture — per-occurrence failures are logged and consumed
+    // inside the arm).
     if (isActionsScheduleTriggerMessage(message.body)) {
       try {
-        const inserted = await handleActionsScheduleTrigger(env, message.body);
-        console.log(`[repo-tasks] actions-trigger ${message.id}: repo ${message.body.repoId} tick ${message.body.scheduledUnix} inserted ${inserted}`);
+        const inserted = await handleActionsScheduleTrigger({ d1: env.DB, appUrl: env.APP_URL ?? "" }, message.body);
+        console.log(`[repo-tasks] actions-trigger ${message.id}: spec ${message.body.specId} inserted ${inserted}`);
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] actions-trigger ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
