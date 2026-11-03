@@ -442,7 +442,7 @@ export interface AuditEventQuery {
   scopeType?: AuditScopeType;
   scopeId?: string | number;
   origin?: AuditOrigin;
-  /** Keyset cursor: the (created_unix, id) pair of the last row of the
+  /** Keyset cursor: the (timestamp_unix, id) pair of the last row of the
    *  previous page — exact continuation across equal-timestamp rows (upstream
    *  paginates with ListOptions OFFSET; ours is the D1 keyset idiom §4.1
    *  names, and it orders `timestamp_unix [DESC|ASC], id [DESC|ASC]` like
@@ -479,7 +479,7 @@ export async function findAuditEvents(
   const ascending = query.sort === "timestamp_asc";
   if (query.cursor !== undefined) {
     const c = query.cursor.createdUnix;
-    // Exact keyset continuation: (created_unix, id) tuple compare — no row
+    // Exact keyset continuation: (timestamp_unix, id) tuple compare — no row
     // skipped nor repeated when a page boundary splits same-second events.
     const cursorCond = ascending
       ? or(
@@ -561,7 +561,7 @@ export const AUDIT_PRUNE_MAX_PAGES = 40;
 /**
  * The cron producer (§4.3): DISARMED (return 0 before any I/O) unless
  * `AUDIT_RETENTION_DAYS` holds a positive integer; then ONE indexed
- * existence probe (`created_unix < cut` LIMIT 1 — idx_audit_event_created)
+ * existence probe (`timestamp_unix < cut` LIMIT 1 — idx_audit_event_created)
  * and, only when expired rows exist, ONE `{kind: "audit-retention"}` message
  * on REPO_TASKS. SELECT + enqueue ONLY — the delete runs in the consumer
  * (AGENTS.md: crons enqueue, consumers do the work). No CAS claim on purpose

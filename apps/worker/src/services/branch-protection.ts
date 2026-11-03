@@ -563,7 +563,7 @@ export function renameRefusedByProtection(rules: readonly ProtectedBranchRow[], 
  * the admin's last deliberate edit, the same posture the deletion scrub's
  * rewriteRuleConfig documents). The rewrite is SKIPPED — silently, exactly
  * like upstream — when a DIFFERENT rule already claims `to` exactly (the
- * UNIQUE(repo_id, rule_name) pair both stores guard); upstream's
+ * UNIQUE(repo_id, branch_name) pair both stores guard); upstream's
  * `existingRule.ID == protectedBranch.ID` self-match arm is carried for the
  * case-insensitive-collation shapes its MySQL backend can produce. `rules`
  * is the caller's pre-surgery snapshot (rules rows do not change across the
