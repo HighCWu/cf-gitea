@@ -20,7 +20,7 @@
  */
 
 import { env } from "cloudflare:workers";
-import { and, eq, gt, inArray, lte, ne } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, lte, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
@@ -28,6 +28,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { mergeableOfRow, statusFromMergeability } from "../api/services/pull-engine";
 import { HAS_CHANGED, parseUpdatedFiles, UNVIEWED, updateReviewStateAtHead, VIEWED } from "../ui/pages/pull-files";
 import {
+  comments,
   follows,
   lfsObjects,
   orgMembers,
@@ -42,6 +43,7 @@ import {
   repositories,
   reviewState,
   stars,
+  trackedTimes,
   userRedirects,
   userSettings,
   users,
@@ -1219,5 +1221,382 @@ describe("repo_units parity completion (ADR-0007 FN-6, migration 0066)", () => {
       (await db.select().from(repoUnits).where(and(eq(repoUnits.repoId, "fn6repo"), eq(repoUnits.type, "actions"))).get())
         ?.everyoneAccessMode,
     ).toBe("write");
+  });
+});
+
+/**
+ * ADR-0007 FN-2 (migration 0067): upstream `Comment`'s mutation-metadata
+ * columns the landed table omitted — the project pair (comment.go:291-292),
+ * the time family's exact-row link (:301), the team review-request id (:307,
+ * `NOT NULL DEFAULT 0`) and the CommentMetaData JSON (:360). The
+ * original_author pair stays out — intentional-recorded-absent (SPEC-0005
+ * §9, the forge-metadata importer's mark; FN-9 is the family carrier).
+ * 0067 is pure ADD COLUMN (no rebuild — 0066's double-quoted-copy trap does
+ * not apply) plus the conservative JSON-gated backfills (SPEC-0005 §7.5):
+ * the type-30/31 `content` payloads move into their columns and the bodies
+ * blank (upstream's type-30/31 content is EMPTY — the payload rides the
+ * columns), the time family gains the writers' exact-row link, and the
+ * team-request rows take `pull_reviews.reviewer_team_id`. The landed
+ * writers/readers are pinned in their own batteries (projects/issues/
+ * pull-reviews); this describe pins the migration's own effect on
+ * pre-0067 rows (the FN-6 technique: the backfill statements verbatim).
+ */
+describe("comments mutation-metadata parity (ADR-0007 FN-2, migration 0067)", () => {
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+  });
+
+  /** One comment row the PRE-0067 shape wrote (the new columns absent —
+   *  overrides may only carry legacy columns). */
+  const seedOldComment = (values: Record<string, string | number>): Promise<number> => {
+    const base: Record<string, string | number> = {
+      type: 30,
+      poster_id: 910100,
+      issue_id: 910101,
+      content: "",
+      created_unix: 1_700_000_000,
+      updated_unix: 1_700_000_000,
+      ...values,
+    };
+    const keys = Object.keys(base);
+    return env.DB
+      .prepare(`INSERT INTO comments (${keys.join(", ")}) VALUES (${keys.map(() => "?").join(", ")})`)
+      .bind(...Object.values(base))
+      .run()
+      .then((r) => Number(r.meta.last_row_id));
+  };
+
+  it("0067's DDL: the five columns ride upstream's names/shapes, patch is untouched, no new index", async () => {
+    const db = drizzle(env.DB);
+    const info = await tableColumns("comments");
+    const names = info.map((col) => col.name);
+    // Pure ADD COLUMN: SQLite appends, so the five land after updated_unix in
+    // the migration's ALTER order (the drizzle schema object's family-beside
+    // placement is a reader-only concern — column ORDER is not a parity
+    // surface; the names/types/defaults are).
+    expect(names).toEqual([
+      "id",
+      "type",
+      "poster_id",
+      "issue_id",
+      "label_id",
+      "old_milestone_id",
+      "milestone_id",
+      "assignee_id",
+      "removed_assignee",
+      "resolve_doer_id",
+      "old_title",
+      "new_title",
+      "old_ref",
+      "new_ref",
+      "dependent_issue_id",
+      "line",
+      "tree_path",
+      "content",
+      "content_version",
+      "patch", // the §7-parity erratum: no DDL — the column rides untouched
+      "commit_sha",
+      "review_id",
+      "invalidated",
+      "ref_repo_id",
+      "ref_issue_id",
+      "ref_comment_id",
+      "ref_action",
+      "ref_is_pull",
+      "created_unix",
+      "updated_unix",
+      "old_project_id",
+      "project_id",
+      "time_id",
+      "assignee_team_id",
+      "comment_meta_data",
+    ]);
+    const byName = new Map(info.map((col) => [col.name, col]));
+    // The four plain NULLable INTEGERs (upstream nullable int64s).
+    for (const name of ["old_project_id", "project_id", "time_id"]) {
+      expect(byName.get(name)).toEqual({ cid: names.indexOf(name), name, type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 });
+    }
+    // The team id carries the tag's literal: NOT NULL DEFAULT 0 (comment.go:307).
+    expect(byName.get("assignee_team_id")).toEqual({ cid: names.indexOf("assignee_team_id"), name: "assignee_team_id", type: "INTEGER", notnull: 1, dflt_value: "0", pk: 0 });
+    // The metadata is the JSON TEXT (comment.go:360 `xorm:"JSON TEXT"`).
+    expect(byName.get("comment_meta_data")).toEqual({ cid: names.indexOf("comment_meta_data"), name: "comment_meta_data", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    // None of the 7 carries an upstream index tag — add none (§7.2); the
+    // pre-0067 set is exactly these four (sqlite_master yields creation
+    // order, so the pin sorts).
+    expect((await indexNames("comments")).sort()).toEqual(
+      ["comments_issue_idx", "comments_issue_covering_idx", "comments_ref_issue_idx", "comments_poster_created_idx"].sort(),
+    );
+    // A fresh row reads the team default (the drizzle decode path).
+    const id = await seedOldComment({});
+    expect((await db.select().from(comments).where(eq(comments.id, id)).get())?.assigneeTeamId).toBe(0);
+  });
+
+  it("the type-30/31 backfill: the JSON payloads move into the columns, the bodies blank", async () => {
+    const db = drizzle(env.DB);
+    // The three landed payload shapes the pre-0067 writers serialized
+    // (projects.ts:914 add / :967 remove / :1060 column move — SPEC §7.5).
+    const add = await seedOldComment({ content: '{"old_project_id":0,"project_id":77}' });
+    const remove = await seedOldComment({ content: '{"old_project_id":77,"project_id":0}' });
+    const move = await seedOldComment({ type: 31, content: '{"project_id":77,"project_column_id":911,"project_column_title":"Todo"}' });
+    // A stray OTHER-type row carrying a JSON-looking body is NOT the
+    // backfill's business (the type gates).
+    const plain = await seedOldComment({ type: 0, content: '{"old_project_id":0,"project_id":77}' });
+
+    // Migration 0067's backfill statements verbatim
+    // (src/db/migrations/0067_comment-mutation-metadata.sql).
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`old_project_id\` = json_extract(\`content\`, '$.old_project_id'),
+    \`project_id\` = json_extract(\`content\`, '$.project_id'),
+    \`content\` = ''
+WHERE \`type\` = 30
+  AND json_valid(\`content\`)
+  AND json_type(\`content\`, '$') = 'object'
+  AND json_type(\`content\`, '$.old_project_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_id') IN ('integer', 'real')`,
+      )
+      .run();
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`project_id\` = json_extract(\`content\`, '$.project_id'),
+    \`comment_meta_data\` = json_object(
+      'project_column_id', json_extract(\`content\`, '$.project_column_id'),
+      'project_column_title', json_extract(\`content\`, '$.project_column_title')
+    ),
+    \`content\` = ''
+WHERE \`type\` = 31
+  AND json_valid(\`content\`)
+  AND json_type(\`content\`, '$') = 'object'
+  AND json_type(\`content\`, '$.project_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_column_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_column_title') = 'text'`,
+      )
+      .run();
+
+    const rows = await db.select().from(comments).where(inArray(comments.id, [add, remove, move, plain])).all();
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    expect(byId.get(add)).toMatchObject({ type: 30, oldProjectId: 0, projectId: 77, content: "", commentMetaData: null });
+    expect(byId.get(remove)).toMatchObject({ type: 30, oldProjectId: 77, projectId: 0, content: "" });
+    // The move fills project_id + the metadata with the two known keys —
+    // project_title is NOT recoverable from the old payload (the migration's
+    // recorded limit) — and blanks the body.
+    expect(byId.get(move)).toMatchObject({ type: 31, projectId: 77, content: "" });
+    expect(JSON.parse(byId.get(move)!.commentMetaData!)).toEqual({ project_column_id: 911, project_column_title: "Todo" });
+    // The plain comment keeps its body verbatim (its JSON was CONTENT).
+    expect(byId.get(plain)).toMatchObject({ type: 0, oldProjectId: null, projectId: null, content: '{"old_project_id":0,"project_id":77}' });
+  });
+
+  it("the conservative arms: non-JSON, missing-key and wrong-kind payloads stay verbatim", async () => {
+    const db = drizzle(env.DB);
+    const junk = await seedOldComment({ type: 31, content: "not json {" });
+    const scalar = await seedOldComment({ type: 30, content: '"just a string"' });
+    const missingKey = await seedOldComment({ type: 30, content: '{"project_id":77}' }); // no old_project_id
+    const nullId = await seedOldComment({ type: 30, content: '{"old_project_id":null,"project_id":77}' });
+    const textId = await seedOldComment({ type: 31, content: '{"project_id":77,"project_column_id":911,"project_column_title":5}' });
+    const noMatch14 = await seedOldComment({ type: 14, poster_id: 910102, content: "|5400" });
+    const marker14 = await seedOldComment({ type: 14, poster_id: 910102, content: "|abc" });
+
+    // Both type-30/31 statements run; the json gates reject every row above.
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`old_project_id\` = json_extract(\`content\`, '$.old_project_id'),
+    \`project_id\` = json_extract(\`content\`, '$.project_id'),
+    \`content\` = ''
+WHERE \`type\` = 30
+  AND json_valid(\`content\`)
+  AND json_type(\`content\`, '$') = 'object'
+  AND json_type(\`content\`, '$.old_project_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_id') IN ('integer', 'real')`,
+      )
+      .run();
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`project_id\` = json_extract(\`content\`, '$.project_id'),
+    \`comment_meta_data\` = json_object(
+      'project_column_id', json_extract(\`content\`, '$.project_column_id'),
+      'project_column_title', json_extract(\`content\`, '$.project_column_title')
+    ),
+    \`content\` = ''
+WHERE \`type\` = 31
+  AND json_valid(\`content\`)
+  AND json_type(\`content\`, '$') = 'object'
+  AND json_type(\`content\`, '$.project_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_column_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_column_title') = 'text'`,
+      )
+      .run();
+
+    const rows = await db.select().from(comments).where(inArray(comments.id, [junk, scalar, missingKey, nullId, textId])).all();
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    // Left verbatim — the timeline reader keeps its content fallbacks for
+    // exactly these rows (SPEC §7.5's conservative arm, no crash).
+    expect(byId.get(junk)).toMatchObject({ content: "not json {", projectId: null, commentMetaData: null });
+    expect(byId.get(scalar)).toMatchObject({ content: '"just a string"', oldProjectId: null, projectId: null });
+    expect(byId.get(missingKey)).toMatchObject({ content: '{"project_id":77}', oldProjectId: null, projectId: null });
+    expect(byId.get(nullId)).toMatchObject({ content: '{"old_project_id":null,"project_id":77}', projectId: null });
+    expect(byId.get(textId)).toMatchObject({ content: '{"project_id":77,"project_column_id":911,"project_column_title":5}', commentMetaData: null });
+    // The time rows: no matching tracked_time → NULL; the non-numeric marker
+    // parses to 0 and is skipped (CAST 'abc' → 0, the != 0 gate).
+    const times = await db.select().from(comments).where(inArray(comments.id, [noMatch14, marker14])).all();
+    expect(times.map((row) => row.timeId)).toEqual([null, null]);
+  });
+
+  it("the time_id backfill: the correlation applied once — newest matching entry wins, same-second banks", async () => {
+    const db = drizzle(env.DB);
+    // Entries for the type-14 arm: two live rows with (issue, poster, 5400),
+    // one older one newer; the newest id is the pin. A deleted twin and a
+    // LATER-created twin are excluded (deleted = 0, created <= comment).
+    await env.DB
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1699999000)")
+      .run();
+    await env.DB
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1700000000)")
+      .run();
+    await env.DB
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 1, 1699999500)")
+      .run();
+    await env.DB
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1700000005)")
+      .run();
+    const entries = await db
+      .select({ id: trackedTimes.id, deleted: trackedTimes.deleted, createdAt: trackedTimes.createdAt })
+      .from(trackedTimes)
+      .orderBy(asc(trackedTimes.id))
+      .all();
+    // Seeded in id order: older live, at-the-second live, deleted twin,
+    // later-created live.
+    const [older, at, deletedTwin, newer] = entries.map((row) => row.id);
+    expect(entries.map((row) => row.deleted)).toEqual([false, false, true, false]);
+    expect(entries[1]!.createdAt).toEqual(new Date(1_700_000_000_000));
+
+    const comment14 = await seedOldComment({ type: 14, poster_id: 910102, content: "|5400" });
+    // A type-13 banked entry created in the comment's own second.
+    const banked = (
+      await env.DB.prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910103, 61, 0, 1699999800)").run()
+    ).meta.last_row_id;
+    const comment13 = await seedOldComment({ type: 13, poster_id: 910103, created_unix: 1_699_999_800, content: "1 minute 1 seconds " });
+
+    // Migration 0067's time backfills verbatim (the type-14 then type-13
+    // statements of src/db/migrations/0067_comment-mutation-metadata.sql).
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`time_id\` = (
+  SELECT \`tt\`.\`id\`
+  FROM \`tracked_time\` \`tt\`
+  WHERE \`tt\`.\`issue_id\` = \`comments\`.\`issue_id\`
+    AND \`tt\`.\`user_id\` = \`comments\`.\`poster_id\`
+    AND \`tt\`.\`seconds\` = CAST(substr(\`comments\`.\`content\`, 2) AS INTEGER)
+    AND \`tt\`.\`deleted\` = 0
+    AND \`tt\`.\`created_unix\` <= \`comments\`.\`created_unix\`
+  ORDER BY \`tt\`.\`id\` DESC
+  LIMIT 1
+)
+WHERE \`type\` = 14
+  AND \`poster_id\` IS NOT NULL
+  AND \`created_unix\` IS NOT NULL
+  AND \`content\` LIKE '|%'
+  AND CAST(substr(\`content\`, 2) AS INTEGER) != 0
+  AND EXISTS (
+    SELECT 1 FROM \`tracked_time\` \`tt2\`
+    WHERE \`tt2\`.\`issue_id\` = \`comments\`.\`issue_id\`
+      AND \`tt2\`.\`user_id\` = \`comments\`.\`poster_id\`
+      AND \`tt2\`.\`seconds\` = CAST(substr(\`content\`, 2) AS INTEGER)
+      AND \`tt2\`.\`deleted\` = 0
+      AND \`tt2\`.\`created_unix\` <= \`comments\`.\`created_unix\`
+  )`,
+      )
+      .run();
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`time_id\` = (
+  SELECT \`tt\`.\`id\`
+  FROM \`tracked_time\` \`tt\`
+  WHERE \`tt\`.\`issue_id\` = \`comments\`.\`issue_id\`
+    AND \`tt\`.\`user_id\` = \`comments\`.\`poster_id\`
+    AND \`tt\`.\`deleted\` = 0
+    AND \`tt\`.\`created_unix\` = \`comments\`.\`created_unix\`
+  ORDER BY \`tt\`.\`id\` DESC
+  LIMIT 1
+)
+WHERE \`type\` = 13
+  AND \`poster_id\` IS NOT NULL
+  AND \`created_unix\` IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM \`tracked_time\` \`tt2\`
+    WHERE \`tt2\`.\`issue_id\` = \`comments\`.\`issue_id\`
+      AND \`tt2\`.\`user_id\` = \`comments\`.\`poster_id\`
+      AND \`tt2\`.\`deleted\` = 0
+      AND \`tt2\`.\`created_unix\` = \`comments\`.\`created_unix\`
+  )`,
+      )
+      .run();
+
+    const backfilled = await db.select().from(comments).where(inArray(comments.id, [comment14, comment13])).all();
+    const byId = new Map(backfilled.map((row) => [row.id, row]));
+    // The four seeds are distinct rows, so the pin is a real choice.
+    expect(new Set([older, at, deletedTwin, newer]).size).toBe(4);
+    // The newest LIVE entry at-or-before the comment's own second — the
+    // later-created twin (`newer`, created 5 s AFTER the comment) and the
+    // deleted one lose; `at` (created IN the comment's second) outranks
+    // `older` (created 1000 s earlier) by the DESC id order.
+    expect(byId.get(comment14)?.timeId).toBe(at);
+    expect(byId.get(comment14)?.timeId).not.toBe(newer);
+    expect(byId.get(comment14)?.timeId).not.toBe(deletedTwin);
+    expect(byId.get(comment13)?.timeId).toBe(Number(banked));
+  });
+
+  it("the assignee_team_id backfill: team-request rows take pull_reviews.reviewer_team_id; user and removed arms keep 0", async () => {
+    const db = drizzle(env.DB);
+    const teamRequest = (
+      await env.DB
+        .prepare("INSERT INTO pull_reviews (type, reviewer_id, reviewer_team_id, issue_id, content, created_unix, updated_unix) VALUES (4, 0, 555, 910101, '', 1700000000, 1700000000)")
+        .run()
+    ).meta.last_row_id;
+    const userRequest = (
+      await env.DB
+        .prepare("INSERT INTO pull_reviews (type, reviewer_id, reviewer_team_id, issue_id, content, created_unix, updated_unix) VALUES (4, 910102, 0, 910101, '', 1700000000, 1700000000)")
+        .run()
+    ).meta.last_row_id;
+    const teamAdd = await seedOldComment({ type: 27, review_id: Number(teamRequest) }); // assignee_id NULL — the team shape
+    const userAdd = await seedOldComment({ type: 27, poster_id: 910102, assignee_id: 910102, review_id: Number(userRequest) });
+    const removedNoReview = await seedOldComment({ type: 27, removed_assignee: 1 }); // no review_id — stays 0
+    const danglingReview = await seedOldComment({ type: 27, review_id: 999999 }); // no pull_reviews row — stays 0
+
+    // Migration 0067's team backfill verbatim
+    // (src/db/migrations/0067_comment-mutation-metadata.sql).
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`assignee_team_id\` = (
+  SELECT \`pr\`.\`reviewer_team_id\`
+  FROM \`pull_reviews\` \`pr\`
+  WHERE \`pr\`.\`id\` = \`comments\`.\`review_id\`
+)
+WHERE \`type\` = 27
+  AND \`assignee_id\` IS NULL
+  AND \`review_id\` > 0
+  AND EXISTS (
+    SELECT 1 FROM \`pull_reviews\` \`pr2\`
+    WHERE \`pr2\`.\`id\` = \`comments\`.\`review_id\`
+      AND \`pr2\`.\`reviewer_team_id\` > 0
+  )`,
+      )
+      .run();
+
+    const rows = await db.select().from(comments).where(inArray(comments.id, [teamAdd, userAdd, removedNoReview, danglingReview])).all();
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    expect(byId.get(teamAdd)?.assigneeTeamId).toBe(555);
+    // User-request rows (reviewer_id > 0, reviewer_team_id = 0) and removed
+    // arms keep the DEFAULT 0.
+    expect(byId.get(userAdd)?.assigneeTeamId).toBe(0);
+    expect(byId.get(userAdd)?.assigneeId).toBe(910102);
+    expect(byId.get(removedNoReview)?.assigneeTeamId).toBe(0);
+    expect(byId.get(danglingReview)?.assigneeTeamId).toBe(0);
   });
 });

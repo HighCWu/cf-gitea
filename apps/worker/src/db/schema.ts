@@ -792,7 +792,9 @@ export const pullRequests = sqliteTable(
  * (`models/issues/comment.go:246–328`); system comments (close/reopen/labels/
  * xrefs) and user comments share this table, discriminated by `type`
  * (`CommentType` in src/issues/comment-types.ts). The xref columns
- * (types 3/4/5/6) point at the referenced issue (`ref_*`).
+ * (types 3/4/5/6) point at the referenced issue (`ref_*`). The only
+ * upstream columns absent are the original_author pair — the forge-metadata
+ * importer's mark, intentional-recorded-absent (SPEC-0005 §9).
  */
 export const comments = sqliteTable(
   "comments",
@@ -803,10 +805,21 @@ export const comments = sqliteTable(
     posterId: integer("poster_id"),
     issueId: integer("issue_id").notNull(),
     labelId: integer("label_id"),
+    // ADR-0007 FN-2: the project pair (upstream OldProjectID/ProjectID,
+    // models/issues/comment.go:291-292). The type-30/31 writers stamp the
+    // arm's ids (add: old=0/project=N, remove: old=N/project=0; column moves
+    // stamp project_id too); content is upstream-empty (the payload rides
+    // the columns, not the body).
+    oldProjectId: integer("old_project_id"),
+    projectId: integer("project_id"),
     oldMilestoneId: integer("old_milestone_id"),
     milestoneId: integer("milestone_id"),
+    /** Upstream TimeID (comment.go:301) — the time family's exact-row link. */
+    timeId: integer("time_id"),
     assigneeId: integer("assignee_id"),
     removedAssignee: integer("removed_assignee").default(0),
+    /** Upstream AssigneeTeamID (comment.go:307, tag `NOT NULL DEFAULT 0`). */
+    assigneeTeamId: integer("assignee_team_id").notNull().default(0),
     resolveDoerId: integer("resolve_doer_id"),
     oldTitle: text("old_title"),
     newTitle: text("new_title"),
@@ -829,6 +842,14 @@ export const comments = sqliteTable(
     /** none(0)/closes(1)/reopens(2)/neutered(3). */
     refAction: integer("ref_action"),
     refIsPull: integer("ref_is_pull", { mode: "boolean" }).notNull().default(false),
+    /**
+     * Upstream CommentMetaData (comment.go:360, `xorm:"JSON TEXT"`) — JSON
+     * `{project_column_id?, project_column_title?, project_title?, …}`
+     * (struct comment.go:249-257). The type-31 column-move writer fills it
+     * (the payload upstream's template reads); the CODEOWNERS/workflow
+     * metadata arms have no surface here (SPEC-0005 §7 as-built).
+     */
+    commentMetaData: text("comment_meta_data"),
     createdAt: integer("created_unix", { mode: "timestamp" }),
     updatedAt: integer("updated_unix", { mode: "timestamp" }),
   },

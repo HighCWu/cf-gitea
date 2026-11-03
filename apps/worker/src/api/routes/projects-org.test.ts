@@ -717,15 +717,18 @@ describe("column issues: add / list / remove / move (owner arms)", () => {
     expect(removeB.status).toBe(204);
     expect(await db().select().from(projectIssues).where(eq(projectIssues.issueId, member.id)).all()).toHaveLength(0);
     // Comments: the A→B move wrote the type-31 column change; the removal
-    // writes the type-30 detach ({old_project_id, project_id: 0}).
+    // writes the type-30 detach. FN-2: the ids ride the columns (`content`
+    // empty — upstream's body); the move fills project_id + the
+    // comment_meta_data JSON with project_title included.
     const written = await db().select().from(comments).where(eq(comments.issueId, member.id)).orderBy(comments.id).all();
     expect(written.map((c) => c.type)).toEqual([31, 30]);
-    expect(JSON.parse(written[0]?.content ?? "{}")).toEqual({
-      project_id: project.id,
+    expect(written[0]).toMatchObject({ content: "", projectId: project.id });
+    expect(JSON.parse(written[0]!.commentMetaData ?? "{}")).toEqual({
       project_column_id: b.id,
       project_column_title: "B",
+      project_title: project.title,
     });
-    expect(JSON.parse(written[1]?.content ?? "{}")).toEqual({ old_project_id: project.id, project_id: 0 });
+    expect(written[1]).toMatchObject({ content: "", oldProjectId: project.id, projectId: 0 });
   });
 });
 

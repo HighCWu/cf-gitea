@@ -142,9 +142,11 @@ import { notifyIssueAssigneeChanged } from "../../services/mail/notify";
  *     title + state) for writers (issue_dependency.go:103-129). Upstream's
  *     exact zero-render differs (it re-converts a synthesized row through
  *     toIssue); we render the redacted subset deterministically.
- *   - the stop-tracking (13) comment's `time_id` back-reference has no home
- *     column in the landed comments table (append-only schema) — the seconds
- *     travel in the comment content, the entry lives in tracked_time.
+ *   - the time-family comments stamp the FN-2 `time_id` column (upstream
+ *     TimeID, models/issues/comment.go:301) with the batch-mate tracked_time
+ *     id — the add-time and stop-tracking writers below; the seconds still
+ *     travel in the comment content (upstream's own content shape), the
+ *     entry lives in tracked_time.
  *   - GET …/times embeds the full issue in every entry (upstream
  *     ToTrackedTime after LoadAttributes); the `user` query filter behaves
  *     upstream-exact including the cantSetUser scoping (:108-119).
@@ -1064,23 +1066,31 @@ async function stopwatchOfIssue(d1: D1Database, userId: number, issueId: number)
 /**
  * finishIssueStopwatch (stopwatch.go:145-169): insert the tracked_time for
  * the elapsed seconds, the stop_tracking (13) comment with the SecToHours
- * content, the fold, and the stopwatch delete — one batch. DEVIATION: the
- * comment's time_id back-reference has no landed column (module header).
+ * content, the fold, and the stopwatch delete. Upstream inserts the
+ * tracked_time first and stamps the comment's TimeID from it (:153-164);
+ * the drizzle batch cannot reference a prior leg's returning id, so the
+ * banked insert runs alone and the comment/fold/delete batch follows —
+ * upstream's statement order, the stopwatch delete LAST (a phase-1 failure
+ * cannot lose a running stopwatch while its time is banked).
  */
 async function finishStopwatch(d1: D1Database, issue: IssueRow, userId: number, stopwatch: { id: number; createdAt: Date }, now: Date): Promise<void> {
   const elapsed = Math.max(0, Math.floor((now.getTime() - stopwatch.createdAt.getTime()) / 1000));
-  await drizzle(d1).batch([
-    drizzle(d1).insert(trackedTimes).values({
+  const [time] = await drizzle(d1)
+    .insert(trackedTimes)
+    .values({
       issueId: issue.id,
       userId,
       seconds: elapsed,
       createdAt: now,
-    }),
+    })
+    .returning({ id: trackedTimes.id });
+  await drizzle(d1).batch([
     drizzle(d1).insert(comments).values({
       type: CommentType.StopTracking,
       posterId: userId,
       issueId: issue.id,
       content: secToHours(elapsed),
+      timeId: time!.id,
       createdAt: now,
       updatedAt: now,
     }),
@@ -1532,22 +1542,27 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     }
     const now = new Date();
     const created = body.created !== undefined && body.created !== null ? new Date(body.created) : now;
-    const result = await drizzle(c.env.DB).batch([
-      drizzle(c.env.DB)
-        .insert(trackedTimes)
-        .values({ issueId: issue.id, userId, seconds: body.time, createdAt: created })
-        .returning({ id: trackedTimes.id }),
+    // Upstream AddTime (tracked_time.go:166-191): the time row inserts first
+    // (t.ID), the comment carries TimeID; the drizzle batch cannot reference
+    // a prior leg's returning id, so the insert runs alone and the
+    // comment/fold batch follows — upstream's statement order.
+    const [inserted] = await drizzle(c.env.DB)
+      .insert(trackedTimes)
+      .values({ issueId: issue.id, userId, seconds: body.time, createdAt: created })
+      .returning({ id: trackedTimes.id });
+    await drizzle(c.env.DB).batch([
       drizzle(c.env.DB).insert(comments).values({
         type: CommentType.AddTimeManual,
         posterId: doerId,
         issueId: issue.id,
         content: `|${body.time}`,
+        timeId: inserted!.id,
         createdAt: now,
         updatedAt: now,
       }),
       drizzle(c.env.DB).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
     ] as const);
-    const insertedId = result[0][0]?.id;
+    const insertedId = inserted?.id;
     const userRow = await findUserRowById(c.env.DB, userId);
     return c.json(
       {

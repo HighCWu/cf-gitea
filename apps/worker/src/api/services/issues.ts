@@ -23,6 +23,7 @@ import {
   pullRequests,
   reactions,
   repositories,
+  teams,
   trackedTimes,
   users,
 } from "../../db/schema";
@@ -37,6 +38,7 @@ import type { ApiEnv } from "../env";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
 import type { Project } from "../models/project";
 import type { Attachment as ReleaseAttachment } from "../models/release";
+import type { Team } from "../models/team";
 import type { User } from "../models/user";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "./blocks";
 import { ActionType } from "./activity-feeds";
@@ -957,15 +959,19 @@ function refActionName(action: number | null): string {
 // Timeline render prefetch (the query-shape audit's A5)
 //
 // The timeline route rendered each row with 1..5 serial selects — the poster
-// plus up to four metadata rows the timeline's entity kinds carry and the
+// plus up to five metadata rows the timeline's entity kinds carry and the
 // issue-list context does not: the OLD milestone, the new milestone, the
-// per-comment label, the assignee. `prefetchTimelineContext` batches each
-// arm across the page into ONE inArray select per entity kind; the route
-// hands the maps to `toTimelineComment` through its optional `preload`.
-// Behavior parity: a map miss renders exactly what the per-row select miss
-// renders (null poster, null old/new milestone, null label, null assignee)
-// — omitted preload keeps the per-row selects verbatim.
+// per-comment label, the assignee, and (FN-2) the assignee team.
+// `prefetchTimelineContext` batches each arm across the page into ONE inArray
+// select per entity kind; the route hands the maps to `toTimelineComment`
+// through its optional `preload`. Behavior parity: a map miss renders
+// exactly what the per-row select miss renders (null poster, null old/new
+// milestone, null label, null assignee, null-or-drop team) — omitted preload
+// keeps the per-row selects verbatim.
 // ---------------------------------------------------------------------------
+
+/** Team row (the timeline `assignee_team` arm's entity — FN-2). */
+type TeamRow = typeof teams.$inferSelect;
 
 /** Per-entity page rows backing `toTimelineComment`'s batched render. */
 export interface TimelineRenderContext {
@@ -978,6 +984,10 @@ export interface TimelineRenderContext {
   labels: Map<number, LabelRow>;
   /** Assignee rows by user id (the per-comment `assignee` arm). */
   assignees: Map<number, UserRow>;
+  /** Team rows by id (the type-27 team review-request `assignee_team` arm,
+   *  FN-2); a dangling team id drops the ROW (upstream LoadAssigneeUserAndTeam's
+   *  GetPossibleTeamByID error arm → ToTimelineComment's nil), not a null render. */
+  teams: Map<number, TeamRow>;
   /** The type-19/20 comments' dependent-issue legs by issue id: the issue
    *  row plus its OWN repo pair (dependency edges may cross repos — the
    *  render's URLs and repository meta resolve against the pair); a dangling
@@ -1013,15 +1023,17 @@ export async function prefetchTimelineContext(d1: D1Database, commentRows: Comme
   ];
   const labelIds = [...new Set(commentRows.flatMap((row) => (row.labelId === null || row.labelId === undefined ? [] : [row.labelId])))];
   const assigneeIds = [...new Set(commentRows.flatMap((row) => (row.assigneeId === null || row.assigneeId === undefined ? [] : [row.assigneeId])))];
+  const teamIds = [...new Set(commentRows.flatMap((row) => (row.assigneeTeamId > 0 ? [row.assigneeTeamId] : [])))];
   const dependentIssueIds = [
     ...new Set(commentRows.flatMap((row) => (row.dependentIssueId === null || row.dependentIssueId === undefined ? [] : [row.dependentIssueId]))),
   ];
   const db = drizzle(d1);
-  const [posterRows, milestoneRows, labelRows, assigneeRows, dependentIssueRows] = await Promise.all([
+  const [posterRows, milestoneRows, labelRows, assigneeRows, teamRows, dependentIssueRows] = await Promise.all([
     posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
     milestoneIds.length > 0 ? db.select().from(milestones).where(inArray(milestones.id, milestoneIds)).all() : Promise.resolve([]),
     labelIds.length > 0 ? db.select().from(labels).where(inArray(labels.id, labelIds)).all() : Promise.resolve([]),
     assigneeIds.length > 0 ? db.select().from(users).where(inArray(users.id, assigneeIds)).all() : Promise.resolve([]),
+    teamIds.length > 0 ? db.select().from(teams).where(inArray(teams.id, teamIds)).all() : Promise.resolve([]),
     dependentIssueIds.length > 0 ? db.select().from(issues).where(inArray(issues.id, dependentIssueIds)).all() : Promise.resolve([]),
   ]);
   // The dependent legs' repo pairs — the A6 batch twin (ONE repositories ⋈
@@ -1042,6 +1054,7 @@ export async function prefetchTimelineContext(d1: D1Database, commentRows: Comme
     milestones: new Map(milestoneRows.map((row) => [row.id, row])),
     labels: new Map(labelRows.map((row) => [row.id, row])),
     assignees: new Map(assigneeRows.map((row) => [row.id, row])),
+    teams: new Map(teamRows.map((row) => [row.id, row])),
     dependentIssues,
   };
 }
@@ -1079,6 +1092,38 @@ function labelFromMap(rows: Map<number, LabelRow>, id: number | null | undefined
  *  identical null semantics, 0 reads. */
 function assigneeRowFromMap(rows: Map<number, UserRow>, id: number | null | undefined): UserRow | null {
   return id === null || id === undefined ? null : (rows.get(id) ?? null);
+}
+
+/** The context twin of the per-row team select — returns the RAW row (the
+ *  render's `toTimelineTeam` call is shared with the per-row arm). The
+ *  unset sentinel is 0 (upstream's AssigneeTeamID NOT NULL DEFAULT 0 —
+ *  LoadAssigneeUserAndTeam gates on `> 0`), and a dangling id stays absent
+ *  → null, the drop-the-row arm's input. 0 reads. */
+function teamRowFromMap(rows: Map<number, TeamRow>, id: number | null | undefined): TeamRow | null {
+  return id === null || id === undefined || id <= 0 ? null : (rows.get(id) ?? null);
+}
+
+/** `convert.ToTeam` with no org load (issue_comment.go:179-181 →
+ *  convert.go:945-961 → ToTeams :966-991) — the timeline `assignee_team`
+ *  arm's render. Upstream leaves the error arm unhandled there (`_`), the
+ *  row fields always render; the units map parses our TEXT JSON column
+ *  (org-teams.ts's `toApiTeam` shape, org field omitted — loadOrg unset).
+ *  Replicated here because org-teams.ts is a route module and services do
+ *  not import routes. */
+function toTimelineTeam(team: TeamRow): Team {
+  const unitsMap = team.unitsMap === null ? {} : (JSON.parse(team.unitsMap) as Record<string, string>);
+  return {
+    id: team.id,
+    name: team.name,
+    description: team.description,
+    includes_all_repositories: team.includesAllRepositories,
+    can_create_org_repo: team.canCreateOrgRepo,
+    permission: team.authorize,
+    // Go iterates the map unordered; sorted keys keep cf-gitea deterministic.
+    units: Object.keys(unitsMap).sort(),
+    units_map: unitsMap,
+    visibility: team.visibility,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,11 +1230,15 @@ type TimelineTimeCorrelation =
  * The time-tracking comment's tracked_time — upstream `Comment.LoadTime`
  * (models/issues/comment.go:733-738) reads the comment's `time_id` column,
  * GetTrackedTimeByID filters the row to the comment's OWN issue
- * (tracked_time.go:312-322), ToTrackedTime then renders the
- * LoadAttributes'd row (user_name + the full issue render). Our comment rows
- * carry NO time_id column (the landed time writers' documented deviation —
- * the routes/issue-tables-t2.ts module header), so the exact-row linkage is
- * rebuilt from the writer batches' determinism:
+ * (tracked_time.go:312-322 — id + issue_id, no deleted filter: a
+ * soft-deleted entry still loads, ToTrackedTime :158-174 renders it),
+ * ToTrackedTime then renders the LoadAttributes'd row (user_name + the full
+ * issue render). FN-2 landed the `time_id` column and the writers stamp it
+ * (SPEC-0005 §7.3), so the exact-row link is read FIRST, verbatim.
+ *
+ * The (poster, seconds, second) correlation below is the LEGACY fallback
+ * only — for pre-migration rows the 0067 backfill could not pin (the SPEC
+ * §7.7 removal marker: one release after the backfill, then drop):
  *   - add_time_manual (14): the `|<seconds>` content marker holds the entry's
  *     seconds (tracked_time.go:183-188) — the batch-mate is the newest live
  *     entry with those seconds by the comment poster on this issue;
@@ -1200,14 +1249,27 @@ type TimelineTimeCorrelation =
  * delete_time_manual (26) is `none` — upstream sets no TimeID there either
  * (tracked_time.go:252-263/:276-286), so its render is the same null; types
  * outside the time family are LoadTime's `TimeID == 0` early return. A
- * dangling entry (purged row, an admin-add whose poster is not the entry's
- * user) is `missing` — the upstream LoadTime error arm that drops the row,
+ * dangling time_id (purged row, wrong-issue row) or a fallback arm with no
+ * match is `missing` — the upstream LoadTime error arm that drops the row,
  * never a null-metadata render.
  */
 async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, comment: CommentRow): Promise<TimelineTimeCorrelation> {
   let entry: { id: number; issueId: number; userId: number; seconds: number; createdAt: Date | null } | null = null;
   let expected = false;
-  if (comment.type === CommentType.AddTimeManual && (comment.content ?? "").startsWith("|")) {
+  if ((comment.timeId ?? 0) > 0) {
+    // The exact-row link (upstream LoadTime → GetTrackedTimeByID): id +
+    // issue_id, deleted rides along.
+    expected = true;
+    entry =
+      (
+        await drizzle(d1)
+          .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
+          .from(trackedTimes)
+          .where(and(eq(trackedTimes.id, comment.timeId!), eq(trackedTimes.issueId, issue.id)))
+          .limit(1)
+          .then((rows) => (rows[0] === undefined ? null : rows[0]))
+      ) ?? null;
+  } else if (comment.type === CommentType.AddTimeManual && (comment.content ?? "").startsWith("|")) {
     const seconds = goParseInt64((comment.content ?? "").slice(1));
     if (comment.posterId !== null && seconds !== 0) {
       expected = true;
@@ -1296,19 +1358,22 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
  * `convert.ToTimelineComment` → the contract `TimelineComment`. Emits the
  * metadata subset our comment rows carry: old/new title (type 10), label
  * (type 7), old/milestone (type 8), old/new ref (types 3–6/33), assignee +
- * removed flag (type 9), ref commit sha + action, the humanized time bodies
- * + tracked_time (types 13/14 — see trackedTimeOfComment) and the type-19/20
- * dependent_issue (LoadDepIssueDetails → ToAPIIssue). Deferred metadata
- * renders the Go zero exactly like upstream's empty columns: projects,
- * reviews, teams (tier 2/3 surfaces), and the xref issue enrichment (the
- * xref writers land with the push pipeline).
+ * removed flag (type 9), the team review-request's assignee_team (type 27 —
+ * FN-2), the type-30/31 project ids (FN-2), ref commit sha + action, the
+ * humanized time bodies + tracked_time (types 13/14 — see
+ * trackedTimeOfComment) and the type-19/20 dependent_issue
+ * (LoadDepIssueDetails → ToAPIIssue). Deferred metadata renders the Go zero
+ * exactly like upstream's empty columns: the review/resolve_doer arms and
+ * the xref issue enrichment (the xref writers land with the push pipeline).
  *
  * THE DEGENERATE ARMS DROP THE ROW (ledger ⑬-#16, services/convert/
  * issue_comment.go:34-68): upstream's per-type loads ERROR on a dangling
  * reference and ToTimelineComment answers `return nil` — the row leaves no
- * metadata render behind. Three arms error upstream and drop here:
+ * metadata render behind. Four arms error upstream and drop here:
  *   - the assignee user row missing (LoadAssigneeUserAndTeam →
  *     GetPossibleUserByID ErrUserNotExist, :37-40);
+ *   - the assignee team row missing (the same load's team leg →
+ *     GetPossibleTeamByID, :43-46 — FN-2);
  *   - the dependent issue row (or its repo pair) unresolvable
  *     (LoadDepIssueDetails → GetIssueByID error, :44-47; the pair is
  *     FK-coupled to the issue, so both collapse to one arm);
@@ -1323,14 +1388,15 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
  * schema-valid shape of the same drop (the rows are unreachable through
  * healthy writes either way).
  *
- * The poster plus up to four metadata rows (old/new milestone, label,
- * assignee) are fetched per render; the timeline ROUTE passes `preload` (the
- * page-scoped `prefetchTimelineContext` maps — the query-shape audit's A5)
- * so the reads collapse to lookups — a map miss renders the per-row null
- * verbatim. Omitted keeps the per-row selects (single-item and fallback
- * callers). The time-comment correlation and the dependent_issue render are
- * per-row on both paths (the rare arms — a batched tracked_times key would
- * fan one inArray per distinct (user, seconds, second) tuple, no win).
+ * The poster plus up to five metadata rows (old/new milestone, label,
+ * assignee, team) are fetched per render; the timeline ROUTE passes
+ * `preload` (the page-scoped `prefetchTimelineContext` maps — the
+ * query-shape audit's A5) so the reads collapse to lookups — a map miss
+ * renders the per-row null verbatim. Omitted keeps the per-row selects
+ * (single-item and fallback callers). The time-comment correlation and the
+ * dependent_issue render are per-row on both paths (the rare arms — a
+ * batched tracked_times key would fan one inArray per distinct (user,
+ * seconds, second) tuple, no win).
  */
 export async function toTimelineComment(
   d1: D1Database,
@@ -1344,7 +1410,7 @@ export async function toTimelineComment(
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
 
-  const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow, dependentLeg, timeCorrelation] = await Promise.all([
+  const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow, teamRow, dependentLeg, timeCorrelation] = await Promise.all([
     preload !== undefined
       ? milestoneFromMap(preload.milestones, comment.oldMilestoneId)
       : comment.oldMilestoneId === null || comment.oldMilestoneId === undefined
@@ -1385,13 +1451,26 @@ export async function toTimelineComment(
             .where(eq(users.id, comment.assigneeId))
             .limit(1)
             .then((rows) => (rows[0] === undefined ? null : rows[0])),
+    preload !== undefined
+      ? teamRowFromMap(preload.teams, comment.assigneeTeamId)
+      : comment.assigneeTeamId <= 0
+        ? Promise.resolve(null)
+        : drizzle(d1)
+            .select()
+            .from(teams)
+            .where(eq(teams.id, comment.assigneeTeamId))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0])),
     comment.dependentIssueId === null || comment.dependentIssueId === undefined
       ? Promise.resolve(null)
       : preload === undefined
         ? dependentIssueLegOf(d1, comment.dependentIssueId)
         : Promise.resolve(preload.dependentIssues.get(comment.dependentIssueId) ?? null),
-    // The time family's rare arms only — `none` for every other row.
-    comment.type === CommentType.AddTimeManual || comment.type === CommentType.StopTracking
+    // The time family's rare arms only — `none` for every other row. A row
+    // already carrying its exact time_id (FN-2) joins the family: upstream
+    // LoadTime runs on every comment and its TimeID == 0 early return is the
+    // only gate (comment.go:733-736).
+    (comment.timeId ?? 0) > 0 || comment.type === CommentType.AddTimeManual || comment.type === CommentType.StopTracking
       ? trackedTimeOfComment(d1, viewer, pair, issue, comment)
       : Promise.resolve({ kind: "none" as const }),
   ]);
@@ -1399,6 +1478,11 @@ export async function toTimelineComment(
   // The degenerate arms drop the row (see the docstring) — null, never a
   // null-metadata render.
   if (comment.assigneeId !== null && comment.assigneeId !== undefined && assigneeRow === null) {
+    return null;
+  }
+  // The team twin (LoadAssigneeUserAndTeam's team leg → GetPossibleTeamByID
+  // error → ToTimelineComment's nil).
+  if (comment.assigneeTeamId > 0 && teamRow === null) {
     return null;
   }
   if (comment.dependentIssueId !== null && comment.dependentIssueId !== undefined && dependentLeg === null) {
@@ -1418,8 +1502,8 @@ export async function toTimelineComment(
     body: timelineBodyOf(comment),
     created_at: isoOrZero(comment.createdAt),
     updated_at: isoOrZero(comment.updatedAt),
-    old_project_id: 0, // projects tier 3
-    project_id: 0,
+    old_project_id: comment.oldProjectId ?? 0, // unset rides the Go zero (the contract's int64)
+    project_id: comment.projectId ?? 0,
     old_milestone: oldMilestoneRow === null ? null : toApiMilestone(oldMilestoneRow),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
     tracked_time: timeCorrelation.kind === "found" ? timeCorrelation.time : null,
@@ -1434,7 +1518,7 @@ export async function toTimelineComment(
     review_id: comment.reviewId ?? 0,
     label: labelRow === null ? null : toEmbeddedLabel(labelRow, pair, viewer.origin),
     assignee: assigneeRow === null ? null : apiUserFromRow(assigneeRow, viewer),
-    assignee_team: null, // teams tier 2
+    assignee_team: teamRow === null ? null : toTimelineTeam(teamRow),
     removed_assignee: (comment.removedAssignee ?? 0) !== 0,
     resolve_doer: null, // review threads tier 2
     dependent_issue: dependentLeg === null ? null : await toApiIssue(d1, viewer, dependentLeg.pair, dependentLeg.issue),
@@ -2237,9 +2321,10 @@ function projectCanBeAccessedByOwnerRepo(repo: RepositoryWithOwner, project: Pro
 
 /**
  * The type-30 project comment, the landed projects-service shape verbatim
- * (services/projects.ts writeProjectComment): the ids ride `content` JSON
- * (the landed adaptation — upstream has dedicated int64 columns), the row
- * does NOT count into num_comments (upstream updateCommentInfos,
+ * (services/projects.ts writeProjectComment): the arm's ids stamp the FN-2
+ * columns (`old_project_id`/`project_id`, upstream CreateCommentOptions
+ * issue_project.go:90-99) and `content` stays empty — upstream's body; the
+ * row does NOT count into num_comments (upstream updateCommentInfos,
  * comment.go:937-948) and bumps the issue's updated_unix. Replicated here
  * because the REMOVAL arm is upstream's direct row delete
  * (issue_project.go:113-127 — no column dance) and projects.ts is outside
@@ -2250,7 +2335,7 @@ async function writeIssueProjectComment(
   d1: D1Database,
   issueId: number,
   posterId: number | null,
-  payload: Record<string, unknown>,
+  cells: { oldProjectId: number; projectId: number },
   now: Date,
 ): Promise<void> {
   const db = drizzle(d1);
@@ -2259,7 +2344,9 @@ async function writeIssueProjectComment(
       type: CommentType.Project,
       posterId,
       issueId,
-      content: JSON.stringify(payload),
+      content: "",
+      oldProjectId: cells.oldProjectId,
+      projectId: cells.projectId,
       createdAt: now,
       updatedAt: now,
     }),
@@ -2356,7 +2443,7 @@ export async function assignOrRemoveIssueProjects(
       .delete(projectIssues)
       .where(and(eq(projectIssues.issueId, issue.id), inArray(projectIssues.projectId, removed)));
     for (const projectId of removed) {
-      await writeIssueProjectComment(d1, issue.id, doerId, { old_project_id: projectId, project_id: 0 }, now);
+      await writeIssueProjectComment(d1, issue.id, doerId, { oldProjectId: projectId, projectId: 0 }, now);
     }
     await notifyIssueChangeProjects(d1, {
       issue,
@@ -2368,7 +2455,7 @@ export async function assignOrRemoveIssueProjects(
     });
   }
   // Adds: the default column + the landed attach seam (which writes the
-  // add comment {old_project_id: 0, project_id: project.id} internally).
+  // add comment {oldProjectId: 0, projectId: project.id} internally).
   for (const project of addRows) {
     const defaultColumn = await mustDefaultColumn(d1, project, now);
     await addIssueToColumn(d1, project, issue, defaultColumn, doerId, now);

@@ -41,6 +41,7 @@ import {
   repoCounters,
   repoSettings,
   repositories,
+  teams,
   trackedTimes,
   userBlocking,
   users,
@@ -4678,7 +4679,9 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
     expect(memberships.map((m) => m.projectId)).toEqual([project.id]);
     const projectComments = await db().select().from(comments).where(eq(comments.type, CommentType.Project)).all();
     expect(projectComments).toHaveLength(1);
-    expect(JSON.parse(projectComments[0]!.content ?? "{}")).toEqual({ old_project_id: 0, project_id: project.id });
+    // FN-2: the ids ride the columns, `content` stays empty (upstream's
+    // type-30 body).
+    expect(projectComments[0]).toMatchObject({ content: "", oldProjectId: 0, projectId: project.id });
   });
 
   it("⑯-P3-4: a non-writer's create projects are cleared silently (issue.go:622's form.Projects = nil)", async () => {
@@ -4739,9 +4742,13 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
     // through IssueAssignOrRemoveProject's per-side comments
     // (issue_project.go:137-151, one type-30 add per project, request order).
     const adds = await db().select().from(comments).where(eq(comments.type, CommentType.Project)).all();
-    expect(adds.map((c) => JSON.parse(c.content ?? "{}") as { old_project_id: number; project_id: number })).toEqual([
-      { old_project_id: 0, project_id: p1.id },
-      { old_project_id: 0, project_id: p2.id },
+    // FN-2: the arm matrix rides the columns (the pre-port shape carried the
+    // payload in `content` JSON).
+    expect(
+      adds.map((c) => ({ old_project_id: c.oldProjectId ?? 0, project_id: c.projectId ?? 0, content: c.content })),
+    ).toEqual([
+      { old_project_id: 0, project_id: p1.id, content: "" },
+      { old_project_id: 0, project_id: p2.id, content: "" },
     ]);
 
     // Replace: [p2] removes p1, keeps p2 — one REMOVAL comment joins the set
@@ -4756,9 +4763,9 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
     const memberships = await db().select().from(projectIssues).where(eq(projectIssues.issueId, issue.id)).all();
     expect(memberships.map((m) => m.projectId)).toEqual([p2.id]);
     const afterReplace = await db().select().from(comments).where(eq(comments.type, CommentType.Project)).all();
-    const removals = afterReplace.filter((c) => (JSON.parse(c.content ?? "{}") as { project_id: number }).project_id === 0);
+    const removals = afterReplace.filter((c) => (c.projectId ?? 0) === 0);
     expect(removals).toHaveLength(1);
-    expect(JSON.parse(removals[0]!.content ?? "{}")).toEqual({ old_project_id: p1.id, project_id: 0 });
+    expect(removals[0]).toMatchObject({ content: "", oldProjectId: p1.id, projectId: 0 });
 
     // Clear: the empty array removes the last membership.
     const clear = await router()(`/repos/alice/visible/issues/${issue.index}`, {
@@ -5038,5 +5045,199 @@ describe("the owner-project counts scope (R5-3)", () => {
     >();
     expect(strangerTimes).toHaveLength(1);
     expect(strangerTimes[0]!.issue.projects?.[0]).toMatchObject({ num_open_issues: 1, num_closed_issues: 0, num_issues: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FN-2 timeline metadata renders (ADR-0007, SPEC-0005 §7.4): the timeline
+// readers stopped hardcoding the mutation-metadata arms — the project pair
+// renders the row's columns (the old 0/0 hardcode), the type-27 team arm
+// resolves the team row (the old null hardcode), and the time family reads
+// the exact `time_id` row FIRST with the (poster, seconds, second)
+// correlation demoted to the legacy fallback (the 0067-unpinned rows).
+// ---------------------------------------------------------------------------
+
+describe("FN-2 timeline metadata renders (ADR-0007, SPEC-0005 §7.4)", () => {
+  const at = (offset: number): Date => new Date((1_770_100_000 + offset) * 1000);
+
+  /** The org + team a type-27 team-request row needs. */
+  async function seedTeam(): Promise<{ orgId: number; teamId: number }> {
+    const org = (
+      await db()
+        .insert(users)
+        .values({ username: "fn2-org", usernameLower: "fn2-org", type: "org", status: "active", createdAt: at(0) })
+        .returning({ id: users.id })
+        .all()
+    )[0]!;
+    const team = (
+      await db()
+        .insert(teams)
+        .values({ orgId: org.id, lowerName: "fn2-team", name: "FN2 Team", description: "", authorize: "write" })
+        .returning({ id: teams.id })
+        .all()
+    )[0]!;
+    return { orgId: org.id, teamId: team.id };
+  }
+
+  it("fn2-timeline-time-render-exact: tracked_time pins the comment's OWN time_id row, not the heuristic twin; a dangling time_id drops the row", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "fn2 exact time", { posterId: owner.id });
+    // Two entries with the SAME (issue, poster, seconds) — the legacy
+    // heuristic picks the NEWEST; the exact arm must pin the comment's
+    // own (OLDER) time_id row.
+    const entries = await db()
+      .insert(trackedTimes)
+      .values([
+        { issueId: issue.id, userId: owner.id, seconds: 5400, createdAt: at(10) },
+        { issueId: issue.id, userId: owner.id, seconds: 5400, createdAt: at(20) },
+      ])
+      .returning({ id: trackedTimes.id })
+      .all();
+    const [older, newer] = entries.map((row) => row.id);
+    expect(older).not.toBe(newer);
+    const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
+      db().insert(comments).values({ issueId: issue.id, content: "", createdAt: at(30), updatedAt: at(30), ...values });
+    await insert({ type: CommentType.AddTimeManual, posterId: owner.id, content: "|5400", timeId: older, createdAt: at(40), updatedAt: at(40) });
+    await insert({ type: CommentType.AddTimeManual, posterId: owner.id, content: "|5400", timeId: 999999, createdAt: at(50), updatedAt: at(50) }); // dangling
+
+    const app = createApiRouter();
+    const res = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/timeline`), env);
+    expect(res.status).toBe(200);
+    const timeline = await res.json<Array<Record<string, unknown> & { id: number; tracked_time: Record<string, unknown> | null }>>();
+    // The dangling-id row DROPPED (upstream LoadTime → GetTrackedTimeByID
+    // error arm → ToTimelineComment's nil, the route filter's shape).
+    expect(timeline).toHaveLength(1);
+    const time = timeline[0]!.tracked_time;
+    expect(time).not.toBeNull();
+    expect(time!.id).toBe(older); // the exact row — NOT the heuristic's newest twin
+    expect(time!.time).toBe(5400);
+    expect(time!.user_name).toBe("Alice");
+    expect(time!.user_id).toBe(owner.id);
+    expect(time!.issue_id).toBe(issue.id);
+  });
+
+  it("fn2-timeline-assignee-team-render: the team arm renders the ToTeam shape, the user arm renders assignee; a dangling team id drops the row", async () => {
+    const owner = await seedUser("Alice");
+    const other = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "fn2 team render", { posterId: owner.id });
+    const { teamId } = await seedTeam();
+    const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
+      db().insert(comments).values({ issueId: issue.id, content: "", createdAt: at(30), updatedAt: at(30), ...values });
+    await insert({ type: CommentType.ReviewRequest, posterId: owner.id, assigneeTeamId: teamId }); // the team arm
+    await insert({ type: CommentType.ReviewRequest, posterId: other.id, assigneeId: other.id }); // the user arm
+    await insert({ type: CommentType.ReviewRequest, posterId: owner.id, assigneeTeamId: 999999 }); // dangling team
+
+    const app = createApiRouter();
+    const res = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/timeline`), env);
+    expect(res.status).toBe(200);
+    const timeline = await res.json<Array<Record<string, unknown> & { id: number; assignee: Record<string, unknown> | null; assignee_team: Record<string, unknown> | null }>>();
+    // The dangling team id DROPS the row (LoadAssigneeUserAndTeam's team leg
+    // → GetPossibleTeamByID error → ToTimelineComment's nil).
+    expect(timeline).toHaveLength(2);
+    const teamRender = timeline.find((item) => item.assignee_team !== null);
+    const userRender = timeline.find((item) => item.assignee !== null);
+    expect(teamRender).toBeDefined();
+    expect(userRender).toBeDefined();
+    // The contract Team shape (ToTeam with no org load): the emitted fields,
+    // units parsed from the (null → {}) units_map, sorted keys.
+    expect(teamRender!.assignee).toBeNull();
+    expect(teamRender!.assignee_team).toMatchObject({
+      id: teamId,
+      name: "FN2 Team",
+      description: "",
+      includes_all_repositories: false,
+      can_create_org_repo: false,
+      permission: "write",
+      units: [],
+      units_map: {},
+      visibility: "private",
+    });
+    // The user arm keeps upstream's AssigneeID path: the assignee renders,
+    // the team id stays the null render.
+    expect(userRender!.assignee_team).toBeNull();
+    expect((userRender!.assignee as Record<string, unknown>).login).toBe("Bob");
+  });
+
+  it("fn2-timeline-project-ids-render: fresh AND backfilled type-30 rows emit the real ids with the empty body; other types stay 0/0", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "fn2 project ids", { posterId: owner.id });
+    const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
+      db().insert(comments).values({ issueId: issue.id, content: "", createdAt: at(30), updatedAt: at(30), ...values });
+    // The FRESH shape: the writers stamp the columns and leave content empty.
+    await insert({ type: CommentType.Project, posterId: owner.id, oldProjectId: 0, projectId: 77 });
+    // The BACKFILLED shape: the pre-0067 row (payload JSON in content) run
+    // through migration 0067's type-30 backfill statement verbatim.
+    await insert({ type: CommentType.Project, posterId: owner.id, content: '{"old_project_id":88,"project_id":0}' });
+    await env.DB
+      .prepare(
+        `UPDATE \`comments\`
+SET \`old_project_id\` = json_extract(\`content\`, '$.old_project_id'),
+    \`project_id\` = json_extract(\`content\`, '$.project_id'),
+    \`content\` = ''
+WHERE \`type\` = 30
+  AND json_valid(\`content\`)
+  AND json_type(\`content\`, '$') = 'object'
+  AND json_type(\`content\`, '$.old_project_id') IN ('integer', 'real')
+  AND json_type(\`content\`, '$.project_id') IN ('integer', 'real')`,
+      )
+      .run();
+    // A plain comment: every other type keeps the Go zero (the contract's
+    // int64 default), and its body is NOT rewritten.
+    await insert({ type: CommentType.Comment, posterId: owner.id, content: "plain body" });
+
+    const app = createApiRouter();
+    const res = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/timeline`), env);
+    expect(res.status).toBe(200);
+    const timeline = await res.json<Array<Record<string, unknown> & { id: number; body: string; old_project_id: number; project_id: number }>>();
+    expect(timeline).toHaveLength(3);
+    const attach = timeline.find((item) => item.project_id === 77);
+    const detach = timeline.find((item) => item.old_project_id === 88);
+    const plain = timeline.find((item) => item.body === "plain body");
+    expect(attach).toBeDefined();
+    expect(detach).toBeDefined();
+    // The bodies are EMPTY — the payload rides the columns, not the timeline
+    // body (the pre-FN-2 leak through timelineBodyOf's passthrough is gone).
+    expect(attach!.body).toBe("");
+    expect(attach!.old_project_id).toBe(0);
+    expect(detach!.body).toBe("");
+    expect(detach!.project_id).toBe(0);
+    expect(plain!.old_project_id).toBe(0);
+    expect(plain!.project_id).toBe(0);
+  });
+
+  it("fn2-timeline-body-passthrough-regression: the humanized/verbatim body arms are untouched by the port", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "fn2 body passthrough", { posterId: owner.id });
+    const entry = (
+      await db()
+        .insert(trackedTimes)
+        .values({ issueId: issue.id, userId: owner.id, seconds: 3600, createdAt: at(10) })
+        .returning({ id: trackedTimes.id })
+        .all()
+    )[0]!;
+    const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
+      db().insert(comments).values({ issueId: issue.id, content: "", createdAt: at(30), updatedAt: at(30), ...values });
+    await insert({ type: CommentType.AddTimeManual, posterId: owner.id, content: "|3600", timeId: entry.id }); // humanized
+    // The stop-tracking writer pre-humanizes its content AND stamps the
+    // batch-mate id (the exact arm) — a stamp-less row would ride the legacy
+    // correlation and drop (no same-second entry here).
+    await insert({ type: CommentType.StopTracking, posterId: owner.id, content: "1 hour ", timeId: entry.id }); // pre-humanized verbatim
+    await insert({ type: CommentType.ChangeTimeEstimate, posterId: owner.id, content: "5400" }); // estimate string
+    await insert({ type: CommentType.Comment, posterId: owner.id, content: '{"looks":"like json"}' }); // verbatim — NOT stripped
+
+    const app = createApiRouter();
+    const res = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/timeline`), env);
+    expect(res.status).toBe(200);
+    const timeline = await res.json<Array<Record<string, unknown> & { id: number; body: string }>>();
+    expect(timeline).toHaveLength(4);
+    const bodies = new Set(timeline.map((item) => item.body));
+    expect(bodies).toContain("1 hour"); // secToHours(3600)
+    expect(bodies).toContain("1 hour "); // the stop-tracking content passes through
+    expect(bodies).toContain("1h 30m"); // TimeEstimateString(5400)
+    expect(bodies).toContain('{"looks":"like json"}'); // non-project bodies verbatim
   });
 });

@@ -1597,6 +1597,7 @@ export function registerPullReviewRoutes(
             posterId: doerId,
             issueId: issue.id,
             reviewId: review.id,
+            assigneeTeamId: team.id, // upstream AssigneeTeamID (review.go:865)
             createdAt: now,
             updatedAt: now,
           }).returning(),
@@ -1700,6 +1701,7 @@ export function registerPullReviewRoutes(
           posterId: doerId,
           issueId: issue.id,
           removedAssignee: 1,
+          assigneeTeamId: team.id, // upstream AssigneeTeamID (review.go:922)
           createdAt: now,
           updatedAt: now,
         }),

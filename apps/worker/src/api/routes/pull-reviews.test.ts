@@ -22,7 +22,7 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -664,6 +664,31 @@ describe("code-comment diff hunks (the GetCodeCommentPatch port)", () => {
     expect(list).toHaveLength(1);
     expect(list[0]!.diff_hunk).toBe("");
   });
+
+  it("FN-2 regression pin (SPEC-0005 §7.6 #11): code-comment create still stores comments.patch — the mutation-metadata port touched no patch DDL", async () => {
+    const { index } = await seedDiffScenario();
+    const run = router();
+    const created = (await jsonBody(
+      await run(
+        `/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews`,
+        authed(DOER_TOKEN, {
+          method: "POST",
+          body: JSON.stringify({ event: "COMMENT", body: "patch parity", comments: [{ path: FILE, body: "stored", new_position: 6 }] }),
+        }),
+      ),
+    ));
+    // The STORE level: the row's patch column holds the hunks (patch is
+    // untouched by 0067 — schema.test.ts pins its DDL verbatim; this suite's
+    // beforeEach wipes comments, so the single code comment is THE row).
+    const stored = await db().select({ patch: comments.patch }).from(comments).where(eq(comments.type, CommentType.Code)).all();
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.patch).toContain("@@");
+    // The render path unchanged: the review comments listing renders the
+    // stored patch through patch2diff.
+    const list = await jsonArray(await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews/${String(created.id)}/comments`));
+    expect(list).toHaveLength(1);
+    expect(list[0]!.diff_hunk).not.toBe("");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1043,5 +1068,92 @@ describe("POST …/requested_reviewers team_reviewers mail fan-out (teamReviewRe
     }
     expect(rows[0]!.dedupeKey).toBe(`pull-review-request:${commentIds[0]}:11`);
     expect(rows[1]!.dedupeKey).toBe(`pull-review-request:${commentIds[1]}:12`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FN-2 (ADR-0007, SPEC-0005 §7.3): the team review-request arms stamp the
+// comment's assignee_team_id — upstream AssigneeTeamID (review.go:865 add /
+// :922 remove); the user-request arms keep AssigneeID and the DEFAULT 0
+// (review.go:748-758). The timeline render of the arm is pinned in
+// issues.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("FN-2: the review-request comments stamp assignee_team_id", () => {
+  /** The ORG-owned repo + team the team arms require (team resolution keys
+   *  teams.org_id on the owner row) — the mail fan-out test's fixture shape. */
+  async function seedOrgRepoWithTeam(): Promise<{ repoId: string; teamId: number; pr: { issueId: number; index: number } }> {
+    for (const table of ["email_outbox", "team_members", "teams"]) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+    await env.DB
+      .prepare("INSERT INTO users (id, username, username_lower, email, type, status, created_at) VALUES (10, 'acme', 'acme', NULL, 'org', 'active', 0)")
+      .run();
+    const repoId = String(repoSeq++);
+    await db().insert(repositories).values({
+      id: repoId,
+      storageKey: `r_${repoId}`,
+      ownerNamespace: "acme",
+      ownerId: 10,
+      slug: SLUG,
+      visibility: "public",
+      isArchived: false,
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await service().ensureRepoCounters(repoId);
+    const teamId = (await db().insert(teams).values({ orgId: 10, lowerName: "requesters", name: "Requesters" }).returning({ id: teams.id }).all())[0]!.id;
+    await db().insert(teamMembers).values({ orgId: 10, teamId, userId: 1 });
+    const pr = await seedPull(repoId);
+    return { repoId, teamId, pr };
+  }
+
+  it("the team add writes (assignee_id NULL, review_id set, assignee_team_id = team.id); the remove stamps it too", async () => {
+    const run = router();
+    const { teamId, pr } = await seedOrgRepoWithTeam();
+
+    const res = await run(`/api/v1/repos/acme/${SLUG}/pulls/${pr.index}/requested_reviewers`, authed(POSTER_TOKEN, { method: "POST", body: JSON.stringify({ team_reviewers: ["requesters"] }) }));
+    expect(res.status).toBe(201);
+    const addComment = (
+      await db().select().from(comments).where(and(eq(comments.issueId, pr.issueId), eq(comments.type, CommentType.ReviewRequest))).all()
+    )[0]!;
+    expect(addComment.assigneeId ?? null).toBeNull(); // the team shape: no user arm
+    expect(addComment.assigneeTeamId).toBe(teamId); // review.go:865
+    expect(addComment.removedAssignee ?? 0).toBe(0);
+    expect((addComment.reviewId ?? 0)).toBeGreaterThan(0); // the Request row link
+    const requestRows = await reviewRows(pr.issueId);
+    expect(requestRows).toHaveLength(1);
+    expect(addComment.reviewId).toBe(requestRows[0]!.id);
+
+    const del = await run(`/api/v1/repos/acme/${SLUG}/pulls/${pr.index}/requested_reviewers`, authed(POSTER_TOKEN, { method: "DELETE", body: JSON.stringify({ team_reviewers: ["requesters"] }) }));
+    expect(del.status).toBe(204);
+    const removeComment = (
+      await db()
+        .select()
+        .from(comments)
+        .where(and(eq(comments.issueId, pr.issueId), eq(comments.type, CommentType.ReviewRequest)))
+        .orderBy(desc(comments.id))
+        .all()
+    )[0]!;
+    expect(removeComment.id).not.toBe(addComment.id);
+    expect(removeComment.assigneeTeamId).toBe(teamId); // review.go:922
+    expect(removeComment.removedAssignee).toBe(1);
+    expect(removeComment.reviewId ?? 0).toBe(0); // the removed arm carries no review link
+  });
+
+  it("the user-request arms keep assignee_id and the DEFAULT-0 team id", async () => {
+    const run = router();
+    await seedOrgRepoWithTeam(); // the org fixture does not disturb the user arm
+    const repoId = await seedRepo();
+    const pr = await seedPull(repoId);
+
+    const res = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/requested_reviewers`, authed(POSTER_TOKEN, { method: "POST", body: JSON.stringify({ reviewers: ["doer"] }) }));
+    expect(res.status).toBe(201);
+    const addComment = (
+      await db().select().from(comments).where(and(eq(comments.issueId, pr.issueId), eq(comments.type, CommentType.ReviewRequest))).all()
+    )[0]!;
+    expect(addComment.assigneeId).toBe(1); // upstream AssigneeID (review.go:748-758)
+    expect(addComment.assigneeTeamId).toBe(0);
   });
 });

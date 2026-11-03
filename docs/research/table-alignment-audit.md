@@ -50,10 +50,13 @@ sources and found accurate.
   the §4 section carry the landed annotations), FN-6 LANDED (migration
   0066, repo_units `id`/`created_unix`/`everyone_access_mode` — the §3.1
   row and the §4 section carry the landed annotations; the toggle-stamp
-  follow-up landed as its own fix). The next OPENING units per this
+  follow-up landed as its own fix), FN-2 LANDED (migration 0067, the
+  comments mutation-metadata five after §7.11 recorded the original_author
+  pair absent — the §4 `comment` row, the derivation expansion's column
+  rows, and the §5 section carry the landed annotations; SPEC-0005 §7 is
+  the as-built record). The next OPENING units per this
   audit's own ordering (API-visible first, records last) are therefore
-  FN-2 (comments mutation-metadata — 5 columns to PORT after §7.11
-  recorded the original_author pair absent), FN-7 (pull_auto_merges,
+  FN-7 (pull_auto_merges,
   riding FN-5's renames), and FN-4 (repositories upstream-column
   completion, purely additive).
 
@@ -276,7 +279,7 @@ classes only.
 | `milestone` | models/issues/milestone.go:47 | schema.ts:866 `milestones` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `stopwatch` | models/issues/stopwatch.go:20 | schema.ts:1940 `stopwatch` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `issue` | models/issues/issue.go:54 | schema.ts:610 `issues` | drift | upstream column `name` → ours `title`: the field carries the explicit xorm column-NAME tag `xorm:"name"` (issue.go:63), which upstream's own SQL binds (writes: `UpdateIssueCols(ctx, issue, "name")`, issue_update.go:198; search: the backticked column, issue.go:536); ours declares `title` (schema.ts:624) — FN-5 carrier (§7.8); the rest is blanket families (id / timestamp-name / strictness) |
-| `comment` | models/issues/comment.go:273 | schema.ts:740 `comments` | drift | missing 7 mutation-metadata cols (comment_meta_data, project_id, old_project_id, time_id, assignee_team_id, original_author, original_author_id); the census's 8th, patch_quoted, WITHDRAWN by the §4 erratum (upstream's column IS patch: parity); the original_author pair now recorded-absent (§7.11), leaving 5 PORT columns for FN-2 |
+| `comment` | models/issues/comment.go:273 | schema.ts:740 `comments` | drift | missing 7 mutation-metadata cols (comment_meta_data, project_id, old_project_id, time_id, assignee_team_id, original_author, original_author_id); the census's 8th, patch_quoted, WITHDRAWN by the §4 erratum (upstream's column IS patch: parity); the original_author pair now recorded-absent (§7.11), leaving 5 PORT columns for FN-2 — the 5 LANDED (migration 0067, pure ADD COLUMN + the JSON-gated backfills; the writers/readers ride SPEC-0005 §7 as-built; patch untouched) |
 | `issue_content_history` | models/issues/content_history.go:20 | schema.ts:3455 `issue_content_history` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `tracked_time` | models/issues/tracked_time.go:22 | schema.ts:1913 `tracked_time` | drift | time → seconds column rename (unit kept seconds) |
 | `issue_dependency` | models/issues/dependency.go:101 | schema.ts:1885 `issue_dependency` | drift | missing updated_unix |
@@ -602,10 +605,10 @@ Verdict matrix (ADR-0007 vocabulary; ours cites = this worktree):
 
 | upstream column | upstream field (cite) | our write seam today | our read arm today | verdict |
 |---|---|---|---|---|
-| `project_id` | `ProjectID int64` nullable (comment.go:292) | LIVE — type-30/31 writers carry the id in `content` JSON (api/services/projects.ts:914,967,1060; api/services/issues.ts:2258-2266) | LIVE-but-hardcoded — `project_id: 0` (api/services/issues.ts:1422) | drift → PORT (FN-2) |
-| `old_project_id` | `OldProjectID int64` nullable (comment.go:291) | same type-30 writers (same cells) | LIVE-but-hardcoded — `old_project_id: 0` (issues.ts:1421) | drift → PORT (FN-2) |
-| `time_id` | `TimeID int64` nullable (comment.go:301) | LIVE — time writers omit it (ui/pages/issue-timeline-writes.ts:764-771,817-824; api/routes/issue-tables-t2.ts:1541-1549) | LIVE-but-heuristic — `trackedTimeOfComment` correlates (poster, seconds, second) (api/services/issues.ts:1207) | drift → PORT (FN-2) |
-| `assignee_team_id` | `AssigneeTeamID int64` NOT NULL DEFAULT 0 (comment.go:307) | LIVE — team review-request comments write neither id arm (api/routes/pull-reviews.ts:1596-1602 add, :1699-1706 remove) | LIVE-but-null — `assignee_team: null` (issues.ts:1437) | drift → PORT (FN-2) |
+| `project_id` | `ProjectID int64` nullable (comment.go:292) | LANDED (FN-2) — the type-30/31 writers stamp the column with `content` empty (api/services/projects.ts, api/services/issues.ts; SPEC-0005 §7.3 as-built); the pre-port JSON-in-content rows are backfilled by 0067 | LANDED — the timeline render reads the column (the `project_id: 0` hardcode gone, api/services/issues.ts) | drift → LANDED (FN-2, 2026-11-03) |
+| `old_project_id` | `OldProjectID int64` nullable (comment.go:291) | LANDED (FN-2) — same arms, the add/remove id pair per issue_project.go:90-99/:138-147 | LANDED — the timeline render reads the column | drift → LANDED (FN-2, 2026-11-03) |
+| `time_id` | `TimeID int64` nullable (comment.go:301) | LANDED (FN-2) — the add/stop writers stamp the exact-row link in all four twins (the trackedTimes insert runs alone, then the comment batch — a drizzle batch leg cannot reference a prior leg's returning id); 0067 backfilled the pre-port rows via the documented correlation | LANDED — `trackedTimeOfComment` reads `time_id` FIRST, the (poster, seconds, second) correlation is the legacy-row fallback only (its docstring is the removal marker) | drift → LANDED (FN-2, 2026-11-03) |
+| `assignee_team_id` | `AssigneeTeamID int64` NOT NULL DEFAULT 0 (comment.go:307) | LANDED (FN-2) — the team review-request arms stamp `assigneeTeamId = team.id` (api/routes/pull-reviews.ts, review.go:865/:922); 0067 backfilled the team rows from `pull_reviews.reviewer_team_id` | LANDED — the timeline renders the contract Team shape via the batched teams map (upstream ToTeam; a dangling id drops the row — LoadAssigneeUserAndTeam's error arm), the `assignee_team: null` hardcode gone | drift → LANDED (FN-2, 2026-11-03) |
 | `comment_meta_data` | `CommentMetaData *CommentMetaData` JSON TEXT nullable (comment.go:360, struct :249-257) | PARTIAL — type-31 column-move payload rides `content` JSON (projects.ts:1060); no CODEOWNERS arm; workflows reuse the human write (services/projects-workflow.ts:510-560) | none — no type-31/label timeline render (ui/pages/issue-detail.tsx:734-746 renders types 0/1/2/28 only), no label-merge guard | drift → PORT the column-move arm; SpecialDoerName arms PORT-WHEN-READ |
 | `original_author` | `OriginalAuthor string` nullable (comment.go:280) | none — no comment-migration inflow (grep 0) | none — API `user` renders the poster row directly (issues.ts:1417), no `ToAuthor` fallback | recorded-absent (FN-9, §7.11 + SPEC-0005 §9; the `issues.original_author` twin is RESERVED, schema.ts:620) |
 | `original_author_id` | `OriginalAuthorID int64` nullable (comment.go:281) | none | none | recorded-absent (FN-9, §7.11) |
@@ -1084,7 +1087,14 @@ applies).
   §4 erratum — upstream's column IS `patch`, the comment.go:330 bare-token
   override: parity) and the `original_author`/`original_author_id` pair
   (comment.go:280-281) is recorded-absent by §7.11 + SPEC-0005 §9, not
-  ported.
+  ported. **LANDED (2026-11-03, migration 0067 — pure ADD COLUMN + the
+  JSON-gated backfills; the type-30/31/time/team writers stamp the columns
+  with `content` empty, the timeline readers render the columns, the team
+  arm, and the exact `time_id` row; SPEC-0005 §7 is the as-built record.
+  Tests: schema.test's FN-2 describe (DDL + the backfill statements
+  verbatim, the conservative arms) + the FN-2 describes in the
+  issue-timeline-writes, issue-tables-t2, pull-reviews and issues
+  batteries).**
 - **FN-4: repositories upstream-column completion (26 columns).** The
   §4 repositories residual: identity denormalization (`name`, `lower_name`,
   `owner_name`), sizes (`size`, `git_size`, `lfs_size` — ours `size_kb`

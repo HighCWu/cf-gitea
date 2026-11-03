@@ -757,15 +757,22 @@ export async function applyDependencyRemoveWrite(
 
 /** AddTime (models/issues/tracked_time.go:164-193, the landed API port's
  *  shape): the tracked_time row + the add_time_manual (14) comment with
- *  the `|{seconds}` marker + the counter fold. */
+ *  the `|{seconds}` marker + the counter fold. Upstream inserts the time row
+ *  first and stamps the comment's TimeID from it (:171-189); the drizzle
+ *  batch cannot reference a prior leg's returning id, so the insert runs
+ *  alone and the comment/fold batch follows — upstream's statement order. */
 export async function applyTimeAddWrite(d1: D1Database, issue: IssueRow, userId: number, seconds: number, now: Date): Promise<void> {
+  const [time] = await drizzle(d1)
+    .insert(trackedTimes)
+    .values({ issueId: issue.id, userId, seconds, createdAt: now })
+    .returning({ id: trackedTimes.id });
   await drizzle(d1).batch([
-    drizzle(d1).insert(trackedTimes).values({ issueId: issue.id, userId, seconds, createdAt: now }),
     drizzle(d1).insert(comments).values({
       type: CommentType.AddTimeManual,
       posterId: userId,
       issueId: issue.id,
       content: `|${seconds}`,
+      timeId: time!.id,
       createdAt: now,
       updatedAt: now,
     }),
@@ -808,17 +815,25 @@ export async function applyTimeDeleteWrite(d1: D1Database, issue: IssueRow, entr
 
 /** finishIssueStopwatch (stopwatch.go:145-169): bank the elapsed time, the
  *  stop_tracking (13) comment with the SecToHours content, the counter
- *  fold, the row delete — one batch (the time_id back-reference has no
- *  landed column — the landed API port's documented deviation). */
+ *  fold, the row delete. Upstream inserts the tracked_time first and stamps
+ *  the comment's TimeID from it (:153-164); the drizzle batch cannot
+ *  reference a prior leg's returning id, so the banked insert runs alone and
+ *  the comment/fold/delete batch follows — upstream's statement order, the
+ *  stopwatch delete LAST so a phase-1 failure cannot lose a running
+ *  stopwatch while its time is banked. */
 export async function finishStopwatch(d1: D1Database, issue: IssueRow, userId: number, stopwatch: { id: number; createdAt: Date }, now: Date): Promise<void> {
   const elapsed = Math.max(0, Math.floor((now.getTime() - stopwatch.createdAt.getTime()) / 1000));
+  const [time] = await drizzle(d1)
+    .insert(trackedTimes)
+    .values({ issueId: issue.id, userId, seconds: elapsed, createdAt: now })
+    .returning({ id: trackedTimes.id });
   await drizzle(d1).batch([
-    drizzle(d1).insert(trackedTimes).values({ issueId: issue.id, userId, seconds: elapsed, createdAt: now }),
     drizzle(d1).insert(comments).values({
       type: CommentType.StopTracking,
       posterId: userId,
       issueId: issue.id,
       content: secToHours(elapsed),
+      timeId: time!.id,
       createdAt: now,
       updatedAt: now,
     }),

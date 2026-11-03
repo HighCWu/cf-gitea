@@ -807,11 +807,15 @@ describe("column issues: list / add / remove / move", () => {
     expect(membership).toMatchObject({ projectId: project.id, projectColumnId: target.id, sorting: 0 });
     const written = await db().select().from(comments).where(eq(comments.issueId, issue.id)).orderBy(comments.id).all();
     expect(written.map((c) => c.type)).toEqual([30, 31]); // project-added, then column-changed
-    expect(JSON.parse(written[0]?.content ?? "{}")).toEqual({ old_project_id: 0, project_id: project.id });
-    expect(JSON.parse(written[1]?.content ?? "{}")).toEqual({
-      project_id: project.id,
+    // FN-2: the ids ride the columns (`content` empty — upstream's body);
+    // the column move fills project_id + the comment_meta_data JSON with
+    // project_title included (buildCreateCommentMetaData).
+    expect(written[0]).toMatchObject({ content: "", oldProjectId: 0, projectId: project.id, commentMetaData: null });
+    expect(written[1]).toMatchObject({ content: "", projectId: project.id });
+    expect(JSON.parse(written[1]!.commentMetaData ?? "{}")).toEqual({
       project_column_id: target.id,
       project_column_title: "In Progress",
+      project_title: project.title,
     });
     const refreshed = await db().select().from(issues).where(eq(issues.id, issue.id)).all();
     expect(refreshed[0]?.numComments).toBe(0); // system comments never bump the count
@@ -894,7 +898,8 @@ describe("column issues: list / add / remove / move", () => {
     expect(res.status).toBe(204);
     expect(await db().select().from(projectIssues).where(eq(projectIssues.issueId, member.id)).all()).toHaveLength(0);
     const written = await db().select().from(comments).where(eq(comments.issueId, member.id)).all();
-    expect(JSON.parse(written[0]?.content ?? "{}")).toEqual({ old_project_id: project.id, project_id: 0 });
+    // FN-2: the detach ids ride the columns, the body stays empty.
+    expect(written[0]).toMatchObject({ content: "", oldProjectId: project.id, projectId: 0 });
   });
 
   it("repoMoveProjectIssue moves with sorting; foreign column 422; non-member 422", async () => {

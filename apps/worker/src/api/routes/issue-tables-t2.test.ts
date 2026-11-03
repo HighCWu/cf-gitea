@@ -1238,3 +1238,47 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// FN-2 (ADR-0007, SPEC-0005 §7.3): the API-port time twins stamp the exact
+// time_id — upstream AddTime carries `TimeID: t.ID` (tracked_time.go:188) and
+// finishIssueStopwatch `TimeID: tt.ID` (stopwatch.go:162); the drizzle batch
+// cannot reference a prior leg's returning id, so the banked insert runs
+// alone before the comment/fold batch. The web twins' battery pins the same
+// stamps (issue-timeline-writes.test.ts).
+// ---------------------------------------------------------------------------
+
+describe("FN-2: the times/stopwatch writers stamp time_id", () => {
+  it("POST /times inserts the entry first and the add_time_manual (14) comment carries its id", async () => {
+    const res = await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed(jsonBody({ time: 120 })));
+    expect(res.status).toBe(200);
+    const entry = (await drizzle(env.DB).select({ id: trackedTimes.id }).from(trackedTimes).all())[0]!;
+    const comment = (await systemComments(issueA.id, 14))[0]!;
+    expect(entry).toBeDefined();
+    expect(comment.timeId).toBe(entry.id);
+  });
+
+  it("the stopwatch stop banks the entry and the stop_tracking (13) comment carries its id; cancel/delete stamp none", async () => {
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/stopwatch/start`, authed({ method: "POST" }));
+    const stopped = await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/stopwatch/stop`, authed({ method: "POST" }));
+    expect(stopped.status).toBe(201);
+    const banked = (await drizzle(env.DB).select({ id: trackedTimes.id }).from(trackedTimes).all())[0]!;
+    const stopComment = (await systemComments(issueA.id, 13))[0]!;
+    expect(banked).toBeDefined();
+    expect(stopComment.timeId).toBe(banked.id);
+
+    // The cancel arm banks nothing and writes no time_id (stopwatch.go:222-230);
+    // the time delete's comment 26 stamps none either (tracked_time.go:252-263).
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/stopwatch/start`, authed({ method: "POST" }));
+    const cancelled = await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/stopwatch/delete`, authed({ method: "DELETE" }));
+    expect(cancelled.status).toBe(204);
+    expect(((await systemComments(issueA.id, 15))[0]!).timeId ?? null).toBeNull();
+
+    const second = await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed(jsonBody({ time: 5 })));
+    expect(second.status).toBe(200);
+    const entry = (await drizzle(env.DB).select({ id: trackedTimes.id, deleted: trackedTimes.deleted }).from(trackedTimes).orderBy(asc(trackedTimes.id)).all()).at(-1)!;
+    const del = await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times/${entry.id}`, authed({ method: "DELETE" }));
+    expect(del.status).toBe(204);
+    expect(((await systemComments(issueA.id, 26)).at(-1)!).timeId ?? null).toBeNull();
+  });
+});

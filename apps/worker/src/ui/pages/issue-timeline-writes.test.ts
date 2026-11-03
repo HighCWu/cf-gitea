@@ -52,12 +52,12 @@
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { and, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { addIssueToColumn, createColumn, createProject, mustDefaultColumn, repoProjectScope } from "../../api/services/projects";
+import { addIssueToColumn, createColumn, createProject, moveIssueToColumn, mustDefaultColumn, removeIssueFromColumn, repoProjectScope } from "../../api/services/projects";
 import {
   comments,
   issueDependencies,
@@ -1247,5 +1247,138 @@ describe("POST /{issues|pulls}/projects/column (upstream UpdateIssueProjectColum
       formPost("/x", { issue_id: "999999", id: String(column.id) }, f.ownerCookie),
     );
     expect(missingIssue.status).toBe(404);
+  });
+});
+
+// --- FN-2: the mutation-metadata writes (ADR-0007, SPEC-0005 §7.3) -----------------
+//
+// The port stamped the comments mutation-metadata columns the writers own:
+// the time twins carry the exact-row `time_id` (upstream tracked_time.go:188 /
+// stopwatch.go:162 — the trackedTimes insert now runs BEFORE the comment batch
+// so the returning id can stamp it), the project arms carry the
+// `old_project_id`/`project_id` pair with `content` EMPTY (upstream's
+// CreateCommentOptions carry the ids as struct fields, issue_project.go:90-99),
+// and the column move carries `project_id` + the `comment_meta_data` JSON
+// including the project_title (buildCreateCommentMetaData, comment.go:847-864).
+// The read side is pinned in the issues.test.ts timeline battery.
+
+describe("FN-2 mutation-metadata writes (ADR-0007, SPEC-0005 §7.3)", () => {
+  it("the time twins stamp time_id with their batch-mate entry; the delete/cancel arms leave it NULL", async () => {
+    const f = await ensureFixture();
+    const target = await throwawayIssue("tl: fn2 time ids", f.ownerId);
+
+    // The manual add: the entry inserts first, the comment carries its id.
+    await fetchTimeline(`/tl-owner/timelines/issues/${target.index}/times/add`, formPost("/x", { hours: "1", minutes: "30" }, f.ownerCookie));
+    const addEntry = await drizzle(env.DB).select({ id: trackedTimes.id }).from(trackedTimes).get();
+    const addComment = await drizzle(env.DB)
+      .select({ id: comments.id, timeId: comments.timeId, content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.AddTimeManual)))
+      .get();
+    expect(addEntry).toBeDefined();
+    expect(addComment?.timeId).toBe(addEntry!.id);
+
+    // The stopwatch stop: the banked entry is the stop_tracking comment's link.
+    await fetchTimeline(`/tl-owner/timelines/issues/${target.index}/times/stopwatch/start`, formPost("/x", {}, f.ownerCookie));
+    await fetchTimeline(`/tl-owner/timelines/issues/${target.index}/times/stopwatch/stop`, formPost("/x", {}, f.ownerCookie));
+    const banked = await drizzle(env.DB).select({ id: trackedTimes.id }).from(trackedTimes).orderBy(desc(trackedTimes.id)).get();
+    const stopComment = await drizzle(env.DB)
+      .select({ timeId: comments.timeId })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.StopTracking)))
+      .get();
+    expect(banked).toBeDefined();
+    expect(stopComment?.timeId).toBe(banked!.id);
+
+    // The cancel arm banks nothing and stamps no time_id (upstream sets no
+    // TimeID on cancel_tracking, stopwatch.go:222-230).
+    await fetchTimeline(`/tl-owner/timelines/issues/${target.index}/times/stopwatch/start`, formPost("/x", {}, f.ownerCookie));
+    await fetchTimeline(`/tl-owner/timelines/issues/${target.index}/times/stopwatch/cancel`, formPost("/x", {}, f.ownerCookie));
+    const cancelComment = await drizzle(env.DB)
+      .select({ timeId: comments.timeId })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.CancelTracking)))
+      .get();
+    expect(cancelComment?.timeId ?? null).toBeNull();
+
+    // The delete arm's comment 26 carries no time_id either
+    // (tracked_time.go:252-263 — upstream's delete stamps none).
+    const entry = await drizzle(env.DB).select({ id: trackedTimes.id }).from(trackedTimes).orderBy(asc(trackedTimes.id)).get();
+    if (entry === undefined) throw new Error("tracked time seed missing");
+    await fetchTimeline(`/tl-owner/timelines/issues/${target.index}/times/${entry.id}/delete`, formPost("/x", {}, f.adminCookie));
+    const delComment = await drizzle(env.DB)
+      .select({ timeId: comments.timeId })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.DeleteTimeManual)))
+      .get();
+    expect(delComment?.timeId ?? null).toBeNull();
+  });
+
+  it("the project attach/remove comments carry the id pair in the COLUMNS, content empty", async () => {
+    const f = await ensureFixture();
+    const project = await createProject(env.DB, repoProjectScope(f.repoId), { title: "tl: fn2 attach project", creatorId: f.ownerId, now: at(70) });
+    const defaultColumn = await mustDefaultColumn(env.DB, project, at(71));
+    const target = await throwawayIssue("tl: fn2 project attach", f.ownerId);
+    const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, target.id)).get();
+    if (row === undefined) throw new Error("target row missing");
+    const before = await numCommentsOf(target.id);
+
+    // Attach (the add arm rides addIssueToColumn's membership-null branch —
+    // the landed issues-service seam's twin shape).
+    await addIssueToColumn(env.DB, project, row, defaultColumn, f.ownerId, at(72));
+    const addComment = await drizzle(env.DB)
+      .select({ type: comments.type, content: comments.content, oldProjectId: comments.oldProjectId, projectId: comments.projectId, commentMetaData: comments.commentMetaData })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.Project)))
+      .get();
+    expect(addComment).toMatchObject({ content: "", oldProjectId: 0, projectId: project.id, commentMetaData: null }); // issue_project.go:138-147
+    expect(await numCommentsOf(target.id)).toBe(before); // the type-30 no-count rule
+
+    // Remove: the mirrored pair (old=N/project=0 — issue_project.go:113-127).
+    const column = defaultColumn;
+    await removeIssueFromColumn(env.DB, project, row, column, f.ownerId, at(73));
+    const removeComment = await drizzle(env.DB)
+      .select({ content: comments.content, oldProjectId: comments.oldProjectId, projectId: comments.projectId })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.Project)))
+      .orderBy(desc(comments.id))
+      .get();
+    expect(removeComment).toMatchObject({ content: "", oldProjectId: project.id, projectId: 0 });
+    expect(await numCommentsOf(target.id)).toBe(before); // still the no-count rule
+  });
+
+  it("the column move stamps project_id + the comment_meta_data JSON (project_title included); a no-op move writes nothing", async () => {
+    const f = await ensureFixture();
+    const project = await createProject(env.DB, repoProjectScope(f.repoId), { title: "tl: fn2 move project", creatorId: f.ownerId, now: at(74) });
+    const first = await mustDefaultColumn(env.DB, project, at(75));
+    const second = await createColumn(env.DB, project.id, { title: "tl: fn2 second column", creatorId: f.ownerId, now: at(76) });
+    const target = await throwawayIssue("tl: fn2 column move", f.ownerId);
+    const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, target.id)).get();
+    if (row === undefined) throw new Error("target row missing");
+    await addIssueToColumn(env.DB, project, row, first, f.ownerId, at(77));
+    const before = await numCommentsOf(target.id);
+    expect(await commentsOfType(target.id, CommentType.ProjectColumn)).toBe(0); // the attach's same-column move is a no-op
+
+    // A REAL column change: the type-31 metadata carries all three keys —
+    // project_title is the FN-2 addition (the type-31 template reads it).
+    await moveIssueToColumn(env.DB, project, row, second, null, f.ownerId, at(78));
+    const moveComment = await drizzle(env.DB)
+      .select({ content: comments.content, projectId: comments.projectId, commentMetaData: comments.commentMetaData })
+      .from(comments)
+      .where(and(eq(comments.issueId, target.id), eq(comments.type, CommentType.ProjectColumn)))
+      .get();
+    expect(moveComment?.content).toBe("");
+    expect(moveComment?.projectId).toBe(project.id);
+    expect(JSON.parse(moveComment!.commentMetaData!)).toEqual({
+      project_column_id: second.id,
+      project_column_title: "tl: fn2 second column",
+      project_title: "tl: fn2 move project",
+    });
+    expect(await numCommentsOf(target.id)).toBe(before); // type-31 also no-count
+
+    // The no-op move (same column) writes nothing (services/projects/issue.go
+    // only comments a REAL column change).
+    await moveIssueToColumn(env.DB, project, row, second, null, f.ownerId, at(79));
+    expect(await commentsOfType(target.id, CommentType.ProjectColumn)).toBe(1);
   });
 });

@@ -918,17 +918,23 @@ payload-fixture stage above as a fourth check in the same job.
    maintained incrementally instead of computed per read. If counts drift, a
    recount-job (upstream's `UpdateIssueReactions` pattern) is the fallback.
 
-## 7. FN-2 port plan (derived, not yet built) — **PLAN ONLY**
+## 7. FN-2 port (as-built)
 
-**Status: PLAN. Nothing in this section exists in the tree.** Derived by the
-FN-2 derivation-prep unit (GJ, 2026-11-03) from the upstream pin
-`fc4936884584` and the current worktree; the full write-site matrix with
-file:line cites lives in
-`docs/research/table-alignment-audit.md` §4 `comment` (the entry's FN-2
-derivation expansion). The schema hunk and generated migration are OWNED BY
-FN-3's sibling until it lands — the port unit lands them after. Cites below
-are verified at the pin; ours cites are this worktree's line numbers and may
-drift with sibling waves (re-grep before editing).
+**Status: LANDED (FN-2 port unit, 2026-11-03).** Derived by the FN-2
+derivation-prep unit (GJ, 2026-11-03) from the upstream pin `fc4936884584`
+and the then-current worktree; the full write-site matrix with file:line
+cites lives in `docs/research/table-alignment-audit.md` §4 `comment` (the
+entry's FN-2 derivation expansion). The section keeps the derived plan's
+structure; **As-built** notes record where the port deviated or resolved an
+open point. The landed artifacts: the five `comments` columns
+(`src/db/schema.ts`), migration `0067_comment-mutation-metadata.sql` (+ the
+snapshot + journal entry), the write seams (`api/services/projects.ts`,
+`api/services/issues.ts`, `api/routes/pull-reviews.ts`, the time twins in
+`ui/pages/issue-timeline-writes.ts` + `api/routes/issue-tables-t2.ts`), the
+de-hardcoded read arms (`api/services/issues.ts`'s timeline render), and the
+test battery (`src/db/schema.test.ts`'s FN-2 describe; the FN-2 describes in
+`ui/pages/issue-timeline-writes.test.ts`, `api/routes/issue-tables-t2.test.ts`,
+`api/routes/pull-reviews.test.ts`, `src/api/issues.test.ts`).
 
 **The audit-count correction this plan is built on:** upstream has NO
 `patch_quoted` column — the Go field `PatchQuoted` carries the xorm
@@ -986,7 +992,12 @@ field order):
   the audit classifies the pair port-when-read, and ADR-0007 queues
   port-when-read with its reader. The port unit should surface the choice
   in its SPEC record either way.
+  **As-built: DEFER taken** — the migration and schema carry five columns;
+  the pair is FN-9's carrier per SPEC-0005 §9 (the audit's §7.11 record).
 - `comments.patch`: **no DDL, no change** (the §7-parity erratum).
+  **As-built: held** — the column rides untouched; the battery pins it
+  (schema.test.ts's column list + the pull-reviews patch-store regression
+  pin).
 
 ### 7.3 Write seams to thread (our seam → upstream writer)
 
@@ -1010,7 +1021,9 @@ field order):
    `{project_column_id, project_column_title, project_title}` →
    `comment_meta_data`; `content` → `''`. **Add `project_title`** — ours
    omits it today; upstream's metadata carries it and the type-31 template
-   reads it (`comments.tmpl:586-591`).
+   reads it (`comments.tmpl:586-591`). **As-built: exactly this** — the
+   move arm already receives the project row, so `project_title` lands with
+   no signature change.
 3. **Time-family comments** — ours: `applyTimeAddWrite`
    (`ui/pages/issue-timeline-writes.ts:759-773`) and the API-port twins
    (`api/routes/issue-tables-t2.ts:1541-1549` add; `finishStopwatch`
@@ -1022,7 +1035,13 @@ field order):
    stopwatch.go:194-201, :222-230). Port: the trackedTimes INSERT and the
    comment ride the same drizzle batch — add `.returning({ id })` to the
    trackedTimes leg and stamp `time_id` from it. delete/start/cancel arms
-   stay column-less (parity).
+   stay column-less (parity). **As-built: the batch SPLIT instead** — a
+   drizzle batch leg cannot reference a prior leg's returning id, so the
+   trackedTimes insert runs alone and the comment/fold batch follows
+   (upstream's own statement order; in the `finishStopwatch` twins the
+   stopwatch delete stays LAST in the follow-up batch so a phase-1 failure
+   cannot bank time while losing a running stopwatch). The stamps are
+   exactly the plan's.
 4. **Team review-request comments** — ours: the API team arms
    (`api/routes/pull-reviews.ts:1596-1602` add, :1699-1706 remove — both
    write neither id arm today). Upstream: `models/issues/review.go:859-869`
@@ -1030,6 +1049,7 @@ field order):
    Port: stamp `assigneeTeamId = team.id` in both arms; the user-request
    arms (`api/services/pull-reviews.ts:498-507`/:585-594) keep
    `assigneeId` (upstream's AssigneeID path, review.go:748-758) untouched.
+   **As-built: exactly this.**
 
 ### 7.4 Read arms to de-hardcode
 
@@ -1047,6 +1067,20 @@ field order):
     while pre-migration rows exist, then drop (§7.7).
 - **No UI arm changes**: `issue-detail.tsx:734-746` renders types
   0/1/2/28 only this wave; nothing to thread there.
+
+**As-built (§7.4)**: all three arms landed in `api/services/issues.ts` —
+the project ids read the row's columns (the Go zero for NULL), the team arm
+resolves through `prefetchTimelineContext`'s batched `teams` map (the
+milestone/label/assignee pattern, with a dangling id DROPPING the row —
+upstream LoadAssigneeUserAndTeam's GetPossibleTeamByID error arm →
+ToTimelineComment's nil — and the render being convert.go's ToTeam with no
+org load, replicated in the service since routes/org-teams.ts's `toApiTeam`
+is route-local), and `trackedTimeOfComment` reads `time_id` first with the
+correlation demoted to the fallback (its docstring is the removal marker).
+One precision beyond the plan: the LoadTime call now gates on
+`time_id > 0` for ANY row type (upstream LoadTime's own early return is
+TimeID == 0 — not a type gate), with the correlation arms still scoped to
+the 13/14 family.
 
 ### 7.5 The migration (one generated migration + backfills)
 
@@ -1072,6 +1106,21 @@ DDL first (§7.2), then, in the same migration, idempotent backfills:
    and `review_id > 0` — join `pull_reviews.reviewer_team_id`
    (`schema.ts:2447`; the team-add arm writes `reviewId: review.id`,
    `pull-reviews.ts:1596-1601`). `assignee_team_id` defaults 0 elsewhere.
+
+**As-built (§7.5)**: migration `0067_comment-mutation-metadata.sql` — five
+ALTERs (upstream ALTER order: old_project_id, project_id, time_id,
+assignee_team_id, comment_meta_data — SQLite appends, so the physical order
+is the ALTER order, not the struct order), then the four backfill UPDATEs.
+Two recorded precisions beyond the plan: (a) every JSON gate pins BOTH the
+`json_valid` parse AND the payload key KINDS (`json_type` = 'integer'/'real'
+for ids, 'text' for the column title — a null/string id or a non-object
+payload fails the row untouched, widening the conservative arm), and (b) the
+type-31 backfilled metadata carries the TWO recoverable keys only —
+`project_title` is not reconstructible from the old payload (the writers'
+pre-port payloads never carried it); only rows written by the new writer
+carry the three-key metadata. Verified applied + backfilled on seeded
+old-shape rows in the local D1, and pinned by the schema.test.ts FN-2
+describe (the backfill statements verbatim, the FN-6 technique).
 
 ### 7.6 Test battery design (names + asserted shapes; no code)
 
@@ -1124,20 +1173,49 @@ never cited as suite-green (ADR-0006):
     verbatim bodies) — the port must not widen the body rewrite to
     non-project types.
 
-### 7.7 Open items for the port unit
+**As-built (§7.6)**: all twelve landed, D1-backed; the file homes —
+1 → `schema.test.ts` (DDL, types/defaults, the untouched `patch`, the four
+pre-0067 indexes pinned exactly); 2/3 → the FN-2 describe in
+`ui/pages/issue-timeline-writes.test.ts` (service-level, both arms + the
+no-op move); 4 → the FN-2 describes in `issue-timeline-writes.test.ts` (web
+twins) and `api/routes/issue-tables-t2.test.ts` (API twins); 5/7/8/12 → the
+FN-2 describe in `src/api/issues.test.ts` (route-level renders over
+`prefetchTimelineContext`'s batched path); 6 → the FN-2 describe in
+`api/routes/pull-reviews.test.ts`; 9/10 → `schema.test.ts` (the backfill
+statements verbatim against seeded old-shape rows, the conservative arms
+including the wrong-kind-payload cases); 11 → `pull-reviews.test.ts` (the
+patch-store regression pin beside the existing diff-hunk battery). The
+schema describe additionally pins `assignee_team_id`'s DEFAULT-0 read and
+the migration's no-new-index invariant. The stale pre-port assertions that
+pinned the type-30/31 content JSON (issues.test.ts's ⑯-P3-4 pair,
+projects-repo/org.test.ts's column-issues ladders) were updated to the
+columns shape in the same change — they were pins of the superseded
+adaptation, not independent parity arms.
+
+### 7.7 Open items for the port unit — all RESOLVED as-built
 
 - The `trackedTimeOfComment` heuristic: keep as legacy fallback through one
   release after the backfill (rows the backfill could not pin), then drop;
   the docstring at `issues.ts:1183-1196` is the removal marker.
+  **RESOLVED: the fallback is IN PLACE** (the exact `time_id` arm reads
+  first); the docstring carries the removal marker — the drop is a future
+  unit's cleanup, not this port's.
 - `finishStopwatch`'s batch needs the trackedTimes leg switched to
   `.returning({ id })` in BOTH twins (web + API ports) — batch leg ordering
   is preserved by drizzle, but verify the returned id is the comment's
   batch-mate (same batch, sequential).
+  **RESOLVED: the batch split** (§7.3 as-built) — the insert runs alone,
+  the returning id is then a plain constant in the comment batch; the
+  battery asserts the stamp equals the batch-mate entry's id in all four
+  writers (web add/stop, API add/stop).
 - The `project_title` addition to type-31 metadata (§7.3 item 2) — confirm
   the board UI's move entry passes the project row (it does today via
-  `moveIssueToColumn(project, …)`).
+  `moveIssueToColumn(project, …)`). **RESOLVED: confirmed + asserted** (the
+  metadata toEqual pins all three keys).
 - The original_author DEFER-vs-LAND decision (§7.2) — the port unit's SPEC
   record states the choice; FN-9 remains the family carrier if deferred.
+  **RESOLVED: DEFER** (§7.2 as-built; SPEC-0005 §9 is the record, FN-9 the
+  family carrier).
 
 ## 8. FN-5 rename plan — PLAN ONLY
 

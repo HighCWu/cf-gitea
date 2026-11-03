@@ -65,12 +65,12 @@ import { apiUserFromRow, canViewRepositoryWithTeams, type RepositoryWithOwner, t
  *  - upstream's project/move system comments (CommentType 30/31) have
  *    dedicated int64 columns (`old_project_id`, `project_id`,
  *    `project_column_id`, `project_column_title`, models/issues/comment.go);
- *    the landed comments table does not carry them, so the ids serialize
- *    into `content` as JSON — the established adaptation (type 29
- *    PullRequestPush stores PushActionContent JSON the same way). The rows,
- *    timestamps and the issue.updated_unix bump follow upstream
- *    updateCommentInfos (comment.go:937-948: system comments do NOT bump
- *    num_comments but DO touch updated_unix).
+ *    FN-2 landed the columns (ADR-0007: `old_project_id`/`project_id`/
+ *    `comment_meta_data` — the column pair rides the JSON metadata, upstream's
+ *    exact shape) and the writers below stamp them with `content` empty,
+ *    upstream's body. The rows, timestamps and the issue.updated_unix bump
+ *    follow upstream updateCommentInfos (comment.go:937-948: system comments
+ *    do NOT bump num_comments but DO touch updated_unix).
  *  - workflow execution landed with the notifier port (the deferred surface
  *    of ledger v1.5.2 §1.5 P2-3, implemented per
  *    specs/projects-workflow-notifier.md): the column add/remove/move arms
@@ -812,17 +812,25 @@ async function projectIssueRow(d1: D1Database, issueId: number, projectId: numbe
 }
 
 /**
- * The system comment the project arms write (adaptation: ids in `content`
- * JSON — see the module header). Types 30/31 do NOT bump `num_comments`
- * (upstream updateCommentInfos, comment.go:937-948) but DO bump the issue's
- * `updated_unix`.
+ * The system comment the project arms write. Upstream CreateCommentOptions
+ * carry the ids as struct fields (issue_project.go:90-99/:138-147, services/
+ * projects/issue.go:180-191): the add/remove arms stamp
+ * `old_project_id`/`project_id`, the column move stamps `project_id` plus the
+ * `comment_meta_data` JSON (buildCreateCommentMetaData, comment.go:847-864),
+ * and `content` stays empty — no payload leaks into the timeline body.
+ * Types 30/31 do NOT bump `num_comments` (upstream updateCommentInfos,
+ * comment.go:937-948) but DO bump the issue's `updated_unix`.
  */
 async function writeProjectComment(
   d1: D1Database,
   type: 30 | 31,
   issueId: number,
   posterId: number | null,
-  payload: Record<string, unknown>,
+  cells: {
+    oldProjectId?: number;
+    projectId?: number;
+    commentMetaData?: Record<string, unknown>;
+  },
   now: Date,
 ): Promise<void> {
   const db = drizzle(d1);
@@ -831,7 +839,10 @@ async function writeProjectComment(
       type,
       posterId,
       issueId,
-      content: JSON.stringify(payload),
+      content: "",
+      oldProjectId: cells.oldProjectId,
+      projectId: cells.projectId,
+      commentMetaData: cells.commentMetaData === undefined ? null : JSON.stringify(cells.commentMetaData),
       createdAt: now,
       updatedAt: now,
     }),
@@ -911,7 +922,7 @@ export async function addIssueToColumn(
         projectColumnId: defaultColumn.id,
         sorting: nextSorting,
       });
-    await writeProjectComment(d1, 30, issue.id, doerId, { old_project_id: 0, project_id: project.id }, now);
+    await writeProjectComment(d1, 30, issue.id, doerId, { oldProjectId: 0, projectId: project.id }, now);
     attached = true;
   }
   const move = await moveIssueWithinProject(d1, project, issue, column, null, doerId, now);
@@ -964,7 +975,7 @@ export async function removeIssueFromColumn(
   await drizzle(d1)
     .delete(projectIssues)
     .where(and(eq(projectIssues.issueId, issue.id), eq(projectIssues.projectId, project.id)));
-  await writeProjectComment(d1, 30, issue.id, doerId, { old_project_id: project.id, project_id: 0 }, now);
+  await writeProjectComment(d1, 30, issue.id, doerId, { oldProjectId: project.id, projectId: 0 }, now);
   if (opts?.viaWorkflow === undefined) {
     await notifyIssueChangeProjects(d1, {
       issue,
@@ -1057,7 +1068,14 @@ async function moveIssueWithinProject(
       31,
       issue.id,
       doerId,
-      { project_id: project.id, project_column_id: column.id, project_column_title: column.title },
+      {
+        projectId: project.id,
+        commentMetaData: {
+          project_column_id: column.id,
+          project_column_title: column.title,
+          project_title: project.title,
+        },
+      },
       now,
     );
   }
