@@ -19,7 +19,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { listReposStarredByUser } from "../../api/services/stars";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, repoSettings, stars, users } from "../../db/schema";
+import { repositories, stars, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -107,9 +107,11 @@ async function seedBaseFixtures(): Promise<void> {
     createdAt: new Date("2026-02-03T04:05:06Z"),
   });
   await drizzle(env.DB).update(users).set({ numStars: 3 }).where(eq(users.id, bobId));
+  // FN-4/0068: descriptions live on the repositories row.
   await drizzle(env.DB)
-    .insert(repoSettings)
-    .values({ repoId: "repo-alpha", description: "Alpha demo repo" });
+    .update(repositories)
+    .set({ description: "Alpha demo repo" })
+    .where(eq(repositories.id, "repo-alpha"));
 }
 
 beforeAll(async () => {

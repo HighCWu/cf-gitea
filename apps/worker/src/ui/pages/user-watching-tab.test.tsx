@@ -22,7 +22,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { followUser } from "../../api/services/follows";
-import { repoSettings, repoWatchers, repositories, users } from "../../db/schema";
+import { repoWatchers, repositories, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import {
@@ -116,7 +116,8 @@ async function seedRepo(spec: RepoSpec): Promise<void> {
     updatedAt: FIXED_DATE,
   });
   if (spec.description !== undefined) {
-    await drizzle(env.DB).insert(repoSettings).values({ repoId: spec.id, description: spec.description });
+    // FN-4/0068: descriptions live on the repositories row.
+    await drizzle(env.DB).update(repositories).set({ description: spec.description }).where(eq(repositories.id, spec.id));
   }
 }
 

@@ -45,7 +45,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { emailAddresses, repositories, repoSettings, users } from "../../db/schema";
+import { emailAddresses, repositories, users } from "../../db/schema";
 import { OrgService } from "../../services/orgs/orgs";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
@@ -141,7 +141,8 @@ async function seedDetail(): Promise<Seeded> {
       .run();
   await seedRepo("9102", "zeta", "private");
   await seedRepo("9101", "alpha", "public", "9199"); // the fork arm
-  await drizzle(env.DB).insert(repoSettings).values({ repoId: "9101", description: "the alpha repo" }).run();
+  // FN-4/0068: descriptions live on the repositories row.
+  await drizzle(env.DB).update(repositories).set({ description: "the alpha repo" }).where(eq(repositories.id, "9101")).run();
 
   return {
     adminId: admin.id,

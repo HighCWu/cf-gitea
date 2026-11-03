@@ -23,13 +23,7 @@ import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { createRepoLabel } from "../../api/services/labels";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import {
-  issueLabels,
-  issueSubscriptions,
-  repoSettings,
-  repoWatchers,
-  repositories,
-} from "../../db/schema";
+import { issueLabels, issueSubscriptions, repoWatchers, repositories } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -452,7 +446,7 @@ describe("loadWatchingData — the WatchedByID read", () => {
     // (description ""), so the former insert/onConflictDoNothing form was a
     // NO-OP against the app-seeded row and the batched description read "" —
     // set it by UPDATE so the description actually lands (the 0276a82 idiom).
-    await db.update(repoSettings).set({ description: "visible description" }).where(eq(repoSettings.repoId, s.publicRepoId));
+    await db.update(repositories).set({ description: "visible description" }).where(eq(repositories.id, s.publicRepoId));
     await watchRepo(s.publicRepoId);
     await watchRepo(s.privateRepoId); // watched but unreadable for the non-admin
     await watchRepo(s.ownRepoId); // the isOwner grant arm

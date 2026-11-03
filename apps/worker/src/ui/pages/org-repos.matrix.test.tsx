@@ -72,7 +72,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { TeamsService } from "../../api/routes/org-teams";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repositories, repoSettings } from "../../db/schema";
+import { repositories } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -168,9 +168,9 @@ async function seedReposWorld(): Promise<ReposWorld> {
   // (DefaultRepoUnits), so the former explicit INSERT collides on the UNIQUE
   // repo_id — set the description by UPDATE (the 0276a82 sweep's idiom).
   await drizzle(env.DB)
-    .update(repoSettings)
+    .update(repositories)
     .set({ description: "The public workhorse." })
-    .where(eq(repoSettings.repoId, alpha.id))
+        .where(eq(repositories.id, alpha.id))
     .run();
   await drizzle(env.DB)
     .update(repositories)

@@ -62,7 +62,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repoSettings, repositories, users } from "../../db/schema";
+import { repositories, users } from "../../db/schema";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { T0, uiEnv } from "../__tests__/harness";
@@ -182,14 +182,9 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
   }
   const soloId = await ensureRowRepo(owner.id, "explore92-solo");
   await ensureRowRepo(owner.id, "explore92-vault", "private");
-  const soloSettings = await db
-    .select({ repoId: repoSettings.repoId })
-    .from(repoSettings)
-    .where(eq(repoSettings.repoId, soloId))
-    .get();
-  if (soloSettings === undefined) {
-    await db.insert(repoSettings).values({ repoId: soloId, description: "the solo settings description line" });
-  }
+  // FN-4/0068: the description rides the repositories row directly (the
+  // old repo_settings existence guard was the retired store's idiom).
+  await db.update(repositories).set({ description: "the solo settings description line" }).where(eq(repositories.id, soloId));
 
   fixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
