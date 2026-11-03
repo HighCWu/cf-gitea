@@ -18,10 +18,12 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { actionSchedules, actionScheduleSpecs } from "../../db/schema";
+import { actionRunJobs, actionRuns, actionSchedules, actionScheduleSpecs, repositories } from "../../db/schema";
+import { ACTION_STATUS_CANCELLED, ACTION_STATUS_RUNNING, ACTION_STATUS_SUCCESS, ACTION_STATUS_WAITING } from "./model";
 import { ACTIONS_USER_ID } from "./trigger";
 import {
   advanceScheduleSpecCAS,
+  cleanRepoScheduleTasks,
   cronNext,
   createScheduleTaskBySchedules,
   deleteScheduleTaskByRepo,
@@ -29,6 +31,7 @@ import {
   getScheduleSpecById,
   getSchedulesByRepo,
   handleActionsScheduleTrigger,
+  isActionsScheduleCleanMessage,
   isActionsScheduleTriggerMessage,
   parseCronSpec,
   withScheduleInEventPayload,
@@ -313,5 +316,141 @@ describe("deleteScheduleTaskByRepo + getSchedulesByRepo + the consumer's gone-ro
     expect(await db().select().from(actionScheduleSpecs)).toHaveLength(0);
     expect(await getScheduleSpecById(env.DB, spec.id)).toBeNull();
     expect(await handleActionsScheduleTrigger({ d1: env.DB, appUrl: "" }, { kind: "actions-trigger", specId: spec.id })).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CleanRepoScheduleTasks (clear_tasks.go:59-62 + models/actions/schedule.go:
+// 104-123) — the actions-unavailable clean: the registry rows go, the live
+// default-branch schedule runs cancel, everything else stands.
+// ---------------------------------------------------------------------------
+
+const CLEAN_REPO = "repo-sched-clean";
+
+describe("cleanRepoScheduleTasks (the §D7 wiring)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare(`DELETE FROM ${CLEANUP_TABLES[0]}`).run();
+    await env.DB.prepare(`DELETE FROM ${CLEANUP_TABLES[1]}`).run();
+    await env.DB.prepare("DELETE FROM action_run_jobs").run();
+    await env.DB.prepare("DELETE FROM action_runs").run();
+    await env.DB.prepare("DELETE FROM repositories").run();
+  });
+
+  let runIndex = 0;
+
+  /** The fixture repo (defaultBranch defaults "main" in the schema). */
+  async function seedRepo(): Promise<void> {
+    await drizzle(env.DB).insert(repositories).values({
+      id: CLEAN_REPO,
+      storageKey: `r_${CLEAN_REPO}`,
+      ownerNamespace: "alice",
+      ownerId: 41,
+      slug: "clean",
+      visibility: "public",
+      createdAt: new Date(0),
+    });
+  }
+
+  /** One run + one unclaimed job in the given statuses. */
+  async function seedRunWithJob(opts: {
+    triggerEvent: string;
+    ref: string;
+    runStatus: number;
+    jobStatus: number;
+  }): Promise<{ runId: number; jobId: number }> {
+    runIndex += 1;
+    const run = await db()
+      .insert(actionRuns)
+      .values({
+        repoId: CLEAN_REPO,
+        ownerId: 41,
+        index: runIndex,
+        status: opts.runStatus,
+        ref: opts.ref,
+        triggerEvent: opts.triggerEvent,
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionRuns.id });
+    const runId = run[0]!.id;
+    const job = await db()
+      .insert(actionRunJobs)
+      .values({
+        runId,
+        repoId: CLEAN_REPO,
+        ownerId: 41,
+        jobId: `job-${runId}`,
+        attempt: 1,
+        workflowPayload: new TextEncoder().encode("jobs: {}"),
+        status: opts.jobStatus,
+        taskId: 0,
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionRunJobs.id });
+    return { runId, jobId: job[0]!.id };
+  }
+
+  const jobStatusOf = async (jobId: number): Promise<number> =>
+    (await db().select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)))[0]!.status;
+  const runStatusOf = async (runId: number): Promise<number> =>
+    (await db().select().from(actionRuns).where(eq(actionRuns.id, runId)))[0]!.status;
+
+  it("deletes the registry rows and cancels ONLY the live default-branch schedule runs", async () => {
+    await seedRepo();
+    await createScheduleTaskBySchedules(env.DB, { ...BASE_CTX, repoId: CLEAN_REPO }, [
+      { entryName: "hourly.yml", content: "x", specs: ["0 * * * *"] },
+    ]);
+    // The live schedule run on the DEFAULT branch — the cancel's target.
+    const live = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/main", runStatus: ACTION_STATUS_WAITING, jobStatus: ACTION_STATUS_WAITING });
+    // A push run on the same repo — NEVER the clean's target.
+    const push = await seedRunWithJob({ triggerEvent: "push", ref: "refs/heads/main", runStatus: ACTION_STATUS_RUNNING, jobStatus: ACTION_STATUS_WAITING });
+    // A schedule run on a NON-default branch — CancelPreviousJobs' ref
+    // filter keeps it (run_job.go:713).
+    const otherRef = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/feature", runStatus: ACTION_STATUS_WAITING, jobStatus: ACTION_STATUS_WAITING });
+    // A DONE schedule run on the default branch — outside the live-status
+    // set (run_job.go:716-719).
+    const done = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/main", runStatus: ACTION_STATUS_SUCCESS, jobStatus: ACTION_STATUS_SUCCESS });
+
+    const cancelled = await cleanRepoScheduleTasks(env.DB, CLEAN_REPO);
+
+    // The registry is empty (DeleteScheduleTaskByRepo, :108-110).
+    expect(await db().select().from(actionSchedules)).toHaveLength(0);
+    expect(await db().select().from(actionScheduleSpecs)).toHaveLength(0);
+    // Exactly the live default-branch schedule job cancelled; its run
+    // re-aggregated to CANCELLED (the refreshRunStatus settle).
+    expect(cancelled).toBe(1);
+    expect(await jobStatusOf(live.jobId)).toBe(ACTION_STATUS_CANCELLED);
+    expect(await runStatusOf(live.runId)).toBe(ACTION_STATUS_CANCELLED);
+    // The push run, the other-ref schedule run and the done run stand.
+    expect(await jobStatusOf(push.jobId)).toBe(ACTION_STATUS_WAITING);
+    expect(await runStatusOf(push.runId)).toBe(ACTION_STATUS_RUNNING);
+    expect(await jobStatusOf(otherRef.jobId)).toBe(ACTION_STATUS_WAITING);
+    expect(await jobStatusOf(done.jobId)).toBe(ACTION_STATUS_SUCCESS);
+  });
+
+  it("a repo whose repositories row is gone: the registry rows still go, nothing to cancel", async () => {
+    await createScheduleTaskBySchedules(env.DB, { ...BASE_CTX, repoId: CLEAN_REPO }, [
+      { entryName: "hourly.yml", content: "x", specs: ["0 * * * *"] },
+    ]);
+    const cancelled = await cleanRepoScheduleTasks(env.DB, CLEAN_REPO);
+    expect(cancelled).toBe(0);
+    expect(await db().select().from(actionSchedules)).toHaveLength(0);
+    expect(await db().select().from(actionScheduleSpecs)).toHaveLength(0);
+  });
+
+  it("an idempotent re-clean: no rows, no live runs → 0 again", async () => {
+    await seedRepo();
+    expect(await cleanRepoScheduleTasks(env.DB, CLEAN_REPO)).toBe(0);
+  });
+});
+
+describe("the clean message guard narrows the producer's shape", () => {
+  it("accepts {kind, repoId} and nothing else", () => {
+    expect(isActionsScheduleCleanMessage({ kind: "actions-schedule-clean", repoId: "r1" })).toBe(true);
+    expect(isActionsScheduleCleanMessage({ kind: "actions-trigger", specId: 7 })).toBe(false);
+    expect(isActionsScheduleCleanMessage({ kind: "actions-schedule-clean" })).toBe(false);
+    expect(isActionsScheduleCleanMessage({ kind: "actions-schedule-clean", repoId: 5 })).toBe(false);
+    expect(isActionsScheduleCleanMessage(null)).toBe(false);
   });
 });

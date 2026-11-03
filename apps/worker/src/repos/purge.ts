@@ -69,6 +69,10 @@ import {
   stopEndlessTasks,
 } from "../services/actions/sweeps";
 import { handleActionsScheduleTrigger, isActionsScheduleTriggerMessage } from "../services/actions/trigger";
+import {
+  cleanRepoScheduleTasks,
+  isActionsScheduleCleanMessage,
+} from "../services/actions/schedule";
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { isMailOutboxMessage, runMailOutboxArm } from "../services/mail/outbox";
 import { handleAutoMergeCheck, isAutoMergeCheckMessage } from "../services/pull-automerge";
@@ -448,6 +452,26 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] auto-merge-check ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Schedule clean (SPEC-0012 §D7 — upstream CleanRepoScheduleTasks'
+    // residual-row sweep): one message = one repo whose action_schedule rows
+    // survive an actions-unavailable state (archived, or the actions unit
+    // row gone — the hourly producer's probe in services/demo-sweep.ts).
+    // cleanRepoScheduleTasks deletes the registry rows then cancels the
+    // repo's in-progress schedule runs on the default branch (clear_tasks.go:59-62
+    // + models/actions/schedule.go:104-123). Idempotent across redeliveries
+    // (a cleaned repo deletes zero rows); a throw retries THAT message (the
+    // mirror-sync posture).
+    if (isActionsScheduleCleanMessage(message.body)) {
+      try {
+        const cancelled = await cleanRepoScheduleTasks(env.DB, message.body.repoId);
+        console.log(`[repo-tasks] actions-schedule-clean ${message.id}: repo ${message.body.repoId} cleaned, ${cancelled} job(s) cancelled`);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] actions-schedule-clean ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

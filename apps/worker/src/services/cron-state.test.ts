@@ -1,7 +1,7 @@
 /**
  * The cron tick state's tests (usability F3): the arm census (the exact
  * handleScheduledCron dispatch mirror — five step arms on every non-hourly
- * entry, EIGHT producer arms on the hourly entry), the two tick upserts over
+ * entry, NINE producer arms on the hourly entry), the two tick upserts over
  * real D1 (success moves last_success + increments runs + CLEARS the error;
  * failure stamps the error pair and preserves the history; both clip; both
  * no-op on an empty arm set), and the monitor's read seam. The store module
@@ -44,7 +44,7 @@ const stepArms = armsForEntry("*/10 * * * *");
 const hourlyArms = armsForEntry(DEMO_SWEEP_CRON);
 
 describe("the arm census (CRON_ARMS — the handleScheduledCron dispatch mirror)", () => {
-  it("lists exactly the THIRTEEN landed arms with the two wrangler specs", () => {
+  it("lists exactly the FOURTEEN landed arms with the two wrangler specs", () => {
     expect(CRON_ARMS.map((arm) => arm.arm)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
@@ -62,6 +62,9 @@ describe("the arm census (CRON_ARMS — the handleScheduledCron dispatch mirror)
       "cancel_abandoned_jobs",
       "cleanup_ephemeral_runners",
       "cleanup_hook_task_table",
+      // SPEC-0012 §D7's CleanRepoScheduleTasks wiring — the residual-row
+      // sweep (the §D7 tail's second seam, 2026-11-03).
+      "clean_repo_schedule_tasks",
     ]);
     for (const arm of CRON_ARMS) {
       expect([DEMO_SWEEP_CRON, "*/10 * * * *"]).toContain(arm.spec);
@@ -78,7 +81,7 @@ describe("the arm census (CRON_ARMS — the handleScheduledCron dispatch mirror)
     ]);
   });
 
-  it("the hourly entry carries the EIGHT producer arms", () => {
+  it("the hourly entry carries the NINE producer arms", () => {
     expect(hourlyArms.map((arm) => arm.arm)).toEqual([
       "demo_sweep",
       "delete_old_audit_events",
@@ -88,6 +91,7 @@ describe("the arm census (CRON_ARMS — the handleScheduledCron dispatch mirror)
       "cancel_abandoned_jobs",
       "cleanup_ephemeral_runners",
       "cleanup_hook_task_table",
+      "clean_repo_schedule_tasks",
     ]);
   });
 
@@ -102,7 +106,7 @@ describe("recordArmsSuccess (the completed-tick upsert)", () => {
   it("inserts a fresh row (runs 1, last_success set) and increments on the next tick", async () => {
     await recordArmsSuccess(env.DB, hourlyArms, { now: NOW });
     let rows = await drizzle(env.DB).select().from(cronState).all();
-    expect(rows).toHaveLength(8); // the hourly arm count (§D7 moved start_schedule_tasks to the step entry)
+    expect(rows).toHaveLength(9); // the hourly arm count (the §D7 clean arm joined with clean_repo_schedule_tasks)
     expect(rows.every((row) => row.runs === 1 && row.lastError === null && row.lastErrorUnix === null)).toBe(true);
 
     await recordArmsSuccess(env.DB, hourlyArms, { now: LATER });

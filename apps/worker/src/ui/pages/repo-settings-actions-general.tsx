@@ -323,9 +323,15 @@ export async function readRepoActionsGeneralFormParams(request: Request): Promis
  * settings upsert). The global-disabled guard (actions.go:80/82) is
  * unreachable here (the reduction above), so the write always applies.
  * Db failures propagate (upstream's ServerError arm).
+ *
+ * The write threads the full env so saveRepoSettings' settings-change arm
+ * (services/repository/setting.go:27-51 — the §D7 wiring) can re-walk the
+ * schedule registry on enable and clean it on disable: upstream's
+ * ActionsUnitPost calls UpdateRepositoryUnits, which IS that arm — the
+ * reduction to the flag write keeps the arm by passing the context through.
  */
-export async function applyRepoActionsUnitToggle(d1: D1Database, repoId: string, form: RepoActionsUnitForm): Promise<void> {
-  await saveRepoSettings(d1, repoId, { hasActions: form.enableActions }, new Date());
+export async function applyRepoActionsUnitToggle(env: Pick<Env, "DB" | "REPO">, repoId: string, form: RepoActionsUnitForm): Promise<void> {
+  await saveRepoSettings(env.DB, repoId, { hasActions: form.enableActions }, new Date(), { env });
 }
 
 // ---------------------------------------------------------------------------

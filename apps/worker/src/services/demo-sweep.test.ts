@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { actionSchedules, actionScheduleSpecs, repoMirrors, repositories, webhookDeliveries, webhooks } from "../db/schema";
+import { actionSchedules, actionScheduleSpecs, repoMirrors, repoUnits, repositories, webhookDeliveries, webhooks } from "../db/schema";
 import {
   DEMO_RETENTION_HOURS,
   DEMO_SWEEP_CRON,
@@ -27,6 +27,7 @@ import {
   demoModeEnabled,
   enqueueDueActionScheduleScans,
   enqueueDueDemoSweeps,
+  enqueueDueScheduleTaskCleans,
   enqueueDueWebhookMaintenance,
   handleScheduledCron,
   isDemoSweepMessage,
@@ -768,5 +769,103 @@ describe("the actions-schedule producer (enqueueDueActionScheduleScans)", () => 
   it("DB or REPO_TASKS unbound: fails loud before the first read (the packages-cleanup posture)", async () => {
     await expect(enqueueDueActionScheduleScans({ DB: undefined, REPO_TASKS: spyQueue() }, { now: NOW })).rejects.toThrow(/not bound/);
     await expect(enqueueDueActionScheduleScans({ DB: env.DB, REPO_TASKS: undefined }, { now: NOW })).rejects.toThrow(/not bound/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The schedule-clean producer (SPEC-0012 §D7's CleanRepoScheduleTasks
+// wiring — the residual-row sweep: archived or unit-less registries)
+// ---------------------------------------------------------------------------
+
+describe("the schedule-clean producer (enqueueDueScheduleTaskCleans)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** The fixture owner (once per test — the repos share it). */
+  async function seedCleanOwner(): Promise<void> {
+    await seedUser(70, "clean-owner");
+  }
+
+  /** A repo + one registry row for it (the residue the probe reads). */
+  async function seedScheduleRepo(opts: { repoId: string; archived?: boolean; actionsUnit?: boolean }): Promise<void> {
+    await drizzle(env.DB).insert(repositories).values({
+      id: opts.repoId,
+      storageKey: `r_${opts.repoId}`,
+      ownerNamespace: "clean-owner",
+      ownerId: 70,
+      slug: opts.repoId,
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      isArchived: opts.archived === true,
+      createdAt: new Date(0),
+    });
+    if (opts.actionsUnit === true) {
+      await drizzle(env.DB).insert(repoUnits).values({ repoId: opts.repoId, type: "actions" });
+    }
+    await drizzle(env.DB).insert(actionSchedules).values({
+      title: "ci",
+      specs: "[]",
+      repoId: opts.repoId,
+      ownerId: 70,
+      workflowId: "ci.yml",
+      triggerUserId: -2,
+      ref: "refs/heads/main",
+      commitSha: "a".repeat(40),
+      event: "push",
+      eventPayload: "{}",
+      content: "on: schedule",
+      created: new Date(0),
+      updated: new Date(0),
+    });
+  }
+
+  it("a clean instance: no registry rows → zero sends, one compact 0-residual log line", async () => {
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    const queue = spyQueue();
+    expect(await enqueueDueScheduleTaskCleans({ DB: env.DB, REPO_TASKS: queue })).toBe(0);
+    expect(totalSends(queue)).toBe(0);
+    expect(consoleLog).toHaveBeenCalledTimes(1);
+    expect(consoleLog).toHaveBeenCalledWith("[schedule-clean] 0 residual repos (archived or unit-less registries)");
+  });
+
+  it("an ARCHIVED repo's registry rows arm the probe: one {kind, repoId} message", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await seedCleanOwner();
+    await seedScheduleRepo({ repoId: "residue-archived", archived: true });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueScheduleTaskCleans({ DB: env.DB, REPO_TASKS: queue });
+    expect(enqueued).toBe(1);
+    expect(queue.bodies).toEqual([[{ kind: "actions-schedule-clean", repoId: "residue-archived" }]]);
+  });
+
+  it("a repo whose actions UNIT row is gone arms the probe; an enabled repo's rows never do", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await seedCleanOwner();
+    await seedScheduleRepo({ repoId: "residue-unitless", actionsUnit: false });
+    // The enabled control: rows exist, the unit row stands → NOT residue.
+    await seedScheduleRepo({ repoId: "enabled-live", actionsUnit: true });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueScheduleTaskCleans({ DB: env.DB, REPO_TASKS: queue });
+    expect(enqueued).toBe(1);
+    expect(queue.bodies).toEqual([[{ kind: "actions-schedule-clean", repoId: "residue-unitless" }]]);
+  });
+
+  it("the limit page drains oldest-first (limit 1 over two residue repos)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await seedCleanOwner();
+    await seedScheduleRepo({ repoId: "residue-a", archived: true });
+    await seedScheduleRepo({ repoId: "residue-b", archived: true });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueScheduleTaskCleans({ DB: env.DB, REPO_TASKS: queue }, { limit: 1 });
+    expect(enqueued).toBe(1);
+    expect(queue.bodies).toEqual([[{ kind: "actions-schedule-clean", repoId: "residue-a" }]]);
+  });
+
+  it("DB or REPO_TASKS unbound: fails loud before the first read (the packages-cleanup posture)", async () => {
+    await expect(enqueueDueScheduleTaskCleans({ DB: undefined, REPO_TASKS: spyQueue() })).rejects.toThrow(/not bound/);
+    await expect(enqueueDueScheduleTaskCleans({ DB: env.DB, REPO_TASKS: undefined })).rejects.toThrow(/not bound/);
   });
 });

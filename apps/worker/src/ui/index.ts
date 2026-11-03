@@ -9130,7 +9130,10 @@ async function repoActionsUnitSubmit(c: Context<{ Bindings: Env }>): Promise<Res
   const { repo, respond } = resolved;
   if (resolved.route.family !== "settings-actions-general-unit") return respond(await c.notFound()); // drift guard
   const form = parseRepoActionsUnitForm(await readUrlEncodedForm(c.req.raw));
-  await applyRepoActionsUnitToggle(c.env.DB, repo.id, form);
+  // The full env rides (not just DB): saveRepoSettings' settings-change arm
+  // re-walks the schedule registry through the REPO cell (the §D7 wiring,
+  // upstream ActionsUnitPost → UpdateRepositoryUnits' actions body).
+  await applyRepoActionsUnitToggle(c.env, repo.id, form);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/general` } }));
 }
 

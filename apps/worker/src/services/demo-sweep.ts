@@ -53,10 +53,15 @@
  * actions-abandoned + ephemeral block (the SIXTH — the ungated
  * `cancel_abandoned_jobs` + `cleanup_ephemeral_runners` pair;
  * SPEC-0015 §4.3 + SPEC-0016 §4.4 + SPEC-0012 §4.5 — SIX sanctioned
- * extensions total) and the probe-gated webhook-maintenance producer
+ * extensions total), the probe-gated webhook-maintenance producer
  * (SPEC-0005 §4.9 as-built — upstream's own registered
  * `cleanup_hook_task_table` task, services/cron/tasks_basic.go:124-135;
- * parity-placed with the ratified non-demo-gated packages shape). The
+ * parity-placed with the ratified non-demo-gated packages shape) and the
+ * probe-gated schedule-clean producer (the §D7 tail's CleanRepoScheduleTasks
+ * wiring — the residual-row sweep covering the seams this surface lacks,
+ * upstream's own global-disable posture, notifier_helper.go:156-160). With
+ * it the hourly entry carries EIGHT producer blocks (NINE producer calls).
+ * The
  * actions-schedule producer (upstream's own registered
  * `start_schedule_tasks`, cron/tasks_actions.go:55-67, enabled default —
  * the SEVENTH sanctioned extension) MOVED to the step entry with the
@@ -66,26 +71,29 @@
  * (the 1m→10m recorded cadence floor; the due-derivation and its recorded
  * divergences live in services/actions/schedule.ts's header). Every
  * non-hourly entry carries FIVE arms: the mirror pair, the zombie/endless
- * stops, and the schedule scan. Thirteen producer calls across the two
- * entries (8 hourly + 5 step); the services/cron-state.ts CRON_ARMS census
+ * stops, and the schedule scan. Fourteen producer calls across the two
+ * entries (9 hourly + 5 step); the services/cron-state.ts CRON_ARMS census
  * carries both integration rows (cleanup_hook_task_table with 870c9b3,
  * start_schedule_tasks with the D-7a completion, its spec moved to the step
- * entry with §D7).
+ * entry with §D7) and the schedule-clean row (the §D7 tail's
+ * CleanRepoScheduleTasks wiring — the census's FIFTH extension-name arm, no
+ * upstream registered task exists to twin, so it takes upstream's function
+ * name per the cleanup_ephemeral_runners convention).
  * Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
  * purge.ts consumer arms directly with fabricated ScheduledControllers —
  * the delegation itself is one await.
  */
 
-import { asc, eq, inArray, isNull, lt, or, and } from "drizzle-orm";
+import { asc, eq, inArray, isNull, lt, or, and, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, users, webhookDeliveries } from "../db/schema";
+import { actionSchedules, repoUnits, repositories, users, webhookDeliveries } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
 import { enqueueDueAutoMergeChecks } from "./pull-automerge";
 import { enqueueDueActionsRetention, enqueueDueZombieStops } from "./actions/retention";
 import { enqueueDueAbandonedJobCancels, enqueueDueEndlessTaskStops, enqueueDueEphemeralCleanup } from "./actions/sweeps";
 import type { ActionsScheduleTriggerMessage } from "./actions/trigger";
-import { dueScheduleSpecIds } from "./actions/schedule";
+import { dueScheduleSpecIds, type ActionsScheduleCleanMessage } from "./actions/schedule";
 import { enqueueDuePackagesCleanup } from "./packages/cleanup";
 import { enqueueDueMirrorSyncs } from "./mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "./mirror/push-sync";
@@ -458,6 +466,96 @@ export async function enqueueDueActionScheduleScans(env: ActionsScheduleProducer
 }
 
 // ---------------------------------------------------------------------------
+// The schedule-clean producer (SPEC-0012 §D7's CleanRepoScheduleTasks wiring)
+// — the residual-row sweep for the seams this surface lacks
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-tick page size for the schedule-clean producer (the demo producer's
+ * LIMIT 50 throttle, §3.1): the residue set is normally empty (both event
+ * seams — the actions-unit disable and the archive flip — clean inline now),
+ * so a backlog drains oldest-first over hours rather than bursting.
+ */
+export const SCHEDULE_CLEAN_PAGE_LIMIT = 50;
+
+/**
+ * The env slice the schedule-clean producer touches (the
+ * WebhookMaintenanceProducerEnv posture — bindings optional for the tests,
+ * the generated Env satisfies the required shape, the runtime guard below is
+ * the fail-closed defense).
+ */
+export type ScheduleCleanProducerEnv = Partial<Pick<Env, "DB" | "REPO_TASKS">>;
+
+/**
+ * The schedule-clean producer (upstream CleanRepoScheduleTasks,
+ * services/actions/clear_tasks.go:59-62 + models/actions/schedule.go:104-123,
+ * via services/actions/schedule.ts cleanRepoScheduleTasks). The event seams
+ * are wired inline (the actions-unit disable in saveRepoSettings, the
+ * archive flip in setRepoArchived — both setting.go:58 / repo.go:1002
+ * verbatim), but upstream carries a FOURTH seam this port has no writer for:
+ * notifier_helper.go:156-160's `TypeActions.UnitGlobalDisabled()` arm, whose
+ * trigger "will be changed manually" in app.ini — cleaned lazily per repo on
+ * the next notify because "there is no other place we can do this". Our port
+ * has no instance-wide actions toggle at all, and an event-seam clean that
+ * THREW leaves its rows behind (the arm is log-and-continue by design), so
+ * the same residue can linger here; this hourly sweep is that arm's
+ * adaptation: find repos whose action_schedule rows survive in an
+ * actions-UNAVAILABLE state (the repo ARCHIVED, or its repo_units actions
+ * row GONE — exactly the conditions upstream's seams fire under) and enqueue
+ * one {kind: "actions-schedule-clean", repoId} per repo; the REPO_TASKS
+ * consumer runs cleanRepoScheduleTasks (delete rows + cancel the in-progress
+ * schedule runs on the default branch) with its own queue budget. Rows of
+ * ENABLED repos are never touched — the destructive case upstream's clean
+ * can never hit either. NOT demo-gated and NOT var-gated (upstream's clean
+ * is unconditional at each of its seams — the ratified non-demo-gated
+ * packages shape); the probe is ONE indexed LIMIT-1 read over the schedule
+ * rows, so a clean instance costs one EXISTS-shaped query and zero sends.
+ * Returns the number of messages enqueued.
+ */
+export async function enqueueDueScheduleTaskCleans(
+  env: ScheduleCleanProducerEnv,
+  options: { limit?: number } = {},
+): Promise<number> {
+  const db = env.DB;
+  const queue = env.REPO_TASKS;
+  if (db === undefined || queue === undefined) {
+    // Unbound bindings are a config bug — fail loud (the packages-cleanup
+    // producer's posture); the generated Env types the bindings required,
+    // this is the fail-closed runtime defense.
+    throw new Error("DB/REPO_TASKS not bound (wrangler.jsonc); the schedule-clean producer cannot probe");
+  }
+  const limit = options.limit ?? SCHEDULE_CLEAN_PAGE_LIMIT;
+  const d1 = drizzle(db);
+  // The residue probe + candidate page in one statement: schedule rows whose
+  // repo is archived, or whose actions unit row is gone (the LEFT JOIN's
+  // null-extension marker over the units probe — the demo producer's
+  // `users.id IS NULL` shape). Oldest schedule row first (a stable drain
+  // order); DISTINCT over the schedule's repo ids.
+  const residue = await d1
+    .selectDistinct({ repoId: actionSchedules.repoId })
+    .from(actionSchedules)
+    .leftJoin(repositories, eq(repositories.id, actionSchedules.repoId))
+    .where(
+      or(
+        eq(repositories.isArchived, true),
+        sql`NOT EXISTS (SELECT 1 FROM repo_units ${repoUnits} WHERE ${repoUnits.repoId} = ${actionSchedules.repoId} AND ${repoUnits.type} = 'actions')`,
+      ),
+    )
+    .orderBy(asc(actionSchedules.repoId))
+    .limit(limit);
+  if (residue.length === 0) {
+    console.log("[schedule-clean] 0 residual repos (archived or unit-less registries)");
+    return 0;
+  }
+  const messages: ActionsScheduleCleanMessage[] = residue.map((row) => ({ kind: "actions-schedule-clean", repoId: row.repoId }));
+  for (let i = 0; i < messages.length; i += 100) {
+    await queue.sendBatch(messages.slice(i, i + 100).map((message) => ({ body: message })));
+  }
+  console.log(`[schedule-clean] enqueued ${messages.length} repo clean(s)`);
+  return messages.length;
+}
+
+// ---------------------------------------------------------------------------
 // The scheduled dispatch (§3.1) — see the mount record in the module header
 // ---------------------------------------------------------------------------
 
@@ -473,7 +571,10 @@ export async function enqueueDueActionScheduleScans(env: ActionsScheduleProducer
  * set → zero reads and zero sends), the auto-merge due-scan producer
  * (probe-shaped, ungated — the 58f9890 fold) and the webhook-maintenance
  * producer (probe-gated, never var-gated — SPEC-0005 §4.9 as-built: no stale
- * `delivering` row AND no over-age terminal row → zero sends);
+ * `delivering` row AND no over-age terminal row → zero sends), plus the
+ * schedule-clean producer (probe-gated, never var-gated — the §D7
+ * CleanRepoScheduleTasks wiring: no archived-or-unit-less registry → zero
+ * sends);
  * every OTHER entry — the standing
  * 10-minute step entry and anything a future config adds — runs the mirror
  * producers exactly as the inline handler always has: unconditional,
@@ -601,6 +702,34 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
       );
     }
     // --- END webhook-maintenance producer block -----------------------------
+    // --- BEGIN schedule-clean producer block (SPEC-0012 §D7's
+    // --- CleanRepoScheduleTasks wiring; the §D7 tail's second seam) ---------
+    // Upstream's CleanRepoScheduleTasks (clear_tasks.go:59-62) is
+    // event-driven at FOUR seams; the settings/archive two ride the landed
+    // writes inline (saveRepoSettings' has_actions arm, setRepoArchived),
+    // and this hourly sweep carries the residue: repos whose schedule rows
+    // survive in an actions-unavailable state (archived, or the actions
+    // unit row gone) — the rows upstream's notifier_helper.go:156-160
+    // global-disable arm cleans lazily ("there is no other place we can do
+    // this because the app.ini will be changed manually"), which our port
+    // has no writer for, plus any event-seam clean that threw (the arm is
+    // log-and-continue by design). ONE indexed probe arms the tick (zero
+    // sends on a clean instance); per-residue-repo
+    // {kind: "actions-schedule-clean", repoId} messages ride REPO_TASKS and
+    // the consumer runs cleanRepoScheduleTasks (delete rows + cancel the
+    // in-progress schedule runs on the default branch) with its own queue
+    // budget. NOT demo-gated, NOT var-gated (upstream's clean is
+    // unconditional at every seam); enabled repos' rows are never touched.
+    // Swallowed failures keep the hourly invocation intact (the tail-arm
+    // rationale); the next tick re-probes.
+    try {
+      await enqueueDueScheduleTaskCleans(env, {});
+    } catch (error) {
+      console.error(
+        `[schedule-clean] producer probe failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // --- END schedule-clean producer block ----------------------------------
     // (The actions-schedule producer rode this hourly entry from its W14
     // landing until the 2026-11-03 two-table registry alignment — SPEC-0012
     // §D7 moved it to the step entry below, where upstream's

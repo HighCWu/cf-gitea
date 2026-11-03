@@ -24,7 +24,8 @@ import { eq } from "drizzle-orm";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { repoRedirects, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actionRunJobs, actionRuns, actionSchedules, repoRedirects, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { ACTION_STATUS_CANCELLED, ACTION_STATUS_WAITING } from "../services/actions/model";
 import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { handleRepoTasks, purgeRepoMessage } from "./purge";
@@ -162,6 +163,10 @@ async function resetD1(): Promise<void> {
     "repo_redirects",
     "webhook_deliveries",
     "webhooks",
+    "action_schedule_spec",
+    "action_schedule",
+    "action_run_jobs",
+    "action_runs",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
@@ -620,5 +625,86 @@ describe("webhook-maintenance consumer arm (SPEC-0005 §4.9 + §3.6)", () => {
     expect(acked).toEqual([]);
     const lines = consoleError.mock.calls.map((args) => args.map(String).join(" "));
     expect(lines.some((line) => line.includes("[repo-tasks] webhook-maintenance wm-3 retrying"))).toBe(true);
+  });
+});
+
+describe("schedule-clean consumer arm (SPEC-0012 §D7 — CleanRepoScheduleTasks' residual-row sweep)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("runs cleanRepoScheduleTasks for the message's repo: registry rows gone, a live default-branch schedule run cancelled, acks", async () => {
+    await seedUser(81, "clean-owner");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "9001",
+      storageKey: "r_9001",
+      ownerNamespace: "owner-9001",
+      ownerId: 81,
+      slug: "repo-9001",
+      visibility: "public",
+      createdAt: new Date(0),
+    });
+    await drizzle(env.DB).insert(actionSchedules).values({
+      title: "ci",
+      specs: "[]",
+      repoId: "9001",
+      ownerId: 81,
+      workflowId: "ci.yml",
+      triggerUserId: -2,
+      ref: "refs/heads/main",
+      commitSha: "a".repeat(40),
+      event: "push",
+      eventPayload: "{}",
+      content: "on: schedule",
+      created: new Date(0),
+      updated: new Date(0),
+    });
+    const run = await drizzle(env.DB)
+      .insert(actionRuns)
+      .values({
+        repoId: "9001",
+        ownerId: 81,
+        index: 1,
+        status: ACTION_STATUS_WAITING,
+        ref: "refs/heads/main",
+        triggerEvent: "schedule",
+        created: new Date(0),
+        updated: new Date(0),
+      })
+      .returning({ id: actionRuns.id });
+    const runId = run[0]!.id;
+    await drizzle(env.DB).insert(actionRunJobs).values({
+      runId,
+      repoId: "9001",
+      ownerId: 81,
+      jobId: "job-clean-1",
+      attempt: 1,
+      workflowPayload: new TextEncoder().encode("jobs: {}"),
+      status: ACTION_STATUS_WAITING,
+      taskId: 0,
+      created: new Date(0),
+      updated: new Date(0),
+    });
+
+    const { batch, acked, retried } = fabricatedBatch([
+      { id: "schedclean-1", body: { kind: "actions-schedule-clean", repoId: "9001" } },
+    ]);
+    await handleRepoTasks(batch, env);
+
+    expect(acked).toEqual(["schedclean-1"]);
+    expect(retried).toEqual([]);
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toEqual([]);
+    expect((await drizzle(env.DB).select().from(actionRunJobs).all())[0]?.status).toBe(ACTION_STATUS_CANCELLED);
+    expect((await drizzle(env.DB).select().from(actionRuns).all())[0]?.status).toBe(ACTION_STATUS_CANCELLED);
+  });
+
+  it("acks a clean for a repo with nothing to clean (the idempotent redelivery shape)", async () => {
+    const { batch, acked, retried } = fabricatedBatch([
+      { id: "schedclean-2", body: { kind: "actions-schedule-clean", repoId: "never-created" } },
+    ]);
+    await handleRepoTasks(batch, env);
+    expect(acked).toEqual(["schedclean-2"]);
+    expect(retried).toEqual([]);
   });
 });

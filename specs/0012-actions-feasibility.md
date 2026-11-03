@@ -1409,7 +1409,10 @@ the registry holding the parsed specs.
   (`schedule.go:69-71`); the 5-year horizon returns zero (`spec.go:58-60`).
 - Gone schedule/repo rows and archived repos skip SILENTLY but only AFTER
   the advance (`schedule_tasks.go:74-99`) — rows keep churning on archived
-  repos, exactly upstream.
+  repos exactly upstream WHEN THEY EXIST: since the 2026-11-03 seam wiring
+  (below) an ARCHIVE cleans the rows at the flip itself, so the churn case
+  is residue only (an archive predating the seam, or a clean that threw —
+  the sweep arm heals it).
 - The unit gate and the disabled-workflow list skip after the advance
   (`schedule_tasks.go:101-125`) — a re-enabled workflow resumes on its
   schedule.
@@ -1432,12 +1435,68 @@ the registry holding the parsed specs.
 - A push removing every schedule workflow: the count>0 delete runs first,
   the empty detection returns — the repo's rows are gone
   (`notifier_helper.go:601-615`).
-- Out of scope (recorded, not regressed): the settings-change arm
-  (`services/repository/setting.go:27-40` — DeleteScheduleTaskByRepo +
-  DetectAndHandleSchedules on the actions-unit toggle) and
-  `CleanRepoScheduleTasks` (`clear_tasks.go:75`) have no cf-gitea seam yet
-  (the unit toggle lives outside this unit's ownership); the registry
-  refreshes on default-branch pushes only, upstream's dominant path.
+- **The two recorded-unwired seams are WIRED (the 2026-11-03 tail of this
+  as-built, same day as the landing):**
+  1. *The settings-change arm* — upstream `UpdateRepositoryUnits`
+     (`services/repository/setting.go:20-64`, the FM cite resolved to this
+     file): whenever the update INCLUDES the actions unit, the in-tx body
+     runs `DeleteScheduleTaskByRepo` + `DetectAndHandleSchedules`
+     (:31-41, both log-and-continue), and a DISABLE additionally runs
+     `CleanRepoScheduleTasks` AFTER the transaction (:19 `disableActions :=
+     slices.Contains(deleteUnitTypes, unit.TypeActions)`, :55-58 "only
+     disabling stops in-progress schedule runs"). Port home: the unit
+     toggle's landed reduction — `saveRepoSettings`'s `has_actions` write
+     (`api/services/repo-settings.ts`, the ActionsUnitPost collapse the C9
+     wave documented) — fires the same pair after the settings batch
+     commits: enable → delete + the tree re-walk through the standalone
+     `detectAndHandleSchedules` port (schedule.ts; registration verbatim
+     `newNotifyInputForSchedules` — event `schedule`, payload `null`,
+     `notifier_helper.go:82-85`), disable → `cleanRepoScheduleTasks`. The
+     threaded callers are the two real has_actions writers: the UI toggle
+     (`applyRepoActionsUnitToggle`, repo-settings-actions-general.tsx —
+     ui/index.ts passes the full env) and the API PATCH's settings arm
+     (`routes/repo.ts`, upstream `updateRepoUnits`' actions body,
+     repo.go:967-974). The arm never fails the write (upstream's
+     log-and-continue envelope); the arm's other upstream property holds by
+     construction — the re-walk reads the TREE and repo row, never the unit
+     rows, so post-commit firing is equivalent to upstream's in-tx position.
+  2. *CleanRepoScheduleTasks* — upstream `clear_tasks.go:59-62` →
+     `models/actions/schedule.go:104-123`: `DeleteScheduleTaskByRepo` +
+     `CancelPreviousJobs(repo, default-branch ref, workflowID="", event=
+     schedule)` (run_job.go:706-723 — the live-status set running/waiting/
+     blocked/cancelling, empty workflow filter = every workflow). Ported as
+     `cleanRepoScheduleTasks` (schedule.ts), wired at THREE seams:
+     the unit-disable half of arm 1; the ARCHIVE flip
+     (`setRepoArchived`, repo-settings.ts — upstream's own post-write
+     calls at `routers/api/v1/repo/repo.go:1002` and
+     `routers/web/repo/setting/setting.go:1023`; unarchive cleans nothing,
+     upstream's else-branch); and the cron census's new
+     `clean_repo_schedule_tasks` arm (hourly entry, probe-gated, NOT
+     demo-gated — services/demo-sweep.ts `enqueueDueScheduleTaskCleans` +
+     the purge.ts consumer arm). The cron row is the recorded ADAPTATION:
+     upstream's clean is event-driven at FOUR seams with NO registered
+     cron (the brief's "periodic" premise does not hold at the pin), and
+     its fourth seam — `notifier_helper.go:156-160`'s
+     `TypeActions.UnitGlobalDisabled()` arm, which exists because "there is
+     no other place we can do this because the app.ini will be changed
+     manually" — has NO writer in this port (no instance-wide actions
+     toggle exists), so the sweep finds the residue (schedule rows of
+     archived or unit-less repos — never an enabled repo's rows, the
+     destructive case upstream's clean can never hit either) and runs the
+     same clean per repo. The name takes upstream's function name per the
+     `cleanup_ephemeral_runners` convention; the producer is one indexed
+     LIMIT-1 probe (zero sends on a clean instance), the consumer runs
+     per-repo with its own queue budget; both event seams' errors are
+     log-and-continue exactly upstream, and the sweep is what heals a
+     clean that threw.
+  - Not ported (recorded gaps, both reported): upstream's per-repo unit
+    re-save fires the re-walk for the ORG/USER-level surfaces too
+    (`UpdateRepositoryUnits`'s other callers) — our surface exposes only
+    the repo-level writers above, which is what was wired; and
+    `SwitchSchedulesToDefaultBranch` (clear_tasks.go:66-77 — the
+    default-branch RENAME cleanup) has no seam here yet (a default-branch
+    rename is a repositories-column write with no schedule hook today).
+
 
 **API surface:** none — the registry is internal (upstream exposes no
 schedule API at the pin; `FindScheduleOptions`' only consumer is the

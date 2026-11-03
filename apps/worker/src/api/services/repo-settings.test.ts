@@ -21,7 +21,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { actionRunners, repoUnits, repositories } from "../../db/schema";
+import { actionRunners, actionSchedules, actionScheduleSpecs, repoUnits, repositories } from "../../db/schema";
 import { scopeRepoIds, type RunnerRow } from "../../services/actions/model";
 import { loadRepoSettings, saveRepoSettings } from "./repo-settings";
 
@@ -33,7 +33,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["repo_units", "repo_settings", "action_runners", "repositories", "users"]) {
+  for (const table of ["repo_units", "repo_settings", "action_runners", "action_schedule_spec", "action_schedule", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -114,6 +114,79 @@ describe("saveRepoSettings — the Actions unit-row lockstep (ActionsUnitPost's 
     await drizzle(env.DB).insert(repoUnits).values({ repoId: "repo-1", type: "actions" });
     await saveRepoSettings(env.DB, "repo-1", { hasActions: false }, T0);
     expect(await unitTypes("repo-1")).toEqual([]);
+  });
+});
+
+describe("the settings-change arm (setting.go:27-51 — the §D7 wiring)", () => {
+  /** The registry rows the arm acts on (direct seeds — the registration
+   *  lifecycle is schedule.test.ts's arm). */
+  async function seedScheduleRows(repoId: string): Promise<void> {
+    const schedule = await drizzle(env.DB)
+      .insert(actionSchedules)
+      .values({
+        title: "ci",
+        specs: JSON.stringify(["0 * * * *"]),
+        repoId,
+        ownerId: OWNER_ID,
+        workflowId: "ci.yml",
+        triggerUserId: -2,
+        ref: "refs/heads/main",
+        commitSha: "a".repeat(40),
+        event: "push",
+        eventPayload: "{}",
+        content: "on: schedule",
+        created: T0,
+        updated: T0,
+      })
+      .returning({ id: actionSchedules.id });
+    await drizzle(env.DB).insert(actionScheduleSpecs).values({
+      repoId,
+      scheduleId: schedule[0]!.id,
+      spec: "0 * * * *",
+      next: new Date(T0),
+      prev: null,
+      created: T0,
+      updated: T0,
+    });
+  }
+
+  it("ENABLE deletes the registry rows before the re-walk (setting.go:32-35's in-tx pair, delete half)", async () => {
+    await seedScheduleRows("repo-1");
+    // env threaded (the production callers all do) — the detect runs against
+    // a fixture repo with no default branch and skips silently
+    // (notifier_helper.go:672-676's GetCommit miss arm).
+    await saveRepoSettings(env.DB, "repo-1", { hasActions: true }, T0, { env });
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(actionScheduleSpecs).all()).toHaveLength(0);
+    // The unit write stands.
+    expect(await unitTypes("repo-1")).toEqual(["actions"]);
+  });
+
+  it("ENABLE without a threaded env still runs the delete half (the re-walk skip is logged, not fatal)", async () => {
+    await seedScheduleRows("repo-1");
+    await saveRepoSettings(env.DB, "repo-1", { hasActions: true }, T0);
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
+    expect(await unitTypes("repo-1")).toEqual(["actions"]);
+  });
+
+  it("DISABLE runs CleanRepoScheduleTasks: the registry rows go (setting.go:55-58)", async () => {
+    await seedScheduleRows("repo-1");
+    await saveRepoSettings(env.DB, "repo-1", { hasActions: false }, T0);
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(actionScheduleSpecs).all()).toHaveLength(0);
+    expect(await unitTypes("repo-1")).toEqual([]);
+  });
+
+  it("the arm is repo-scoped: the neighbor's registry rows never move", async () => {
+    await seedScheduleRows("repo-2");
+    await saveRepoSettings(env.DB, "repo-1", { hasActions: false }, T0);
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(1);
+  });
+
+  it("a unit-less save never fires the arm (the description PATCH's shape)", async () => {
+    await seedScheduleRows("repo-1");
+    await saveRepoSettings(env.DB, "repo-1", { description: "hello" }, T0);
+    expect(await drizzle(env.DB).select().from(actionSchedules).all()).toHaveLength(1);
   });
 });
 

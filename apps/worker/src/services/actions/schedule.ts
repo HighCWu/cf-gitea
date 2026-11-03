@@ -58,19 +58,52 @@
  *   - Consume-side `now`: startTask's `now` is the ticker's clock; ours is
  *     the delivery's (the advance and its `Next(now+1m)` evaluate at consume
  *     time; the producer's tick only selects due rows).
- *   - The settings-change arm (services/repository/setting.go:27-40) and
- *     CleanRepoScheduleTasks (clear_tasks.go:75) have no cf-gitea seam yet —
- *     the registry refreshes on default-branch pushes only (the §D7 tail).
+ *   - The settings-change arm (services/repository/setting.go:20-64 —
+ *     UpdateRepositoryUnits fires DeleteScheduleTaskByRepo +
+ *     DetectAndHandleSchedules on every actions-unit write and
+ *     CleanRepoScheduleTasks on the disable) and CleanRepoScheduleTasks
+ *     (clear_tasks.go:59-62 + models/actions/schedule.go:104-123) are WIRED:
+ *     the settings arm rides saveRepoSettings' has_actions write
+ *     (api/services/repo-settings.ts) and the archive seam
+ *     (setRepoArchived), and the clean rides the hourly
+ *     clean_repo_schedule_tasks producer (services/demo-sweep.ts — the
+ *     clean_repo_schedule_tasks census arm, the residual-row sweep that
+ *     covers the seams our surface lacks, upstream's own "app.ini will be
+ *     changed manually" posture, notifier_helper.go:156-160).
  */
 
-import { and, asc, desc, eq, isNull, lte } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { findRepositoryById } from "../../api/services/repository";
-import { actionScheduleSpecs, actionSchedules, repoUnits } from "../../db/schema";
+import { findRepositoryById, type RepositoryWithOwner } from "../../api/services/repository";
+import { engineName } from "../../repos/service";
+import {
+  actionRunJobs,
+  actionRuns,
+  actionScheduleSpecs,
+  actionSchedules,
+  repositories,
+  repoUnits,
+} from "../../db/schema";
 import { loadRepoActionsConfig } from "./config";
-import { ellipsisDisplayString } from "./model";
-import { ACTIONS_USER_ID, insertTriggeredRunSplit } from "./trigger";
+import {
+  ACTION_STATUS_BLOCKED,
+  ACTION_STATUS_CANCELLED,
+  ACTION_STATUS_CANCELLING,
+  ACTION_STATUS_RUNNING,
+  ACTION_STATUS_WAITING,
+  ellipsisDisplayString,
+  increaseTaskVersion,
+} from "./model";
+import { hasWaitingJobsToPick, isDoneStatus, refreshRunStatus, stopTask } from "./update";
+import {
+  ACTIONS_USER_ID,
+  getEventsFromContent,
+  insertTriggeredRunSplit,
+  listWorkflows,
+  type ActionsTriggerEnv,
+  type TriggerCellReads,
+} from "./trigger";
 
 // ---------------------------------------------------------------------------
 // The robfig/cron v3 grammar (models/actions/schedule_spec.go Parse +
@@ -457,6 +490,26 @@ export function isActionsScheduleTriggerMessage(value: unknown): value is Action
   );
 }
 
+/**
+ * The clean_repo_schedule_tasks producer's message (services/demo-sweep.ts):
+ * one per repo whose registry rows survived an actions-unavailable state —
+ * the consumer runs cleanRepoScheduleTasks for it. Idempotent: a redelivery
+ * of a cleaned repo deletes zero rows and cancels zero runs.
+ */
+export interface ActionsScheduleCleanMessage {
+  kind: "actions-schedule-clean";
+  repoId: string;
+}
+
+export function isActionsScheduleCleanMessage(value: unknown): value is ActionsScheduleCleanMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as ActionsScheduleCleanMessage).kind === "actions-schedule-clean" &&
+    typeof (value as ActionsScheduleCleanMessage).repoId === "string"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The registry (models/actions/schedule.go + notifier_helper.go handleSchedules)
 // ---------------------------------------------------------------------------
@@ -593,6 +646,179 @@ export async function deleteScheduleTaskByRepo(d1: D1Database, repoId: string): 
   const db = drizzle(d1);
   await db.delete(actionScheduleSpecs).where(eq(actionScheduleSpecs.repoId, repoId));
   await db.delete(actionSchedules).where(eq(actionSchedules.repoId, repoId));
+}
+
+// ---------------------------------------------------------------------------
+// The settings-change arm (services/repository/setting.go:20-64 +
+// notifier_helper.go:654-685) and the clean (clear_tasks.go:59-62)
+// ---------------------------------------------------------------------------
+
+/**
+ * DetectScheduledWorkflows (modules/actions/workflows.go:242-279 — the
+ * schedule-carrying workflows of one ref with their OnSchedule cron strings,
+ * actionslib model/workflow.go:90-102), over the cell reads. Shared by the
+ * standalone detect below; trigger.ts's push-fused twin keeps its own inline
+ * walk (not refactored there — the push seam's file is not this arm's owner).
+ * A workflow whose content fails GetEventsFromContent is logged and skipped
+ * (workflows.go:255-259); one with no cron-keyed schedule entry registers
+ * nothing ("no schedule event", notifier_helper.go:622-624).
+ */
+export async function detectScheduledWorkflows(reads: TriggerCellReads, ref: string): Promise<DetectedScheduleWorkflow[]> {
+  const workflowFiles = await listWorkflows(reads, ref);
+  const detected: DetectedScheduleWorkflow[] = [];
+  for (const file of workflowFiles) {
+    let events;
+    try {
+      events = getEventsFromContent(file.content);
+    } catch (err) {
+      // GetEventsFromContent's ignore arm (workflows.go:255-259)
+      console.error(
+        `[actions-schedule] ignore invalid workflow ${file.entryName}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
+    const specs: string[] = [];
+    for (const evt of events) {
+      if (evt.schedules === null) continue;
+      for (const record of evt.schedules) {
+        const cron = record["cron"];
+        if (typeof cron === "string" && cron !== "") specs.push(cron);
+      }
+    }
+    if (specs.length === 0) continue; // "no schedule event" (:622-624)
+    detected.push({ entryName: file.entryName, content: file.content, specs });
+  }
+  return detected;
+}
+
+/**
+ * DetectAndHandleSchedules, the STANDALONE entry (notifier_helper.go:654-685)
+ * — the settings-change arm's re-walk (setting.go:39) and the shape behind
+ * the future instance-level consumers. Upstream's body verbatim: the
+ * empty/archived skips (:667-669), the DEFAULT-BRANCH tip re-read (:672-676
+ * GetCommit(repo.DefaultBranch) — the caller passes no ref; the repo row's
+ * defaultBranch IS the registration ref), the tree enumeration, and the
+ * registry replace through handleSchedules. The caller owns the DO cell (the
+ * git-repository read upstream opens itself) and the registration fields:
+ * the settings path registers `newNotifyInputForSchedules` verbatim —
+ * Event = HookEventSchedule "schedule" and the EncodedPayload of a nil
+ * Payload, the literal "null" (notifier_helper.go:82-85) — NOT the push
+ * payload, because no push happened. trigger.ts's same-named function is the
+ * push seam's fusion (its caller owns the update/payload there).
+ */
+export async function detectAndHandleSchedules(
+  env: ActionsTriggerEnv,
+  pair: RepositoryWithOwner,
+  registration: { event: string; eventPayload: string },
+): Promise<void> {
+  const repo = pair.repo;
+  // The empty/archived skips (notifier_helper.go:667-669)
+  if (repo.isEmpty || repo.isArchived) return;
+  const ref = `refs/heads/${repo.defaultBranch}`;
+  const reads: TriggerCellReads = env.REPO.getByName(engineName(repo.ownerNamespace, repo.slug));
+  const commit = await reads.readCommit(ref);
+  if (commit === null) return; // no default branch — nothing can be scheduled
+  const detected = await detectScheduledWorkflows(reads, ref);
+  await handleSchedules(
+    env.DB,
+    {
+      repoId: repo.id,
+      ownerId: repo.ownerId ?? 0,
+      ref,
+      commitSha: commit.oid,
+      commitTitle: commit.subject,
+      event: registration.event,
+      eventPayload: registration.eventPayload,
+    },
+    detected,
+  );
+}
+
+/**
+ * CleanRepoScheduleTasks (services/actions/clear_tasks.go:59-62 →
+ * models/actions/schedule.go:104-123): the actions-unavailable cleanup —
+ * DeleteScheduleTaskByRepo FIRST ("if actions disabled when there is
+ * schedule task, this will remove the outdated schedule tasks", :105-106),
+ * then CancelPreviousJobs of this repo's SCHEDULE runs on the DEFAULT
+ * BRANCH (run_job.go:706-723: runs with trigger_event = schedule on the
+ * ref, workflow filter EMPTY = every workflow — ToConds skips an empty
+ * workflow_id — in status running/waiting/blocked/cancelling; their job
+ * rows cancel per cancelOneJob, and each cancellation rides the
+ * UpdateRunJob hook's live halves — the wake when pickable work remains and
+ * the run aggregate recompute — exactly the sweeps.ts cancelAbandonedJobs
+ * precedent; the notifyAndEmitFinishedJobs tail stays the M3 emitter
+ * family's staged arm). Errors PROPAGATE to the caller, whose log-and-
+ * continue is upstream's own shape (setting.go:58-60 logs, the write
+ * stands). Returns the cancelled run count.
+ */
+export async function cleanRepoScheduleTasks(d1: D1Database, repoId: string): Promise<number> {
+  // The registry rows go first, verbatim (:108-110).
+  await deleteScheduleTaskByRepo(d1, repoId);
+  // The default-branch read is a DIRECT repositories probe, not the
+  // owner-joined findRepositoryById: the clean must not lose the cancel
+  // half to a dangling owner row (the join drops the row entirely), and
+  // upstream's clean needs only the repo's DefaultBranch.
+  const repoRows = await drizzle(d1)
+    .select({ defaultBranch: repositories.defaultBranch })
+    .from(repositories)
+    .where(eq(repositories.id, repoId))
+    .limit(1);
+  const defaultBranch = repoRows[0]?.defaultBranch;
+  if (defaultBranch === undefined) return 0; // rows gone; no default branch to cancel against
+  const db = drizzle(d1);
+  const ref = `refs/heads/${defaultBranch}`;
+  const liveRuns = await db
+    .select({ id: actionRuns.id })
+    .from(actionRuns)
+    .where(
+      and(
+        eq(actionRuns.repoId, repoId),
+        eq(actionRuns.ref, ref),
+        eq(actionRuns.triggerEvent, "schedule"),
+        inArray(actionRuns.status, [
+          ACTION_STATUS_RUNNING,
+          ACTION_STATUS_WAITING,
+          ACTION_STATUS_BLOCKED,
+          ACTION_STATUS_CANCELLING,
+        ]),
+      ),
+    );
+  if (liveRuns.length === 0) return 0;
+  const runIds = liveRuns.map((run) => run.id);
+  const jobs = await db.select().from(actionRunJobs).where(inArray(actionRunJobs.runId, runIds)).all();
+  let cancelled = 0;
+  for (const job of jobs) {
+    const now = new Date();
+    if (isDoneStatus(job.status)) continue; // cancelOneJob's done arm (run_job.go:806-808)
+    if (job.taskId === 0) {
+      // cancelOneJob's direct arm behind the just-claimed CAS (:810-819) —
+      // a runner claiming in the same instant wins and the cancellation
+      // no-ops.
+      const updated = await db
+        .update(actionRunJobs)
+        .set({ status: ACTION_STATUS_CANCELLED, stopped: now, updated: now })
+        .where(and(eq(actionRunJobs.id, job.id), eq(actionRunJobs.taskId, 0)))
+        .returning({ id: actionRunJobs.id });
+      if (updated.length === 0) continue;
+    } else {
+      // cancelOneJob's claimed arm: stopTask's CANCELLING handshake
+      // (CancelJobs' force=false — no forced cancel here).
+      try {
+        await stopTask(d1, job.taskId, ACTION_STATUS_CANCELLING);
+      } catch {
+        continue; // the task row vanished — nothing to cancel
+      }
+    }
+    // The UpdateRunJob hook's live halves (run_job.go:503-530), per job —
+    // the sweeps.ts precedent.
+    if (await hasWaitingJobsToPick(d1, job.repoId)) {
+      await increaseTaskVersion(d1, job.ownerId, job.repoId);
+    }
+    await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId);
+    cancelled += 1;
+  }
+  return cancelled;
 }
 
 /**

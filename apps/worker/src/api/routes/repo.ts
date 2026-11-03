@@ -32,6 +32,7 @@ import {
   deleteRepoSettings,
   loadRepoSettings,
   saveRepoSettings,
+  setRepoArchived,
   PROJECTS_MODES,
   SQUASH_MERGE_MESSAGES,
   validatePullRequestsUpdateSettings,
@@ -644,10 +645,11 @@ export function registerRepoRoutes(
         throw new ApiError(422, "repo is a mirror, cannot archive/un-archive");
       }
       if (form.archived !== undefined && form.archived !== found.repo.isArchived) {
-        await drizzle(c.env.DB)
-          .update(repositories)
-          .set({ isArchived: form.archived, updatedAt: now })
-          .where(eq(repositories.id, found.repo.id));
+        // The landed SetArchiveRepo port (repo-settings.ts) — now also the
+        // API arm's schedule-clean seam: upstream's updateRepoArchivedState
+        // tail-calls CleanRepoScheduleTasks on archive (repo.go:1002-1005),
+        // which the shared write carries internally.
+        await setRepoArchived(c.env.DB, found.repo.id, form.archived, now);
       }
 
       // Template flag (upstream updateBasicProperties, repo.go:699-701:
@@ -753,7 +755,12 @@ export function registerRepoRoutes(
       }
 
       if (Object.keys(settingsPatch).length > 0) {
-        await saveRepoSettings(c.env.DB, found.repo.id, settingsPatch, now);
+        // The env rides for the settings-change arm: a has_actions PATCH is
+        // upstream's updateRepoUnits actions body (repo.go:967-974 →
+        // UpdateRepositoryUnits' DeleteScheduleTaskByRepo +
+        // DetectAndHandleSchedules on enable, CleanRepoScheduleTasks on
+        // disable — the §D7 wiring; the re-walk needs the REPO cell).
+        await saveRepoSettings(c.env.DB, found.repo.id, settingsPatch, now, { env: c.env });
       }
 
       // Re-render through the same converter as GET (the rename may have

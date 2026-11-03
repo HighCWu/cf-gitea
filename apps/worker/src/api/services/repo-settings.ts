@@ -3,6 +3,13 @@ import { and, eq } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 
 import { repoSettings, repoUnits, repositories } from "../../db/schema";
+import { findRepositoryById } from "./repository";
+import {
+  cleanRepoScheduleTasks,
+  deleteScheduleTaskByRepo,
+  detectAndHandleSchedules,
+} from "../../services/actions/schedule";
+import type { ActionsTriggerEnv } from "../../services/actions/trigger";
 
 /**
  * Upstream `PullRequestsConfig` (models/repo/repo_unit.go:119-137) — the
@@ -342,6 +349,13 @@ export async function saveRepoSettings(
   repoId: string,
   patch: RepoSettingsPatch,
   now: Date,
+  // The settings-change arm's context (upstream UpdateRepositoryUnits runs
+  // INSIDE repo_service with full context; our store is d1-shaped, so the
+  // tree-reading half rides an explicit opt-in — every production hasActions
+  // caller threads it; the undefined case (unit tests, description-only
+  // saves) runs the arm's D1 halves and logs the tree skip, inside
+  // upstream's own log-and-continue envelope).
+  scheduleArm: { env?: ActionsTriggerEnv } = {},
 ): Promise<void> {
   const current = await loadRepoSettings(d1, repoId);
   const merged: RepoSettings = {
@@ -426,9 +440,77 @@ export async function saveRepoSettings(
 
   if (unitWrites.length === 0) {
     await upsert;
+    await fireActionsScheduleArm(d1, repoId, patch, scheduleArm);
     return;
   }
   await db.batch([upsert, ...unitWrites] as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+  await fireActionsScheduleArm(d1, repoId, patch, scheduleArm);
+}
+
+/**
+ * The settings-change arm (upstream UpdateRepositoryUnits'
+ * actions-unit body, services/repository/setting.go:27-51 — the §D7 seam,
+ * wired 2026-11-03): whenever the write INCLUDES the actions unit, upstream
+ * re-walks the registry inside the update — DeleteScheduleTaskByRepo, then
+ * DetectAndHandleSchedules (both log-and-continue, :32-41) — and a DISABLE
+ * additionally runs CleanRepoScheduleTasks AFTER the transaction
+ * ("only disabling stops in-progress schedule runs", :55-58, :19's
+ * `disableActions := slices.Contains(deleteUnitTypes, …)`). The port rides
+ * this store's has_actions write (the ActionsUnitPost reduction — the unit
+ * row insert/delete IS the toggle):
+ *
+ *   - enable (true): the registry delete + the tree re-walk through
+ *     detectAndHandleSchedules with newNotifyInputForSchedules' verbatim
+ *     registration (event "schedule", payload "null" — no push happened);
+ *   - disable (false): cleanRepoScheduleTasks — the rows go AND the
+ *     in-progress schedule runs on the default branch cancel.
+ *
+ * Both arms are best-effort exactly upstream: an error logs and the unit
+ * write STANDS (upstream's log.Error arms never fail UpdateRepositoryUnits).
+ * The two skips this port adds, both logged: a missing `scheduleArm.env`
+ * (the tree read needs the REPO binding; the delete half still ran) and —
+ * inside detectAndHandleSchedules itself — upstream's empty/archived skips.
+ * ORDER note: upstream's re-walk runs in-transaction, before the unit rows
+ * are rewritten; ours runs after the batch commits. Equivalent, because the
+ * re-walk reads the TREE and the repo row, never the unit rows
+ * (DetectAndHandleSchedules has no unit gate of its own, :654-685), and the
+ * batch is atomic on D1 either way.
+ */
+async function fireActionsScheduleArm(
+  d1: D1Database,
+  repoId: string,
+  patch: RepoSettingsPatch,
+  scheduleArm: { env?: ActionsTriggerEnv },
+): Promise<void> {
+  if (patch.hasActions === undefined) return;
+  try {
+    if (patch.hasActions === true) {
+      // The in-tx pair (setting.go:31-41): delete, then re-detect.
+      await deleteScheduleTaskByRepo(d1, repoId);
+      if (scheduleArm.env === undefined) {
+        console.error(`[repo-settings] actions unit enabled for ${repoId}: schedule re-walk skipped (no REPO binding threaded)`);
+        return;
+      }
+      const pair = await findRepositoryById(d1, repoId);
+      if (pair === null) {
+        console.error(`[repo-settings] actions unit enabled for ${repoId}: repo row gone — schedule re-walk skipped`);
+        return;
+      }
+      // newNotifyInputForSchedules (notifier_helper.go:82-85): Event =
+      // HookEventSchedule, Payload = nil → EncodedPayload "null".
+      await detectAndHandleSchedules(scheduleArm.env, pair, { event: "schedule", eventPayload: "null" });
+    } else {
+      // The post-transaction disable clean (setting.go:55-58).
+      const cancelled = await cleanRepoScheduleTasks(d1, repoId);
+      if (cancelled > 0) console.log(`[repo-settings] actions unit disabled for ${repoId}: cancelled ${cancelled} schedule job(s)`);
+    }
+  } catch (error) {
+    // log.Error + continue — the unit write stands (setting.go:32-41, :57-60).
+    console.error(
+      `[repo-settings] the actions settings-change arm failed for ${repoId} (the write stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /** Repo-scoped settings delete (the api repoDelete path's housekeeping; the
@@ -445,12 +527,30 @@ export async function deleteRepoSettings(d1: D1Database, repoId: string): Promis
  * landed); the caller owns upstream's mirror refusal
  * (`repo.settings.archive.error_ismirror` — handleSettingsPostArchive:1009)
  * because it needs the mirror read, so this arm is the unconditional write.
+ *
+ * The ARCHIVE seam of the schedule cleanup (the §D7 wiring, 2026-11-03): an
+ * ARCHIVE runs CleanRepoScheduleTasks after the flip — upstream's own
+ * post-write call at routers/api/v1/repo/repo.go:1002 (the API arm) and
+ * routers/web/repo/setting/setting.go:1023 (the web arm); an UNARCHIVE does
+ * nothing (upstream's `else` branch has no schedule call) — the registry
+ * re-registers on the next default-branch push. Best-effort upstream: the
+ * clean's error is logged, the flip stands (repo.go:1003-1004).
  */
 export async function setRepoArchived(d1: D1Database, repoId: string, archived: boolean, now: Date): Promise<void> {
   await drizzle(d1)
     .update(repositories)
     .set({ isArchived: archived, updatedAt: now })
     .where(eq(repositories.id, repoId));
+  if (!archived) return;
+  try {
+    const cancelled = await cleanRepoScheduleTasks(d1, repoId);
+    if (cancelled > 0) console.log(`[repo-settings] repo ${repoId} archived: cancelled ${cancelled} schedule job(s)`);
+  } catch (error) {
+    console.error(
+      `[repo-settings] CleanRepoScheduleTasks after archiving ${repoId} failed (the flip stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /**

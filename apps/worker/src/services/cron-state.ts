@@ -21,7 +21,7 @@
  * per entry mirror handleScheduledCron's dispatch EXACTLY
  * (services/demo-sweep.ts — the mount record in its module header):
  *
- *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries EIGHT producer
+ *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries NINE producer
  *     arms: demo_sweep (SPEC-0014), delete_old_audit_events (SPEC-0015
  *     §4.3), cleanup_packages (SPEC-0016 §4.4), cleanup_actions
  *     (SPEC-0012 §4.5), auto_merge_due_scan (the 58f9890 fold — upstream's
@@ -29,9 +29,11 @@
  *     the due scan needs a tick), cancel_abandoned_jobs and
  *     cleanup_ephemeral_runners (SPEC-0012 §4.5's parity-review sweeps —
  *     the dispatcher's actions-abandoned + ephemeral block, its SIXTH
- *     sanctioned extension), and cleanup_hook_task_table (SPEC-0005 §4.9
+ *     sanctioned extension), cleanup_hook_task_table (SPEC-0005 §4.9
  *     as-built, the 870c9b3 landing — the dispatcher's webhook-maintenance
- *     block);
+ *     block), and clean_repo_schedule_tasks (SPEC-0012 §D7's
+ *     CleanRepoScheduleTasks wiring — the residual-row sweep for the
+ *     actions-unavailable seams, the dispatcher's schedule-clean block);
  *   - EVERY OTHER entry (today the standing 10-minute step) carries the
  *     FIVE unconditional arms: update_mirrors + update_push_mirrors
  *     (SPEC-0009 §2.6 / specs/push-mirror-outbound.md), stop_zombie_tasks
@@ -54,7 +56,7 @@
  * producer's faithful twin (SPEC-0012, the SEVENTH sanctioned extension);
  * tasks_extended.go:146 delete_old_audit_events; tasks_actions.go:70/:80 —
  * our single actions-retention producer carries the cleanup_actions +
- * cleanup_action_runs pair's bodies, folded per SPEC-0012 §4.5). FOUR arms
+ * cleanup_action_runs pair's bodies, folded per SPEC-0012 §4.5). FIVE arms
  * are cf-gitea extensions with no upstream registered task: demo_sweep
  * (SPEC-0014); auto_merge_due_scan — upstream's auto-merge module is fully
  * queue/notify-driven (services/automerge/automerge.go) with no registered
@@ -63,12 +65,18 @@
  * families into the ONE update_mirrors task (mirror.go:34-110 iterates
  * pull and push mirrors under one body), ours runs two producers, so the
  * push twin gets the convention-following name and the split is recorded
- * here; and cleanup_ephemeral_runners — upstream folds the ephemeral-runner
+ * here; cleanup_ephemeral_runners — upstream folds the ephemeral-runner
  * sweep into the ONE cleanup_actions task body (cleanup.go:34-39 runs
- * CleanupEphemeralRunners inside every Cleanup), ours decouples it as an
+ * CleanupEphemeralRunners inside every nightly Cleanup), ours decouples it as an
  * always-on UNGATED producer (SPEC-0012 §4.5, parity-review item 3c —
  * upstream runs it in every nightly Cleanup with no retention knob), so it
- * takes upstream's function name and the split is recorded here.
+ * takes upstream's function name and the split is recorded here; and
+ * clean_repo_schedule_tasks — upstream's CleanRepoScheduleTasks is
+ * event-driven at four seams (setting.go:58, repo.go:1002,
+ * notifier_helper.go:157, web setting.go:1023) with no registered cron, and
+ * our settings/archive seams ride the writes inline, so the residual-row
+ * sweep takes upstream's function name too (the §D7 tail's wiring, the
+ * dispatcher's schedule-clean block).
  *
  * Schedules render the WRANGLER EXPRESSION verbatim (the registries'
  * standing convention — the expression is literally what runs), not
@@ -178,6 +186,17 @@ export const CRON_ARMS: readonly CronArm[] = [
   // producer (SPEC-0005 §4.9 as-built, the 870c9b3 landing), probe-gated
   // and NOT demo-gated (the packages shape).
   { arm: "cleanup_hook_task_table", spec: DEMO_SWEEP_CRON },
+  // NO upstream registered task — the §D7 tail's CleanRepoScheduleTasks
+  // wiring (clear_tasks.go:59-62 + models/actions/schedule.go:104-123, the
+  // 2026-11-03 landing): upstream's clean is event-driven (the actions-unit
+  // disable, the archive flip, the instance-wide UnitGlobalDisabled notify
+  // arm — services/repository/setting.go:58, repo.go:1002,
+  // notifier_helper.go:157), and the settings/archive seams ride our writes
+  // inline; this hourly producer sweeps the RESIDUE (schedule rows of
+  // archived or unit-less repos — the global-disable case our surface has
+  // no writer for), so it takes upstream's function name per the
+  // cleanup_ephemeral_runners convention, probe-gated (the packages shape).
+  { arm: "clean_repo_schedule_tasks", spec: DEMO_SWEEP_CRON },
 ];
 
 /** The entry's arms (the census filter — the hourly entry is matched EXACTLY
@@ -279,7 +298,7 @@ export interface CronStateRow {
 }
 
 /**
- * The full tick state, keyed by arm name — ONE point scan of a ≤13-row
+ * The full tick state, keyed by arm name — ONE point scan of a ≤14-row
  * table. Arms without a row (nothing recorded yet — a fresh deployment, or the
  * golden harness) are simply absent: the monitor renders the never-fired
  * arms, exactly upstream's unset-Prev posture.

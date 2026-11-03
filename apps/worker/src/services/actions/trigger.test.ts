@@ -2392,9 +2392,14 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     const { tips, pack } = await buildChainPack(null, [
       { message: "ci: schedule workflow", files: [{ path: ".gitea/workflows/hourly.yml", content: hourly }] },
     ]);
+    // The unit-flag write rides BEFORE the push: since the §D7 settings arm
+    // wired (setting.go:27-51), an has_actions save IS UpdateRepositoryUnits'
+    // actions body — its delete half runs even on a re-save — so seeding the
+    // row after the push would wipe the just-registered rows (the arm the
+    // repo-settings suite pins).
+    await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
     await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
     await db().delete(actionRuns);
-    await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
     expect(
       await toggleRepoActionsWorkflow(env.DB, repoId, userId, { workflowId: "hourly.yml", isEnable: false, scopedWorkflowSourceRepoId: "" }),
     ).toBe("saved");

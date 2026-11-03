@@ -247,36 +247,36 @@ describe("the collaborative_owner parse arms (actions.go:95-142)", () => {
 describe("applyRepoActionsUnitToggle (ActionsUnitPost's UpdateRepositoryUnits arm over repo_settings.has_actions)", () => {
   it("flips the store's default-false unit ON", async () => {
     expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(false); // the store default
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: true });
     expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(true);
   });
 
   it("flips an enabled unit OFF (the disabled posture's write)", async () => {
     await enableActions();
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: false });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: false });
     expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(false);
   });
 
   it("is idempotent both ways (the settings upsert)", async () => {
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: true });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: true });
     expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(true);
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: false });
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: false });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: false });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: false });
     expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(false);
   });
 
   it("is repo-scoped — the neighbor's flag never moves", async () => {
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: true });
     expect((await loadRepoSettings(env.DB, "repo-2")).hasActions).toBe(false);
   });
 
   it("maintains the repo_units actions row in lockstep (the scan's unit gate — ActionsUnitPost's UpdateRepositoryUnits arm: enable inserts, disable deletes)", async () => {
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: true });
     expect(
       (await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all()).map((r) => r.type),
     ).toEqual(["actions"]);
-    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: false });
+    await applyRepoActionsUnitToggle(env, repo.id, { enableActions: false });
     expect(await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all()).toEqual([]);
   });
 });
