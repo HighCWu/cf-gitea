@@ -204,6 +204,7 @@ import { releases, users } from "../../db/schema";
 import type { ReleaseRow } from "../../issues/service";
 import { renderIssueMarkdown } from "./issue-detail";
 import type { RepoRow } from "../ui-context";
+import { pathEscapeSegments } from "../page-data";
 import {
   USER_FEED_CONTENT_TYPES,
   cdataBody,
@@ -230,16 +231,6 @@ const GHOST_PUBLISHER = { name: "Ghost", email: "" } as const;
  *  owns a push-synced row and a publisher): no author elements on either
  *  envelope (the gorilla omitempty posture). */
 const NO_PUBLISHER = { name: "", email: "" } as const;
-
-/** `util.PathEscapeSegments` (modules/util/url.go:12-18): split on "/",
- *  `url.PathEscape` each segment, rejoin. Local mirror — the twins'
- *  helpers are module-private and index.ts is not this wave's file. */
-function pathEscapeSegments(value: string): string {
-  return value
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-}
 
 /** The publisher identity behind one feed row (GetDisplayName /
  *  GetEmail — the module header's reductions). */
@@ -300,6 +291,11 @@ export function tagsFeedItemFromRow(
   // overrides the link for EVERY row when the releases unit is unreadable
   // — and it doubles as the landed dead-link rule for tag-only/rowless
   // tags, which the release detail would 404 — the tags page's choice).
+  // Both tails escape through util.PathEscapeSegments (the release arm via
+  // rel.HTMLURL(), models/repo/release.go:146; the else-arm
+  // routers/web/feed/convert.go:293) — the ONE Go-parity port in
+  // api/services/releases.ts (R2-L2) re-exported by page-data;
+  // `encodeURIComponent` was its inverse on the legal path characters.
   const link =
     canReadReleases && releaseBacked
       ? `${repoHref}/releases/tag/${pathEscapeSegments(tagName)}`

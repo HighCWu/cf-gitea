@@ -165,6 +165,7 @@ import { renderMarkdownToHtml } from "../../api/services/markdown";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
 import { orgMembers, repositories } from "../../db/schema";
 import type { Viewer } from "../viewer";
+import { pathEscapeSegments } from "../page-data";
 import { ellipsisDisplay, issueIndexOf, issueInfos } from "./activity-feeds";
 
 // ---------------------------------------------------------------------------
@@ -284,15 +285,6 @@ function feedBranchOf(refName: string): string {
   return refName.startsWith("refs/heads/") ? refName.slice("refs/heads/".length) : refName;
 }
 
-/** `util.PathEscapeSegments` (modules/util/url.go:12-18): split on "/",
- *  `url.PathEscape` each segment, rejoin. */
-function pathEscapeSegments(value: string): string {
-  return value
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-}
-
 /** The upstream feeds.Item — exactly the fields gorilla's serializer reads
  *  (feed.go:28-40) that convert.go sets (:200-211). */
 export interface UserFeedItem {
@@ -354,7 +346,11 @@ export function feedItemFromActivity(
 
   const issueLink = `${repoHref}/issues/${encodeURIComponent(rawIndex)}`; // toIssueLink
   const pullLink = `${repoHref}/pulls/${encodeURIComponent(rawIndex)}`; // toPullLink
-  // toReleaseLink — GetBranch does NOT strip the tag prefix (the quirk note).
+  // toReleaseLink — GetBranch does NOT strip the tag prefix (the quirk note);
+  // the tail escapes through util.PathEscapeSegments (routers/web/feed/
+  // convert.go:50), i.e. the ONE Go-parity port in api/services/releases.ts
+  // (R2-L2) re-exported by page-data — `encodeURIComponent` was its inverse
+  // on the legal path characters.
   const releaseLink = `${repoHref}/releases/tag/${pathEscapeSegments(feedBranchOf(activity.ref_name))}`;
 
   // The title arm — the locale strings (locale_en-US.json:3500-3529) with

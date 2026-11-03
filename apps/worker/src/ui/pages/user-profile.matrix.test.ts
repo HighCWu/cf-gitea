@@ -35,7 +35,12 @@
  *     edge anon-visible on /uppal and /upgal; the contrasting
  *     private-follower edge staying out of anon's total while the site
  *     admin counts it — upstream's count IS the visibility-filtered
- *     listing's count, profile.go:118-138 + models/user/user.go:355-398).
+ *     listing's count, profile.go:118-138 + models/user/user.go:355-398),
+ *   - the follow button's BLOCK gate (profile_big_avatar.tmpl:124's
+ *     `{{if not .UserBlocking}}` over header.go:85-90's GetBlocking(doer,
+ *     target)): a viewer who blocks the target loses the button on every
+ *     profile tab, an unblocked viewer is unchanged, and the landed
+ *     unblock write restores it.
  *
  * Fixture posture: wave 7's idempotent ensure-once seeding (its block owns
  * its own users; this file adds a disjoint `up*` family) with sessions
@@ -48,6 +53,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { blockPartyFromUserRow, blockUser, unblockUser } from "../../api/services/blocks";
 import { followUser } from "../../api/services/follows";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { starRepo } from "../../api/services/stars";
@@ -216,6 +222,22 @@ async function ensureFixtures(): Promise<void> {
   // The org (the tab-discrimination arm — public, so any viewer resolves it).
   if ((await orgs.getOrgByUsername("uporg")) === null) {
     await orgs.createOrg({ name: "uporg", ownerId: pal.id, visibility: "public", now: FIXED_DATE });
+  }
+
+  // The block-gate pair (the follow button's `{{if not .UserBlocking}}` arm —
+  // profile_big_avatar.tmpl:124 over header.go:85-90): two plain, public,
+  // relation-free rows disjoint from every pinned follow edge (the block
+  // write's cascade would tear follow/star/watch relations out). The block
+  // row itself is the follow-gate test's own setup (the landed write runs
+  // there and undoes itself), so no block state is seeded here.
+  for (const name of ["upblocker", "upblocked"]) {
+    await db.insert(users).values({
+      username: name,
+      usernameLower: name,
+      status: "active",
+      visibility: "public",
+      createdAt: FIXED_DATE,
+    });
   }
 }
 
@@ -539,6 +561,69 @@ describe("the avatar-card follow counts (real follows rows, anon-visible)", () =
     expect(anonHtml).not.toContain("2 followers</a>");
     const admin = await get("/uppal", "upadmin");
     expect(await admin.text()).toContain("2 followers</a>");
+  });
+});
+
+// --- the follow button's block gate (the R6-7 tail — profile_big_avatar.tmpl
+// :124's `{{if not .UserBlocking}}` over header.go:85-90's GetBlocking(doer,
+// target): the button hides while the VIEWER blocks the target, and the
+// landed unblock write restores it) -------------------------------------------
+
+describe("the follow button's block gate ({{if not .UserBlocking}})", () => {
+  it("a blocked viewer loses the button on every profile tab, strangers keep it, the unblock write restores it", async () => {
+    const blocker = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "upblocker")).get()
+    )!;
+    const target = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "upblocked")).get()
+    )!;
+
+    // The outer `and .IsSigned (ne .SignedUserID .ContextUser.ID)` gate:
+    // anonymous never sees the button (blocking or not).
+    const anon = await get("/upblocked");
+    expect(anon.status).toBe(200);
+    expect(await anon.text()).not.toContain('action="/upblocked?action=');
+
+    // An unblocked stranger: the unchanged arm — the Follow form renders.
+    const stranger = await get("/upblocked", "uppal");
+    expect(stranger.status).toBe(200);
+    expect(await stranger.text()).toContain('<form method="post" action="/upblocked?action=follow">');
+
+    // upblocker blocks upblocked (the landed BlockUser write — its cascade
+    // is a no-op on this relation-free pair): the `{{if not .UserBlocking}}`
+    // arm hides the button for the VIEWER who blocks, on the repositories
+    // view AND the organizations tab (the same avatar card renders on every
+    // profile tab — prepareContextForProfileBigAvatar runs for each).
+    await blockUser(
+      env.DB,
+      { id: blocker.id, isAdmin: false },
+      blockPartyFromUserRow(blocker),
+      blockPartyFromUserRow(target),
+      "",
+    );
+    const blockedPage = await get("/upblocked", "upblocker");
+    expect(blockedPage.status).toBe(200);
+    expect(await blockedPage.text()).not.toContain('action="/upblocked?action=');
+    const blockedOrgs = await get("/upblocked?tab=organizations", "upblocker");
+    expect(blockedOrgs.status).toBe(200);
+    expect(await blockedOrgs.text()).not.toContain('action="/upblocked?action=');
+    // The gate is per-viewer (GetBlocking(doer, target)), not global: the
+    // stranger's button is untouched by the pair's block row.
+    expect(await (await get("/upblocked", "uppal")).text()).toContain(
+      '<form method="post" action="/upblocked?action=follow">',
+    );
+
+    // The landed unblock surface stays reachable over the gate: the row
+    // delete flips UserBlocking back and the Follow form returns.
+    await unblockUser(
+      env.DB,
+      { id: blocker.id, isAdmin: false },
+      blockPartyFromUserRow(blocker),
+      blockPartyFromUserRow(target),
+    );
+    const restored = await get("/upblocked", "upblocker");
+    expect(restored.status).toBe(200);
+    expect(await restored.text()).toContain('<form method="post" action="/upblocked?action=follow">');
   });
 });
 

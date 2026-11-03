@@ -100,6 +100,7 @@ import {
 } from "./repo-actions-view";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
+import { pathEscapeSegments } from "../page-data";
 
 type D1 = D1Database;
 
@@ -178,13 +179,16 @@ export function normalizeArtifactPreviewPath(path: string): string {
   return joined === "." ? "" : joined;
 }
 
-/** PathEscapeSegments (util/url.go:12-19). */
-export function pathEscapeSegments(path: string): string {
-  return path
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-}
+/**
+ * PathEscapeSegments (util/url.go:12-19) — every preview surface here renders
+ * through it upstream (`view_artifact.go:109` PreviewContentURL, `:164`
+ * listing Link, `:431` the raw-view redirect tail). The ONE Go-parity port
+ * (the byte-derived `url.PathEscape` safe set) lives in
+ * api/services/releases.ts (R2-L2) and page-data re-exports it;
+ * `encodeURIComponent` is its inverse on the legal path characters
+ * (`!'()*` stay raw, `$&+:;=@` encode), so the local char class is retired.
+ */
+export { pathEscapeSegments };
 
 /** artifactPreviewFallbackPath (view_artifact.go:144-146) — the row's
  *  artifactPath, falling back to the artifact name. */

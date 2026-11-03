@@ -39,13 +39,14 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories } from "../../db/schema";
+import { releases, repositories } from "../../db/schema";
 import type { RepoRow } from "../ui-context";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
 import {
   RELEASES_FEED_CONTENT_TYPES,
   loadReleasesFeedData,
+  releaseFeedItemFromRow,
   renderReleasesFeedAtom,
   renderReleasesFeedRss,
 } from "./releases-feed-xml";
@@ -404,5 +405,33 @@ describe("the mounted /{owner}/{repo}/releases.rss|.atom route arms", () => {
       const res = await fetchRoute(`/alice/demo/${tail}`);
       expect(res.status, tail).toBe(404);
     }
+  });
+});
+
+// --- the link escaper ----------------------------------------------------------
+
+describe("the release-link escaper (the ONE Go-parity PathEscapeSegments port)", () => {
+  it("escapes per url.PathEscape (release.go:146) — `!'()*` encode, `$&+:;=@` stay raw (encodeURIComponent was the inverse class)", async () => {
+    await seedBaseFixtures();
+    const id = await insertRelease(GHOSTY_REPO_ID, {
+      tagName: `v1!+$&'()*;=?~`,
+      title: "escaper exercise",
+      note: "",
+      createdAt: T0,
+      publishedUnix: T0,
+    });
+    const row = await drizzle(env.DB).select().from(releases).where(eq(releases.id, id)).get();
+    if (row === undefined) throw new Error("fixture missing: the escaper release");
+    const item = releaseFeedItemFromRow(
+      row,
+      { name: "alice", email: "alice@example.com" },
+      `${ORIGIN}/alice/ghosty`,
+      ORIGIN,
+      await repoRow(GHOSTY_REPO_ID),
+    );
+    // PathEscapeSegments per segment (a "/" tag keeps its separators — a
+    // surface covered by the port's own tests, api/releases.test.ts):
+    // `! ' ( ) ; ?` encode, `$ & + = ~` stay raw.
+    expect(item.link).toBe(`${ORIGIN}/alice/ghosty/releases/tag/v1%21+$&%27%28%29%2A%3B=%3F~`);
   });
 });

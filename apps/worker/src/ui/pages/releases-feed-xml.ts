@@ -181,6 +181,7 @@ import { releases, users } from "../../db/schema";
 import type { ReleaseRow } from "../../issues/service";
 import { renderIssueMarkdown } from "./issue-detail";
 import type { RepoRow } from "../ui-context";
+import { pathEscapeSegments } from "../page-data";
 import {
   USER_FEED_CONTENT_TYPES,
   cdataBody,
@@ -202,16 +203,6 @@ const RELEASES_FOR = "Releases for %s";
  *  "Ghost", Email "" (GetDisplayName at the pin → the username; GetEmail
  *  → the zero email). */
 const GHOST_PUBLISHER = { name: "Ghost", email: "" } as const;
-
-/** `util.PathEscapeSegments` (modules/util/url.go:12-18): split on "/",
- *  `url.PathEscape` each segment, rejoin. Local mirror — the twin's
- *  helper is module-private and index.ts is not this wave's file. */
-function pathEscapeSegments(value: string): string {
-  return value
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-}
 
 /** The publisher identity behind one release row (GetDisplayName /
  *  GetEmail — the module header's reductions). */
@@ -258,6 +249,11 @@ export function releaseFeedItemFromRow(
   origin: string,
   repo: RepoRow,
 ): ReleasesFeedItem {
+  // rel.HTMLURL() — `/releases/tag/` + util.PathEscapeSegments(TagName)
+  // (models/repo/release.go:146, the convert.go:289 Link.Href); the escape
+  // is the ONE Go-parity port in api/services/releases.ts (R2-L2)
+  // re-exported by page-data — `encodeURIComponent` was its inverse on the
+  // legal path characters (`!'()*` raw, `$&+:;=@` encoded).
   const link = `${repoHref}/releases/tag/${pathEscapeSegments(row.tagName)}`;
   return {
     title: row.title, // !IsTag arm (convert.go:295-297) — the query pins is_tag=false

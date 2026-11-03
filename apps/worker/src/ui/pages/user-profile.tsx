@@ -93,6 +93,7 @@ import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { doerCanViewPrivate } from "../../api/services/orgs";
+import { isBlockedBy } from "../../api/services/blocks";
 import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
 import { orgMembers, projects, repoSettings, repositories, users } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
@@ -269,9 +270,10 @@ export interface UserProfileData {
    *  shared/user/header.go:172-192). */
   openProjects: number;
   /** profile_big_avatar.tmpl:123-136's follow button input: present only
-   *  for a signed-in viewer who is not the target (upstream's
-   *  `and .IsSigned (ne .SignedUserID .ContextUser.ID)` gate — no block
-   *  store exists, so the `{{if not .UserBlocking}}` arm always holds);
+   *  for a signed-in viewer who is neither the target (upstream's
+   *  `and .IsSigned (ne .SignedUserID .ContextUser.ID)` gate) nor BLOCKING
+   *  the target (`{{if not .UserBlocking}}` :124 over header.go:85-90's
+   *  GetBlocking(doer, target) — the landed block store's isBlockedBy);
    *  `following` is IsFollowing(doer, target) (header.go:28). */
   followButton: { following: boolean } | null;
   /** profile_big_avatar.tmpl:18's admin gear gate (`{{if .IsAdmin}}` — the
@@ -339,7 +341,7 @@ export async function loadUserProfileData(
   }
 
   const followViewer = { id: doer.id, isAdmin: doer.isAdmin };
-  const [followers, following, openProjectsRow, viewerFollows] = await Promise.all([
+  const [followers, following, openProjectsRow, viewerFollows, viewerBlocks] = await Promise.all([
     listFollowers(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
     listFollowing(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
     // header.tmpl:24's ProjectCount (the OPEN individual projects —
@@ -355,6 +357,11 @@ export async function loadUserProfileData(
     // who is not the target carries the button, IsFollowing(doer, target)
     // is its label (header.go:28's exact argument order).
     doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
+    // header.go:85-90's GetBlocking(doer, target) — the `{{if not
+    // .UserBlocking}}` arm (:124) hides the button while the VIEWER blocks
+    // the target (the landed block store's HasBlocking probe; anon/self
+    // never reach the button, so the probe is skipped with them).
+    doer.id !== null && doer.id !== user.id ? isBlockedBy(d1, doer.id, user.id) : Promise.resolve(false),
   ]);
 
   return {
@@ -366,7 +373,8 @@ export async function loadUserProfileData(
     page,
     more: page * USER_PROFILE_PAGE_SIZE < total,
     openProjects: Number(openProjectsRow?.total ?? 0),
-    followButton: doer.id !== null && doer.id !== user.id ? { following: viewerFollows } : null,
+    followButton:
+      doer.id !== null && doer.id !== user.id && !viewerBlocks ? { following: viewerFollows } : null,
     viewerIsAdmin: doer.isAdmin,
   };
 }
@@ -664,7 +672,8 @@ export interface UserProfileOrganizationsData {
   page: number;
   more: boolean;
   /** The avatar card's follow-button input (the repositories loader's
-   *  shape — the same template renders on every profile tab). */
+   *  shape — the same template renders on every profile tab, the block
+   *  gate included: `{{if not .UserBlocking}}` rides along). */
   followButton: { following: boolean } | null;
   /** The avatar card's admin gear gate (the viewer's admin flag). */
   viewerIsAdmin: boolean;
@@ -714,22 +723,25 @@ export async function loadUserProfileOrganizationsData(
   const repoWhere = seePrivate
     ? eq(repositories.ownerId, user.id)
     : and(eq(repositories.ownerId, user.id), eq(repositories.visibility, "public"));
-  const [followers, following, repoCountRow, openProjectsRow, viewerFollows] = await Promise.all([
-    listFollowers(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
-    listFollowing(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
-    drizzle(d1).select({ total: sql<number>`count(*)` }).from(repositories).where(repoWhere).get(),
-    // The strip's Projects count (the loader's parity read — see
-    // loadUserProfileData's note).
-    drizzle(d1)
-      .select({ total: sql<number>`count(*)` })
-      .from(projects)
-      .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
-      .get(),
-    // The avatar card is the SAME template on every profile tab
-    // (prepareContextForProfileBigAvatar runs for each) — the follow
-    // button's gate + state ride along here too.
-    doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
-  ]);
+  const [followers, following, repoCountRow, openProjectsRow, viewerFollows, viewerBlocks] =
+    await Promise.all([
+      listFollowers(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
+      listFollowing(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
+      drizzle(d1).select({ total: sql<number>`count(*)` }).from(repositories).where(repoWhere).get(),
+      // The strip's Projects count (the loader's parity read — see
+      // loadUserProfileData's note).
+      drizzle(d1)
+        .select({ total: sql<number>`count(*)` })
+        .from(projects)
+        .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
+        .get(),
+      // The avatar card is the SAME template on every profile tab
+      // (prepareContextForProfileBigAvatar runs for each) — the follow
+      // button's gate + state ride along here too, the block gate
+      // included (header.go:85-90's GetBlocking probe).
+      doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
+      doer.id !== null && doer.id !== user.id ? isBlockedBy(d1, doer.id, user.id) : Promise.resolve(false),
+    ]);
 
   return {
     user,
@@ -741,7 +753,8 @@ export async function loadUserProfileOrganizationsData(
     openProjects: Number(openProjectsRow?.total ?? 0),
     page,
     more: page * USER_PROFILE_PAGE_SIZE < listing.total,
-    followButton: doer.id !== null && doer.id !== user.id ? { following: viewerFollows } : null,
+    followButton:
+      doer.id !== null && doer.id !== user.id && !viewerBlocks ? { following: viewerFollows } : null,
     viewerIsAdmin: doer.isAdmin,
   };
 }
