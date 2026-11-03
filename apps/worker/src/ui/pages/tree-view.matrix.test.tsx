@@ -1078,10 +1078,14 @@ describe("the typed-mode file-list rows (the 100644-only seed builder cannot rea
     expect(table).toContain(
       '<a class="entry-name" href="/tvx-owner/tvx-sub/src/branch/main/link-file" title="link-file">link-file</a>',
     );
-    // The ampersand name round-trips percent-encoded in the href (one URL
-    // segment) and HTML-escaped in the title/text attributes.
+    // The ampersand name rides the Go-parity escaper (R2-L2's port, now
+    // shared from api/services/releases — url.PathEscape KEEPS `&`, the
+    // encodePathSegment safe set's $&+:;=@ arm): the href carries the raw
+    // `&` (HTML-escaped to &amp; by the attribute renderer, exactly
+    // upstream's PathEscapeSegments + html/template bytes,
+    // view_list.tmpl:49) and the title/text attributes HTML-escape it.
     expect(table).toContain(
-      '<a class="entry-name" href="/tvx-owner/tvx-sub/src/branch/main/a%26b.md" title="a&amp;b.md">a&amp;b.md</a>',
+      '<a class="entry-name" href="/tvx-owner/tvx-sub/src/branch/main/a&amp;b.md" title="a&amp;b.md">a&amp;b.md</a>',
     );
   });
 

@@ -16,7 +16,7 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
@@ -33,6 +33,7 @@ import {
   labels,
   milestones,
   notificationStates,
+  orgMembers,
   projectIssues,
   projects,
   pullRequests,
@@ -52,7 +53,8 @@ import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 import type { TimelineComment } from "./models/issue";
-import { toTimelineComment } from "./services/issues";
+import { prefetchIssueRenderContext, toApiIssue, toTimelineComment } from "./services/issues";
+import { toApiProject } from "./services/projects";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
 import { findRepositoryByPath, type Viewer } from "./services/repository";
 
@@ -87,6 +89,7 @@ beforeEach(async () => {
     "issues",
     "milestones",
     "labels",
+    "org_members",
     "repo_counters",
     "repo_settings",
     "repo_collaborators",
@@ -4784,5 +4787,180 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
     });
     expect(missing.status).toBe(400);
     expect(await missing.json()).toEqual({ message: "project 424242 not found", url: ERROR_URL });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R5-3's counts scope: the Issue.projects numbers on OWNER-level projects
+// intersect the member issues with the viewer's visible repo set (upstream
+// LoadIssueNumbersForProject's owner branch — services/projects/issue.go:
+// 330-340's IssuesOptions{Doer, AllPublic, Owner} — only the repository
+// branch at :298-309 counts unfiltered). The K6 batched stage
+// (prefetchIssueRenderContext's grouped counts read) and the per-row twin
+// (toApiProject) run the SAME split, so a private-repo issue counts for its
+// owner but not for a stranger on the org board render.
+// ---------------------------------------------------------------------------
+
+describe("the owner-project counts scope (R5-3)", () => {
+  /** The api Viewer for a seeded user row (the repository.test.ts viewerFor shape). */
+  function viewerFor(id: number, login: string): Viewer {
+    return {
+      origin: "https://example.com",
+      requester: {
+        id,
+        login,
+        email: "",
+        full_name: "",
+        avatar_url: "",
+        html_url: "",
+        language: "",
+        location: "",
+        website: "",
+        description: "",
+        active: true,
+        is_admin: false,
+        prohibit_login: false,
+        restricted: false,
+        login_name: "",
+        source_id: 0,
+        followers_count: 0,
+        following_count: 0,
+        starred_repos_count: 0,
+        created: "2026-01-01T00:00:00Z",
+        last_login: "0001-01-01T00:00:00Z",
+        type: "User",
+        visibility: "public",
+      },
+    };
+  }
+
+  async function seedBoardWorld(): Promise<{
+    orgId: number;
+    ownerId: number;
+    strangerId: number;
+    pubIssueId: number;
+    projectId: number;
+    repoProjectId: number;
+    pairRepoSlug: string;
+    privRepoId: string;
+  }> {
+    const boss = await seedUser("orgboss");
+    const stranger = await seedUser("boardstranger");
+    // The org account: a users row of type org + the creator's Owners
+    // membership (the doerRepoAccessMode owner bridge).
+    const orgRows = await db()
+      .insert(users)
+      .values({ username: "acme", usernameLower: "acme", type: "org", isAdmin: false, status: "active", createdAt: new Date("2026-01-01T00:00:00Z") })
+      .returning()
+      .all();
+    const org = orgRows[0];
+    if (org === undefined) throw new Error("org seed failed");
+    await db().insert(orgMembers).values({ orgId: org.id, userId: boss.id, role: "owner", createdAt: new Date("2026-01-01T00:00:00Z") });
+
+    const pubRepoId = await seedRepo("acme", "boardpub");
+    const privRepoId = await seedRepo("acme", "boardvault", { private: true });
+    await db()
+      .update(repositories)
+      .set({ ownerId: org.id })
+      .where(inArray(repositories.id, [pubRepoId, privRepoId]));
+
+    const pubIssue = await seedIssue(pubRepoId, "public board issue");
+    const privOpen = await seedIssue(privRepoId, "vault open");
+    const privClosed = await seedIssue(privRepoId, "vault closed", { closed: true });
+
+    const now = new Date("2026-02-03T04:05:06Z");
+    const projectRows = await db()
+      .insert(projects)
+      .values([
+        // The ORG board (owner-level, repoId "") — the owner branch.
+        { title: "org board", description: "", ownerId: org.id, repoId: "", creatorId: boss.id, type: 3, createdAt: now, updatedAt: now },
+        // The REPOSITORY board on the private repo — the unfiltered branch.
+        { title: "vault board", description: "", ownerId: 0, repoId: privRepoId, creatorId: boss.id, type: 2, createdAt: now, updatedAt: now },
+      ])
+      .returning()
+      .all();
+    const [orgProject, repoProject] = projectRows;
+    if (orgProject === undefined || repoProject === undefined) throw new Error("project seed failed");
+    await db().insert(projectIssues).values([
+      { issueId: pubIssue.id, projectId: orgProject.id },
+      { issueId: privOpen.id, projectId: orgProject.id },
+      { issueId: privClosed.id, projectId: orgProject.id },
+      { issueId: privOpen.id, projectId: repoProject.id },
+      { issueId: privClosed.id, projectId: repoProject.id },
+    ]);
+    return {
+      orgId: org.id,
+      ownerId: boss.id,
+      strangerId: stranger.id,
+      pubIssueId: pubIssue.id,
+      projectId: orgProject.id,
+      repoProjectId: repoProject.id,
+      pairRepoSlug: "boardpub",
+      privRepoId,
+    };
+  }
+
+  it("a private-repo issue counts for its owner but not for a stranger on the org board — batched stage and per-row twin agree", async () => {
+    const world = await seedBoardWorld();
+    const ownerView = viewerFor(world.ownerId, "orgboss");
+    const strangerView = viewerFor(world.strangerId, "boardstranger");
+    const anonView: Viewer = { origin: "https://example.com", requester: null };
+    // The stranger-visible page: the PUBLIC repo's issue only (a stranger's
+    // list never carries the vault's rows) — its `projects` render is where
+    // the board's counts surface.
+    const pageRows = await db().select().from(issues).where(eq(issues.id, world.pubIssueId)).all();
+    expect(pageRows).toHaveLength(1);
+
+    // The owner sees every member issue: 2 open (public + vault) + 1 closed.
+    const ownerCtx = await prefetchIssueRenderContext(env.DB, pageRows, { viewer: ownerView });
+    expect(ownerCtx.projectCounts.get(world.projectId)).toEqual({ open: 2, closed: 1, total: 3 });
+    // A stranger (and anonymous — AllPublic) counts only the public repo.
+    const strangerCtx = await prefetchIssueRenderContext(env.DB, pageRows, { viewer: strangerView });
+    expect(strangerCtx.projectCounts.get(world.projectId)).toEqual({ open: 1, closed: 0, total: 1 });
+    const anonCtx = await prefetchIssueRenderContext(env.DB, pageRows, { viewer: anonView });
+    expect(anonCtx.projectCounts.get(world.projectId)).toEqual({ open: 1, closed: 0, total: 1 });
+    // Un-threaded callers keep the plain branch (the pre-R5-3 bytes).
+    const plainCtx = await prefetchIssueRenderContext(env.DB, pageRows);
+    expect(plainCtx.projectCounts.get(world.projectId)).toEqual({ open: 2, closed: 1, total: 3 });
+
+    // The per-row twin (toApiProject) answers the SAME numbers per viewer.
+    const projectRow = (await db().select().from(projects).where(eq(projects.id, world.projectId)).all())[0]!;
+    const ownerCounts = await toApiProject(env.DB, projectRow, ownerView, "https://example.com/acme/-/projects/1");
+    expect(ownerCounts.num_open_issues).toBe(2);
+    expect(ownerCounts.num_closed_issues).toBe(1);
+    expect(ownerCounts.num_issues).toBe(3);
+    const strangerCounts = await toApiProject(env.DB, projectRow, strangerView, "https://example.com/acme/-/projects/1");
+    expect(strangerCounts.num_open_issues).toBe(1);
+    expect(strangerCounts.num_closed_issues).toBe(0);
+    expect(strangerCounts.num_issues).toBe(1);
+
+    // The two render arms agree per viewer on the wire (the batched context
+    // vs the per-row reads, the same issue row).
+    const pair = await findRepositoryByPath(env.DB, "acme", world.pairRepoSlug);
+    if (pair === null) throw new Error("pair fixture missing");
+    const batched = await toApiIssue(env.DB, strangerView, pair, pageRows[0]!, { context: strangerCtx });
+    const perRow = await toApiIssue(env.DB, strangerView, pair, pageRows[0]!);
+    expect(batched.projects).toHaveLength(1);
+    expect(batched.projects![0]!.num_issues).toBe(1);
+    expect(perRow.projects![0]!.num_issues).toBe(batched.projects![0]!.num_issues);
+    const ownerBatched = await toApiIssue(env.DB, ownerView, pair, pageRows[0]!, { context: ownerCtx });
+    expect(ownerBatched.projects![0]!.num_issues).toBe(3);
+  });
+
+  it("the repository branch (ownerId === 0) counts unfiltered for every viewer (issue.go:298-309)", async () => {
+    const world = await seedBoardWorld();
+    const strangerView = viewerFor(world.strangerId, "boardstranger");
+    // A page from the private repo — its repo-scoped board's numbers ride
+    // the repository branch: no viewer intersection (route visibility
+    // already covers every member issue). The stranger counts BOTH vault
+    // issues — the branch is unfiltered for every viewer.
+    const vaultRows = await db().select().from(issues).where(eq(issues.repoId, world.privRepoId)).all();
+    expect(vaultRows).toHaveLength(2);
+    const ctx = await prefetchIssueRenderContext(env.DB, vaultRows, { viewer: strangerView });
+    expect(ctx.projectCounts.get(world.repoProjectId)).toEqual({ open: 1, closed: 1, total: 2 });
+    // The counts are PROJECT-scoped, not page-scoped: the org board's public
+    // repo bucket survives for the stranger with the same numbers as on the
+    // public page — only the vault buckets stay filtered out.
+    expect(ctx.projectCounts.get(world.projectId)).toEqual({ open: 1, closed: 0, total: 1 });
   });
 });

@@ -244,16 +244,28 @@ export async function listProjects(
  * services/projects/issue.go:298-309) — plain joined counts, no permission
  * filtering (route visibility already covers every member issue).
  * `project_issue` joins `issue` so rows whose issue vanished do not count.
+ * Passing `visibleRepoIds` turns the read into the owner branch's filtered
+ * shape (issue.go:330-340's IssuesOptions{Doer, AllPublic, Owner} — the
+ * same intersection `projectIssueCountsForOrg` runs; an EMPTY set answers
+ * the empty-set zeros, undefined keeps the unfiltered repository branch).
  */
 export async function projectIssueCounts(
   d1: D1Database,
   projectId: number,
+  visibleRepoIds?: string[],
 ): Promise<{ open: number; closed: number; total: number }> {
+  if (visibleRepoIds !== undefined && visibleRepoIds.length === 0) {
+    return { open: 0, closed: 0, total: 0 };
+  }
   const rows = await drizzle(d1)
     .select({ closed: issues.isClosed, value: sql<number>`count(*)` })
     .from(projectIssues)
     .innerJoin(issues, eq(projectIssues.issueId, issues.id))
-    .where(eq(projectIssues.projectId, projectId))
+    .where(
+      visibleRepoIds === undefined
+        ? eq(projectIssues.projectId, projectId)
+        : and(eq(projectIssues.projectId, projectId), inArray(issues.repoId, visibleRepoIds)),
+    )
     .groupBy(issues.isClosed);
   let open = 0;
   let closed = 0;
@@ -1506,9 +1518,22 @@ export async function toApiProjectColumnList(
  * hidden), `updated_at` null only for legacy rows (our column is NOT NULL),
  * creator embedded when the user row still exists (`loadProjectCreators` is
  * best-effort: a vanished creator leaves the field off rather than failing).
+ * The counts run the `LoadIssueNumbersForProject` branch split (services/
+ * projects/issue.go:298-309 vs :330-340): repository rows (ownerId === 0,
+ * the upstream `project.OwnerID == 0` test) count unfiltered; owner rows
+ * (org/individual) count ONLY the member issues inside the doer's visible
+ * repo set — the same `userVisibleRepos` walk `projectIssueCountsForOrg`
+ * is fed, so the per-row twin and the route-threaded pages agree.
  */
 export async function toApiProject(d1: D1Database, row: ProjectRow, viewer: Viewer, htmlUrl: string): Promise<Project> {
-  const counts = await projectIssueCounts(d1, row.id);
+  const counts =
+    row.ownerId === 0
+      ? await projectIssueCounts(d1, row.id)
+      : await projectIssueCounts(
+          d1,
+          row.id,
+          (await userVisibleRepos(d1, row.ownerId, viewer)).map((pair) => pair.repo.id),
+        );
   const isClosed = row.isClosed;
   return {
     id: row.id,
@@ -1719,9 +1744,10 @@ export async function projectIssueCountsForOrg(
 
 /**
  * `ToProject` with the owner arm's permission-filtered counts. toApiProject
- * still computes the plain counts internally (kept untouched — the same
- * "pure redundancy, not a second gate" trade the repo routes document);
- * the org arm's numbers win on the wire.
+ * now computes the SAME owner-branch intersection internally (the counts
+ * split rides inside it), so the override is pure redundancy — the caller's
+ * per-request visible set merely saves the re-walk; the org arm's numbers
+ * win on the wire either way.
  */
 export async function toApiOrgProject(
   d1: D1Database,

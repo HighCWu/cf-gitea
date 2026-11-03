@@ -181,7 +181,7 @@ import { canViewRepositoryWithTeams, type RepositoryRow } from "../../api/servic
 import { packageFiles, packageVersions, packages, projects, repositories, users } from "../../db/schema";
 import { getBlobById, packageBlobContentKey, type PackageBlobRow } from "../../services/packages/blobs";
 import { getTerraformLock, isTerraformLockLocked, type TerraformLockInfo } from "../../services/packages/terraform";
-import type { OrgRecord } from "../../services/orgs/orgs";
+import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import type { User as ApiUser } from "../../api/models/user";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
 import {
@@ -606,7 +606,14 @@ export async function ownerPackagesChrome(
 ): Promise<PackagesOwnerChrome> {
   if (owner.kind === "user") return userProfileChrome(d1, owner.user, doer);
   const [repoCount, orgOpenProjects, viewerFollows] = await Promise.all([
-    ownerRepoCount(d1, ownerIdOf(owner), doer),
+    // loadHeaderCount's RepoCount arm, ORG flavor (shared/user/header.go:
+    // 165-176): the org listing's OWN doer-visible total — `listOrgRepos`'
+    // team-aware visibility walk (the user-code-search orgRepoCount
+    // convention, ONE predicate across every org page; FB R6-6's recorded
+    // residual). The profile WHERE below stays the USER arm only.
+    new OrgService(d1)
+      .listOrgRepos(owner.org.id, { id: doer.id, isAdmin: doer.isAdmin }, { page: 1, pageSize: 1 })
+      .then((page) => page.total),
     // The org arm's Projects-tab count (header.tmpl:17-20 — the OPEN
     // organization projects: the projects.ownerId arm over the org's id,
     // loadHeaderCount parity — shared/user/header.go:178-192 computes
@@ -648,9 +655,11 @@ function parseSortFacet(raw: string | null): PackageVersionSort {
     : "";
 }
 
-/** The menu/overview tab's repository count (loadHeaderCount's RepoCount
- *  arm — the profile loader's WHERE: self/admin sees private rows, everyone
- *  else public). */
+/** The USER arm's menu/overview tab repository count (loadHeaderCount's
+ *  RepoCount arm — the profile loader's WHERE: self/admin sees private rows,
+ *  everyone else public). The ORG arm reads the org listing's own total
+ *  instead (ownerPackagesChrome's listOrgRepos read — the orgRepoCount
+ *  convention, FB R6-6's residual now folded). */
 async function ownerRepoCount(d1: D1Database, ownerId: number, doer: ProfileDoer): Promise<number> {
   const seePrivate = doer.id !== null && (doer.isAdmin || doer.id === ownerId);
   const where = seePrivate

@@ -1242,6 +1242,59 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     await store.removeSource(0, SRC_ID);
   });
 
+  // R1-F9's web twin — the gate's owner argument is the RESOLVED repo's
+  // CURRENT owner (view.go:930 `ctx.Repo.Repository.OwnerID`; rerun.go:93's
+  // repo.OwnerID is the same currency), not the run row's frozen ownerId:
+  // after a transfer the scoped gate consults the NEW owner's registrations
+  // (the service twin pins the same currency in services/actions/rerun.test.ts).
+  it("after a transfer the scoped gate reads the NEW owner's registrations (view.go:930 — the current-owner currency)", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    const SRC_ID = "repo-scoped-src-xfer";
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO users (id, username, username_lower, display_name, created_at) VALUES (8, 'bob', 'bob', 'Bob', unixepoch())",
+    ).run();
+    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
+    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
+    await drizzle(env.DB)
+      .update(actionRuns)
+      .set({ isScopedRun: true, workflowRepoId: SRC_ID, ownerId: 1 }) // frozen at insert
+      .where(eq(actionRuns.id, seeded.run.id));
+    await drizzle(env.DB).update(repositories).set({ ownerId: 8 }).where(eq(repositories.id, repo.id)); // the transfer
+
+    // The stale pre-transfer flag stands + bob's REQUIRED registration
+    // rescues it: a run.ownerId read would scan owner 1 — no registration —
+    // and answer the refusal; the current-owner read finds bob's required
+    // row and the rerun proceeds (IsScopedWorkflowOptedOut's conjunction,
+    // workflow.go:89-92).
+    await saveRepoActionsConfig(env.DB, repo.id, {
+      ...parseRepoActionsConfig(null),
+      disabledScopedWorkflows: { [SRC_ID]: [WORKFLOW_ID] },
+    });
+    await store.addSource(8, SRC_ID);
+    await store.setSourceConfigs(8, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
+    const allowed = await rerun(seeded.run.id, { kind: "run" });
+    expect(allowed).toMatchObject({ kind: "json", status: 200 });
+
+    // The converse: only the OLD owner's required registration survives the
+    // transfer — the current-owner read misses it, so the stale flag refuses
+    // (rerun.go:98-99's text on the web twin's JSONError shape). The first
+    // arm's rerun re-opened the run (attempt 2, waiting) — re-settle it to
+    // done so the not-done pre-check (:921-925) stays out of the way.
+    await store.removeSource(8, SRC_ID);
+    await store.addSource(1, SRC_ID);
+    await store.setSourceConfigs(1, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
+    const reopened = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.run.id)))[0]!;
+    await setStatus(seeded.run.id, reopened.latestAttemptId, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
+    const refused = await rerun(seeded.run.id, { kind: "run" });
+    expect(refused).toEqual({
+      kind: "json",
+      status: 400,
+      body: { errorMessage: "Workflow is disabled.", renderFormat: "text" },
+    });
+
+    await store.removeSource(1, SRC_ID);
+  });
+
   it("the job rerun: a foreign job 404-shells, the run's own job succeeds (view.go:970-974)", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }, { jobId: "side" }] });
     await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });

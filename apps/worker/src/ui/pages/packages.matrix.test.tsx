@@ -525,6 +525,22 @@ describe("the R04 list — rows, facets, empty arms", () => {
     const ownerData = await loadOwnerPackagesData(env.DB, { kind: "org", org }, ownerViewer, ORIGIN, new URLSearchParams());
     const ownerHtml = renderOwnerPackagesPage(pageCtx(ownerViewer), ownerData);
     expect(ownerHtml).toContain('href="/pkgorg/priv-repo"');
+
+    // FB R6-6's recorded residual, landed: the ORG arm's Repositories label
+    // is the org LISTING's doer-visible total (listOrgRepos' team-aware
+    // walk — the user-code-search orgRepoCount convention), not the profile
+    // WHERE. The private repo is the discriminator: the retired WHERE's
+    // self-arm compared the viewer's USER id against the ORG id (never
+    // equal), so even the org owner counted public rows only — zero here.
+    // The org owner now counts the private row (label renders on the org
+    // menu, scoped to that anchor); the blind anonymous arm still counts
+    // zero (the label dropped).
+    expect(ownerData.repoCount).toBe(1);
+    const reposItem = ownerHtml.slice(ownerHtml.indexOf('href="/pkgorg">'));
+    expect(reposItem.slice(0, reposItem.indexOf("</a>"))).toContain('<div class="ui small label">1</div>');
+    expect(anonData.repoCount).toBe(0);
+    const anonReposItem = anonHtml.slice(anonHtml.indexOf('href="/pkgorg">'));
+    expect(anonReposItem.slice(0, anonReposItem.indexOf("</a>"))).not.toContain("ui small label");
   });
 });
 

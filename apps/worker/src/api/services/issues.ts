@@ -51,6 +51,7 @@ import {
   projectTypeToString,
   templateTypeToString,
   toApiProject,
+  userVisibleRepos,
   type ProjectRow,
 } from "./projects";
 import { engineRepoName, pullHeadRef } from "./engine";
@@ -367,11 +368,14 @@ export interface IssueRenderContext {
   projectCreators: Map<number, UserRow>;
   /** The page's distinct projects' joined open/closed member-issue counts by
    *  project id — ONE GROUP BY read over the page's project ids, the page
-   *  twin of `projectIssueCounts` (the plain-joined branch of upstream
-   *  `LoadIssueNumbersForProject`, services/projects/issue.go:291-309, whose
-   *  numbers `toProject` renders preloaded, services/convert/project.go:
-   *  126-152). A project with no live member issues (or a map miss) renders
-   *  the zero counts — the per-project read's empty-join answer. */
+   *  twin of `projectIssueCounts` (upstream `LoadIssueNumbersForProject`,
+   *  services/projects/issue.go:291-340, whose numbers `toProject` renders
+   *  preloaded, services/convert/project.go:126-152). The branch split rides
+   *  the collapse: repository projects (ownerId === 0) count unfiltered,
+   *  owner projects only the viewer-visible repos when the render viewer was
+   *  threaded (`opts.viewer`) — the per-row twin's exact shape. A project
+   *  with no live member issues (or a map miss) renders the zero counts —
+   *  the per-project read's empty-join answer. */
   projectCounts: Map<number, { open: number; closed: number; total: number }>;
 }
 
@@ -397,8 +401,21 @@ export interface IssueRenderPreload {
  * statements there, exactly like the per-row path. The id lists stay far under
  * the D1 100-variable cap: the API paging clamps at 50 rows
  * (pagination.ts MAX_RESPONSE_ITEMS).
+ *
+ * `opts.viewer` (optional) threads the render viewer into the counts scope
+ * (R5-3): owner-scope projects (ownerId > 0) count only the member issues
+ * inside the viewer's visible repo set — the same intersection the per-row
+ * twin `toApiProject` computes, so both render arms stay deep-equal for the
+ * same viewer (an anonymous viewer is `viewerOf`'s requester-null Viewer,
+ * the AllPublic arm). Absent keeps the plain (unfiltered) branch — the
+ * pre-threaded bytes, so callers that have not adopted the option see zero
+ * drift.
  */
-export async function prefetchIssueRenderContext(d1: D1Database, pageRows: IssueRow[]): Promise<IssueRenderContext> {
+export async function prefetchIssueRenderContext(
+  d1: D1Database,
+  pageRows: IssueRow[],
+  opts: { viewer?: Viewer } = {},
+): Promise<IssueRenderContext> {
   const issueIds = pageRows.map((row) => row.id);
   const posterIds = [...new Set(pageRows.flatMap((row) => (row.posterId === null ? [] : [row.posterId])))];
   const milestoneIds = [...new Set(pageRows.flatMap((row) => (row.milestoneId === null ? [] : [row.milestoneId])))];
@@ -502,30 +519,64 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
   // membership's vanished issue never counts) over the page's DISTINCT
   // project ids — a page with no memberships skips both (0 statements,
   // exactly like the per-row path whose toApiProject is never reached).
+  // The grouped read keys per REPO too (R5-3's counts scope): owner-scope
+  // projects (ownerId > 0) must count only the member issues inside the
+  // viewer's visible repo set (services/projects/issue.go:330-340's
+  // IssuesOptions{Doer, AllPublic, Owner}; the repository branch —
+  // :298-309's `project.OwnerID == 0` — stays unfiltered), so the buckets
+  // carry issues.repoId and the collapse below filters per project. The
+  // visible sets ride the ONE landed walk (`userVisibleRepos`, once per
+  // distinct owner); an un-threaded viewer (opts.viewer === undefined)
+  // keeps the plain branch — the route callers' threading rides their own
+  // owner, and the numbers then match the per-row twin exactly.
   const projectIds = [...new Set(projectRows.map((row) => row.project.id))];
   const projectCreatorIds = [...new Set(projectRows.flatMap((row) => (row.project.creatorId <= 0 ? [] : [row.project.creatorId])))];
   const [projectCreatorRows, projectCountRows] = await Promise.all([
     projectCreatorIds.length > 0 ? db.select().from(users).where(inArray(users.id, projectCreatorIds)).all() : Promise.resolve([]),
     projectIds.length > 0
       ? db
-          .select({ projectId: projectIssues.projectId, closed: issues.isClosed, value: sql<number>`count(*)` })
+          .select({ projectId: projectIssues.projectId, repoId: issues.repoId, closed: issues.isClosed, value: sql<number>`count(*)` })
           .from(projectIssues)
           .innerJoin(issues, eq(projectIssues.issueId, issues.id))
           .where(inArray(projectIssues.projectId, projectIds))
-          .groupBy(projectIssues.projectId, issues.isClosed)
+          .groupBy(projectIssues.projectId, issues.repoId, issues.isClosed)
           .all()
       : Promise.resolve([]),
   ]);
   const projectCounts = new Map<number, { open: number; closed: number; total: number }>();
-  for (const row of projectCountRows) {
-    const bucket = projectCounts.get(row.projectId) ?? { open: 0, closed: 0, total: 0 };
-    if (row.closed) {
-      bucket.closed = Number(row.value);
-    } else {
-      bucket.open = Number(row.value);
+  if (projectCountRows.length > 0) {
+    const viewer = opts.viewer;
+    const visibleByOwner = new Map<number, Set<string>>();
+    if (viewer !== undefined) {
+      const ownerIds = [...new Set(projectRows.map((row) => row.project.ownerId).filter((ownerId) => ownerId !== 0))];
+      await Promise.all(
+        ownerIds.map(async (ownerId) => {
+          const repos = await userVisibleRepos(d1, ownerId, viewer);
+          visibleByOwner.set(ownerId, new Set(repos.map((pair) => pair.repo.id)));
+        }),
+      );
     }
-    bucket.total = bucket.open + bucket.closed;
-    projectCounts.set(row.projectId, bucket);
+    const projectsById = new Map(projectRows.map((row) => [row.project.id, row.project]));
+    for (const row of projectCountRows) {
+      const project = projectsById.get(row.projectId);
+      if (project !== undefined && project.ownerId !== 0) {
+        const visible = visibleByOwner.get(project.ownerId);
+        // an un-threaded viewer keeps the plain branch; a threaded one sums
+        // only the repo buckets inside the owner's visible set
+        if (visible !== undefined && !visible.has(row.repoId)) continue;
+      }
+      const bucket = projectCounts.get(row.projectId) ?? { open: 0, closed: 0, total: 0 };
+      // the repo-keyed buckets ACCUMULATE (the group now carries one row per
+      // (project, repo, state) — the landed read's per-state single row is
+      // gone)
+      if (row.closed) {
+        bucket.closed += Number(row.value);
+      } else {
+        bucket.open += Number(row.value);
+      }
+      bucket.total = bucket.open + bucket.closed;
+      projectCounts.set(row.projectId, bucket);
+    }
   }
   return {
     posters: new Map(posterRows.map((row) => [row.id, row])),

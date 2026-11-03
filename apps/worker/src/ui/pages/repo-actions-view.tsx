@@ -2043,16 +2043,29 @@ export async function rerunActionRun(
   // store over the run's own WorkflowRepoID (view.go:929-936's
   // `disabled = IsScopedWorkflowOptedOut(...)` — the landed parity columns
   // carry is_scoped_run/workflow_repo_id on every producer row); the owner
-  // arg rides run.ownerId, the sibling gate's shape (rerun.ts's
-  // validateRerun — the repo's CURRENT-owner divergence after a transfer is
-  // R1-F9's separate thread).
+  // arg is the RESOLVED repo's CURRENT owner (upstream reads
+  // ctx.Repo.Repository.OwnerID — view.go:930; rerun.go:93's repo.OwnerID
+  // is the same currency), so after a transfer the gate consults the NEW
+  // owner's registrations — the run row's ownerId is the pre-transfer value
+  // and misses them (R1-F9). The store's repositories row is the currency
+  // source here (the handler receives no ownerId); the read mirrors the
+  // landed service-side self-resolution (services/actions/rerun.ts
+  // validateRerun).
   if (!isDoneStatusValue(run.status)) {
     return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.runNotDone, renderFormat: "text" } };
   }
   const cfg = await loadRepoActionsConfig(d1, run.repoId);
   let workflowDisabled = cfg.disabledWorkflows.includes(run.workflowId);
   if (run.isScopedRun) {
-    workflowDisabled = await isScopedWorkflowOptedOut(d1, cfg, run.ownerId, run.workflowRepoId, run.workflowId);
+    const resolved = await drizzle(d1)
+      .select({ ownerId: repositories.ownerId })
+      .from(repositories)
+      .where(eq(repositories.id, run.repoId))
+      .get();
+    // the column is nullable in the store; 0 = upstream's impossible
+    // no-owner row (the (0, ownerId) scan degrades to instance-level rows
+    // only — the landed rerun.ts convention)
+    workflowDisabled = await isScopedWorkflowOptedOut(d1, cfg, resolved?.ownerId ?? 0, run.workflowRepoId, run.workflowId);
   }
   if (workflowDisabled) {
     return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.workflowDisabled, renderFormat: "text" } };

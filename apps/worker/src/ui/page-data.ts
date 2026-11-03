@@ -299,9 +299,22 @@ export function parsePageNumber(raw: string | null): number {
   return parsed < 1 ? 1 : parsed;
 }
 
-/** Upstream `PathEscapeSegments` (routers/common): escape each "/"-separated
- *  segment, keep the separators. `PathEscape` for single values is the same
- *  `encodeURIComponent` on a segment-free string. */
-export function pathEscapeSegments(path: string): string {
-  return path.split("/").map(encodeURIComponent).join("/");
-}
+/**
+ * Upstream `util.PathEscapeSegments` (gitea/modules/util/url.go:12-19) —
+ * `url.PathEscape` each "/"-separated segment, KEEP the separators. The
+ * Go-parity port (the byte-derived `url.PathEscape` safe set) is the ONE
+ * released implementation in api/services/releases.ts (R2-L2, commit
+ * c2056f3: kept = unreserved + $&+:;=@, escaped = !"'()* , ; ? etc.);
+ * `encodeURIComponent` is its inverse on exactly the legal ref/path
+ * characters (`!'()*` stay raw, `$&+:;=@` encode), so this module re-exports
+ * the released port instead of carrying a second char class.
+ *
+ * Per-surface derivation (upstream IS the escaper choice):
+ *  - refs (branch/tag names) and tree paths in the sub-URLs: templates run
+ *    `PathEscapeSegments` (`view_list.tmpl:15/:38/:49`, `markup.go:67`'s
+ *    refPath; a slash tag renders `/releases/tag/v1/2`, release.go:136-146);
+ *  - single-value names (HomeLink, `user.go:342-344`'s `url.PathEscape`)
+ *    carry no "/" by construction (invalid username chars), where
+ *    PathEscapeSegments IS PathEscape — one surface here too.
+ */
+export { pathEscapeSegments } from "../api/services/releases";

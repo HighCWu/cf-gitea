@@ -532,16 +532,18 @@ describe("recipient arms and gates", () => {
     await service.addComment({ issueId: wip.issue.id, posterId: neighborId, content: "watcher comment", now: T3 });
     expect(await neighborList()).toContain(wip.issue.id);
 
-    // The second prefix of the shared set and the rename timing: a "Draft:"
-    // PR drops too, and renaming off WIP re-qualifies the watcher for the
-    // (past) activity — the gate reads the CURRENT title (derived-model
-    // timing caveat, deviation 1/4).
+    // The second prefix of the shared set and the rename timing (FD's R5-1
+    // re-baseline, repository.go:199: the set is [WIP:, [WIP]] — "Draft" is
+    // NOT a prefix upstream, so the draft-titled PR QUALIFIES and renaming
+    // keeps it qualified): a "[WIP]" PR drops, and renaming off WIP
+    // re-qualifies the watcher for the (past) activity — the gate reads the
+    // CURRENT title (derived-model timing caveat, deviation 1/4).
     const draft = await service.createPullRequest({
       repoId: REPO_ID,
       headRepoId: REPO_ID,
       baseBranch: "main",
       headBranch: "draft-topic",
-      title: "Draft: notes",
+      title: "[WIP] notes",
       posterId: 1,
       now: T2,
     });
