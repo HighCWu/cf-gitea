@@ -43,7 +43,7 @@ import { auditEvents, oauth2Applications, oauth2AuthorizationCodes, oauth2Grants
 import { demoModeEnabled } from "../services/demo-sweep";
 import type { UiAssetsFetcher } from "./index";
 import type { UiManifest } from "./manifest";
-import { mintSession } from "./session";
+import { impersonateSessionUser, mintSession } from "./session";
 // The scope family's ONE home is the service module (the v1.5.2 F9 absorb —
 // the authorize module re-imports from there too).
 import { grantAdditionalScopes, normalizeGrantScope } from "../services/oauth2/token";
@@ -676,6 +676,53 @@ describe("POST /login/oauth/grant — the audit record (W4)", () => {
     });
     expect(res.status).toBe(303);
     expect(await grantAuditRows()).toHaveLength(0);
+  });
+
+  // The v1.5.5 R3-L2 thread: Record attaches the admin behind an impersonated
+  // session at the record seam itself (event.go:124) — the consent-grant emit
+  // rides the session's impersonator_user_id (migration 0058).
+  it("an impersonated consent carries the admin as the impersonator pair", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run();
+    const admin = await seedUser("GrantAdmin");
+    const target = await seedUser("GrantTarget");
+    const sessionId = target.cookie.split(":")[0] ?? "";
+    expect(await impersonateSessionUser(env.DB, sessionId, admin.id, target.id)).toBe("impersonating");
+    await seedConsentFixture({ clientId: "audit-client-imp" });
+    const fields = await harvestConsentForm(target, {
+      clientId: "audit-client-imp",
+      query: "&scope=openid%20read%3Auser&code_challenge_method=S256&code_challenge=abc",
+    });
+    const res = await request("/login/oauth/grant", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, cookie: `gitea_session=${target.cookie}` },
+      body: formBody({ ...fields, granted: "true" }),
+    });
+    expect(res.status).toBe(303);
+    const rows = await grantAuditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.actorId).toBe(target.id); // the doer stays the actor
+    expect(rows[0]!.impersonatorId).toBe(admin.id);
+    expect(rows[0]!.impersonatorName).toBe("GrantAdmin");
+  });
+
+  it("a plain session's grant emit carries NO impersonator (impersonatorId 0)", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run();
+    const user = await seedUser("PlainConsenter");
+    await seedConsentFixture({ clientId: "audit-client-plain" });
+    const fields = await harvestConsentForm(user, {
+      clientId: "audit-client-plain",
+      query: "&scope=openid&code_challenge_method=S256&code_challenge=abc",
+    });
+    const res = await request("/login/oauth/grant", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, cookie: `gitea_session=${user.cookie}` },
+      body: formBody({ ...fields, granted: "true" }),
+    });
+    expect(res.status).toBe(303);
+    const rows = await grantAuditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.impersonatorId).toBe(0);
+    expect(rows[0]!.impersonatorName).toBeNull();
   });
 });
 

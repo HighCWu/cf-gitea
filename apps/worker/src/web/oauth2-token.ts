@@ -85,7 +85,7 @@ import {
   oauth2AppUrl,
   oauth2FeatureEnabled,
   oauth2Issuer,
-  resolveOAuth2AccessTokenCredential,
+  resolveUserInfoCredential,
   validateCodeChallenge,
   type AccessTokenErrorShape,
   type OAuth2SigningMaterial,
@@ -569,9 +569,9 @@ export function containsRedirectUri(app: OAuth2ApplicationRow, redirectUri: stri
 
 /**
  * normalizePublicClientRedirectURI (oauth2.go:190-205): http ONLY, an
- * EXPLICIT port, a LOOPBACK IP (net.ParseIP().IsLoopback — 127.0.0.0/8 and
- * ::1; NOT the name "localhost") — the port is stripped and the URI is
- * re-spelled with Go url.URL.String() over Host = Hostname(): the BARE
+ * EXPLICIT port, a LOOPBACK IP (net.ParseIP().IsLoopback — isLoopbackIP's
+ * port below; NOT the name "localhost") — the port is stripped and the URI
+ * is re-spelled with Go url.URL.String() over Host = Hostname(): the BARE
  * address (brackets OFF for ::1), so a presented `http://[::1]:3456/`
  * normalizes to `http://::1` and matches a registered `http://::1/` — the
  * upstream fixture at models/auth/oauth2_test.go:87-106.
@@ -590,14 +590,127 @@ function normalizePublicClientRedirectURI(redirectUri: string): string | null {
   // wants the bare address (Go's Hostname() also de-brackets).
   const bareHost =
     parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]") ? parsed.hostname.slice(1, -1) : parsed.hostname;
-  const isLoopback = bareHost === "::1" || bareHost.startsWith("127.");
-  if (!isLoopback) {
+  if (!isLoopbackIP(bareHost)) {
     return null;
   }
   // Go String() over Host = Hostname(): the bare address, brackets off.
   const userinfo = parsed.username === "" ? "" : `${parsed.username}@`;
   const path = parsed.pathname === "/" ? "" : parsed.pathname;
   return `${parsed.protocol}//${userinfo}${bareHost}${path}${parsed.search}${parsed.hash}`;
+}
+
+/**
+ * net.ParseIP's minimal port over the TEXT forms Go accepts (verified
+ * against the Go 1.25.1 stdlib, byte-probe): dotted-quad IPv4 — four octets
+ * of 1-3 DIGITS with NO leading zero ("127.0.0.001" and "0127.0.0.1" are
+ * rejected; the Go 1.17 strictness — and "127.1" is no shortcut) — and
+ * RFC 4291 IPv6 text (1-4 hex digits per group, case-insensitive, at most
+ * one "::" run, an optional trailing embedded IPv4 tail, exactly 8 groups
+ * after expansion, no %zone). Answers IsLoopback's verdict
+ * (net/ip.go): an IPv4-form address — a plain v4 parse, or the IPv4-MAPPED
+ * ::ffff:a.b.c.d shape (groups 1-5 zero, group 6 = 0xffff, the dotted and
+ * pure-hex spellings alike) — loops back on the 127/8 first octet;
+ * otherwise only ::1 itself. Names ("127.evil.com", "localhost") and the
+ * embedded-without-mapping form ("::127.0.0.1") parse/loop back NOT.
+ */
+export function isLoopbackIP(host: string): boolean {
+  const groups = parseIPGroups(host);
+  if (groups === null) {
+    return false;
+  }
+  if (groups.kind === "ipv4") {
+    return groups.octets[0] === 127;
+  }
+  const g = groups.values;
+  // The IPv4-mapped shape (::ffff:a.b.c.d — To4() non-nil upstream).
+  if (g.slice(0, 5).every((v) => v === 0) && g[5] === 0xffff) {
+    return Math.floor(g[6]! / 256) === 127;
+  }
+  return g.slice(0, 7).every((v) => v === 0) && g[7] === 1;
+}
+
+/** One parsed address: either four IPv4 octets or eight IPv6 groups. */
+function parseIPGroups(host: string): { kind: "ipv4"; octets: number[] } | { kind: "ipv6"; values: number[] } | null {
+  const ipv4 = parseIPv4Octets(host);
+  if (ipv4 !== null) {
+    return { kind: "ipv4", octets: ipv4 };
+  }
+  return parseIPv6Groups(host);
+}
+
+/** Go's post-1.17 dotted-quad rule: 1-3 digits, no leading zero (a lone "0"
+ *  is fine), value <= 255. */
+function parseIPv4Octets(host: string): number[] | null {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^(0|[1-9]\d{0,2})$/.test(part)) {
+      return null;
+    }
+    const value = Number.parseInt(part, 10);
+    if (value > 255) {
+      return null;
+    }
+    octets.push(value);
+  }
+  return octets;
+}
+
+/** RFC 4291 §2.2 text: hex groups, one "::" run max, an optional trailing
+ *  IPv4 tail (the tail folds into the last two groups), exactly 8 groups
+ *  after expansion ("::" must stand for at least one group; no %zone). */
+function parseIPv6Groups(host: string): { kind: "ipv6"; values: number[] } | null {
+  if (host.includes("%")) {
+    return null; // Go's ParseIP rejects a zone
+  }
+  const doubleColon = host.split("::");
+  if (doubleColon.length > 2) {
+    return null;
+  }
+  const headPart = doubleColon[0]!;
+  const tailPart = doubleColon.length === 2 ? doubleColon[1]! : "";
+  // A bare leading/trailing "::" yields an empty side ("" — legal);
+  // ":::" splits into >2 pieces and died above.
+  const parseGroupList = (part: string, allowIpv4Tail: boolean): number[] | null => {
+    if (part === "") {
+      return [];
+    }
+    const pieces = part.split(":");
+    const groups: number[] = [];
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i]!;
+      const isTail = allowIpv4Tail && i === pieces.length - 1;
+      if (isTail && piece.includes(".")) {
+        const octets = parseIPv4Octets(piece);
+        if (octets === null) {
+          return null;
+        }
+        groups.push((octets[0]! << 8) | octets[1]!, (octets[2]! << 8) | octets[3]!);
+        continue;
+      }
+      if (!/^[0-9a-fA-F]{1,4}$/.test(piece)) {
+        return null;
+      }
+      groups.push(Number.parseInt(piece, 16));
+    }
+    return groups;
+  };
+  const head = parseGroupList(headPart, true);
+  const tail = parseGroupList(tailPart, true);
+  if (head === null || tail === null) {
+    return null;
+  }
+  if (doubleColon.length === 2) {
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) {
+      return null;
+    }
+    return { kind: "ipv6", values: [...head, ...new Array<number>(fill).fill(0), ...tail] };
+  }
+  return head.length === 8 ? { kind: "ipv6", values: head } : null;
 }
 
 /** Go %q for the ASCII client-id shapes (the refresh unknown-client arm). */
@@ -678,14 +791,18 @@ oauth2Router.post("/login/oauth/introspect", async (c) => {
  *  (`m.Methods("GET, POST, OPTIONS", "/userinfo", ...)`). */
 async function infoOAuth(c: Context<{ Bindings: OAuth2TokenEnv }>): Promise<Response> {
   const db = c.env.DB;
-  // The ONLY accepted credential is an OAuth2 access token — a PAT (a
-  // dotless Bearer) or a session is not enough (the AuthedMethod == "oauth2"
-  // check, :97-101). 401 carries the Bearer challenge.
+  // The gate (the AuthedMethod == "oauth2" check, :97-101 + group.go:63-64)
+  // is on the AUTH METHOD THAT ANSWERED — and the OAuth2 method itself
+  // authenticates BOTH token shapes: a dotted JWT grant AND a dotless PAT
+  // (services/auth/oauth2.go:146-165's else branch — the v1.5.5 R3-M2
+  // correction: the earlier "PAT ⇒ 401" record misread the chain). A
+  // session (or no credential) is still not enough. 401 carries the Bearer
+  // challenge.
   const bearer = parseAuthorizationHeader(c.req.header("Authorization") ?? "")?.bearerToken?.token ?? null;
   const resolved =
     bearer === null
       ? null
-      : await resolveOAuth2AccessTokenCredential(db, bearer, {
+      : await resolveUserInfoCredential(db, bearer, {
           enabled: oauth2FeatureEnabled(c.env),
           configuredAlgorithm: c.env.OAUTH2_SIGNING_ALGORITHM,
           now: new Date(),
@@ -694,7 +811,7 @@ async function infoOAuth(c: Context<{ Bindings: OAuth2TokenEnv }>): Promise<Resp
     return plainTextResponse(401, "no valid authorization", { "www-authenticate": 'Bearer realm="Gitea OAuth2"' });
   }
   // read:user enforcement (:103-114) over the SAME resolved scope the API
-  // gate reads (GetDoerTokenScope).
+  // gate reads (GetDoerTokenScope) — grant and PAT carriers alike.
   const scopeSet = ScopeSet.parseLenient(resolved.scope);
   if (!scopeSet.has("read:user")) {
     return plainTextResponse(403, "token does not have required scope: read:user", {

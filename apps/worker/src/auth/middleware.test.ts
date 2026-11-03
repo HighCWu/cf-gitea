@@ -44,7 +44,11 @@ const buildApp = (): Hono<AuthEnv> => {
   app.get("/_admin", requireToken(), requireSiteAdmin(), (c) => c.json({ ok: true }));
   app.get("/_whoami", sudo(), (c) => {
     const auth = c.get("auth");
-    return c.json({ user: auth?.user?.username ?? null, scope: auth?.scope?.toString() ?? null });
+    return c.json({
+      user: auth?.user?.username ?? null,
+      scope: auth?.scope?.toString() ?? null,
+      isBasicAuth: auth?.isBasicAuth ?? false,
+    });
   });
   // The ungated sibling GET mirrors upstream POST /user/repos (api.go:1181):
   // only the POST arm carries rejectPublicOnly; the GET route has no gate.
@@ -264,7 +268,7 @@ describe("sudo (SPEC-0002 §4.2)", () => {
       headers: { Authorization: `token ${admin.token}` },
     });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ user: "Impersonated", scope: "read:user" });
+    expect(await response.json()).toEqual({ user: "Impersonated", scope: "read:user", isBasicAuth: false });
 
     // The swapped doer cannot exceed the admin token's scopes.
     const repo = await call("https://example.com/_repo?sudo=impersonated", {
@@ -284,7 +288,7 @@ describe("sudo (SPEC-0002 §4.2)", () => {
       headers: { Authorization: `token ${admin.token}`, Sudo: "headertarget" },
     });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ user: "HeaderTarget", scope: "all" });
+    expect(await response.json()).toEqual({ user: "HeaderTarget", scope: "all", isBasicAuth: false });
   });
 
   it("admin without sudo keeps their own identity", async () => {
@@ -293,7 +297,7 @@ describe("sudo (SPEC-0002 §4.2)", () => {
       headers: { Authorization: `token ${admin.token}` },
     });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ user: "SoloAdmin", scope: "all" });
+    expect(await response.json()).toEqual({ user: "SoloAdmin", scope: "all", isBasicAuth: false });
   });
 });
 
@@ -534,13 +538,15 @@ describe("failure limiter fails open (production finding ef2c049)", () => {
 
 // ---------------------------------------------------------------------------
 // THE OAUTH2 DISPATCH (SPEC specs/oauth2-provider.md §2.7 — W2): a dotted
-// Bearer credential resolves through the grant (verifyJws → grant → the
-// strict time bounds), carrying GrantAdditionalScopes as its scope —
-// feeding the landed gates UNCHANGED. The actions-JWT arm of upstream's
-// dotted dispatch is not ported (no Actions-user API identity).
+// credential resolves through the grant (verifyJws → grant → the strict
+// time bounds) on BOTH carriers — the Bearer header AND the HTTP Basic pair
+// (basic.go:59-81's VerifyAuthToken dispatch-first, both parseAuthBasic
+// shapes) — carrying GrantAdditionalScopes as its scope and feeding the
+// landed gates UNCHANGED. The actions-JWT arm of upstream's dotted dispatch
+// is not ported (no Actions-user API identity).
 // ---------------------------------------------------------------------------
 
-describe("the OAuth2 Bearer-dots dispatch (services/auth/oauth2.go:110-128)", () => {
+describe("the OAuth2 dotted-credential dispatch (services/auth/oauth2.go:110-128 + basic.go:59-81)", () => {
   let oauth2Seq = 0;
 
   /** A grant + a signed access token over a seeded user (the W2 mint). */
@@ -664,10 +670,40 @@ describe("the OAuth2 Bearer-dots dispatch (services/auth/oauth2.go:110-128)", ()
     expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
   });
 
-  it("a Basic-carried JWT stays the PAT lookup (upstream's Basic method) → 401", async () => {
+  // The v1.5.5 R3-M1 correction: upstream's Basic method is DISPATCH-FIRST —
+  // basic.go:59-81's VerifyAuthToken runs GetOAuthAccessTokenScopeAndUserID
+  // on the Basic-carried token (BOTH parseAuthBasic shapes, basic.go:44-59)
+  // before the PAT fallback. This is the git-credential-oauth / GCM shape:
+  // the JWT stored as the Basic password.
+  it("a Basic-carried JWT (password shape) authenticates the grant user, isBasicAuth kept", async () => {
+    const seeded = await seedOAuth2Token("read:repository,write:issue");
+    const ok = await call("https://example.com/_repo", {
+      headers: { Authorization: basicHeader("someone", seeded.token) },
+    });
+    expect(ok.status).toBe(200);
+    const who = await call("https://example.com/_whoami", {
+      headers: { Authorization: basicHeader("someone", seeded.token) },
+    });
+    const identity = await who.json<{ user: string; scope: string; isBasicAuth: boolean }>();
+    expect(identity.user).toBe(`Oauth2User${oauth2Seq}`);
+    expect(identity.scope).toBe("write:issue,read:repository");
+    expect(identity.isBasicAuth).toBe(true); // the Basic method answered — reqBasicAuth sees basic
+  });
+
+  it("a Basic-carried JWT (username-as-token shape, empty password) authenticates too", async () => {
     const seeded = await seedOAuth2Token("");
+    const who = await call("https://example.com/_whoami", {
+      headers: { Authorization: basicTokenHeader(seeded.token) },
+    });
+    const identity = await who.json<{ user: string; scope: string; isBasicAuth: boolean }>();
+    expect(identity.user).toBe(`Oauth2User${oauth2Seq}`);
+    expect(identity.scope).toBe("all"); // the no-access-word grant's legacy default
+    expect(identity.isBasicAuth).toBe(true);
+  });
+
+  it("a Basic-carried dotted NON-token still falls through to the PAT lookup → 401", async () => {
     const denied = await call("https://example.com/_whoami", {
-      headers: { Authorization: `Basic ${btoa(`${seeded.token}:`)}` },
+      headers: { Authorization: basicHeader("someone", "not.a.jwt") },
     });
     expect(denied.status).toBe(401);
     expect(await denied.json()).toEqual(INVALID_CREDENTIALS);

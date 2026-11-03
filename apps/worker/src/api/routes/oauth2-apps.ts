@@ -3,7 +3,7 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 
 import type { AuthInfo } from "../../auth/auth-context";
-import { emitOAuth2ApplicationAudit } from "../../services/oauth2/audit-arms";
+import { actorCredentialOf, emitOAuth2ApplicationAudit } from "../../services/oauth2/audit-arms";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { User as ApiUser } from "../models/user";
@@ -74,7 +74,10 @@ import {
  *               handler maps to APIErrorInternal — user/app.go
  *               UpdateOauth2Application + models/auth/oauth2.go:328 — unlike
  *               get/delete which 404 the foreign app; rendered by the
- *               repo-wide handler as the documented internal-error body).
+ *               repo-wide handler as the documented internal-error body);
+ *   - delete:   500 (the BuiltinApplications lock — oauth2.go:392-394's
+ *               plain "application is locked: <client_id>" error hits the
+ *               same APIErrorInternal arm, BEFORE the uid scoping).
  *
  * ERROR MESSAGES (the exact upstream texts):
  *   - invalid redirect URI: "invalid redirect URI: <uri>" (user/app.go,
@@ -140,6 +143,21 @@ const idParam = {
   id: z.string().min(1).openapi({ type: "integer", format: "int64", description: "Application ID to be found" }),
 } as const;
 
+/**
+ * BuiltinApplications' five seeded client_ids (models/auth/oauth2.go:66-98;
+ * migration 0052's uid-0 INSERT OR IGNORE rows): the DELETE lock set
+ * (oauth2.go:392-394 — the check loads the app by ID and fires BEFORE the
+ * uid scoping, so a foreign caller deleting a builtin app locks out too;
+ * PATCH's parity differs — its UID-mismatch check fires first, :328-334).
+ */
+const BUILTIN_APPLICATION_CLIENT_IDS: ReadonlySet<string> = new Set([
+  "a4792ccc-144e-407e-86c9-5e7d8d9c3269", // git-credential-oauth
+  "e90ee53c-94e2-48ac-9358-a874fb9e0662", // git-credential-manager
+  "d57cb8c4-630c-4168-8324-ec79935e18d4", // tea
+  "b757811a-05c8-4c76-8d74-a5ee3d2073f2", // gitea-app
+  "75a9ec3e-42b5-40cb-9144-9ea96ecd56a6", // gitea-vscode
+]);
+
 // ---------------------------------------------------------------------------
 // Handler helpers — the upstream ports, in handler order.
 // ---------------------------------------------------------------------------
@@ -198,17 +216,20 @@ function requireValidRedirectUris(uris: string[]): void {
 
 /**
  * The audit arms' actor snapshot — upstream `audit.Record(ctx, …, ctx.Doer,
- * …)`: the login as the name, the credential in the "access-token:<id>"
- * format (models/audit/audit_event.go:27's documented shapes; null when the
- * request rode another auth method — session/basic resolutions carry no
- * token row). The `auth` read follows the scope-gate's `| undefined`
- * annotation (the standalone-router injection path may leave it unset).
+ * …)`: the login as the name, the credential the CALLING credential
+ * (event.go:123 → GetDoerCredential, user_extdata.go:126-132) —
+ * "access-token:<id>" for a PAT bearer, "oauth2-grant:<grantId>" for a
+ * grant carrier (audit_event.go:27's documented shapes), null when the
+ * request rode another auth method. The derivation lives in
+ * services/oauth2/audit-arms.ts's actorCredentialOf; the `auth` read
+ * follows the scope-gate's `| undefined` annotation (the standalone-router
+ * injection path may leave it unset).
  */
 function auditActorOf(authUser: ApiUser, auth: AuthInfo | undefined): { id: number; username: string; credential: string | null } {
   return {
     id: authUser.id ?? 0,
     username: authUser.username ?? "",
-    credential: auth?.token ? `access-token:${auth.token.id}` : null,
+    credential: actorCredentialOf(auth),
   };
 }
 
@@ -435,6 +456,14 @@ export function registerOAuth2AppRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: M
       const app = await getOAuth2ApplicationById(c.env.DB, id);
       if (app === null) {
         throw new ApiError(404, "not found");
+      }
+      // BuiltinApplications' lock (models/auth/oauth2.go:392-394): the five
+      // seeded apps refuse the delete with upstream's plain error — its
+      // handler routes every non-notfound arm to APIErrorInternal, the 500
+      // (the repo-wide onError renders the documented internal-error body;
+      // the thrown text stays in the logs, the APIErrorInternal shape).
+      if (BUILTIN_APPLICATION_CLIENT_IDS.has(app.clientId)) {
+        throw new Error(`failed to delete OAuth2 application: application is locked: ${app.clientId}`);
       }
       if (!(await deleteOAuth2Application(c.env.DB, id, doer.id))) {
         throw new ApiError(404, "not found");

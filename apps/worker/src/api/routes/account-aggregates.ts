@@ -10,6 +10,7 @@ import {
   gpgKeys,
   issueStopwatches,
   issues,
+  personalAccessTokens,
   trackedTimes,
   userRedirects,
   users,
@@ -23,7 +24,7 @@ import {
 } from "../../auth/errors";
 import { scopeStringSlice } from "../../auth/scopes";
 import { loadSubkeys, toApiGpgKey } from "../services/account-keys";
-import { emitAccessTokenAudit } from "../../services/oauth2/audit-arms";
+import { actorCredentialOf, emitAccessTokenAudit } from "../../services/oauth2/audit-arms";
 import { canWriteRepository } from "../services/repo-access";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
@@ -1061,7 +1062,11 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
       })
       .catch(mintErrorToApiError);
     // audit.Record(ctx, UserAccessTokenAdd) — ctx.ContextUser as owner, the
-    // doer as actor (app.go:156 over applications.go:133's template).
+    // doer as actor (app.go:156 over applications.go:133's template). The
+    // credential is the CALLING credential (event.go:123 → GetDoerCredential,
+    // user_extdata.go:126-132) — NOT the minted row: the request's own PAT
+    // stamps access-token:<caller id>, an OAuth2-grant carrier stamps
+    // oauth2-grant:<grantId> (audit_event.go:27).
     await emitAccessTokenAudit(c.env.DB, {
       userId: target.id,
       tokenName: minted.name,
@@ -1069,7 +1074,8 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
       verb: "add",
       origin: "api",
       actor: { id: doer.id ?? 0, username: doer.login ?? target.username },
-      actorCredential: `access-token:${String(minted.id)}`,
+      actorCredential: actorCredentialOf(c.get("auth")),
+      impersonatorUserId: null, // the API twins carry no session impersonator
     });
     return c.json(
       {
@@ -1106,22 +1112,39 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
       }
       tokenId = byName[0]!.id;
     }
-    const deleted = await tokenService(c).revoke(target.id, tokenId);
-    if (!deleted) {
+    // GetAccessTokenByID BEFORE the delete (app.go:225-228) — the row's NAME
+    // feeds the audit arm (app.go:225-231 records t.Name in BOTH forms; the
+    // v1.5.5 R3-L1 fix — the "#<id>" synthesis never existed upstream), and
+    // the miss answers the same 404 the delete's 0-rows arm used to.
+    const row = await drizzle(c.env.DB)
+      .select({ name: personalAccessTokens.name })
+      .from(personalAccessTokens)
+      .where(and(eq(personalAccessTokens.id, tokenId), eq(personalAccessTokens.userId, target.id)))
+      .get();
+    if (row === undefined) {
       // GetAccessTokenByID's ErrAccessTokenNotExist via APIErrorAuto —
       // the NewNotExistErrorf text (models/auth).
       throw new ApiError(404, `access token does not exist [id: ${tokenId}]`);
     }
+    const deleted = await tokenService(c).revoke(target.id, tokenId);
+    if (!deleted) {
+      // The delete's own 0-rows arm — unreachable after the load above
+      // (upstream's DeleteAccessTokenByID failure arm), kept as the belt.
+      throw new ApiError(404, `access token does not exist [id: ${tokenId}]`);
+    }
     // audit.Record(ctx, UserAccessTokenRemove) — app.go:231 over
-    // applications.go:162's template (the arm loads the name if the id-form
-    // deleted it; the name-form carry is the tokenParam).
+    // applications.go:162's template; the credential is the CALLING
+    // credential (event.go:123 → GetDoerCredential — NOT the path param;
+    // the v1.5.5 R3-M3 fix: by-name deletes stamped a NAME into the
+    // credential column).
     await emitAccessTokenAudit(c.env.DB, {
       userId: target.id,
-      tokenName: goParseIntBase0(tokenParam) === 0 ? tokenParam : `#${String(tokenId)}`,
+      tokenName: row.name,
       verb: "remove",
       origin: "api",
       actor: { id: doer.id ?? 0, username: doer.login ?? target.username },
-      actorCredential: `access-token:${tokenParam}`,
+      actorCredential: actorCredentialOf(c.get("auth")),
+      impersonatorUserId: null, // the API twins carry no session impersonator
     });
     return c.body(null, 204);
   });

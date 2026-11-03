@@ -443,12 +443,19 @@ export function parseUserSettingsApplicationsDeleteForm(params: URLSearchParams)
  * HasPermissionScope gate, the duplicate-name arm, then the mint (the
  * 255-char cap answers the binder's `Name: MaxSize(255)` spelling). The
  * scope-escalation note is in the module header.
+ *
+ * `impersonatorUserId` — the viewer's impersonation carry (migration 0058):
+ * upstream's audit.Record attaches the admin behind an impersonated session
+ * at the record seam itself (event.go:124's Impersonator pair), so the web
+ * PAT arms thread it (the v1.5.5 R3-L2 fix; the settings writes ride a
+ * session — no actor credential).
  */
 export async function createTokenFromForm(
   d1: D1Database,
   userId: number,
   form: UserSettingsApplicationsForm,
   now: Date = new Date(),
+  impersonatorUserId?: number | null,
 ): Promise<CreateTokenOutcome> {
   if (form.name === "") {
     return { outcome: "invalid", message: "Name: Required" };
@@ -470,13 +477,14 @@ export async function createTokenFromForm(
     // audit.Record(ctx, audit_model.UserAccessTokenAdd, owner, "token",
     // t.Name, "token_scope", t.Scope) (applications.go:133 — after the mint,
     // before the panel render). The web write rides a session: no actor
-    // credential.
+    // credential; the impersonator rides the record seam (event.go:124).
     await emitAccessTokenAudit(d1, {
       userId,
       tokenName: form.name,
       tokenScope: normalized,
       verb: "add",
       origin: "ui",
+      impersonatorUserId,
     });
     return { outcome: "created", plaintext: minted.plaintext };
   } catch (error) {
@@ -504,8 +512,15 @@ function mintErrorToOutcome(error: unknown, name: string): CreateTokenOutcome {
  *  the landed owner-scoped `TokenService.revoke`: the row loads first (the
  *  audit name — upstream's GetAccessTokenByID arm, applications.go:169-173;
  *  a miss answers "missing" with NO audit — the stale-form arm), then the
- *  delete, then the UserAccessTokenRemove audit row (applications.go:162). */
-export async function revokeTokenFromForm(d1: D1Database, userId: number, id: number): Promise<RevokeTokenOutcome> {
+ *  delete, then the UserAccessTokenRemove audit row (applications.go:162).
+ *  `impersonatorUserId` — the record seam's impersonator pair (event.go:124;
+ *  the create twin's note). */
+export async function revokeTokenFromForm(
+  d1: D1Database,
+  userId: number,
+  id: number,
+  impersonatorUserId?: number | null,
+): Promise<RevokeTokenOutcome> {
   const row = await drizzle(d1)
     .select({ id: personalAccessTokens.id, name: personalAccessTokens.name })
     .from(personalAccessTokens)
@@ -518,7 +533,13 @@ export async function revokeTokenFromForm(d1: D1Database, userId: number, id: nu
   if (!deleted) {
     return "missing";
   }
-  await emitAccessTokenAudit(d1, { userId, tokenName: row.name, verb: "remove", origin: "ui" });
+  await emitAccessTokenAudit(d1, {
+    userId,
+    tokenName: row.name,
+    verb: "remove",
+    origin: "ui",
+    impersonatorUserId,
+  });
   return "deleted";
 }
 

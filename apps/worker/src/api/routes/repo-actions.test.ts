@@ -1509,4 +1509,45 @@ describe("the audit arms (workflow.go:49/:192-193 — the API twins)", () => {
     expect((await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nope" }, "alice-token")).status).toBe(404);
     expect(await auditRows()).toHaveLength(0);
   });
+
+  // The v1.5.5 R3-M3 twin pin: a request riding an OAuth2 GRANT stamps the
+  // grant credential (event.go:123 → GetDoerCredential's second shape,
+  // user_extdata.go:126-132) — not access-token:<id>.
+  it("a grant-carrier request stamps oauth2-grant:<grantId>", async () => {
+    const grantRequireToken: MiddlewareHandler<ApiEnv> = async (c, next) => {
+      await createTokenAuthMiddleware(resolver)(c, async () => {
+        c.set("auth", {
+          user: null,
+          token: {
+            id: 4242,
+            userId: ALICE_ID,
+            name: "oauth2-grant",
+            prefix: "", // the grant carrier's sentinel (middleware.ts's oauth2CredentialAuth)
+            scopes: "all",
+            expiresAt: null,
+            lastUsedAt: null,
+            createdAt: new Date(),
+          },
+          scope: null,
+          isBasicAuth: false,
+        });
+        await next();
+      });
+    };
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerRepoActionsRoutes(app, grantRequireToken);
+    const send = async (path: string, init?: RequestInit): Promise<Response> =>
+      await app.fetch(new Request(`${ORIGIN}${path.replace(/^\/api\/v1/, "")}`, init), env);
+    const res = await send(`${SUITE}/actions/workflows/ci.yml/disable`, {
+      method: "PUT",
+      headers: { Authorization: "token alice-token" },
+    });
+    expect(res.status).toBe(204);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.actorCredential).toBe("oauth2-grant:4242");
+    // the stranded-disable hazard (this describe's afterAll comment)
+    await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token");
+  });
 });

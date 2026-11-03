@@ -5,9 +5,12 @@
  * descriptions, the authorization_code-vs-refresh client message split),
  * the client-auth shapes (form / Basic / the disagreement arms), the PKCE
  * exchange arms, the one-time replay, the refresh family (happy, wrong
- * kind, foreign client, reuse under the flag), userinfo's PAT-refusal +
- * read:user gate + group content, introspection's Basic-only 401 +
- * inactive-200 + the active shape without exp, the JWKS member order, and
+ * kind, foreign client, reuse under the flag), userinfo's PAT acceptance
+ * (the OAuth2 method itself authenticates dotless PATs — services/auth/
+ * oauth2.go:146-165) + read:user gate + group content, introspection's
+ * Basic-only 401 +
+ * inactive-200 + the active shape without exp, the JWKS member order,
+ * the loopback ParseIP port (isLoopbackIP), and
  * the bare-OPTIONS 405 deny arms.
  *
  * Codes are minted DIRECTLY through the W1 store (grants.ts) — the
@@ -28,7 +31,7 @@ import { base64UrlDecode } from "../services/oauth2/jws";
 import { generateAuthorizationCode, getOrCreateGrant, type OAuth2GrantRow } from "../services/oauth2/grants";
 import { resetOAuth2KeyCachesForTests } from "../services/oauth2/keys";
 import { loadOAuth2SigningMaterial, mintTokenTrio } from "../services/oauth2/token";
-import { containsRedirectUri, oauth2Router, parseClientSecretBasic, parseTokenForm } from "./oauth2-token";
+import { containsRedirectUri, isLoopbackIP, oauth2Router, parseClientSecretBasic, parseTokenForm } from "./oauth2-token";
 
 const T0 = new Date("2026-01-01T00:00:00Z");
 /** The route layer's clock is the WALL (upstream time.Now) — every code and
@@ -663,15 +666,54 @@ describe("POST /login/oauth/introspect (IntrospectOAuth)", () => {
 // ---------------------------------------------------------------------------
 
 describe("GET/POST /login/oauth/userinfo (InfoOAuth)", () => {
-  it("a PAT (dotless Bearer) → 401 'no valid authorization' + the Bearer challenge", async () => {
-    const user = await seedUser();
+  // The v1.5.5 R3-M2 correction: the gate (oauth2_provider.go:97) is on the
+  // RESOLVED AuthedMethod (group.go:63-64), and the OAuth2 method itself
+  // authenticates DOTLESS PATs (services/auth/oauth2.go:146-165's else
+  // branch) — a PAT with read:user answers 200 from the same builder; the
+  // earlier "PAT ⇒ 401" record misread the chain.
+  it("a PAT (dotless Bearer) with read:user → 200, the same builder shape as a grant", async () => {
+    const user = await seedUser("w2pat");
     const { TokenService } = await import("../auth/token-service");
-    const pat = await new TokenService(env.DB).mint({ userId: user.id, name: "pat", scopes: "all" });
+    const pat = await new TokenService(env.DB).mint({ userId: user.id, name: "pat", scopes: "read:user" });
     const response = await call("/login/oauth/userinfo", { headers: { authorization: `Bearer ${pat.plaintext}` } });
+    const text = await response.text();
+    expect(response.status, text).toBe(200);
+    const body = JSON.parse(text) as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual(["sub", "name", "preferred_username", "email", "picture", "groups"]);
+    expect(body.sub).toBe(String(user.id));
+    expect(body.preferred_username).toBe(user.username);
+    expect(body.groups).toBeNull();
+  });
+
+  it("a PAT without read:user → 403 'token does not have required scope: read:user'", async () => {
+    const user = await seedUser("w2pat2");
+    const { TokenService } = await import("../auth/token-service");
+    const pat = await new TokenService(env.DB).mint({ userId: user.id, name: "pat", scopes: "read:repository" });
+    const response = await call("/login/oauth/userinfo", { headers: { authorization: `Bearer ${pat.plaintext}` } });
+    expect(response.status).toBe(403);
+    expect(response.headers.get("www-authenticate")).toBe('Bearer realm="Gitea OAuth2"');
+    expect(await response.text()).toBe("token does not have required scope: read:user");
+  });
+
+  it("an unknown dotless bearer → 401 'no valid authorization' + the Bearer challenge", async () => {
+    const response = await call("/login/oauth/userinfo", { headers: { authorization: "Bearer cfg_00000000" } });
     expect(response.status).toBe(401);
     expect(response.headers.get("www-authenticate")).toBe('Bearer realm="Gitea OAuth2"');
     expect(response.headers.get("content-type")).toBe("text/plain;charset=utf-8");
     expect(await response.text()).toBe("no valid authorization");
+  });
+
+  it("the PAT arm stamps last_used_at (upstream's UpdateAccessToken sits in the dotless arm, oauth2.go:141-144)", async () => {
+    const user = await seedUser("w2pat3");
+    const { TokenService } = await import("../auth/token-service");
+    const service = new TokenService(env.DB);
+    const pat = await service.mint({ userId: user.id, name: "pat", scopes: "read:user" });
+    const seededRow = await service.verify(pat.plaintext);
+    expect(seededRow?.token.lastUsedAt).toBeNull();
+    const response = await call("/login/oauth/userinfo", { headers: { authorization: `Bearer ${pat.plaintext}` } });
+    expect(response.status).toBe(200);
+    const touched = await service.verify(pat.plaintext);
+    expect(touched?.token.lastUsedAt).not.toBeNull();
   });
 
   it("no credential at all → the same 401 (a session would be the upstream Session method — refused identically)", async () => {
@@ -838,6 +880,73 @@ describe("containsRedirectUri — the upstream fixture table (oauth2_test.go:77-
     const conf = appRow('["http://127.0.0.1/"]', true);
     expect(containsRedirectUri(conf, "http://127.0.0.1")).toBe(true);
     expect(containsRedirectUri(conf, "http://127.0.0.1:3456/")).toBe(false);
+  });
+});
+
+// The v1.5.5 R3-L4 port: the loopback membership check is
+// net.ParseIP().IsLoopback() upstream (oauth2.go:196-198) — the earlier
+// `bareHost === "::1" || startsWith("127.")` missed the IPv4-mapped
+// ::ffff:127.0.0.1 and accepted the NAME 127.evil.com. The verdicts below
+// were probed against the local Go 1.25.1 stdlib (byte-probe).
+describe("isLoopbackIP — the minimal net.ParseIP/IsLoopback port (oauth2.go:190-205)", () => {
+  const appRow = (redirectUris: string): Parameters<typeof containsRedirectUri>[0] => ({
+    id: 1,
+    uid: 0,
+    name: "app",
+    clientId: "cid",
+    clientSecret: "",
+    confidentialClient: false,
+    skipSecondaryAuthorization: false,
+    redirectUris,
+    createdAt: T0,
+    updatedAt: T0,
+  });
+
+  it.each([
+    ["127.0.0.1", true],
+    ["127.254.1.2", true], // the whole 127/8 loops back
+    ["::1", true],
+    ["::ffff:127.0.0.1", true], // the mapped form (the relay's IN edge)
+    ["::ffff:7f00:1", true], // the same address, pure-hex spelling
+    ["0:0:0:0:0:ffff:7f00:1", true], // unexpanded
+    ["::FFFF:127.0.0.1", true], // case-insensitive hex
+    ["127.evil.com", false], // a NAME never parses (the relay's OUT edge)
+    ["localhost", false],
+    ["::127.0.0.1", false], // embedded v4 WITHOUT the ffff prefix: no To4
+    ["::ffff:128.0.0.1", false], // mapped but not 127/8
+    ["fe80::1", false],
+    ["::0", false],
+    ["1::", false],
+    ["::", false],
+    ["192.168.0.1", false],
+    ["255.255.255.255", false],
+    // the parse strictness (Go 1.17+): no leading zeros, no 2-part v4
+    ["127.0.0.001", false],
+    ["0127.0.0.1", false],
+    ["127.1", false],
+    ["::1%eth0", false], // no zone
+    [":::", false],
+    ["", false],
+  ])("IsLoopback(%j) === %j", (host, expected) => {
+    expect(isLoopbackIP(host)).toBe(expected);
+  });
+
+  it("the mapped loopback rides the redirect-uri membership (the port variance fires)", () => {
+    // DISCLOSED spelling edge: the WHATWG URL serializer canonicalizes the
+    // presented "[::ffff:127.0.0.1]" to "[::ffff:7f00:1]" (Go's url.Parse
+    // keeps the presented spelling), so the normalized candidate carries the
+    // canonical hex form — a registered entry spelled the canonical way
+    // matches; upstream compares the raw spelling. The OLD code matched
+    // NEITHER (the mapped host never passed the loopback gate, so the
+    // port-stripped candidate was never added).
+    const app = appRow('["http://::ffff:7f00:1/"]');
+    expect(containsRedirectUri(app, "http://[::ffff:127.0.0.1]:3456/")).toBe(true);
+    expect(containsRedirectUri(app, "http://[::ffff:7f00:1]:3456/")).toBe(true);
+  });
+
+  it("the dotted-name host gets NO port variance (127.evil.com out)", () => {
+    const app = appRow('["http://127.0.0.1/"]');
+    expect(containsRedirectUri(app, "http://127.evil.com:3456/")).toBe(false);
   });
 });
 

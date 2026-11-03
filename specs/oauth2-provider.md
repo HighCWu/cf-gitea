@@ -72,7 +72,7 @@ Basic-realm flip.
 | `/login/oauth/authorize` | GET, POST | `auth.AuthorizeOAuth` (`routers/web/auth/oauth2_provider.go:224`) | behind `reqSignIn` — anonymous browsers are redirected to login and back (`web.go:623`) |
 | `/login/oauth/grant` | POST | `auth.GrantApplicationOAuth` (`oauth2_provider.go:405`) | the consent form POST; also `reqSignIn` |
 | `/login/oauth/access_token` | POST, OPTIONS | `auth.AccessTokenOAuth` (`oauth2_provider.go:506`) | token issuance; CORS middleware slot |
-| `/login/oauth/userinfo` | GET, POST, OPTIONS | `auth.InfoOAuth` (`oauth2_provider.go:96`) | requires an OAuth2 access token (not a PAT) with `read:user` |
+| `/login/oauth/userinfo` | GET, POST, OPTIONS | `auth.InfoOAuth` (`oauth2_provider.go:96`) | requires the OAuth2 auth method (`read:user`) — the method itself accepts BOTH a grant JWT and a dotless PAT |
 | `/login/oauth/keys` | GET, OPTIONS | `auth.OIDCKeys` (`oauth2_provider.go:482`) | the JWKS (one key) |
 | `/login/oauth/introspect` | POST, OPTIONS | `auth.IntrospectOAuth` (`oauth2_provider.go:146`) | RFC 7662; caller authenticates with client credentials |
 | `/.well-known/openid-configuration` | GET | `auth.OIDCWellKnown` (`routers/web/auth/oauth2_wellknown.go:16`) | registered at `web.go:531–532`; 404 when the provider is disabled |
@@ -274,9 +274,19 @@ Rules to port exactly:
 
 ### 2.6 userinfo, introspection, JWKS, discovery
 
-- **userinfo** (`InfoOAuth`): authenticates ONLY via the OAuth2 auth method — a PAT
-  (or a session) is not enough; the pin checks `ctx.Data["AuthedMethod"] ==
-  (&auth_service.OAuth2{}).Name()` (:97). Response: `{sub: <user id>, name,
+- **userinfo** (`InfoOAuth`): the gate is on the RESOLVED auth method — the pin
+  checks `ctx.Data["AuthedMethod"] == (&auth_service.OAuth2{}).Name()` (:97), and
+  `AuthedMethod` is stamped by whichever group method answered
+  (`services/auth/group.go:63-64`). The OAuth2 method itself authenticates BOTH
+  token shapes (`services/auth/oauth2.go:110-165`): a DOTTED bearer resolves the
+  grant JWT; a DOTLESS bearer resolves a PAT (`GetAccessTokenBySHA`, :146-165 —
+  the earlier as-built "a PAT (or a session) is not enough" record misread the
+  chain; corrected in the v1.5.5 R3-M2 fix, `resolveUserInfoCredential`). A
+  session (or no credential) is still not enough — the Session method never
+  stamps "oauth2". As-built: both carriers answer 200 from the same builder
+  behind the same `read:user` gate; the PAT arm carries the throttled
+  last-used touch (upstream's `UpdateAccessToken` sits in the dotless arm,
+  :141-144). Response: `{sub: <user id>, name,
   preferred_username, email, picture, groups}` (`userInfoResponse`, :86–93).
 - **introspection** (`IntrospectOAuth`): caller must present
   `client_secret_basic` (Basic only — no form credentials); unauthenticated ⇒ 401 +
@@ -311,6 +321,15 @@ Upstream's API auth group tries OAuth2 first (`buildAuthGroup`,
   bounds strict); the doer carries the grant's scope (via `GrantAdditionalScopes`)
   and credential kind `oauth2-grant`. A dotless token is a PAT (our `cfg_` row
   lookup, unchanged).
+- **The Basic carrier** (the v1.5.5 R3-M1 as-built): upstream's Basic method is
+  dispatch-FIRST — `services/auth/basic.go:59-81`'s `VerifyAuthToken` runs
+  `GetOAuthAccessTokenScopeAndUserID` on the Basic-carried token (BOTH
+  `parseAuthBasic` shapes, basic.go:44-59 — username-as-token and
+  password-as-token) before falling back to the PAT lookup. This is the
+  git-credential-oauth / GCM shape (the JWT stored as the Basic password), which
+  401'd here until the fix. resolveAuth now dispatches the Basic candidate
+  through the same dotted resolution and keeps `isBasicAuth` (the Basic method
+  answered — the `reqBasicAuth` routes still see basic).
 - Effect: the **landed `apiScopeGate` needs no change** — the OAuth2 token resolves
   to (doer, scope) before the gate reads it, exactly like a PAT. The gate's
   `admin:application`-scoped `/user/applications/oauth2` family therefore also
@@ -729,10 +748,13 @@ vectors — `models/auth/oauth2_test.go` (grant/code/secret semantics),
   consent path, denied path with the `access_denied` redirect, session-mismatch 400,
   added-scope diff), plus the golden DOM snapshot for the consent page (SPEC-0008
   §5.2 process) and the `grant_error` page.
-- **userinfo/introspect/keys/well-known**: userinfo with a PAT ⇒ 401 (not an OAuth2
-  token); with an OAuth2 token lacking `read:user` ⇒ 403; groups content;
-  introspection's Basic-only 401, inactive-200 for junk/foreign tokens, active shape
-  without exp; JWKS members per key type; discovery against the exact upstream key
+- **userinfo/introspect/keys/well-known**: userinfo with a PAT ⇒ 200 (the OAuth2
+  method authenticates dotless PATs — `services/auth/oauth2.go:146-165`; the
+  v1.5.5 R3-M2 as-built, replacing the earlier "PAT ⇒ 401" row) and with a PAT
+  lacking `read:user` ⇒ 403; with an OAuth2 grant token lacking `read:user` ⇒
+  403; groups content; introspection's Basic-only 401, inactive-200 for
+  junk/foreign tokens, active shape without exp; JWKS members per key type;
+  discovery against the exact upstream key
   set (`oauth2_wellknown.go:25–67`), issuer equality.
 - **Auth-method integration**: `/api/v1/user` with an OAuth2 Bearer JWT resolves the
   doer + grant scope through the landed `apiScopeGate` (scope-gate matrix stays

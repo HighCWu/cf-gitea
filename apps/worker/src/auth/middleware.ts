@@ -159,21 +159,28 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
       });
     }
 
-    // THE OAUTH2 DISPATCH (SPEC specs/oauth2-provider.md §2.7): a dotted
-    // BEARER credential is OAuth2-grant shape (services/auth/oauth2.go:
-    // 110-128 — the token extraction takes Bearer/query; a Basic-carried
-    // JWT stays the PAT lookup like upstream's Basic method). verifyJws
-    // pins the instance alg, assertApiTimeBounds applies the strict
-    // exp/iat bounds, and the grant lookup resolves the doer + the access
-    // scope — feeding the landed apiScopeGate UNCHANGED (§2.7: the token
-    // resolves to (doer, scope) before the gate reads it, exactly like a
-    // PAT). Upstream's actions-JWT arm of the dotted dispatch is not
-    // ported (no Actions-user API identity; the recorded divergence note
-    // in resolveOAuth2AccessTokenCredential's header).
+    // THE OAUTH2 DISPATCH (SPEC specs/oauth2-provider.md §2.7): a DOTTED
+    // credential is OAuth2-grant shape on BOTH carriers — the Bearer header
+    // (services/auth/oauth2.go:110-128, the token extraction takes
+    // Bearer/query) AND the HTTP Basic pair (basic.go:59-81's
+    // VerifyAuthToken runs GetOAuthAccessTokenScopeAndUserID FIRST on the
+    // Basic-carried token — BOTH the username-as-token and the
+    // password-as-token shapes of parseAuthBasic, basic.go:44-59 — before
+    // falling back to the PAT lookup). This is the shape git-credential-
+    // oauth / GCM store: the JWT as the Basic password. verifyJws pins the
+    // instance alg, assertApiTimeBounds applies the strict exp/iat bounds,
+    // and the grant lookup resolves the doer + the access scope — feeding
+    // the landed apiScopeGate UNCHANGED (§2.7: the token resolves to
+    // (doer, scope) before the gate reads it, exactly like a PAT).
+    // isBasicAuth stays `parsed.basicAuth !== null` — a Basic-carried grant
+    // remains basic auth for the reqBasicAuth routes, exactly upstream's
+    // Basic method answering. Upstream's actions-JWT arm of the dotted
+    // dispatch is not ported (no Actions-user API identity; the recorded
+    // divergence note in resolveOAuth2AccessTokenCredential's header).
     const oauth2Env: OAuth2DispatchEnv = c.env;
     const oauth2Resolved =
-      bearerCredential !== null && bearerCredential.includes(".")
-        ? await resolveOAuth2AccessTokenCredential(c.env.DB, bearerCredential, {
+      credential.includes(".")
+        ? await resolveOAuth2AccessTokenCredential(c.env.DB, credential, {
             enabled: oauth2FeatureEnabled(oauth2Env),
             configuredAlgorithm: oauth2Env.OAUTH2_SIGNING_ALGORITHM,
             now,

@@ -28,6 +28,26 @@
  * admin twin carries the empty-name posture, the AuditEventInput contract's
  * "'' when the caller has no resolved name").
  *
+ * The ACTOR CREDENTIAL (v1.5.5 R3-M3): upstream stamps the CALLING
+ * credential — `ActorCredential: user_model.GetDoerCredential(doer)`
+ * (event.go:123 over user_extdata.go:126-132), which renders
+ * "access-token:<id>" for a PAT bearer and "oauth2-grant:<grantId>" for an
+ * OAuth2-grant bearer (models/audit/audit_event.go:27's documented
+ * shapes). `actorCredentialOf` derives it from the request's auth snapshot;
+ * a session write (no token) carries null.
+ *
+ * The IMPERSONATOR (v1.5.5 R3-L2): upstream's Record attaches the admin
+ * behind an impersonated session at the record seam itself
+ * (`Impersonator: impersonatorRef(ImpersonatorFromContext(ctx), doer)`,
+ * event.go:124) — dropped when absent or when the admin IS the doer
+ * (refs.go:29-36). The session rows carry the id alone (migration 0058's
+ * `impersonator_user_id`), so `resolveImpersonatorRef` (the
+ * services/actions/audit-arms.ts twin) derives the name with ONE users read
+ * on the impersonated arm; a vanished row degrades to id-only. The web
+ * OAuth2-application CRUD stays WITHOUT it deliberately — upstream's
+ * RecordScoped path (scoped.go:108-131) omits Impersonator genuinely; only
+ * the PAT pair and the consent-grant emit thread it.
+ *
  * Failure posture: upstream's audit writeEvent LOGS failures and never
  * fails the request (services/audit/event.go:136-140) — every helper
  * catches and logs, the caller's response is unaffected (the W7
@@ -41,6 +61,67 @@ import { users, type users as UsersTable } from "../../db/schema";
 import { AuditActions, emitAudit } from "../audit";
 
 type UserRow = typeof UsersTable.$inferSelect;
+
+/**
+ * The CALLING credential (user_extdata.go:126-132's GetDoerCredential over
+ * the request's auth snapshot): "oauth2-grant:<grantId>" when the request
+ * rode an OAuth2 grant — the auth middleware's grant carrier stamps
+ * name="oauth2-grant" and prefix="" (middleware.ts's oauth2CredentialAuth;
+ * the prefix guard keeps a PAT literally NAMED "oauth2-grant" on the
+ * access-token arm) — "access-token:<id>" for a PAT bearer, null when the
+ * write rode a session.
+ */
+export function actorCredentialOf(
+  auth: { token?: { id: number; name: string; prefix: string } | null } | undefined,
+): string | null {
+  const token = auth?.token;
+  if (token === undefined || token === null) {
+    return null;
+  }
+  if (token.name === "oauth2-grant" && token.prefix === "") {
+    return `oauth2-grant:${token.id}`;
+  }
+  return `access-token:${token.id}`;
+}
+
+/** impersonatorRef's nil arm in the row's zero shape (buildEvent leaves
+ *  ImpersonatorID 0 / ImpersonatorName unset, event.go:77-80). */
+const NOT_IMPERSONATED: { id: number; name: string | null } = { id: 0, name: null };
+
+/**
+ * impersonatorRef's port (refs.go:29-36) over the id-only session form
+ * (migration 0058's `impersonator_user_id`): the same-id fold is verbatim
+ * (the admin IS the doer ⇒ not impersonated); the name derives with ONE
+ * users read taken ONLY on the impersonated arm (upstream AuthShared's
+ * GetUserByID, routers/common/auth.go:37-45) and a vanished row degrades to
+ * ID-ONLY — logged, never thrown, so the audit row still lands ("the
+ * session stays usable, but audit events must not silently lose the admin
+ * behind it"; ours keeps the id where upstream drops it).
+ */
+export async function resolveImpersonatorRef(
+  db: D1Database,
+  actorId: number,
+  impersonatorUserId: number | null | undefined,
+): Promise<{ id: number; name: string | null }> {
+  const id = impersonatorUserId ?? 0;
+  if (id === 0 || id === actorId) {
+    return NOT_IMPERSONATED; // refs.go:31-36's fold
+  }
+  try {
+    const row = await drizzle(db)
+      .select({ username: users.username })
+      .from(users)
+      .where(eq(users.id, id))
+      .get();
+    if (row !== undefined) {
+      return { id, name: row.username };
+    }
+    console.error(`oauth2: unable to resolve impersonator ${id}: no users row`);
+  } catch (error) {
+    console.error(`oauth2: unable to resolve impersonator ${id}`, error);
+  }
+  return { id, name: null };
+}
 
 /** The OAuth2-application verbs (oauth2_common.go's recordAudit call sites:
  *  :77 add, :143 update, :170 secret, :189 remove, :220 revoke). */
@@ -64,7 +145,12 @@ export interface OAuth2ApplicationAuditArm {
   /** The acting credential (the API token arms' "access-token:<id>",
    *  audit_event.go:27's documented format; session writes pass null). */
   actorCredential?: string | null;
+  /** Deliberately ABSENT here: the OAuth2-application CRUD rides upstream's
+   *  RecordScoped path, which omits the impersonator genuinely
+   *  (scoped.go:108-131) — the PAT pair and the grant emit carry it. */
 }
+
+/** RecordScoped's OAuth2Application ScopedActions (scoped.go:39-63): the
 
 /** RecordScoped's OAuth2Application ScopedActions (scoped.go:39-63): the
  *  verb's action per scope kind. Revoke carries ONLY the user variant
@@ -93,6 +179,10 @@ export interface AccessTokenAuditArm {
   ipAddress?: string | null;
   actor?: { id: number; username: string };
   actorCredential?: string | null;
+  /** The admin behind an impersonated session (event.go:124's
+   *  Impersonator pair — resolveImpersonatorRef folds the same-id arm);
+   *  absent/null = not impersonated. */
+  impersonatorUserId?: number | null;
 }
 
 /** Load the owner row (the scope + the actor fallback's source). */
@@ -164,11 +254,17 @@ export async function emitAccessTokenAudit(db: D1Database, arm: AccessTokenAudit
       vars.token_scope = arm.tokenScope ?? "";
     }
     const actor = arm.actor ?? { id: arm.userId, username };
+    // The impersonator rides the record seam (event.go:124) — the PAT pair
+    // threads it (ui OAuth2-app CRUD does not, scoped.go:108-131's genuine
+    // omission).
+    const impersonator = await resolveImpersonatorRef(db, actor.id, arm.impersonatorUserId);
     await emitAudit(drizzle(db), {
       action,
       actorId: actor.id,
       actorName: actor.username,
       actorCredential: arm.actorCredential ?? null,
+      impersonatorId: impersonator.id,
+      impersonatorName: impersonator.name,
       scopeType: "user",
       scopeId: arm.userId,
       scopeName: username,

@@ -8600,7 +8600,7 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
       repo: { id: repo.id, ownerNamespace: repo.ownerNamespace, slug: repo.slug },
       workflowId: formValue("workflow"),
       ref: form.get("ref") ?? url.searchParams.get("ref") ?? "",
-      runId: String(outcome.run.id),
+      runId: outcome.run.id, // numeric like upstream's int64 pair (workflow.go:192-193)
       actor: { id: viewer.id, username: viewer.username },
       impersonatorUserId: viewer.impersonatorUserId ?? null, // the admin behind an impersonated session (migration 0058)
       origin: "ui",
@@ -11575,7 +11575,9 @@ async function userSettingsApplicationsSubmit(c: Context<{ Bindings: Env }>): Pr
   const p = await userSettingsTabPrologue(c, true);
   if (!p.ok) return p.response;
   const form = parseUserSettingsApplicationsForm(await readUrlEncodedForm(c.req.raw));
-  const outcome = await createTokenFromForm(c.env.DB, p.viewer.id, form);
+  // The impersonated-session admin rides the audit row (R3-L2; the arms'
+  // resolveImpersonatorRef does the name lookup — event.go:124's arm).
+  const outcome = await createTokenFromForm(c.env.DB, p.viewer.id, form, undefined, p.viewer.impersonatorUserId ?? null);
   const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin);
   if (outcome.outcome === "created") {
     // The one-shot plaintext banner: a full-page re-render carrying the
@@ -11593,7 +11595,7 @@ async function userSettingsApplicationsDelete(c: Context<{ Bindings: Env }>): Pr
   const p = await userSettingsTabPrologue(c, true);
   if (!p.ok) return p.response;
   const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
-  await revokeTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0);
+  await revokeTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0, p.viewer.impersonatorUserId ?? null);
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
 }
 

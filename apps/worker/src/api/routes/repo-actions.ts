@@ -23,6 +23,7 @@ import {
 } from "../../db/schema";
 import type { AuthInfo } from "../../auth/auth-context";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../../services/actions/audit-arms";
+import { actorCredentialOf } from "../../services/oauth2/audit-arms";
 import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
 import { increaseTaskVersion } from "../../services/actions/model";
 import {
@@ -271,8 +272,10 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     workflow.go:192-193) emit through services/actions/audit-arms.ts AFTER
  *     each write succeeds, origin "api" (api.go:954's AuditOrigin(OriginAPI)
  *     marks the whole /api/v1 router) with the requester as actor and the
- *     "access-token:<id>" credential (the auditActorOf house shape —
- *     oauth2-apps.ts's derivation, models/audit/audit_event.go:27).
+ *     CALLING credential (the auditActorOf house shape — "access-token:<id>"
+ *     for a PAT bearer, "oauth2-grant:<grantId>" for a grant carrier;
+ *     services/oauth2/audit-arms.ts's actorCredentialOf over
+ *     models/audit/audit_event.go:27).
  */
 
 // ---------------------------------------------------------------------------
@@ -307,18 +310,21 @@ async function requireActionsWriter(c: Context<ApiEnv>, pair: RepositoryWithOwne
 
 /**
  * The audit arms' actor snapshot — upstream `audit.Record(ctx, …)` resolves
- * the actor from the context doer: the login as the name, the credential in
- * the "access-token:<id>" format (models/audit/audit_event.go:27's
- * documented shapes; null when the request rode another auth method —
- * session/basic resolutions carry no token row). The `auth` read follows the
- * scope-gate's `| undefined` annotation (the standalone-router injection
- * path may leave it unset). The oauth2-apps.ts auditActorOf house shape.
+ * the actor from the context doer: the login as the name, the credential the
+ * CALLING credential (event.go:123 → GetDoerCredential, user_extdata.go:
+ * 126-132) — "access-token:<id>" for a PAT bearer, "oauth2-grant:<grantId>"
+ * for a grant carrier (audit_event.go:27's documented shapes), null when
+ * the request rode another auth method. The derivation is
+ * services/oauth2/audit-arms.ts's actorCredentialOf (the oauth2-apps.ts
+ * auditActorOf house shape); the `auth` read follows the scope-gate's
+ * `| undefined` annotation (the standalone-router injection path may leave
+ * it unset).
  */
 function auditActorOf(authUser: User, auth: AuthInfo | undefined): { id: number; username: string; credential: string | null } {
   return {
     id: authUser.id ?? 0,
     username: authUser.username ?? "",
-    credential: auth?.token ? `access-token:${auth.token.id}` : null,
+    credential: actorCredentialOf(auth),
   };
 }
 

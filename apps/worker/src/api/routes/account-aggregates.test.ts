@@ -981,3 +981,93 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     expect(body[1]).toMatchObject({ issue_index: b.index, repo_name: "other" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// The v1.5.5 R3 arms (M3 — the calling credential; L1 — the loaded name).
+// ---------------------------------------------------------------------------
+
+describe("the token twins' audit credentials (R3-M3 — event.go:123 → GetDoerCredential)", () => {
+  /** A bespoke mount whose middleware attaches an auth SNAPSHOT (the real
+   *  resolveAuth shape): the routes read c.get("auth") for the credential. */
+  async function snapshotRouter(tokenShape: { id: number; name: string; prefix: string }): Promise<(path: string, init?: RequestInit) => Promise<Response>> {
+    const { ScopeSet } = await import("../../auth/scopes");
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    app.use("/users/*", async (c, next) => {
+      c.set("auth", {
+        user: {
+          id: owner.id,
+          username: owner.username,
+          usernameLower: owner.username.toLowerCase(),
+          email: null,
+          displayName: null,
+          location: null,
+          website: null,
+          description: null,
+          isAdmin: false,
+          status: "active",
+          createdAt: NOW,
+        },
+        token: {
+          id: tokenShape.id,
+          userId: owner.id,
+          name: tokenShape.name,
+          prefix: tokenShape.prefix,
+          scopes: "all",
+          expiresAt: null,
+          lastUsedAt: null,
+          createdAt: NOW,
+        },
+        scope: ScopeSet.parseLenient("all"),
+        isBasicAuth: false,
+      });
+      await next();
+    });
+    registerAccountAggregatesRoutes(app, createTokenAuthMiddleware(resolver()));
+    return async (path, init) => app.fetch(new Request(`https://example.com${path}`, init), env);
+  }
+
+  it("a PAT-carrier request stamps access-token:<CALLER id> — never the minted row's id", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run(); // this file's siblings leave add rows behind
+    const send = await snapshotRouter({ id: 77, name: "caller-pat", prefix: "cfg_callee11" });
+    const res = await send(`/users/${owner.username}/tokens`, jsonAuth(token(owner), { name: "fresh", scopes: ["all"] }));
+    expect(res.status).toBe(201);
+    const { auditEvents } = await import("../../db/schema");
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    const add = rows.find((row) => row.action === "user:accesstoken:add");
+    expect(add).toBeDefined();
+    // 77 is the CALLER's token id; the minted row's id differs (the old pin
+    // stamped access-token:<minted.id> here)
+    expect(add?.actorCredential).toBe("access-token:77");
+  });
+
+  it("a grant-carrier request stamps oauth2-grant:<grantId> (user_extdata.go:126-132's second shape)", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run(); // this file's siblings leave add rows behind
+    const send = await snapshotRouter({ id: 99, name: "oauth2-grant", prefix: "" });
+    const res = await send(`/users/${owner.username}/tokens`, jsonAuth(token(owner), { name: "fresh2", scopes: ["all"] }));
+    expect(res.status).toBe(201);
+    const { auditEvents } = await import("../../db/schema");
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    const add = rows.find((row) => row.action === "user:accesstoken:add");
+    expect(add?.actorCredential).toBe("oauth2-grant:99");
+  });
+});
+
+describe("the token-remove audit name (R3-L1 — app.go:225-231 loads the row)", () => {
+  it("the id-form delete records the ROW's name, never a #<id> synthesis", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run(); // this file's siblings leave remove rows behind
+    const service = new TokenService(env.DB);
+    const minted = await service.mint({ userId: owner.id, name: "named-row", scopes: "all" });
+    const res = await router()(`/users/${owner.username}/tokens/${minted.id}`, {
+      method: "DELETE",
+      ...authed(token(owner)),
+    });
+    expect(res.status).toBe(204);
+    const { auditEvents } = await import("../../db/schema");
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    const remove = rows.find((row) => row.action === "user:accesstoken:remove");
+    expect(remove).toBeDefined();
+    expect(JSON.parse(remove?.metadata ?? "{}")).toEqual({ token: "named-row" });
+    expect(remove?.message).toContain("named-row");
+  });
+});

@@ -255,6 +255,29 @@ describe("the PAT audit arms (F3 — applications.go:133/:162)", () => {
     });
     expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
   });
+
+  // The v1.5.5 R3-L2 thread: Record attaches the admin behind an impersonated
+  // session at the record seam itself (event.go:124) — the web PAT arms take
+  // the id-only form the session rows carry (migration 0058).
+  it("an impersonated create carries the admin's id in the impersonator pair (id-only for a vanished row)", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "imp", scopesRaw: "read:user" }, NOW, 4242);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.impersonatorId).toBe(4242);
+    expect(rows[0]!.impersonatorName).toBeNull(); // no users row 4242 — the id-only degradation
+  });
+
+  it("an impersonated revoke carries the admin's id; a plain write stays impersonator-free", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "revoke-me", scopesRaw: "read:user" }, NOW);
+    const row = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    expect(await revokeTokenFromForm(env.DB, aliceId, row.id, 4243)).toBe("deleted");
+    await createTokenFromForm(env.DB, aliceId, { name: "plain", scopesRaw: "read:user" }, NOW);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual(["user:accesstoken:add", "user:accesstoken:remove", "user:accesstoken:add"]);
+    expect(rows[0]!.impersonatorId).toBe(0); // the create rode no impersonation
+    expect(rows[1]!.impersonatorId).toBe(4243);
+    expect(rows[2]!.impersonatorId).toBe(0);
+  });
 });
 
 describe("regenerateTokenFromForm (F10 — upstream RegenerateAccessToken, applications.go:176-185)", () => {

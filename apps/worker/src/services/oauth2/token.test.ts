@@ -34,6 +34,7 @@ import {
   oauth2FeatureEnabled,
   oauth2Issuer,
   resolveOAuth2AccessTokenCredential,
+  resolveUserInfoCredential,
   s256ChallengeFromVerifier,
   splitGrantScopes,
   validateCodeChallenge,
@@ -857,5 +858,84 @@ describe("resolveOAuth2AccessTokenCredential (the dispatch)", () => {
     expect(
       await resolveOAuth2AccessTokenCredential(env.DB, accessToken, { enabled: false, now: new Date(T0.getTime() + 1000) }),
     ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The userinfo credential resolution (InfoOAuth's auth half — the v1.5.5
+// R3-M2 seam): the gate is on the RESOLVED AuthedMethod (oauth2_provider.go:
+// 97 + group.go:63-64) and the OAuth2 method itself authenticates BOTH
+// shapes (services/auth/oauth2.go:110-165) — a dotted bearer through the
+// grant JWT, a dotless bearer through the PAT lookup.
+// ---------------------------------------------------------------------------
+
+describe("resolveUserInfoCredential (the dotless-resolution seam)", () => {
+  it("a dotted bearer resolves through the grant: the doer row + GrantAdditionalScopes, patId null", async () => {
+    const userId = await seedUser();
+    const app = await seedApp();
+    const grant = await seedGrant(userId, app.id, "read:user");
+    const material = await loadOAuth2SigningMaterial(env.DB);
+    const result = await mintTokenTrio({
+      db: env.DB,
+      grant,
+      application: (await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, app.id)).get())!,
+      user: (await drizzle(env.DB).select().from(users).where(eq(users.id, userId)).get())!,
+      material,
+      issuer: "https://git.example.com",
+      appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
+      now: T0,
+    });
+    if (!result.ok) throw new Error("mint failed");
+    const accessToken = (result.response as { access_token: string }).access_token;
+    const resolved = await resolveUserInfoCredential(env.DB, accessToken, { enabled: true, now: new Date(T0.getTime() + 1000) });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.user.id).toBe(userId);
+    expect(resolved!.scope).toBe("read:user");
+    expect(resolved!.patId).toBeNull();
+  });
+
+  it("a dotless bearer resolves the PAT row (the stored scope authority, the full user row)", async () => {
+    const userId = await seedUser({ displayName: "Pat Carrier" });
+    const { TokenService } = await import("../../auth/token-service");
+    const pat = await new TokenService(env.DB).mint({ userId, name: "userinfo-pat", scopes: "read:user,read:repository" });
+    const resolved = await resolveUserInfoCredential(env.DB, pat.plaintext, { enabled: true, now: new Date(T0.getTime() + 1000) });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.user.id).toBe(userId);
+    expect(resolved!.user.displayName).toBe("Pat Carrier");
+    expect(resolved!.scope).toBe("read:repository,read:user"); // the stored normalized string
+    expect(resolved!.patId).toBe(pat.id);
+  });
+
+  it("the PAT arm stamps the throttled last-used touch; the grant arm never writes PAT rows", async () => {
+    const userId = await seedUser();
+    const { TokenService } = await import("../../auth/token-service");
+    const service = new TokenService(env.DB);
+    const pat = await service.mint({ userId, name: "touch-pat", scopes: "read:user" });
+    const before = await service.verify(pat.plaintext);
+    expect(before?.token.lastUsedAt).toBeNull();
+    await resolveUserInfoCredential(env.DB, pat.plaintext, { enabled: true, now: new Date(T0.getTime() + 1000) });
+    const after = await service.verify(pat.plaintext);
+    expect(after?.token.lastUsedAt).not.toBeNull();
+    // the touch is throttled: a second immediate resolution skips it (the
+    // stored last-used is >= the 24 h throttle behind)
+    const second = await resolveUserInfoCredential(env.DB, pat.plaintext, { enabled: true, now: new Date(T0.getTime() + 2000) });
+    expect(second).not.toBeNull();
+    const untouched = await service.verify(pat.plaintext);
+    expect(untouched?.token.lastUsedAt?.getTime()).toBe(after?.token.lastUsedAt?.getTime());
+  });
+
+  it("an unknown dotless bearer answers null (the 401 arm)", async () => {
+    const resolved = await resolveUserInfoCredential(env.DB, "cfg_00000000", { enabled: true, now: new Date(T0.getTime() + 1000) });
+    expect(resolved).toBeNull();
+  });
+
+  it("the enabled gate covers the DOTTED arm only (services/auth/oauth2.go:32-34 sits inside GetOAuthAccessTokenScopeAndUserID)", async () => {
+    const userId = await seedUser();
+    const { TokenService } = await import("../../auth/token-service");
+    const pat = await new TokenService(env.DB).mint({ userId, name: "disabled-provider-pat", scopes: "read:user" });
+    const resolved = await resolveUserInfoCredential(env.DB, pat.plaintext, { enabled: false, now: new Date(T0.getTime() + 1000) });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.patId).toBe(pat.id);
   });
 });

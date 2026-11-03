@@ -77,6 +77,7 @@ import {
 import { grantAdditionalScopes, normalizeGrantScope, oauth2FeatureEnabled } from "../services/oauth2/token";
 import { oauth2Applications, sessions, users } from "../db/schema";
 import { AuditActions, emitAudit } from "../services/audit";
+import { resolveImpersonatorRef } from "../services/oauth2/audit-arms";
 import { demoModeEnabled } from "../services/demo-sweep";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import {
@@ -246,6 +247,10 @@ interface SignedIn {
    *  PRESENTED cookie's id half AFTER verifySession authenticated the secret
    *  (the id alone authorizes nothing; the pair does). */
   sessionId: string;
+  /** The admin behind an impersonated session (migration 0058's
+   *  `impersonator_user_id`, the viewer's field) — the audit impersonator
+   *  pair's source (event.go:124); undefined = not impersonated. */
+  impersonatorUserId?: number;
 }
 
 /** Settle the verification's background work (`ctx.waitUntil` where an
@@ -277,7 +282,11 @@ async function requireSignIn(c: RouteContext): Promise<SignedIn | Response> {
     for (const work of verification.background) sink(work);
     if (verification.outcome === "authenticated") {
       const colon = value.indexOf(":");
-      return { user: verification.user, sessionId: colon > 0 ? value.slice(0, colon) : "" };
+      return {
+        user: verification.user,
+        sessionId: colon > 0 ? value.slice(0, colon) : "",
+        ...(verification.impersonatorUserId !== null ? { impersonatorUserId: verification.impersonatorUserId } : {}),
+      };
     }
     if (verification.clearCookie) {
       return signInRedirect(c, clearSessionSetCookie());
@@ -650,14 +659,20 @@ async function grantPost(c: RouteContext): Promise<Response> {
       // "oauth2_application", app.Name, "granted_scope", form.Scope):
       // scope = the doer (user), metadata pairs oauth2_application +
       // granted_scope (the template renders {oauth2_application} and the
-      // reserved {scope}). Upstream's writeEvent LOGS failures and never
-      // fails the request (services/audit/event.go:136-140) — the catch
-      // keeps that posture.
+      // reserved {scope}). Record attaches the impersonator at the record
+      // seam (event.go:124) — the consent-grant emit threads the session's
+      // admin id (the v1.5.5 R3-L2 fix; resolveImpersonatorRef folds the
+      // same-id arm and degrades a vanished row to id-only). Upstream's
+      // writeEvent LOGS failures and never fails the request
+      // (services/audit/event.go:136-140) — the catch keeps that posture.
       try {
+        const impersonator = await resolveImpersonatorRef(c.env.DB, doer.id, signedIn.impersonatorUserId);
         await emitAudit(drizzle(c.env.DB), {
           action: AuditActions.UserOAuth2ApplicationGrant,
           actorId: doer.id,
           actorName: doer.username,
+          impersonatorId: impersonator.id,
+          impersonatorName: impersonator.name,
           scopeType: "user",
           scopeId: doer.id,
           scopeName: doer.username,

@@ -29,6 +29,8 @@ import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
 import { auditEvents, oauth2Applications, users } from "../../db/schema";
+import type { AuthInfo } from "../../auth/auth-context";
+import { ScopeSet } from "../../auth/scopes";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -533,5 +535,112 @@ describe("the audit arms (F3 — user/app.go:278/:460/:360)", () => {
     const foreign = await del(`/api/v1/user/applications/oauth2/${created.id}`, bob.id);
     expect(foreign.status).toBe(404);
     expect(await db().select().from(auditEvents).all()).toHaveLength(1); // the 404 arm emitted nothing
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The v1.5.5 R3 arms (M3 — the calling credential; L3 — the builtin lock).
+// ---------------------------------------------------------------------------
+
+describe("the R3-M3 credential arm (event.go:123 → GetDoerCredential)", () => {
+  /** A GRANT-carrier auth snapshot — the auth middleware's oauth2CredentialAuth
+   *  shape (name "oauth2-grant", prefix ""). The user slice rides too: the
+   *  api auth seam derives authUser FROM the snapshot when `auth` is set. */
+  const grantAuthSnapshot = (userId: number, username: string, grantId: number): AuthInfo => ({
+    user: {
+      id: userId,
+      username,
+      usernameLower: username.toLowerCase(),
+      email: null,
+      displayName: null,
+      location: null,
+      website: null,
+      description: null,
+      isAdmin: false,
+      status: "active",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    },
+    token: {
+      id: grantId,
+      userId,
+      name: "oauth2-grant",
+      prefix: "",
+      scopes: "all",
+      expiresAt: null,
+      lastUsedAt: null,
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    },
+    scope: ScopeSet.parseLenient("all"),
+    isBasicAuth: false,
+  });
+
+  it("a grant-carrier request stamps oauth2-grant:<grantId>, not access-token:<id>", async () => {
+    const { alice } = await seedWorld();
+    const created = await createApp(alice.id);
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    app.use("/user/applications/oauth2/*", async (c, next) => {
+      c.set("auth", grantAuthSnapshot(alice.id, alice.username, 4242));
+      await next();
+    });
+    registerOAuth2AppRoutes(app, createTokenAuthMiddleware(resolver));
+    const res = await app.fetch(
+      new Request(`https://example.com/user/applications/oauth2/${created.id}`, {
+        method: "DELETE",
+        headers: authHeaders(alice.id),
+      }),
+      env,
+    );
+    expect(res.status).toBe(204);
+    const rows = await db().select().from(auditEvents).all();
+    expect(rows).toHaveLength(2); // the createApp add + the remove
+    expect(rows[1]!.actorCredential).toBe("oauth2-grant:4242");
+  });
+});
+
+describe("the R3-L3 builtin lock (models/auth/oauth2.go:392-394)", () => {
+  const seedBuiltin = async (uid: number): Promise<number> => {
+    const [row] = await db()
+      .insert(oauth2Applications)
+      .values({
+        uid,
+        name: "git-credential-oauth",
+        clientId: "a4792ccc-144e-407e-86c9-5e7d8d9c3269",
+        clientSecret: "",
+        confidentialClient: false,
+        redirectUris: '["http://127.0.0.1","https://127.0.0.1"]',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning()
+      .all();
+    return row!.id;
+  };
+
+  it("the owner's delete → the locked 500 (upstream's plain error → APIErrorInternal)", async () => {
+    const { alice } = await seedWorld();
+    const id = await seedBuiltin(alice.id);
+    const res = await del(`/api/v1/user/applications/oauth2/${id}`, alice.id);
+    expect(res.status).toBe(500);
+    expect(await messageOf(res)).toBe("internal server error");
+    // the row survives
+    expect(await db().select().from(oauth2Applications).all()).toHaveLength(1);
+  });
+
+  it("the lock fires BEFORE the uid scoping: a foreign caller locks out too (not the 404)", async () => {
+    const { alice, bob } = await seedWorld();
+    const id = await seedBuiltin(alice.id);
+    const foreign = await del(`/api/v1/user/applications/oauth2/${id}`, bob.id);
+    expect(foreign.status).toBe(500);
+    expect(await db().select().from(oauth2Applications).all()).toHaveLength(1);
+    // the failure arm emits nothing (no createApp rode this test)
+    expect(await db().select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("a NON-builtin app keeps the foreign-404 arm", async () => {
+    const { alice, bob } = await seedWorld();
+    const created = await createApp(alice.id);
+    const foreign = await del(`/api/v1/user/applications/oauth2/${created.id}`, bob.id);
+    expect(foreign.status).toBe(404);
   });
 });

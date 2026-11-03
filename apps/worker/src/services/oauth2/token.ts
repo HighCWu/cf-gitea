@@ -55,6 +55,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { normalizeScope as normalizeAccessTokenScope } from "../../auth/scopes";
+import { TokenService } from "../../auth/token-service";
 import { oauth2Applications, orgMembers, teamMembers, teams, userSettings, users } from "../../db/schema";
 import { avatarLinkWithSize } from "../avatars";
 import {
@@ -763,4 +764,71 @@ export async function resolveOAuth2AccessTokenCredential(
     return null;
   }
   return { user, grant, scope: grantAdditionalScopes(grant.scope), grantId: grant.id };
+}
+
+// ---------------------------------------------------------------------------
+// The userinfo credential resolution (InfoOAuth's auth half — the gate is on
+// the RESOLVED AuthedMethod, oauth2_provider.go:97-101 + group.go:63-64)
+// ---------------------------------------------------------------------------
+
+/** The resolved userinfo credential: the doer row plus the scope authority
+ *  the read:user / public-only gates read (GetDoerTokenScope's string). */
+export interface ResolvedUserInfoCredential {
+  user: OAuth2UserRow;
+  /** GrantAdditionalScopes for a grant carrier; the PAT's stored
+   *  (normalized, comma-joined) scope string for a token carrier. */
+  scope: string;
+  /** The PAT row id — null for a grant carrier (the last-used touch is the
+   *  token arm ONLY; a grant never writes personal_access_tokens rows). */
+  patId: number | null;
+}
+
+/**
+ * The userinfo endpoint's credential resolution. Upstream's gate
+ * (`ctx.Data["AuthedMethod"] != (&OAuth2{}).Name()`, oauth2_provider.go:97)
+ * is on the AUTH METHOD THAT ANSWERED (group.go:63-64 stamps it) — and the
+ * OAuth2 method itself authenticates BOTH token shapes
+ * (services/auth/oauth2.go:110-165): a DOTTED bearer resolves through the
+ * grant JWT (resolveOAuth2AccessTokenCredential), a DOTLESS bearer is a PAT
+ * (userFromToken's else branch, :146-165 — GetAccessTokenBySHA, the
+ * UpdateAccessToken touch, the access-token ExtDoerData). Any failure
+ * answers null (the caller's 401 + Bearer challenge).
+ *
+ * The enabled option gates the DOTTED arm only — upstream's
+ * `setting.OAuth2.Enabled` check sits inside GetOAuthAccessTokenScopeAndUserID
+ * (services/auth/oauth2.go:32-34); the PAT lookup runs regardless. The
+ * dotless arm's touch reuses the auth middleware's 24 h throttle
+ * (SPEC-0002 §2.7's recorded posture) instead of upstream's every-call
+ * UpdateAccessToken (:141-144) — one throttled indexed write, awaited so the
+ * resolution stays deterministic.
+ */
+export async function resolveUserInfoCredential(
+  db: D1Database,
+  accessToken: string,
+  options: {
+    enabled: boolean;
+    configuredAlgorithm?: string;
+    now: Date;
+  },
+): Promise<ResolvedUserInfoCredential | null> {
+  if (accessToken.includes(".")) {
+    const grant = await resolveOAuth2AccessTokenCredential(db, accessToken, options);
+    if (grant === null) {
+      return null;
+    }
+    return { user: grant.user, scope: grant.scope, patId: null };
+  }
+  const service = new TokenService(db);
+  const verified = await service.verify(accessToken, { now: options.now });
+  if (verified === null) {
+    return null;
+  }
+  const user = await drizzle(db).select().from(users).where(eq(users.id, verified.token.userId)).get();
+  if (user === undefined) {
+    return null;
+  }
+  if (service.needsLastUsedTouch(verified.token, options.now)) {
+    await service.touchLastUsed(verified.token.id, options.now);
+  }
+  return { user, scope: verified.token.scopes, patId: verified.token.id };
 }
