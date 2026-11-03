@@ -756,7 +756,9 @@ describe.skipIf(!BENCH_ENABLED)("D1 metadata-plane bench", () => {
   test("list: thread page + labels join", async () => {
     const userId = fixtures.memberId;
     // lastActivityExpr / threadRowQuery / threadCountQuery shapes from
-    // src/api/routes/notifications.ts (route-local; copied verbatim here).
+    // src/api/routes/notifications.ts (route-local; copied verbatim here —
+    // including a606ecc's result-set-cap column trims, so the page select
+    // measures the production row width, not the pre-cap 107-column shape).
     const lastActivity = sql`max(
       coalesce((select max(coalesce(c.updated_unix, c.created_unix)) from comments c
         where c.issue_id = ${issues.id} and (c.poster_id is null or c.poster_id <> ${userId})), 0),
@@ -773,7 +775,16 @@ describe.skipIf(!BENCH_ENABLED)("D1 metadata-plane bench", () => {
     )`;
     const pageQuery = () =>
       db
-        .select({ issue: issues, repo: repositories, owner: users, pull: pullRequests })
+        .select({
+          issue: issues,
+          repo: repositories,
+          owner: users,
+          // The a606ecc trims (the D1 result-set column cap): pull narrowed
+          // to the serializer's only read, state to its two fields; pulling
+          // whole tables here would re-measure the shape that 500'd prod.
+          pull: { hasMerged: pullRequests.hasMerged },
+          state: { pinned: notificationStates.pinned, readAtUnix: notificationStates.readAtUnix },
+        })
         .from(issues)
         .innerJoin(repositories, eq(repositories.id, issues.repoId))
         .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))

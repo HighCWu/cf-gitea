@@ -1770,6 +1770,14 @@ export function registerPullRoutes(
       // (webhook/notifier.go:689-721, payload @715 with HookIssueClosed @718;
       // services/pull Merge fires it and the route answers a bare StatusOK, so
       // this payload is the path's ONLY PR render): payload mode.
+      // Flavor note (unit TAILS2, 2026-11-04): auto-merge landings dispatch
+      // notify.AutoMergePullRequest upstream (merge.go:403-406), but the
+      // webhook receiver is a pure redirect into MergePullRequest
+      // (webhook/notifier.go:684-687) — payload/secret flavor IDENTICAL for
+      // auto-merges, so this emit reads no wasAutoMerged stamp; the split
+      // (ActionAutoMergePullRequest) lives only in the mail/feed notifiers,
+      // recorded not ported (mail arm staged: services/mail/notify.ts's
+      // merge-arm doc).
       const merged = await findPullRequestByIndex(c.env.DB, found.repo.id, checked.index);
       if (merged !== null) {
         // The merge notifier's ToPayloadPullRequest carries the diff-stat trio

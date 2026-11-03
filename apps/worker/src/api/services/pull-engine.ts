@@ -710,8 +710,18 @@ export async function mergePullRequest(
     // upstream's Merge reads GetScheduledMergeByPullID (computing wasAutoMerged
     // from it) and DeleteScheduledAutoMerge's the row inside the success
     // transaction — a direct merge raced or superseded a schedule, and the
-    // landing clears it. The emission half of wasAutoMerged is the landing's
-    // webhook arms above; the delete is composed directly over the table (the
+    // landing clears it. The wasAutoMerged emission half is
+    // markAsMergedPostProcess's notify dispatch (merge.go:403-407), and its
+    // WEBHOOK arm is flavor-uniform: webhookNotifier.AutoMergePullRequest is a
+    // pure redirect into MergePullRequest (services/webhook/notifier.go
+    // :684-687 — same ToPayloadPullRequest payload @715 with HookIssueClosed
+    // @718, same secret pipeline), so the merged webhook needs no stamp read —
+    // the non-port record (unit TAILS2, 2026-11-04); the flavor split lives in
+    // the non-webhook notifiers only (mail notify.go:148-156
+    // ActionAutoMergePullRequest — STAGED per the services/mail/notify.ts
+    // merge-arm doc; feed notifier.go:279-289; the actions notifier redirects
+    // like the webhook, notifier.go:674-677). The delete is composed directly
+    // over the table (the
     // service's deleteScheduledAutoMerge — automerge.go:98-100 — is the same
     // statement, but pull-automerge.ts imports THIS module, so reaching back
     // would invert the layer direction with a cycle). Idempotent with the
