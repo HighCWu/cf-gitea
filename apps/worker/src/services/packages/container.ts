@@ -110,6 +110,7 @@ import {
   type PackagesQuotaConfig,
 } from "./model";
 import { isValidAbsoluteHttpUrl } from "./protocol-common";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Constants (modules/packages/container/const.go + metadata.go:20-35 +
@@ -1325,6 +1326,12 @@ export async function putContainerManifest(opts: {
   content: ReadableStream<Uint8Array>;
   declaredLength?: number;
   quota: PackagesQuotaConfig;
+  /**
+   * The webhook seam (GAPS #8): present -> EVERY successful manifest push
+   * fires the `package` created event (manifest.go:95 — the container
+   * registry has NO versionCreated gate upstream). Undefined = silent.
+   */
+  webhookEnv?: PackageEventEnv;
   now?: Date;
 }): Promise<PutContainerManifestResult> {
   const now = opts.now ?? new Date();
@@ -1630,6 +1637,7 @@ async function processOciImageManifest(
     image: string;
     reference: string;
     quota: PackagesQuotaConfig;
+    webhookEnv?: PackageEventEnv;
   },
   documentText: string,
   spooled: SpooledBlob,
@@ -1704,6 +1712,18 @@ async function processOciImageManifest(
   }
 
   const digest = await createManifestBlob(opts.d1, opts.bucket, versionId, upload.version.id, mediaType, spooled, now);
+
+  // The created arm (manifest.go:95): the container registry fires on EVERY
+  // successful manifest push — no versionCreated gate upstream. The seam
+  // never throws.
+  if (opts.webhookEnv !== undefined) {
+    const versionRow = (await drizzle(opts.d1).select().from(packageVersions).where(eq(packageVersions.id, versionId)).get()) ?? null;
+    const pkgRow =
+      versionRow === null ? null : ((await drizzle(opts.d1).select().from(packages).where(eq(packages.id, versionRow.packageId)).get()) ?? null);
+    if (versionRow !== null && pkgRow !== null) {
+      await emitPackageCreated(opts.webhookEnv, { pkg: pkgRow, version: versionRow }, opts.doer.id);
+    }
+  }
   return { digest };
 }
 
@@ -1718,6 +1738,7 @@ async function processOciImageIndex(
     image: string;
     reference: string;
     quota: PackagesQuotaConfig;
+    webhookEnv?: PackageEventEnv;
   },
   documentText: string,
   spooled: SpooledBlob,
@@ -1781,6 +1802,18 @@ async function processOciImageIndex(
     now,
   );
   const digest = await createManifestBlob(opts.d1, opts.bucket, versionId, upload.version.id, mediaType, spooled, now);
+
+  // The created arm (manifest.go:95): the container registry fires on EVERY
+  // successful manifest push — no versionCreated gate upstream. The seam
+  // never throws.
+  if (opts.webhookEnv !== undefined) {
+    const versionRow = (await drizzle(opts.d1).select().from(packageVersions).where(eq(packageVersions.id, versionId)).get()) ?? null;
+    const pkgRow =
+      versionRow === null ? null : ((await drizzle(opts.d1).select().from(packages).where(eq(packages.id, versionRow.packageId)).get()) ?? null);
+    if (versionRow !== null && pkgRow !== null) {
+      await emitPackageCreated(opts.webhookEnv, { pkg: pkgRow, version: versionRow }, opts.doer.id);
+    }
+  }
   return { digest };
 }
 

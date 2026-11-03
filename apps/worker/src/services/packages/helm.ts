@@ -81,6 +81,7 @@ import {
   spoolAndHash,
   type SpooledBlob,
 } from "./blobs";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
 import { pathEscape } from "../../api/services/releases";
 
@@ -556,6 +557,13 @@ export const MAX_PROVENANCE_PARSE_BYTES = 1024 * 1024;
 
 export interface UploadHelmChartInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -668,6 +676,7 @@ export async function uploadHelmChart(input: UploadHelmChartInput): Promise<Uplo
       await deletePackageFile(input.d1, existing.id);
       overwrote = true;
     }
+    let chartResult: UploadHelmResult;
     if (existing === null || existing.blobId !== blob.id) {
       const fileResult = await tryInsertFile(input.d1, {
         versionId: version.id,
@@ -682,9 +691,17 @@ export async function uploadHelmChart(input: UploadHelmChartInput): Promise<Uplo
         // the D1 UNIQUE and answers the duplicate arm.
         throw new Error("package file insert raced an overwrite");
       }
-      return { descriptorFile: fileResult.row, blob, metadata, createdFile: fileResult.outcome === "created", overwrote };
+      chartResult = { descriptorFile: fileResult.row, blob, metadata, createdFile: fileResult.outcome === "created", overwrote };
+    } else {
+      chartResult = { descriptorFile: existing, blob, metadata, createdFile: false, overwrote };
     }
-    return { descriptorFile: existing, blob, metadata, createdFile: false, overwrote };
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded — the duplicate-version arm threw above, so versionCreated
+    // holds here; the seam never throws.
+    if (input.webhookEnv !== undefined) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
+    return chartResult;
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);
     throw error;

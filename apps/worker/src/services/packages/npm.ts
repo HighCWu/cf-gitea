@@ -93,6 +93,7 @@ import {
   tryInsertFile,
 } from "./model";
 import { getOrInsertBlob, packageBlobContentKey, spoolAndHash, type SpooledBlob } from "./blobs";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 import { getPackageProperties, isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1241,13 @@ export const MAX_NPM_UPLOAD_BYTES = 64 * 1024 * 1024;
 
 export interface UploadNpmPackageInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -1407,6 +1415,12 @@ export async function uploadNpmPackage(input: UploadNpmPackageInput): Promise<Up
       await linkPackageToRepo(input.d1, pkg.id, linkedRepo.id);
     }
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded — the duplicate-version arm threw above, so versionCreated
+    // holds here; the seam never throws.
+    if (input.webhookEnv !== undefined) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { kind: "published", pkg, version, blob, file: fileResult.row };
   } finally {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

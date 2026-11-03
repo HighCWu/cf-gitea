@@ -777,6 +777,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined,
         quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
       });
       return new Response(null, { status: 201 });
     } catch (error) {
@@ -964,6 +967,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
         quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
       });
       return new Response(null, { status: 201 });
     } catch (error) {
@@ -1125,7 +1131,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         useLegacyPackageName: new URL(c.req.url).searchParams.get("use_legacy_package_name") ?? "",
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: outcome.kind === "created" ? 201 : 200 });
     } catch (error) {
@@ -1160,7 +1168,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         doer,
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
       };
       if (kind === "dependency") {
         await uploadNugetPackage(input);
@@ -1613,7 +1623,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         component: c.req.param("component") ?? "",
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });
     } catch (error) {
@@ -1688,7 +1700,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         repository: c.req.param("repository") ?? "",
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });
     } catch (error) {
@@ -1851,7 +1865,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
             group: target.group,
             content: bodyStream(c.req.raw),
             declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-            quota: packagesQuotaFromEnv(c.env),
+                        // The `package` created arm (packages.go:131) — the walk gates it.
+            webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
           });
           return new Response(null, { status: 201 });
         }
@@ -2027,7 +2043,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
           repository: target.repository,
           content: bodyStream(c.req.raw),
           declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-          quota: packagesQuotaFromEnv(c.env),
+                    // The `package` created arm (packages.go:131) — the walk gates it.
+          webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
         });
         return new Response(null, { status: 201 });
       }
@@ -2097,7 +2115,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         doer,
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });
     } catch (error) {
@@ -2198,7 +2218,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         doer,
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
         // UpdatePackageIndexIfExists (cargo.go:210-220) — the `_cargo-index`
         // mirror hook, committed as ctx.Doer (index.go:301-303); the repo-
         // absent no-op stays INSIDE the seam.
@@ -2509,7 +2531,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         contentType: c.req.header("content-type") ?? "",
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-        quota: packagesQuotaFromEnv(c.env),
+                // The `package` created arm (packages.go:131) — the walk gates it.
+        webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
         maxBytes: MAX_SWIFT_UPLOAD_BYTES,
       });
       return new Response(null, { status: 201, headers: { "content-version": "1" } });
@@ -3415,6 +3439,9 @@ async function npmDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
           content: bodyStream(c.req.raw),
           declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
           quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
           instanceOrigin: origin,
         });
         // deprecatePackage's 200 (npm.go:334) / UploadPackage's 201 (npm.go:277).
@@ -4180,7 +4207,9 @@ async function containerPutManifest(c: Context<{ Bindings: Env }>, image: string
     contentType: c.req.header("Content-Type") ?? "",
     content: bodyStream(c.req.raw),
     declaredLength: contentLength(c.req.raw) ?? undefined,
-    quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (manifest.go:95 — every successful push).
+    webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
   });
   return containerResponse(201, null, {
     location: `/v2/${owner.usernameLower}/${image}/manifests/${reference}`,
@@ -4545,7 +4574,9 @@ async function rubygemsUpload(c: Context<{ Bindings: Env }>): Promise<Response> 
       doer,
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-      quota: packagesQuotaFromEnv(c.env),
+            // The `package` created arm (packages.go:131) — the walk gates it.
+      webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
     });
     return new Response(null, { status: 201 });
   } catch (error) {
@@ -4694,7 +4725,9 @@ async function vagrantUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
       provider,
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-      quota: packagesQuotaFromEnv(c.env),
+            // The `package` created arm (packages.go:131) — the walk gates it.
+      webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
     });
     return new Response(null, { status: 201 });
   } catch (error) {
@@ -4825,7 +4858,9 @@ async function terraformUpload(c: Context<{ Bindings: Env }>): Promise<Response>
       name,
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-      quota: packagesQuotaFromEnv(c.env),
+            // The `package` created arm (packages.go:131) — the walk gates it.
+      webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
     });
     return new Response(null, { status: 201 });
   } catch (error) {
@@ -5144,7 +5179,9 @@ async function condaUpload(
       filename,
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-      quota: packagesQuotaFromEnv(c.env),
+            // The `package` created arm (packages.go:131) — the walk gates it.
+      webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
     });
     return new Response(null, { status: 201 });
   } catch (error) {
@@ -5275,7 +5312,9 @@ async function cranUpload(c: Context<{ Bindings: Env }>, kind: "source" | "binar
       doer,
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
-      quota: packagesQuotaFromEnv(c.env),
+            // The `package` created arm (packages.go:131) — the walk gates it.
+      webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
     };
     if (kind === "source") {
       await uploadCranSourcePackage(input);
@@ -5378,6 +5417,9 @@ async function pubUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
       quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
     });
     return new Response(null, {
       status: 204,
@@ -5612,6 +5654,9 @@ async function chefUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
       content: bodyStream(c.req.raw),
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
       quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
     });
     return new Response(JSON.stringify({}), { status: 201, headers: { "content-type": "application/json" } });
   } catch (error) {
@@ -5875,6 +5920,9 @@ async function composerUpload(c: Context<{ Bindings: Env }>): Promise<Response> 
       declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
       versionParam: c.req.query("version") ?? "",
       quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
     });
     return new Response(null, { status: 201 });
   } catch (error) {
@@ -6271,7 +6319,9 @@ async function conanDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
             filename: target.filename,
             content: bodyStream(c.req.raw),
             declaredLength: contentLength(c.req.raw) ?? undefined,
-            quota: packagesQuotaFromEnv(c.env),
+                        // The `package` created arm (packages.go:131) — the walk gates it.
+            webhookEnv: c.env,
+quota: packagesQuotaFromEnv(c.env),
           });
         } catch (error) {
           if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {

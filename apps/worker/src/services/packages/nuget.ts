@@ -107,6 +107,7 @@ import {
 } from "./blobs";
 import { goQueryEscape, parseGoSemver, parseGoVersion, type GoVersion } from "./npm";
 import { crc32 } from "./distro-common";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Errors — metadata.go's InvalidArgument sentinels answer 400 at the route;
@@ -1833,6 +1834,13 @@ export function formInt(params: URLSearchParams, key: string): number {
 
 export interface NugetProtocolInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -1979,6 +1987,11 @@ export async function uploadNugetPackage(input: NugetProtocolInput): Promise<Nug
       throw new Error("package nuspec file conflict despite a fresh version");
     }
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { pkg, version, blob, nupkgFile: nupkgResult.row, nuspecFile: nuspecResult.row };
   } finally {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

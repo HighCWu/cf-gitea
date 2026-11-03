@@ -21,7 +21,16 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { webhookDeliveries, webhooks } from "../db/schema";
 
-/** Event types (§2.6, gitea/modules/webhook/type.go:14–46; Actions-only ones deferred). */
+/**
+ * Event types (§2.6, gitea/modules/webhook/type.go:14–46). The two
+ * Actions-family wire events (`workflow_run`/`workflow_job`, type.go:41-42 —
+ * members of AllEvents()) arrived with the Actions wave (GAPS #7); the
+ * third Actions-only type, `schedule` (type.go:44), stays deliberately
+ * absent: it sits OUTSIDE AllEvents() upstream and no PrepareWebhooks caller
+ * ever passes it — it is Actions-trigger vocabulary (the detection notify
+ * input, notifier_helper.go:84, and the run's TriggerEvent), never a
+ * webhook delivery. See docs/compat/webhook-event-coverage.md's schedule row.
+ */
 export type HookEventType =
   | "create"
   | "delete"
@@ -46,7 +55,9 @@ export type HookEventType =
   | "repository"
   | "release"
   | "package"
-  | "status";
+  | "status"
+  | "workflow_run"
+  | "workflow_job";
 
 /** Parsed `webhooks.events` JSON (upstream `HookEvent`, modules/webhook/events.go). */
 export interface HookEventConfig {

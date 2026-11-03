@@ -83,6 +83,7 @@ import {
 } from "./blobs";
 import { writeVersionMetadata } from "./protocol-common";
 import { deletePackageFile, deletePackageVersionAndReferences } from "./model";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // The reference grammar (modules/packages/conan/reference.go)
@@ -591,6 +592,13 @@ export async function getConanPackageInfo(
 
 export interface UploadConanFileInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -679,6 +687,8 @@ export async function uploadConanFile(input: UploadConanFileInput): Promise<Uplo
     // conan.go:404-419 — an EXISTING version keeps its row (the conanfile
     // metadata UPDATES it in place); a fresh one carries the metadata.
     let version = await getVersionByNameAndVersion(input.d1, input.owner.id, "conan", input.recipe.name, input.recipe.version);
+    // The version-added gate (packages.go:131): only the INSERT arm notifies.
+    const versionCreated = version === null;
     if (version === null) {
       const { row } = await getOrInsertVersion(input.d1, {
         packageId: pkg.id,
@@ -768,6 +778,11 @@ export async function uploadConanFile(input: UploadConanFileInput): Promise<Uplo
       )
       .run();
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { version, file: fileResult.row, blob };
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

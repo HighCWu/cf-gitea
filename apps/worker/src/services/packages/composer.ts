@@ -83,6 +83,7 @@ import {
   spoolAndHash,
   type SpooledBlob,
 } from "./blobs";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
 import { crc32, readTarMembers } from "./distro-common";
 import { bzip2Decompress } from "./bz2";
@@ -441,6 +442,13 @@ export async function parseComposerPackage(bytes: Uint8Array, versionParam = "")
 
 export interface UploadComposerPackageInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -549,6 +557,12 @@ export async function uploadComposerPackage(input: UploadComposerPackageInput): 
       throw new DuplicatePackageVersionError(version);
     }
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded — the duplicate-version arm threw above, so versionCreated
+    // holds here; the seam never throws.
+    if (input.webhookEnv !== undefined) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { pkg: { id: pkg.id, name: pkg.name }, version, file: fileResult.row, blob, parsed };
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

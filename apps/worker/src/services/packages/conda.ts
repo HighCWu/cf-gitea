@@ -106,6 +106,7 @@ import { readTarMembers, crc32 } from "./distro-common";
 import { bzip2Decompress } from "./bz2";
 import { bzip2Compress } from "./bz2-encode";
 import { zstdDecompress } from "./zstd";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // The module constants (modules/packages/conda/metadata.go:26-31)
@@ -941,6 +942,13 @@ export async function openCondaFileForDownload(
 
 export interface UploadCondaPackageInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -1095,6 +1103,11 @@ export async function uploadCondaPackageFile(input: UploadCondaPackageInput): Pr
     }
     await writeCondaFileProperties(input.d1, fileResult.row.id, parsed);
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { pkg: { id: pkg.id, name: pkg.name }, version, file: fileResult.row, blob, parsed };
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

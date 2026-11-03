@@ -106,6 +106,7 @@ import {
 } from "./blobs";
 import { DuplicatePackageFileError } from "./generic";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Constants + the extension helpers (maven.go:33-45, 416-422)
@@ -828,6 +829,13 @@ function isGoTruthyFormValue(raw: string): boolean {
 
 export interface UploadMavenPackageFileInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -1014,7 +1022,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
       semverCompatible: false,
       now,
     });
-    const { row: version } = await getOrInsertVersion(input.d1, {
+    const { row: version, created: versionCreated } = await getOrInsertVersion(input.d1, {
       packageId: pkg.id,
       creatorId: input.doer.id,
       version: params.version,
@@ -1074,6 +1082,11 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
     }
     if (fileResult.outcome === "identical" && !params.isMeta) {
       throw new DuplicatePackageFileError(fileResult.row);
+    }
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
     }
     return { kind: "created", file: fileResult.row, blob, createdFile: fileResult.outcome === "created" };
   } catch (error) {

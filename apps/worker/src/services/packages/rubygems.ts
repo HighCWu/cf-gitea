@@ -149,6 +149,7 @@ import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common"
 import { copySpoolToContentKey, getOrInsertBlob, packageBlobContentKey, spoolAndHash, type SpooledBlob } from "./blobs";
 import { concatBytes, walkGzipMembers } from "./distro-common";
 import { md5Hex } from "./maven";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream sentinels (metadata.go:23-30 + limited_reader.go:12 + the
@@ -1345,6 +1346,13 @@ export async function openRubyGemForDownload(
 
 export interface UploadRubyGemInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -1457,6 +1465,11 @@ export async function uploadRubyGem(input: UploadRubyGemInput): Promise<UploadRu
       // A duplicate file row is unreachable through this walk (the version
       // duplicate 409s first) — the DEFAULT-arm posture stands.
       throw new Error("package file already exists");
+    }
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
     }
     return { version, file: fileResult.row, blob, parsed };
   } catch (error) {

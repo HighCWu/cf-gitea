@@ -1701,3 +1701,193 @@ rows at one sha; a pre-port legacy-hash row is adopted and superseded.
 4. The census flips at landing: audit rows 221 (`drift` → `aligned`)
    and 222 (`missing-table` → `aligned`), and the §3.1 ours-cite stays
    schema.ts-pinned.
+
+## 11. ISSUE-TEMPLATE pipeline (web UI) — derivation + as-built port (TEMPLATES unit, 2026-11-04)
+
+Closes the GAPS #9 absence (issue-new-choose.ts carried the honest no-templates
+arm only). Upstream sites at the pin: `routers/web/repo/issue_new.go`,
+`routers/web/repo/issue.go:51-74`, `services/issue/template.go`,
+`modules/issue/template/{template,unmarshal}.go`,
+`modules/markup/markdown/meta.go`, `modules/structs/issue.go:146-279`,
+`templates/repo/issue/{choose,new_form}.tmpl` + `fields/*.tmpl`,
+`routers/web/web.go:1354-1358`. No schema impact (zero migration; tree reads
+only — D1 stays untouched by this family).
+
+### 11.1 Upstream derivation (the normative rules)
+
+**Discovery** (`services/issue/template.go:24-155`, default branch only):
+directory candidates IN precedence order — `ISSUE_TEMPLATE`, `issue_template`,
+`.gitea/ISSUE_TEMPLATE`, `.gitea/issue_template`, `.github/ISSUE_TEMPLATE`,
+`.github/issue_template`, `.gitlab/ISSUE_TEMPLATE`, `.gitlab/issue_template`
+(:24-33); every subtree's direct entries whose name `CouldBe` a template are
+unmarshalled (no recursion — `tree.ListEntries`, :128-153); a parse failure
+records `TemplateErrors[path.Join(dir, name)]` and the walk continues; a
+template's `ref` front-matter normalizes to `refs/heads/<ref>` unless it
+already starts `refs/` (:147-149). Config candidates (:35-40):
+`.gitea|.github/ISSUE_TEMPLATE|issue_template/config` + `.yaml` tried before
+`.yml` (:169-177); parse/validate failure → the DEFAULT config plus the error
+(GetTemplateConfig never returns nil, :51-99; contact-link messages exact:
+`contact_link at position N is missing name|url|about key`,
+`<url> is not a valid URL` via `url.ParseRequestURI`). `HasTemplatesOrContactLinks`
+(:182-190) = any valid template OR any parsed contact links (the config ERROR
+arm leaves the default = zero links).
+
+**File forms** (`modules/structs/issue.go:268-279`): base name
+`config.yaml|config.yml` → not a template; extension `.md` → markdown form;
+`.yaml|.yml` → yaml form; anything else skipped. Size gates: >8 MiB
+(MaxDisplayFileSize, `unmarshal.go:69-71`) and the 1 MiB read cap
+(`ReadWithLimit`, :79) — a larger blob errors into TemplateErrors.
+
+**Markdown form** (`unmarshal.go:97-120` + `meta.go`): line 1 must be a YAML
+separator (optional leading spaces, ≥3 dashes, trailing spaces only —
+`isYAMLSeparator`); a second separator closes the front matter; empty front →
+extract failure. FAILURE IS SILENT-FALLBACK: the whole file becomes `content`,
+`name` = path base, `about` = `EllipsisDisplayString(content, 80)` — a broken
+front-matter .md is still a (generic) template. `description` is the accepted
+spelling of `about` when the latter is absent (:93-95,116-118,125-129).
+Front-matter keys: `name`, `title`, `about`(or `description`), `labels`,
+`assignees`, `ref`; `labels`/`assignees` accept a YAML sequence OR a scalar
+comma-split-and-trimmed string (`IssueTemplateStringSlice`, structs :208-236).
+
+**Yaml form** (`unmarshal.go:121-144`): `yaml.Unmarshal` into the template
+struct (unknown keys ignored); missing field `id` defaults to its list index;
+`visible` defaults to `[form]`, plus `[content]` for every type except
+markdown (:135-142). Fields: `type` ∈ {markdown, textarea, input, dropdown,
+checkboxes}, `attributes`, `validations`.
+
+**Validation** (`modules/issue/template/template.go`) — FIRST error wins,
+position prefix `body[<i>](<type>)` (+ `, option[<j>]` for option errors):
+`name`/`about` required (md and yaml alike); yaml: fields non-empty
+(`'body' is required`); per field: `id` required, `[\w-]` only, unique;
+`label` required in attributes unless markdown; type schemas — markdown:
+`value` string required; textarea: `description`/`placeholder`/`value`/`render`
+strings; input: those three + `is_number` bool + `regex` string; dropdown:
+`description` string, `multiple`/`list` bools, `options` non-empty string
+array, `default` int in range; checkboxes: `description` string, `options`
+non-empty dict array each with required string `label`, optional `visible`
+list of `form|content`, optional `required` bool (and cannot require a hidden
+checkbox); unknown type → `unknown type`; `required` validation bool denied on
+hidden fields (`can not require a hidden field`).
+
+**Choose page** (`NewIssueChooseTemplate`, issue_new.go:180-204 + choose.tmpl):
+`GET /{owner}/{repo}/issues/new/choose` inside `reqUnitIssuesReader`. Empty
+discovery (`!HasTemplatesOrContactLinks`) → `303` onto
+`issues/new?{RawQuery}` (query verbatim). Otherwise: one card per template —
+`{name}` + `{about}`, button `{repoLink}/issues/new?template={file_name}&{prefill}`
+("Get Started") — one card per config contact link (external `url`, "Open"),
+the blank card when `blank_issues_enabled` (default true) — `{repoLink}/issues/new?{prefill}`
+("Default") — and the config-error warning (`The issue config contains errors:`
++ the error text). `prefill` (`issuePrefillQuery`, issue_page_meta.go:144-153)
+filters the incoming query to `label`/`labels`/`milestone`/`project`/`assignee`
+(non-empty values only, re-encoded). Template parse errors flash:
+`{n} invalid template(s) found` / `Invalid templates have been ignored` /
+sorted `file: error` lines (renderErrorOfTemplates :155-177).
+
+**New-issue prefill** (`NewIssue` :99-153 + `setTemplateIfExists` :40-96):
+`title`/`body` query params land as TitleQuery/BodyQuery; the template
+candidate list is `?template=` FIRST then the 18 fallback paths
+(`IssueTemplateCandidates`, issue.go:56-74 — `ISSUE_TEMPLATE.{md,yaml,yml}`,
+`issue_template.*`, `.gitea/ISSUE_TEMPLATE.*`, `.gitea/issue_template.*`,
+`.github/ISSUE_TEMPLATE.*`, `.github/issue_template.*`) — a missing/unknown
+`?template=` falls through to the fallbacks (util.ErrNotExist → continue; a
+PARSE error records into TemplateErrors → continue); the first success wins.
+Effects: form title = template `title` (query title still wins);
+markdown → `content` prefills the body textarea; yaml → the form renders the
+template FIELDS (the plain textarea disappears), `template-file` hidden input
+carries the file name, and each `field:{id}` query param replaces that field's
+`attributes.value` (prefilled inputs, :66-71). Sidebar prefill: query
+`label`/`labels` names take precedence, else the template's `labels` matched
+case-insensitively by name against the repo's labels (`SetSelectedLabelNames`,
+issue_page_meta.go:582-586); same precedence for `assignee(s)` vs template
+`assignees`; `reference` = the template `ref` (branch short name shown).
+POST (`NewIssuePost` :324-397): when `template-file` is set, re-unmarshal from
+the default branch; on success `content = RenderToMarkdown(template, form)`
+— on failure the submitted `content` stands silently.
+
+**Render grammar** (`template.go:305-492` — the byte contract): fields with an
+empty id or not visible-in-content are skipped; `### {label}` header unless
+markdown or `hide_label`; trailing blank line per field. checkboxes →
+`- [x] {label}` / `- [ ] {label}` per content-visible option (checked =
+`form-field-{id}-{i}` == "on"); dropdown → checked = option index inside the
+comma-split of `form-field-{id}` — any checked: `list: true` renders one
+`- {opt}` per line else `{", ".join}`; none → `_No response_`; input →
+trimmed value or `_No response_`; textarea → `_No response_`, or the value
+fenced with `{minQuotes}{render}` fences (minQuotes = one more backtick than
+the longest ≥3-backtick run in the value), or the bare value; markdown → its
+`attributes.value`.
+
+**API arm**: `GET /repos/{owner}/{repo}/issue_templates` (api.go:1540,
+reqRepoReader(code); repo.go:1174-1201) returns the discovered JSON array and
+`X-Gitea-Warning: error occurs when parsing issue template: count=N` when any
+parse error exists. `CreateIssueOption` carries NO template field — the API
+create surface is template-free upstream; the prefill/POST arms are web-only.
+`issue_config` + `/issue_config/validate` already landed (repo-extras-t2.ts).
+
+### 11.2 Port plan → as-built (ours)
+
+- NEW `apps/worker/src/ui/pages/issue-templates.ts` — the full parser/service
+  port (discovery walk over `engineReads` tree reads, md front-matter
+  extraction, yaml parse via the landed `yaml` dependency, upstream-exact
+  validation messages and error positions, `renderToMarkdown`, config walk,
+  `hasTemplatesOrContactLinks`, `issuePrefillQuery`). Also exports the JSON
+  wire projection of an `IssueTemplate` (the §11.1 API shape) for the future
+  `/issue_templates` API arm; that route itself is NOT landed here (the API
+  tier file repo-extras-t2.ts is outside this unit's ownership; the §11.1
+  note travels with the projection).
+- `issue-new-choose.ts` (git-mv'd to .tsx for the render): the no-templates
+  303 arm STAYS (and its exact test pins); the render arm grows — discovery,
+  template/contact/blank cards, the config-error warning, the invalid-template
+  flash block (our in-page warning-message reduction of the upstream flash).
+- `new-issue.tsx`: GET — title/body query, `?template=` candidate chain over
+  the 18 fallbacks, yaml fields render (input/textarea/dropdown/checkboxes/
+  markdown per the field templates' grammar, native-form reductions recorded
+  below), `field:{id}` overrides, label name prefill (query precedence),
+  title template prefill, the blank-issues 303 onto choose; POST —
+  `template-file` + `form-field-*` parsing (repeated `form-field-{id}` values
+  comma-joined, the Fomantic hidden-input contract) and the
+  `renderToMarkdown` write.
+- `ui/index.ts`: the two handlers grow the data loading (discovery + config +
+  candidate template); registrations unchanged.
+
+### 11.3 Recorded reductions (equal-behavior deviations)
+
+1. **Flash vs in-page**: upstream's invalid-template notice is a session flash
+   (`base/alert` + `alert_details` <details> block); our pages are stateless
+   SSR — the same three strings render as an in-page warning message block.
+2. **Dropdown form element**: upstream posts a Fomantic JS dropdown syncing a
+   hidden input with the comma-joined selected indices; our no-JS form renders
+   a native `<select name="form-field-{id}">` (multi select posts repeated
+   values, which the parser comma-joins back to the exact hidden-input
+   contract before render). The rendered markdown is byte-identical.
+3. **Textarea editor**: the combo markdown editor reduces to the plain
+   textarea (the landed new-issue posture); `render`-fenced textareas keep
+   the exact fence grammar (monospace plain textarea).
+4. **Assignees sidebar**: not offered (the landed new-issue reduction) — a
+   template's `assignees` front-matter and the `assignee` query param are
+   parsed and validated but cannot prefill a control; recorded, not rendered.
+5. **YAML error strings**: structurally invalid template/config yaml surfaces
+   our parser's message where upstream surfaces go-yaml internals (the
+   issue_config port's recorded position, repo-extras-t2.ts). Validation
+   errors (name/about/fields/types) ARE upstream-exact.
+6. **Locale**: the choose/new strings are the en-US literals at the pin
+   (Get Started / Open / Default / Create an issue from default template. /
+   Invalid templates have been ignored / {n} invalid template(s) found /
+   The issue config contains errors:).
+
+### 11.4 Testing plan (as-built)
+
+- `issue-templates.test.ts` (unit): CouldBe rules; md front-matter happy +
+  fallback arms (no front matter / broken separator → generic template); yaml
+  defaults (ids, visible); the string-slice dual form; validation first-error
+  messages + positions (a full matrix per §11.1); renderToMarkdown byte pins
+  for all five field types incl. minQuotes escalation, list-dropdown, hidden
+  fields/options, `_No response_`.
+- `issue-new-choose.test.ts` (unit + seam pins): the 303 arm unchanged; the
+  prefill-query filter (pure).
+- `issue-templates.matrix.test.tsx` (engine-backed): the discovery matrix
+  (md root + .gitea dir + .github dir + gitlab dir precedence, invalid files
+  erroring without blocking siblings), the choose render cards + blank +
+  contact links + config error, the prefill round-trip (`?template=` →
+  prefilled form → POST → the rendered markdown issue body with D1 read-back),
+  the fallback-candidate chain (no `?template=` → ISSUE_TEMPLATE.md picked),
+  and the blank-issues-disabled redirect onto choose.

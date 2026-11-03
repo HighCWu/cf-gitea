@@ -113,6 +113,7 @@ import { getPackageProperties, isValidAbsoluteHttpUrl, writeVersionMetadata } fr
 import { bytesToHex } from "./distro-common";
 import { parseGoSemver } from "./npm";
 import { updateCargoIndexMirror, type CargoIndexHook } from "./cargo-index";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Metadata (modules/packages/cargo/parser.go:27-51 — the JSON-tag order is
@@ -571,6 +572,13 @@ export interface CargoOwner {
 
 export interface UploadCargoPackageInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: CargoOwner;
   doer: { id: number; isAdmin: boolean };
@@ -695,6 +703,11 @@ export async function uploadCargoPackage(input: UploadCargoPackageInput): Promis
       input.cargoIndex === undefined ? undefined : { ...input.cargoIndex, doerId: input.doer.id },
     );
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { pkg, versionId: version.id, version: version.version };
   } finally {
     await bucket.delete(spooled.spoolKey).catch(() => undefined);

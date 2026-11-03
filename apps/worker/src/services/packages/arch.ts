@@ -127,6 +127,7 @@ import {
 } from "./model";
 import { DuplicatePackageFileError } from "./generic";
 import { writeVersionMetadata } from "./protocol-common";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream constants (modules/packages/arch/metadata.go:24-39 +
@@ -674,6 +675,13 @@ export async function parseArchPackage(body: Uint8Array): Promise<ArchPackageWal
 
 export interface UploadArchPackageInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: { id: number; isAdmin: boolean };
@@ -806,6 +814,11 @@ export async function uploadArchPackage(input: UploadArchPackageInput): Promise<
       .run();
 
     await buildArchRepositoryFiles(input.d1, input.bucket, input.owner, repository, architecture, now);
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { file: { id: fileResult.row.id, name: filename }, packageInfo };
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

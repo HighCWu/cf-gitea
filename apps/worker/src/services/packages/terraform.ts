@@ -95,6 +95,7 @@ import {
   type SpooledBlob,
 } from "./blobs";
 import { DuplicatePackageFileError } from "./generic";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // The module constants (modules/packages/terraform/)
@@ -477,6 +478,13 @@ export async function assertTerraformStateWritable(
 
 export interface UploadTerraformStateInput {
   d1: D1Database;
+  /**
+   * The webhook seam (GAPS #8): present AND the walk created the version row
+   * -> the `package` created event fires (upstream packages.go:131, notify
+   * gated on versionCreated). Undefined keeps the walk silent.
+   */
+  webhookEnv?: PackageEventEnv;
+
   bucket: R2Bucket;
   owner: PackageOwnerRow;
   doer: PackageDoer;
@@ -537,7 +545,7 @@ export async function uploadTerraformState(input: UploadTerraformStateInput): Pr
       semverCompatible: false,
       now,
     });
-    const { row: version } = await getOrInsertVersion(input.d1, {
+    const { row: version, created: versionCreated } = await getOrInsertVersion(input.d1, {
       packageId: pkg.id,
       creatorId: input.doer.id,
       version: String(state.serial),
@@ -571,6 +579,11 @@ export async function uploadTerraformState(input: UploadTerraformStateInput): Pr
       throw new DuplicatePackageFileError(fileResult.row);
     }
 
+    // The created arm (packages.go:131): fires after the walk's last write
+    // succeeded, gated on versionCreated; the seam never throws.
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
+    }
     return { pkg: { id: pkg.id, name: pkg.name }, version, file: fileResult.row, blob, state };
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);

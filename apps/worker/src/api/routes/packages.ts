@@ -65,6 +65,12 @@ import {
 import { PackageSizeMismatchError } from "../../services/packages/blobs";
 import { servePackageFileResponse } from "../../services/packages/serve-content";
 import {
+  emitPackageDeleted,
+  resolvePackageEventAllVersions,
+  resolvePackageEventDescriptor,
+  type PackageEventDescriptor,
+} from "../../services/packages/webhooks";
+import {
   getTerraformLock,
   isTerraformLockLocked,
   TERRAFORM_PACKAGE_TYPE,
@@ -658,7 +664,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       responses: { 204: { description: "empty" }, 404: notFoundResponse, 422: terraformDeleteRefusal },
     }),
     async (c) => {
-      const { owner } = await requirePackageContext(c, "write", { requireToken: true, groupScopeGate: true });
+      const { owner, cred } = await requirePackageContext(c, "write", { requireToken: true, groupScopeGate: true });
       const params = c.req.valid("param");
       const pkg = await getPackageByName(c.env.DB, owner.id, params.type, params.name);
       if (pkg === null) {
@@ -667,7 +673,15 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       // RemovePackage's spec hook (packages.go:681): the terraform
       // specialization's locked-state refusal rides here.
       await assertPackageDeleteAllowed(c.env.DB, pkg);
+      // The `package` deleted arm (packages.go:714): RemovePackage fires ONE
+      // EVENT PER VERSION DESCRIPTOR (the `for _, pd := range pds` loop) —
+      // resolve the full descriptor set BEFORE the cascade (the payload
+      // renders the pre-delete state).
+      const descriptors = await resolvePackageEventAllVersions(c.env.DB, owner.id, params.type, params.name);
       await deletePackageAndReferences(c.env.DB, pkg.id);
+      if (descriptors.length > 0) {
+        await emitPackageDeleted(c.env, descriptors, cred.doer?.id ?? 0);
+      }
       return c.body(null, 204);
     },
   );
@@ -708,7 +722,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       responses: { 204: { description: "empty" }, 404: notFoundResponse, 422: terraformDeleteRefusal },
     }),
     async (c) => {
-      const { owner } = await requirePackageContext(c, "write", { requireToken: true, groupScopeGate: true });
+      const { owner, cred } = await requirePackageContext(c, "write", { requireToken: true, groupScopeGate: true });
       const params = c.req.valid("param");
       const versionRow = await getVersionByNameAndVersion(c.env.DB, owner.id, params.type, params.name, params.version);
       if (versionRow === null) {
@@ -722,6 +736,9 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       // specialization's locked-then-latest refusals ride here.
       await assertPackageVersionDeleteAllowed(c.env.DB, pkg, versionRow);
       await deletePackageVersionAndReferences(c.env.DB, versionRow.id);
+      // The `package` deleted arm (packages.go:532): one event, the
+      // pre-resolved rows (both were in scope already).
+      await emitPackageDeleted(c.env, [{ pkg, version: versionRow }], cred.doer?.id ?? 0);
       return c.body(null, 204);
     },
   );
@@ -1048,6 +1065,9 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
         // upstream Go reads the stream regardless).
         declaredLength: contentLength(c.req.raw) ?? undefined,
         quota: packagesQuotaFromEnv(c.env),
+        // The `package` created arm (packages.go:131) — the walk fires it
+        // itself, gated on versionCreated.
+        webhookEnv: c.env,
       });
       return new Response(null, { status: 201 });
     } catch (error) {
@@ -1061,8 +1081,17 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
 
   const deleteVersion = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
     try {
-      const { owner } = await protocolContext(c, "write");
+      const { owner, cred } = await protocolContext(c, "write");
       const params = c.req.param();
+      // The `package` deleted arm (packages.go:532): resolve the descriptor
+      // BEFORE the cascade so the payload renders the pre-delete state.
+      const desc: PackageEventDescriptor | null = await resolvePackageEventDescriptor(
+        c.env.DB,
+        owner.id,
+        "generic",
+        params.packagename ?? "",
+        params.packageversion ?? "",
+      );
       const deleted = await deleteGenericVersion(
         c.env.DB,
         owner,
@@ -1071,6 +1100,9 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
       );
       if (!deleted) {
         return plainResponse(404, "package does not exist");
+      }
+      if (desc !== null) {
+        await emitPackageDeleted(c.env, [desc], cred.doer?.id ?? 0);
       }
       return new Response(null, { status: 204 });
     } catch (error) {
@@ -1081,8 +1113,18 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
 
   const deleteFile = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
     try {
-      const { owner } = await protocolContext(c, "write");
+      const { owner, cred } = await protocolContext(c, "write");
       const params = c.req.param();
+      // The `package` deleted arm (packages.go:572): a file delete notifies
+      // ONLY when the version cascaded with it (pd != nil) — gated on the
+      // service's outcome below.
+      const desc: PackageEventDescriptor | null = await resolvePackageEventDescriptor(
+        c.env.DB,
+        owner.id,
+        "generic",
+        params.packagename ?? "",
+        params.packageversion ?? "",
+      );
       const deleted = await deleteGenericFile(
         c.env.DB,
         owner,
@@ -1092,6 +1134,9 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
       );
       if (deleted === null) {
         return plainResponse(404, "package file does not exist");
+      }
+      if (desc !== null && deleted === "version") {
+        await emitPackageDeleted(c.env, [desc], cred.doer?.id ?? 0);
       }
       return new Response(null, { status: 204 });
     } catch (error) {

@@ -51,6 +51,7 @@ import {
   spoolAndHash,
   type SpooledBlob,
 } from "./blobs";
+import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream's validation set (generic.go:20-66), ported verbatim — Go's \w is
@@ -106,6 +107,13 @@ export interface UploadGenericFileInput {
   declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   now?: Date;
+  /**
+   * The webhook seam (GAPS #8): when present AND the walk created the
+   * version row, the `package` created event fires (upstream packages.go:131
+   * — notify gated on versionCreated, post-commit). Undefined keeps the
+   * walk silent (the test/cron posture).
+   */
+  webhookEnv?: PackageEventEnv;
   /** Test seams. */
   maxBytes?: number;
   spoolKey?: string;
@@ -171,7 +179,7 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
       name: input.packageName,
       now,
     });
-    const { row: version } = await getOrInsertVersion(input.d1, {
+    const { row: version, created: versionCreated } = await getOrInsertVersion(input.d1, {
       packageId: pkg.id,
       creatorId: input.doer.id,
       version: input.packageVersion,
@@ -213,6 +221,13 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
     });
     if (fileResult.outcome !== "created") {
       throw new DuplicatePackageFileError(fileResult.row);
+    }
+    // The created arm (packages.go:131): the notify runs AFTER the walk's
+    // last write committed, gated on versionCreated — a same-version
+    // second-file upload lands silently, a duplicate file 409s before this
+    // line. Never throws (the seam swallows and logs).
+    if (input.webhookEnv !== undefined && versionCreated) {
+      await emitPackageCreated(input.webhookEnv, { pkg, version }, input.doer.id);
     }
     return { descriptorFile: fileResult.row, blob, createdFile: true };
   } catch (error) {
