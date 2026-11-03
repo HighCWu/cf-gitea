@@ -336,18 +336,27 @@ classes only.
 
 | our table | cite | verdict | reason |
 |---|---|---|---|
-| `repo_counters` | schema.ts:417 | extra-ours | consolidated per-repo number allocators (`issue_index`, `run_index`) — the platform-idiomatic merge of upstream's per-resource index tables; SPEC-0012. Known ours-extra per the audit brief; comment-verified. |
-| `auth_failures` | schema.ts:575 | extra-ours | brute-force throttle ledger; SPEC-0002. |
-| `repo_imports` | schema.ts:1322 | extra-ours | import/migration task rows; SPEC-0003/SPEC-0009. |
-| `repo_settings` | schema.ts:1523 | extra-ours | per-repo settings row; SPEC-0004. |
-| `user_settings` | schema.ts:1611 | extra-ours | columnar profile-prefs side store (theme/language/hide_email/hide_activity/diff_view_style/email_notifications_preference); user-notification-settings.md + SPEC-0020. Upstream's `user_setting` KV is separately ported 1:1 as `user_settings_kv`. |
-| `action_log_chunks` | schema.ts:4446 | extra-ours | hot log bytes per task — the `dbfs` analog on R2/D1; SPEC-0012 §4.3 (schema.ts:3906,4439). |
-| `system_keystore` | schema.ts:4593 | extra-ours | instance keystore (JWT/OIDC material); SPEC-0012 §4.4 + SPEC-0018 §1 (schema.ts:4550-4562) — upstream keeps these in app.ini/AppData files, which the substrate lacks. |
-| `cron_state` | schema.ts:4636 | extra-ours | cron tick bookkeeping; SPEC-0020. |
-| `email_outbox` | schema.ts:4664 | extra-ours | outbound mail rows; SPEC email-outbound. |
-| `email_inbound` | schema.ts:4722 | extra-ours | inbound mail rows; SPEC email-inbound. |
-| `deleted_branches` | schema.ts:4939 | extra-ours | the deleted arm of upstream's `branch` table (restore source: tip sha at delete time, actor, timestamp) split into its own table; the live arm is engine-derived. No standalone SPEC cite found — fold the record into the next schema-touching SPEC. |
-| `federation_followers` | schema.ts:5160 | extra-ours | ActivityPub follower store; SPEC federation (the ADR-0007 §"S-1 unlocked" arm). |
+| `repo_counters` | schema.ts:417 | intentional-recorded | consolidated per-repo number allocators (`issue_index`, `run_index`) — the platform-idiomatic merge of upstream's per-resource index tables; recorded SPEC-0005 §3.1 (the allocation decision + the schema line) + SPEC-0012 §4.5 (`run_index`). Known ours-extra per the audit brief; comment-verified. |
+| `auth_failures` | schema.ts:575 | intentional-recorded | brute-force throttle ledger; recorded SPEC-0002 §3 (the Drizzle row; §2.7's per-IP window posture). |
+| `repo_imports` | schema.ts:1322 | intentional-recorded | import/migration task rows; recorded SPEC-0003 §3.1 (columns + the staged state; SPEC-0009 consumes the §3.1/§3.3 tables). |
+| `repo_settings` | schema.ts:1523 | intentional-recorded | per-repo PATCH round-trip side row (the `has_*` unit flags; description/website legacy since migration 0068 — SPEC-0001 §4.1); recorded SPEC-0004 §3 item 6 — the census gap this unit closed (the old bare "SPEC-0004" cite had no table record behind it). |
+| `user_settings` | schema.ts:1611 | intentional-recorded | columnar profile-prefs side store (theme/language/hide_email/hide_activity/diff_view_style/email_notifications_preference); recorded user-notification-settings.md §4 (the migration-0008 side store + the non-interference ground) + SPEC-0020 (the `user_settings_kv` contrast). Upstream's `user_setting` KV is separately ported 1:1 as `user_settings_kv`. |
+| `action_log_chunks` | schema.ts:4446 | intentional-recorded | hot log bytes per task — the `dbfs` analog on R2/D1; recorded SPEC-0012 §4.3 (schema.ts:3906,4439). |
+| `system_keystore` | schema.ts:4593 | intentional-recorded | instance keystore (JWT/OIDC material); recorded SPEC-0012 §4.4 + §4.6 entry 7 (migration 0042, RESOLVED 3bc5d29; the old cite's "SPEC-0018 §1" arm carries no keystore record — corrected here) (schema.ts:4550-4562) — upstream keeps these in app.ini/AppData files, which the substrate lacks. |
+| `cron_state` | schema.ts:4636 | intentional-recorded | cron tick bookkeeping; recorded SPEC-0020 §4.1 (migration 0044). |
+| `email_outbox` | schema.ts:4664 | intentional-recorded | outbound mail rows; recorded email-outbound.md §4.1 (the DDL, migration 0049). |
+| `email_inbound` | schema.ts:4722 | intentional-recorded | inbound mail rows; recorded email-inbound.md §5 (the DDL, migration 0054). |
+| `deleted_branches` | schema.ts:4939 | intentional-recorded | the deleted arm of upstream's `branch` table (restore source: tip sha at delete time, actor, timestamp) split into its own table; the live arm is engine-derived. Recorded SPEC-0008 §3.1 as-built amendment (migration 0059; the PRE-CAS write + restore-replay ground) — the GR "fold into the next schema-touching SPEC" flag, closed by this unit. |
+| `federation_followers` | schema.ts:5160 | intentional-recorded | ActivityPub follower store; recorded federation.md §5 Tier B as-built (migration 0063, the ADR-0007 S-1 grant — intentional-recorded-with-predecessor). |
+
+Record sweep (RECORDS unit, 2026-11-04): every row re-tested against the
+SPECs (grep for table/column). 10/12 already carried records; the two gaps
+(`repo_settings`, `deleted_branches`) got their SPEC records this unit
+(SPEC-0004 §3 item 6, SPEC-0008 §3.1 as-built) — no drift-extra: all 12
+have live readers + a ground. Side finding: `lfs_locks.lower_path` — which
+the census (§3.1) and §4 still call "unrecorded" — IS recorded (SPEC-0006
+§2.7, LANDED 2026-10-30, migration 0045); those two cells are outside this
+unit's ownership and await their owners.
 
 Arithmetic: 95 upstream tables paired (one pair, `attachment`, splits into
 two of ours; the `upload` pair shares `issue_attachments` with it) + 22

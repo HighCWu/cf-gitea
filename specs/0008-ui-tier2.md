@@ -380,6 +380,24 @@ engine's RepoCell. Two coordination notes ride along with this SPEC (not schema)
   `serveHead` TODO documents the same gap). The shell renders what exists (owner/name,
   visibility badge, created date) and omits the rest until those columns land.
 
+**As-built amendment (the branches U3 extension): `deleted_branches` (migration 0059;
+the ADR-0007 record, was the §3.2 census gap).** Upstream's `branch` table
+(`models/git/branch.go:106`) carries BOTH arms — live rows (stored for pagination and
+search) and deleted rows (`IsDeleted`/`DeletedByID`/`DeletedUnix`, the restore source).
+Ours has no D1 branch table at all: the live arm is engine-derived from git refs, so
+the only durable state a delete leaves is the restore substrate — `repo_id`, `name`,
+`commit_id` (tip sha at delete time), `deleted_by_id`, `deleted_unix`; UNIQUE
+`(repo_id, name)`, upsert overwrites on re-delete. Ground: once `refs/heads/<name>` is
+gone the tip sha is unrecoverable by construction, so the delete arm writes the row
+PRE-CAS (`applyBranchDelete` step 4.5, pages/branches.tsx — a refusal or crash after it
+can lose a delete, never the sha), and the restore arm replays `commitApiChange({ref,
+expectedOldOid: ZERO_OID, newOid: sha})` from the row (pages/branch-restore.ts —
+upstream `RestoreBranchPost`, web.go:1485) gated writer + non-protected (list.tmpl's
+`{{if not .IsProtected}}`; the no-hook substrate checks the rule match explicitly).
+This is upstream's `branch` deleted arm split into its own table — the live arm's
+engine derivation is the platform ground (the audit census's missing-table verdict for
+upstream `branch`, per ADR-0007).
+
 ### 3.2 Data sourcing rules — direct service calls, never HTTP self-fetch
 
 Pages call the same layers the API routes call — D1 through Drizzle service modules and

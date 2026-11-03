@@ -375,6 +375,20 @@ Deltas and pull-forwards it forces:
    implied by tier 1 and is called out in the open questions.
 5. **No new D1 tables are invented here** — the table list above is a requirement
    spec for SPEC-0005, not a schema. Drizzle migrations land with SPEC-0005.
+6. **`repo_settings` — the PATCH round-trip side row (as-built, migration 0007;
+   the ADR-0007 record, was the §3.2 census gap).** The `EditRepoOption` fields
+   (§2.4) that had no landed `repositories` column but must survive a PATCH→GET
+   round trip: the `has_*` unit flags (issues/wiki/pull_requests/releases/
+   projects/packages/actions) plus description/website. Ground: upstream keeps all
+   of these on the `repositories` row itself (`repo.go:160-226`); the side row
+   (1:1, `repo_id` PK) avoided widening the hot `repositories` schema while the
+   port columns were pending. Migration 0068 (FN-4; SPEC-0001 §4.1 as-built) moved
+   the profile text onto `repositories` — description/website are now legacy-unread
+   (`loadRepoSettings` drops both; the 0068 backfill read these rows); the flags
+   half stays the standing store — writer `saveRepoSettings` (the PATCH store batch
+   and the unit toggles' single choke point, SPEC-0012 M1c as-built), readers the
+   per-feature gates (ui-context, wiki/packages/projects/releases). Missing row =
+   upstream defaults (services/repo-settings.ts `DEFAULT_REPO_SETTINGS`).
 
 ## 4. Edge cases, limits, failure modes
 
