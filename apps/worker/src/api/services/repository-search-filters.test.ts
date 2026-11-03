@@ -16,6 +16,8 @@
  *   of private orgs, minus the hidden-membership exclusion in public-only
  *   searches; `exclusive` collapses to owned-only; the default mode is
  *   owned-OR-collaborates.
+ * - `includeDesc` — the keyword arm's `LOWER(description)` substring match
+ *   (repo_list.go:484-486) over the 0068 description column, off by default.
  *
  * Cross-visibility refusals are pinned per filter: an anonymous (or
  * public-only) searcher asking for another user's stars, a team's grants, or
@@ -129,7 +131,7 @@ async function seedRepo(
   ownerNamespace: string,
   slug: string,
   visibility: "public" | "private",
-  extra: { forkParent?: string } = {},
+  extra: { forkParent?: string; description?: string | null } = {},
 ): Promise<string> {
   const id = `sf_${ownerNamespace.replace(/-/g, "_")}_${slug.replace(/-/g, "_")}`;
   await drizzle(env.DB)
@@ -417,6 +419,67 @@ describe("search topic=true (repo_list.go:455-491)", () => {
       topicOnly: true,
     });
     expect(either.items.map((p) => p.repo.slug)).toEqual(["mixed"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// includeDesc — the keyword arm's description match (repo_list.go:484-486)
+// ---------------------------------------------------------------------------
+
+describe("search includeDesc (repo_list.go:484-486)", () => {
+  it("default OFF: a keyword matching only a description finds nothing", async () => {
+    const owner = await seedVerifiedUser({ username: "Owner" });
+    await seedRepo(owner.id, "owner", "vaultproj", "public", {
+      description: "the secret recipe keeper",
+    });
+
+    // The needle appears ONLY in the description — no name, no topic hit —
+    // and the flag is absent, so upstream never builds the description arm
+    // (repo_list.go:484) and the keyword misses.
+    const miss = await searchRepositories(env.DB, anonymous, { ...searchOpts, keyword: "recipe" });
+    expect(miss.total).toBe(0);
+  });
+
+  it("includeDesc=true matches the LOWER(description) arm beside the name arms", async () => {
+    const owner = await seedVerifiedUser({ username: "Owner" });
+    await seedRepo(owner.id, "owner", "vaultproj", "public", {
+      description: "the Secret Recipe keeper",
+    });
+    await seedRepo(owner.id, "owner", "unrelated", "public"); // NULL description
+
+    // Case-folded substring (upstream lowercases the needle and wraps the
+    // column in LOWER); the NULL-description sibling stays out.
+    const hit = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "ReCiPe",
+      includeDesc: true,
+    });
+    expect(hit.items.map((p) => p.repo.slug)).toEqual(["vaultproj"]);
+
+    // The name arms still answer in the same OR — adding the flag does not
+    // narrow the keyword (repo_list.go:471-486, every arm is an OR).
+    const byName = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "unrelated",
+      includeDesc: true,
+    });
+    expect(byName.items.map((p) => p.repo.slug)).toEqual(["unrelated"]);
+  });
+
+  it("comma needles each match descriptions too (the per-segment loop)", async () => {
+    const owner = await seedVerifiedUser({ username: "Owner" });
+    await seedRepo(owner.id, "owner", "one", "public", { description: "holds the lantern" });
+    await seedRepo(owner.id, "owner", "two", "public", { description: "keeps the map" });
+    await seedRepo(owner.id, "owner", "three", "public");
+
+    // Each needle rides its own description arm (repo_list.go:482-487); a
+    // needle matching nothing passes nothing.
+    const both = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "lantern,nowhere,map",
+      includeDesc: true,
+    });
+    expect(both.items.map((p) => p.repo.slug).sort()).toEqual(["one", "two"]);
   });
 });
 

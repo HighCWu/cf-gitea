@@ -565,3 +565,103 @@ describe("the repo wire counters — release_counter / branch_count / updated_at
     expect(repositoryOrderBy("updated", "asc").length).toBe(1);
   });
 });
+
+describe("the real sort columns — size/git_size/lfs_size/stars/forks (OrderByMap)", () => {
+  it("each OrderByMap key orders its own landed column, both directions", async () => {
+    const owner = await seedVerifiedUser({ username: "column_sorter" });
+    // Three rows whose per-column values scramble the name order, so every
+    // key proves it reads ITS column (not slug/id fallback):
+    //   slug        alpha   beta   gamma
+    //   size_kb      300    100    200   → asc: beta gamma alpha
+    //   git_size      30     20     10   → asc: gamma beta alpha
+    //   lfs_size       5     15     25   → asc: alpha beta gamma
+    //   num_stars      2      9      4   → asc: alpha gamma beta
+    //   num_forks      7      1      3   → asc: beta gamma alpha
+    const alpha = await seedRepo(owner.id, "column_sorter", "alpha", "public");
+    const beta = await seedRepo(owner.id, "column_sorter", "beta", "public");
+    const gamma = await seedRepo(owner.id, "column_sorter", "gamma", "public");
+    const db = drizzle(env.DB);
+    await db.update(repositories).set({ sizeKb: 300, gitSize: 30, lfsSize: 5, numStars: 2, numForks: 7 }).where(eq(repositories.id, alpha));
+    await db.update(repositories).set({ sizeKb: 100, gitSize: 20, lfsSize: 15, numStars: 9, numForks: 1 }).where(eq(repositories.id, beta));
+    await db.update(repositories).set({ sizeKb: 200, gitSize: 10, lfsSize: 25, numStars: 4, numForks: 3 }).where(eq(repositories.id, gamma));
+
+    // Owned-only (repo.go:159-161, exclusive) scopes the page to this
+    // test's three rows — sibling fixtures would ride a public-only search.
+    const base = {
+      keyword: "",
+      topicOnly: false,
+      includeDesc: false,
+      uid: owner.id,
+      exclusive: true,
+      priorityOwnerId: 0,
+      teamId: 0,
+      starredBy: 0,
+      includePrivate: false,
+      isPrivate: null,
+      template: null,
+      archived: null,
+      mode: "" as const,
+      page: 1,
+      limit: 50,
+    };
+    const slugs = (res: { items: Array<{ repo: { slug: string } }> }) => res.items.map((item) => item.repo.slug);
+
+    // "size ASC|DESC" over the settled KiB fold (upstream's byte key
+    // divided at render, convert/repository.go:207 — monotone, same order).
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "size", order: "asc" }))).toEqual(["beta", "gamma", "alpha"]);
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "size", order: "desc" }))).toEqual(["alpha", "gamma", "beta"]);
+
+    // "git_size ASC|DESC" (repo.go:204 — the settled git footprint KiB).
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "git_size", order: "asc" }))).toEqual(["gamma", "beta", "alpha"]);
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "git_size", order: "desc" }))).toEqual(["alpha", "beta", "gamma"]);
+
+    // "lfs_size ASC|DESC" (repo.go:205 — the settled LFS sum KiB).
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "lfs_size", order: "asc" }))).toEqual(["alpha", "beta", "gamma"]);
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "lfs_size", order: "desc" }))).toEqual(["gamma", "beta", "alpha"]);
+
+    // SearchOrderByStars(Reverse) = "num_stars ASC|DESC" (db/search.go:23-24)
+    // over the settled star tally — no longer the id stand-in.
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "stars", order: "asc" }))).toEqual(["alpha", "gamma", "beta"]);
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "stars", order: "desc" }))).toEqual(["beta", "gamma", "alpha"]);
+
+    // SearchOrderByForks(Reverse) = "num_forks ASC|DESC" (db/search.go:25-26).
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "forks", order: "asc" }))).toEqual(["beta", "gamma", "alpha"]);
+    expect(slugs(await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "forks", order: "desc" }))).toEqual(["alpha", "gamma", "beta"]);
+
+    // Shape pins alongside the ordering pins: real columns ride ONE bare
+    // ORDER BY expression (upstream's map entries carry no tiebreak).
+    for (const key of ["size", "git_size", "lfs_size", "stars", "forks"]) {
+      expect(repositoryOrderBy(key, "asc").length).toBe(1);
+    }
+  });
+
+  it("the stand-in arms are gone: every row with equal keys is admissible order (no id tiebreak leakage)", async () => {
+    // The former stand-in forced CAST(id)+id under equal sort keys; the real
+    // column leaves ties to the engine exactly like upstream. Two rows with
+    // identical values must BOTH answer regardless of which internal order
+    // the engine picks — the assertion pins membership/total, not sequence.
+    const owner = await seedVerifiedUser({ username: "tie_sorter" });
+    await seedRepo(owner.id, "tie_sorter", "tiea", "public");
+    await seedRepo(owner.id, "tie_sorter", "tieb", "public");
+    const base = {
+      keyword: "",
+      topicOnly: false,
+      includeDesc: false,
+      uid: owner.id,
+      exclusive: true,
+      priorityOwnerId: 0,
+      teamId: 0,
+      starredBy: 0,
+      includePrivate: false,
+      isPrivate: null,
+      template: null,
+      archived: null,
+      mode: "" as const,
+      page: 1,
+      limit: 50,
+    };
+    const tied = await searchRepositories(env.DB, viewerFor(owner), { ...base, sort: "stars", order: "asc" });
+    expect(tied.total).toBe(2);
+    expect(tied.items.map((item) => item.repo.slug).sort()).toEqual(["tiea", "tieb"]);
+  });
+});

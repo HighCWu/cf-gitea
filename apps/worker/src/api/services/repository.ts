@@ -1211,17 +1211,23 @@ export interface RepositoryListOptions {
 }
 
 /**
- * Sort/order validation mirroring upstream `ResolveSortOrder` +
- * `repo_model.OrderByMap` (routers/api/v1/utils/sort.go): order is validated
- * only when `sort` is set, invalid values are 422s with Go-%q messages
- * (`JSON.stringify` matches %q for plain words). `updated` sorts the real
- * `updated_at` column (upstream SearchOrderByLeastUpdated/RecentUpdated);
- * sorts still backed by missing columns (`size`, `git_size`, `lfs_size`,
- * `stars`, `forks`) resolve to id order — CORRECTED (the fixed-id-seed
- * wave's CAST probe): `CAST(uuid AS INTEGER)` is NOT equal-zero (it parses
- * the leading digits — '550e…'→550, '123e…'→123, letters→0), so the id
- * stand-in is arbitrary BUT deterministic per stored set only with the
- * tiebreak below. TODO(SPEC-0005): real columns.
+ * Sort/order validation mirroring upstream `ResolveSortOrder`
+ * (routers/api/v1/utils/sort.go) + `repo_model.OrderByMap`
+ * (models/repo/search.go — the map the /repos/search route resolves at
+ * repo.go:189): order is validated only when `sort` is set, invalid values
+ * are 422s with Go-%q messages (`JSON.stringify` matches %q for plain
+ * words). Every OrderByMap key now sorts a REAL column: `updated` rides the
+ * nullable `updated_at` coalesced to `created_at` (upstream
+ * SearchOrderByLeastUpdated/RecentUpdated), and the landed 0068/counter
+ * columns back the rest — `size` the settled KiB fold `size_kb` (upstream
+ * stores BYTES and divides at render, convert/repository.go:207
+ * `int(repo.Size / 1024)`, so the KiB value is monotone in upstream's byte
+ * key and the order is upstream's — only same-KiB rows tie), `git_size`/
+ * `lfs_size` the settled KiB twins, `stars`/`forks` the exact upstream
+ * `num_stars`/`num_forks` tallies. Single-column keys carry NO tiebreak —
+ * upstream's map entries are bare `col ASC|DESC` and equal keys order
+ * arbitrarily there too; only the `id` arm keeps its CAST pair (the int64-id
+ * fold).
  */
 export function repositoryOrderBy(sort: string, order: string): SQL[] {
   if (sort === "") {
@@ -1260,17 +1266,27 @@ export function repositoryOrderBy(sort: string, order: string): SQL[] {
           : desc(updatedSortKey()),
       ];
     case "size":
+      // "size ASC|DESC" (OrderByMap) over upstream's byte `Repository.Size`
+      // (repo.go:203) — ours is the settled KiB fold, the SAME int(Size/1024)
+      // value the wire renders (convert/repository.go:207); monotone in the
+      // byte size, so the order is upstream's and only same-KiB rows tie
+      // (unspecified upstream too).
+      return [ascending ? asc(repositories.sizeKb) : desc(repositories.sizeKb)];
     case "git_size":
+      // "git_size ASC|DESC" — the settled git footprint in KiB (repo.go:204;
+      // upstream bytes, ours the floored KB like size_kb).
+      return [ascending ? asc(repositories.gitSize) : desc(repositories.gitSize)];
     case "lfs_size":
+      // "lfs_size ASC|DESC" — the settled LFS sum in KiB (repo.go:205).
+      return [ascending ? asc(repositories.lfsSize) : desc(repositories.lfsSize)];
     case "stars":
+      // SearchOrderByStars(Reverse) = "num_stars ASC|DESC" (db/search.go:23-24)
+      // over the settled star tally.
+      return [ascending ? asc(repositories.numStars) : desc(repositories.numStars)];
     case "forks":
-      // No D1 column yet: the CAST stand-in over uuid ids is arbitrary —
-      // the id tiebreak makes it DETERMINISTIC (equal CASTs break by the
-      // raw id; without it the row order shuffles per stored set).
-      return [
-        ascending ? asc(castIdNumber()) : desc(castIdNumber()),
-        ascending ? asc(repositories.id) : desc(repositories.id),
-      ];
+      // SearchOrderByForks(Reverse) = "num_forks ASC|DESC" (db/search.go:25-26)
+      // over the settled fork tally.
+      return [ascending ? asc(repositories.numForks) : desc(repositories.numForks)];
     default:
       throw new ApiError(422, `Invalid sort mode: ${JSON.stringify(sort)}`);
   }
@@ -1471,11 +1487,10 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
  * `topic=true` over `repo_topics` (exact-equality needles; upstream
  * repo_list.go:455-491), `starredBy` over `stars` (:396-398), `team_id` over
  * `teams`/`team_repo_access` (:451-453, effective-grant shape), and
- * `mode=collaborative` over the Collaborate=true arm (:405-449). Remaining
+ * `mode=collaborative` over the Collaborate=true arm (:405-449). `includeDesc`
+ * rides the 0068 `description` column (:484-486 — each comma needle ORs a
+ * `LOWER(description)` substring match when the flag is set). Remaining
  * documented divergences:
- *  - `includeDesc`: the description column landed (migration 0068) but the
- *    keyword arm has not been re-based onto it yet — keyword matches names
- *    and topics only (TODO: the includeDesc port).
  *  - `mode`: fork/mirror/source filter the landed columns (upstream
  *    repo.go:163-176 → repo_list.go:500-513): `fork` ≡ `is_fork` (our
  *    `fork_parent IS NOT NULL`), `mirror` ≡ `is_mirror`, `source` ≡ neither.
@@ -1620,8 +1635,19 @@ export async function searchRepositories(
           ) as SQL,
         );
       }
-      // TODO(SPEC-0005): the description match for includeDesc — the column
-      // landed (migration 0068) but this arm has not been re-based onto it.
+      // The includeDesc arm (repo_list.go:484-486): with the flag set, EACH
+      // comma needle also ORs `LOWER(description) LIKE <needle>` — inside
+      // the per-segment loop, beside the name arms. instr() over lower() is
+      // the block's NOT-LIKE adaptation (the 50-byte D1 pattern cap); NULL
+      // descriptions (no settings row) fail instr() — no match, exactly
+      // upstream's empty-string behavior.
+      if (opts.includeDesc) {
+        for (const part of opts.keyword.split(",")) {
+          keywordConditions.push(
+            sql`instr(lower(${repositories.description}), ${part.toLowerCase()}) > 0`,
+          );
+        }
+      }
     }
     conditions.push(or(...keywordConditions) as SQL);
   }
