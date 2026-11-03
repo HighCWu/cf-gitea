@@ -452,6 +452,33 @@ describe("the {team} tail's gate and feed filter", () => {
     expect(alphaHtml).toContain('href="/org/dashorg/dashboard/Alpha%20Crew">');
   });
 
+  it("escapes the divergent team-name class with Go PathEscape bytes, not the encodeURIComponent set", async () => {
+    // Team names have NO charset gate either side (IsUsableTeamName
+    // reserves only the literal "new" — team.go:222-229, mirrored in
+    // org-teams.ts's createTeam) — a name legally carries the class
+    // encodeURIComponent keeps raw (`!'()*`), where upstream's Go
+    // `url.PathEscape` percent-encodes every byte. Derived empirically
+    // against Go 1.25.1: url.PathEscape("crew !bang(x)*") ===
+    // "crew%20%21bang%28x%29%2A".
+    const service = new TeamsService(env.DB);
+    const bang = await service.createTeam(world.org, { name: "crew !bang(x)*", permission: "read" });
+    await service.addTeamMember(bang, world.ownerId);
+
+    // The route admits the PathEscape'd tail: the engine decodes the group
+    // and the lookup finds the exact name.
+    const res = await getRoute("/org/dashorg/dashboard/crew%20%21bang%28x%29%2A", world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The dropdown item + the Activities tab both carry the exact upstream
+    // bytes (navbar.tmpl:63-70 tail + navbar.tmpl:81's
+    // `/{{PathEscape .Team.Name}}`).
+    expect(html).toContain('href="/org/dashorg/dashboard/crew%20%21bang%28x%29%2A">');
+    // The divergent bytes: the encodeURIComponent emit would keep `!` and
+    // `*` raw (`crew%20!bang(x)*`) — never render it.
+    expect(html).not.toContain("/dashboard/crew%20!bang%28x%29*");
+    expect(html).not.toContain("/dashboard/crew !bang(x)*");
+  });
+
   it("paginates the feed at the landed 20-per-page cap and folds the junk page parameter", async () => {
     // 25 more create_repo rows in open-repo → 29 org rows total.
     for (let index = 1; index <= 25; index += 1) {

@@ -90,6 +90,7 @@
 import { and, asc, desc, eq, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { pathEscape } from "../../api/services/releases";
 import { addUserBadges, BadgeNotExistError, removeUserBadges, UserBadgeAlreadyExistsError } from "../../services/badges";
 import { badges, userBadges, users } from "../../db/schema";
 
@@ -439,9 +440,14 @@ export interface AdminBadgeUsersData {
 // The renders (templates/admin/badge/*.tmpl at the pin)
 // ---------------------------------------------------------------------------
 
-/** The slug-bearing link builder — PathEscape's encodeURIComponent twin. */
+/** The slug-bearing link builder — Go `url.PathEscape` on the slug
+ *  (list.tmpl:55 `{{$.Link}}/slug/{{.Slug | PathEscape}}`; the Go-side
+ *  twins badges.go:82/:162. Slugs carry NO charset gate either side —
+ *  upstream's form.Slug is only uniqueness-checked, our badgeSchema is a
+ *  bare z.string() — so the divergent `!'()*` class and `$&+:=@` encode
+ *  where encodeURIComponent keeps/escapes the inverse set). */
 function badgeSlugPath(slug: string, tail = ""): string {
-  return `/-/admin/badges/slug/${encodeURIComponent(slug)}${tail}`;
+  return `/-/admin/badges/slug/${pathEscape(slug)}${tail}`;
 }
 
 /** The full-document render — the list (list.tmpl). */

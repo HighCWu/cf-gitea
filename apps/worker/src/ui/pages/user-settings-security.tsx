@@ -160,6 +160,7 @@
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { pathEscape } from "../../api/services/releases";
 import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import { hasTwoFactorByUid } from "../../auth/two-factor";
@@ -584,12 +585,13 @@ function AccountLinksSection(props: { data: UserSettingsSecurityPageData }) {
             {/* accountlinks.tmpl:5-20's dropdown reduced to always-visible
                 button anchors (the module header): one per ACTIVE source,
                 href the dance start — the SAME url shape the login page's
-                navigator renders. */}
+                navigator renders (Go `url.PathEscape` on the source name —
+                accountlinks.tmpl:12 `{{$key | PathEscape}}`). */}
             {data.linkButtons.map((button) => (
               <a
                 class="ui primary tiny button"
                 rel="nofollow"
-                href={`/user/oauth2/${encodeURIComponent(button.name)}`}
+                href={`/user/oauth2/${pathEscape(button.name)}`}
                 title={button.displayName}
               >
                 <ProviderIcon

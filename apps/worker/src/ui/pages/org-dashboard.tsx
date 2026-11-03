@@ -101,6 +101,7 @@ import {
 import { resolveOrgForRequest, type ResolvedOrg } from "../../api/services/orgs";
 import { listOrgRepositories } from "../../api/services/org-repos";
 import { TeamsService, type TeamRecord } from "../../api/routes/org-teams";
+import { pathEscape } from "../../api/services/releases";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import {
@@ -589,8 +590,11 @@ function OrgDashboardNavbar(props: { data: OrgDashboardData; viewerName: string 
   const orgLink = `/org/${data.org.username}`;
   const dashLink = `${orgLink}/dashboard`;
   // navbar.tmpl:81 — the Activities href carries the team tail on a team
-  // page (DashboardLink + `/{{PathEscape .Team.Name}}`).
-  const activitiesHref = data.team === null ? dashLink : `${dashLink}/${encodeURIComponent(data.team.name)}`;
+  // page (DashboardLink + `/{{PathEscape .Team.Name}}`): Go `url.PathEscape`
+  // on the team name (the divergent `!'()*` class encodes where
+  // encodeURIComponent keeps it raw; a `/` encodes instead of breaking the
+  // route).
+  const activitiesHref = data.team === null ? dashLink : `${dashLink}/${pathEscape(data.team.name)}`;
   return (
     <div class="secondary-nav tw-border-b tw-border-b-secondary">
       <div class="ui secondary stackable menu">
@@ -643,7 +647,16 @@ function OrgDashboardNavbar(props: { data: OrgDashboardData; viewerName: string 
                       key={team.id}
                       class={data.team !== null && data.team.id === team.id ? "active selected item" : "item"}
                       title={team.name}
-                      href={`${orgLink}/dashboard/${encodeURIComponent(team.name)}`}
+                      // navbar.tmpl:63-70 — the filter items. Upstream leaves
+                      // the raw `{{.Name}}` in the href's URL context, where
+                      // html/template's url-normalizer keeps `#?&/` unescaped
+                      // (a `#`/`?` name truncates the link into a
+                      // fragment/query — an upstream bug). We escape with
+                      // Go `url.PathEscape` instead — the convention the SAME
+                      // template applies to the same team names four lines
+                      // down (navbar.tmpl:81/85/90/95 PathEscape) and on the
+                      // team pages (sidebar.tmpl:16, new.tmpl:7/186).
+                      href={`${orgLink}/dashboard/${pathEscape(team.name)}`}
                     >
                       {team.name}
                     </a>
@@ -778,9 +791,11 @@ export function OrgDashboardPage(props: { ctx: UiContext; data: OrgDashboardData
   const { ctx, data } = props;
   const orgLink = `/org/${data.org.username}`;
   // The pager keeps the team tail on a team page (upstream base/paginate
-  // preserves the URL path).
+  // preserves the URL path — the request path's encoded team segment; the
+  // SSR reconstruction emits Go `url.PathEscape` bytes, navbar.tmpl:81's
+  // convention).
   const dashLink =
-    data.team === null ? `${orgLink}/dashboard` : `${orgLink}/dashboard/${encodeURIComponent(data.team.name)}`;
+    data.team === null ? `${orgLink}/dashboard` : `${orgLink}/dashboard/${pathEscape(data.team.name)}`;
   return (
     <BaseLayout ctx={ctx} title={`${orgDisplayName(data.org)} - ${orgDashboardLocale.dashboard}`} pageClass="dashboard feeds">
       <OrgDashboardNavbar data={data} viewerName={props.viewerName} />

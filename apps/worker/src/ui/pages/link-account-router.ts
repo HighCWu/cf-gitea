@@ -73,6 +73,7 @@
 
 import { Hono, type Context } from "hono";
 
+import { pathEscape } from "../../api/services/releases";
 import { D1FailureLimiter } from "../../auth/failure-limiter";
 import {
   limiterCheckFailOpen,
@@ -225,13 +226,17 @@ async function notFoundShell(c: RouteContext): Promise<Response> {
  *  `/user/oauth2/{source}?redirect_to={target}&oauth2_continue={marker}`
  *  (the target parameter omitted when the hint is absent/invalid —
  *  safeRedirectTarget answers "/" for those and the start leg parks
- *  nothing). */
+ *  nothing). The source segment escapes with Go `url.PathEscape` — the
+ *  same emit the dance start's button hrefs use (upstream's twins:
+ *  external_auth_methods.tmpl:3, auth.go:241); byte-identical to
+ *  encodeURIComponent on the SPEC §6.3 slug charset, divergent on
+ *  `!'()*` and `$&+:=@` if the gate ever lifts. */
 function reDanceRedirect(sourceName: string, redirectTo: string, marker: string): string {
   const params = new URLSearchParams();
   const target = safeRedirectTarget(redirectTo);
   if (target !== "/") params.set("redirect_to", target);
   params.set("oauth2_continue", marker);
-  return `/user/oauth2/${encodeURIComponent(sourceName)}?${params.toString()}`;
+  return `/user/oauth2/${pathEscape(sourceName)}?${params.toString()}`;
 }
 
 /** The POST failure re-render (200 + inline message, the failed arm's tab

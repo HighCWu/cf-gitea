@@ -198,10 +198,12 @@ function formPost(fields: Record<string, string>): RequestInit {
 }
 
 /** Run the anonymous dance up to the link-page redirect; returns the hints
- *  the callback parked on the redirect (the W2 anonymous-miss arm). */
-async function runToLinkPage(redirectTarget?: string): Promise<URL> {
+ *  the callback parked on the redirect (the W2 anonymous-miss arm).
+ *  `sourcePathTail` is the ENCODED source segment in the URLs (default the
+ *  plain "OIDC" slug; the divergent-name pin passes Go PathEscape bytes). */
+async function runToLinkPage(redirectTarget?: string, sourcePathTail = "OIDC"): Promise<URL> {
   const startQuery = redirectTarget !== undefined ? `?redirect_to=${encodeURIComponent(redirectTarget)}` : "";
-  const start = await freq(`https://app.example.com/user/oauth2/OIDC${startQuery}`);
+  const start = await freq(`https://app.example.com/user/oauth2/${sourcePathTail}${startQuery}`);
   expect(start.status).toBe(303);
   const danceCookie = (start.headers.get("set-cookie") ?? "")
     .split(/(?=gitea_oauth2_state=)/)
@@ -215,9 +217,12 @@ async function runToLinkPage(redirectTarget?: string): Promise<URL> {
     token_type: "Bearer",
     id_token: await signIdToken(idp, { ...baseClaims(), nonce: authorizeUrl.searchParams.get("nonce") }),
   };
-  const callback = await freq(`https://app.example.com/user/oauth2/OIDC/callback?code=the-code&state=${encodeURIComponent(state)}`, {
-    headers: { cookie: `${OAUTH2_DANCE_COOKIE_NAME}=${danceCookie!.split(";")[0]!.split("=").slice(1).join("=")}` },
-  });
+  const callback = await freq(
+    `https://app.example.com/user/oauth2/${sourcePathTail}/callback?code=the-code&state=${encodeURIComponent(state)}`,
+    {
+      headers: { cookie: `${OAUTH2_DANCE_COOKIE_NAME}=${danceCookie!.split(";")[0]!.split("=").slice(1).join("=")}` },
+    },
+  );
   expect(callback.status).toBe(303);
   const location = callback.headers.get("location")!;
   expect(location.startsWith("/user/link_account?")).toBe(true);
@@ -398,6 +403,37 @@ describe("POST /user/link_account_signin (LinkAccountPostSignIn's ladder)", () =
       .bind("sub-123", String(source.id))
       .all<{ user_id: number }>();
     expect(links[0]?.user_id).toBe(userId);
+  });
+
+  it("the re-dance escapes a divergent source name with Go PathEscape bytes (external_auth_methods.tmpl:3's emit)", async () => {
+    // Upstream's dance start carries the admin-set source name escaped with
+    // url.PathEscape (external_auth_methods.tmpl:3; the Go twin
+    // auth.go:241). OURS is slug-gated (SPEC §6.3's recorded divergence) —
+    // such a name cannot exist through the admin flow — but the store takes
+    // any name, so this pin drives the FULL ladder through the exact
+    // upstream bytes to hold the re-dance emit for a gate lift. Derived
+    // empirically against Go 1.25.1: url.PathEscape("crew !bang(x)*") ===
+    // "crew%20%21bang%28x%29%2A".
+    await seedOidcSource("crew !bang(x)*");
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+
+    const linkPage = await runToLinkPage("/after", "crew%20%21bang%28x%29%2A");
+    const post = await req(
+      "https://app.example.com/user/link_account_signin",
+      formPost({
+        user_name: "jane",
+        password: pat,
+        oauth2_source: linkPage.searchParams.get("oauth2_source") ?? "",
+        redirect_to: linkPage.searchParams.get("redirect_to") ?? "",
+      }),
+    );
+    expect(post.status).toBe(303);
+    // The re-dance Location carries the exact upstream bytes — the
+    // encodeURIComponent emit would keep `!` and `*` raw.
+    expect(post.headers.get("location")).toBe(
+      "/user/oauth2/crew%20%21bang%28x%29%2A?redirect_to=%2Fafter&oauth2_continue=signin-link",
+    );
   });
 
   it("a wrong credential re-renders at 200 with the incorrect message; no session minted", async () => {

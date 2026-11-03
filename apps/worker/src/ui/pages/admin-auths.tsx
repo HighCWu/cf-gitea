@@ -116,6 +116,7 @@
 
 import { AdminEmbeddedSvg, AdminFamilyShell, formatAdminDate, adminFamilyLocale } from "./admin-users";
 import { Icon, renderPage } from "../shell";
+import { pathEscape } from "../../api/services/releases";
 import {
   OAuth2ConfigError,
   OAUTH2_PROVIDER_KEYS,
@@ -888,9 +889,12 @@ function OAuth2SourceFields(props: {
 /** The tips segment (new.tmpl:77-171 reduced): the OAuth2 general tip +
  *  the callback URL (server-computed when the name is known — the JS-fill
  *  reduction) and the THREE EXECUTABLE providers' tips (the module
- *  header's posture-line note). */
+ *  header's posture-line note). The callback URL escapes the name with Go
+ *  `url.PathEscape` — upstream's fill is the SAME helper on both sides:
+ *  web_src/js/features/admin/common.ts:267 (frontend `pathEscape`) over
+ *  services/auth/source/oauth2/providers.go:225 (`url.PathEscape`). */
 function AuthSourceTips(props: { name: string; origin: string }) {
-  const callbackUrl = props.name === "" ? "" : `${props.origin}/user/oauth2/${encodeURIComponent(props.name)}/callback`;
+  const callbackUrl = props.name === "" ? "" : `${props.origin}/user/oauth2/${pathEscape(props.name)}/callback`;
   return (
     <>
       <h4 class="ui top attached header">{adminAuthsLocale.tips}</h4>

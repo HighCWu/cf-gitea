@@ -71,6 +71,7 @@
 
 import { BaseLayout, Icon, renderPage } from "../shell";
 import { locale } from "../locale";
+import { pathEscape } from "../../api/services/releases";
 import { parseOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import type { UiContext } from "../ui-context";
 
@@ -226,11 +227,17 @@ export function oauth2LoginSourceButtons(rows: Array<{ name: string; cfg: string
  *  at the pin): the `sign_in_or` divider + the `#external-login-navigator`
  *  anchors. `withDivider=false` renders the navigator alone (the signup
  *  form's position uses the same pair — callers pass the upstream shape
- *  they mirror). The href: `/user/oauth2/{Source.Name}` — encodeURIComponent
- *  is PathEscape's analog and agrees with it on the slug-validated charset
- *  (SPEC §6.3); `data-require-appurl-check` + `rel="nofollow"` are the
- *  template's own attributes (the former is upstream's JS hardening hook —
- *  inert in the no-JS shell). */
+ *  they mirror). The href: `/user/oauth2/{Source.Name}` escaped with Go
+ *  `url.PathEscape` (external_auth_methods.tmpl:3
+ *  `{{$provider.DisplayName | PathEscape}}`; the Go-side twin
+ *  auth.go:241). Upstream's name is the admin-set auth-source name
+ *  (providers.go:53-55) — free text, hence the PathEscape; OURS is the
+ *  SPEC §6.3 recorded divergence, slug-gated `[A-Za-z0-9._-]+` ≤30, on
+ *  which PathEscape and encodeURIComponent agree byte-for-byte — the
+ *  PathEscape emit keeps the byte-parity if the gate ever lifts;
+ *  `data-require-appurl-check` + `rel="nofollow"` are the template's own
+ *  attributes (the former is upstream's JS hardening hook — inert in the
+ *  no-JS shell). */
 export function ExternalAuthMethods(props: { sources: OAuth2LoginSourceButton[]; withDivider?: boolean }) {
   if (props.sources.length === 0) return null;
   return (
@@ -242,7 +249,7 @@ export function ExternalAuthMethods(props: { sources: OAuth2LoginSourceButton[];
             class="ui button external-login-link tw-gap-3"
             data-require-appurl-check="true"
             rel="nofollow"
-            href={`/user/oauth2/${encodeURIComponent(source.name)}`}
+            href={`/user/oauth2/${pathEscape(source.name)}`}
           >
             <ProviderIcon source={source} /> {loginOAuth2Locale.sign_in_with_provider.replace("%s", source.name)}
           </a>

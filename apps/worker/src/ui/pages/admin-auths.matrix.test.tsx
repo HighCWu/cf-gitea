@@ -710,6 +710,22 @@ describe("the new-page DOM (new.tmpl reduced to the OAuth2 arm)", () => {
     expect(html).not.toContain('name="two_factor_policy"');
   });
 
+  it("escapes the tips callback URL with Go PathEscape bytes on the divergent class (common.ts:267 + providers.go:225)", () => {
+    // Upstream's fill helper IS a JS pathEscape over the name field
+    // (web_src/js/features/admin/common.ts:267), matching the Go-side
+    // callback construction (providers.go:225 url.PathEscape) — the SSR
+    // reduction emits the same helper's bytes. Under OUR SPEC §6.3 slug
+    // gate such a name cannot exist, so this pin holds the emit to
+    // upstream's exact bytes for a gate lift. Derived empirically against
+    // Go 1.25.1: url.PathEscape("crew !bang(x)*") ===
+    // "crew%20%21bang%28x%29%2A".
+    const values = { ...newAdminAuthSourceFormValues(), name: "crew !bang(x)*" };
+    const html = renderToString(<AdminAuthSourceNewPage ctx={ctx} data={{ form: values, error: null, errorField: null }} />);
+    expect(html).toContain(`<b id="oauth2-callback-url">${ctx.origin}/user/oauth2/crew%20%21bang%28x%29%2A/callback</b>`);
+    // The encodeURIComponent emit would keep `!` and `*` raw — never render it.
+    expect(html).not.toContain("/user/oauth2/crew%20!bang%28x%29*/");
+  });
+
   it("the error re-render carries the message, the flagged field class, and the typed values", () => {
     const values = { ...newAdminAuthSourceFormValues(), name: "typed-name" };
     const html = renderToString(

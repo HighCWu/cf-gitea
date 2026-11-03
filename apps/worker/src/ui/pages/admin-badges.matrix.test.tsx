@@ -215,6 +215,25 @@ describe("the badge family DOM (templates/admin/badge/*.tmpl at the pin)", () =>
     expect(html.split('<th scope="col">').length - 1).toBe(4); // the scoped thead (the closed R6 gap)
   });
 
+  it("escapes the list's slug links with Go PathEscape bytes on the divergent class (list.tmpl:55)", async () => {
+    // Badge slugs carry NO charset gate either side — upstream's
+    // AdminCreateBadgeForm is only Required+unique (badges.go:65), ours is
+    // a bare z.string() — so a divergent-class slug EXISTS here, and
+    // upstream escapes it with `| PathEscape` (the Go twins badges.go:82
+    // /:162). Derived empirically against Go 1.25.1:
+    // url.PathEscape("crew !bang(x)*") === "crew%20%21bang%28x%29%2A".
+    await drizzle(env.DB)
+      .insert(badges)
+      .values({ slug: "crew !bang(x)*", description: "The divergent slug.", imageUrl: null })
+      .run();
+    // The keyword read is the slug's exact substring — the LIKE probe.
+    const html = renderToString(<AdminBadgesPage ctx={ctx} data={await load("q=crew !bang")} />);
+    expect(html).toContain('href="/-/admin/badges/slug/crew%20%21bang%28x%29%2A">');
+    expect(html).toContain('href="/-/admin/badges/slug/crew%20%21bang%28x%29%2A/edit"');
+    // The encodeURIComponent emit would keep `!` and `*` raw — never render it.
+    expect(html).not.toContain("/admin/badges/slug/crew%20!bang%28x%29*");
+  });
+
   it("the new page renders the required fields and the error arm re-renders with the submitted values", () => {
     const empty = renderToString(<AdminBadgeNewPage ctx={ctx} data={{ form: { slug: "", description: "", imageUrl: "" }, error: null }} />);
     expect(empty).toContain('class="page-content admin new badge"');

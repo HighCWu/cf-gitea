@@ -227,6 +227,20 @@ describe("the security page DOM (security.tmpl + twofa.tmpl at the pin)", () => 
     expect(html).not.toContain("OpenID");
   });
 
+  it("escapes the active source's dance-start href with Go PathEscape bytes on the divergent class (accountlinks.tmpl:12)", async () => {
+    // Upstream's `$key` is the admin-set source name — free text there,
+    // hence `| PathEscape`; OURS is slug-gated (SPEC §6.3's recorded
+    // divergence), so this pin holds the emit to upstream's exact bytes
+    // for a gate lift (the store takes any name — the gate lives in the
+    // admin API layer). Derived empirically against Go 1.25.1:
+    // url.PathEscape("crew !bang(x)*") === "crew%20%21bang%28x%29%2A".
+    await seedSource("crew !bang(x)*");
+    const html = await pageHtml();
+    expect(html).toContain('href="/user/oauth2/crew%20%21bang%28x%29%2A"');
+    // The encodeURIComponent emit would keep `!` and `*` raw — never render it.
+    expect(html).not.toContain("/user/oauth2/crew%20!bang%28x%29*");
+  });
+
   it("the full-document render path matches the component path", async () => {
     const data = await loadUserSettingsSecurityPageData(env.DB, 1);
     const html = renderUserSettingsSecurityPage(ctx, data);

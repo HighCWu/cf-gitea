@@ -113,6 +113,25 @@ describe("the login page's social block (signin_inner.tmpl:50-56)", () => {
     expect(html.indexOf("divider divider-text")).toBeLessThan(html.indexOf("external-login-navigator"));
   });
 
+  it("escapes the source name with Go PathEscape bytes on the divergent class (external_auth_methods.tmpl:3)", () => {
+    // Upstream's URL token is the admin-set source name (providers.go:53-55
+    // — free text, hence the template's `| PathEscape`, the Go twin
+    // auth.go:241). OURS is slug-gated (SPEC §6.3's recorded divergence) —
+    // a class-carrying name cannot exist under the gate — but this pin
+    // holds the emit to upstream's exact bytes so a gate lift cannot
+    // silently diverge. Derived empirically against Go 1.25.1:
+    // url.PathEscape("crew !bang(x)*") === "crew%20%21bang%28x%29%2A".
+    const html = renderLoginPage({
+      ctx: ANON_CTX,
+      redirectTo: null,
+      error: null,
+      oauth2Sources: [{ name: "crew !bang(x)*", provider: "openidConnect", iconUrl: null }],
+    });
+    expect(html).toContain('href="/user/oauth2/crew%20%21bang%28x%29%2A"');
+    // The encodeURIComponent emit would keep `!` and `*` raw — never render it.
+    expect(html).not.toContain("/user/oauth2/crew%20!bang%28x%29*");
+  });
+
   it("the icon arms: the img override, the three brand glyphs, the globe fallback", () => {
     const html = renderLoginPage({
       ctx: ANON_CTX,
