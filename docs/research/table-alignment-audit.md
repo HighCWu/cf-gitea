@@ -426,7 +426,7 @@ Verdict matrix (ADR-0007 vocabulary; ours cites = this worktree):
 | `comment_meta_data` | `CommentMetaData *CommentMetaData` JSON TEXT nullable (comment.go:360, struct :249-257) | PARTIAL — type-31 column-move payload rides `content` JSON (projects.ts:1060); no CODEOWNERS arm; workflows reuse the human write (services/projects-workflow.ts:510-560) | none — no type-31/label timeline render (ui/pages/issue-detail.tsx:734-746 renders types 0/1/2/28 only), no label-merge guard | drift → PORT the column-move arm; SpecialDoerName arms PORT-WHEN-READ |
 | `original_author` | `OriginalAuthor string` nullable (comment.go:280) | none — no comment-migration inflow (grep 0) | none — API `user` renders the poster row directly (issues.ts:1417), no `ToAuthor` fallback | port-when-read (twin of the unwritten `issues.original_author`, schema.ts:620) |
 | `original_author_id` | `OriginalAuthorID int64` nullable (comment.go:281) | none | none | port-when-read |
-| (`patch`) | `PatchQuoted string xorm:"LONGTEXT patch"` (comment.go:330) | LIVE — code-comment create + reply write it (api/routes/pull-reviews.ts:1013; api/routes/repo-extras-t2.ts:1511) | LIVE — diff-hunk render (pull-reviews.ts:506) | PARITY (erratum above) |
+| (`patch`) | `PatchQuoted string xorm:"LONGTEXT patch"` (comment.go:330) | LIVE — code-comment create + reply write it (api/routes/pull-reviews.ts:1013; api/routes/repo-extras-t2.ts:1509) | LIVE — diff-hunk render (pull-reviews.ts:506) | PARITY (erratum above) |
 
 The derivation, column by column (upstream write/read cites verified at the
 pin):

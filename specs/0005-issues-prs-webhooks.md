@@ -917,3 +917,224 @@ payload-fixture stage above as a fourth check in the same job.
    ships now so issue payloads carrying `reactions` counts (API Issue object) can be
    maintained incrementally instead of computed per read. If counts drift, a
    recount-job (upstream's `UpdateIssueReactions` pattern) is the fallback.
+
+## 7. FN-2 port plan (derived, not yet built) — **PLAN ONLY**
+
+**Status: PLAN. Nothing in this section exists in the tree.** Derived by the
+FN-2 derivation-prep unit (GJ, 2026-11-03) from the upstream pin
+`fc4936884584` and the current worktree; the full write-site matrix with
+file:line cites lives in
+`docs/research/table-alignment-audit.md` §4 `comment` (the entry's FN-2
+derivation expansion). The schema hunk and generated migration are OWNED BY
+FN-3's sibling until it lands — the port unit lands them after. Cites below
+are verified at the pin; ours cites are this worktree's line numbers and may
+drift with sibling waves (re-grep before editing).
+
+**The audit-count correction this plan is built on:** upstream has NO
+`patch_quoted` column — the Go field `PatchQuoted` carries the xorm
+column-name override `xorm:"LONGTEXT patch"` (`models/issues/comment.go:330`),
+so upstream's persisted column is literally `patch`, and ours
+(`comments.patch`, §3.2) is PARITY, not ours-extra. FN-2 therefore adds **7
+columns**, and `comments.patch` needs no DDL and no writer change.
+
+### 7.1 Scope
+
+- **In**: the 7 `comments` columns (§7.2); threading the live write seams
+  (§7.3); de-hardcoding the timeline render arms (§7.4); one generated
+  migration with the row backfills (§7.5); the test battery (§7.6).
+- **Out (recorded, not planned blind)**:
+  - `original_author`/`original_author_id` WRITERS — no comment-migration
+    inflow exists here (upstream's only writer is the repo-migration
+    uploader's `RemapExternalUser`, comment.go:1279-1283 via
+    `services/migrations/gitea_uploader.go:1010-1026`; readers: `ToAuthor`
+    ghost-fallback `services/convert/user.go:53-58`, migrated-author
+    template `comments_authorlink.tmpl:1-8`, `HasOriginalAuthor` role
+    descriptor comment.go:1295-1298). Port-when-read, with the FN-9 family.
+  - CODEOWNERS review-request attribution (`SpecialDoerName` in
+    `comment_meta_data`, review.go:756/:867) — no CODEOWNERS surface here.
+  - Project-workflow comment metadata (the ctx carrier, comment.go:261-266 +
+    `workflow_notifier.go:145`) — our workflows reuse the human write path
+    (`services/projects-workflow.ts:510-560`); the reader arms (workflow
+    author attribution `MetaSpecialDoerTr` comment.go:806-819; the
+    label-merge guard `sameCommentMetaData`, `routers/web/repo/
+    issue_view.go:221-231) do not exist in our surface (the UI renders no
+    label or type-31 timeline events this wave, `ui/pages/
+    issue-detail.tsx:734-746`).
+  - Upstream's invalid-UTF-8 `strconv.Quote` guard on the patch column
+    (comment.go:402-415/:418-426) — ours stores the raw engine diff; a
+    no-op for valid UTF-8. Record, do not build.
+
+### 7.2 Schema (the DDL the port unit lands)
+
+`comments` gains, in upstream column-name/case (`models/issues/comment.go`
+field order):
+
+| column | upstream field (cite) | DDL |
+|---|---|---|
+| `original_author` | `OriginalAuthor string` (comment.go:280) | `text` NULL — **land-or-defer decision below** |
+| `original_author_id` | `OriginalAuthorID int64` (comment.go:281) | `integer` NULL — same decision |
+| `old_project_id` | `OldProjectID int64` (comment.go:291) | `integer` NULL |
+| `project_id` | `ProjectID int64` (comment.go:292) | `integer` NULL |
+| `time_id` | `TimeID int64` (comment.go:301) | `integer` NULL |
+| `assignee_team_id` | `AssigneeTeamID int64` (comment.go:307) | `integer` NOT NULL DEFAULT 0 (the tag's literal) |
+| `comment_meta_data` | `CommentMetaData *CommentMetaData` JSON (comment.go:360) | `text` NULL, JSON-serialized `CommentMetaData` `{project_column_id?, project_column_title?, project_title?, project_workflow_event?, special_doer_name?}` (struct :249-257) |
+
+- None of the 7 carries an upstream index tag — add none.
+- **original_author pair decision point**: DEFER is cleaner (port-when-read,
+  zero readers/writers); LAND-now buys table-parity in one migration and no
+  later DDL revisit. Recommendation: DEFER to FN-9 (the family carrier) —
+  the audit classifies the pair port-when-read, and ADR-0007 queues
+  port-when-read with its reader. The port unit should surface the choice
+  in its SPEC record either way.
+- `comments.patch`: **no DDL, no change** (the §7-parity erratum).
+
+### 7.3 Write seams to thread (our seam → upstream writer)
+
+1. **Type-30 project comments** — ours: `writeProjectComment`
+   (`api/services/projects.ts:820-840`, type-30 cells at :914 add /
+   :967 remove) and the issues-service twin `writeIssueProjectComment`
+   (`api/services/issues.ts:2249-2266`, cells :2359 remove / the add arm
+   via `addIssueToColumn` → projects.ts:914). Upstream:
+   `models/issues/issue_project.go:90-99` (remove:
+   `OldProjectID: projectID, ProjectID: 0`) and :138-147 (add:
+   `OldProjectID: 0, ProjectID: projectID`). Port: write the ids into the
+   columns and set `content` to `''` (upstream's type-30 content is empty —
+   ours carries the JSON payload, which today LEAKS into the timeline API's
+   `body` via `timelineBodyOf`'s passthrough, `issues.ts:1143-1157`).
+2. **Type-31 column-move comments** — ours: `moveIssueWithinProject`
+   (`api/services/projects.ts:1055-1062`, payload
+   `{project_id, project_column_id, project_column_title}`). Upstream:
+   `services/projects/issue.go:180-191` (opts `ProjectID`/`ProjectTitle`/
+   `ProjectColumnID`/`ProjectColumnTitle` → `buildCreateCommentMetaData`,
+   comment.go:847-864). Port: `project_id` → the column;
+   `{project_column_id, project_column_title, project_title}` →
+   `comment_meta_data`; `content` → `''`. **Add `project_title`** — ours
+   omits it today; upstream's metadata carries it and the type-31 template
+   reads it (`comments.tmpl:586-591`).
+3. **Time-family comments** — ours: `applyTimeAddWrite`
+   (`ui/pages/issue-timeline-writes.ts:759-773`) and the API-port twins
+   (`api/routes/issue-tables-t2.ts:1541-1549` add; `finishStopwatch`
+   :1070-1093 stop; the web twin `ui/pages/issue-timeline-writes.ts:815-833`
+   stop). Upstream: add-time-manual stamps `TimeID: t.ID`
+   (`tracked_time.go:180-189`, cell :188) and stop-tracking stamps
+   `TimeID: tt.ID` (`stopwatch.go:156-164`, cell :162); the delete/start/
+   cancel arms stamp none (tracked_time.go:256-263, :280-287;
+   stopwatch.go:194-201, :222-230). Port: the trackedTimes INSERT and the
+   comment ride the same drizzle batch — add `.returning({ id })` to the
+   trackedTimes leg and stamp `time_id` from it. delete/start/cancel arms
+   stay column-less (parity).
+4. **Team review-request comments** — ours: the API team arms
+   (`api/routes/pull-reviews.ts:1596-1602` add, :1699-1706 remove — both
+   write neither id arm today). Upstream: `models/issues/review.go:859-869`
+   (add, `AssigneeTeamID: reviewer.ID`) and :916-928 (remove, same stamp).
+   Port: stamp `assigneeTeamId = team.id` in both arms; the user-request
+   arms (`api/services/pull-reviews.ts:498-507`/:585-594) keep
+   `assigneeId` (upstream's AssigneeID path, review.go:748-758) untouched.
+
+### 7.4 Read arms to de-hardcode
+
+- `toTimelineComment` (`api/services/issues.ts:1335-1442`):
+  - `old_project_id: 0` / `project_id: 0` (:1421-1422) → the row's values.
+    Contract shape unchanged (`modules/structs/issue_comment.go:68-69`) —
+    ADR-0002-safe.
+  - `assignee_team: null` (:1437) → when `assigneeTeamId > 0`, resolve the
+    team row (one batched map alongside the existing preload maps, the
+    milestone/label/assignee pattern) and render the contract `Team` shape
+    (upstream `ToTeam`, `services/convert/issue_comment.go:179-181`).
+  - `trackedTimeOfComment` (:1207) → read `time_id` FIRST (exact-row
+    linkage, upstream `LoadTime` comment.go:732-739); keep the
+    (poster, seconds, second) correlation ONLY as the legacy-row fallback
+    while pre-migration rows exist, then drop (§7.7).
+- **No UI arm changes**: `issue-detail.tsx:734-746` renders types
+  0/1/2/28 only this wave; nothing to thread there.
+
+### 7.5 The migration (one generated migration + backfills)
+
+DDL first (§7.2), then, in the same migration, idempotent backfills:
+
+1. **Type-30/31 content → columns**: for `type IN (30, 31)` rows whose
+   `content` parses as the landed payload JSON: `old_project_id`/
+   `project_id` from the payload keys (`{old_project_id, project_id}` —
+   `projects.ts:914/:967`; `{project_id, project_column_id,
+   project_column_title}` — :1060), type-31 also fills `comment_meta_data`
+   with `{project_column_id, project_column_title}`; then set
+   `content = ''` for the migrated rows (upstream-parity body). A
+   non-parsing or missing-key row is left verbatim (conservative arm — no
+   crash, recorded).
+2. **`time_id` backfill**: type-14 rows with the `|<seconds>` content —
+   the newest live `tracked_times` row matching
+   `(issue_id, user_id = poster_id, seconds)` at or before the comment's
+   `created_unix`; type-13 rows — the newest live row created in the
+   comment's own second. This is exactly `trackedTimeOfComment`'s
+   documented correlation (`issues.ts:1183-1196`) applied once; rows it
+   cannot pin stay NULL and keep riding the fallback reader.
+3. **`assignee_team_id` backfill**: type-27 rows with `assignee_id` NULL
+   and `review_id > 0` — join `pull_reviews.reviewer_team_id`
+   (`schema.ts:2447`; the team-add arm writes `reviewId: review.id`,
+   `pull-reviews.ts:1596-1601`). `assignee_team_id` defaults 0 elsewhere.
+
+### 7.6 Test battery design (names + asserted shapes; no code)
+
+All D1-backed (`@cloudflare/vitest-pool-workers`), `pnpm test` per file,
+never cited as suite-green (ADR-0006):
+
+1. `fn2-schema-columns-present` — after the migration,
+   `table_info(comments)` carries the 7 columns; `assignee_team_id`
+   NOT NULL DEFAULT 0, the other 6 NULLable; no new indexes.
+2. `fn2-project-comment-columns` — both type-30 arms (add/remove, both
+   services) write `project_id`/`old_project_id` per the arm matrix,
+   `content === ''`, `comment_meta_data` NULL; `num_comments` unchanged
+   (the type-30 no-count rule, issues.ts:2241-2247).
+3. `fn2-project-column-comment-metadata` — a real column move writes the
+   type-31 row with `project_id` set, `comment_meta_data` =
+   `{project_column_id, project_column_title, project_title}`,
+   `content === ''`; a no-op move (same column) writes nothing.
+4. `fn2-time-comments-time-id` — add-time writes `time_id` = the
+   batch-mate `tracked_times.id`; stop-tracking writes `time_id` = the
+   banked entry's id; delete/start/cancel leave `time_id` NULL.
+5. `fn2-timeline-time-render-exact` — `toTimelineComment` renders
+   `tracked_time` from the EXACT `time_id` row (assert `user_name`/
+   `seconds` of the pinned entry, not a heuristic twin); a dangling
+   `time_id` reproduces upstream's drop-the-row arm (the row filtered
+   from the timeline, `issues.ts:1306-1316` shape).
+6. `fn2-team-review-request-assignee-team` — team request add → type-27
+   row with `assignee_team_id = team.id`, `assignee_id` NULL,
+   `review_id` set; remove → `assignee_team_id` set +
+   `removed_assignee = 1`; user-request rows keep `assignee_id` and
+   `assignee_team_id = 0`.
+7. `fn2-timeline-assignee-team-render` — a team-request row's timeline
+   entry carries `assignee_team` (the contract Team shape: `id`, `name`,
+   and `ToTeam`'s emitted fields), `assignee` null; a user-request row
+   renders `assignee` and `assignee_team` null.
+8. `fn2-timeline-project-ids-render` — timeline entries emit real
+   `old_project_id`/`project_id` for type-30/31 rows (fresh + backfilled)
+   and `0` for every other type; the type-30 `body` is `""` (not JSON).
+9. `fn2-backfill-from-content-json` — seed pre-migration rows (type-30
+   JSON payloads from both writer shapes, type-31 payload, type-14
+   `|<seconds>`, type-13, type-27 with `review_id`) → run the migration →
+   every backfill lands and migrated 30/31 rows have `content = ''`.
+10. `fn2-backfill-conservative-arms` — a type-31 row with non-JSON
+    content, and a type-14 row with no matching `tracked_times` entry:
+    migration leaves them verbatim/NULL, no failure.
+11. `fn2-patch-parity-unchanged` — code-comment create + reply still
+    write and render `comments.patch` (regression guard pinning the
+    "no DDL on patch" erratum).
+12. `fn2-timeline-body-passthrough-regression` — non-project types keep
+    the `timelineBodyOf` behavior (time humanization, estimate string,
+    verbatim bodies) — the port must not widen the body rewrite to
+    non-project types.
+
+### 7.7 Open items for the port unit
+
+- The `trackedTimeOfComment` heuristic: keep as legacy fallback through one
+  release after the backfill (rows the backfill could not pin), then drop;
+  the docstring at `issues.ts:1183-1196` is the removal marker.
+- `finishStopwatch`'s batch needs the trackedTimes leg switched to
+  `.returning({ id })` in BOTH twins (web + API ports) — batch leg ordering
+  is preserved by drizzle, but verify the returned id is the comment's
+  batch-mate (same batch, sequential).
+- The `project_title` addition to type-31 metadata (§7.3 item 2) — confirm
+  the board UI's move entry passes the project row (it does today via
+  `moveIssueToColumn(project, …)`).
+- The original_author DEFER-vs-LAND decision (§7.2) — the port unit's SPEC
+  record states the choice; FN-9 remains the family carrier if deferred.
