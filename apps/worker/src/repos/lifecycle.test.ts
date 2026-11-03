@@ -744,17 +744,17 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
 
     // Two issues in the doomed repo, one in the survivor.
     await env.DB.prepare(
-      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'T1', unixepoch())",
+      "INSERT INTO issues (repo_id, `index`, poster_id, name, created_unix) VALUES (?, 1, ?, 'T1', unixepoch())",
     )
       .bind(doomed.id, alice.id)
       .run();
     await env.DB.prepare(
-      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 2, ?, 'T2', unixepoch())",
+      "INSERT INTO issues (repo_id, `index`, poster_id, name, created_unix) VALUES (?, 2, ?, 'T2', unixepoch())",
     )
       .bind(doomed.id, alice.id)
       .run();
     await env.DB.prepare(
-      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'S1', unixepoch())",
+      "INSERT INTO issues (repo_id, `index`, poster_id, name, created_unix) VALUES (?, 1, ?, 'S1', unixepoch())",
     )
       .bind(survivor.id, alice.id)
       .run();
@@ -812,7 +812,7 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     // In-file hygiene: this file's beforeEach does not sweep these tables.
     await env.DB.prepare("DELETE FROM project_workflows").run();
     await env.DB.prepare("DELETE FROM project_issues").run();
-    await env.DB.prepare("DELETE FROM project_columns").run();
+    await env.DB.prepare("DELETE FROM project_board").run();
     await env.DB.prepare("DELETE FROM projects").run();
 
     const insertProject = async (repoId: string | null, title: string): Promise<number> => {
@@ -861,7 +861,7 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     // (services/issue/issue.go:246) and the repo delete runs it for every
     // issue — while the owner-level BOARD itself survives.
     await env.DB.prepare(
-      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'B1', unixepoch())",
+      "INSERT INTO issues (repo_id, `index`, poster_id, name, created_unix) VALUES (?, 1, ?, 'B1', unixepoch())",
     )
       .bind(doomed.id, alice.id)
       .run();

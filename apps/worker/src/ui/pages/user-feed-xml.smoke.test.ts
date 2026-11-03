@@ -85,7 +85,7 @@ async function seedBaseFixtures(): Promise<void> {
   }
 
   const issue7 = await env.DB.prepare(
-    "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, 7, 1, 'Live issue title', 0, unixepoch())",
+    "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, 7, 1, 'Live issue title', 0, unixepoch())",
   )
     .bind(REPO_ID)
     .run();
@@ -339,7 +339,7 @@ describe("user feed xml query-shape witness (query-shape-audit C2, the xml mirro
     // The referenced pull: index 9, is_pull — the HTMLURL path split rides
     // the widened read (C2's fixture shape).
     await env.DB.prepare(
-      "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, 9, 1, 'The Pull', 1, unixepoch())",
+      "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, 9, 1, 'The Pull', 1, unixepoch())",
     )
       .bind(REPO_ID)
       .run();
@@ -347,7 +347,7 @@ describe("user feed xml query-shape witness (query-shape-audit C2, the xml mirro
     for (const index of Array.from({ length: C2_XML_CORPUS_ISSUES }, (_, i) => i + 1)) {
       if (index === 7 || index === 9) continue;
       await env.DB.prepare(
-        "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, ?, 1, ?, 0, unixepoch())",
+        "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, ?, 1, ?, 0, unixepoch())",
       )
         .bind(REPO_ID, index, `Corpus issue ${index}`)
         .run();
@@ -395,7 +395,7 @@ describe("user feed xml query-shape witness (query-shape-audit C2, the xml mirro
     const fixedRead = await meter.rowsReadOf((sql) => sql.includes('"repo_id" in'));
     expect(fixedRead).toBeGreaterThan(0);
     expect(fixedRead).toBeLessThan(C2_XML_CORPUS_ISSUES);
-    const preFix = await env.DB.prepare('SELECT "repo_id", "index", "title" FROM "issues" WHERE "repo_id" IN (?)')
+    const preFix = await env.DB.prepare('SELECT "repo_id", "index", "name" FROM "issues" WHERE "repo_id" IN (?)')
       .bind(REPO_ID)
       .all();
     const preFixRead = preFix.meta?.rows_read ?? 0;

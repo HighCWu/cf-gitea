@@ -1432,6 +1432,9 @@ const P2_ADDED_INDEXES: readonly [name: string, ddl: string][] = [
  *  them — comments_issue_idx, teams_org_idx, protected_branches_repo_idx,
  *  pull_reviews_issue_idx, notification_states_user_idx, secrets_owner_idx,
  *  action_variables_owner_idx.) */
+// The two project_columns_* witness DDLs target `project_board` — the table
+// the FN-5 rename (0069) left behind; the witness re-CREATEs these dropped
+// indexes to prove their absence and measure the survivors' plans.
 const P2_DROPPED_INDEXES: readonly [name: string, ddl: string][] = [
   [
     "deploy_keys_token_hash_idx",
@@ -1443,11 +1446,11 @@ const P2_DROPPED_INDEXES: readonly [name: string, ddl: string][] = [
   ],
   [
     "project_columns_created_idx",
-    "CREATE INDEX `project_columns_created_idx` ON `project_columns` (`created_unix`)",
+    "CREATE INDEX `project_columns_created_idx` ON `project_board` (`created_unix`)",
   ],
   [
     "project_columns_updated_idx",
-    "CREATE INDEX `project_columns_updated_idx` ON `project_columns` (`updated_unix`)",
+    "CREATE INDEX `project_columns_updated_idx` ON `project_board` (`updated_unix`)",
   ],
   ["projects_title_idx", "CREATE INDEX `projects_title_idx` ON `projects` (`title`)"],
   [
@@ -2141,7 +2144,7 @@ describe("index witness (migration 0037 — the audit's P2 wave)", () => {
       },
       {
         name: "protected branches by repo",
-        sql: "SELECT id, rule_name FROM protected_branches WHERE repo_id = ?",
+        sql: "SELECT id, branch_name FROM protected_branches WHERE repo_id = ?",
         binds: [repoId],
       },
       {
@@ -2195,7 +2198,7 @@ describe("index witness (migration 0037 — the audit's P2 wave)", () => {
       },
       {
         name: "project columns",
-        sql: "SELECT id, title FROM project_columns WHERE project_id = ?",
+        sql: "SELECT id, title FROM project_board WHERE project_id = ?",
         binds: [firstProject],
       },
       {

@@ -95,13 +95,13 @@ async function seedBaseFixtures(): Promise<void> {
   }
 
   const issue7 = await env.DB.prepare(
-    "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, 7, 2, 'Live issue title', 0, unixepoch())",
+    "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, 7, 2, 'Live issue title', 0, unixepoch())",
   )
     .bind(REPO_ID)
     .run();
   issue7Id = issue7.meta.last_row_id;
   const issue9 = await env.DB.prepare(
-    "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, 9, 2, 'The Pull', 1, unixepoch())",
+    "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, 9, 2, 'The Pull', 1, unixepoch())",
   )
     .bind(REPO_ID)
     .run();
@@ -704,7 +704,7 @@ describe("activity feeds query-shape witness (query-shape-audit C2)", () => {
     for (const index of Array.from({ length: C2_CORPUS_ISSUES }, (_, i) => i + 1)) {
       if (index === 7 || index === 9) continue;
       await env.DB.prepare(
-        "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, ?, 2, ?, 0, unixepoch())",
+        "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, ?, 2, ?, 0, unixepoch())",
       )
         .bind(REPO_ID, index, `Corpus issue ${index}`)
         .run();
@@ -740,7 +740,7 @@ describe("activity feeds query-shape witness (query-shape-audit C2)", () => {
     const fixedRead = await meter.rowsReadOf((sql) => sql.includes('"repo_id" in'));
     expect(fixedRead).toBeGreaterThan(0);
     expect(fixedRead).toBeLessThan(C2_CORPUS_ISSUES);
-    const preFix = await env.DB.prepare('SELECT "repo_id", "index", "title" FROM "issues" WHERE "repo_id" IN (?)')
+    const preFix = await env.DB.prepare('SELECT "repo_id", "index", "name" FROM "issues" WHERE "repo_id" IN (?)')
       .bind(REPO_ID)
       .all();
     const preFixRead = preFix.meta?.rows_read ?? 0;

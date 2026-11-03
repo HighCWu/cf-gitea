@@ -644,6 +644,10 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
       style,
       message: scheduled.mergeMessage ?? "",
       deleteBranchAfterMerge: false, // the flag's arm runs AFTER the row delete, upstream's tail
+      // The consumer's own-landing flag (automerge.go:262's `true` final
+      // arg): the merged arm stamps the schedule row's merged_commit_id
+      // (FN-7, merge.go:265-274) before its cleanup delete (:835-838).
+      wasAutoMerged: true,
       doerId: scheduled.doerId,
       now,
     });

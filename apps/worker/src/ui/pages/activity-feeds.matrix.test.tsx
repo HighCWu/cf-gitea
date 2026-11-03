@@ -131,13 +131,13 @@ async function seedBaseFixtures(): Promise<void> {
   }
 
   const issue7 = await env.DB.prepare(
-    "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, 7, 2, 'Live issue title', 0, unixepoch())",
+    "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, 7, 2, 'Live issue title', 0, unixepoch())",
   )
     .bind(REPO_ID)
     .run();
   issue7Id = issue7.meta.last_row_id;
   const issue9 = await env.DB.prepare(
-    "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, 9, 2, 'The Pull', 1, unixepoch())",
+    "INSERT INTO issues (repo_id, `index`, poster_id, name, is_pull, created_unix) VALUES (?, 9, 2, 'The Pull', 1, unixepoch())",
   )
     .bind(REPO_ID)
     .run();

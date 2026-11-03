@@ -1057,13 +1057,13 @@ describe("review_state.updated_files parity (ADR-0007 FN-3, migration 0065)", ()
     const column = info.results.find((col) => col.name === "updated_files");
     expect(column).toEqual({ cid: 5, name: "updated_files", type: "TEXT", notnull: 1, dflt_value: "'{}'", pk: 0 });
     // The cursor columns the pre-map writer used stay untouched.
-    expect(info.results.map((col) => col.name)).toEqual(["id", "user_id", "issue_id", "commit_sha", "updated_unix", "updated_files"]);
+    expect(info.results.map((col) => col.name)).toEqual(["id", "user_id", "pull_id", "commit_sha", "updated_unix", "updated_files"]);
   });
 
   it("the legacy cursor writer (a pre-0065 INSERT omitting the column) still lands and reads '{}' — the default covers it", async () => {
     // Exactly the shape the pre-0065 code wrote: user/pull/sha/unix, no map.
     await env.DB
-      .prepare("INSERT INTO review_state (user_id, issue_id, commit_sha, updated_unix) VALUES (910001, 910002, 'a', 1700000000)")
+      .prepare("INSERT INTO review_state (user_id, pull_id, commit_sha, updated_unix) VALUES (910001, 910002, 'a', 1700000000)")
       .run();
     const raw = await env.DB.prepare("SELECT commit_sha, updated_files, updated_unix FROM review_state WHERE user_id = 910001").first<{
       commit_sha: string;
@@ -1472,16 +1472,16 @@ WHERE \`type\` = 31
     // one older one newer; the newest id is the pin. A deleted twin and a
     // LATER-created twin are excluded (deleted = 0, created <= comment).
     await env.DB
-      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1699999000)")
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, time, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1699999000)")
       .run();
     await env.DB
-      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1700000000)")
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, time, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1700000000)")
       .run();
     await env.DB
-      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 1, 1699999500)")
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, time, deleted, created_unix) VALUES (910101, 910102, 5400, 1, 1699999500)")
       .run();
     await env.DB
-      .prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1700000005)")
+      .prepare("INSERT INTO tracked_time (issue_id, user_id, time, deleted, created_unix) VALUES (910101, 910102, 5400, 0, 1700000005)")
       .run();
     const entries = await db
       .select({ id: trackedTimes.id, deleted: trackedTimes.deleted, createdAt: trackedTimes.createdAt })
@@ -1497,12 +1497,15 @@ WHERE \`type\` = 31
     const comment14 = await seedOldComment({ type: 14, poster_id: 910102, content: "|5400" });
     // A type-13 banked entry created in the comment's own second.
     const banked = (
-      await env.DB.prepare("INSERT INTO tracked_time (issue_id, user_id, seconds, deleted, created_unix) VALUES (910101, 910103, 61, 0, 1699999800)").run()
+      await env.DB.prepare("INSERT INTO tracked_time (issue_id, user_id, time, deleted, created_unix) VALUES (910101, 910103, 61, 0, 1699999800)").run()
     ).meta.last_row_id;
     const comment13 = await seedOldComment({ type: 13, poster_id: 910103, created_unix: 1_699_999_800, content: "1 minute 1 seconds " });
 
-    // Migration 0067's time backfills verbatim (the type-14 then type-13
-    // statements of src/db/migrations/0067_comment-mutation-metadata.sql).
+    // Migration 0067's time backfills (the type-14 then type-13 statements
+    // of src/db/migrations/0067_comment-mutation-metadata.sql). The replay is
+    // 0067's SQL adapted to today's column names — 0069 renamed
+    // tracked_time.seconds -> time (FN-5), while 0067's own file stays
+    // verbatim at its point in history.
     await env.DB
       .prepare(
         `UPDATE \`comments\`
@@ -1511,7 +1514,7 @@ SET \`time_id\` = (
   FROM \`tracked_time\` \`tt\`
   WHERE \`tt\`.\`issue_id\` = \`comments\`.\`issue_id\`
     AND \`tt\`.\`user_id\` = \`comments\`.\`poster_id\`
-    AND \`tt\`.\`seconds\` = CAST(substr(\`comments\`.\`content\`, 2) AS INTEGER)
+    AND \`tt\`.\`time\` = CAST(substr(\`comments\`.\`content\`, 2) AS INTEGER)
     AND \`tt\`.\`deleted\` = 0
     AND \`tt\`.\`created_unix\` <= \`comments\`.\`created_unix\`
   ORDER BY \`tt\`.\`id\` DESC
@@ -1526,7 +1529,7 @@ WHERE \`type\` = 14
     SELECT 1 FROM \`tracked_time\` \`tt2\`
     WHERE \`tt2\`.\`issue_id\` = \`comments\`.\`issue_id\`
       AND \`tt2\`.\`user_id\` = \`comments\`.\`poster_id\`
-      AND \`tt2\`.\`seconds\` = CAST(substr(\`content\`, 2) AS INTEGER)
+      AND \`tt2\`.\`time\` = CAST(substr(\`content\`, 2) AS INTEGER)
       AND \`tt2\`.\`deleted\` = 0
       AND \`tt2\`.\`created_unix\` <= \`comments\`.\`created_unix\`
   )`,

@@ -1075,12 +1075,12 @@ milestone/label/assignee pattern, with a dangling id DROPPING the row —
 upstream LoadAssigneeUserAndTeam's GetPossibleTeamByID error arm →
 ToTimelineComment's nil — and the render being convert.go's ToTeam with no
 org load, replicated in the service since routes/org-teams.ts's `toApiTeam`
-is route-local), and `trackedTimeOfComment` reads `time_id` first with the
-correlation demoted to the fallback (its docstring is the removal marker).
+is route-local), and `trackedTimeOfComment` reads `time_id` first (the
+§7.7-recorded legacy correlation fallback was REMOVED once the one-release
+marker matured — the derivation lives in §7.7).
 One precision beyond the plan: the LoadTime call now gates on
 `time_id > 0` for ANY row type (upstream LoadTime's own early return is
-TimeID == 0 — not a type gate), with the correlation arms still scoped to
-the 13/14 family.
+TimeID == 0 — not a type gate).
 
 ### 7.5 The migration (one generated migration + backfills)
 
@@ -1101,7 +1101,8 @@ DDL first (§7.2), then, in the same migration, idempotent backfills:
    `created_unix`; type-13 rows — the newest live row created in the
    comment's own second. This is exactly `trackedTimeOfComment`'s
    documented correlation (`issues.ts:1183-1196`) applied once; rows it
-   cannot pin stay NULL and keep riding the fallback reader.
+   cannot pin stay NULL and render the upstream legacy shape (the §7.7
+   record — the reader fallback is removed, so NULL is terminal).
 3. **`assignee_team_id` backfill**: type-27 rows with `assignee_id` NULL
    and `review_id > 0` — join `pull_reviews.reviewer_team_id`
    (`schema.ts:2447`; the team-add arm writes `reviewId: review.id`,
@@ -1197,9 +1198,26 @@ adaptation, not independent parity arms.
 - The `trackedTimeOfComment` heuristic: keep as legacy fallback through one
   release after the backfill (rows the backfill could not pin), then drop;
   the docstring at `issues.ts:1183-1196` is the removal marker.
-  **RESOLVED: the fallback is IN PLACE** (the exact `time_id` arm reads
-  first); the docstring carries the removal marker — the drop is a future
-  unit's cleanup, not this port's.
+  **RESOLVED: the fallback REMOVED** (the one-release marker matured —
+  v1.5.6 carried the backfill). The removal derivation, from the
+  writers' pre-0067 output (the times routes landed 2026-10-25, the
+  backfill 2026-11-03): every row the 0067 backfill left NULL is
+  unresolvable by the reader's fallback too, because the backfill IS that
+  same correlation applied once with strictly better data —
+  (a) the admin `user_name`-override add (our recorded writer divergence:
+  the comment's poster is the admin doer, the entry's user the target;
+  both the backfill and the fallback key on poster — no match), and
+  (b) the batch-mate soft-deleted before the backfill ran (both filter
+  `deleted = 0` — no match); nothing undeletes and post-migration writers
+  stamp the id, so the fallback resolved zero rows ever, and its one
+  reachable hit would MISRENDER: a NULL row whose post-migration re-add
+  carries the same poster + seconds grafts the NEW entry onto the OLD
+  comment. Unstamped rows now answer `none` — exactly upstream's legacy
+  shape, because upstream's own `time_id` migration (v173, v1.14,
+  `AddTimeIDCommentColumn`) performed NO backfill either: its pre-v1.14
+  rows keep TimeID == 0 and ride the LoadTime early return (row KEPT,
+  tracked_time nil). `missing` stays for a positive-but-dangling id
+  (upstream's GetTrackedTimeByID error arm — the row drop).
 - `finishStopwatch`'s batch needs the trackedTimes leg switched to
   `.returning({ id })` in BOTH twins (web + API ports) — batch leg ordering
   is preserved by drizzle, but verify the returned id is the comment's
@@ -1217,14 +1235,16 @@ adaptation, not independent parity arms.
   **RESOLVED: DEFER** (§7.2 as-built; SPEC-0005 §9 is the record, FN-9 the
   family carrier).
 
-## 8. FN-5 rename plan — PLAN ONLY
+## 8. FN-5 rename batch — as-built (FN-5 unit carrying FN-7, 2026-11-04)
 
-**Status: PLAN ONLY. Nothing is built; no migration has been generated.**
-Derived by the GM-resume unit (2026-11-03) from the upstream pin
-`fc49368845`; the derivation record (per-member verification, the
-same-class sweep, blast-radius counts, and the drizzle migration-shape
-evidence) is the audit doc's §7.10. This section is the port unit's
-normative plan.
+**Status: LANDED.** Migrations `0069_fn5-upstream-column-names` +
+`0070_fn7-automerge-merged-commit-id` applied local and verified on
+carried rows; FN-7 rides (§8.6). Derived by the GM-resume unit
+(2026-11-03) from the upstream pin `fc49368845`; the derivation record
+(per-member verification, the same-class sweep, blast-radius counts, and
+the drizzle migration-shape evidence) is the audit doc's §7.10. The
+member table below (§8.1) and the property-kept contract (§8.2) landed
+exactly as planned — ZERO application-code edits.
 
 ### 8.1 Scope — the 18 renames (17 columns + 1 table)
 
@@ -1315,6 +1335,37 @@ flow:
 5. `pnpm db:migrate:remote` is the deploy-time step per the house
    deploy discipline.
 
+**As-built (2026-11-04):** no interactive TTY was available, so steps 1-2
+went through the 0064 --custom precedent instead: the schema flip first,
+then `pnpm exec drizzle-kit generate --custom` (NOT `pnpm db:generate --
+--custom`; pnpm swallows the dashes), which creates an empty migration
+file and — the discovery — COPIES the previous snapshot verbatim (0
+schema diffs; the 0064-era snapshot identity was coincidental, schema
+unchanged that day). Two deterministic repairs followed: (a) the file was
+renamed to `0069_fn5-upstream-column-names.sql` with the journal tag
+updated in-command (JSON validated in the same command); (b) the 0069
+snapshot was hand-moved to the post-rename state — scripted re-key + name
+fixes over the 11 member tables (17 columns, the project_board table
+rename, and the 7 index column arrays that reference renamed columns) —
+and self-checked: the 0068→0069 snapshot diff is EXACTLY the rename set,
+every attribute (type/nullability/default/pk) preserved. Step 3's gate
+ran on the hand-authored ALTER set: 1 RENAME TABLE (first, the
+drizzle-kit ordering) + 17 RENAME COLUMN + the
+`protected_branches_repo_rule_uq` rebuild (DROP INDEX + CREATE UNIQUE
+INDEX over (`repo_id`,`branch_name`) under the kept name — the one
+DDL-visible index shape), all backtick-quoted, no data statements (the
+FN-6/0066 DQS trap cannot apply). 0070 then came from the NORMAL
+generate against the corrected snapshot and emitted exactly
+``ALTER TABLE `pull_auto_merges` ADD `merged_commit_id` text;`` — which
+also proves the hand-moved snapshot matches schema.ts on all 107 tables.
+Step 4: seeded carried rows in all 11 member tables before the apply;
+`pnpm db:migrate:local` applied both (two green rows in the wrangler
+table); PRAGMA table_info before/after captured — every rename in place,
+column ORDER preserved, `merged_commit_id` appended last — and every
+carried row read back under its new name with its value intact (plus the
+53 live dev audit_event rows under `timestamp_unix`); the rebuilt index's
+sqlite_master DDL reads UNIQUE(`repo_id`,`branch_name`).
+
 ### 8.4 Test plan (names + asserted shapes; no code)
 
 - ~26 raw-SQL fixture lines across 6 test files carry the OLD names and
@@ -1326,6 +1377,21 @@ flow:
   (`tracked_time` `seconds` ×6); activity-feeds.test.tsx:98 and ~13
   sibling `INSERT INTO issues (… title …)` fixtures; and
   settings-danger-zone.matrix.test.tsx:120 (`repo_transfer.new_owner_id`).
+  - **As-built: the real blast was 41 lines across 14 test files** (40
+    SQL/DDL lines + 1 comment) — the plan's ~26/6 undershot: five
+    `project_columns` cleanup-list entries (`DELETE FROM $table` loops in
+    projects-workflow/projects-org/projects-user/projects-repo tests +
+    admin-monitor) and lifecycle's own `DELETE FROM project_columns`
+    would have 500ed every one of those suites; lifecycle carried a
+    fourth `issues.title` INSERT and two raw `SELECT … "title" FROM
+    "issues"` witnesses rode the feed suites; schema.test's review_state
+    column-list PIN (`PRAGMA table_info` → `toEqual([...])`) and its
+    verbatim 0067 time-backfill replay (two `tt.seconds` refs) needed the
+    flip + an adaptation note (0067's own file stays verbatim at its
+    point in history); bench-d1's P2-drop witness DDL strings (the
+    re-CREATE-to-prove-absence battery) had to target `project_board`.
+    All sites were re-grepped from the tree at landing (the audit's own
+    cite-drift note §7.9); every suite re-run green.
 - The schema.test FN-3 describe pins stay green except the
   review_state INSERT fixture named above; no new DDL-pin describes are
   required — the renames carry no shape change (types, nullability,
@@ -1333,20 +1399,64 @@ flow:
 - Full-suite verdict per ADR-0006 (`pnpm test:full`), with the renamed
   fixtures' scopes attributed.
 
-### 8.5 Open items for the port unit
+### 8.5 Open items for the port unit — RESOLVED as-built
 
 - The rename prompts must be answered deliberately: drizzle-kit
   offers "created" as the default-arm; choosing it for any member would
   emit DROP COLUMN + ADD COLUMN and destroy data — the §8.3 step-3 gate
-  exists to catch exactly that.
+  exists to catch exactly that. **RESOLVED: superseded by the hand-authored
+  path (§8.3 as-built) — no prompt was ever raised; the non-TTY fail-loud
+  verdict held and the snapshot diff self-check replaces rename detection
+  (the 0068→0069 snapshot delta is exactly the rename set, nothing
+  dropped/re-added).**
 - Optional ours-side follow-up (NOT this unit): FN-7 may rename the
   `pullAutoMerges.issueId`/`reviewState.issueId` drizzle properties to
   match their new columns — a code refactor riding FN-7's additive DDL,
-  not an FN-5 deliverable.
+  not an FN-5 deliverable. **RESOLVED: NOT taken — the property-kept
+  contract held (properties stay `issueId`/`issueId`), zero application
+  churn.**
 - The bench-d1 raw SELECTs (:2144, :2198) are benchmark witnesses —
   after the rename they must still hit the same plans (the index under
   `protected_branches_repo_rule_uq` is rebuilt over the renamed column;
-  re-run the bench file, not just the unit tests).
+  re-run the bench file, not just the unit tests). **RESOLVED: bench file
+  re-run green after the flip (3 passed / 5 skipped — the skips are the
+  file's own pre-existing posture), same witness battery, plus the two P2
+  witness DDL strings moved to `project_board`.**
+
+### 8.6 FN-7 as-built — pull_auto_merges.merged_commit_id (rides 0069)
+
+**Status: LANDED.** Migration `0070_fn7-automerge-merged-commit-id` (the
+normal generate against the post-0069 snapshot — a pure
+``ALTER TABLE `pull_auto_merges` ADD `merged_commit_id` text;``, nullable,
+no default, appended last per the ADD-COLUMN convention; DQS audit clean).
+Upstream pin: `MergedCommitID string xorm:"VARCHAR(64)"`
+(models/pull/automerge.go:26). The ours-extra `sha` column STAYS (the
+recorded head-sha-gate addition).
+
+The writer arm — upstream `Merge` passes `wasAutoMerged=true` from the
+automerge consumer (services/automerge/automerge.go:262) and
+`recordMergeIntent` stamps the schedule row
+(services/pull/merge.go:265-274) before `MarkAsMerged` reads it for the
+`wasAutoMerged = schedule.MergedCommitID == pr.MergedCommitID` comparison
+and deletes it (:829-838). Our composition: `MergePullOptions` gains
+`wasAutoMerged?: boolean`; `mergePullRequest`'s merged arm calls the new
+exported `stampAutoMergeCommit(d1, issueId, commitOid)` when the landing
+is the winner's own (`wasAutoMerged === true && commitOid !== null`),
+BEFORE the existing best-effort schedule-cleanup delete — the same
+two-statement order upstream runs across its recordMergeIntent and
+MarkAsMerged transactions, so a crash between them leaves the STAMPED row
+(durable marker), which the consumer's first ladder arm
+(already-closed-or-merged) reaps. The consumer
+(services/pull-automerge.ts) passes `wasAutoMerged: true`; every manual
+caller omits it — the supersede delete stands unchanged for them.
+Recorded non-port: `clearMergeIntent`'s schedule-stamp revert
+(merge.go:289) — our engine stamps D1 rows only AFTER the merged commit
+landed in the base repo, so the "rows stamped but the merged commit lost"
+trigger cannot arise. The stamp pin (pull-automerge.test.ts): the
+exported writer pinned against a live schedule row (nullable round-trip),
+then the full winner-arm landing consumes the stamped row and merges the
+PR (the shared-headOid ordering required the blockedpr distinct-tip
+preparation).
 
 ## 9. FN-9 disposition — the original_author family: RECORD (intentional-recorded-absent)
 
@@ -1410,3 +1520,184 @@ Consequently:
   + dedup-key widening (reaction.go:221-233; reaction.go:63-70). Until
   that SPEC exists, the absence of the family is the recorded, correct
   state.
+
+## 10. FN-8 port plan — the `commit_statuses.context_hash` + `index` completion — PLAN ONLY
+
+**Status: PLAN ONLY. Nothing is built; no migration has been generated.**
+Derived by the FN-8-prep unit (2026-11-04) from the upstream pin
+`fc4936884584`; the full derivation record (upstream writer/reader
+semantics, ours-surface inventory, the id-semantics blast-radius table,
+and the migration-shape evidence) is the audit doc's §7.12. This section
+is the port unit's normative plan. Cites below are upstream
+models/git/commit_status.go unless another file is named.
+
+### 10.1 Scope — two columns on `commit_statuses` + one counter table
+
+Add to the landed `commit_statuses` table (schema.ts:1256-1279
+working-tree 2026-11-04; the block drifts under concurrent schema edits
+— re-grep at landing), mirroring
+the upstream tags' nullable posture (neither tag carries NOT NULL —
+contrast :40 `SHA … VARCHAR(64) NOT NULL`):
+
+- `context_hash` VARCHAR(64), indexed — `ContextHash string
+  xorm:"VARCHAR(64) index"` (:50).
+- `index` INTEGER, indexed — `Index int64 xorm:"INDEX
+  UNIQUE(repo_sha_index)"` (:41). The column NAME is upstream's literal
+  `index` (a SQLite reserved word: drizzle quotes identifiers; every raw
+  SQL surface in the port quotes it, exactly like upstream's own
+  backticks at :315-325, :346, :357). The schema property stays `index`
+  (§8.2's Go-field-maps-to-property convention — zero application churn).
+- NEW table `commit_status_indexes` (the §7.5 pluralization family:
+  upstream singular `commit_status_index` — the same recorded pattern
+  that made `commit_status` → `commit_statuses`), mirroring
+  `CommitStatusIndex` (:329-335): autoincr id, `repo_id`, `sha`,
+  `max_index`, `unique(repo_id, sha)`, index on `max_index`.
+
+Out of scope, unchanged: the REST/webhook wire field SETS (neither new
+column is ever rendered — `ContextHash` has no json tag and
+`Index` maps only to the REST `id` VALUE, not a new field);
+`commit_status_summary` (FN-14's no-reader arm, §3.3).
+
+### 10.2 The semantics being restored (normative)
+
+- `index` IS the per-(repo, sha) monotonic creation ordinal, 1-based:
+  every `NewCommitStatus` (:497-537) allocates inside its transaction
+  (:506-536) via the counter table's MAX+1 (:508, counter :125-181;
+  first status of a sha gets 1 — postgres arm :65-67, sqlite arm
+  :153-154). It is NOT the row pk; the counter RESTARTS per (repo, sha).
+- The REST `CommitStatus.id` field carries `Index`, not the row pk
+  (services/convert/status.go:24 `ID: status.Index`).
+- The webhook `CommitStatusPayload.id` carries the ROW PK
+  (services/webhook/notifier.go:942, field modules/structs/hook.go:659).
+  Upstream itself runs this asymmetry — the port reproduces it, so our
+  webhook emit stays byte-faithful and unchanged (routes/statuses.ts:318).
+- `context_hash` IS the dedupe key: lowercase hex sha1 of the context
+  string (`HashCommitStatusContext` :550-552), defaulted from `Context`
+  at write when the caller left it empty (:526-528); callers may
+  pre-compute to split same-display contexts — the Actions writer mixes
+  the workflow file path in (services/actions/commit_status.go:282,
+  issue #35699) with a legacy-hash adoption arm (:288-302) that adopts
+  the pre-#35699 Context-only hash from an in-flight Actions-owned row
+  so stale pending statuses still get superseded. The column is
+  internal-only — its only observable is the latest-per-context grouping
+  it keys (`GetLatestCommitStatus` :343-359, `CountLatestCommitStatus`
+  :361-366, `ForPairs` :369-422, `ForRepoCommitIDs` :426-472).
+
+### 10.3 The migration (one generated migration + the SQL backfill) and the hash pass
+
+1. `ALTER TABLE commit_statuses ADD COLUMN context_hash varchar(64);`
+   and `ADD COLUMN index integer;` — plain adds, no table rebuild.
+2. Backfill `index` in SQL — the per-sha 1-based creation ordinal
+   reconstructed from insertion order (correlated-count form,
+   order-equivalent to `ROW_NUMBER() OVER (PARTITION BY repo_id, sha
+   ORDER BY id ASC)`):
+   `UPDATE commit_statuses SET "index" = (SELECT COUNT(*) FROM
+   commit_statuses c2 WHERE c2.repo_id = commit_statuses.repo_id AND
+   c2.sha = commit_statuses.sha AND c2.id <= commit_statuses.id);`
+   Ground: within one (repo, sha), creation order ascends with our
+   global autoincrement id — the order oracle our table already carries
+   (the recorded reduction, api/services/commit-status.ts:27-30);
+   created_unix cannot do this (1-second resolution — upstream's own
+   reason for the column, :325).
+3. Seed `commit_status_indexes`:
+   `INSERT INTO commit_status_indexes (repo_id, sha, max_index) SELECT
+   repo_id, sha, max("index") FROM commit_statuses GROUP BY repo_id, sha;`
+   — upstream's own seed shape (modelmigration/v1_16/v195.go:39-44), so
+   the counter resumes instead of restarting.
+4. Enforcement, in INDEX form (D1 `ADD COLUMN` cannot add table
+   constraints; a UNIQUE table constraint over existing+new columns
+   would force a SQLite table rebuild — the FN-6/0066 lesson; unique
+   indexes enforce identically, and NULLs are distinct so un-backfilled
+   rows never violate):
+   `CREATE UNIQUE INDEX commit_statuses_repo_sha_index_uq ON
+   commit_statuses (repo_id, sha, "index");` plus standalone indexes on
+   `"index"` and on `context_hash` (the three structures :41/:50
+   declare).
+5. `context_hash` backfill is NOT pure SQL (D1's SQLite core has no
+   sha1(), and the value MUST be sha1-hex — the writers compute exactly
+   that, so any other backfill function would split dedupe groups
+   between migrated and new rows). Plan: the opportunistic lazy repair —
+   every writer path computes `sha1(context)` (WebCrypto
+   `digest("SHA-1")` is available in Workers) for new rows, and the read
+   path repairs NULL-hash rows it encounters (bounded by page size; the
+   UPDATEs ride `ctx.waitUntil`). Convergence guarantee: SQL GROUP BY
+   treats NULLs as one group, so an unrepaired row dedupes exactly as
+   the pre-port raw-context rows do — behavior degrades to today's,
+   never worse (the same opportunistic-trigger posture §3.3 records for
+   `commit_status_summary`).
+
+Gate: post-generate eyeball (ALTERs + CREATE INDEX/TABLE only, no DROP
+COLUMN, no table rebuild), then `pnpm db:migrate:local` against a seeded
+dev D1 proving rows survive and the ordinals match per-sha row counts.
+
+### 10.4 Write seams to thread
+
+- API POST (`/repos/{owner}/{repo}/statuses/{sha}`,
+  routes/statuses.ts:384-392): allocate the ordinal with a
+  drizzle-native upsert on `commit_status_indexes` —
+  `.values({…, maxIndex: 1}).onConflictDoUpdate({target: [repoId, sha],
+  set: {maxIndex: sql\`max_index + 1\`}}).returning()` (the postgres
+  arm's shape :64-75; one statement, atomic under SQLite's write lock) —
+  store `index` + `contextHash = sha1(context)` on the row. Counter
+  bump + insert ride ONE D1 batch (upstream's single WithTx :506-536);
+  a crash between the pair burns an ordinal — harmless, upstream
+  identical.
+- Actions writer (`createWorkflowCommitStatus`,
+  services/actions/trigger.ts:2160-2197): compute the mixed hash
+  `sha1(ctxName + "\x00" + workflowId)` (actions/commit_status.go:282),
+  port the legacy-adoption arm (:288-302 — adopt only when the latest
+  row's hash is the Context-only hash, its context matches, and its
+  creator is the Actions user), allocate `index` through the same
+  counter, keep the identical-state short-circuit per mixed-hash group.
+  The module-header reduction disclosure (trigger.ts:118-121) is
+  DELETED with this landing — two same-named workflows with different
+  files now keep separate groups (the #35699 observable).
+- Reads: `commitStatusOrderBy` swaps id → `index`
+  (api/services/commit-status.ts:39-56); `latestCommitStatuses` swaps to
+  max(`index`) per `context_hash` (:210-238). The three downstream call
+  sites (branch-protection.ts:830 gate, pull-automerge.ts:198 twin,
+  search-aux.ts:586 repo list) consume the service and change nothing.
+- Repo delete cascade gains the new table (repos/service.ts:1106).
+- Dissolved TODOs: the commit-status.ts:87-93 and :142-147 note blocks
+  become parity notes (no TODO text remains — census row 222's cite
+  clears).
+
+### 10.5 The id-semantics flip (the API-visible change) and its blast radius
+
+The REST `id` field changes VALUE SEMANTICS on every `CommitStatus`
+render: POST 201 body, list items, `combined.statuses[].id` — from row
+pk to per-sha ordinal (upstream convert/status.go:24). Full
+per-surface table with pinned-test dispositions: audit §7.12 §3. Summary:
+
+| surface | change | survives unchanged |
+|---|---|---|
+| REST `CommitStatus.id` (3 surfaces) | row pk → per-sha index | the type-only pins (statuses.test.ts:184,189); field SETS (:175) |
+| webhook `CommitStatusPayload.id` | none (pk stays — upstream's asymmetry) | emit-test field set (statuses.test.ts:630-641) |
+| sort orders / latest-per-context / total_count | id stand-in → real columns (same observable through the writers) | behavior pins once fixtures seed `index`+`context_hash` |
+| raw-seeding fixtures (statuses.test.ts:296-334, 421-483; branch-protection.test.ts:476,606) | MUST-EDIT — seeds gain `index` (+ `context_hash` where grouping matters) | — |
+
+New pins (names only, §8.4's pattern): POST assigns per-sha ordinals
+1,2,… and a second sha restarts at 1; REST id differs from the webhook
+payload id for the same row; sort=highestindex orders by seeded `index`
+ASC (not ids); latest-per-context groups by `context_hash`, not raw
+context; the backfill reconstructs ordinals from seed order (fixture:
+3 rows, same created_unix second, shuffled ids); the counter seed
+resumes at max(`index`); two same-named workflows keep separate latest
+rows at one sha; a pre-port legacy-hash row is adopted and superseded.
+
+### 10.6 Open items for the port unit
+
+1. The lazy hash repair's placement (read path vs a first-write sweep) —
+   the SPEC pins the contract (converges, bounded, waitUntil); the unit
+   picks the seam.
+2. Whether `getPullRequestCommitStatusState`'s paging exhaust loop
+   (branch-protection.ts:848) needs a bound change once groups key
+   on hash — grouping cardinality only shrinks for API rows (equal or
+   fewer groups); verify no fixture depended on the raw-context
+   collapse.
+3. SPEC-0004 §2.4 (:270-272) gains the id-semantics note ("`id` is the
+   per-sha ordinal, not the row pk; webhook `id` is the row pk") when
+   this plan lands.
+4. The census flips at landing: audit rows 221 (`drift` → `aligned`)
+   and 222 (`missing-table` → `aligned`), and the §3.1 ours-cite stays
+   schema.ts-pinned.

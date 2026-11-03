@@ -347,6 +347,11 @@ export interface MergePullOptions {
   deleteBranchAfterMerge: boolean;
   /** manually-merged: the commit the caller merged into base */
   mergeCommitId?: string;
+  /** The auto-merge consumer's flag — upstream Merge's final wasAutoMerged
+   *  arg (services/automerge/automerge.go:262 passes true; every manual
+   *  caller omits it). FN-7: when set, the merged arm stamps the schedule
+   *  row's merged_commit_id before consuming it. */
+  wasAutoMerged?: boolean;
   doerId: number;
   now: Date;
 }
@@ -455,6 +460,18 @@ function mergePerson(c: Context<ApiEnv>, now: Date): Person {
  *   - manually-merged → verify the given commit is an ancestor of base
  *     (upstream MergedManually) and mark the row without touching refs.
  */
+/**
+ * FN-7: the schedule row's merged_commit_id stamp — upstream's
+ * recordMergeIntent arm (services/pull/merge.go:265-274): when the landing
+ * is the auto-merge schedule's own, the row records the merge's commit id
+ * (`MergedCommitID xorm:"VARCHAR(64)"`, models/pull/automerge.go:26) before
+ * MarkAsMerged's consumption (:829-838) deletes it. Exported for the stamp
+ * pin (the write is only observable between the stamp and the delete).
+ */
+export async function stampAutoMergeCommit(d1: D1Database, issueId: number, commitOid: string): Promise<void> {
+  await drizzle(d1).update(pullAutoMerges).set({ mergedCommitId: commitOid }).where(eq(pullAutoMerges.issueId, issueId));
+}
+
 export async function mergePullRequest(
   c: Context<ApiEnv>,
   pair: RepositoryWithOwner,
@@ -677,6 +694,18 @@ export async function mergePullRequest(
   // closed issue. Best-effort, never throws: the merge has already landed,
   // exactly like upstream logs notify errors past the merge (:865-867).
   if (merged.length > 0) {
+    // FN-7: the schedule's recordMergeIntent stamp (services/pull/merge.go:
+    // 265-274) — when THIS landing is the auto-merge consumer's own, the
+    // schedule row records the merge's commit id: the durable marker that
+    // this landing was the schedule's own (MarkAsMerged's
+    // wasAutoMerged = schedule.MergedCommitID == pr.MergedCommitID,
+    // merge.go:834). The stamp precedes the cleanup delete below (:835-838) —
+    // the same two-statement order upstream runs across its recordMergeIntent
+    // and MarkAsMerged transactions; a crash between them leaves the stamped
+    // row, which the consumer's first ladder arm (already-merged) reaps.
+    if (opts.wasAutoMerged === true && commitOid !== null) {
+      await stampAutoMergeCommit(c.env.DB, issue.id, commitOid);
+    }
     // The scheduled auto merge's cleanup (services/pull/merge.go:827-837):
     // upstream's Merge reads GetScheduledMergeByPullID (computing wasAutoMerged
     // from it) and DeleteScheduledAutoMerge's the row inside the success

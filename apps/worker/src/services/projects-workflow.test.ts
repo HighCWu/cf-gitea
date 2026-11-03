@@ -63,7 +63,7 @@ beforeEach(async () => {
     "comments",
     "project_workflows",
     "project_issues",
-    "project_columns",
+    "project_board",
     "projects",
     "issue_labels",
     "issues",

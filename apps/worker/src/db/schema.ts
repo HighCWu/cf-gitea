@@ -415,8 +415,9 @@ export const repoTransfer = sqliteTable(
     repoId: text("repo_id").notNull().unique(),
     /** Who filed the request. */
     doerId: integer("doer_id").notNull(),
-    /** Target owner (users.id). */
-    newOwnerId: integer("new_owner_id").notNull(),
+    /** Target owner (users.id) — upstream column `recipient_id` (RecipientID
+     *  untagged, transfer.go:68; its own query binds recipient_id, :177). */
+    newOwnerId: integer("recipient_id").notNull(),
     createdAt: integer("created_at", { mode: "timestamp" })
       .notNull()
       .default(sql`(unixepoch())`),
@@ -425,7 +426,7 @@ export const repoTransfer = sqliteTable(
     // TeamIDs []int64` (models/repo/transfer.go:72, xorm JSON TEXT).
     // Kept LAST per the ALTER ADD COLUMN append convention (see the
     // repositories table note). JSON id-list per the house convention
-    // (protected_tags.allowlist_team_ids): `[]` when the target is a user —
+    // (protected_tags.allowlist_team_i_ds): `[]` when the target is a user —
     // upstream files `nil` there (teams can only ride an ORG-bound transfer,
     // routers/api/v1/repo/transfer.go:80-84 422s the user-target arm before
     // anything is stored). Filing validates every id (team exists → 422
@@ -435,7 +436,9 @@ export const repoTransfer = sqliteTable(
     // addRepositoryToTeam per team) — vanished teams drop silently there
     // (LoadAttributes re-fetches by id, transfer.go:111-121).
     // -------------------------------------------------------------------------
-    teamIds: text("team_ids").notNull().default("[]"),
+    // FN-5: the SQL name is upstream's mapper output `team_i_ds` (TeamIDs
+    // untagged, transfer.go:72 — GonicMapper splits the ID run).
+    teamIds: text("team_i_ds").notNull().default("[]"),
   },
 );
 
@@ -782,8 +785,11 @@ export const issues = sqliteTable(
     /** Mirrored importer fields (upstream OriginalAuthor/OriginalAuthorID). */
     originalAuthor: text("original_author"),
     originalAuthorId: integer("original_author_id"),
-    /** Title, truncated to 255 display-width chars by the service (§2.2). */
-    title: text("title").notNull(),
+    /** Title, truncated to 255 display-width chars by the service (§2.2).
+     *  FN-5: the SQL name is upstream's explicit column-NAME tag
+     *  `xorm:"name"` (issue.go:63) — upstream's own SQL binds it
+     *  (issue_update.go:198, issue.go:536). */
+    title: text("name").notNull(),
     content: text("content"),
     contentVersion: integer("content_version").notNull().default(0),
     milestoneId: integer("milestone_id"),
@@ -2100,8 +2106,9 @@ export const trackedTimes = sqliteTable(
     id: integer("id").primaryKey({ autoIncrement: true }),
     issueId: integer("issue_id").notNull(),
     userId: integer("user_id").notNull(),
-    /** Seconds spent (upstream `Time NOT NULL`). */
-    seconds: integer("seconds").notNull(),
+    /** Seconds spent (upstream `Time NOT NULL`, tracked_time.go:30 — FN-5:
+     *  the mapper output is the literal `time`). */
+    seconds: integer("time").notNull(),
     /** Upstream `Deleted` — soft-delete flag; lists filter it out. */
     deleted: integer("deleted", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_unix", { mode: "timestamp" }),
@@ -2673,16 +2680,18 @@ export const protectedBranches = sqliteTable(
     /** Keys the landed TEXT repositories.id — the repo-scoped-table
      *  convention (no FK; rows die with the deleteRepository cascade). */
     repoId: text("repo_id").notNull(),
-    /** Upstream column `branch_name` (RuleName, protected_branch.go:34 — "a
-     *  branch name or a glob match to branch name"); we keep the semantic
-     *  name and the API carries `rule_name`. */
-    ruleName: text("rule_name").notNull(),
+    /** Upstream column `branch_name` (RuleName's quoted pin
+     *  `'branch_name' UNIQUE(s)`, protected_branch.go:34 — "a branch name or
+     *  a glob match to branch name"); FN-5 landed the SQL name; the property
+     *  keeps the semantic name and the API carries `rule_name`. */
+    ruleName: text("branch_name").notNull(),
     /** First-match ordering input (protected_branch.go:35, NOT NULL DEFAULT 0). */
     priority: integer("priority").notNull().default(0),
     /** The `ProtectedBranchConfig` JSON verbatim under upstream's exact
      *  snake_case json keys (protected_branch.go:45–80) so contract
-     *  rendering is a read-and-echo (SPEC-0013 §3.1). */
-    rules: text("rules").notNull(),
+     *  rendering is a read-and-echo (SPEC-0013 §3.1). FN-5: the SQL name is
+     *  upstream's quoted pin `'config' JSON LONGTEXT` (:38). */
+    rules: text("config").notNull(),
     createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
     updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
   },
@@ -3177,15 +3186,20 @@ export const projects = sqliteTable(
  * (upstream's own xorm column is `` `default` ``).
  */
 export const projectColumns = sqliteTable(
-  "project_columns",
+  // FN-5: the SQL table is upstream's `project_board` (the TableName()
+  // override, models/project/column.go:66-68 — upstream's own TODO keeps the
+  // legacy name); the drizzle export/property names stay ours-side ergonomic.
+  "project_board",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     /** EllipsisDisplayString(255) at write time. */
     title: text("title").notNull(),
-    /** Upstream `Default bool xorm:"NOT NULL DEFAULT false"` — issues not
-     *  assigned to a specific column land here (legacy project_issues rows
-     *  with column 0 read as this column, issue.go:36-44). */
-    isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `Default bool xorm:"NOT NULL DEFAULT false"` (column.go:52 —
+     *  the mapper output is the literal `default`; `` `default` `` in
+     *  upstream's own DDL) — issues not assigned to a specific column land
+     *  here (legacy project_issues rows with column 0 read as this column,
+     *  issue.go:36-44). */
+    isDefault: integer("default", { mode: "boolean" }).notNull().default(false),
     /** int8 domain (-128..127); EditProjectColumnOption rejects outside it. */
     sorting: integer("sorting").notNull().default(0),
     /** `#rrggbb` or "" (upstream `VARCHAR(7)`, ColumnColorPattern
@@ -3226,10 +3240,10 @@ export const projectIssues = sqliteTable(
     /** Global issues.id (not the repo-local index). */
     issueId: integer("issue_id").notNull(),
     projectId: integer("project_id").notNull(),
-    /** Upstream physical column `project_board_id` (`project_column_id` is
-     *  the upstream TODO rename, issue.go:20); 0 = legacy default-column
-     *  encoding. NOT NULL DEFAULT 0 upstream. */
-    projectColumnId: integer("project_column_id").notNull().default(0),
+    /** Upstream physical column `project_board_id` (the quoted pin
+     *  `'project_board_id' INDEX`, issue.go:21 — FN-5 landed the name);
+     *  0 = legacy default-column encoding. NOT NULL DEFAULT 0 upstream. */
+    projectColumnId: integer("project_board_id").notNull().default(0),
     /** Position within the column, ascending (int64 upstream). */
     sorting: integer("sorting").notNull().default(0),
   },
@@ -3258,14 +3272,17 @@ export const projectWorkflows = sqliteTable(
     projectId: integer("project_id").notNull(),
     /** WorkflowEvent string (`item_added_to_project`, `pull_request_merged`,
      *  …) — validity is checked at create/update time against the eight
-     *  known values. */
-    event: text("event").notNull().default(""),
+     *  known values. FN-5: the SQL name is upstream's mapper output
+     *  `workflow_event` (workflows.go:163). */
+    event: text("workflow_event").notNull().default(""),
     /** JSON WorkflowFilters ({issue_type, source_column_id,
-     *  target_column_id, label_ids}, omitempty upstream). */
-    filters: text("filters").notNull().default("{}"),
+     *  target_column_id, label_ids}, omitempty upstream). FN-5: mapper
+     *  output `workflow_filters` (workflows.go:164). */
+    filters: text("workflow_filters").notNull().default("{}"),
     /** JSON WorkflowActions ({column_id, add_label_ids, remove_label_ids,
-     *  issue_state}, omitempty upstream). */
-    actions: text("actions").notNull().default("{}"),
+     *  issue_state}, omitempty upstream). FN-5: mapper output
+     *  `workflow_actions` (workflows.go:165). */
+    actions: text("workflow_actions").notNull().default("{}"),
     /** Upstream `Enabled bool xorm:"DEFAULT true NOT NULL"`. */
     enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
     /** Upstream `CreatedUnix xorm:"created"`. */
@@ -3311,10 +3328,12 @@ export const protectedTags = sqliteTable(
     /** Upstream column `name_pattern` — a glob, or a REGEX when wrapped in
      *  literal slashes (EnsureCompiledPattern, protected_tag.go:36-45). */
     namePattern: text("name_pattern").notNull(),
-    /** `AllowlistUserIDs []int64 xorm:"JSON TEXT"` (protected_tag.go:27). */
-    allowlistUserIds: text("allowlist_user_ids").notNull().default("[]"),
-    /** `AllowlistTeamIDs []int64 xorm:"JSON TEXT"` (protected_tag.go:28). */
-    allowlistTeamIds: text("allowlist_team_ids").notNull().default("[]"),
+    /** `AllowlistUserIDs []int64 xorm:"JSON TEXT"` (protected_tag.go:27 —
+     *  FN-5: the mapper output is `allowlist_user_i_ds`). */
+    allowlistUserIds: text("allowlist_user_i_ds").notNull().default("[]"),
+    /** `AllowlistTeamIDs []int64 xorm:"JSON TEXT"` (protected_tag.go:28 —
+     *  FN-5: the mapper output is `allowlist_team_i_ds`). */
+    allowlistTeamIds: text("allowlist_team_i_ds").notNull().default("[]"),
     /** Row creation (upstream `CreatedUnix xorm:"created"`). */
     createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
     /** Last edit (upstream `UpdatedUnix xorm:"updated"`). */
@@ -3733,7 +3752,9 @@ export const auditEvents = sqliteTable(
      *  the message carries everything. */
     metadata: text("metadata"),
     ipAddress: text("ip_address"),
-    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** FN-5: the SQL name is upstream's mapper output `timestamp_unix`
+     *  (TimestampUnix `xorm:"INDEX NOT NULL"`, audit_event.go:37). */
+    createdUnix: integer("timestamp_unix", { mode: "timestamp" }).notNull(),
   },
   (t) => [
     // Upstream-matched scalar `Action INDEX` (audit_event.go:24). Serves the
@@ -5151,8 +5172,10 @@ export const reviewState = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     userId: integer("user_id").notNull(),
-    /** The PULL's issue id (upstream PullID). */
-    issueId: integer("issue_id").notNull(),
+    /** The PULL's issue id (upstream `PullID`, review_state.go:44 — FN-5
+     *  landed the mapper output `pull_id`; the VALUE SPACE stays the
+     *  issues.id 1:1 rows, the FN-3 recorded note). */
+    issueId: integer("pull_id").notNull(),
     /** Upstream `CommitSHA` — the head sha the viewed marks were made at. */
     commitSha: text("commit_sha").notNull(),
     /**
@@ -5188,19 +5211,30 @@ export const pullAutoMerges = sqliteTable(
   "pull_auto_merges",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
-    /** The PULL's issue id (upstream PullID). */
-    issueId: integer("issue_id").notNull(),
+    /** The PULL's issue id (upstream `PullID xorm:"UNIQUE"`, automerge.go:19
+     *  — FN-5 landed the mapper output `pull_id`; the VALUE SPACE stays the
+     *  issues.id 1:1 rows, the FN-3 recorded note). */
+    issueId: integer("pull_id").notNull(),
     /** Upstream `DoerID` — who scheduled the auto-merge. */
     doerId: integer("doer_id").notNull(),
-    /** Upstream `SHA` — the head sha the schedule was made at. */
+    /** Upstream `SHA` — the head sha the schedule was made at. Ours-extra,
+     *  recorded addition (the audit's pull_auto_merge row) — stays. */
     sha: text("sha").notNull(),
     /** Upstream `MergeStyle` (merge/rebase/rebase-merge/squash/fast-forward). */
     mergeStyle: text("merge_style").notNull(),
     /** Upstream `DeleteBranchAfterMerge`. */
     deleteBranchAfterMerge: integer("delete_branch_after_merge", { mode: "boolean" }).notNull().default(false),
-    /** Upstream `MergeMessage` (nullable — the box's optional message). */
-    mergeMessage: text("merge_message"),
+    /** Upstream `Message xorm:"LONGTEXT"` (automerge.go:23 — FN-5 landed the
+     *  mapper output `message`; nullable — the box's optional message). */
+    mergeMessage: text("message"),
     createdUnix: integer("created_unix").notNull(),
+    /** Upstream `MergedCommitID xorm:"VARCHAR(64)"` (automerge.go:26 — FN-7):
+     *  the merge's commit id at completion, stamped by the automerge winner
+     *  arm (services/pull/merge.go:265-274's recordMergeIntent). Nullable —
+     *  a row that never completed its merge carries NULL. Kept LAST per the
+     *  ALTER ADD COLUMN append convention (see the repositories table note).
+     *  Ours-extra `sha` above stays the recorded addition. */
+    mergedCommitId: text("merged_commit_id"),
   },
   (t) => [
     uniqueIndex("pull_auto_merges_issue_uq").on(t.issueId),

@@ -1178,8 +1178,18 @@ applies).
   several feed API fields (`description`, `website`, `avatar`) that ours
   renders empty today.
 - **FN-5: the gonic-quirk + project rename batch (one migration).**
-  **STATUS: PLAN DERIVED (2026-11-03, §7.10 + SPEC-0005 §8 — PLAN ONLY;
-  nothing built).** 18 renames (17 columns + 1 table), every member
+  **STATUS: LANDED (2026-11-04, migration `0069_fn5-upstream-column-names`
+  — hand-authored ALTER set per the 0064 --custom precedent: 1 RENAME
+  TABLE + 17 RENAME COLUMN + the protected_branches_repo_rule_uq rebuild,
+  applied local and verified on carried rows (PRAGMA before/after +
+  read-backs under the new names); the 0069 snapshot hand-moved to the
+  post-rename state so the next diff stayed pure — the drizzle-kit
+  interactive-rename flow of §7.10.4 was superseded, its non-TTY fail-loud
+  verdict confirmed. The fixture blast came out 41 lines across 14 test
+  files (the §7.10 table's ~26/6 undershot the cleanup-list entries, the
+  0067 backfill replay, and lifecycle's fourth INSERT) — the SPEC-0005 §8
+  as-built block carries the full landing + FN-7's rider; the rest of this
+  row is the original scope, kept for the cites).** 18 renames (17 columns + 1 table), every member
   re-verified at the pin against the §1 override rule; the per-member
   cite table, the same-class sweep, the blast radius, and the drizzle
   migration-shape verdict are §7.10; the plan is SPEC-0005 §8. The batch
@@ -1245,7 +1255,18 @@ applies).
   UpdateRepoUnitPublicAccess repo_unit.go:374-378; its reader is the
   calculator's everyone ladder, repo_permission.go:231-234). Enum-text
   family (`type`, `anonymous_access_mode`) stays under §2.3.
-- **FN-7: pull_auto_merges completion.** Missing `merged_commit_id`
+- **FN-7: pull_auto_merges completion.** **STATUS: LANDED (2026-11-04,
+  migration `0070_fn7-automerge-merged-commit-id` — pure ADD COLUMN
+  `merged_commit_id` text, nullable, no rebuild (the 0066 DQS audit
+  applied); the stamp arm landed in mergePullRequest's merged section:
+  `MergePullOptions.wasAutoMerged` (upstream automerge.go:262's `true`
+  arg) gates `stampAutoMergeCommit` (services/pull/merge.go:265-274's
+  recordMergeIntent) BEFORE the composed schedule-cleanup delete
+  (:829-838); the consumer passes true; the stamp pin rides
+  pull-automerge.test.ts. clearMergeIntent's schedule-stamp revert
+  (merge.go:289) is a recorded non-port — our engine stamps D1 only after
+  the push landed, so its trigger cannot arise; SPEC-0005 §8.6 as-built).**
+  Missing `merged_commit_id`
   (automerge.go:26 — the recorded merge result); ours-extra `sha` (the
   head-sha gate) stays as a recorded addition. Rides FN-5's renames.
 - **FN-8: commit_statuses completion.** **STATUS: DERIVED (2026-11-04,

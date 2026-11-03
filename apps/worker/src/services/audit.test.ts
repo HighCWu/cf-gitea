@@ -127,7 +127,7 @@ async function seedEvent(fields: {
   impersonatorId?: number;
 }): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO audit_event (action, actor_id, actor_name, impersonator_id, scope_type, scope_id, scope_name, origin, message, created_unix)
+    `INSERT INTO audit_event (action, actor_id, actor_name, impersonator_id, scope_type, scope_id, scope_name, origin, message, timestamp_unix)
      VALUES (?, ?, 'seeder', ?, ?, ?, 'seeded', ?, 'seeded', ?)`,
   )
     .bind(
@@ -416,8 +416,8 @@ describe("findAuditEvents (upstream FindEvents parity)", () => {
     const explainSeq = Date.now();
     const sqlText = `EXPLAIN QUERY PLAN SELECT id FROM audit_event
  WHERE scope_type = ? AND scope_id = ?
-   AND (created_unix < ? OR (created_unix = ? AND id < ?))
- ORDER BY created_unix DESC, id DESC LIMIT 30 /* audit-scope-page-witness-${explainSeq} */`;
+   AND (timestamp_unix < ? OR (timestamp_unix = ? AND id < ?))
+ ORDER BY timestamp_unix DESC, id DESC LIMIT 30 /* audit-scope-page-witness-${explainSeq} */`;
     const plan = await env.DB.prepare(sqlText)
       .bind("repository", "r1", base - 200, base - 200, 1)
       .all<{ detail: string }>();
@@ -433,7 +433,7 @@ describe("findAuditEvents (upstream FindEvents parity)", () => {
     const base = Math.floor(NOW.getTime() / 1000);
     const seq = Date.now();
     const probe = await env.DB.prepare(
-      `EXPLAIN QUERY PLAN SELECT id FROM audit_event WHERE created_unix < ? LIMIT 1 /* audit-retention-probe-witness-${seq} */`,
+      `EXPLAIN QUERY PLAN SELECT id FROM audit_event WHERE timestamp_unix < ? LIMIT 1 /* audit-retention-probe-witness-${seq} */`,
     )
       .bind(base - 90 * DAY)
       .all<{ detail: string }>();

@@ -117,7 +117,7 @@ async function seedBobRepo(slug: string): Promise<void> {
  *  Transfer would (the recipient bob; the doer alice). */
 async function seedPendingTransfer(): Promise<void> {
   await env.DB.prepare(
-    "INSERT INTO repo_transfer (repo_id, doer_id, new_owner_id, created_at) VALUES ('repo-1', ?, ?, unixepoch())",
+    "INSERT INTO repo_transfer (repo_id, doer_id, recipient_id, created_at) VALUES ('repo-1', ?, ?, unixepoch())",
   )
     .bind(aliceId, bobId)
     .run();

@@ -121,7 +121,7 @@ const FIXTURE_TABLES = [
   "milestones",
   "oauth2_application",
   "package_cleanup_rules",
-  "project_columns",
+  "project_board",
   "projects",
   "public_keys",
   "push_mirrors",

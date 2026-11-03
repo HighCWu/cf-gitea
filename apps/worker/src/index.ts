@@ -404,8 +404,9 @@ export default {
     // attachments/:uuid + web.go:1530 /:owner/:repo/attachments/:uuid — the
     // same web mux family as the carve above): without this the 4-/5-segment
     // shapes fall into the repo-scoped branch and the headless engine 404s
-    // them before the attachmentsServingRouter mount sees them (the release
-    // shape parses as a UI page today, the compat shape claims nothing). The
+    // them before the attachmentsServingRouter mount sees them (since TAILS
+    // neither shape parses as a UI page — the wave-41 claim was the deleted
+    // dead twin). The
     // exact shapes only — deeper/shorter tails keep the engine's unclaimed
     // 404, upstream's chi answer for an unmatched param path.
     const isRepoScopedAttachment =

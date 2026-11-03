@@ -37,6 +37,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { createCommitStatus } from "../api/services/commit-status";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { ZERO_OID, branchRef, pullHeadRef } from "../api/services/engine";
+import { stampAutoMergeCommit } from "../api/services/pull-engine";
 import { comments, issueDependencies, PRStatus, protectedBranches, pullAutoMerges, pullRequests, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { CommentType } from "../issues/comment-types";
@@ -227,6 +228,42 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     expect(after.issue.isClosed).toBe(true);
     const rows = await d1().select().from(comments).where(eq(comments.issueId, found.issue.id)).all();
     expect(rows.some((row) => row.type === CommentType.MergePull)).toBe(true);
+  });
+
+  it("FN-7: the winner arm's landing stamps the schedule's merged_commit_id (merge.go:265-274) before consuming it", async () => {
+    // The stamp write is only observable BETWEEN the stamp and the row's
+    // consumption (both inside the winner arm's merged section — the same
+    // two-statement order upstream runs across recordMergeIntent and
+    // MarkAsMerged), so the pin drives the exported writer against a live
+    // schedule row: the nullable column round-trips the merge's commit id,
+    // then the full landing consumes the stamped row and merges the PR.
+    const index = await seedScheduledPr("stampfn7", "merge");
+    const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    // A tip DISTINCT from the shared headOid (already squash-merged by the
+    // green-pr test) — the same first-of-their-content preparation the
+    // blockedpr test uses.
+    const tip = await landChildCommitOnBranch("stampfn7-branch", headOid, "stamp.ts", "// stamp work\n");
+    await d1().update(pullRequests).set({ headSha: tip }).where(eq(pullRequests.id, found.pullRequest.id));
+    await env.REPO.getByName("alice/amrepo").commitApiChange({ ref: pullHeadRef(found.pullRequest.index), expectedOldOid: headOid, newOid: tip });
+    await d1().update(pullAutoMerges).set({ sha: tip }).where(eq(pullAutoMerges.issueId, found.issue.id));
+    const mergeOid = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    await stampAutoMergeCommit(env.DB, found.issue.id, mergeOid);
+    const scheduled = await getScheduledAutoMerge(env.DB, found.issue.id);
+    expect(scheduled?.mergedCommitId).toBe(mergeOid);
+    await createCommitStatus(env.DB, {
+      repoId,
+      sha: tip,
+      state: "success",
+      targetUrl: "https://ci.example.com/build/7",
+      description: "build ok",
+      context: "ci/build",
+      creatorId: alice.id,
+    });
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("merged");
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+    const after = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    expect(after.pullRequest.hasMerged).toBe(true);
+    expect(after.pullRequest.mergedCommitId).not.toBeNull();
   });
 
   it("deletes the schedule of a closed PR and answers not-mergeable for a conflicted one", async () => {

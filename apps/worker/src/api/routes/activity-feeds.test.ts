@@ -464,7 +464,7 @@ describe("activity feeds — orgListActivityFeeds", () => {
 describe("activity feeds — comments and reviews", () => {
   it("renders comment_issue with the embedded comment object", async () => {
     const issue = await env.DB.prepare(
-      'INSERT INTO issues (repo_id, "index", poster_id, title) VALUES (?, 1, 1, \'T\')',
+      'INSERT INTO issues (repo_id, "index", poster_id, name) VALUES (?, 1, 1, \'T\')',
     )
       .bind(REPO_ID)
       .run();
@@ -640,7 +640,7 @@ describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
     await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType: ActionType.CreateIssue, isPrivate: false, content: "1|one" });
     await recordAction(env.DB, { actUserId: neighborId, repoId: ORG_REPO_ID, opType: ActionType.CreateIssue, isPrivate: false, content: "2|two" });
     const issueInsert = await env.DB.prepare(
-      'INSERT INTO issues (repo_id, "index", poster_id, title) VALUES (?, 1, 1, \'T\')',
+      'INSERT INTO issues (repo_id, "index", poster_id, name) VALUES (?, 1, 1, \'T\')',
     )
       .bind(REPO_ID)
       .run();
