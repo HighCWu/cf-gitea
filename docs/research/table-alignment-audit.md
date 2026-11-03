@@ -218,8 +218,8 @@ classes only.
 | `package_blob_upload` | models/packages/package_blob_upload.go:24 | schema.ts:3837 `package_blob_uploads` | drift | hash_state_bytes missing (resumable-upload state); chunk_count extra |
 | `package_cleanup_rule` | models/packages/package_cleanup_rule.go:25 | schema.ts:3788 `package_cleanup_rules` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `commit_status_summary` | models/git/commit_status_summary.go:17 | — | missing-table | no reader in worker (grep 0) |
-| `commit_status` | models/git/commit_status.go:37 | schema.ts:1066 `commit_statuses` | drift | missing context_hash, index |
-| `commit_status_index` | models/git/commit_status.go:330 | — | missing-table | no table; autoincrement id substitutes, documented TODO(SPEC-0005) (api/services/commit-status.ts:88-91,143-145) |
+| `commit_status` | models/git/commit_status.go:37 | schema.ts:1256 `commit_statuses` | drift | missing context_hash, index — DERIVED, port plan staged (§7.12; SPEC-0005 §10 PLAN ONLY); ours cite re-grepped 2026-11-04 (drifts under concurrent schema edits: :1066 as-of-audit → :1250 → :1256; re-grep at landing) |
+| `commit_status_index` | models/git/commit_status.go:330 | — | missing-table | no table; autoincrement id substitutes, documented TODO(SPEC-0005) (api/services/commit-status.ts:88-91,143-145); the FN-8 port plans the table + the max-index seed (§7.12, SPEC-0005 §10 PLAN ONLY) |
 | `lfs_lock` | models/git/lfs_lock.go:21 | schema.ts:1281 `lfs_locks` | drift | ours-extra lower_path (schema.ts:1293, unrecorded case-fold lookup; FN-12 records it); `created` → `created_at` is the FN-13 §7.2 recorded timestamp-name family |
 | `package_blob` | models/packages/package_blob.go:30 | schema.ts:3693 `package_blobs` | intentional-recorded | hash-rename claim WITHDRAWN (§7.8): upstream carries explicit overrides `hash_md5/hash_sha1/hash_sha256/hash_sha512` (package_blob.go:33-36), ours matches verbatim (schema.ts:3700-3704); the real divergence is ours-NULLable md5/sha1/sha512 vs upstream NOT NULL — recorded, SPEC-0016 package_blobs bullet + the schema.ts table comment (WebCrypto has no MD5) |
 | `package` | models/packages/package.go:191 | schema.ts:3613 `packages` | aligned | blanket families only (id / timestamp-name / strictness) |
@@ -714,12 +714,12 @@ Remaining structural cells (unchanged by this expansion):
 - ~~MISSING `patch_quoted`~~ / ~~OURS-EXTRA `patch`~~ — ERRATUM: one parity column `patch` (schema.ts:763 ↔ comment.go:330's tag override); see the expansion header
 - TYPE `removed_assignee`: upstream boolean (models/issues/comment.go:305) vs ours integer (schema.ts:752 (`comments`)) — the §2.4 blanket (storage-equal, cosmetic; census cite :306 corrected — the field sits at :305)
 
-### `commit_status` → `commit_statuses` schema.ts:1066
+### `commit_status` → `commit_statuses` schema.ts:1256
 
 upstream: models/git/commit_status.go (struct `CommitStatus`)
 
-- MISSING `context_hash` (text(varchar64)) — upstream models/git/commit_status.go:50 (`ContextHash`); no ours counterpart
-- MISSING `index` (integer) — upstream models/git/commit_status.go:41 (`Index`); no ours counterpart
+- MISSING `context_hash` (text(varchar64)) — upstream models/git/commit_status.go:50 (`ContextHash`); no ours counterpart. Semantics + port derived (§7.12): the sha1 dedupe key (`HashCommitStatusContext`, commit_status.go:550-552), default-derived from `Context` at write (:526-528) or pre-computed by the Actions caller with the workflow path mixed in (actions/commit_status.go:282, issue #35699); internal-only (no json tag — never rendered on the API or the webhook), its only observable is the latest-per-context grouping it keys (GetLatestCommitStatus :343-359, CountLatestCommitStatus :361-366, ForPairs :369-422, ForRepoCommitIDs :426-472)
+- MISSING `index` (integer) — upstream models/git/commit_status.go:41 (`Index`); no ours counterpart. Semantics + port derived (§7.12): the per-(repo, sha) monotonic creation ordinal — the API `id` field carries it (services/convert/status.go:24 `ID: status.Index`), NOT the row pk; assigned inside the `NewCommitStatus` tx (:497-537) from the `commit_status_index` MAX+1 counter (:125-181, table :329-335)
 
 ### `gpg_key` → `gpg_keys` schema.ts:2373
 
@@ -1239,11 +1239,16 @@ applies).
 - **FN-7: pull_auto_merges completion.** Missing `merged_commit_id`
   (automerge.go:26 — the recorded merge result); ours-extra `sha` (the
   head-sha gate) stays as a recorded addition. Rides FN-5's renames.
-- **FN-8: commit_statuses completion.** Missing `context_hash`
+- **FN-8: commit_statuses completion.** **STATUS: DERIVED (2026-11-04,
+  §7.12 + SPEC-0005 §10 PLAN ONLY) — nothing is built; the port unit's
+  normative plan is staged.** Missing `context_hash`
   (commit_status.go:50) + `index` (commit_status.go:41 — the per-sha
   monotonic index; pairs with the documented `commit_status_index`
   TODO in `api/services/commit-status.ts:88-91`). API-visible: upstream
-  emits the per-sha index as the status `id`.
+  emits the per-sha index as the status `id`
+  (services/convert/status.go:24) — the blast-radius table for that
+  id-semantics flip is §7.12 §3 (the webhook payload keeps the row pk,
+  services/webhook/notifier.go:942 — the asymmetry is upstream's own).
 - **FN-9: the original_author family.** **STATUS: DISPOSITIONED as
   intentional-recorded-absent (2026-11-03, §7.11 + SPEC-0005 §9 RECORD) —
   the row is closed as a record; no migration is planned.** `releases`,
@@ -2092,3 +2097,252 @@ cite-audit); the FN-9 backlog row's cites are corrected in place
 choice and §7.7's open item close on DEFER: the pair stays out of FN-2's
 migration, and the "family carrier" FN-9 named there is this record, not
 a future port unit. The FN-2 port unit's SPEC record cites SPEC-0005 §9.
+
+### 7.12 FN-8 derivation — `commit_statuses.context_hash` + `index`: upstream semantics, ours surface, the id-semantics blast radius, and the port plan (FN-8-prep unit, 2026-11-04)
+
+Closes the FN-8 row's owed derivation. Everything below was re-verified
+with my own eyes at the pin `fc4936884584` (both sides). The plan carrier
+is **SPEC-0005 §10 — PLAN ONLY** (nothing built; the FN-8 row's status
+points there). Zero code was written by this unit.
+
+**1. The upstream derivation — what each column IS, who writes it, who
+reads it.**
+
+- **Struct** (models/git/commit_status.go:37-57): `Index int64
+  xorm:"INDEX UNIQUE(repo_sha_index)"` (:41 — a standalone index PLUS the
+  named composite unique over repo_id, sha, index) and `ContextHash
+  string xorm:"VARCHAR(64) index"` (:50 — standalone index). Neither tag
+  carries NOT NULL (contrast :40 `SHA … VARCHAR(64) NOT NULL`); both are
+  nullable at the tag level — the plan mirrors that posture.
+- **The writer** — `NewCommitStatus` (:497-537) runs inside ONE
+  `db.WithTx` (:506-536): it first calls `GetNextCommitStatusIndex
+  (repoID, sha)` (:508), assigns `opts.CommitStatus.Index = idx` (:520),
+  then inserts. `GetNextCommitStatusIndex` (:125-181) validates the sha
+  (:126-129) and bumps the per-(repo, sha) `max_index` counter in the
+  `commit_status_index` table (:329-335: ID, RepoID `unique(repo_sha)`,
+  SHA `unique(repo_sha)`, MaxIndex `index`) — one arm per dialect
+  (postgres upsert+RETURNING :64-75, mysql :77-94, mssql :96-122) plus
+  the sqlite default (UPDATE-then-INSERT slow path :140-181). **The
+  per-sha ordinal is 1-based MAX+1**: the first status of a sha gets
+  index 1 (postgres arm inserts VALUES(?,?,1) on the miss :65-67; sqlite
+  arm inserts 0 then UPDATE+1 :153-154), so the counter RESTARTS per
+  (repo, sha) — it is not the row pk's global sequence.
+- **ContextHash semantics** (:50 + :546-552): `HashCommitStatusContext`
+  = lowercase hex sha1 of the context string (:550-552). `NewCommitStatus`
+  derives it from `Context` when the caller left it empty (:526-528);
+  callers MAY pre-compute to split same-display-Context rows — the
+  Actions writer mixes the workflow file path in
+  (`HashCommitStatusContext(ctxName + "\x00" + workflowID)`,
+  services/actions/commit_status.go:282, issue #35699, with the
+  legacy-hash adoption reader :288-302 that adopts the pre-#35699
+  Context-only hash from an in-flight Actions-owned row so the stale
+  pending status still gets superseded). **The column is
+  internal-only**: no json tag anywhere on the struct, absent from the
+  API wire (`structs.CommitStatus`, modules/structs/status.go:13-32) and
+  from the webhook payload (`CommitStatusPayload`,
+  modules/structs/hook.go:647-673) — its ONLY observable is the
+  latest-per-context grouping it keys, plus the internal adoption-arm
+  comparison.
+- **The reader surfaces**:
+  - API serializer: `ToCommitStatus` sets `ID: status.Index`
+    (services/convert/status.go:24) — **the REST `id` field IS the
+    per-sha index, not the row pk**.
+  - List ordering: `CommitStatusOptions.ToOrders` (:312-327) — every
+    order terminates in `` `index` `` (default
+    `` created_unix DESC, `index` DESC `` with the load-bearing comment
+    "timestamps have 1s resolution, `index` keeps paging stable"
+    :325); the inverted names (`leastindex` → `` `index` DESC ``,
+    `highestindex` → `` `index` ASC ``, :320-323) are pinned-faithful in
+    ours (api/services/commit-status.ts:16-18). Upstream backtick-quotes
+    `` `index` `` in every SQL surface (:315-325, :346, :357) — SQLite
+    reserved word, our port quotes it identically.
+  - Latest-per-context reads: `GetLatestCommitStatus` (:343-359 —
+    `` max(`index`) `` GROUP BY context_hash, then fetch rows by those
+    indices), `CountLatestCommitStatus` (:361-366), `ForPairs` (:369-422),
+    `ForRepoCommitIDs` (:426-472). Pin observation: the second fetch in
+    `GetLatestCommitStatus` carries NO ORDER BY (:357) — the emitted
+    array order is engine-dependent; ours orders desc (a pre-existing
+    recorded choice, commit-status.ts:229) — state parity is unaffected
+    (`Combine` is order-insensitive; our combined arm renders no
+    target_url), left as-is.
+  - PR merge-box rollup: `routers/web/repo/pull.go:413-414`
+    (GetLatestCommitStatus at the PR head) + `MergeRequiredContextsCommitStatus`
+    (services/pull/commit_status.go:19-71, the GetLatestCommitStatus
+    caller :142) over the raw latest-per-context rows; the dashboard/
+    commit-list surfaces read the same raw rows (web view.go:142,
+    commit.go:386 — §3.3's cites).
+  - **The webhook payload `id` is the ROW PK** — `ID: status.ID`
+    (services/webhook/notifier.go:942, field hook.go:659). Upstream
+    itself carries the asymmetry: REST id = Index, webhook id = pk.
+- **Upstream's own backfill precedents** (both shipped as migrations):
+  - context_hash: `AddCommitStatusContext` (modelmigration/v1_10/v88.go:18-66)
+    — Sync the column, then backfill `hashContext(status.Context)` in
+    id-ordered batches (the sha1-of-Context default, exactly what
+    NewCommitStatus would have written).
+  - the counter table: `AddTableCommitStatusIndex`
+    (modelmigration/v1_16/v195.go:16-46) — create `commit_status_index`,
+    then seed `max(commit_status.index) GROUP BY repo_id, sha` so the
+    counter RESUMES from the max existing index per sha.
+
+**2. Ours surface (working-tree, 2026-11-04).**
+
+- Schema: `commit_statuses` sits at schema.ts:1256-1279 (working-tree
+  2026-11-04; the audit-time cite :1066 drifted and the block moves
+  under concurrent schema edits — re-grep at landing; census row
+  re-cited) — global
+  autoincrement `id` pk, NO `context_hash`, NO `index`; the only index is
+  `commit_statuses_repo_sha_idx (repo_id, sha)` (schema.ts:1274 at the
+  same working-tree snapshot).
+- The REST id: `id: row.id` (api/services/commit-status.ts:97) —
+  **divergent from upstream's `ID: status.Index`**. The TODO the audit
+  row names, verbatim: "`id` carries the per-sha status INDEX (our D1
+  table has no index column — the autoincrement id takes its place;
+  TODO(SPEC-0005): commit_status_index)" (commit-status.ts:87-93), and
+  the insert-side twin "upstream's separate `commit_status_index` counter
+  (per-sha monotonic index) has no D1 counterpart yet — the autoincrement
+  id doubles as the sort/aggregation key (module comment)"
+  (:142-147). The module comment records the standing reduction: "`context`
+  groups 1:1 with its hash, and the global autoincrement `id` is
+  order-equivalent to the per-sha index within one (repo, sha)"
+  (:27-30).
+- Dedupe/lookup shape: `latestCommitStatuses` groups by the RAW
+  `context` with `max(id)` per group (:210-238) — where upstream groups
+  by context_hash with `` max(`index`) ``.
+- The webhook emit: `routes/statuses.ts:313-325` builds
+  CommitStatusPayload with `id: row.id` (:318) — **already
+  upstream-faithful** (upstream webhook id is the pk too); NO change.
+- The second writer: Actions `createWorkflowCommitStatus`
+  (services/actions/trigger.ts:2160-2197) — dedupes by
+  `eq(context, ctxName)` + `orderBy(desc(id))` (:2166-2168) and inserts
+  without hash/index; its module header discloses the reduction
+  (:119-121: two same-named workflows sharing a job name supersede each
+  other here where upstream keeps both; the legacy-adoption arm
+  "unreachable").
+- Downstream consumers of the reads (no direct id use):
+  `mergeRequiredContextsCommitStatus` (services/branch-protection.ts:830-906,
+  the merge gate) and its auto-merge twin (services/pull-automerge.ts:198-262,
+  pages latestCommitStatuses at :233-245); the repo-list
+  `latest_commit_status` (ui/pages/search-aux.ts:586); the repo-delete
+  cascade (repos/service.ts:1106).
+
+**3. The id-semantics blast-radius table — every pin the flip touches.**
+
+| surface | ours today | after the port | upstream at the pin | pinned tests |
+|---|---|---|---|---|
+| REST `CommitStatus.id` (POST 201 body; list items; `combined.statuses[].id`) | row pk (commit-status.ts:97) | per-sha index (the flip) | Index (convert/status.go:24) | statuses.test.ts:184,189 assert type-only (`typeof === "number"`, `Number.isInteger`) — survive; NEW pins: first status of a sha → 1, ordinal increments, RESTARTS across shas, `id` ≠ row pk |
+| Webhook `CommitStatusPayload.id` | row pk (statuses.ts:318) | row pk — UNCHANGED | pk (notifier.go:942, hook.go:659) | statuses.test.ts:630-641 asserts the field SET (id present, emit test :609) — survives; NEW pin: webhook id = pk ≠ REST id (upstream's own asymmetry) |
+| List sort orders (`sort=` five values + default) | `id` as the index stand-in (commit-status.ts:39-56) | column `index` (same observable through the writer; raw seeds must carry index) | ToOrders :312-327 (inverted names :320-323 kept) | statuses.test.ts:296-312 (default order) + :314-334 (the `it.each` sort matrix) seed RAW rows whose order relies on "ids a<b<c" doubling as index order — MUST-EDIT (seed `index`) |
+| Latest-per-context grouping (combined + gates) | `max(id)` per raw `context` (commit-status.ts:219-223) | `` max(`index`) `` per `context_hash` | :343-359 | combined tests statuses.test.ts:421-433 (shape), :444-468 (precedence matrix), :470-483 (latest-per-context) seed raw rows — MUST-EDIT (seed hash + index); branch-protection.test.ts:476,606 raw seeds — MUST-EDIT (NULL context_hash would collapse ALL rows into one NULL group under GROUP BY, and NULL `index` breaks max) |
+| Combined `total_count` / `X-Total-Count` | count of context groups (:232-237) | count of context_hash groups | :361-366 | same fixtures as above |
+| Actions writer dedupe | raw context + identical-state short-circuit (trigger.ts:2166-2172) | mixed hash group + legacy-adoption arm + counter | actions/commit_status.go:282-302 | trigger.test.ts:1678-1697 (identical-state short-circuit; onlyReplace) — survive via the writer; NEW pin: two same-named workflows (different paths) now keep separate groups (#35699 observable) |
+| Merge gates (branch-protection / pull-automerge) | consume latestCommitStatuses rows | unchanged call sites — the swap is service-internal; observable grouping identical for API-created rows | pull/commit_status.go:19-71,142 | branch-protection.test.ts fixtures edited (above); pull-automerge.test.ts builds row objects in memory (no D1 seeds) — verify shapes gain hash/index |
+| Repo-list `latest_commit_status` (UI search-aux) | latestCommitStatuses (search-aux.ts:586) | unchanged call site | view surface | no direct id pins (grep: no commitStatuses hits in pages-wave18.test.ts) |
+| Repo delete cascade | deletes commit_statuses rows (repos/service.ts:1106) | + delete commit_status_indexes rows for the repo | upstream cascades via FK-free per-table deletes | schema.test.ts / repository.test.ts delete sweep — extend |
+
+Pipes note: `status` webhook deliveries carry no `context_hash`/
+`index` — the wire payloads' field SETS are unchanged on every surface
+(REST contract field set pinned at statuses.test.ts:175; webhook field
+set at :630-641, inside the emit test :609).
+
+**4. The migration shape (drizzle-kit, one generated migration +
+one application-side hash pass).**
+
+- ADD COLUMN x2 on `commit_statuses`, mirroring the tags' nullable
+  posture: `context_hash` VARCHAR(64) + `index` INTEGER (the column NAME
+  is upstream's `index` — a SQLite reserved word: drizzle quotes every
+  identifier, and all raw SQL in the port quotes it like upstream's own
+  backticks; schema property `index` needs no rename under the §7.10
+  Go-field-maps-to-property convention). Plain `ALTER TABLE ADD COLUMN`
+  — no table rebuild.
+- Backfill `index` (pure SQL — D1-doable): per-sha 1-based creation
+  ordinal, correlated-count form,
+  `` UPDATE commit_statuses SET "index" = (SELECT COUNT(*) FROM commit_statuses c2 WHERE c2.repo_id = commit_statuses.repo_id AND c2.sha = commit_statuses.sha AND c2.id <= commit_statuses.id) ``
+  (order-equivalent to `ROW_NUMBER() OVER (PARTITION BY repo_id, sha
+  ORDER BY id ASC)`). **Derivation**: upstream's index IS the 1-based
+  per-sha creation ordinal (:497-521 + counter :329-335; first row = 1,
+  :65-67/:153-154), and within one (repo, sha) creation order ascends
+  with our global autoincrement id — the id is the creation-order oracle
+  our table already carries, exactly the reduction the module comment
+  records (commit-status.ts:27-30); created_unix cannot do this job
+  (1-second resolution — upstream's own reason for the column, :325).
+  Cost: O(n²) worst-case per sha group; commit_statuses tables are small
+  per sha (CI statuses), acceptable for a one-shot migration.
+- Seed the NEW `commit_status_indexes` table (name per the §7.5
+  pluralization family — upstream singular `commit_status_index`, the
+  same recorded pattern that made `commit_status` → `commit_statuses`):
+  `INSERT … SELECT repo_id, sha, max(index) … GROUP BY repo_id, sha` —
+  **upstream's own v195 seed shape** (v195.go:39-44), so the counter
+  resumes instead of restarting.
+- Backfill `context_hash` — NOT expressible as pure D1 SQL (SQLite core
+  has no sha1(); the value MUST be sha1-hex because the writers compute
+  exactly that — a different backfill function would split dedupe groups
+  between migrated and new rows). Two arms, plan takes (b): (a) a
+  self-host one-off script (wrangler d1 execute cannot compute sha1
+  either — it would have to be a Worker-invoked pass); **(b) the
+  opportunistic lazy repair** — every writer path computes
+  `sha1(context)` (WebCrypto `digest("SHA-1")` is available in Workers)
+  for new rows, and the read path repairs NULL-hash rows it encounters
+  (bounded by page size, `ctx.waitUntil` for the UPDATEs) — the same
+  opportunistic-trigger posture §3.3 records for commit_status_summary.
+  Convergence note: unrepaired rows keep grouping under SQL's NULL group
+  (SQLite GROUP BY treats NULLs as one group), so an unrepaired row
+  dedupes exactly as the pre-port raw-context rows do — observable
+  behavior degrades to today's, never worse.
+- Enforcement after backfill: `CREATE UNIQUE INDEX
+  commit_statuses_repo_sha_index_uq ON commit_statuses (repo_id, sha,
+  "index")` + standalone `CREATE INDEX … ( "index" )` and `CREATE INDEX
+  … (context_hash)` — the three structures upstream's tags declare
+  (:41 composite UNIQUE + standalone INDEX; :50 context_hash index).
+  Index-FORM, not table-constraint: D1 `ADD COLUMN` cannot add table
+  constraints, and a SQLite UNIQUE table constraint over existing+new
+  columns would force a table rebuild (the FN-6/0066 lesson); SQLite
+  treats a unique index identically for enforcement, and NULLs are
+  distinct in unique indexes, so un-backfilled rows never violate.
+- Gate: post-generate eyeball (ALTERs + CREATE INDEX/TABLE only, no
+  DROP COLUMN), `pnpm db:migrate:local` against a seeded dev D1, and the
+  `index` backfill verified against the per-sha row counts.
+
+**5. The writer threading + the flips (the port unit's work list).**
+
+- `commit_status_indexes` drizzle table (mirrors CommitStatusIndex
+  :329-335): autoincr id, repoId, sha, maxIndex, `unique(repo_id, sha)`.
+- Index allocation: drizzle-native upsert —
+  `.insert(commitStatusIndexes).values({…, maxIndex: 1})
+  .onConflictDoUpdate({ target: [repoId, sha], set: { maxIndex: sql`max_index + 1` } })
+  .returning()` — the POSTGRES arm's shape (:64-75), one statement,
+  atomic under SQLite's write lock; counter + insert ride ONE D1 batch
+  (upstream's single WithTx, :506-536); a crash between the pair burns
+  an ordinal, harmless (upstream identical).
+- API POST (routes/statuses.ts:384-392 + createCommitStatus): allocate,
+  store `index` + `contextHash = sha1(context)`; the response renders
+  `id: row.index` (commit-status.ts:97 flips — the TODO block :87-93 and
+  :142-147 dissolve into parity notes).
+- Reads: `commitStatusOrderBy` swaps id → index (:39-56);
+  `latestCommitStatuses` swaps to max(index) per context_hash (:210-238).
+- Actions writer (trigger.ts:2160-2197): compute the mixed hash
+  `sha1(ctxName + "\x00" + workflowId)` (actions/commit_status.go:282), add the
+  legacy-adoption arm (:288-302 — adopt when the latest row for the sha
+  carries the legacy hash, same context, and creator is the Actions
+  user), allocate `index`, keep the identical-state short-circuit per
+  mixed-hash group. The :119-121 reduction disclosure is deleted with
+  the column landing.
+- Repo delete sweep gains the new table (repos/service.ts:1106).
+- Test battery (names, no code): "POST assigns per-sha ordinals 1,2,…;
+  a second sha restarts at 1"; "REST id differs from the webhook
+  payload id for the same row"; "sort=highestindex orders by index ASC
+  with seeded indices (not ids)"; "latest-per-context groups by
+  context_hash, not raw context"; "backfill migration reconstructs
+  ordinals from seed order (fixture: 3 rows, shuffled ids within one
+  second)"; "counter seed resumes at max(index)"; "actions: two
+  same-named workflows keep separate latest rows at one sha";
+  "actions: a pre-port legacy-hash row is adopted and superseded".
+
+**6. Census-owner notes.** Census row 221 re-cited (schema.ts:1066 →
+:1256, working-tree 2026-11-04; the ours-cite moves under concurrent
+schema edits — re-grep at landing) and carries the DERIVED pointer; row
+222 (commit_status_index) carries the plan pointer; the §4 subsection is
+expanded with both columns' semantics. The port unit flips rows
+221 (`drift` → `aligned`) and 222 (`missing-table` → `aligned`) at
+landing, and dissolves the TODO cites in row 222. SPEC-0005 §10 is the
+normative plan carrier; SPEC-0004 §2.4's status rows (:270-272) get the
+id-semantics note at port time.
