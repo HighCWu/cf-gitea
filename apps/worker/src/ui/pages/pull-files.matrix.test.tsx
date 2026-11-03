@@ -54,6 +54,7 @@ import { renderToString } from "hono/jsx/dom/server";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { issues, PRStatus, protectedBranches, pullRequests, repositories, reviewState, users } from "../../db/schema";
+import { findIssueByRepoAndIndex } from "../../api/services/issues";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { authorize } from "../../git-http/authorize";
 import { gitHttpGate, settleCreatingRepo } from "../../git-http/gate";
@@ -67,7 +68,17 @@ import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
-import { diffFileViews, loadPullFilesData, renderPullFilesPage, updateViewedFilesFromWeb, type PullFilesData } from "./pull-files";
+import {
+  diffFileViews,
+  HAS_CHANGED,
+  loadPullFilesData,
+  renderPullFilesPage,
+  UNVIEWED,
+  updateViewedFilesFromWeb,
+  VIEWED,
+  type PullFilesData,
+  type ViewedFileState,
+} from "./pull-files";
 
 // wave-129 full-run contention budget: this file's beforeAll seeding (the
 // receive-flow w111* fixture family) measured a 4.68s hook share of the 30s
@@ -1612,53 +1623,89 @@ describe("w111 viewed-files round-trip (the review_state seam)", () => {
     return found;
   }
 
-  async function storedRows(userId: number): Promise<{ commitSha: string }[]> {
+  async function storedRows(userId: number): Promise<{ commitSha: string; updatedFiles: string }[]> {
     return drizzle(env.DB)
-      .select({ commitSha: reviewState.commitSha })
+      .select({ commitSha: reviewState.commitSha, updatedFiles: reviewState.updatedFiles })
       .from(reviewState)
       .where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, viewIssueId)))
       .all();
   }
 
-  it("stamps the whole-PR mark from the official bundle's JSON body and reads it back current", async () => {
+  it("stores the posted per-file entry from the official bundle's JSON body and reads the map back", async () => {
     const { issue, pullRequest } = await prRowOf();
     const ctx = writeCtx(JSON.stringify({ files: { "a.ts": true }, headCommitSHA: HEAD }), "application/json");
     const outcome = await updateViewedFilesFromWeb({ c: ctx, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser });
     expect(outcome).toEqual({ outcome: "ok" });
-    // The row: one (user, pull) row at the posted sha.
-    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD }]);
-    // The loader (viewer passed) reads it CURRENT; the viewerless call — the
-    // mounted GET until the fold passes the viewer — reads null.
+    // The row: one (user, pull) row at the posted sha, the entry stored in
+    // upstream's numeric ViewedState shape (review_state.go's JSON map).
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD, updatedFiles: '{"a.ts":2}' }]);
+    // The loader (viewer passed) reads the row; this fixture's PR has no
+    // engine refs, so the diff is empty and the resolved per-file record is
+    // empty over it; the viewerless call — the mounted GET until the fold
+    // passes the viewer — reads null.
     const withViewer = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), viewRepoId, viewIndex, viewerUser);
-    expect(withViewer!.viewed).toEqual({ commitSha: HEAD, current: true });
+    expect(withViewer!.viewed).toEqual({ commitSha: HEAD, current: true, files: {} });
     const noViewer = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), viewRepoId, viewIndex);
     expect(noViewer!.viewed).toBeNull();
   });
 
-  it("re-marking overwrites the sha (the upsert); an empty-map body defaults to the head sha", async () => {
+  it("merges a same-sha delta (mergeFiles' per-key override) and an empty map leaves the stored entries alone", async () => {
     const { issue, pullRequest } = await prRowOf();
-    const ctx = writeCtx(JSON.stringify({ files: {} }), "application/json");
-    expect(await updateViewedFilesFromWeb({ c: ctx, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
-    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD }]); // defaulted from pr.headSha
+    // Same sha, a second file + the first flipped off: per-key override.
+    const delta = writeCtx(JSON.stringify({ files: { "a.ts": false, "b.ts": true }, headCommitSHA: HEAD }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: delta, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD, updatedFiles: '{"a.ts":0,"b.ts":2}' }]);
+    // An empty map (the {files:{}} post) advances nothing in the map — the
+    // stored entries survive (upstream inserts/updates the row either way).
+    const empty = writeCtx(JSON.stringify({ files: {} }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: empty, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD, updatedFiles: '{"a.ts":0,"b.ts":2}' }]);
   });
 
-  it("the all-false map clears the row; the urlencoded form marks and unmarks", async () => {
+  it("inherits the map across a sha advance (UpdateReviewState's previous-row seed) and the cursor moves", async () => {
     const { issue, pullRequest } = await prRowOf();
-    const unmark = writeCtx(JSON.stringify({ files: { "a.ts": false }, headCommitSHA: HEAD }), "application/json");
-    expect(await updateViewedFilesFromWeb({ c: unmark, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
-    expect(await storedRows(viewerUser.id)).toHaveLength(0);
+    const advance = writeCtx(JSON.stringify({ files: { "b.ts": false }, headCommitSHA: STALE }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: advance, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    // The stored map seeds the new-sha row (a.ts:0 kept, b.ts flipped 2→0);
+    // upstream keeps per-commit rows, our cursor updates in place — the
+    // recorded single-row adaptation (the FN-3 SPEC).
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: STALE, updatedFiles: '{"a.ts":0,"b.ts":0}' }]);
+  });
+
+  it("the urlencoded form expands to the whole diff (no engine refs here → no entries) and never deletes the row", async () => {
+    const { issue, pullRequest } = await prRowOf();
     const form = writeCtx(`head_commit_sha=${HEAD}&viewed=true`, "application/x-www-form-urlencoded");
     expect(await updateViewedFilesFromWeb({ c: form, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
-    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD }]);
+    // The mark arm resolves the diff's full path set; this fixture's range is
+    // unreadable (no refs), so the row advances with the inherited map —
+    // never an error page. Real-diff expansion is the w111 engine suite.
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD, updatedFiles: '{"a.ts":0,"b.ts":0}' }]);
+    // The unmark form: same store shape (entries, not a delete — upstream
+    // never deletes rows on uncheck).
     const formOff = writeCtx("viewed=false", "application/x-www-form-urlencoded");
     expect(await updateViewedFilesFromWeb({ c: formOff, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
-    expect(await storedRows(viewerUser.id)).toHaveLength(0);
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD, updatedFiles: '{"a.ts":0,"b.ts":0}' }]);
   });
 
-  it("maps the refusals: malformed JSON 400, non-pull redirect", async () => {
+  it("maps the refusals: Go-decode-strict 400s, malformed JSON 400, non-pull redirect", async () => {
     const { issue, pullRequest } = await prRowOf();
     const bad = writeCtx("{not json", "application/json");
     expect(await updateViewedFilesFromWeb({ c: bad, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({
+      outcome: "bad-request",
+    });
+    // Upstream decodes into {files: map[string]bool, headCommitSHA: string}
+    // (pull_review.go:297-300): a non-bool value or a non-string sha is a
+    // decode error — the same 400s.
+    const nonBool = writeCtx(JSON.stringify({ files: { "a.ts": "yes" } }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: nonBool, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({
+      outcome: "bad-request",
+    });
+    const nonStringSha = writeCtx(JSON.stringify({ headCommitSHA: 5 }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: nonStringSha, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({
+      outcome: "bad-request",
+    });
+    const nonObjectFiles = writeCtx(JSON.stringify({ files: ["a.ts"] }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: nonObjectFiles, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({
       outcome: "bad-request",
     });
     // The non-pull twin redirects onto the issues family (getPullInfo's arm).
@@ -1671,9 +1718,10 @@ describe("w111 viewed-files round-trip (the review_state seam)", () => {
   });
 
   it("renders the viewed summary, the mark form and the per-file checkboxes from the loaded data", async () => {
-    // A stale row (a push moved the head past the mark) → summary 0 / N and
-    // the mark form; per-file labels unchecked.
-    const staleHtml = await renderWithRow(STALE);
+    // A stale row (a push moved the head past the mark) with an empty map —
+    // the migrated legacy cursor row — → summary 0 / N and the mark form;
+    // per-file labels unchecked.
+    const staleHtml = await renderWithRow(STALE, {});
     expect(staleHtml).toContain("0 / 1 files viewed");
     expect(staleHtml).toContain('id="viewed-files-summary" value="0" max="1"');
     expect(staleHtml).toContain(`<form action="/w111viewer/viewrepo/pulls/${viewIndex}/viewed-files" method="post">`);
@@ -1682,15 +1730,21 @@ describe("w111 viewed-files round-trip (the review_state seam)", () => {
     expect(staleHtml).toContain(`name="head_commit_sha" value="${HEAD}"`);
     expect(staleHtml).toContain('name="viewed" value="true"');
     expect(staleHtml).toContain('class="viewed-file-form unselectable"');
-    // A current row → the full count, NO mark form, checked labels.
-    const currentHtml = await renderWithRow(HEAD);
+    // A CURRENT row marks only the MAP's viewed entries: an empty map still
+    // renders the mark form (anything left to mark), the checkbox unchecked.
+    const currentEmptyHtml = await renderWithRow(HEAD, {});
+    expect(currentEmptyHtml).toContain("0 / 1 files viewed");
+    expect(currentEmptyHtml).toContain(`action="/w111viewer/viewrepo/pulls/${viewIndex}/viewed-files"`);
+    expect(currentEmptyHtml).toContain('class="viewed-file-form unselectable"');
+    // The viewed entry → the full count, NO mark form, the checked label.
+    const currentHtml = await renderWithRow(HEAD, { "f2.txt": VIEWED });
     expect(currentHtml).toContain("1 / 1 files viewed");
     expect(currentHtml).not.toContain(`action="/w111viewer/viewrepo/pulls/${viewIndex}/viewed-files"`);
     expect(currentHtml).toContain("viewed-file-form unselectable viewed-file-checked-form");
     expect(currentHtml).toContain(`data-headcommit="${HEAD}"`);
     expect(currentHtml).toContain('type="checkbox" name="f2.txt" autocomplete="off" checked=""');
     // Anonymous renders neither the summary nor the labels.
-    const anonData = await loadedData({ kind: "anonymous" }, null);
+    const anonData = await loadedData({ kind: "anonymous" }, null, null);
     const anonHtml = renderPullFilesPage({ ctx: pageCtx({ kind: "anonymous" }), data: anonData });
     expect(anonHtml).not.toContain("viewed-files-summary");
     expect(anonHtml).not.toContain("viewed-file-form");
@@ -1702,15 +1756,17 @@ describe("w111 viewed-files round-trip (the review_state seam)", () => {
     return { viewer, origin: "https://test.local", assets: shellAssetsFromManifest(manifest), repo: viewRepoRow! };
   }
 
-  /** The loader's data with the review_state row pinned to `rowSha` and one
-   *  fabricated text file (the engine-backed diff renders are the route
-   *  suites' job). */
-  async function loadedData(viewer: Viewer, rowSha: string | null): Promise<PullFilesData> {
+  /** The loader's data with the review_state row pinned to `rowSha` (+ map)
+   *  and one fabricated text file (the engine-backed diff renders are the
+   *  route suites' job). The fabricated path joins the resolved per-file
+   *  record the way the real loader would have resolved it over the rendered
+   *  diff (the real engine diff here is empty — no refs). */
+  async function loadedData(viewer: Viewer, rowSha: string | null, map: Record<string, ViewedFileState> | null): Promise<PullFilesData> {
     await prRowOf();
     const userId = viewer.kind === "user" ? viewer.id : -1;
     await drizzle(env.DB).delete(reviewState).where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, viewIssueId)));
     if (rowSha !== null) {
-      await drizzle(env.DB).insert(reviewState).values({ userId, issueId: viewIssueId, commitSha: rowSha, updatedUnix: T0 });
+      await drizzle(env.DB).insert(reviewState).values({ userId, issueId: viewIssueId, commitSha: rowSha, updatedFiles: JSON.stringify(map ?? {}), updatedUnix: T0 });
     }
     const loaded = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), viewRepoId, viewIndex, viewer);
     if (loaded === null) throw new Error("fixture loader returned null");
@@ -1725,13 +1781,164 @@ describe("w111 viewed-files round-trip (the review_state seam)", () => {
         hunks: [],
       },
     ]);
-    return { ...loaded, files, totalAddition: 1, totalDeletion: 0 };
+    const viewed =
+      loaded.viewed === null
+        ? null
+        : { ...loaded.viewed, files: { ...loaded.viewed.files, "f2.txt": (map ?? {})["f2.txt"] ?? UNVIEWED } };
+    return { ...loaded, files, totalAddition: 1, totalDeletion: 0, viewed };
   }
 
-  async function renderWithRow(rowSha: string): Promise<string> {
-    const data = await loadedData(viewerUser, rowSha);
+  async function renderWithRow(rowSha: string, map: Record<string, ViewedFileState>): Promise<string> {
+    const data = await loadedData(viewerUser, rowSha, map);
     return renderPullFilesPage({ ctx: pageCtx(viewerUser), data });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The FN-3 per-file map over the REAL engine (ADR-0007): the write matrix and
+// the read ladder (SyncUserSpecificDiff's resolution) run against the w111
+// topic pull — real refs/pull/N/head, so the seam's no-JS expansion and the
+// loader's changed-since-cursor computation both hit the actual engine.
+// ---------------------------------------------------------------------------
+
+describe("w111 FN-3 per-file viewed map (write matrix + read ladder over the real diff)", () => {
+  const viewerUser = { kind: "user" as const, id: 0, username: "w111viewer", isAdmin: false };
+  let fnRepoId = "";
+  let fnRepoRow: UiContext["repo"];
+
+  beforeAll(async () => {
+    if ((await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "w111viewer")).get()) === undefined) {
+      const seeded = await seedVerifiedUser({ username: "w111viewer" });
+      viewerUser.id = seeded.id;
+    } else {
+      viewerUser.id = (await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "w111viewer")).get())!.id;
+    }
+    fnRepoId = await repoIdOf("w111pull");
+    const rows = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, fnRepoId)).all();
+    fnRepoRow = rows[0];
+  });
+
+  /** The topic pull's rows (the seeded open PR: main → topic, real head ref).
+   *  The seed pushes never fire the PR-head sync (created refs take the
+   *  create family), so the row's cached head_sha is unset — pinned here to
+   *  the real tip, the state a production sync leaves. */
+  async function topicRows() {
+    const found = await findIssueByRepoAndIndex(env.DB, fnRepoId, w().pull.topic);
+    if (found === null || !found.isPull) throw new Error("w111 topic fixture missing");
+    const pr = await findPullRequestByIndex(env.DB, fnRepoId, w().pull.topic);
+    if (pr === null) throw new Error("w111 topic PR row missing");
+    if (pr.pullRequest.headSha !== w().topicTip) {
+      await drizzle(env.DB)
+        .update(pullRequests)
+        .set({ headSha: w().topicTip })
+        .where(and(eq(pullRequests.id, pr.pullRequest.id), eq(pullRequests.hasMerged, false)));
+    }
+    return { issue: found, pr: pr.pullRequest };
+  }
+
+  function writeCtxFor(body: string, contentType: string, index: number) {
+    const request = new Request(`https://test.local/${OWNER}/w111pull/pulls/${index}/viewed-files`, {
+      method: "POST",
+      headers: { "content-type": contentType },
+      body,
+    });
+    return new Context<{ Bindings: Env }>(request, { env });
+  }
+
+  async function fnRows(): Promise<{ commitSha: string; updatedFiles: string }[]> {
+    const { issue } = await topicRows();
+    return drizzle(env.DB)
+      .select({ commitSha: reviewState.commitSha, updatedFiles: reviewState.updatedFiles })
+      .from(reviewState)
+      .where(and(eq(reviewState.userId, viewerUser.id), eq(reviewState.issueId, issue.id)))
+      .all();
+  }
+
+  async function fnClear(): Promise<void> {
+    const { issue } = await topicRows();
+    await drizzle(env.DB).delete(reviewState).where(and(eq(reviewState.userId, viewerUser.id), eq(reviewState.issueId, issue.id)));
+  }
+
+  it("the no-JS form expands to the diff's full path set (both files) and the unmark form writes the UNVIEWED entries", async () => {
+    await fnClear();
+    const { issue, pr } = await topicRows();
+    const mark = writeCtxFor(`head_commit_sha=${w().topicTip}&viewed=true`, "application/x-www-form-urlencoded", w().pull.topic);
+    expect(await updateViewedFilesFromWeb({ c: mark, repo: fnRepoRow!, issue, pr, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    // The range main...topic adds f2.txt + f3.txt — both stored VIEWED.
+    expect(await fnRows()).toEqual([{ commitSha: w().topicTip, updatedFiles: '{"f2.txt":2,"f3.txt":2}' }]);
+    const unmark = writeCtxFor(`head_commit_sha=${w().topicTip}&viewed=false`, "application/x-www-form-urlencoded", w().pull.topic);
+    expect(await updateViewedFilesFromWeb({ c: unmark, repo: fnRepoRow!, issue, pr, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    // The unmark form marks everything UNVIEWED — entries written, the row
+    // persists (upstream never deletes review_state rows on uncheck).
+    expect(await fnRows()).toEqual([{ commitSha: w().topicTip, updatedFiles: '{"f2.txt":0,"f3.txt":0}' }]);
+  });
+
+  it("the read ladder resolves per-file states: subset marks, an advance flips the changed file to has-changed", async () => {
+    await fnClear();
+    const { issue, pr } = await topicRows();
+    // 1. The subset post: only f2.txt viewed at the current head.
+    const subset = writeCtxFor(JSON.stringify({ files: { "f2.txt": true }, headCommitSHA: w().topicTip }), "application/json", w().pull.topic);
+    expect(await updateViewedFilesFromWeb({ c: subset, repo: fnRepoRow!, issue, pr, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    // Upstream stores only the POSTED keys (mergeFiles merges the subset into
+    // the stored map; absent paths get no entry — the read treats them
+    // UNVIEWED).
+    expect(await fnRows()).toEqual([{ commitSha: w().topicTip, updatedFiles: '{"f2.txt":2}' }]);
+    const current = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), fnRepoId, w().pull.topic, viewerUser);
+    expect(current!.viewed!.commitSha).toBe(w().topicTip);
+    expect(current!.viewed!.current).toBe(true);
+    // f2 VIEWED, f3 UNVIEWED — the per-file map, not the whole-PR shade.
+    expect(current!.viewed!.files).toEqual({ "f2.txt": VIEWED, "f3.txt": UNVIEWED });
+
+    // 2. The advance: the reviewer posts at a NEW head sha (upstream's new
+    //    row, our inherited cursor). tips[4] (the binarm tip) changed f2.txt
+    //    (deleted) but not f3.txt relative to tips[3] — wait, the PR head
+    //    stays tips[3]; the row advances to tips[4], so the read computes the
+    //    changed set tips[4]→tips[3] = f2.txt + f2-renamed.txt + bin/logo.bin:
+    //    the stored VIEWED f2 degrades to HAS_CHANGED, f3 (inherited VIEWED)
+    //    keeps VIEWED.
+    const inherit = writeCtxFor(JSON.stringify({ files: { "f3.txt": true }, headCommitSHA: w().binTip }), "application/json", w().pull.topic);
+    expect(await updateViewedFilesFromWeb({ c: inherit, repo: fnRepoRow!, issue, pr, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    // The seed: the row's map ({f2:2, f3:0}) merged with the posted {f3:2} at
+    // the NEW sha — the inheritance proof in one stored map.
+    expect(await fnRows()).toEqual([{ commitSha: w().binTip, updatedFiles: '{"f2.txt":2,"f3.txt":2}' }]);
+    const after = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), fnRepoId, w().pull.topic, viewerUser);
+    expect(after!.viewed!.commitSha).toBe(w().binTip);
+    expect(after!.viewed!.current).toBe(false);
+    // The ladder (gitdiff.go:1541-1555): f2 changed-since-cursor →
+    // HAS_CHANGED; f3 stored VIEWED and unchanged → VIEWED.
+    expect(after!.viewed!.files).toEqual({ "f2.txt": HAS_CHANGED, "f3.txt": VIEWED });
+    // The count: GetViewedFileCount over the resolved states — 1 of 2.
+    await fnClear();
+  });
+
+  it("renders the real-diff page arms: the partial summary, the checked subset and the changed-since marker", async () => {
+    await fnClear();
+    const { issue, pr } = await topicRows();
+    // f2 viewed at the head; f3 not → 1 / 2, f2 checked, f3 unchecked, no
+    // changed-since markers.
+    const seed = writeCtxFor(JSON.stringify({ files: { "f2.txt": true }, headCommitSHA: w().topicTip }), "application/json", w().pull.topic);
+    await updateViewedFilesFromWeb({ c: seed, repo: fnRepoRow!, issue, pr, viewer: viewerUser });
+    const page = await get(`/${OWNER}/w111pull/pulls/${w().pull.topic}/files`, "w111viewer");
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain("1 / 2 files viewed");
+    expect(html).toContain('id="viewed-files-summary" value="1" max="2"');
+    expect(html).toContain('type="checkbox" name="f2.txt" autocomplete="off" checked=""');
+    expect(html).toContain('type="checkbox" name="f3.txt" autocomplete="off"');
+    expect(html).not.toContain("changed-since-last-review");
+    // The row advanced to the binarm tip (the reviewer posted f3's mark at
+    // the new head — the map inherits): f2 degrades to has-changed on the
+    // page (the marker), f3 keeps its checked label.
+    const advance = writeCtxFor(JSON.stringify({ files: { "f3.txt": true }, headCommitSHA: w().binTip }), "application/json", w().pull.topic);
+    await updateViewedFilesFromWeb({ c: advance, repo: fnRepoRow!, issue, pr, viewer: viewerUser });
+    const stalePage = await get(`/${OWNER}/w111pull/pulls/${w().pull.topic}/files`, "w111viewer");
+    const staleHtml = await stalePage.text();
+    expect(staleHtml).toContain('<span class="changed-since-last-review unselectable not-mobile">Changed since your last review</span>');
+    expect(staleHtml).toContain("1 / 2 files viewed");
+    expect(staleHtml).toContain('type="checkbox" name="f3.txt" autocomplete="off" checked=""');
+    expect(staleHtml).toContain('type="checkbox" name="f2.txt" autocomplete="off"');
+    await fnClear();
+  });
 });
 
 // The DiffFileBox viewed-label DOM (the fragment-level pin — the box is the
@@ -1752,12 +1959,19 @@ describe("w111 DiffFileBox viewed-file-form label", () => {
       },
     ]))[0]!;
     const withForm = renderToString(
-      <DiffFileBox view={view} viewedForm={{ link: "/o/r/pulls/1/viewed-files", headCommitSha: BOX_SHA, viewed: true }} />,
+      <DiffFileBox view={view} viewedForm={{ link: "/o/r/pulls/1/viewed-files", headCommitSha: BOX_SHA, viewed: true, hasChanged: false }} />,
     );
     expect(withForm).toContain('data-link="/o/r/pulls/1/viewed-files"');
     expect(withForm).toContain(`data-headcommit="${BOX_SHA}"`);
     expect(withForm).toContain('class="viewed-file-form unselectable viewed-file-checked-form"');
     expect(withForm).toContain('type="checkbox" name="g.txt" autocomplete="off" checked=""');
+    expect(withForm).not.toContain("changed-since-last-review");
+    // The has-changed arm: box.tmpl:141-143's marker span precedes the label.
+    const changed = renderToString(
+      <DiffFileBox view={view} viewedForm={{ link: "/o/r/pulls/1/viewed-files", headCommitSha: BOX_SHA, viewed: false, hasChanged: true }} />,
+    );
+    expect(changed).toContain('<span class="changed-since-last-review unselectable not-mobile">Changed since your last review</span>');
+    expect(changed).toContain('class="viewed-file-form unselectable"');
     const without = renderToString(<DiffFileBox view={view} />);
     expect(without).not.toContain("viewed-file-form");
   });

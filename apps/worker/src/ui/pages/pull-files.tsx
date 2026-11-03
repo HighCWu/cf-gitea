@@ -67,12 +67,14 @@
  * - The fold-file/clipboard/kebab buttons, the file-view toggle (image/CSV)
  *   and the diff-file-tree are JS islands — the no-JS reduction omits them;
  *   the +A/-D stats bar and the BIN mark (stats.tmpl, box.tmpl:126-130)
- *   render server-side. The VIEWED-FILES arm is REAL (migration 0059's
- *   review_state): the signed-in viewer's whole-PR mark renders the
- *   viewed-files summary (box.tmpl:28-33) + the no-JS mark form and the
- *   per-file viewed-file-form labels (box.tmpl:144-148, upstream's exact
- *   attrs — the official bundle POSTs them to the write seam below; the
- *   landed one-row store reduces the per-file map, the seam's doc).
+ *   render server-side. The VIEWED-FILES arm is REAL per-file since
+ *   migration 0065 (ADR-0007 FN-3 — review_state.updated_files, upstream's
+ *   `map[string]ViewedState` JSON): the signed-in viewer's stored map
+ *   renders the viewed-files summary count (box.tmpl:28-33), the per-file
+ *   viewed-file-form labels (box.tmpl:144-148, upstream's exact attrs — the
+ *   official bundle POSTs them to the write seam below) and the
+ *   changed-since-last-review markers (box.tmpl:141-143); the no-JS whole-PR
+ *   mark form expands to the diff's full path set (the seam's doc).
  * - The tab/toolbar octicons (octicon-comment-discussion/git-commit/diff)
  *   are outside the generated icon allowlist (scripts/gen-ui-icons.mjs is
  *   not a ui/ file) — the tabs and the summary line render text only.
@@ -91,8 +93,9 @@ import type { DiffFileJson } from "@cf-gitea/git-engine";
 
 import { ApiError } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
+import { engineRepoName } from "../../api/services/engine";
 import { findIssueByRepoAndIndex } from "../../api/services/issues";
-import { pullRequestDiff } from "../../api/services/pull-engine";
+import { pullRequestDiff, pullRequestDiffForEnv } from "../../api/services/pull-engine";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { findRepositoryById } from "../../api/services/repository";
 import { reviewState, users } from "../../db/schema";
@@ -122,11 +125,45 @@ export const pullFilesLocale = {
   filemode_executable: "Executable",
   filemode_symlink: "Symlink",
   filemode_submodule: "Submodule",
-  // the VIEWED-FILES arm (box.tmpl:28-33 + 144-148 — the en-US strings).
+  // the VIEWED-FILES arm (box.tmpl:28-33 + 141-148 — the en-US strings).
   has_viewed_file: "Viewed", // "repo.pulls.has_viewed_file"
+  has_changed_since_last_review: "Changed since your last review", // "repo.pulls.has_changed_since_last_review"
   viewed_files_label: "files viewed", // "repo.pulls.viewed_files_label" = "%[1]d / %[2]d files viewed" (the count prefix renders beside)
   viewed_files_template: "%[1]d / %[2]d files viewed", // the JS refresh template (data-text-changed-template)
 } as const;
+
+/**
+ * Upstream's `ViewedState` (models/pull/review_state.go:19-25) — the per-file
+ * viewed iota, stored verbatim as the number values of
+ * `review_state.updated_files`' JSON (`map[string]ViewedState`; xorm's JSON
+ * codec emits the uint8 via encoding/json, so `{"path": 2}`). HasChanged is
+ * INTERNAL ONLY ("cannot be set from the UI/API", review_state.go:23) — no
+ * external arm writes it here either (the read path derives it, the SPEC's
+ * derivation note).
+ */
+export const UNVIEWED = 0;
+export const HAS_CHANGED = 1;
+export const VIEWED = 2;
+export type ViewedFileState = typeof UNVIEWED | typeof HAS_CHANGED | typeof VIEWED;
+
+/** Parse the stored `updated_files` JSON (`{}` on anything malformed — the
+ *  pre-0065 cursor rows carry the migration default and nothing else ever
+ *  writes non-map bytes; upstream's decode errors 400 at the API edge, the
+ *  stored shape is trusted). */
+export function parseUpdatedFiles(raw: string | null | undefined): Record<string, ViewedFileState> {
+  if (raw === null || raw === undefined || raw === "") return {};
+  try {
+    const data: unknown = JSON.parse(raw);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+    const map: Record<string, ViewedFileState> = {};
+    for (const [path, state] of Object.entries(data as Record<string, unknown>)) {
+      map[path] = state === VIEWED ? VIEWED : state === HAS_CHANGED ? HAS_CHANGED : UNVIEWED;
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Render model — the loader computes everything (hashes, numbering, body
@@ -167,14 +204,20 @@ export interface DiffFileView {
   hunks: DiffHunkView[];
 }
 
-/** The viewer's viewed state, the landed `review_state` reduction (one row
- *  per (user, pull) with the head sha the marks were made at — upstream's
- *  per-file map has no D1 home). `current` = the row's sha IS the PR's head
- *  sha: the whole-PR mark shades every file (upstream shades the marked
- *  subset); a stale sha (a new push since) shades nothing. */
+/** The viewer's viewed state (upstream's `ReviewState` + the
+ *  SyncUserSpecificDiff resolution, gitdiff.go:1510-1579): the (user, pull)
+ *  row — cursor sha + `updated_files` map — resolved per file over the
+ *  loaded diff. `current` = the row's sha IS the PR's head sha (nothing can
+ *  have changed since the marks). Each diff path carries the ladder's
+ *  outcome (gitdiff.go:1541-1555): HAS_CHANGED when the stored map says so
+ *  or the file changed between the cursor sha and the head, else the stored
+ *  VIEWED, else UNVIEWED. */
 export interface PullFilesViewedState {
   commitSha: string;
   current: boolean;
+  /** Keyed by diff path — every loaded file has an entry (and only loaded
+   *  files do, so the summary count walks this record). */
+  files: Record<string, ViewedFileState>;
 }
 
 /** The files page render inputs, loaded by loadPullFilesData. */
@@ -337,25 +380,60 @@ export async function loadPullFilesData(
     files: views,
     totalAddition: files.reduce((sum, file) => sum + file.add, 0),
     totalDeletion: files.reduce((sum, file) => sum + file.del, 0),
-    viewed: await loadViewedState(c.env.DB, viewer, issue.id, pr.headSha),
+    viewed: await loadViewedState(c.env, pair.repo, viewer, issue.id, pr.headSha, files),
   };
 }
 
 /**
- * The viewer's review_state read (upstream GetNewestReviewState,
- * models/pull/review_state.go:113-124 — newest row for (user, pull); ours
- * is unique per pair, so one get). `current` = the row's sha is the PR's
- * head sha — the reduction of upstream's per-file IsViewed walk
- * (SyncUserSpecificDiff): the whole-PR mark shades every file at the sha it
- * was made at, nothing after a new push. Anonymous viewers and sha-less PR
- * rows read null.
+ * The viewer's review_state read (upstream GetNewestReviewState +
+ * SyncUserSpecificDiff — review_state.go:130-137 / gitdiff.go:1510-1579 —
+ * the newest row for (user, pull), then its map resolved over the rendered
+ * diff). `current` = the row's sha IS the PR's head sha: nothing can have
+ * changed since the marks, so the ladder's changed-set is empty by
+ * definition and no engine read runs. Otherwise the changed paths between
+ * the cursor and the head (GetFilesChangedBetween's port, the changed-set
+ * source of gitdiff.go:1526) mark a file HAS_CHANGED even when its stored
+ * state is VIEWED — the upstream rule that degrades a stale viewed mark.
+ * Anonymous viewers and sha-less PR rows read null.
  */
-async function loadViewedState(d1: D1Database, viewer: Viewer | undefined, issueId: number, headSha: string | null): Promise<PullFilesViewedState | null> {
+async function loadViewedState(env: Env, repoPair: { ownerNamespace: string; slug: string }, viewer: Viewer | undefined, issueId: number, headSha: string | null, diffFiles: DiffFileJson[]): Promise<PullFilesViewedState | null> {
   if (viewer === undefined || viewer.kind !== "user") return null;
   if (headSha === null || headSha === "") return null;
-  const row = await getNewestReviewState(d1, viewer.id, issueId);
+  const row = await getNewestReviewState(env.DB, viewer.id, issueId);
   if (row === null) return null;
-  return { commitSha: row.commitSha, current: row.commitSha === headSha };
+  const current = row.commitSha === headSha;
+  const stored = parseUpdatedFiles(row.updatedFiles);
+  const changed = current ? new Set<string>() : await changedPathsSinceCursor(env, repoPair, row.commitSha, headSha);
+  const files: Record<string, ViewedFileState> = {};
+  for (const file of diffFiles) {
+    const state = stored[file.path] ?? UNVIEWED;
+    files[file.path] =
+      state === HAS_CHANGED || changed.has(file.path) ? HAS_CHANGED : state === VIEWED ? VIEWED : UNVIEWED;
+  }
+  return { commitSha: row.commitSha, current, files };
+}
+
+/**
+ * GetFilesChangedBetween (modules/git/repo_compare.go:81-90) via the
+ * engine's two-commit readDiff — the changed-path set between the stored
+ * cursor and the current head. Transport/ref failures collapse to the empty
+ * set: upstream ignores the error and "assum[es] no changes"
+ * (gitdiff.go:1527-1534, the errIgnored posture — a gc'ed base commit must
+ * not fail the page).
+ */
+async function changedPathsSinceCursor(env: Env, repoPair: { ownerNamespace: string; slug: string }, fromSha: string, toSha: string): Promise<Set<string>> {
+  const safe = async <T,>(pending: Promise<T>): Promise<T | null> => {
+    try {
+      return await pending;
+    } catch {
+      return null;
+    }
+  };
+  // readDiff(id, id2) = the changes id2..id — the diff engine read's own
+  // direction comment; the names here are (new, old) so the set is what
+  // changed FROM the cursor TO the head.
+  const diff = await safe(env.REPO.getByName(engineRepoName(repoPair)).readDiff(toSha, fromSha));
+  return new Set((diff?.files ?? []).map((file) => file.path));
 }
 
 // ---------------------------------------------------------------------------
@@ -425,15 +503,16 @@ function UnifiedHunkRows(props: { nameHash: string; hunk: DiffHunkView }) {
 }
 
 /** One file box (box.tmpl:95-222 reduced): header (name anchor + entry-mode
- *  label + stats/BIN + the viewed checkbox) and body (unified table, or the
- *  honest degraded branch). Exported for the compare view's diff half
- *  (pages/compare.tsx) — one box vocabulary for every diff surface.
- *  `viewedForm` renders the viewed-file-form label (box.tmpl:144-148's
- *  `viewed-file-form` + initDiffFileViewedForm island: data-link +
+ *  label + stats/BIN + the changed-since marker + the viewed checkbox) and
+ *  body (unified table, or the honest degraded branch). Exported for the
+ *  compare view's diff half (pages/compare.tsx) — one box vocabulary for
+ *  every diff surface. `viewedForm` renders the changed-since-last-review
+ *  marker (box.tmpl:141-143) and the viewed-file-form label (box.tmpl:
+ *  144-148's `viewed-file-form` + initDiffFileViewedForm island: data-link +
  *  data-headcommit + the path-named checkbox — the official bundle POSTs
  *  it to the viewed-files route; no-JS it renders the state read-only),
  *  absent on surfaces without a PR (the compare view). */
-export function DiffFileBox(props: { view: DiffFileView; viewedForm?: { link: string; headCommitSha: string; viewed: boolean } | null }) {
+export function DiffFileBox(props: { view: DiffFileView; viewedForm?: { link: string; headCommitSha: string; viewed: boolean; hasChanged: boolean } | null }) {
   const { view } = props;
   return (
     <div
@@ -457,6 +536,11 @@ export function DiffFileBox(props: { view: DiffFileView; viewedForm?: { link: st
           ) : (
             <DiffStats addition={view.file.add} deletion={view.file.del} />
           )}
+          {props.viewedForm != null && props.viewedForm.hasChanged ? (
+            // box.tmpl:141-143 (`$isReviewFile && $file.HasChangedSinceLastReview`)
+            // — the degraded stale-viewed marker, upstream's exact class set.
+            <span class="changed-since-last-review unselectable not-mobile">{pullFilesLocale.has_changed_since_last_review}</span>
+          ) : null}
           {props.viewedForm != null ? (
             <label
               data-link={props.viewedForm.link}
@@ -519,9 +603,12 @@ export function PullFilesPage(props: { ctx: UiContext; data: PullFilesData }) {
     mergerName: data.mergerName,
   };
   const empty = data.files.length === 0;
-  // The viewed summary's reduced count: the whole-PR mark shades every file
-  // when current, nothing otherwise (the loadViewedState reduction).
-  const numViewedFiles = data.viewed !== null && data.viewed.current ? data.files.length : 0;
+  // GetViewedFileCount (review_state.go:54-65) over the resolved per-file
+  // states: the stored-map Viewed entries whose files have not changed since
+  // the cursor (SyncUserSpecificDiff degrades those to has-changed before
+  // the count runs, gitdiff.go:1545-1551 — the loader's ladder did that
+  // already, so the count walks VIEWED values).
+  const numViewedFiles = data.viewed === null ? 0 : Object.values(data.viewed.files).filter((state) => state === VIEWED).length;
   const viewedFilesLink = `${repoLink}/pulls/${data.issue.index}/viewed-files`;
   return (
     <BaseLayout
@@ -555,10 +642,12 @@ export function PullFilesPage(props: { ctx: UiContext; data: PullFilesData }) {
             // The diff-detail-actions half (box.tmpl:27-35): the viewed-files
             // summary (SignedUserID + PageIsPullFiles + not DiffNotAvailable
             // gates — the loader's viewer read covers the first two, `empty`
-            // the third) reduced to the whole-PR count, plus the no-JS mark
-            // form (upstream marks per-file via the JS checkboxes; the
-            // landed one-row store takes the whole-PR post — the checkbox
-            // labels below stay upstream-exact for the official bundle).
+            // the third) over the per-file count, plus the no-JS mark form
+            // (upstream marks per-file via the JS checkboxes — a no-JS viewer
+            // has no per-file control, so the house form marks the whole diff;
+            // it renders while anything is left to mark and expands to every
+            // diff path in the seam). The checkbox labels below stay
+            // upstream-exact for the official bundle.
             <div class="diff-detail-actions">
               <div class="not-mobile tw-flex tw-items-center tw-flex-col tw-whitespace-nowrap tw-mr-1">
                 <label for="viewed-files-summary" id="viewed-files-summary-label" data-text-changed-template={pullFilesLocale.viewed_files_template}>
@@ -566,7 +655,7 @@ export function PullFilesPage(props: { ctx: UiContext; data: PullFilesData }) {
                 </label>
                 <progress id="viewed-files-summary" value={numViewedFiles} max={data.files.length} />
               </div>
-              {!data.viewed.current && data.pr.headSha !== null && data.pr.headSha !== "" ? (
+              {numViewedFiles < data.files.length && data.pr.headSha !== null && data.pr.headSha !== "" ? (
                 <form action={viewedFilesLink} method="post">
                   <input type="hidden" name="head_commit_sha" value={data.pr.headSha} />
                   <input type="hidden" name="viewed" value="true" />
@@ -589,7 +678,12 @@ export function PullFilesPage(props: { ctx: UiContext; data: PullFilesData }) {
                       viewedForm={
                         data.viewed === null || data.pr.headSha === null || data.pr.headSha === ""
                           ? null
-                          : { link: viewedFilesLink, headCommitSha: data.pr.headSha, viewed: data.viewed.current }
+                          : {
+                              link: viewedFilesLink,
+                              headCommitSha: data.pr.headSha,
+                              viewed: (data.viewed.files[view.file.path] ?? UNVIEWED) === VIEWED,
+                              hasChanged: (data.viewed.files[view.file.path] ?? UNVIEWED) === HAS_CHANGED,
+                            }
                       }
                     />
                   ))
@@ -636,17 +730,21 @@ export interface ViewedFilesWriteContext {
 }
 
 /**
- * The viewed write, reduced to the landed store: upstream parses
- * `{files: {path: bool}, headCommitSHA}` (pull_review.go:299-302), defaults
- * the sha to the PR's head commit (:308-311) and merges the per-file map
- * into the user's review state. The landed `review_state` row is ONE sha
- * per (user, pull) — no per-file home — so the map OR-reduces to the
- * whole-PR mark: ANY viewed=true stamps the row at the sha (the page shades
- * every file at that sha); an all-false map clears it (the uncheck-everything
- * arm; upstream stores per-file Unviewed states instead). An absent/empty
- * map means the plain mark (the no-JS form posts `viewed=true` explicitly).
- * The official bundle's checkbox JS (pull-view-file.ts initDiffFileViewedForm)
- * posts the exact upstream JSON — one file per post — and lands as the mark.
+ * The viewed write — upstream's UpdateViewedFiles (pull_review.go:302-336)
+ * over UpdateReviewState's merge ladder (review_state.go:83-113): the
+ * posted per-file entries (`{files: {path: bool}, headCommitSHA}`, bool →
+ * VIEWED/UNVIEWED — HasChanged is internal only, :325-329) merge into the
+ * user's `updated_files` map at the resolved sha (empty posted sha → the
+ * PR's head, :319-321). Same-sha posts override the posted keys only
+ * (mergeFiles, :117-126); a DIFFERENT sha inherits the row's current map
+ * first (getNewestReviewStateApartFrom's seeding, :93-98 — the single-row
+ * cursor IS the newest map, so the seed and the row are one read) and the
+ * cursor advances. The no-JS form arm (files absent) is the whole-PR mark:
+ * the diff's full path set takes VIEWED/UNVIEWED — the store now has the
+ * per-file home, so the mark is expressed as entries, never a row delete
+ * (upstream never deletes rows on uncheck). The official bundle's checkbox
+ * JS (pull-view-file.ts initDiffFileViewedForm) posts the exact upstream
+ * JSON — one file per post — and merges as one entry.
  */
 export async function updateViewedFilesFromWeb(ctx: ViewedFilesWriteContext): Promise<ViewedFilesWriteOutcome> {
   // getPullInfo's arms: the missing issue 404s at the route prologue; the
@@ -657,81 +755,121 @@ export async function updateViewedFilesFromWeb(ctx: ViewedFilesWriteContext): Pr
   const parsed = await parseViewedFilesBody(ctx.c.req.raw);
   if (parsed === null) return { outcome: "bad-request" }; // the decode-failure 400
   const sha = parsed.headCommitSha !== "" ? parsed.headCommitSha : (ctx.pr?.headSha ?? "");
-  if (parsed.markViewed) {
-    await updateReviewStateAtHead(ctx.c.env.DB, ctx.viewer.id, ctx.issue.id, sha, new Date());
+  let entries: Record<string, ViewedFileState>;
+  if (parsed.files !== null) {
+    entries = {};
+    for (const [path, viewed] of Object.entries(parsed.files)) {
+      entries[path] = viewed ? VIEWED : UNVIEWED;
+    }
   } else {
-    await clearReviewState(ctx.c.env.DB, ctx.viewer.id, ctx.issue.id);
+    // The no-JS form: the whole-PR mark over the diff's full path set. An
+    // unreadable range (the broken-PR arm) degrades to no entries — the row
+    // still advances with its inherited map, never an error page.
+    const paths = await writeDiffPaths(ctx.c.env, ctx.repo, ctx.pr).catch(() => [] as string[]);
+    entries = {};
+    for (const path of paths) entries[path] = parsed.markAll ? VIEWED : UNVIEWED;
   }
+  await updateReviewStateAtHead(ctx.c.env.DB, ctx.viewer.id, ctx.issue.id, sha, entries, new Date());
   return { outcome: "ok" };
 }
 
-/** The body parser: upstream's JSON (content-type application/json — the
- *  official bundle's fetch) or the no-JS form's urlencoded fields
- *  (`head_commit_sha`, `viewed`). Malformed JSON → null (the 400). Both
- *  bodies are tiny by construction (one checkbox / one file per post). */
-async function parseViewedFilesBody(request: Request): Promise<{ headCommitSha: string; markViewed: boolean } | null> {
+/** The no-JS form's diff-path set — the same range the files page renders
+ *  (pullRequestDiffForEnv, the merge-base...pull-head composition). Errors
+ *  and missing rows degrade to the empty list (the caller writes the
+ *  entries-less row). */
+async function writeDiffPaths(env: Env, repo: RepoRow, pr: PullRequestRow | null): Promise<string[]> {
+  if (pr === null) return [];
+  const pair = await findRepositoryById(env.DB, repo.id);
+  if (pair === null) return [];
+  const range = await pullRequestDiffForEnv(env, pair, pr);
+  return range.files.map((file) => file.path);
+}
+
+/**
+ * The body parser: upstream's JSON decode into viewedFilesUpdate
+ * (pull_review.go:297-300, 310-316 — content-type application/json, the
+ * official bundle's fetch) or the no-JS form's urlencoded fields
+ * (`head_commit_sha`, `viewed`). JSON strictness is Go's decode: a
+ * non-object top level, a non-object `files`, a non-bool file value or a
+ * non-string `headCommitSHA` are all decode errors → null (the 400);
+ * absent `files`/`headCommitSHA` decode as the zero values (nil map, "").
+ * Malformed JSON → null (the 400). Both bodies are tiny by construction
+ * (one checkbox / one file per post).
+ */
+async function parseViewedFilesBody(request: Request): Promise<{ headCommitSha: string; files: Record<string, boolean> | null; markAll: boolean } | null> {
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
+    let data: unknown;
     try {
-      const data: unknown = await request.json();
-      if (typeof data !== "object" || data === null) return null;
-      const record = data as { files?: unknown; headCommitSHA?: unknown };
-      let markViewed = true; // absent/empty map → the plain mark
-      if (typeof record.files === "object" && record.files !== null) {
-        const values = Object.values(record.files as Record<string, unknown>).filter((value) => typeof value === "boolean");
-        if (values.length > 0) markViewed = values.some((viewed) => viewed === true);
-      }
-      return {
-        headCommitSha: typeof record.headCommitSHA === "string" ? record.headCommitSHA : "",
-        markViewed,
-      };
+      data = await request.json();
     } catch {
       return null;
     }
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+    const record = data as { files?: unknown; headCommitSHA?: unknown };
+    let files: Record<string, boolean> | null = null;
+    if (record.files !== undefined) {
+      if (typeof record.files !== "object" || record.files === null || Array.isArray(record.files)) return null;
+      files = {};
+      for (const [path, viewed] of Object.entries(record.files as Record<string, unknown>)) {
+        if (typeof viewed !== "boolean") return null;
+        files[path] = viewed;
+      }
+    }
+    let headCommitSha = "";
+    if (record.headCommitSHA !== undefined) {
+      if (typeof record.headCommitSHA !== "string") return null;
+      headCommitSha = record.headCommitSHA;
+    }
+    return { headCommitSha, files, markAll: true };
   }
   const params = new URLSearchParams(await request.text());
   const viewed = params.get("viewed");
   return {
     headCommitSha: params.get("head_commit_sha") ?? "",
-    markViewed: viewed === null ? true : viewed === "true" || viewed === "on" || viewed === "1",
+    files: null,
+    markAll: viewed === null ? true : viewed === "true" || viewed === "on" || viewed === "1",
   };
 }
 
-/** `GetNewestReviewState` (review_state.go:113-124) — the (user, pull)
- *  row, or null. */
+/** `GetNewestReviewState` (review_state.go:130-137) — the (user, pull) row
+ *  (ours is unique per pair, so one get), cursor + raw map + order stamp. */
 export async function getNewestReviewState(
   d1: D1Database,
   userId: number,
   issueId: number,
-): Promise<{ commitSha: string; updatedUnix: number } | null> {
+): Promise<{ commitSha: string; updatedFiles: string; updatedUnix: number } | null> {
   const row = await drizzle(d1)
-    .select({ commitSha: reviewState.commitSha, updatedUnix: reviewState.updatedUnix })
+    .select({ commitSha: reviewState.commitSha, updatedFiles: reviewState.updatedFiles, updatedUnix: reviewState.updatedUnix })
     .from(reviewState)
     .where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, issueId)))
     .get();
   return row ?? null;
 }
 
-/** The mark: upsert the (user, pull) row at the sha (the landed
- *  UpdateReviewState's whole-PR reduction — the unique pair index carries
- *  the conflict target). */
-export async function updateReviewStateAtHead(d1: D1Database, userId: number, issueId: number, commitSha: string, now: Date): Promise<void> {
+/**
+ * UpdateReviewState (review_state.go:83-113) over the single-row cursor:
+ * the posted `entries` merge into the stored map (per-key override —
+ * mergeFiles :117-126), the cursor advances to `commitSha`, and the
+ * `updated_unix` order stamp refreshes (the `updated` xorm tag, :47). At a
+ * NEW sha the stored map is the inheritance seed (the same-sha branch is
+ * upstream's plain merge; the new-sha branch is getNewestReviewStateApartFrom
+ * :93-98 — our one-row shape carries the newest map, so seed and row are the
+ * same read). The unique pair index carries the conflict target; the row is
+ * upserted even when `entries` is empty (upstream inserts the empty-map row,
+ * :105-108).
+ */
+export async function updateReviewStateAtHead(d1: D1Database, userId: number, issueId: number, commitSha: string, entries: Record<string, ViewedFileState>, now: Date): Promise<void> {
+  const row = await getNewestReviewState(d1, userId, issueId);
+  const merged: Record<string, ViewedFileState> = row === null ? {} : parseUpdatedFiles(row.updatedFiles);
+  for (const [path, state] of Object.entries(entries)) merged[path] = state;
+  const updatedFiles = JSON.stringify(merged);
+  const updatedUnix = Math.floor(now.getTime() / 1000);
   await drizzle(d1)
     .insert(reviewState)
-    .values({ userId, issueId, commitSha, updatedUnix: Math.floor(now.getTime() / 1000) })
+    .values({ userId, issueId, commitSha, updatedFiles, updatedUnix })
     .onConflictDoUpdate({
       target: [reviewState.userId, reviewState.issueId],
-      set: { commitSha, updatedUnix: Math.floor(now.getTime() / 1000) },
+      set: { commitSha, updatedFiles, updatedUnix },
     });
-}
-
-/** The unmark: the all-unviewed reduction — the row goes (upstream stores
- *  per-file Unviewed states; with no per-file home the cleared pair is the
- *  honest empty). True when a row went. */
-export async function clearReviewState(d1: D1Database, userId: number, issueId: number): Promise<boolean> {
-  const rows = await drizzle(d1)
-    .delete(reviewState)
-    .where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, issueId)))
-    .returning({ id: reviewState.id });
-  return rows.length > 0;
 }

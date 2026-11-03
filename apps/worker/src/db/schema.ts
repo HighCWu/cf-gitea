@@ -4957,7 +4957,7 @@ export const deletedBranches = sqliteTable(
 );
 
 /**
- * Review state (upstream models/issues/review_state.go — the VIEWED-FILES
+ * Review state (upstream models/pull/review_state.go — the VIEWED-FILES
  * arm's substrate, migration 0059): the PR-files viewed tracking, one row
  * per (user, pull), updated to the latest commit sha as the reviewer marks
  * files viewed. The files page's diff highlighting consumes it.
@@ -4971,6 +4971,20 @@ export const reviewState = sqliteTable(
     issueId: integer("issue_id").notNull(),
     /** Upstream `CommitSHA` — the head sha the viewed marks were made at. */
     commitSha: text("commit_sha").notNull(),
+    /**
+     * Upstream `UpdatedFiles` (models/pull/review_state.go:46,
+     * `map[string]ViewedState` serialized `NOT NULL LONGTEXT JSON`) — the
+     * per-file viewed map, `{"path": state}` with the ViewedState iota
+     * verbatim (review_state.go:21-25): 0 = unviewed, 1 = has-changed
+     * (internal only — never settable from the UI/API), 2 = viewed; xorm's
+     * encoding/json emits the uint8 as a number, so the house TEXT keeps the
+     * same numeric shape. `ViewedState` consts live in
+     * ui/pages/pull-files.tsx (the sole reader/writer). Migration-time
+     * DEFAULT '{}' covers the pre-map cursor rows (upstream has no default —
+     * the house adaptation, the FN-3 SPEC's data-model note); the write path
+     * always stores a full JSON object.
+     */
+    updatedFiles: text("updated_files").notNull().default("{}"),
     /** Upstream `UpdatedUnix` (seconds). */
     updatedUnix: integer("updated_unix").notNull(),
   },

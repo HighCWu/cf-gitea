@@ -26,6 +26,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { mergeableOfRow, statusFromMergeability } from "../api/services/pull-engine";
+import { HAS_CHANGED, parseUpdatedFiles, UNVIEWED, updateReviewStateAtHead, VIEWED } from "../ui/pages/pull-files";
 import {
   follows,
   lfsObjects,
@@ -38,6 +39,7 @@ import {
   repoTopics,
   repoWatchers,
   repositories,
+  reviewState,
   stars,
   userRedirects,
   userSettings,
@@ -1002,5 +1004,89 @@ describe("PRStatus upstream alignment (ADR-0007 FN-1, migration 0064)", () => {
         .where(and(eq(pullRequests.status, PRStatus.ManuallyMerged), gt(pullRequests.issueId, 8_640_010)))
         .all(),
     ).toEqual([{ issueId: 8_640_011 }]);
+  });
+});
+
+/**
+ * ADR-0007 FN-3 (migration 0065): upstream's `review_state.updated_files`
+ * (models/pull/review_state.go:46 — `map[string]ViewedState` serialized
+ * `NOT NULL LONGTEXT JSON`, the per-file viewed map) had no counterpart in
+ * ours — the landed reduction stored one sha cursor per (user, pull) with no
+ * per-file home (ui/pages/pull-files.tsx's whole-PR mark). 0065 adds the
+ * column; the write/read port lives in pull-files.tsx (the matrix suite's
+ * FN-3 describe pins the behavior over the real engine).
+ */
+describe("review_state.updated_files parity (ADR-0007 FN-3, migration 0065)", () => {
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+  });
+
+  it("0065's DDL: the column is TEXT NOT NULL DEFAULT '{}' beside the cursor columns", async () => {
+    const info = await env.DB.prepare("PRAGMA table_info(review_state)").all<{
+      cid: number;
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+      pk: number;
+    }>();
+    const column = info.results.find((col) => col.name === "updated_files");
+    expect(column).toEqual({ cid: 5, name: "updated_files", type: "TEXT", notnull: 1, dflt_value: "'{}'", pk: 0 });
+    // The cursor columns the pre-map writer used stay untouched.
+    expect(info.results.map((col) => col.name)).toEqual(["id", "user_id", "issue_id", "commit_sha", "updated_unix", "updated_files"]);
+  });
+
+  it("the legacy cursor writer (a pre-0065 INSERT omitting the column) still lands and reads '{}' — the default covers it", async () => {
+    // Exactly the shape the pre-0065 code wrote: user/pull/sha/unix, no map.
+    await env.DB
+      .prepare("INSERT INTO review_state (user_id, issue_id, commit_sha, updated_unix) VALUES (910001, 910002, 'a', 1700000000)")
+      .run();
+    const raw = await env.DB.prepare("SELECT commit_sha, updated_files, updated_unix FROM review_state WHERE user_id = 910001").first<{
+      commit_sha: string;
+      updated_files: string;
+      updated_unix: number;
+    }>();
+    expect(raw).toEqual({ commit_sha: "a", updated_files: "{}", updated_unix: 1700000000 });
+    // The post-0065 reader parses it as the empty map (no marks — the migrated
+    // legacy row renders zero viewed files, never a crash).
+    expect(parseUpdatedFiles(raw?.updated_files)).toEqual({});
+  });
+
+  it("the merge port: UpdateReviewState's same-sha override, new-sha inheritance, and the parser's defenses", async () => {
+    const db = drizzle(env.DB);
+    const userId = 910_003;
+    const issueId = 910_004;
+    // No row: the posted entries are the map (review_state.go:100).
+    await updateReviewStateAtHead(env.DB, userId, issueId, "s1", { "a.ts": VIEWED, "b.ts": UNVIEWED }, new Date(1_700_000_100_000));
+    expect((await db.select().from(reviewState).where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, issueId))).get())?.updatedFiles).toBe(
+      '{"a.ts":2,"b.ts":0}',
+    );
+    // Same sha: the posted keys override, the others survive (mergeFiles,
+    // review_state.go:117-126).
+    await updateReviewStateAtHead(env.DB, userId, issueId, "s1", { "a.ts": UNVIEWED, "c.ts": VIEWED }, new Date(1_700_000_200_000));
+    expect(
+      (await db.select().from(reviewState).where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, issueId))).get())?.updatedFiles,
+    ).toBe('{"a.ts":0,"b.ts":0,"c.ts":2}');
+    // New sha: the stored map is the inheritance seed (getNewestReviewState-
+    // ApartFrom's previous-row seeding, review_state.go:93-98) merged with the
+    // delta, and the cursor advances with a fresh updated_unix.
+    await updateReviewStateAtHead(env.DB, userId, issueId, "s2", { "b.ts": VIEWED }, new Date(1_700_000_300_000));
+    const row = await db.select().from(reviewState).where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, issueId))).get();
+    expect(row?.commitSha).toBe("s2");
+    expect(row?.updatedFiles).toBe('{"a.ts":0,"b.ts":2,"c.ts":2}');
+    expect(row?.updatedUnix).toBe(1_700_000_300);
+    // One row per (user, pull) — the upsert, never a second row.
+    expect((await db.select().from(reviewState).where(eq(reviewState.userId, userId)).all()).length).toBe(1);
+
+    // The parser's defenses: the migration default, the empty string, the
+    // malformed bytes, a non-map array, and unknown numbers clamp to UNVIEWED
+    // (only 0/1/2 exist upstream — review_state.go:21-25).
+    expect(parseUpdatedFiles("{}")).toEqual({});
+    expect(parseUpdatedFiles("")).toEqual({});
+    expect(parseUpdatedFiles(null)).toEqual({});
+    expect(parseUpdatedFiles(undefined)).toEqual({});
+    expect(parseUpdatedFiles("{not json")).toEqual({});
+    expect(parseUpdatedFiles('{"a.ts":"viewed"}')).toEqual({ "a.ts": UNVIEWED });
+    expect(parseUpdatedFiles('{"a.ts":2,"b.ts":1,"c.ts":9}')).toEqual({ "a.ts": VIEWED, "b.ts": HAS_CHANGED, "c.ts": UNVIEWED });
   });
 });

@@ -1,0 +1,1 @@
+ALTER TABLE `review_state` ADD `updated_files` text DEFAULT '{}' NOT NULL;

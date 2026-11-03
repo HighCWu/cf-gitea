@@ -21,15 +21,15 @@ sources and found accurate.
 - **Our tables: 107** exported `sqliteTable` definitions in
   `apps/worker/src/db/schema.ts`, all with explicit snake_case SQL names.
 - **Verdicts over the 117 upstream tables:**
-  - **47 aligned** (structure faithful; only the blanket families of §2 apply)
+  - **45 aligned** (structure faithful; only the blanket families of §2 apply)
   - **22 intentional-recorded** (a SPEC or code-level record owns the divergence)
-  - **26 drift** (accidental divergence — the migration backlog, §5/FN)
+  - **28 drift** (accidental divergence — the migration backlog, §5/FN)
   - **22 missing-table** (no counterpart; §3.3 splits the no-reader arm)
   - *(0 platform-adapted PAIRS — platform adaptation shows up in the blanket
     families of §2 and in the missing-table rows, not as whole-table rewrites)*
 - **Ours-extras: 12** tables with no upstream counterpart (§3.4).
 - The lost report's "~115 tables / ~60 drifted columns / 4 missing tables"
-  is **superseded**: this census counts 117 / 69 table-specific drift
+  is **superseded**: this census counts 117 / 70 table-specific drift
   columns (+ the blanket families and the 26-column `repositories`
   residual) / **22 missing tables**. The 4-missing-table figure undercounts
   by counting only data tables a reader would touch; this census counts
@@ -175,7 +175,7 @@ classes only.
 | `commit_status` | models/git/commit_status.go:37 | schema.ts:1066 `commit_statuses` | drift | missing context_hash, index |
 | `commit_status_index` | models/git/commit_status.go:330 | — | missing-table | no table; autoincrement id substitutes, documented TODO(SPEC-0005) (api/services/commit-status.ts:88-91,143-145) |
 | `lfs_lock` | models/git/lfs_lock.go:21 | schema.ts:1281 `lfs_locks` | drift | ours-extra lower_path (schema.ts:1293, unrecorded case-fold lookup; FN-12 records it); `created` → `created_at` is the FN-13 §7.2 recorded timestamp-name family |
-| `package_blob` | models/packages/package_blob.go:30 | schema.ts:3693 `package_blobs` | drift | hash_m_d5/sh_a1/sh_a256/sh_a512 gonic renames |
+| `package_blob` | models/packages/package_blob.go:30 | schema.ts:3693 `package_blobs` | intentional-recorded | hash-rename claim WITHDRAWN (§7.8): upstream carries explicit overrides `hash_md5/hash_sha1/hash_sha256/hash_sha512` (package_blob.go:33-36), ours matches verbatim (schema.ts:3700-3704); the real divergence is ours-NULLable md5/sha1/sha512 vs upstream NOT NULL — recorded, SPEC-0016 package_blobs bullet + the schema.ts table comment (WebCrypto has no MD5) |
 | `package` | models/packages/package.go:191 | schema.ts:3613 `packages` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `lfs_meta_object` | models/git/lfs.go:80 | schema.ts:1241 `lfs_objects` | intentional-recorded | lfs_objects state machine, bare keys; SPEC-0006 §3 (schema.ts:1241) |
 | `protected_branch` | models/git/protected_branch.go:30 | schema.ts:2485 `protected_branches` | drift | branch_name → rule_name and config → rules renames |
@@ -194,7 +194,7 @@ classes only.
 | `renamed_branch` | models/git/branch.go:293 | — | missing-table | no landed arm (ui/pages/raw-files.ts:95) |
 | `email_hash` | models/avatars/avatar.go:33 | schema.ts:4805 `email_hash` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `notification` | models/activities/notification.go:52 | schema.ts:1809 `notification_states` | intentional-recorded | state-row reduction; SPEC email-outbound + user-notification-settings (schema.ts:1809); upstream payload columns not ported (residual) |
-| `review_state` | models/pull/review_state.go:41 | schema.ts:4965 `review_state` | drift | missing updated_files (per-file viewed map; ours stores cursor only, api/ui pull-files.tsx:642) |
+| `review_state` | models/pull/review_state.go:41 | schema.ts:4965 `review_state` | drift — LANDED by FN-3 (2026-11-03, migration 0065; `updated_files` ported, the SPEC record `specs/table-alignment-fn3-review-state.md`) | was: missing updated_files (per-file viewed map; ours stored cursor only, api/ui pull-files.tsx:642) |
 | `action` | models/activities/action.go:135 | schema.ts:3397 `action` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `pull_auto_merge` | models/pull/automerge.go:17 | schema.ts:4989 `pull_auto_merges` | drift | missing merged_commit_id; pull_id/message renames (value-space differs on pull_id); ours-extra sha |
 | `action_schedule_spec` | models/actions/schedule_spec.go:19 | schema.ts:4519 `action_schedule_spec` | intentional-recorded | PENDING FM LANDING — column-faithful port; SPEC-0012 §4.1 conventions (schema.ts:4519) |
@@ -232,7 +232,7 @@ classes only.
 | `pull_request` | models/issues/pull.go:120 | schema.ts:680 `pull_requests` | drift | FN-1 status-enum swap IN FLIGHT (migration 0064 + schema.ts:588-596 re-map); still missing type, changed_protected_files; ours-extra head_sha (documented) |
 | `milestone` | models/issues/milestone.go:47 | schema.ts:866 `milestones` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `stopwatch` | models/issues/stopwatch.go:20 | schema.ts:1940 `stopwatch` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `issue` | models/issues/issue.go:54 | schema.ts:610 `issues` | aligned | blanket families only (id / timestamp-name / strictness) |
+| `issue` | models/issues/issue.go:54 | schema.ts:610 `issues` | drift | upstream column `name` → ours `title`: the field carries the explicit xorm column-NAME tag `xorm:"name"` (issue.go:63), which upstream's own SQL binds (writes: `UpdateIssueCols(ctx, issue, "name")`, issue_update.go:198; search: the backticked column, issue.go:536); ours declares `title` (schema.ts:624) — FN-5 carrier (§7.8); the rest is blanket families (id / timestamp-name / strictness) |
 | `comment` | models/issues/comment.go:273 | schema.ts:740 `comments` | drift | missing 8 mutation-metadata cols (patch_quoted, comment_meta_data, project_id, old_project_id, time_id, assignee_team_id, original_author, original_author_id) |
 | `issue_content_history` | models/issues/content_history.go:20 | schema.ts:3455 `issue_content_history` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `tracked_time` | models/issues/tracked_time.go:22 | schema.ts:1913 `tracked_time` | drift | time → seconds column rename (unit kept seconds) |
@@ -251,7 +251,7 @@ classes only.
 | `access_token` | models/auth/access_token.go:20 | schema.ts:545 `personal_access_tokens` | intentional-recorded | PAT redesign: prefix/sha256/scopes/expires; SPEC-0002 §2.7+§3 (schema.ts:545) |
 | `auth_token` | models/auth/auth_token.go:18 | — | missing-table | function covered by sessions sha256_digest/rotation columns (SPEC-0010) |
 | `two_factor` | models/auth/twofactor.go:52 | schema.ts:5019 `two_factor` | intentional-recorded | last_used_passcode_period replay-guard divergence; SPEC-0022 (schema.ts:5019) |
-| `oauth2_application` | models/auth/oauth2.go:39 | schema.ts:3168 `oauth2_application` | drift | redirect_ur_is → redirect_uris gonic-quirk rename |
+| `oauth2_application` | models/auth/oauth2.go:39 | schema.ts:3168 `oauth2_application` | aligned | gonic-rename claim WITHDRAWN (§7.8): upstream carries the explicit override `RedirectURIs xorm:"redirect_uris JSON TEXT"` (oauth2.go:51), ours `redirect_uris` matches verbatim (schema.ts:3184); the rest is blanket families only (id / timestamp-name / strictness) |
 | `oauth2_authorization_code` | models/auth/oauth2.go:403 | schema.ts:3253 `oauth2_authorization_code` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `oauth2_grant` | models/auth/oauth2.go:504 | schema.ts:3215 `oauth2_grant` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `mirror` | models/repo/mirror.go:23 | schema.ts:1720 `repo_mirrors` | intentional-recorded | sync-state/credentials restructure; SPEC-0009 §3 (schema.ts:1720) |
@@ -276,7 +276,7 @@ classes only.
 | `email_address` | models/user/email_address.go:83 | schema.ts:2291 `email_addresses` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `user_open_id` | models/user/openid.go:18 | — | missing-table | no reader in worker (grep 0) |
 | `user_blocking` | models/user/block.go:24 | schema.ts:2784 `user_blocking` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `external_login_user` | models/user/external_login_user.go:47 | schema.ts:4891 `external_login_user` | intentional-recorded | raw_data dropped, tokens written empty; external-auth-sources §7.6/§7.8 (schema.ts:4891) |
+| `external_login_user` | models/user/external_login_user.go:47 | schema.ts:4891 `external_login_user` | intentional-recorded | raw_data dropped, tokens written empty; external-auth-sources §4.3 (both decisions recorded inline; upstream shape §2.6 — the SPEC's §7.6/§7.8 are edge-case list items, not sections; cite corrected §7.8) (schema.ts:4891) |
 | `user_redirect` | models/user/redirect.go:37 | schema.ts:1407 `user_redirects` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `badge` | models/user/badge.go:17 | schema.ts:3296 `badge` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `user_badge` | models/user/badge.go:25 | schema.ts:3309 `user_badge` | aligned | blanket families only (id / timestamp-name / strictness) |
@@ -362,7 +362,7 @@ census holds.
 
 ## 4. Column-level drift (the drifted tables)
 
-27 subsections: the 26 drift-class tables + `repositories` (verdict
+26 subsections: the 25 drift-class tables + `repositories` (verdict
 intentional-recorded with a flagged residual). Within each, blanket-family
 renames (created_at/updated_at, uid→user_id) are excluded; explicit RENAME
 lines are table-specific name-only divergences; MISSING/OURS-EXTRA/TYPE
@@ -395,6 +395,12 @@ upstream: models/git/commit_status.go (struct `CommitStatus`)
 upstream: models/asymkey/gpg_key.go (struct `GPGKey`)
 
 - MISSING `emails` (text(json)) — upstream models/asymkey/gpg_key.go:34 (`Emails`); no ours counterpart
+
+### `issue` → `issues` schema.ts:610
+
+upstream: models/issues/issue.go (struct `Issue`)
+
+- RENAME `name` → `title` (ours `issues`; schema.ts:624) — column-NAME tag, not mapper output: upstream `Title string xorm:"name"` (models/issues/issue.go:63) sets the SQL column to `name`, and upstream's own SQL binds that literal (title writes: `UpdateIssueCols(ctx, issue, "name")` inside ChangeIssueTitle, models/issues/issue_update.go:198; keyword search: `BuildCaseInsensitiveLike` over the backticked column, models/issues/issue.go:536) — name-only divergence; FN-5 carrier (§7.8)
 
 ### `issue_label` → `issue_labels` schema.ts:840
 
@@ -444,10 +450,12 @@ upstream: models/repo/release.go (struct `Release`)
 
 ### `review_state` → `review_state` schema.ts:4965
 
-upstream: models/pull/review_state.go (struct `ReviewState`)
+upstream: models/pull/review_state.go (struct `ReviewState`) — the updated_files
+line below LANDED by FN-3 (2026-11-03, migration 0065; `updated_files` TEXT NOT
+NULL DEFAULT '{}', the numeric ViewedState JSON; `specs/table-alignment-fn3-review-state.md`)
 
 - RENAME `pull_id` → `issue_id` (ours `review_state`; schema.ts:4971) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs)
-- MISSING `updated_files` (text(json) NOT NULL) — upstream models/pull/review_state.go:47 (`UpdatedFiles`); no ours counterpart
+- MISSING `updated_files` (text(json) NOT NULL) — upstream models/pull/review_state.go:47 (`UpdatedFiles`); no ours counterpart — **LANDED by FN-3**
 
 ### `pull_auto_merge` → `pull_auto_merges` schema.ts:4989
 
@@ -457,12 +465,6 @@ upstream: models/pull/automerge.go (struct `AutoMerge`)
 - RENAME `pull_id` → `issue_id` (ours `pull_auto_merges`; schema.ts:4994) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs)
 - MISSING `merged_commit_id` (text(varchar64)) — upstream models/pull/automerge.go:27 (`MergedCommitID`); no ours counterpart
 - OURS-EXTRA `sha` — schema.ts:4998 (`pull_auto_merges.sha`)
-
-### `oauth2_application` → `oauth2_application` schema.ts:3168
-
-upstream: models/auth/oauth2.go (struct `OAuth2Application`)
-
-- RENAME `redirect_ur_is` → `redirect_uris` (ours `oauth2_application`; schema.ts:3184) — rename-only divergence (name, not semantics)
 
 ### `protected_branch` → `protected_branches` schema.ts:2485
 
@@ -477,15 +479,6 @@ upstream: models/git/protected_tag.go (struct `ProtectedTag`)
 
 - RENAME `allowlist_team_i_ds` → `allowlist_team_ids` (ours `protected_tags`; schema.ts:3133) — rename-only divergence (name, not semantics)
 - RENAME `allowlist_user_i_ds` → `allowlist_user_ids` (ours `protected_tags`; schema.ts:3131) — rename-only divergence (name, not semantics)
-
-### `package_blob` → `package_blobs` schema.ts:3693
-
-upstream: models/packages/package_blob.go (struct `PackageBlob`)
-
-- RENAME `hash_m_d5` → `hash_md5` (ours `package_blobs`; schema.ts:3700) — rename-only divergence (name, not semantics)
-- RENAME `hash_sh_a1` → `hash_sha1` (ours `package_blobs`; schema.ts:3701) — rename-only divergence (name, not semantics)
-- RENAME `hash_sh_a256` → `hash_sha256` (ours `package_blobs`; schema.ts:3703) — rename-only divergence (name, not semantics)
-- RENAME `hash_sh_a512` → `hash_sha512` (ours `package_blobs`; schema.ts:3704) — rename-only divergence (name, not semantics)
 
 ### `package_blob_upload` → `package_blob_uploads` schema.ts:3837
 
@@ -522,7 +515,7 @@ upstream: models/repo/transfer.go (struct `RepoTransfer`)
 - RENAME `recipient_id` → `new_owner_id` (ours `repo_transfer`; schema.ts:313) — rename-only divergence (name, not semantics)
 - RENAME `team_i_ds` → `team_ids` (ours `repo_transfer`; schema.ts:332) — rename-only divergence (name, not semantics)
 - MISSING `recipient_access_granted` (boolean NOT NULL, DEFAULT false) — upstream models/repo/transfer.go:76 (`RecipientAccessGranted`); no ours counterpart
-- MISSING `updated_unix` (integer NOT NULL) — upstream models/repo/transfer.go:79 (`UpdatedUnix`); no ours counterpart
+- MISSING `updated_unix` (integer NOT NULL) — upstream models/repo/transfer.go:78 (`UpdatedUnix`); no ours counterpart
 
 ### `repo_unit` → `repo_units` schema.ts:341
 
@@ -634,19 +627,39 @@ applies).
   the worktree fix against upstream's iota: exact match. Rows already
   written under the old lattice are what make this a data migration even
   though no column changes shape.
-- **FN-3: review_state.updated_files — the per-file viewed map.** Upstream
+- **FN-3: review_state.updated_files — the per-file viewed map.**
+  **STATUS: LANDED (2026-11-03, migration `0065_review-state-updated-files`
+  + `specs/table-alignment-fn3-review-state.md` — the rest of this row is
+  the original scope, kept for the cites; the §3.1 row and the §4
+  review_state section carry the LANDED annotations).** Upstream
   stores the whole (path → viewed-state) map per (user, pull)
   (`models/pull/review_state.go:47`, LONGTEXT JSON NOT NULL; rendered by
-  `pull.go:853 filesViewedState = reviewState.UpdatedFiles`); ours landed a
-  REDUCTION — one sha cursor per (user, issue), the whole-PR mark
-  (`schema.ts:4965-4983`; `ui/pages/pull-files.tsx:170,642` "the landed
-  review_state reduction"). API/UI-visible: upstream's per-file viewed
-  checkboxes degrade to a whole-PR toggle on ours. Port: add
-  `updated_files` TEXT (JSON), write the map in
-  `updateViewedFilesFromWeb`, keep the cursor for the cheap read. Rides
-  the `pull_id` value-space note (§4 review_state) — migrating the key to
-  pull_request.id is optional if recorded; issues.id works while the rows
-  stay 1:1.
+  `pull.go:853 filesViewedState = reviewState.UpdatedFiles`); ours had
+  landed a REDUCTION — one sha cursor per (user, issue), the whole-PR mark.
+  API/UI-visible: upstream's per-file viewed checkboxes degraded to a
+  whole-PR toggle on ours. LANDED AS: the `updated_files` TEXT NOT NULL
+  DEFAULT '{}' column (upstream's numeric ViewedState JSON verbatim; the
+  default is the house back-fill for the cursor rows); the write arm
+  (`updateViewedFilesFromWeb`) stores upstream's exact per-file entries —
+  Go-strict decode (non-bool/non-string → 400), bool → Viewed/Unviewed,
+  same-sha posts merge per-key (mergeFiles, review_state.go:117-126), a
+  DIFFERENT sha inherits the stored map then merges and advances the cursor
+  (the single-row mapping of getNewestReviewStateApartFrom's seeding
+  :93-98; the pull_id value-space move stayed optional-unrecorded —
+  issues.id works while the rows stay 1:1), and the old whole-PR row-delete
+  is gone (uncheck writes UNVIEWED entries; the no-JS form arm expands to
+  the diff's full path set); the read arm resolves upstream's ladder
+  (gitdiff.go:1541-1555) per rendered file — stored Viewed degrades to
+  has-changed when the file changed between the cursor sha and the head
+  (GetFilesChangedBetween via the engine's readDiff, errors→empty-set), the
+  summary/progress count is GetViewedFileCount over the resolved states,
+  and the changed-since marker (box.tmpl:141-143) renders; the internal
+  HasChanged persistence write of SyncUserSpecificDiff (:1566-1576) is NOT
+  ported — recorded (the recompute covers the stale-cursor window; no
+  writes on GET). Tests: schema.test's FN-3 describe (DDL pin, legacy-row
+  default, the merge ladder) + pull-files.matrix's rewritten round-trip and
+  its new real-engine FN-3 describe (subset post, advance inheritance,
+  per-file read-back, the page arms).
 - **FN-2: comments mutation-metadata completion (8 columns).** Missing:
   `patch_quoted` (comment.go:331), `comment_meta_data` (comment.go:361),
   `project_id`/`old_project_id` (project-move comments, comment.go:292-293),
