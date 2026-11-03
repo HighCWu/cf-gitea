@@ -234,6 +234,45 @@ describe("POST /user/repos auto_init seeding", () => {
 });
 
 // ---------------------------------------------------------------------------
+// the `template` flag — upstream CreateUserRepo passes `IsTemplate:
+// opt.Template` into CreateRepoOptions (repo.go:253): the created repo IS
+// marked as a template (create-FROM-template is the separate /generate
+// endpoint, whose eligibility gate reads exactly this bit, repo.go:349).
+// ---------------------------------------------------------------------------
+
+describe("POST /user/repos template flag", () => {
+  it("template: true marks the created repo — the 201 body and the follow-up GET carry it", async () => {
+    await seedStubRow();
+    const owner = STUB_USER.login ?? "cf-gitea-stub";
+    const res = await apiCreate({ name: "tpl-create", template: true });
+    expect(res.status).toBe(201);
+    expect(await res.json<{ template: boolean }>()).toMatchObject({ template: true });
+    const app = createApiRouter({ auth: createStubAuthResolver(["stub-token"]) });
+    const ctx = createExecutionContext();
+    const got = await app.fetch(
+      new Request(`https://example.com/repos/${owner}/tpl-create`, {
+        headers: { authorization: "token stub-token" },
+      }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(got.status).toBe(200);
+    expect(await got.json<{ template: boolean }>()).toMatchObject({ template: true });
+  });
+
+  it("an omitted (and a false) template stays the upstream default false", async () => {
+    await seedStubRow();
+    const res = await apiCreate({ name: "tpl-omitted" });
+    expect(res.status).toBe(201);
+    expect(await res.json<{ template: boolean }>()).toMatchObject({ template: false });
+    const explicit = await apiCreate({ name: "tpl-false", template: false });
+    expect(explicit.status).toBe(201);
+    expect(await explicit.json<{ template: boolean }>()).toMatchObject({ template: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // toCreatedOrgRepository — the shared 201 assembly both create routes call
 // ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, like, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, like, lte, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
@@ -1214,13 +1214,13 @@ interface TimelineTrackedTime {
 }
 
 /** The outcome of the time-comment correlation (see trackedTimeOfComment):
- *  `none` — no entry expected (types outside the family, or an arm whose
- *  correlation keys are missing): renders null `tracked_time`, upstream's
- *  `TimeID == 0` early return (models/issues/comment.go:733-736); `missing` —
- *  an entry IS expected but the store holds no matching row: upstream's
- *  GetTrackedTimeByID error arm, which ToTimelineComment answers by DROPPING
- *  the whole row (services/convert/issue_comment.go:53-56; ledger ⑬-#16);
- *  `found` — the rendered TimelineTrackedTime. */
+ *  `none` — no linkage (TimeID unset): renders null `tracked_time` with the
+ *  row KEPT, upstream's `TimeID == 0` early return (models/issues/
+ *  comment.go:733-736); `missing` — a positive time_id but the store holds
+ *  no matching row: upstream's GetTrackedTimeByID error arm, which
+ *  ToTimelineComment answers by DROPPING the whole row (services/convert/
+ *  issue_comment.go:53-56; ledger ⑬-#16); `found` — the rendered
+ *  TimelineTrackedTime. */
 type TimelineTimeCorrelation =
   | { kind: "none" }
   | { kind: "missing" }
@@ -1233,87 +1233,39 @@ type TimelineTimeCorrelation =
  * (tracked_time.go:312-322 — id + issue_id, no deleted filter: a
  * soft-deleted entry still loads, ToTrackedTime :158-174 renders it),
  * ToTrackedTime then renders the LoadAttributes'd row (user_name + the full
- * issue render). FN-2 landed the `time_id` column and the writers stamp it
- * (SPEC-0005 §7.3), so the exact-row link is read FIRST, verbatim.
+ * issue render).
  *
- * The (poster, seconds, second) correlation below is the LEGACY fallback
- * only — for pre-migration rows the 0067 backfill could not pin (the SPEC
- * §7.7 removal marker: one release after the backfill, then drop):
- *   - add_time_manual (14): the `|<seconds>` content marker holds the entry's
- *     seconds (tracked_time.go:183-188) — the batch-mate is the newest live
- *     entry with those seconds by the comment poster on this issue;
- *   - stop_tracking (13): upstream writes the ALREADY-humanized content
- *     (stopwatch.go:160) as do our writers — the batch-mate is the newest
- *     live entry created in the comment's own second (both rows of the batch
- *     share the write's Date).
+ * SPEC §7.7's legacy (poster, seconds, second) correlation fallback was
+ * REMOVED here (the one-release marker matured; derivation in the §7.7
+ * record): the 0067 backfill ran that exact correlation ONCE over every
+ * pre-migration row, and each shape it left NULL is unresolvable by the
+ * reader too — the admin user_name-override add (poster is the admin, the
+ * entry's user is the target: both the backfill and the fallback key on
+ * poster) and the batch-mate soft-deleted before the backfill (both filter
+ * deleted = 0) — so the fallback resolved zero rows ever, and its one
+ * reachable hit (a post-migration same-seconds re-add by the same poster)
+ * grafted the NEW entry onto the OLD comment. Unstamped rows now render
+ * `none` — exactly upstream's legacy-row shape: upstream's own time_id
+ * migration (v173, v1.14) performed NO backfill, so its pre-v1.14 rows keep
+ * TimeID == 0 and ride the same early return, row kept, tracked_time nil.
  * delete_time_manual (26) is `none` — upstream sets no TimeID there either
- * (tracked_time.go:252-263/:276-286), so its render is the same null; types
- * outside the time family are LoadTime's `TimeID == 0` early return. A
- * dangling time_id (purged row, wrong-issue row) or a fallback arm with no
- * match is `missing` — the upstream LoadTime error arm that drops the row,
- * never a null-metadata render.
+ * (tracked_time.go:252-263/:276-286); types outside the time family ditto.
+ * A positive but dangling time_id (purged row, wrong-issue row) is
+ * `missing` — the upstream LoadTime error arm that drops the row, never a
+ * null-metadata render.
  */
 async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, comment: CommentRow): Promise<TimelineTimeCorrelation> {
-  let entry: { id: number; issueId: number; userId: number; seconds: number; createdAt: Date | null } | null = null;
-  let expected = false;
-  if ((comment.timeId ?? 0) > 0) {
-    // The exact-row link (upstream LoadTime → GetTrackedTimeByID): id +
-    // issue_id, deleted rides along.
-    expected = true;
-    entry =
-      (
-        await drizzle(d1)
-          .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
-          .from(trackedTimes)
-          .where(and(eq(trackedTimes.id, comment.timeId!), eq(trackedTimes.issueId, issue.id)))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0]))
-      ) ?? null;
-  } else if (comment.type === CommentType.AddTimeManual && (comment.content ?? "").startsWith("|")) {
-    const seconds = goParseInt64((comment.content ?? "").slice(1));
-    if (comment.posterId !== null && seconds !== 0) {
-      expected = true;
-      entry =
-        (
-          await drizzle(d1)
-            .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
-            .from(trackedTimes)
-            .where(
-              and(
-                eq(trackedTimes.issueId, issue.id),
-                eq(trackedTimes.userId, comment.posterId),
-                eq(trackedTimes.seconds, seconds),
-                eq(trackedTimes.deleted, false),
-              ),
-            )
-            .orderBy(desc(trackedTimes.id))
-            .limit(1)
-            .then((rows) => (rows[0] === undefined ? null : rows[0]))
-        ) ?? null;
-    }
-  } else if (comment.type === CommentType.StopTracking && comment.posterId !== null && comment.createdAt !== null && comment.createdAt !== undefined) {
-    expected = true;
-    entry =
-      (
-        await drizzle(d1)
-          .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
-          .from(trackedTimes)
-          .where(
-            and(
-              eq(trackedTimes.issueId, issue.id),
-              eq(trackedTimes.userId, comment.posterId),
-              eq(trackedTimes.deleted, false),
-              eq(trackedTimes.createdAt, comment.createdAt),
-            ),
-          )
-          .orderBy(desc(trackedTimes.id))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0]))
-      ) ?? null;
-  }
-  if (!expected) {
+  if ((comment.timeId ?? 0) <= 0) {
     return { kind: "none" };
   }
+  // The exact-row link (upstream LoadTime → GetTrackedTimeByID): id +
+  // issue_id, deleted rides along.
+  const entry = await drizzle(d1)
+    .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
+    .from(trackedTimes)
+    .where(and(eq(trackedTimes.id, comment.timeId!), eq(trackedTimes.issueId, issue.id)))
+    .limit(1)
+    .then((rows) => (rows[0] === undefined ? null : rows[0]));
   if (entry === null) {
     return { kind: "missing" };
   }
@@ -1466,11 +1418,12 @@ export async function toTimelineComment(
       : preload === undefined
         ? dependentIssueLegOf(d1, comment.dependentIssueId)
         : Promise.resolve(preload.dependentIssues.get(comment.dependentIssueId) ?? null),
-    // The time family's rare arms only — `none` for every other row. A row
-    // already carrying its exact time_id (FN-2) joins the family: upstream
-    // LoadTime runs on every comment and its TimeID == 0 early return is the
-    // only gate (comment.go:733-736).
-    (comment.timeId ?? 0) > 0 || comment.type === CommentType.AddTimeManual || comment.type === CommentType.StopTracking
+    // Only a stamped time_id can correlate (upstream LoadTime runs on every
+    // comment and its TimeID == 0 early return is the only gate,
+    // comment.go:733-736) — an unstamped row is statically `none`, so the
+    // call is skipped entirely (SPEC §7.7: the legacy correlation fallback
+    // is removed; unstamped rows render the upstream legacy shape).
+    (comment.timeId ?? 0) > 0
       ? trackedTimeOfComment(d1, viewer, pair, issue, comment)
       : Promise.resolve({ kind: "none" as const }),
   ]);

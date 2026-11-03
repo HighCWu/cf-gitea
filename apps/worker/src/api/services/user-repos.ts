@@ -70,10 +70,16 @@ import { tombstoneRepoDO } from "../../repos/purge";
  *     case-insensitive, empty/unknown → `default`. Stored on the
  *     repositories row (create.go:248 `TrustModel: opts.TrustModel`; the
  *     FN-4 `trust_model` port) — 'default' stores NULL, upstream's 0.
- *   - `template` / `object_format_name` are accepted per contract and ignored
- *     (is_template gates generate, but the CREATE form's template flag has no
- *     landed writer arm; sha1 is the only engine object format — the create
- *     seed stores 'sha1' unconditionally).
+ *   - `template` marks the NEW repository as a template (upstream
+ *     CreateUserRepo passes `IsTemplate: opt.Template` into
+ *     CreateRepoOptions, repo.go:253 — create-FROM-template is the separate
+ *     POST /repos/{owner}/{repo}/generate, whose eligibility gate reads
+ *     exactly this flag, repo.go:349). Stored on the row beside
+ *     `default_branch` (the same-request follow-up update — upstream sets
+ *     it on the insert; RepoService.create seeds the default false).
+ *   - `object_format_name` is accepted per contract and ignored (sha1 is the
+ *     only engine object format — the create seed stores 'sha1'
+ *     unconditionally).
  */
 
 /** Upstream `repo_module.Readmes` — the contents of options/readme/. */
@@ -251,14 +257,16 @@ export async function createUserRepository(
   });
 
   // Metadata the create call carries: default branch (upstream
-  // IfZero(opts.DefaultBranch, "main")) and the auto-init is_empty flip.
+  // IfZero(opts.DefaultBranch, "main")), the auto-init is_empty flip, and
+  // the template flag (upstream `IsTemplate: opt.Template`, repo.go:253 —
+  // the generate gate's eligibility bit, repo.go:349).
   const defaultBranch = form.default_branch !== undefined && form.default_branch !== "" ? form.default_branch : repo.defaultBranch;
   if (form.description !== undefined && form.description !== "") {
     await saveRepoSettings(d1, repo.id, { description: form.description }, now);
   }
   await drizzle(d1)
     .update(repositories)
-    .set({ defaultBranch, isEmpty: form.auto_init !== true, updatedAt: now })
+    .set({ defaultBranch, isEmpty: form.auto_init !== true, isTemplate: form.template === true, updatedAt: now })
     .where(eq(repositories.id, repo.id));
 
   if (form.auto_init === true) {

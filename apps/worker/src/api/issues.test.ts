@@ -3467,24 +3467,29 @@ describe("issue/comment asset + timeline enrichment renders (⑬ P2)", () => {
     const repoId = await seedRepo(owner.usernameLower, "visible");
     const issue = await seedIssue(repoId, "timed", { posterId: owner.id });
     const addAt = new Date("2026-05-01T00:00:00Z");
+    const entries = await db()
+      .insert(trackedTimes)
+      .values([
+        { issueId: issue.id, userId: owner.id, seconds: 3600, deleted: false, createdAt: addAt }, // the add_time batch-mate
+        { issueId: issue.id, userId: owner.id, seconds: 7200, deleted: false, createdAt: addAt }, // the stop_tracking batch-mate
+      ])
+      .returning({ id: trackedTimes.id })
+      .all();
     await db().insert(comments).values([
       // The v1.21+ writer format: raw seconds behind the "|" delimiter
-      // (tracked_time.go:185) — the timeline humanizes on the way out.
-      { type: CommentType.AddTimeManual, posterId: owner.id, issueId: issue.id, content: "|3600", createdAt: addAt, updatedAt: addAt },
+      // (tracked_time.go:185) — the timeline humanizes on the way out. The
+      // writers stamp the batch-mate id (SPEC-0005 §7.3); the tracked_time
+      // render keys on that exact row.
+      { type: CommentType.AddTimeManual, posterId: owner.id, issueId: issue.id, content: "|3600", timeId: entries[0]!.id, createdAt: addAt, updatedAt: addAt },
       // The stopwatch stop stores the ALREADY-humanized content upstream
       // (stopwatch.go:160) — a raw-seeded row proves the strip arm covers
-      // type 13 too, and the tracked_time correlation keys on the shared
-      // batch Date.
-      { type: CommentType.StopTracking, posterId: owner.id, issueId: issue.id, content: "|7200", createdAt: addAt, updatedAt: addAt },
+      // type 13 too.
+      { type: CommentType.StopTracking, posterId: owner.id, issueId: issue.id, content: "|7200", timeId: entries[1]!.id, createdAt: addAt, updatedAt: addAt },
       // delete_time_manual carries no TimeID upstream either
       // (tracked_time.go:252-263) — the body humanizes, tracked_time nulls.
       { type: CommentType.DeleteTimeManual, posterId: owner.id, issueId: issue.id, content: "|1800", createdAt: addAt, updatedAt: addAt },
       // change_time_estimate stores decimal seconds — TimeEstimateString.
       { type: CommentType.ChangeTimeEstimate, posterId: owner.id, issueId: issue.id, content: "7200", createdAt: addAt, updatedAt: addAt },
-    ]);
-    await db().insert(trackedTimes).values([
-      { issueId: issue.id, userId: owner.id, seconds: 3600, deleted: false, createdAt: addAt }, // the add_time batch-mate
-      { issueId: issue.id, userId: owner.id, seconds: 7200, deleted: false, createdAt: addAt }, // the stop_tracking batch-mate
     ]);
 
     const res = await router()(`/repos/alice/visible/issues/${issue.index}/timeline`);
@@ -5053,8 +5058,8 @@ describe("the owner-project counts scope (R5-3)", () => {
 // readers stopped hardcoding the mutation-metadata arms — the project pair
 // renders the row's columns (the old 0/0 hardcode), the type-27 team arm
 // resolves the team row (the old null hardcode), and the time family reads
-// the exact `time_id` row FIRST with the (poster, seconds, second)
-// correlation demoted to the legacy fallback (the 0067-unpinned rows).
+// the exact `time_id` row (the §7.7 legacy correlation fallback is
+// REMOVED — unstamped rows render the upstream legacy shape, §7.7 record).
 // ---------------------------------------------------------------------------
 
 describe("FN-2 timeline metadata renders (ADR-0007, SPEC-0005 §7.4)", () => {
@@ -5079,13 +5084,13 @@ describe("FN-2 timeline metadata renders (ADR-0007, SPEC-0005 §7.4)", () => {
     return { orgId: org.id, teamId: team.id };
   }
 
-  it("fn2-timeline-time-render-exact: tracked_time pins the comment's OWN time_id row, not the heuristic twin; a dangling time_id drops the row", async () => {
+  it("fn2-timeline-time-render-exact: tracked_time pins the comment's OWN time_id row, not the newer same-shape entry; a dangling time_id drops the row", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
     const issue = await seedIssue(repoId, "fn2 exact time", { posterId: owner.id });
-    // Two entries with the SAME (issue, poster, seconds) — the legacy
-    // heuristic picks the NEWEST; the exact arm must pin the comment's
-    // own (OLDER) time_id row.
+    // Two entries with the SAME (issue, poster, seconds) — a heuristic could
+    // pick the NEWEST; the exact arm must pin the comment's own (OLDER)
+    // time_id row.
     const entries = await db()
       .insert(trackedTimes)
       .values([
@@ -5115,6 +5120,38 @@ describe("FN-2 timeline metadata renders (ADR-0007, SPEC-0005 §7.4)", () => {
     expect(time!.user_name).toBe("Alice");
     expect(time!.user_id).toBe(owner.id);
     expect(time!.issue_id).toBe(issue.id);
+  });
+
+  it("fn2-timeline-time-render-legacy-unstamped: a stamp-less time-family row renders the upstream legacy shape — row KEPT, tracked_time null, no heuristic graft", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "fn2 legacy unstamped", { posterId: owner.id });
+    // The entries a heuristic COULD have matched: the exact batch-mate shape
+    // (same poster + seconds / same-second bank) — upstream's own time_id
+    // migration (v173, v1.14) performed NO backfill, so its legacy rows keep
+    // TimeID == 0 and render tracked_time nil WITHOUT correlating; ours
+    // answers the same (the §7.7 fallback removal — never graft the entry).
+    await db().insert(trackedTimes).values([
+      { issueId: issue.id, userId: owner.id, seconds: 3600, deleted: false, createdAt: at(10) },
+      { issueId: issue.id, userId: owner.id, seconds: 1800, deleted: false, createdAt: at(20) },
+    ]);
+    const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
+      db().insert(comments).values({ issueId: issue.id, content: "", createdAt: at(30), updatedAt: at(30), ...values });
+    await insert({ type: CommentType.AddTimeManual, posterId: owner.id, content: "|3600" }); // batch-mate exists — no time_id
+    await insert({ type: CommentType.StopTracking, posterId: owner.id, content: "30 minutes", createdAt: at(20), updatedAt: at(20) }); // the writer's pre-humanized body; same-second bank exists — no time_id
+
+    const app = createApiRouter();
+    const res = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/timeline`), env);
+    expect(res.status).toBe(200);
+    const timeline = await res.json<Array<{ type: string; body: string; tracked_time: Record<string, unknown> | null }>>();
+    // Both rows STAY (the upstream TimeID == 0 early return shape — not the
+    // missing-drop of a dangling positive id).
+    expect(timeline).toHaveLength(2);
+    const byType = Object.fromEntries(timeline.map((item) => [item.type, item]));
+    expect(byType.add_time_manual?.body).toBe("1 hour"); // the humanizer keeps its content arm
+    expect(byType.stop_tracking?.body).toBe("30 minutes");
+    expect(byType.add_time_manual?.tracked_time).toBeNull(); // no graft of the batch-mate
+    expect(byType.stop_tracking?.tracked_time).toBeNull(); // no graft of the same-second bank
   });
 
   it("fn2-timeline-assignee-team-render: the team arm renders the ToTeam shape, the user arm renders assignee; a dangling team id drops the row", async () => {
@@ -5223,8 +5260,8 @@ WHERE \`type\` = 30
       db().insert(comments).values({ issueId: issue.id, content: "", createdAt: at(30), updatedAt: at(30), ...values });
     await insert({ type: CommentType.AddTimeManual, posterId: owner.id, content: "|3600", timeId: entry.id }); // humanized
     // The stop-tracking writer pre-humanizes its content AND stamps the
-    // batch-mate id (the exact arm) — a stamp-less row would ride the legacy
-    // correlation and drop (no same-second entry here).
+    // batch-mate id (the exact arm) — a stamp-less row would render the
+    // upstream legacy shape (tracked_time null, row kept; §7.7).
     await insert({ type: CommentType.StopTracking, posterId: owner.id, content: "1 hour ", timeId: entry.id }); // pre-humanized verbatim
     await insert({ type: CommentType.ChangeTimeEstimate, posterId: owner.id, content: "5400" }); // estimate string
     await insert({ type: CommentType.Comment, posterId: owner.id, content: '{"looks":"like json"}' }); // verbatim — NOT stripped
