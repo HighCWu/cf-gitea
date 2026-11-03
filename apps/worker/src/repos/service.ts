@@ -322,6 +322,15 @@ export interface CreateRepoInput {
    *  no kind: upstream's GenerateRepository creates with the NORMAL list
    *  (template.go:90 passes isFork=false and leaves IsTemplate unset). */
   creationKind?: RepoCreationKind;
+  /** Upstream `opts.TrustModel` (create.go:248, ToTrustModel of the API
+   *  form's trust_model, structs/repo.go:167); absent = NULL ≡ the default
+   *  model (repo.go:105). The signing-settings arm port-when-read. */
+  trustModel?: "default" | "collaborator" | "committer" | "collaboratorcommitter";
+  /** Upstream `opts.GitServiceType` (create.go:237, adopt.go:58 — the
+   *  GitServiceType Name() string, structs/repo.go:346-360). Our migrate
+   *  surface admits plain git only (SPEC-0009 §2.2), so the one producible
+   *  value is 'git'; absent = NULL ≡ upstream NotMigrated (0). */
+  originalServiceType?: string;
   /** SPEC-0015 §4.2: the audit event's origin hint. Service-level v1 default
    *  "api" (every current call site is an API route or the git push-create
    *  settle); the downstream audit wave threads the real per-request origin. */
@@ -405,12 +414,34 @@ export class RepoService {
           ownerNamespace: input.owner.usernameLower,
           ownerId: input.owner.id,
           slug: lower,
+          // FN-4 (SPEC-0001 §4.1): upstream's display-case `Name` rides the
+          // input verbatim (create.go:238 `Name: opts.Name`) while the slug
+          // stays folded (LowerName, create.go:239).
+          name: input.name,
           visibility: input.isPrivate ? "private" : "public",
           defaultBranch: "main",
+          // FN-4: the wiki-branch seed (create.go:148 —
+          // `repo.DefaultWikiBranch = setting.Repository.DefaultBranch`, the
+          // instance default; our instance default is 'main', SPEC-0003 §2.5.1).
+          defaultWikiBranch: "main",
           isEmpty: true,
           isArchived: false,
           status: input.status ?? "ready",
           refsVersion: 0,
+          // FN-4: the engine is sha1-only (SPEC-0001 §5) — the upstream
+          // create validates ObjectFormatName against the supported set
+          // (create.go:224-226) and ours admits exactly 'sha1'.
+          objectFormatName: "sha1",
+          // FN-4: `IsFsckEnabled: !opts.IsMirror` (create.go:242) — mirrors
+          // (creationKind "mirror", the SPEC-0009 migrate arm) are created
+          // with fsck disabled, everything else enabled.
+          isFsckEnabled: input.creationKind !== "mirror",
+          // FN-4: `OriginalServiceType: opts.GitServiceType` (create.go:237;
+          // NULL ≡ upstream NotMigrated 0 — only the migrate arm passes one).
+          originalServiceType: input.originalServiceType ?? null,
+          // FN-4: `TrustModel: opts.TrustModel` (create.go:248; NULL ≡ the
+          // default model).
+          trustModel: input.trustModel ?? null,
           createdAt,
         }),
         // Immutable thereafter; renames/transfers never touch it (ADR-0001 D3).
@@ -538,7 +569,18 @@ export class RepoService {
           ),
         this.db
           .update(repositories)
-          .set({ slug: newLower, updatedAt: new Date() })
+          .set({
+            slug: newLower,
+            // FN-4: upstream's rename stamps BOTH carriers — the API edit arm
+            // sets `repo.Name = newRepoName` (display case) beside
+            // `repo.LowerName = strings.ToLower(newRepoName)`
+            // (routers/api/v1/repo/repo.go:666-667, updateBasicProperties;
+            // ChangeRepositoryName itself only moves storage + the redirect,
+            // transfer.go:409-424 → NewRedirect, redirect.go:67-80). New name
+            // in display case; the slug stays folded.
+            name: newName,
+            updatedAt: new Date(),
+          })
           .where(eq(repositories.id, repoId)),
         this.db.insert(repoRedirects).values({
           ownerId: await this.redirectOwnerId(repo),

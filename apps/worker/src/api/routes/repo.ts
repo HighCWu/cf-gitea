@@ -527,6 +527,8 @@ export function registerRepoRoutes(
       // Name: rename only on a case-insensitive change (upstream
       // `!strings.EqualFold(lower_name, newName)`); invalid/reserved names
       // and collisions are the declared 422s (updateBasicProperties).
+      const caseOnlyRename =
+        form.name !== undefined && form.name.toLowerCase() === found.repo.slug && form.name !== found.repo.name;
       if (form.name !== undefined && form.name.toLowerCase() !== found.repo.slug) {
         try {
           await service.rename(found.repo.id, form.name);
@@ -552,6 +554,17 @@ export function registerRepoRoutes(
             }),
           });
         }
+      } else if (caseOnlyRename) {
+        // A case-ONLY rename ("MyRepo" -> "myrepo" over an already-lower
+        // slug): upstream skips ChangeRepositoryName but still stamps the
+        // display-case `Name` on the row (repo.go:666 runs unconditionally,
+        // persisted by UpdateRepository at :727). No storage move, no
+        // redirect, no webhook — the slug is unchanged; FN-4's `name` column
+        // carries the case the slug used to discard.
+        await drizzle(c.env.DB)
+          .update(repositories)
+          .set({ name: form.name, updatedAt: now })
+          .where(eq(repositories.id, found.repo.id));
       }
 
       // Private flip — the fork↔base coupling first (updateBasicProperties,

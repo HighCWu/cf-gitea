@@ -220,6 +220,12 @@ export async function migrateRepository(
       owner: { id: owner.id, usernameLower: owner.usernameLower },
       name: options.repo_name,
       isPrivate: options.private === true,
+      // FN-4: `OriginalServiceType: opts.GitServiceType` (create.go:237) —
+      // the §2.2 restricted family admits plain git only, and upstream's
+      // plain-git service (PlainGitService, structs/repo.go:351) renders
+      // Name() "git". NULL ≡ upstream NotMigrated (0) for non-migrate
+      // creates.
+      originalServiceType: "git",
       // A mirror migration births a DefaultMirrorRepoUnits repo upstream
       // (CreateRepositoryDirectly's IsMirror arm, gitea_uploader.go:108 →
       // create.go:353-354): packages armed, actions not. A plain migration

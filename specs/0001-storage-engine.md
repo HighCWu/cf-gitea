@@ -119,8 +119,8 @@ and THIS block is the record of record):
 | `is_mirror` | BOOLEAN NOT NULL default false | `IsMirror bool xorm:"INDEX"` (repo.go:189) | parity (SPEC-0009 §3.1) |
 | `original_url` | TEXT nullable (schema.ts:116) — sanitized source URL | `OriginalURL string xorm:"VARCHAR(2048)"` (repo.go:163) | parity (SPEC-0009 §3.1) |
 | `is_template` | BOOLEAN NOT NULL default false | `IsTemplate bool xorm:"INDEX NOT NULL DEFAULT false"` (repo.go:201) | parity (migration 0027) |
-| `size_kb` | INTEGER NOT NULL default 0 (schema.ts:145) — the settled GIT footprint in KiB; upstream `Size` = git + LFS (update.go:110) — the FN-4 sizes leg widens the writer scope | `Size int64 xorm:"NOT NULL DEFAULT 0"` (repo.go:203) | fold at a NARROWER scope; scope parity rides FN-4(c) |
-| indexes | `repositories_owner_slug_uq(owner_namespace, slug)` (schema.ts:248) — the arbitration point; `repositories_fork_parent_idx` (:251); `repositories_owner_id_idx` | upstream: `UNIQUE(s)` over (OwnerID, LowerName) + the field INDEXes (repo.go:153-220) | the fold's index shape (fold 1 below) |
+| `size_kb` | INTEGER NOT NULL default 0 (schema.ts:145) — the settled footprint in KiB, scope-parity since the FN-4 port: git + LFS (update.go:110), floored over the byte sum; `git_size`/`lfs_size` carry the split (the LANDED port block below) | `Size int64 xorm:"NOT NULL DEFAULT 0"` (repo.go:203) | fold — scope parity LANDED (fold 4) |
+| indexes | `repositories_owner_slug_uq(owner_namespace, slug)` (schema.ts:248) — the arbitration point; `repositories_fork_parent_idx` (:251); `repositories_owner_id_idx`; `repositories_template_id_idx` (the FN-4 port, repo.go:202) | upstream: `UNIQUE(s)` over (OwnerID, LowerName) + the field INDEXes (repo.go:153-220) | the fold's index shape (fold 1 below) |
 
 **The fold records** — the dispositions with no prior SPEC text; each
 carries its upstream field line, our schema line, and the SPEC or decision
@@ -131,14 +131,14 @@ ground (the ADR-0007 both-side-cite test):
    (repo.go:158-159) with `UNIQUE(owner_id, lower_name)` as the arbitration;
    ours keeps ONE name column, `slug`, stored case-folded
    (repos/service.ts:395,407) under `UNIQUE(owner_namespace, slug)`
-   (schema.ts:248). Consequences recorded here: (a) no display-case copy
-   exists — the API `name` field renders the folded slug
-   (api/services/repository.ts:819) where upstream renders display case;
-   `name` is therefore a REAL upstream column ours lacks, and FN-4 ports it
-   additively (create/rename stamp display case; the slug copy is the
-   best-effort backfill — display case for existing rows is unrecoverable,
-   accepted and recorded). (b) A separate `lower_name` column is declined —
-   it would duplicate the folded slug (state duplication, AGENTS.md).
+   (schema.ts:248). Consequences recorded here: (a) the display-case copy
+   rides the FN-4 `name` port now (LANDED, migration 0068 — the table row
+   below): create/rename/case-only-PATCH stamp it, and the API `name` field
+   renders it (upstream parity; the pre-port folded-slug render was the
+   recorded gap); the 0068 backfill was the slug copy — display case for
+   pre-0068 rows was unrecoverable, accepted and recorded. (b) A separate
+   `lower_name` column is declined — it would duplicate the folded slug
+   (state duplication, AGENTS.md).
 2. **`owner_namespace` folds `owner_name`, folded at write.** Upstream
    `OwnerName` stores the owner's display-case name
    (services/repository/create.go:231); ours stores the folded owner slug
@@ -153,46 +153,66 @@ ground (the ADR-0007 both-side-cite test):
    derives (`fork: row.forkParent !== null`, api/services/repository.ts:835,
    matching upstream `Fork: repo.IsFork`, services/convert/repository.go:208).
    Storing the bool would duplicate the edge.
-4. **`size_kb` covers `size` at a narrower scope.** Upstream's `Size` = git
-   + LFS (update.go:110) with `git_size`/`lfs_size` split out
-   (repo.go:204-205); ours accounts the git footprint only (schema.ts:145).
-   FN-4's sizes leg splits the accounting (adds `git_size`/`lfs_size`) and
-   widens the `size` writer to git+LFS at the SPEC-0014 settle points (the
-   §5 size-observability row, `services/repo-size.ts:146-159`). The KiB unit
-   stays (render divides nothing; upstream divides by 1024 at render,
-   services/convert/repository.go:207).
+4. **`size_kb` covered `size` at a narrower scope — scope parity LANDED.**
+   Upstream's `Size` = git + LFS (update.go:110) with `git_size`/`lfs_size`
+   split out (repo.go:204-205); the pre-0068 accounts was the git footprint
+   only (schema.ts:145). FN-4's sizes leg LANDED (migration 0068 +
+   services/repo-size.ts): the settle persists the triple — `git_size` (the
+   R2 walk), `lfs_size` (the lfs_objects sum, GetRepoLFSSize's shape), and
+   `size_kb` widened to git+LFS flooring the BYTE sum. The KiB unit stays
+   (render divides nothing; upstream divides by 1024 at render,
+   services/convert/repository.go:207). The `size_kb` column itself is
+   unchanged in shape; only the writer scope moved.
 
-**The FN-4 port columns — PENDING (recorded 2026-11-03; not yet landed).**
-One additive migration carries all 18 port columns (every add is
-ALTER-legal — constant DEFAULT or NULL; the one index add is a CREATE INDEX;
-no table rebuild): `name`, `description`, `website`, `avatar`,
-`archived_unix`, `default_wiki_branch`, `git_size`, `is_fsck_enabled`,
-`lfs_size`, `num_action_runs`, `num_closed_action_runs`,
-`num_closed_projects`, `num_projects`, `object_format_name`,
-`original_service_type`, `template_id` (+index), `topics`, `trust_model`.
-Shapes and writer seams per the audit §4 repositories Tables 1/2 (the
-disposition matrix is the source of truth; not re-derived here). Real
-backfills ride the migration: topics ← repo_topics recount (the upstream
-`syncTopicsInRepository` shape, models/repo/topic.go:340-352);
-description/website ← repo_settings rows (today's value source,
-api/services/repository.ts:821/:865); name ← slug copy (display case
-unrecoverable for existing rows — the limitation is recorded, fold 1).
-The FN-4 port unit updates THIS section's table with the landed columns
-when the migration lands (the SPEC-0003 §3.1 FN-6 as-built pattern: the
-landed annotation goes into the SPEC, the derivation stays in the audit).
+**The FN-4 port columns — LANDED (2026-11-03, migration
+`0068_repositories-port-columns` + the writer legs; this block replaces the
+staged PENDING record — the FN-6 as-built pattern, the derivation stays in
+the audit §4 repositories Tables 1/2).** One additive migration carried all
+18 port columns (18 ALTER ADD COLUMN + 1 CREATE INDEX, every add
+ALTER-legal; the FN-6 DQS audit applied: pure adds, no INSERT…SELECT copy,
+no rebuild). Landed as-built shapes (schema.ts; ours cites = this
+worktree):
 
-**schema.ts comment cite errata** (for the FN-4 port unit — schema.ts was
-NOT edited by this record; it is sibling-owned):
+| column (as-built) | notes |
+|---|---|
+| `name` | TEXT NOT NULL DEFAULT '' (ALTER-legal constant) — the DISPLAY-case carrier (repo.go:159); create stamps `input.name` verbatim (create.go:238), rename stamps the new name beside the slug (repo.go:666-667, incl. the case-only PATCH arm), fork/generate copy it; the 0068 backfill is the slug copy (fold 1's unrecoverable-display-case limitation, now realized) |
+| `description` / `website` | TEXT nullable (NULL = no repo_settings row ever existed; the render folds to "") — repo.go:160/161; moved OUT of `repo_settings` (the legacy columns are neither read nor written; loadRepoSettings drops both fields); writers: the PATCH store batch (saveRepoSettings), the create arm, fork copy, generate, migrate; backfill ← repo_settings rows |
+| `avatar` | TEXT nullable (repo.go:216, the KEY); the render builds `/repo-avatars/<key>` (avatar.go:85-91), "" on NULL; no writer arm yet — the upload surface is port-when-read |
+| `archived_unix` | INTEGER NOT NULL DEFAULT 0 (repo.go:220); stamped both ways by the archive toggle (archiver.go:155-164: now on archive, 0 on unarchive); renders as the API `archived_at` (convert/repository.go:229 — AsTime(0) is the 1970 epoch render, replacing the GO_ZERO_TIME placeholder) |
+| `default_wiki_branch` | TEXT nullable (repo.go:165); create seed 'main' (create.go:148 — the instance default); wiki surfaces port-when-read |
+| `git_size` / `lfs_size` | INTEGER NOT NULL DEFAULT 0 (repo.go:204/205), the settled split in KiB; maintained by services/repo-size.ts at the settle points — `git_size` = the R2 prefix walk (unchanged), `lfs_size` = SUM(size) over lfs_objects (GetRepoLFSSize, update.go:105-112, keyed by the LFS router's numeric repo id) |
+| `num_action_runs` / `num_closed_action_runs` | INTEGER NOT NULL DEFAULT 0 (repo.go:182/183); recounted by services/actions updateRepoRunsNumbers (the UpdateRepoRunsNumbers shape, run.go:258-284 — one UPDATE, two count subselects, never-fails) at the run create settles (trigger/model/invalid-workflow), the status chokepoint (refreshRunStatus — the WorkflowRunStatusUpdate notify tail, notify.go:90), the cancel settle, and the delete arms (retention, repo-actions) |
+| `num_projects` / `num_closed_projects` | INTEGER NOT NULL DEFAULT 0 (repo.go:179/180); create = `num_projects + 1` (project.go:282), close/reopen/delete = the recount of both (updateRepositoryProjectCount, project.go:358-375) — the milestone-recount shape; owner-scoped projects never touch the tallies |
+| `object_format_name` | TEXT NOT NULL DEFAULT 'sha1' (repo.go:211); create seed 'sha1' (the engine is sha1-only, SPEC-0001 §5); the API render reads the column instead of the constant |
+| `original_service_type` | TEXT nullable (repo.go:162; NotMigrated=0/PlainGitService=1, structs/repo.go:346-360 — NULL ≡ 0); TEXT per the §2.3 convention; writer = the SPEC-0009 migrate create arm ('git' — the restricted family's only service); adopt port-when-read (no adopt arm yet) |
+| `template_id` | TEXT nullable + `repositories_template_id_idx` (repo.go:202) — TEXT by the id-family extension rule (ADR-0007 item 2 / FN-13 §7.4, the fork_parent precedent; a SHAPE CORRECTION over the audit matrix's INTEGER cell, recorded here); upstream's own surface never writes it nonzero — port-when-read both arms |
+| `topics` | TEXT nullable (repo.go:210, the denormalized JSON); backfill = the repo_topics recount (json_group_array, `topic` ASC — the syncTopicsInRepository shape, topic.go:340-352; '[]' for topic-less); the PUT writer maintains it in the same batch (ASC-sorted — the join's order); the API render reads the column with the row (convert/repository.go:265) — the topics half of the list divergence (parity item 3) CLOSED; the /topics route still reads the join (upstream ListTopics does too) |
+| `trust_model` | TEXT nullable enum default\|collaborator\|committer\|collaboratorcommitter (repo.go:213, §2.3 — NULL ≡ the default 0); create seed from the form's trust_model (create.go:248); the signing-settings arm port-when-read |
 
-- CONFIRMED: the `isTemplate` comment (schema.ts:122) cites
-  `models/repo/repo.go:190`; the actual field line at the pin is repo.go:201.
-- DISPROVEN — do NOT "fix": the audit's finding 3 claims the `status`
-  comment's `repo.go:146-149` should be `:144-149` with `RepositoryReady`
-  at `:145`. Exact-line verification at the pin shows `RepositoryReady =
-  iota` at repo.go:146 and `RepositoryBroken` at :149 — the schema.ts
-  comment (`models/repo/repo.go:146-149`, schema.ts:55) is already exact.
-  The erratum's ":144-149" is the const block's leading comment line
-  (:144) plus `const (` (:145) — no value lines.
+Writer legs by surface owner (code, not DDL): (a) identity/edit — the
+create/rename/PATCH arms + the reader flips off repo_settings (the convert
+renders `name`/`description`/`website` from the row; the case-only rename
+arm stamps the display case without the storage move); (b) counters — the
+projects and actions arms above; (c) sizes — the settle triple above,
+`size_kb` WIDENED to git+LFS (update.go:110; the total floors the BYTE sum
+— floor((g+l)/1024), not the sum of the floored parts); (d) the long-tail —
+archived_unix stamp, the create seeds, is_fsck_enabled (create.go:242
+`!isMirror` at seed; the settings/fsck-cron arms port-when-read),
+original_service_type, template_id.
+
+**schema.ts comment cite errata — RESOLVED (the FN-4 port unit edited
+schema.ts; GU's confirmations held):**
+
+- APPLIED: the `isTemplate` comment now cites `models/repo/repo.go:201`
+  (the :190 cite confirmed off-by-eleven at the pin).
+- DISPROVEN — correctly left alone: the `status` comment's
+  `repo.go:146-149` is already exact (RepositoryReady = iota at repo.go:146,
+  RepositoryBroken at :149; the audit finding's ":144-149" counted the const
+  block's leading comment + `const (` lines).
+- RECHECKED at port time (GU flagged :58 suspect): adopt.go's
+  `OriginalServiceType: opts.GitServiceType` IS at services/repository/
+  adopt.go:58 exactly — verified against the worktree at the pin; no
+  erratum. (The cite now lives on the `original_service_type` row above.)
 
 ## 5. Receive and serve paths
 

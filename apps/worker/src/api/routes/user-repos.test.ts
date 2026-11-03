@@ -267,13 +267,23 @@ describe("toCreatedOrgRepository (the shared 201 assembly)", () => {
     return { pair: { repo, owner }, viewer: { origin: "https://example.com", requester: null } };
   }
 
-  it("carries the settings description and keeps the owner permission triple", async () => {
+  it("carries the row description and keeps the owner permission triple", async () => {
     const { pair, viewer } = await seedPair();
-    const body = toCreatedOrgRepository(viewer, pair, {
-      ...DEFAULT_REPO_SETTINGS,
-      description: "settings-borne description",
-    });
-    expect(body.description).toBe("settings-borne description");
+    // FN-4: description renders the repositories column (migration 0068) —
+    // the create arm writes the row, not the legacy repo_settings store.
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ description: "row-borne description" })
+      .where(eq(repositories.id, "42"));
+    // re-select — the pair's row predates the update
+    const fresh = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "42")).get();
+    if (fresh === undefined) throw new Error("fixture row vanished");
+    const body = toCreatedOrgRepository(
+      viewer,
+      { repo: fresh, owner: pair.owner },
+      { ...DEFAULT_REPO_SETTINGS },
+    );
+    expect(body.description).toBe("row-borne description");
     expect(body.permissions).toEqual({ admin: true, push: true, pull: true });
   });
 

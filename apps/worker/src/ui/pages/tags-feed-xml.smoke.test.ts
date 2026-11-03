@@ -168,22 +168,25 @@ async function seedFixture(): Promise<TagsFeedFixture> {
     .get();
   if (alice === undefined) throw new Error("fixture missing: the seeded owner row");
 
-  const repoRow = await drizzle(env.DB)
+  let repoRow = await drizzle(env.DB)
     .select()
     .from(repositories)
     .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG)))
     .get();
   if (repoRow === undefined) throw new Error("fixture missing: the seeded repo row");
-  const repo = repoRow;
 
-  await env.DB.prepare("DELETE FROM releases WHERE repo_id = ?").bind(repo.id).run();
-  await env.DB.prepare("DELETE FROM repo_settings WHERE repo_id = ? OR repo_id = ?").bind(repo.id, EMPTY_REPO_ID).run();
+  await env.DB.prepare("DELETE FROM releases WHERE repo_id = ?").bind(repoRow.id).run();
+  await env.DB.prepare("DELETE FROM repo_settings WHERE repo_id = ? OR repo_id = ?").bind(repoRow.id, EMPTY_REPO_ID).run();
   await env.DB.prepare("DELETE FROM repositories WHERE id = ?").bind(EMPTY_REPO_ID).run();
 
-  // The RAW channel description (the repo_settings store).
-  await env.DB.prepare("INSERT INTO repo_settings (repo_id, description) VALUES (?, ?)")
-    .bind(repo.id, 'A "tag" repo <feed>')
+  // The RAW channel description (the repositories row — the FN-4 port,
+  // migration 0068, retired the repo_settings store).
+  await env.DB.prepare("UPDATE repositories SET description = ? WHERE id = ?")
+    .bind('A "tag" repo <feed>', repoRow.id)
     .run();
+  // re-select — the fixture row must carry the description it was just given
+  repoRow = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoRow.id)).get())!;
+  const repo = repoRow;
 
   // v1.0.0 — the RELEASE row (release-backed arm, the escaping-exercise
   // title, markdown note, alice as publisher).
@@ -390,7 +393,9 @@ describe("tags feed xml envelopes (the /{owner}/{repo}/tags.rss + .atom byte sur
     // The tags group's gate is reqUnitCodeReader (web.go:1502) — a
     // releases-disabled repo still serves; the projection degrades
     // instead (convert.go:294-296).
-    await env.DB.prepare("UPDATE repo_settings SET has_releases = 0 WHERE repo_id = ?")
+    await env.DB.prepare(
+        "INSERT INTO repo_settings (repo_id, has_releases) VALUES (?, 0) ON CONFLICT(repo_id) DO UPDATE SET has_releases = 0",
+      )
       .bind(fixture.repo.id)
       .run();
 
@@ -422,7 +427,9 @@ describe("tags feed xml envelopes (the /{owner}/{repo}/tags.rss + .atom byte sur
 
 describe("the mounted /{owner}/{repo}/tags.rss|.atom route arms", () => {
   it("THE GATE DIVERGENCE: a releases-disabled repo still SERVES tags.rss — the tags group gates reqUnitCodeReader, NOT the releases reader (web.go:1502)", async () => {
-    await env.DB.prepare("UPDATE repo_settings SET has_releases = 0 WHERE repo_id = ?")
+    await env.DB.prepare(
+        "INSERT INTO repo_settings (repo_id, has_releases) VALUES (?, 0) ON CONFLICT(repo_id) DO UPDATE SET has_releases = 0",
+      )
       .bind(fixture.repo.id)
       .run();
 

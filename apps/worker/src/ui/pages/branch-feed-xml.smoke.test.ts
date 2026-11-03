@@ -171,13 +171,16 @@ async function seedFixture(): Promise<BranchFeedFixture> {
 
   await env.DB.prepare("DELETE FROM repo_settings WHERE repo_id = ? OR repo_id = ?").bind(repo.id, EMPTY_REPO_ID).run();
   await env.DB.prepare("DELETE FROM repositories WHERE id = ?").bind(EMPTY_REPO_ID).run();
-  // The RAW channel description (the repo_settings store).
-  await env.DB.prepare("INSERT INTO repo_settings (repo_id, description) VALUES (?, ?)")
-    .bind(repo.id, 'A "branch" repo <feed>')
+  // The RAW channel description (the repositories row — the FN-4 port,
+  // migration 0068, retired the repo_settings store).
+  await env.DB.prepare("UPDATE repositories SET description = ? WHERE id = ?")
+    .bind('A "branch" repo <feed>', repo.id)
     .run();
   await seedEmptyRepoRow();
 
-  return { repo, tips: seeded.tips };
+  // re-select — the fixture row must carry the description it was just given
+  const fresh = await repoRow({ ownerNamespace: OWNER, slug: SLUG });
+  return { repo: fresh, tips: seeded.tips };
 }
 
 let fixture: BranchFeedFixture;

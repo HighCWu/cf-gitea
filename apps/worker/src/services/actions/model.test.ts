@@ -15,6 +15,7 @@ import {
   actionRunnerTokens,
   actionRunJobs,
   actionRunners,
+  actionRuns,
   actionTasksVersions,
   users,
   repositories,
@@ -33,10 +34,16 @@ import {
   increaseTaskVersion,
   newRunnerTokenWithValue,
   scopeRepoCondition,
+  ACTION_STATUS_SKIPPED,
+  ACTION_STATUS_SUCCESS,
+  insertActionRun,
   shouldPersistLastActive,
   shouldPersistLastOnline,
   statusToResult,
+  updateRepoRunsNumbers,
   verifyRunnerToken,
+  type InsertActionJobInput,
+  type InsertActionRunInput,
 } from "./model";
 
 beforeAll(async () => {
@@ -375,5 +382,57 @@ describe("the dispatch scan's scope condition (task.go:279-286)", () => {
       hasCancellingSupport: false,
     });
     expect(scopeRepoCondition(env.DB, globalRunner)).toBeUndefined();
+  });
+});
+
+describe("updateRepoRunsNumbers (the FN-4 repositories tallies, migration 0068)", () => {
+  const WORKFLOW = new TextEncoder().encode("name: ci\njobs:\n build:\n  runs-on: ubuntu-latest\n  steps: []\n");
+
+  const runInput = (repoId: string, ownerId: number, triggerUserId: number, index: number): InsertActionRunInput => ({
+    repoId,
+    ownerId,
+    workflowId: ".gitea/workflows/ci.yml",
+    index,
+    triggerUserId,
+    ref: "refs/heads/main",
+    commitSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    event: "push",
+    eventPayload: "{}",
+    triggerEvent: "push",
+  });
+
+  const jobInput = (jobId: string): InsertActionJobInput => ({
+    jobId,
+    workflowPayload: WORKFLOW,
+  });
+
+  it("recounts both tallies: total over all runs, closed over statuses 1/2/3/4 (run.go:258-284)", async () => {
+    const ownerId = await seedUser("runs-numbers-owner");
+    const triggerUserId = await seedUser("runs-numbers-trigger");
+    const repoId = await seedRepo("runs-numbers-repo", "runs-numbers-owner", ownerId, "rn");
+
+    // Two runs land through the staged insert (its settle recount rides it).
+    const first = await insertActionRun(env.DB, runInput(repoId, ownerId, triggerUserId, 1), [jobInput("build")]);
+    await insertActionRun(env.DB, runInput(repoId, ownerId, triggerUserId, 2), [jobInput("build")]);
+    let repo = (await db().select().from(repositories).where(eq(repositories.id, repoId)).get())!;
+    expect(repo.numActionRuns).toBe(2);
+    expect(repo.numClosedActionRuns).toBe(0); // both waiting
+
+    // Close the first (success) — the recount moves the closed column only.
+    await db().update(actionRuns).set({ status: ACTION_STATUS_SUCCESS }).where(eq(actionRuns.id, first.run.id));
+    await updateRepoRunsNumbers(env.DB, repoId);
+    repo = (await db().select().from(repositories).where(eq(repositories.id, repoId)).get())!;
+    expect(repo.numActionRuns).toBe(2);
+    expect(repo.numClosedActionRuns).toBe(1);
+
+    // A skipped run closes too (the closed set is 1/2/3/4 — status.go:54).
+    await db().update(actionRuns).set({ status: ACTION_STATUS_SKIPPED }).where(eq(actionRuns.id, first.run.id));
+    await updateRepoRunsNumbers(env.DB, repoId);
+    repo = (await db().select().from(repositories).where(eq(repositories.id, repoId)).get())!;
+    expect(repo.numClosedActionRuns).toBe(1); // still one run, still closed
+
+    // The never-fail posture: an unknown repo id is a silent no-op (the
+    // UPDATE matches nothing — upstream logs and returns, run.go:265-283).
+    await expect(updateRepoRunsNumbers(env.DB, "no-such-repo")).resolves.toBeUndefined();
   });
 });

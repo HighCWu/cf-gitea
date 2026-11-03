@@ -419,7 +419,7 @@ describe("generateRepo creation", () => {
     );
     expect(res.status).toBe(201);
     const body = await res.json<{ name: string; owner: { login: string }; private: boolean; fork: boolean; default_branch: string }>();
-    expect(body.name).toBe("generated"); // the create lowercases (the slug)
+    expect(body.name).toBe("Generated"); // FN-4: the display-case Name column (the slug stays folded)
     expect(body.owner.login).toBe("alice");
     expect(body.private).toBe(false);
     expect(body.fork).toBe(false);
@@ -430,9 +430,11 @@ describe("generateRepo creation", () => {
     expect(row?.isTemplate).toBe(false); // generated repos are not templates
     expect(row?.defaultBranch).toBe("trunk"); // the form's branch wins
     expect(row?.ownerId).toBe(aliceId);
-    const desc = await env.DB.prepare("SELECT description FROM repo_settings WHERE repo_id = ?")
+    // FN-4: description rides the repositories row (migration 0068) — the
+    // legacy repo_settings store is retired.
+    const desc = await env.DB.prepare("SELECT description FROM repositories WHERE id = ?")
       .bind(row!.id)
-      .first<{ description: string }>();
+      .first<{ description: string | null }>();
     expect(desc?.description).toBe("my desc");
   });
 

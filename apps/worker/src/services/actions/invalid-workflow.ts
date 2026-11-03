@@ -41,7 +41,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { actionRunAttempts, actionRunJobSummaries, actionRuns } from "../../db/schema";
 import { loadRepoActionsConfig } from "./config";
-import { ACTION_STATUS_FAILURE, ellipsisDisplayString } from "./model";
+import { ACTION_STATUS_FAILURE, ellipsisDisplayString, updateRepoRunsNumbers } from "./model";
 import type { RunRow } from "./model";
 import { nextRunIndex } from "./trigger";
 
@@ -173,6 +173,9 @@ export async function insertInvalidWorkflowRun(
   // though this tail's invalid-run status call is still not wired; the
   // notifier arm stays unported.
 
+  // FN-4: this arm inserts a CLOSED (failure) run — the tally recount rides
+  // the create settle like every other producer.
+  await updateRepoRunsNumbers(d1, run.repoId);
   return { ...runRow, latestAttemptId: attemptRow.id };
 }
 

@@ -30,7 +30,7 @@ import { createDurableGit } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById, toApiRepository, type Viewer } from "../api/services/repository";
-import { repositories, users } from "../db/schema";
+import { lfsObjects, repositories, users } from "../db/schema";
 import { gitHttpGate } from "../git-http/gate";
 import { authorize } from "../git-http/authorize";
 import { RepoService, type RepoRow } from "../repos/service";
@@ -38,6 +38,7 @@ import { buildPack, buildReceivePackBody, ZERO_OID } from "../repos/testing/git-
 import { replicateRepoCopy } from "../repos/fork-task";
 import {
   bytesToKib,
+  repoLfsNumericId,
   repoStoragePrefix,
   REPO_SIZE_MAX_LIST_PAGES,
   sumRepoStorageBytes,
@@ -348,5 +349,52 @@ describe("the fork settle leg — replicateRepoCopy re-accounts the fork's own p
     const fork = await seedRepo("emptydst");
     await replicateRepoCopy(env, source, fork);
     expect((await repoRow(fork.id)).sizeKb).toBe(0);
+  });
+});
+
+describe("the FN-4 sizes split (git_size/lfs_size + the size scope widening to git+LFS, migration 0068)", () => {
+  const NOW = new Date("2026-01-01T00:00:00Z");
+  const ownerRow = async (repo: RepoRow) => {
+    const rows = await drizzle(env.DB).select().from(users).where(eq(users.id, repo.ownerId!)).all();
+    const owner = rows[0];
+    if (owner === undefined) throw new Error("owner row missing");
+    return owner;
+  };
+  const viewer: Viewer = { origin: "https://example.com", requester: null };
+
+  it("the settle persists the triple: git from the R2 prefix, lfs from lfs_objects, size = the byte sum floored", async () => {
+    const repo = await seedRepo("fn4sizes");
+    // git side: 2048 bytes over two objects.
+    await env.REPO_PACKS.put(repoStoragePrefix(repo.storageKey) + "packs/pack-a.pack", new Uint8Array(1500));
+    await env.REPO_PACKS.put(repoStoragePrefix(repo.storageKey) + "packs/pack-a.idx", new Uint8Array(548));
+    // lfs side: two rows (both states — the batch API's uploading row is the
+    // upstream-table analog) keyed by the LFS router's numeric repo id.
+    const numeric = repoLfsNumericId(repo.id);
+    await drizzle(env.DB)
+      .insert(lfsObjects)
+      .values([
+        { repoId: numeric, oid: "aa".repeat(32), size: 3 * 1024, state: "verified", createdAt: NOW, updatedAt: NOW },
+        { repoId: numeric, oid: "bb".repeat(32), size: 1 * 1024, state: "uploading", createdAt: NOW, updatedAt: NOW },
+      ]);
+    await syncRepoSizeFromStorage(env.REPO_PACKS, env.DB, repo);
+    const row = await repoRow(repo.id);
+    expect(row.gitSize).toBe(2); // 2048 bytes / 1024
+    expect(row.lfsSize).toBe(4); // 4096 bytes / 1024
+    // The scope widening: upstream Size = git + LFS (update.go:110), rendered
+    // over the BYTE sum — 6144/1024 = 6.
+    expect(row.sizeKb).toBe(6);
+    // The API render carries the widened total.
+    const payload = toApiRepository(viewer, { repo: row, owner: await ownerRow(repo) });
+    expect(payload.size).toBe(6);
+  });
+
+  it("an empty lfs table sums 0 — the git-only repo keeps upstream's total (GetRepoLFSSize's empty arm)", async () => {
+    const repo = await seedRepo("fn4nolf");
+    await env.REPO_PACKS.put(repoStoragePrefix(repo.storageKey) + "packs/pack-b.pack", new Uint8Array(1024));
+    await syncRepoSizeFromStorage(env.REPO_PACKS, env.DB, repo);
+    const row = await repoRow(repo.id);
+    expect(row.gitSize).toBe(1);
+    expect(row.lfsSize).toBe(0);
+    expect(row.sizeKb).toBe(1);
   });
 });

@@ -34,7 +34,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { createTokenAuthMiddleware } from "../api/auth";
 import { REPO_SETTINGS_DDL_STATEMENTS } from "../api/services/repo-settings";
 import { mintFor, seedVerifiedUser } from "../auth/testing/seeds";
-import { repoMirrors, repoSettings, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { repoMirrors, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { OrgService } from "./orgs/orgs";
 import { MirrorCredentialKeyError } from "../api/services/mirror";
 import type { ServerMigrateOptions } from "./migrate";
@@ -351,9 +351,9 @@ describe("POST /repos/migrate — mirror arm (mirror=true)", () => {
     expect(mirror!.nextSyncAt).toBeGreaterThan(0);
     expect(mirror!.credentialsCiphertext).not.toBeNull();
 
-    // The description rides the repo-edit stored subset.
-    const settings = await drizzle(env.DB).select().from(repoSettings).where(eq(repoSettings.repoId, repo!.id)).get();
-    expect(settings?.description).toBe("mirrored from upstream");
+    // The description rides the repositories row (the FN-4 port, 0068).
+    const migrated = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repo!.id)).get();
+    expect(migrated?.description).toBe("mirrored from upstream");
 
     // THE SINGLE BIRTH EMISSION: exactly one repository-created, in-request.
     expect(await createdEmissions()).toHaveLength(1);

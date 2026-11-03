@@ -21,7 +21,6 @@ import { OrgService } from "../../services/orgs/orgs";
 import { getRepoLicenses } from "../../services/repo-licenses";
 import { collaboratorModeOf } from "./repo-collaborators";
 import { renderGoDuration } from "./mirror";
-import { listRepoTopics } from "./repo-topics";
 import type { RepoSettings } from "./repo-settings";
 import { listFollowers, listFollowing, type FollowViewer } from "./follows";
 
@@ -98,6 +97,10 @@ export function viewerOf(c: Context<ApiEnv>): Viewer {
  * columns.
  */
 export const GO_ZERO_TIME = "0001-01-01T00:00:00Z";
+/** `timeutil.TimeStamp(0).AsTime()` — Unix epoch, the render of an unset
+ *  TimeStamp column (AsTime is time.Unix(0, 0); modules/timeutil/
+ *  timestamp.go:58-69). NOT Go's zero time. */
+export const EPOCH_ZERO_TIME = "1970-01-01T00:00:00Z";
 
 /**
  * Upstream's default branch for new repositories
@@ -615,11 +618,6 @@ export interface RepositoryRenderRelations {
   /** The repo's 1:1 `repo_mirrors` row (`findMirrorByRepoId`), feeding the
    * mirror_interval/mirror_updated/mirror_last_sync_at triple. */
   mirrorRow?: RepoMirrorRow | null;
-  /** The repo's stored topic names (`repo_topics`, name ASC — the
-   * `syncTopicsInRepository` ordering, models/repo/topic.go:340-353).
-   * Upstream renders the denormalized `repository.topics` column
-   * (convert/repository.go:265); our join table read is the same render. */
-  topics?: string[];
   /** The repo's detected licenses (`repo_license`, license ASC —
    * GetRepoLicenses `.Asc("license")`, models/repo/license.go:46-54, mapped
    * 1:1 through `RepoLicenseList.StringList` — NO dedupe, license.go:30-35).
@@ -714,20 +712,19 @@ export async function toApiRepositoryFull(
   settings?: RepoSettings,
   teamMode?: TeamAccessMode | null,
 ): Promise<Repository> {
-  const [parent, mirrorRow, topics, licenseRows] = await Promise.all([
+  const [parent, mirrorRow, licenseRows] = await Promise.all([
     resolveParentRepository(d1, viewer, pair.repo),
     pair.repo.isMirror ? findMirrorByRepoId(d1, pair.repo.id) : Promise.resolve(null),
-    // Upstream resolves topics with the row itself (the denormalized column)
-    // and licenses inside the converter (repository.go:190-193 — GetRepoLicenses
-    // runs unconditionally, single-repo AND list). Both arms ride this full
-    // resolver; the query-flat list paths keep `[]` (see toApiRepository).
-    listRepoTopics(d1, pair.repo.id),
+    // Upstream resolves topics with the row itself (the denormalized column,
+    // FN-4 — no async arm anymore) and licenses inside the converter
+    // (repository.go:190-193 — GetRepoLicenses runs unconditionally,
+    // single-repo AND list). The license arm rides this full resolver; the
+    // query-flat list paths keep `[]` (see toApiRepository).
     getRepoLicenses(d1, pair.repo.id),
   ]);
   return toApiRepository(viewer, pair, settings, teamMode, {
     parent,
     mirrorRow,
-    topics,
     // RepoLicenseList.StringList (license.go:30-35): the rows' license
     // strings 1:1 — duplicates stay, the ASC order is the read's order.
     licenses: licenseRows.map((row) => row.license),
@@ -816,9 +813,15 @@ export function toApiRepository(
   return {
     id: repositoryIdNumber(row.id),
     owner: apiUserFromRow(owner, viewer),
-    name: row.slug,
+    // FN-4: the display-case `Name` column (`Name: repo.Name`,
+    // convert/repository.go) — stamped by create/rename; the 0068 backfill is
+    // the slug copy, so the folded render is the recorded pre-port fallback.
+    name: row.name || row.slug,
     full_name: `${row.ownerNamespace}/${row.slug}`,
-    description: settings?.description ?? "", // TODO(SPEC-0005): description column (repo_settings until the sweep)
+    // FN-4: the repositories column (`Description: repo.Description`,
+    // convert/repository.go) — repo_settings' legacy store retired by the
+    // port (the TODO this resolves).
+    description: row.description ?? "",
     // Upstream `IsEmpty` — the dedicated D1 column (SPEC-0003 §3.1) that both
     // real transitions flip: the push-create settle (git-http/gate.ts §2.5.2)
     // and the import settle (repos/imports/service.ts settleDone). D1's
@@ -862,7 +865,9 @@ export function toApiRepository(
     // above; rendered for every repo with a non-empty column, not just
     // mirrors).
     original_url: sanitizedOriginalUrl(row.originalUrl),
-    website: settings?.website ?? "", // TODO(SPEC-0005): website column (repo_settings until the sweep)
+    // FN-4: the repositories column (convert/repository.go:214
+    // `Website: repo.Website`) — the repo_settings TODO resolved by the port.
+    website: row.website ?? "",
     // Upstream renders the maintained columns, not live counts:
     // convert/repository.go:219-221 — `Stars: repo.NumStars` / `Forks:
     // repo.NumForks` / `Watchers: repo.NumWatches` (models/repo/repo.go:
@@ -883,7 +888,14 @@ export function toApiRepository(
     created_at: createdIso,
     updated_at: createdIso, // TODO(SPEC-0005): updated_unix column (starts == created)
     archived: row.isArchived,
-    archived_at: GO_ZERO_TIME,
+    // FN-4: `ArchivedAt: repo.ArchivedUnix.AsTime()` (convert/repository.go:229)
+    // — the SetArchiveRepoState stamp (archiver.go:160-162: now on archive, 0
+    // on unarchive). AsTime of 0 is Unix epoch, NOT Go's zero time — the
+    // never-archived render is 1970-01-01T00:00:00Z (upstream's quirk,
+    // rendered verbatim; the previous GO_ZERO_TIME placeholder predated the
+    // column).
+    archived_at:
+      row.archivedUnix === 0 ? EPOCH_ZERO_TIME : new Date(row.archivedUnix * 1000).toISOString(),
     permissions: repositoryPermissions(viewer, row, teamMode),
     has_code: true,
     has_issues: settings?.hasIssues ?? true,
@@ -927,7 +939,15 @@ export function toApiRepository(
     default_update_style: settings?.prUnit.DefaultUpdateStyle ?? DEFAULT_UPDATE_STYLE,
     squash_merge_commit_message: settings?.prUnit.DefaultSquashMergeMessage ?? DEFAULT_SQUASH_MERGE_MESSAGE,
     default_allow_maintainer_edit: settings?.prUnit.DefaultAllowMaintainerEdit ?? true,
-    avatar_url: "",
+    // FN-4: `AvatarURL: repo.AvatarLink(ctx)` (convert/repository.go:259;
+    // models/repo/avatar.go:85-91 + relAvatarLink :66-84 — the stored avatar
+    // KEY's `/repo-avatars/<key>` absolute URL, "" under the default fallback
+    // when the column is empty). The column has no writer arm yet (the upload
+    // surface is port-when-read), so the "" render is today's only value.
+    avatar_url:
+      row.avatar !== null && row.avatar !== ""
+        ? `${viewer.origin}/repo-avatars/${encodeURIComponent(row.avatar)}`
+        : "",
     internal: false,
     // The mirror schedule triple upstream gates on BOTH arms
     // (convert/repository.go:161-170): only `if repo.IsMirror` AND a
@@ -951,14 +971,35 @@ export function toApiRepository(
     // Upstream `Topics: util.SliceNilAsEmpty(repo.Topics)` /
     // `Licenses: util.SliceNilAsEmpty(repoLicenses.StringList())`
     // (convert/repository.go:265/267) — the stored sets on every payload.
-    // The full resolver (toApiRepositoryFull) carries the real reads; the
-    // query-flat list paths keep the empty default (the documented list
-    // divergence, parity review items 3/9 — upstream renders these on lists
-    // too, our list shape stays one query-flat converter by design).
-    topics: relations?.topics ?? [],
+    // Topics render the FN-4 denormalized column with the row itself (upstream
+    // has no async topics arm; the JSON rides `[]` for topic-less repos, NULL
+    // folds to [] like SliceNilAsEmpty) — the former list divergence (parity
+    // review item 3) closes with the column, since the render stays
+    // query-flat. Licenses keep the full resolver's read; the query-flat list
+    // paths keep the empty default (the remaining half of the documented
+    // divergence, parity review item 9 — upstream renders these on lists too,
+    // our list shape stays one query-flat converter by design).
+    topics: parseTopicsColumn(row.topics),
     licenses: relations?.licenses ?? [],
-    object_format_name: "sha1",
+    // FN-4: `ObjectFormatName: repo.ObjectFormatName` (convert/repository.go)
+    // — the stored column (create-seeded 'sha1'; the engine is sha1-only,
+    // SPEC-0001 §5) instead of the hardcoded constant.
+    object_format_name: row.objectFormatName,
   };
+}
+
+/** The `topics` TEXT JSON column read (upstream's xorm `TEXT JSON`
+ *  decode): the stored array verbatim; NULL — a pre-0068 row shape — and any
+ *  non-array payload fold to the empty slice, upstream's
+ *  `util.SliceNilAsEmpty` (convert/repository.go:265). */
+function parseTopicsColumn(raw: string | null): string[] {
+  if (raw === null) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------

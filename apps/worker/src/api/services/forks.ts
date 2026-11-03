@@ -5,7 +5,6 @@ import type { Registry } from "@cf-gitea/git-engine";
 import { repositories, users } from "../../db/schema";
 import { RepoService, type RepoRow } from "../../repos/service";
 import type { Repository } from "../models/repository";
-import { loadRepoSettings, saveRepoSettings } from "./repo-settings";
 import { toApiRepository, type RepositoryWithOwner, type Viewer } from "./repository";
 
 /**
@@ -121,18 +120,20 @@ export async function createFork(
     creationKind: "fork",
   });
 
-  // Upstream copies DefaultBranch + Description + IsPrivate at insert time.
-  // default_branch and fork_parent are Drizzle columns (0009); description
-  // rides the repo-edit side store (the same one the createOrgRepo auto-init
-  // path writes).
-  const settings = await loadRepoSettings(d1, source.id);
+  // Upstream copies DefaultBranch + Description + IsPrivate at insert time
+  // (fork.go:96-100's struct literal). default_branch, fork_parent and —
+  // since the FN-4 port — description are Drizzle columns on the row; the
+  // copy rides the same UPDATE (the legacy repo-settings side store is
+  // retired by migration 0068).
   await drizzle(d1)
     .update(repositories)
-    .set({ defaultBranch: source.defaultBranch, forkParent: source.id, updatedAt: new Date() })
+    .set({
+      defaultBranch: source.defaultBranch,
+      forkParent: source.id,
+      description: source.description,
+      updatedAt: new Date(),
+    })
     .where(eq(repositories.id, created.id));
-  if (settings.description !== "") {
-    await saveRepoSettings(d1, created.id, { description: settings.description }, new Date());
-  }
 
   // The 202 contract: the replication is the queue's work. A lost enqueue
   // strands the fork in 'creating' — logged (the admin-notice equivalent),

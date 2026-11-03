@@ -15,7 +15,12 @@
  * API semantics (GET = name list, PUT = whole-list replace, 422
  * invalidTopics) actually need, and the denormalized column is a render cache
  * upstream maintains with syncTopicsInRepository, which our single-table
- * mapper makes redundant.
+ * mapper made redundant. The FN-4 port (migration 0068, SPEC-0001 §4.1)
+ * landed the `repositories.topics` render column anyway — the API convert
+ * renders it (convert/repository.go:265's `repo.Topics`) — so the REPLACE
+ * writer below carries the column in its batch (the syncTopicsInRepository
+ * shape); the join stays the source of truth for the GET route (upstream's
+ * ListTopics also reads the join, topic.go:57).
  *
  * Validation is the `SanitizeAndValidateTopics` port (models/repo/topic.go):
  * trim + lowercase + dedupe + drop empties, then `^[a-z0-9][-.a-z0-9]*$` and
@@ -26,7 +31,7 @@
 import { and, asc, eq } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
-import { repoTopics } from "../../db/schema";
+import { repositories, repoTopics } from "../../db/schema";
 
 /**
  * SUPERSEDED by migration 0007 (`repoTopics` in src/db/schema.ts) — kept only
@@ -115,6 +120,18 @@ export async function replaceRepoTopics(
   for (const topic of added) {
     statements.push(db.insert(repoTopics).values({ repoId, topic }));
   }
+  // FN-4: the denormalized render column rides the SAME batch (upstream
+  // closes every topic write with syncTopicsInRepository, topic.go:340-352 —
+  // the join's names ONTO `repository.topics` in `topic.name` ASC order, not
+  // input order). The replaced list IS the post-write join state by
+  // construction — sorted to the join's ASC; `[]` is upstream's empty-slice
+  // serialization, so the column never goes stale on this arm.
+  statements.push(
+    db
+      .update(repositories)
+      .set({ topics: JSON.stringify([...validTopics].sort()) })
+      .where(eq(repositories.id, repoId)),
+  );
   // Non-empty here: the both-empty case returned above — the tuple shape
   // drizzle's d1 batch requires.
   await db.batch(statements as [DrizzleD1DatabaseBatchItem, ...DrizzleD1DatabaseBatchItem[]]);

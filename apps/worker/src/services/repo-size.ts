@@ -25,10 +25,11 @@
  * chunked-import channel's transient staging, purged at import end
  * (src/repos/imports/pipeline.ts), never part of the live git dir.
  *
- * DEVIATION (documented): this wave accounts the GIT footprint only — the
- * upstream `size` column's LFS half (update.go:110) is not folded in, since
- * LFS objects live in their own storage domain and the mission pins the
- * semantic to CalRepositorySize's scope (git size, NOT LFS/attachments).
+ * SCOPE (widened by the FN-4 port, 2026-11-03): the earlier git-only posture
+ * is retired — the settle persists upstream's full triple now (git_size,
+ * lfs_size, and `size` = git + LFS, update.go:110), the lfs half summed over
+ * the lfs_objects table like upstream's GetRepoLFSSize. Attachments stay out
+ * (upstream's Size never folds them either).
  *
  * WHEN: upstream recomputes at exactly the settle points we mirror — after a
  * push's updates apply (services/repository/push.go:74-83), after a fork's
@@ -43,10 +44,10 @@
  * callers wrap, log, and the next settle leg re-accounts.
  */
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories } from "../db/schema";
+import { lfsObjects, repositories } from "../db/schema";
 
 /**
  * `repos/<storage_key>/` — the repo's storage prefix (the engine's
@@ -136,12 +137,41 @@ export interface RepoSizeTarget {
 }
 
 /**
- * One settle leg's work: re-account the repo's R2 git footprint and persist
- * `size_kb`. Upstream's UpdateRepoSize is `NoAutoTime()` (models/repo/
- * update.go:108) — the size write deliberately does NOT bump `updated_at`,
- * and neither does ours. An empty/unstored prefix persists 0 (the empty-repo
- * answer). Missing bucket → no-op (nothing is known to be stored). Throws on
- * R2/D1 errors — the wiring wraps.
+ * The LFS half of the settle (upstream `GetRepoLFSSize`, models/repo/
+ * update.go:105-112 — `SUM(size)` over the lfs_object table for the repo).
+ * Ours sums the `lfs_objects` rows — BOTH states: the batch API's
+ * 'uploading' rows are the exact analog of upstream's table rows (created at
+ * the batch handshake), and GC deletes row+object together, so the live
+ * table IS the footprint. Keyed by the LFS router's NUMERIC repo key —
+ * `lfsRepoId` (src/lfs/router.ts:817-819) restated here the same way
+ * `repoStoragePrefix` restates the engine's prefix literal (the router
+ * module drags the whole LFS surface into this import graph; the derivation
+ * is a one-line pure function).
+ */
+export function repoLfsNumericId(repoUuid: string): number {
+  return Number.parseInt(repoUuid.replaceAll("-", "").slice(0, 13), 16);
+}
+
+/** `GetRepoLFSSize` — the summed LFS bytes for the repo (0 when no rows). */
+export async function sumRepoLfsBytes(d1: D1Database, repoId: string): Promise<number> {
+  const rows = await drizzle(d1)
+    .select({ total: sql<number>`coalesce(sum(size), 0)` })
+    .from(lfsObjects)
+    .where(eq(lfsObjects.repoId, repoLfsNumericId(repoId)));
+  return Number(rows[0]?.total ?? 0);
+}
+
+/**
+ * One settle leg's work: re-account the repo's storage footprint and persist
+ * the FN-4 triple — `git_size` (the R2 git prefix), `lfs_size` (the
+ * lfs_objects sum), and `size_kb` WIDENED to upstream's scope (git + LFS,
+ * update.go:110 `Size: gitSize + lfsSize`; the API renders the total's
+ * floored KB, convert/repository.go:207 — note the total is floored over the
+ * BYTE sum, not the sum of the floored parts). Upstream's UpdateRepoSize is
+ * `NoAutoTime()` (update.go:108) — the size write deliberately does NOT bump
+ * `updated_at`, and neither does ours. An empty/unstored prefix persists 0
+ * (the empty-repo answer). Missing bucket → no-op (nothing is known to be
+ * stored). Throws on R2/D1 errors — the wiring wraps.
  */
 export async function syncRepoSizeFromStorage(
   bucket: RepoSizeBucket | undefined | null,
@@ -150,10 +180,15 @@ export async function syncRepoSizeFromStorage(
   options: RepoSizeWalkOptions = {},
 ): Promise<void> {
   if (!bucket) return;
-  const sizeKb = bytesToKib(await sumRepoStorageBytes(bucket, repo.storageKey, options));
+  const gitBytes = await sumRepoStorageBytes(bucket, repo.storageKey, options);
+  const lfsBytes = await sumRepoLfsBytes(d1, repo.id);
   await drizzle(d1)
     .update(repositories)
-    .set({ sizeKb })
+    .set({
+      gitSize: bytesToKib(gitBytes),
+      lfsSize: bytesToKib(lfsBytes),
+      sizeKb: bytesToKib(gitBytes + lfsBytes),
+    })
     .where(eq(repositories.id, repo.id))
     .run();
 }

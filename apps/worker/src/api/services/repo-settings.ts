@@ -190,8 +190,6 @@ export const REPO_SETTINGS_DDL_STATEMENTS: readonly string[] = [
  *  disabled" from "disabled"; until that seed lands the flag stays
  *  accepted-and-ignored (the E1/E3 review drift stays open on it). */
 export interface RepoSettings {
-  description: string;
-  website: string;
   hasIssues: boolean;
   hasWiki: boolean;
   hasPullRequests: boolean;
@@ -214,8 +212,6 @@ export interface RepoSettings {
  *  rows-missing repos (pre-flip creations, hand-seeded rows), preserving
  *  their on-disk posture. */
 export const DEFAULT_REPO_SETTINGS: RepoSettings = {
-  description: "",
-  website: "",
   hasIssues: true,
   hasWiki: true,
   hasPullRequests: true,
@@ -273,8 +269,10 @@ export async function loadRepoSettings(d1: D1Database, repoId: string): Promise<
     return { ...DEFAULT_REPO_SETTINGS, ...units };
   }
   return {
-    description: row.description,
-    website: row.website,
+    // description/website moved OUT with the FN-4 repositories port (the
+    // columns live on the repositories row now; api/services/repository.ts
+    // renders them from there) — the legacy repo_settings columns are no
+    // longer read or written.
     hasIssues: row.hasIssues,
     hasWiki: row.hasWiki,
     hasPullRequests: row.hasPullRequests,
@@ -360,8 +358,6 @@ export async function saveRepoSettings(
   const current = await loadRepoSettings(d1, repoId);
   const merged: RepoSettings = {
     ...current,
-    ...(patch.description !== undefined ? { description: patch.description } : {}),
-    ...(patch.website !== undefined ? { website: patch.website } : {}),
     ...(patch.hasIssues !== undefined ? { hasIssues: patch.hasIssues } : {}),
     ...(patch.hasWiki !== undefined ? { hasWiki: patch.hasWiki } : {}),
     ...(patch.hasPullRequests !== undefined ? { hasPullRequests: patch.hasPullRequests } : {}),
@@ -375,8 +371,6 @@ export async function saveRepoSettings(
   // The settings ROW carries only its own columns — the unit-config carriers
   // live on repo_units and are stripped from the upsert values.
   const values = {
-    description: merged.description,
-    website: merged.website,
     hasIssues: merged.hasIssues,
     hasWiki: merged.hasWiki,
     hasPullRequests: merged.hasPullRequests,
@@ -391,6 +385,24 @@ export async function saveRepoSettings(
     .insert(repoSettings)
     .values({ repoId, ...values })
     .onConflictDoUpdate({ target: repoSettings.repoId, set: values });
+  // FN-4 (SPEC-0001 §4.1): description/website are repositories columns — the
+  // identity write rides the SAME transaction as the flags upsert (upstream
+  // EditRepo writes all of it through the one UpdateRepository, repo.go:727).
+  // The legacy repo_settings columns are no longer written (migration 0068
+  // moved the values; readers render the row).
+  const identityPatched = patch.description !== undefined || patch.website !== undefined;
+  const identity = identityPatched
+    ? [
+        db
+          .update(repositories)
+          .set({
+            ...(patch.description !== undefined ? { description: patch.description } : {}),
+            ...(patch.website !== undefined ? { website: patch.website } : {}),
+            updatedAt: now,
+          })
+          .where(eq(repositories.id, repoId)),
+      ]
+    : [];
 
   const unitWrites: BatchItem<"sqlite">[] = [];
   if (patch.hasActions !== undefined) {
@@ -438,12 +450,12 @@ export async function saveRepoSettings(
     }
   }
 
-  if (unitWrites.length === 0) {
+  if (unitWrites.length === 0 && identity.length === 0) {
     await upsert;
     await fireActionsScheduleArm(d1, repoId, patch, scheduleArm);
     return;
   }
-  await db.batch([upsert, ...unitWrites] as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+  await db.batch([upsert, ...identity, ...unitWrites] as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
   await fireActionsScheduleArm(d1, repoId, patch, scheduleArm);
 }
 
@@ -539,7 +551,17 @@ export async function deleteRepoSettings(d1: D1Database, repoId: string): Promis
 export async function setRepoArchived(d1: D1Database, repoId: string, archived: boolean, now: Date): Promise<void> {
   await drizzle(d1)
     .update(repositories)
-    .set({ isArchived: archived, updatedAt: now })
+    .set({
+      isArchived: archived,
+      // FN-4: upstream SetArchiveRepoState stamps the column both ways —
+      // `repo.ArchivedUnix = timeutil.TimeStampNow()` on archive, `0` on
+      // unarchive (models/repo/archiver.go:160-162, the Cols(...) write
+      // carrying both fields). Rendered as the API `archived_at`
+      // (convert/repository.go:229). Stored as unix seconds like the other
+      // plain-integer stamps.
+      archivedUnix: archived ? Math.floor(now.getTime() / 1000) : 0,
+      updatedAt: now,
+    })
     .where(eq(repositories.id, repoId));
   if (!archived) return;
   try {

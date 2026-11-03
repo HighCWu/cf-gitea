@@ -101,14 +101,16 @@ describe("toApiRepositoryFull renders the stored topics/licenses (parity item 3)
     expect(after.topics).toEqual(["dsp", "web"]);
   });
 
-  it("keeps the sync converter at [] without relations (the query-flat list shape)", async () => {
-    // The documented divergence: list/search paths render the sync converter
-    // (parity review item 9); the topics/licenses arms only ride the full
-    // resolver. Pinning the default so the list shape cannot silently drift.
+  it("renders the row's topics from the FN-4 column without relations; licenses stay [] (parity items 3/9)", async () => {
+    // The FN-4 port (migration 0068) moved topics onto the repositories row:
+    // upstream renders repo.Topics on EVERY payload with no async arm
+    // (convert/repository.go:265), so the sync converter renders the column
+    // and the former list divergence for topics CLOSES (parity item 3).
+    // Licenses keep the full resolver's read — item 9 stands for them.
     await replaceRepoTopics(env.DB, "8101", ["web"]);
     await insertLicense("MIT");
     const payload = toApiRepository(VIEWER, await pair());
-    expect(payload.topics).toEqual([]);
+    expect(payload.topics).toEqual(["web"]);
     expect(payload.licenses).toEqual([]);
   });
 });

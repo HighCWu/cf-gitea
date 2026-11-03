@@ -21,7 +21,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { actionRunners, actionSchedules, actionScheduleSpecs, repoUnits, repositories } from "../../db/schema";
+import { actionRunners, actionSchedules, actionScheduleSpecs, repoSettings, repoUnits, repositories } from "../../db/schema";
 import { scopeRepoIds, type RunnerRow } from "../../services/actions/model";
 import { loadRepoSettings, saveRepoSettings } from "./repo-settings";
 
@@ -200,5 +200,38 @@ describe("the C9 unit-row gap, end to end: toggle → row → the scan's scope",
     expect(await scopeRepoIds(env.DB, runner)).toEqual(["repo-1"]);
     await saveRepoSettings(env.DB, "repo-1", { hasActions: false }, T0);
     expect(await scopeRepoIds(env.DB, runner)).toEqual([]);
+  });
+});
+
+describe("the FN-4 identity ports (migration 0068 — SPEC-0001 §4.1)", () => {
+  it("saveRepoSettings writes description/website to the repositories row, not the legacy store", async () => {
+    await saveRepoSettings(env.DB, "repo-1", { description: "row-borne", website: "https://row.test" }, T0);
+    const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "repo-1")).get();
+    expect(row?.description).toBe("row-borne");
+    expect(row?.website).toBe("https://row.test");
+    // The legacy repo_settings columns stay untouched (the store retired —
+    // their NOT NULL DEFAULT '' rows keep satisfying the old inserts).
+    const settings = await drizzle(env.DB).select().from(repoSettings).where(eq(repoSettings.repoId, "repo-1")).get();
+    expect(settings?.description).toBe("");
+    expect(settings?.website).toBe("");
+    // Partial patches keep the other field.
+    await saveRepoSettings(env.DB, "repo-1", { website: "https://next.test" }, T0);
+    const again = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "repo-1")).get();
+    expect(again?.description).toBe("row-borne");
+    expect(again?.website).toBe("https://next.test");
+  });
+
+  it("setRepoArchived stamps archived_unix (SetArchiveRepoState: now on archive, 0 on unarchive)", async () => {
+    const { setRepoArchived } = await import("./repo-settings");
+    await setRepoArchived(env.DB, "repo-1", true, T0);
+    let row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "repo-1")).get();
+    expect(row?.archivedUnix).toBe(Math.floor(T0.getTime() / 1000));
+    expect(row?.isArchived).toBe(true);
+    // The API render folds 0 to the epoch render (AsTime(0)) — the unarchive
+    // stamp resets to 0, never a stale instant.
+    await setRepoArchived(env.DB, "repo-1", false, T0);
+    row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "repo-1")).get();
+    expect(row?.archivedUnix).toBe(0);
+    expect(row?.isArchived).toBe(false);
   });
 });

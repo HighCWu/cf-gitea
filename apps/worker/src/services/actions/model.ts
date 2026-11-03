@@ -495,6 +495,35 @@ export interface InsertActionJobInput {
  * row + waiting jobs, then the tasks_version bump when a dispatchable
  * (waiting, non-reusable-caller) job exists — run.go:159-165 exactly.
  */
+/**
+ * `UpdateRepoRunsNumbers` (models/actions/run.go:258-284) — the FN-4
+ * repositories tallies (`num_action_runs`/`num_closed_action_runs`,
+ * repo.go:182-183) recounted from the action_runs table: total count plus
+ * the CLOSED statuses (success/failure/cancelled/skipped — upstream's
+ * `In("status", StatusSuccess, StatusFailure, StatusCancelled,
+ * StatusSkipped)`, status.go:54). One statement, two count subselects (the
+ * milestone-recount shape), and like upstream it NEVER fails its caller —
+ * log-and-continue (run.go:265-283's log.Error arms), so a tally error can
+ * never fail a run write. Callers: the run create settles, the run-status
+ * chokepoint (update.ts refreshRunStatus), the cancel settle, and the
+ * run-delete arms.
+ */
+export async function updateRepoRunsNumbers(d1: D1, repoId: string): Promise<void> {
+  try {
+    const CLOSED = `${ACTION_STATUS_SUCCESS}, ${ACTION_STATUS_FAILURE}, ${ACTION_STATUS_CANCELLED}, ${ACTION_STATUS_SKIPPED}`;
+    await drizzle(d1)
+      .update(repositories)
+      .set({
+        numActionRuns: sql`(SELECT count(*) FROM action_runs WHERE repo_id = ${repoId})`,
+        numClosedActionRuns: sql`(SELECT count(*) FROM action_runs WHERE repo_id = ${repoId} AND status IN (${sql.raw(CLOSED)}))`,
+      })
+      .where(eq(repositories.id, repoId))
+      .run();
+  } catch (error) {
+    console.error(`[actions] updateRepoRunsNumbers ${repoId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export async function insertActionRun(
   d1: D1,
   run: InsertActionRunInput,
@@ -581,6 +610,10 @@ export async function insertActionRun(
   if (hasDispatchableWaiting) {
     await increaseTaskVersion(d1, run.ownerId, run.repoId);
   }
+  // FN-4: the create settle's tally recount (upstream notifies the run
+  // creation through WorkflowRunStatusUpdate → UpdateRepoRunsNumbers,
+  // notify.go:90 — a waiting run is uncounted-closed but counted-total).
+  await updateRepoRunsNumbers(d1, run.repoId);
 
   return { run: runRow, attempt: attemptRow, jobRows };
 }

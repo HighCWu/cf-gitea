@@ -1027,6 +1027,26 @@ the drift class):
   it; created_unix/updated_unix/fork_id/is_private need no new record
   (their standing cites are in Tables 1/2).
 
+**FN-4 LANDING (unit FN-4, 2026-11-03, migration
+`0068_repositories-port-columns`) — the disposition above is EXECUTED; this
+section's Tables 1/2 stay the derivation record, SPEC-0001 §4.1 is the
+as-built record of record.** Landing notes over the matrix (each applied,
+not re-derived): (1) all 18 columns landed in the one additive migration
+with the three real backfills; (2) `template_id` landed TEXT (+ index) per
+the id-family extension rule (ADR-0007 item 2 / §7.4) — a shape correction
+over Table 1's INTEGER cell, recorded in the SPEC's landed block; (3)
+description/website landed NULLable per the matrix, the repo_settings
+columns retired in place (neither read nor written; the interface fields
+dropped) rather than dropped by a second rebuild; (4) the readers flipped
+with the writers (the convert renders name/description/website/topics/
+archived_at/avatar_url/object_format_name from the row — the topics half of
+parity item 3 CLOSES, the archived_at placeholder render replaced by
+AsTime(0)'s epoch render); (5) the fork/generate/migrate create arms ride
+the same columns (description copy, 'git' service type); (6) the
+staged-addendum folds + the errata list are applied (isTemplate :190→:201
+fixed in schema.ts; status left exact — DISPROVEN; adopt.go :58 re-verified
+EXACT at port time).
+
 ## 5. The numbered backlog (FN-1..FN-14)
 
 Ordering: API-visible / behavior-carrying first; cosmetic renames and
@@ -1101,7 +1121,41 @@ applies).
   verbatim, the conservative arms) + the FN-2 describes in the
   issue-timeline-writes, issue-tables-t2, pull-reviews and issues
   batteries).**
-- **FN-4: repositories upstream-column completion (26 columns).** The
+- **FN-4: repositories upstream-column completion (26 columns).**
+  **STATUS: LANDED (2026-11-03, migration `0068_repositories-port-columns`
+  + the writer legs — unit FN-4; the rest of this row is the original
+  scope, kept for the cites; the §4 repositories section carries the
+  landed annotations and SPEC-0001 §4.1 is the as-built record).** The
+  18-column port (GR's split: 18 drift + 4 recorded folds + 4 staged
+  folds) landed as ONE additive migration (18 ADD COLUMN + 1 CREATE
+  INDEX — no rebuild, the FN-6 DQS audit applied) with the three real
+  backfills (name ← slug copy — display case unrecoverable, recorded;
+  description/website ← repo_settings; topics ← the repo_topics recount,
+  syncTopicsInRepository's ASC shape, '[]' for topic-less). Writer legs by
+  surface owner: identity/edit (create/rename/case-only-PATCH display-case
+  stamps; description/website moved OUT of repo_settings with the reader
+  flips — the convert, forks, generate, the feeds, the settings page;
+  the API `name` renders display case now), counters (projects create
+  +1/close-reopen-delete recount, project.go:282/:358-375; actions runs
+  recounted by services/actions updateRepoRunsNumbers at the create,
+  refreshRunStatus, cancel and delete arms — run.go:258-284's shape),
+  sizes (git_size/lfs_size split AND `size_kb` widened to git+LFS at the
+  repo-size settle points, the byte-sum floor), long-tail (archived_unix
+  stamp on the archive toggle; the create seeds object_format_name/
+  default_wiki_branch/is_fsck_enabled(!mirror)/trust_model;
+  original_service_type 'git' on the migrate arm; template_id +
+  repositories_template_id_idx, TEXT per the id-family rule — a recorded
+  shape correction over the matrix's INTEGER cell). Port-when-read,
+  recorded not invented: avatar, is_fsck_enabled settings/fsck arms,
+  trust_model signing arm, adopt's service type, template_id readers.
+  Errata folded at port time: the isTemplate cite fixed :190→:201; the
+  status cite DISPROVEN, left exact; adopt.go's OriginalServiceType :58
+  re-verified EXACT. Tests: schema.test's FN-4 describe (the 18-column
+  DDL pin + the three backfills verbatim) + the writer-leg batteries
+  (repo-settings, lifecycle identity stamps, projects tallies,
+  model.test runs-numbers, repo-size split, user-repos/generate/
+  migrate/topics render).**
+  The
   §4 repositories residual: identity denormalization (`name`, `lower_name`,
   `owner_name`), sizes (`size`, `git_size`, `lfs_size` — ours `size_kb`
   covers one), counters (`num_projects`/`num_closed_projects`,

@@ -201,6 +201,7 @@ import {
   ACTION_STATUS_WAITING,
   increaseTaskVersion,
   ellipsisDisplayString,
+  updateRepoRunsNumbers,
   type RunJobRow,
   type RunRow,
 } from "./model";
@@ -2827,6 +2828,10 @@ export async function insertTriggeredRunSplit(
         .from(actionRunJobs)
         .where(and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, runAttempt.id)))
         .orderBy(actionRunJobs.id);
+      // FN-4: the create settle's tally recount (upstream's notify tail,
+      // notify.go:90). Placed after the post-commit kicks — a skipped/failed
+      // insert already terminalized THIS run's status through checkJobsOfRun.
+      await updateRepoRunsNumbers(d1, input.repoId);
       return { run, jobs: freshJobRows.length > 0 ? freshJobRows : jobRows };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

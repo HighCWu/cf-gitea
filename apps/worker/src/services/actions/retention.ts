@@ -74,7 +74,7 @@ import {
   setArtifactExpired,
 } from "./artifacts";
 import { removeLogs } from "./logs";
-import { ACTION_STATUS_CANCELLED, ACTION_STATUS_CANCELLING, ACTION_STATUS_FAILURE, ACTION_STATUS_SKIPPED, ACTION_STATUS_SUCCESS, isLiveTaskStatus } from "./model";
+import { ACTION_STATUS_CANCELLED, ACTION_STATUS_CANCELLING, ACTION_STATUS_FAILURE, ACTION_STATUS_SKIPPED, ACTION_STATUS_SUCCESS, isLiveTaskStatus, updateRepoRunsNumbers } from "./model";
 import { findOldTasksToExpire, stopTask } from "./update";
 
 export interface RetentionOptions {
@@ -296,6 +296,9 @@ export async function deleteRun(env: Env, repoId: string, runId: number): Promis
     db.delete(actionRunJobSummaries).where(and(eq(actionRunJobSummaries.repoId, repoId), eq(actionRunJobSummaries.runId, runId))),
     db.delete(actionRuns).where(and(eq(actionRuns.repoId, repoId), eq(actionRuns.id, runId))),
   ]);
+  // FN-4: the delete arm's tally recount (upstream DeleteRun's
+  // UpdateRepoRunsNumbers tail, cleanup.go:251).
+  await updateRepoRunsNumbers(env.DB, repoId);
 
   // Files last (the DB rows are gone; deletes are best-effort).
   for (const task of tasks) {

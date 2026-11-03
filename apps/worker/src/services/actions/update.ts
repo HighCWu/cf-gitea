@@ -39,7 +39,7 @@ import {
   actionTaskSteps,
   actionTasks,
 } from "../../db/schema";
-import { getRepoById, type RunJobRow, type TaskRow } from "./model";
+import { getRepoById, updateRepoRunsNumbers, type RunJobRow, type TaskRow } from "./model";
 import { decodeLogIndexes, encodeLogIndexes, nextChunkSeq, readLogs, renderLogAppend, sealLogsToStorage } from "./logs";
 import {
   ACTION_STATUS_CANCELLED,
@@ -215,6 +215,11 @@ export async function refreshRunStatus(d1: D1, repoId: string, runId: number, ru
     }
   }
   await db.update(actionRuns).set({ status: runStatus, started, stopped, updated: now }).where(eq(actionRuns.id, run.id));
+  // FN-4: the run-status chokepoint's tally recount — upstream's
+  // WorkflowRunStatusUpdate notify closes with UpdateRepoRunsNumbers
+  // (notify.go:90); every job settle flows through here, so the closed
+  // counts stay current (never-failing, see updateRepoRunsNumbers).
+  await updateRepoRunsNumbers(d1, repoId);
 }
 
 /** hasWaitingJobsToPick (run_job.go:449-455) — only bump when waiting work

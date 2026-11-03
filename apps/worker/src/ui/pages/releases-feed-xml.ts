@@ -176,7 +176,6 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { loadRepoSettings } from "../../api/services/repo-settings";
 import { releases, users } from "../../db/schema";
 import type { ReleaseRow } from "../../issues/service";
 import { renderIssueMarkdown } from "./issue-detail";
@@ -453,11 +452,13 @@ export async function loadReleasesFeedData(
 
   // The channel fields (feed/release.go:33-46): the releases_for locale
   // title over FullName(), the `/release`-singular link quirk, the RAW
-  // description (repo_settings store — no markdown render), Created = now.
+  // description (the repositories row — no markdown render; the FN-4 port
+  // moved the value off the legacy repo_settings store, migration 0068),
+  // Created = now.
   return {
     title: RELEASES_FOR.replace("%s", `${repo.ownerNamespace}/${repo.slug}`),
     link: `${repoHref}/release`,
-    description: (await loadRepoSettings(d1, repo.id)).description,
+    description: repo.description ?? "",
     generatedUnix: Math.floor(now.getTime() / 1000),
     items,
   };

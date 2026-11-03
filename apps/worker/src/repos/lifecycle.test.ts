@@ -76,6 +76,50 @@ async function createRepo(
   return service().create({ owner, name, isPrivate });
 }
 
+describe("the FN-4 identity stamps (migration 0068 — SPEC-0001 §4.1)", () => {
+  it("create keeps the display-case name beside the folded slug; rename stamps both", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "My-Fancy-Repo");
+    expect(repo.slug).toBe("my-fancy-repo"); // the folded carrier (LowerName)
+    expect(repo.name).toBe("My-Fancy-Repo"); // the display-case carrier (Name)
+
+    const renamed = await service().rename(repo.id, "Renamed-Repo");
+    expect(renamed.slug).toBe("renamed-repo");
+    expect(renamed.name).toBe("Renamed-Repo"); // repo.go:666-667's pair
+
+    // A case-ONLY rename is a no-op at the service (the route's else-arm
+    // stamps the display case) — the slug is unchanged.
+    const untouched = await service().rename(repo.id, "renamed-repo");
+    expect(untouched.slug).toBe("renamed-repo");
+    expect(untouched.name).toBe("Renamed-Repo");
+  });
+
+  it("the create seeds the FN-4 long-tail: object_format 'sha1', wiki branch, fsck per kind, trust model, service type", async () => {
+    const alice = await seedVerifiedUser({ username: "seedy" });
+    const normal = await service().create({
+      owner: { id: alice.id, usernameLower: "seedy" },
+      name: "seeded-normal",
+      isPrivate: false,
+      trustModel: "collaborator",
+    });
+    expect(normal.objectFormatName).toBe("sha1"); // create.go:225-226, the engine's only format
+    expect(normal.defaultWikiBranch).toBe("main"); // create.go:148, the instance default
+    expect(normal.isFsckEnabled).toBe(true); // create.go:242 `!opts.IsMirror`
+    expect(normal.trustModel).toBe("collaborator"); // create.go:248
+    expect(normal.originalServiceType).toBeNull(); // create.go:237 — non-migrate creates stay NULL (NotMigrated)
+
+    const mirror = await service().create({
+      owner: { id: alice.id, usernameLower: "seedy" },
+      name: "seeded-mirror",
+      isPrivate: false,
+      creationKind: "mirror",
+      originalServiceType: "git",
+    });
+    expect(mirror.isFsckEnabled).toBe(false); // the mirror arm
+    expect(mirror.originalServiceType).toBe("git"); // the migrate arm's plain-git service
+  });
+});
+
 describe("rename + redirects (SPEC-0003 §2.5.3, ACL row 13)", () => {
   it("301s the old URL to the canonical path BEFORE auth, then serves the repo at the new one", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });

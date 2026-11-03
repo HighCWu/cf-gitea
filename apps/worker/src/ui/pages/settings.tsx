@@ -51,9 +51,9 @@
  * - Basics: the PATCH /repos/{owner}/{repo} route's steps reduced to the
  *   form's fields — `RepoService.rename` (case-insensitive no-op guard, the
  *   route's `updateBasicProperties` port), `RepoService.setVisibility`, and
- *   `saveRepoSettings` for the description (the repoSettings side table).
- *   Name errors (invalid/reserved/collision) re-render with the service's
- *   message — the API's 422 family.
+ *   `saveRepoSettings` for the description/website (repositories columns
+ *   since the FN-4 port, migration 0068). Name errors (invalid/reserved/
+ *   collision) re-render with the service's message — the API's 422 family.
  * - Hooks: `createRepoHook` (src/api/services/hooks.ts) — the exact
  *   checkCreateHookOption validation (422 messages) surfaced inline, and
  *   `listRepoHooks` + one batched delivery-count read for the list.
@@ -298,7 +298,7 @@ import {
   saveRepoSettings,
   setRepoArchived,
   setRepoTemplate,
-  type RepoSettings,
+  type RepoSettingsPatch,
 } from "../../api/services/repo-settings";
 import { OwnerNotAssignableError, RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
 import { deleteWiki, type WikiDoer } from "../../services/wiki";
@@ -515,8 +515,10 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
     hasPackages: settings.hasPackages,
   };
   return {
-    description: settings.description,
-    website: settings.website,
+    // description/website render the repositories row (the FN-4 port,
+    // migration 0068 — the legacy repo_settings store retired).
+    description: repo.description ?? "",
+    website: repo.website ?? "",
     units,
     hasActions: settings.hasActions,
     hasWiki: settings.hasWiki,
@@ -524,10 +526,10 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
     form: {
       action: "",
       name: repo.slug,
-      description: settings.description,
+      description: repo.description ?? "",
       isPrivate: repo.visibility === "private",
       newOwnerName: "",
-      website: settings.website,
+      website: repo.website ?? "",
       isTemplate: repo.isTemplate,
       isArchived: repo.isArchived,
       units,
@@ -818,7 +820,7 @@ export async function applyRepoBasics(
   if (form.isPrivate !== isPrivate) {
     await service.setVisibility(repo.id, form.isPrivate);
   }
-  const settingsPatch: Partial<RepoSettings> = { description: form.description };
+  const settingsPatch: RepoSettingsPatch = { description: form.description };
   if (form.website !== undefined) settingsPatch.website = form.website;
   if (form.units !== undefined) {
     settingsPatch.hasIssues = form.units.hasIssues;

@@ -601,6 +601,27 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       // 0061 (7f2ecd3): the closed-milestone counter — the ALTER sweep's
       // newest append, LAST position (upstream repositories.num_closed_milestones).
       ["num_closed_milestones", "INTEGER", 1, 0],
+      // 0068 (ADR-0007 FN-4): the 18 upstream port columns — the sweep stays
+      // additive-only (the migration battery above pins their
+      // names/types/defaults in detail).
+      ["name", "TEXT", 1, 0],
+      ["description", "TEXT", 0, 0],
+      ["website", "TEXT", 0, 0],
+      ["avatar", "TEXT", 0, 0],
+      ["archived_unix", "INTEGER", 1, 0],
+      ["default_wiki_branch", "TEXT", 0, 0],
+      ["git_size", "INTEGER", 1, 0],
+      ["is_fsck_enabled", "INTEGER", 1, 0],
+      ["lfs_size", "INTEGER", 1, 0],
+      ["num_action_runs", "INTEGER", 1, 0],
+      ["num_closed_action_runs", "INTEGER", 1, 0],
+      ["num_closed_projects", "INTEGER", 1, 0],
+      ["num_projects", "INTEGER", 1, 0],
+      ["object_format_name", "TEXT", 1, 0],
+      ["original_service_type", "TEXT", 0, 0],
+      ["template_id", "TEXT", 0, 0],
+      ["topics", "TEXT", 0, 0],
+      ["trust_model", "TEXT", 0, 0],
     ]);
     // The appended columns keep the ALTER ADD COLUMN constraints: is_mirror
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url
@@ -1598,5 +1619,166 @@ WHERE \`type\` = 27
     expect(byId.get(userAdd)?.assigneeId).toBe(910102);
     expect(byId.get(removedNoReview)?.assigneeTeamId).toBe(0);
     expect(byId.get(danglingReview)?.assigneeTeamId).toBe(0);
+  });
+});
+
+describe("repositories port columns (ADR-0007 FN-4, migration 0068)", () => {
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+  });
+
+  /** One repositories row the PRE-0068 shape wrote (the new columns absent —
+   *  overrides may only carry legacy columns; the constant defaults cover
+   *  the NOT NULL ports, the nullable ones stay NULL). */
+  const seedOldRepo = async (
+    id: string,
+    slug: string,
+    values: Record<string, string | number> = {},
+  ): Promise<void> => {
+    const base: Record<string, string | number> = {
+      id,
+      storage_key: `r_${id}`,
+      owner_namespace: "fn4owner",
+      slug,
+      visibility: "public",
+      created_at: 1_700_000_000,
+      ...values,
+    };
+    const keys = Object.keys(base);
+    await env.DB
+      .prepare(
+        `INSERT INTO repositories (${keys.join(", ")}) VALUES (${keys.map(() => "?").join(", ")})`,
+      )
+      .bind(...Object.values(base))
+      .run();
+  };
+
+  /** Migration 0068's backfill statements verbatim
+   *  (src/db/migrations/0068_repositories-port-columns.sql). */
+  const runBackfills = async (): Promise<void> => {
+    await env.DB.prepare("UPDATE `repositories` SET `name` = `slug`").run();
+    await env.DB
+      .prepare(
+        `UPDATE \`repositories\`
+SET \`description\` = (SELECT \`rs\`.\`description\` FROM \`repo_settings\` \`rs\` WHERE \`rs\`.\`repo_id\` = \`repositories\`.\`id\`),
+    \`website\` = (SELECT \`rs\`.\`website\` FROM \`repo_settings\` \`rs\` WHERE \`rs\`.\`repo_id\` = \`repositories\`.\`id\`)
+WHERE EXISTS (
+  SELECT 1 FROM \`repo_settings\` \`rs\` WHERE \`rs\`.\`repo_id\` = \`repositories\`.\`id\`
+)`,
+      )
+      .run();
+    await env.DB
+      .prepare(
+        `UPDATE \`repositories\`
+SET \`topics\` = COALESCE(
+  (
+    SELECT json_group_array(\`rt\`.\`topic\`)
+    FROM (
+      SELECT \`topic\` FROM \`repo_topics\` WHERE \`repo_id\` = \`repositories\`.\`id\` ORDER BY \`topic\` ASC
+    ) AS \`rt\`
+  ),
+  '[]'
+)`,
+      )
+      .run();
+  };
+
+  it("0068's DDL: the 18 port columns ride upstream's names/shapes as one additive batch, one new index", async () => {
+    const info = await tableColumns("repositories");
+    const names = info.map((col) => col.name);
+    // Pure ADD COLUMN: SQLite appends, so the 18 land after num_closed_milestones
+    // in the migration's ALTER order (the drizzle schema object's family-beside
+    // placement is a reader-only concern — column ORDER is not a parity
+    // surface; the names/types/defaults are).
+    expect(names.slice(names.indexOf("num_closed_milestones") + 1)).toEqual([
+      "name",
+      "description",
+      "website",
+      "avatar",
+      "archived_unix",
+      "default_wiki_branch",
+      "git_size",
+      "is_fsck_enabled",
+      "lfs_size",
+      "num_action_runs",
+      "num_closed_action_runs",
+      "num_closed_projects",
+      "num_projects",
+      "object_format_name",
+      "original_service_type",
+      "template_id",
+      "topics",
+      "trust_model",
+    ]);
+    const byName = new Map(info.map((col) => [col.name, col]));
+    // The identity pair: display-case name NOT NULL DEFAULT '' (the ALTER
+    // constant — backfilled from slug), description/website nullable (the
+    // repo_settings value source until the port; the render folds NULL to
+    // ""), avatar nullable (no writer arm yet).
+    expect(byName.get("name")).toEqual({ cid: names.indexOf("name"), name: "name", type: "TEXT", notnull: 1, dflt_value: "''", pk: 0 });
+    expect(byName.get("description")).toEqual({ cid: names.indexOf("description"), name: "description", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(byName.get("website")).toEqual({ cid: names.indexOf("website"), name: "website", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(byName.get("avatar")).toEqual({ cid: names.indexOf("avatar"), name: "avatar", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    // The stamp + the long-tail NULLables.
+    expect(byName.get("archived_unix")).toEqual({ cid: names.indexOf("archived_unix"), name: "archived_unix", type: "INTEGER", notnull: 1, dflt_value: "0", pk: 0 });
+    expect(byName.get("default_wiki_branch")).toEqual({ cid: names.indexOf("default_wiki_branch"), name: "default_wiki_branch", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(byName.get("original_service_type")).toEqual({ cid: names.indexOf("original_service_type"), name: "original_service_type", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(byName.get("template_id")).toEqual({ cid: names.indexOf("template_id"), name: "template_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(byName.get("topics")).toEqual({ cid: names.indexOf("topics"), name: "topics", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(byName.get("trust_model")).toEqual({ cid: names.indexOf("trust_model"), name: "trust_model", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    // The sizes/counters family: NOT NULL DEFAULT 0 (the num_stars settle
+    // posture — the one-time constant backfill).
+    for (const name of ["git_size", "lfs_size", "num_action_runs", "num_closed_action_runs", "num_closed_projects", "num_projects"]) {
+      expect(byName.get(name)).toEqual({ cid: names.indexOf(name), name, type: "INTEGER", notnull: 1, dflt_value: "0", pk: 0 });
+    }
+    // Upstream's NOT NULL DEFAULT true / 'sha1' carry verbatim.
+    expect(byName.get("is_fsck_enabled")).toEqual({ cid: names.indexOf("is_fsck_enabled"), name: "is_fsck_enabled", type: "INTEGER", notnull: 1, dflt_value: "true", pk: 0 });
+    expect(byName.get("object_format_name")).toEqual({ cid: names.indexOf("object_format_name"), name: "object_format_name", type: "TEXT", notnull: 1, dflt_value: "'sha1'", pk: 0 });
+    // The ONE index the batch adds (upstream `TemplateID int64 xorm:"INDEX"`,
+    // repo.go:202); name/description carry no port index (the fold's
+    // owner_slug_uq arbitration covers lookup).
+    expect(await indexNames("repositories")).toContain("repositories_template_id_idx");
+  });
+
+  it("backfill 1: name ← slug (the recorded best-effort — display case unrecoverable)", async () => {
+    // Real rows carry FOLDED slugs (repos/service.ts folds at write), so the
+    // verbatim copy is identity for the whole population; a display-case
+    // name cannot be reconstructed — fold 1's recorded limitation.
+    await seedOldRepo("fn4a", "display_case_unrecoverable");
+    await runBackfills();
+    const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "fn4a")).get();
+    expect(row?.name).toBe("display_case_unrecoverable"); // the slug copy
+    expect(row?.slug).toBe("display_case_unrecoverable");
+  });
+
+  it("backfill 2: description/website ← repo_settings; rows without a settings row stay NULL", async () => {
+    await seedOldRepo("fn4b", "withsettings");
+    await seedOldRepo("fn4c", "nosettings");
+    await env.DB
+      .prepare(
+        "INSERT INTO repo_settings (repo_id, description, website) VALUES (?, 'the stored description', 'https://fn4.test')",
+      )
+      .bind("fn4b")
+      .run();
+    await runBackfills();
+    const withRow = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "fn4b")).get();
+    expect(withRow?.description).toBe("the stored description");
+    expect(withRow?.website).toBe("https://fn4.test");
+    const withoutRow = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "fn4c")).get();
+    expect(withoutRow?.description).toBeNull(); // NULL folds to "" at render
+    expect(withoutRow?.website).toBeNull();
+  });
+
+  it("backfill 3: topics ← the repo_topics recount (ASC order, '[]' for topic-less repos)", async () => {
+    await seedOldRepo("fn4d", "withtopics");
+    await seedOldRepo("fn4e", "emptytopics");
+    for (const topic of ["web", "api", "ci"]) {
+      await env.DB.prepare("INSERT INTO repo_topics (repo_id, topic) VALUES (?, ?)").bind("fn4d", topic).run();
+    }
+    await runBackfills();
+    const withTopics = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "fn4d")).get();
+    expect(JSON.parse(withTopics?.topics ?? "null")).toEqual(["api", "ci", "web"]); // topic ASC — syncTopicsInRepository's order
+    const noTopics = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "fn4e")).get();
+    expect(noTopics?.topics).toBe("[]"); // upstream's empty-slice serialization
   });
 });

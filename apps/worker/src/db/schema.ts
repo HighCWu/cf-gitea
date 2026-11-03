@@ -119,7 +119,7 @@ export const repositories = sqliteTable(
     // Kept LAST like fork_parent/is_mirror above — ALTER TABLE ADD COLUMN
     // physically appends, so the table_info order stays the migration order.
     // -------------------------------------------------------------------------
-    /** Upstream `Repository.IsTemplate` (models/repo/repo.go:190): the repo
+    /** Upstream `Repository.IsTemplate` (models/repo/repo.go:201): the repo
      *  may seed `POST /repos/{template_owner}/{template_repo}/generate`
      *  copies (api/routes/generate-repo.ts). NOT NULL DEFAULT FALSE per the
      *  upstream column default; the ALTER backfills existing rows false. */
@@ -239,6 +239,108 @@ export const repositories = sqliteTable(
      *  rows yet). The only reader today is internal (the NumOpenMilestones
      *  arithmetic); no wire change. */
     numClosedMilestones: integer("num_closed_milestones").notNull().default(0),
+    // -------------------------------------------------------------------------
+    // ADR-0007 FN-4 — the repositories port columns (migration 0068; SPEC-0001
+    // §4.1 as-built). The 18 upstream `Repository` columns ours lacked (unit
+    // GR's 26-column residual minus the folds), landed as ONE additive batch —
+    // every add is ALTER-legal (constant DEFAULT or NULL; the one index is a
+    // CREATE INDEX; no table rebuild, unlike 0066). Kept LAST like the batch
+    // blocks above — ALTER TABLE ADD COLUMN physically appends, so the
+    // table_info order stays the migration order. Upstream cites are
+    // exact-line at pin `fc4936884584` (models/repo/repo.go).
+    // -------------------------------------------------------------------------
+    /** Upstream `Name string xorm:"INDEX NOT NULL"` (repo.go:159) — the
+     *  DISPLAY-case name; `slug` stays the folded carrier (fold 1, SPEC-0001
+     *  §4.1). Stamped by the create/rename writers; the 0068 backfill is the
+     *  slug copy (display case for pre-0068 rows is unrecoverable — the
+     *  recorded limitation). No index: the fold's owner_slug_uq arbitration
+     *  covers every lookup the upstream field index served. */
+    name: text("name").notNull().default(""),
+    /** Upstream `Description string xorm:"TEXT"` (repo.go:160). The value
+     *  lived in `repo_settings` until this port (the create/edit writers moved
+     *  with it; migration 0068 backfills from those rows). Nullable per the
+     *  ALTER constraint — NULL = no settings row ever existed; the API render
+     *  folds it to "" like upstream's zero value. */
+    description: text("description"),
+    /** Upstream `Website string xorm:"VARCHAR(2048)"` (repo.go:161) — same
+     *  history as description. */
+    website: text("website"),
+    /** Upstream `Avatar string xorm:"VARCHAR(64)"` (repo.go:216) — the avatar
+     *  KEY (bytes live in storage); no upload surface has landed, so the
+     *  column is NULL until that arm ports (reader arms render "" on NULL). */
+    avatar: text("avatar"),
+    /** Upstream `ArchivedUnix timeutil.TimeStamp xorm:"DEFAULT 0"` (repo.go:220)
+     *  — stamped by the archive toggle (SetArchiveRepoState, archiver.go:155-164:
+     *  now on archive, 0 on unarchive, NoAutoTime); rendered as the API
+     *  `archived_at` (convert/repository.go:229, AsTime). */
+    archivedUnix: integer("archived_unix").notNull().default(0),
+    /** Upstream `DefaultWikiBranch string` (repo.go:165; seeded at create,
+     *  create.go:148 = setting.Repository.DefaultBranch). The wiki-init seed;
+     *  the wiki surfaces read it port-when-read (SPEC wiki.md). */
+    defaultWikiBranch: text("default_wiki_branch"),
+    /** Upstream `GitSize int64 xorm:"NOT NULL DEFAULT 0"` (repo.go:204) —
+     *  the settled GIT footprint in KiB (upstream stores bytes; ours stores
+     *  the floored KB like size_kb). Maintained by services/repo-size.ts at
+     *  the settle points. */
+    gitSize: integer("git_size").notNull().default(0),
+    /** Upstream `IsFsckEnabled bool xorm:"NOT NULL DEFAULT true"` (repo.go:208)
+     *  — seeded at create as `!isMirror` (create.go:242); the settings
+     *  advanced arm + the fsck-cron reader port-when-read. */
+    isFsckEnabled: integer("is_fsck_enabled", { mode: "boolean" }).notNull().default(true),
+    /** Upstream `LFSSize int64 xorm:"NOT NULL DEFAULT 0"` (repo.go:205) —
+     *  the settled LFS sum in KiB (upstream GetRepoLFSSize sums lfs_object;
+     *  ours sums lfs_objects by the LFS router's numeric repo key). */
+    lfsSize: integer("lfs_size").notNull().default(0),
+    /** Upstream `NumActionRuns int xorm:"NOT NULL DEFAULT 0"` (repo.go:182) —
+     *  recounted at the run create/finish/delete settles (upstream
+     *  UpdateRepoRunsNumbers, models/actions/run.go:258-284; services/actions
+     *  updateRepoRunsNumbers). */
+    numActionRuns: integer("num_action_runs").notNull().default(0),
+    /** Upstream `NumClosedActionRuns int` (repo.go:183) — the closed twin of
+     *  num_action_runs (statuses 1/2/3/4 = success/failure/cancelled/skipped). */
+    numClosedActionRuns: integer("num_closed_action_runs").notNull().default(0),
+    /** Upstream `NumClosedProjects int xorm:"NOT NULL DEFAULT 0"` (repo.go:180)
+     *  — recounted at the project close/reopen/delete arms (upstream
+     *  updateRepositoryProjectCount, project.go:358-375). */
+    numClosedProjects: integer("num_closed_projects").notNull().default(0),
+    /** Upstream `NumProjects int xorm:"NOT NULL DEFAULT 0"` (repo.go:179) —
+     *  incremented at the repo-project create arm (project.go:282), recounted
+     *  with its closed twin at every state change. */
+    numProjects: integer("num_projects").notNull().default(0),
+    /** Upstream `ObjectFormatName string xorm:"VARCHAR(6) NOT NULL DEFAULT 'sha1'"`
+     *  (repo.go:211) — seeded 'sha1' at create (the engine is sha1-only,
+     *  SPEC-0001 §5); the API render reads the column instead of the constant.
+     *  The TS enum mirrors the API contract's domain (the create form's
+     *  object_format_name), not an engine capability. */
+    objectFormatName: text("object_format_name", { enum: ["sha1", "sha256"] })
+      .notNull()
+      .default("sha1"),
+    /** Upstream `OriginalServiceType api.GitServiceType xorm:"index"`
+     *  (repo.go:162; NotMigrated=0, PlainGitService=1, structs/repo.go:346-360,
+     *  Name()-lowercased) — stored as the service name TEXT per the §2.3
+     *  convention (the FN-6 everyone_access_mode precedent); NULL ≡ upstream 0
+     *  (NotMigrated). Writer: the SPEC-0009 migrate create arm (plain git only
+     *  on our surface → 'git'); adopt port-when-read. */
+    originalServiceType: text("original_service_type"),
+    /** Upstream `TemplateID int64 xorm:"INDEX"` (repo.go:202; upstream's own
+     *  surface never writes it nonzero) — the template repo's id, TEXT per the
+     *  id-family extension rule (ADR-0007 item 2 / FN-13 §7.4; the fork_parent
+     *  precedent) — a shape correction over the audit matrix's INTEGER cell,
+     *  recorded in SPEC-0001 §4.1. Port-when-read both arms. */
+    templateId: text("template_id"),
+    /** Upstream `Topics []string xorm:"TEXT JSON"` (repo.go:210) — the
+     *  denormalized copy maintained by the topic write arms (upstream
+     *  syncTopicsInRepository, topic.go:340-352); the JSON array rides `[]`
+     *  for topic-less repos (upstream's empty-slice serializations); NULL =
+     *  pre-0068 row shape for the API render fold only. */
+    topics: text("topics"),
+    /** Upstream `TrustModel TrustModelType` (repo.go:213; enum repo.go:101-108,
+     *  0 = default) — TEXT enum per §2.3, NULL ≡ the default model; seeded from
+     *  the create form's trust_model (create.go:248); the signing-settings arm
+     *  port-when-read. */
+    trustModel: text("trust_model", {
+      enum: ["default", "collaborator", "committer", "collaboratorcommitter"],
+    }),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -259,6 +361,10 @@ export const repositories = sqliteTable(
     // Upstream carries the same index (`OwnerID int64
     // xorm:"UNIQUE(s) index"`, models/repo/repo.go).
     index("repositories_owner_id_idx").on(t.ownerId),
+    // ADR-0007 FN-4: upstream `TemplateID int64 xorm:"INDEX"` (repo.go:202) —
+    // the one index the port batch adds (the template-from scan; the reader
+    // arm is port-when-read).
+    index("repositories_template_id_idx").on(t.templateId),
   ],
 );
 

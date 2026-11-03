@@ -541,7 +541,7 @@ export async function loadTagsFeedData(
   return {
     title: TAGS_FOR.replace("%s", `${repo.ownerNamespace}/${repo.slug}`),
     link: `${repoHref}/tags`,
-    description: settings.description,
+    description: repo.description ?? "",
     generatedUnix: Math.floor(now.getTime() / 1000),
     items,
   };

@@ -182,7 +182,9 @@ describe("applyRepoWikiSettings (routes/repo.ts:578's has_wiki write over saveRe
     await applyRepoWikiSettings(env.DB, repo, { enableWiki: false });
     const settings = await loadRepoSettings(env.DB, repo.id);
     expect(settings.hasWiki).toBe(false);
-    expect(settings.description).toBe("kept");
+    // description rides the repositories row (the FN-4 port, migration 0068)
+    // — the hasWiki flip must not touch it.
+    expect((await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repo.id)).get())?.description).toBe("kept");
   });
 });
 

@@ -95,6 +95,14 @@ beforeEach(async () => {
   repo = await seedRepo("demo", "public");
 });
 
+/** The repositories row read — the FN-4 value source for description/website
+ *  (the repo_settings columns are retired; migration 0068). */
+async function repoRowById(repoId: string): Promise<RepoRow> {
+  const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get();
+  if (row === undefined) throw new Error(`repo row vanished: ${repoId}`);
+  return row;
+}
+
 async function seedRepo(slug: string, visibility: "public" | "private"): Promise<RepoRow> {
   await env.DB.prepare(
     "INSERT INTO users (id, username, username_lower, display_name, created_at) VALUES (1, 'alice', 'alice', 'Alice Doe', unixepoch())",
@@ -290,7 +298,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/alice/demo/settings")}`);
     expect(await storedSlug()).toBe("demo"); // no rename
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe(""); // no description write
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe(""); // no description write
   });
 
   it("404-shells a signed-in non-admin's GET (the settingsGate posture — the public repo resolves, the tab doesn't)", async () => {
@@ -308,7 +316,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(res.status).toBe(404);
     expect(await res.text()).toContain("status-page-error");
     expect(await storedSlug()).toBe("demo"); // nothing was written
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("");
   });
 
   it("renders the admin's GET at 200 carrying the STORED basics: slug input, stored description, private checkbox", async () => {
@@ -337,7 +345,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
 
     // The D1 read-back: the slug is the LOWERED name, the description landed.
     expect(await storedSlug()).toBe("renamed");
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("renamed body");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("renamed body");
 
     // The git-HTTP/LFS leg: the old URL keeps resolving through repo_redirects.
     expect(await redirectFor("alice", "demo")).toEqual({ redirectRepoId: repo.id });
@@ -362,7 +370,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(res.headers.get("location")).toBe("/alice/demo/settings");
     expect(await storedSlug()).toBe("demo"); // untouched
     expect(await redirectFor("alice", "demo")).toBeUndefined(); // no redirect was filed
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("same repo"); // the rest still applies
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("same repo"); // the rest still applies
   });
 
   it("a description-only write moves neither the slug nor the visibility", async () => {
@@ -371,7 +379,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(res.headers.get("location")).toBe("/alice/demo/settings");
     expect(await storedSlug()).toBe("demo");
     expect(await storedVisibility()).toBe("public"); // no private field → the flip is a no-op
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("words about the repo");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("words about the repo");
   });
 
   it("the visibility flip round-trips through D1 both ways and the GET reflects the stored state", async () => {
@@ -400,7 +408,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(html).toContain('<input id="private" name="private" type="checkbox" checked=""/>'); // the carried flip
     // Nothing was written: the slug, the stored description and the visibility stand.
     expect(await storedSlug()).toBe("demo");
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("stored before");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("stored before");
     expect(await storedVisibility()).toBe("public");
   });
 
@@ -411,7 +419,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(html).toContain('<div class="ui negative message">repository name is not allowed: demo.git</div>');
     expect(html).toContain('value="demo.git"'); // the carried submission
     expect(await storedSlug()).toBe("demo"); // no partial write
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe(""); // the description write never ran
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe(""); // the description write never ran
   });
 
   it("a colliding name re-renders with the RepoNameCollisionError text verbatim and the carried form", async () => {
@@ -423,7 +431,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(html).toContain(">kept</textarea>"); // the carried description
     expect(html).toContain('<input id="private" name="private" type="checkbox" checked=""/>'); // the carried flip
     expect(await storedSlug()).toBe("demo"); // the fixture repo is untouched
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("");
     expect(await storedVisibility()).toBe("public");
   });
 
@@ -432,7 +440,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(res.status).toBe(403);
     expect(await res.text()).toContain("cross-origin request rejected");
     expect(await storedSlug()).toBe("demo"); // nothing was written
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("");
   });
 
   it("renaming ONTO a stale redirect row consumes it: the alias flips to the renaming repo (RepoService.rename's batch swap)", async () => {
@@ -636,13 +644,13 @@ describe("the options form's wave-settings-options field set (template/website/u
   it("the website field round-trips: stored verbatim (including empty), re-rendered as the input value", async () => {
     const set = await basicsPost({ repo_name: "demo", description: "", website: "https://demo.example/pages" });
     expect(set.status).toBe(303);
-    expect((await loadRepoSettings(env.DB, repo.id)).website).toBe("https://demo.example/pages");
+    expect(((await repoRowById(repo.id)).website ?? "")).toBe("https://demo.example/pages");
     expect(await (await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } })).text()).toContain(
       'value="https://demo.example/pages"/>',
     );
     const clear = await basicsPost({ repo_name: "demo", description: "" }); // the empty input clears
     expect(clear.status).toBe(303);
-    expect((await loadRepoSettings(env.DB, repo.id)).website).toBe("");
+    expect(((await repoRowById(repo.id)).website ?? "")).toBe("");
   });
 
   it("the archived flip round-trips both ways through repositories.is_archived and the GET reflects it", async () => {
@@ -672,12 +680,12 @@ describe("the options form's wave-settings-options field set (template/website/u
     // Nothing was written: the flag stands down AND the post's other fields
     // (the description) never landed — the guard fronts the whole POST.
     expect(await storedRepoColumns()).toEqual({ is_template: 0, is_archived: 0 });
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("untouched");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("untouched");
     // Unarchiving (or an already-archived flip) does not hit the guard: the
     // mirror may post the form WITHOUT the archived field and still write.
     const plain = await basicsPost({ repo_name: "demo", description: "mirror still writes" });
     expect(plain.status).toBe(303);
-    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("mirror still writes");
+    expect(((await repoRowById(repo.id)).description ?? "")).toBe("mirror still writes");
   });
 
   it("the invalid-name re-render carries the legacy trio and carries the EXACT submission (the 88cbd17 hardening)", async () => {
@@ -730,8 +738,10 @@ describe("the options form's wave-settings-options field set (template/website/u
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/alice/demo/settings");
     const settings = await loadRepoSettings(env.DB, repo.id);
-    expect(settings.description).toBe("one post");
-    expect(settings.website).toBe("https://one.test");
+    // description/website ride the repositories row (the FN-4 port).
+    const row = await repoRowById(repo.id);
+    expect(row.description).toBe("one post");
+    expect(row.website).toBe("https://one.test");
     expect(settings.hasIssues).toBe(true);
     expect(settings.hasPackages).toBe(true);
     expect(settings.hasPullRequests).toBe(true);

@@ -25,7 +25,7 @@ import type { AuthInfo } from "../../auth/auth-context";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../../services/actions/audit-arms";
 import { actorCredentialOf } from "../../services/oauth2/audit-arms";
 import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
-import { increaseTaskVersion } from "../../services/actions/model";
+import { increaseTaskVersion, updateRepoRunsNumbers } from "../../services/actions/model";
 import {
   isScopedWorkflowOptedOut,
   isScopedWorkflowSourceEffective,
@@ -1885,6 +1885,8 @@ async function settleRunAfterCancel(d1: D1Database, run: RunRow): Promise<void> 
       .update(actionRuns)
       .set({ status: next, started: cols.started ?? attempt.started, stopped: cols.stopped ?? attempt.stopped, updated: now })
       .where(eq(actionRuns.id, run.id));
+    // FN-4: the cancel settle's tally recount (see the legacy arm below).
+    await updateRepoRunsNumbers(d1, run.repoId);
     return;
   }
   const started = run.started ?? (isRunningStatus(next) ? now : null);
@@ -1893,6 +1895,9 @@ async function settleRunAfterCancel(d1: D1Database, run: RunRow): Promise<void> 
     .update(actionRuns)
     .set({ status: next, started, stopped, updated: now })
     .where(eq(actionRuns.id, run.id));
+  // FN-4: the cancel settle's tally recount — the CANCELLED status moves the
+  // closed count (upstream's UpdateRunJob notify tail, notify.go:90).
+  await updateRepoRunsNumbers(d1, run.repoId);
 }
 
 /** cancelRun's re-load + settle (cancel.go:44-68): upstream's job-update path
@@ -1999,6 +2004,9 @@ async function deleteRunRows(d1: D1Database, env: ApiEnv["Bindings"], run: RunRo
     db.delete(actionTaskOutputs).where(inArray(actionTaskOutputs.taskId, taskKeyIds)),
     db.delete(actionTasks).where(inArray(actionTasks.id, taskKeyIds)),
   ]);
+  // FN-4: the run-delete arm's tally recount (upstream DeleteRun's
+  // UpdateRepoRunsNumbers tail, cleanup.go:251).
+  await updateRepoRunsNumbers(d1, run.repoId);
 
   // Storage deletions (cleanup.go:250-256): log-only the best-effort arm.
   for (const task of taskRows) {

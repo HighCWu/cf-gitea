@@ -185,7 +185,6 @@
 import type { CommitJson } from "@cf-gitea/git-engine";
 
 import { branchRef, engineReads } from "../../api/services/engine";
-import { loadRepoSettings } from "../../api/services/repo-settings";
 import type { RepoRow } from "../ui-context";
 import { pathEscapeSegments } from "../page-data";
 import {
@@ -413,11 +412,10 @@ export async function loadBranchFeedData(
   const log = await engineReads(env, repo).listLog(branchRef(branchName), { ofs: 0, n: BRANCH_FEED_PAGE_SIZE });
 
   const repoHref = `${origin}/${repo.ownerNamespace}/${repo.slug}`; // repo.HTMLURL() — NO escaping
-  const settings = await loadRepoSettings(d1, repo.id);
   return {
     title: `Latest commits for branch ${branchName}`, // branch.go:32's plain concat
     link: `${repoHref}/branch/${pathEscapeSegments(branchName)}`, // RefTypeNameSubURL
-    description: settings.description, // RAW — no markdown render
+    description: repo.description ?? "", // RAW — no markdown render (the repositories row, FN-4 port)
     generatedUnix: Math.floor(now.getTime() / 1000),
     items: (log?.commits ?? []).map((commit) => branchFeedItemFromCommit(commit, repoHref)),
   };

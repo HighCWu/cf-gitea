@@ -5,7 +5,6 @@ import { repositories } from "../../db/schema";
 import { tombstoneRepoDO } from "../../repos/purge";
 import { replicateRepoCopy, settleForkRow } from "../../repos/fork-task";
 import { RepoService, type RepoRow } from "../../repos/service";
-import { loadRepoSettings, saveRepoSettings } from "./repo-settings";
 import type { RepositoryWithOwner } from "./repository";
 
 /**
@@ -137,17 +136,14 @@ export async function generateRepoFromTemplate(
 
   try {
     // Step 2 — the form metadata. default_branch: the form's or the
-    // template's; description: the form's only (side store, the forks.ts
-    // convention).
+    // template's; description: the form's only (GenerateRepoOption.
+    // description, template.go:83 `Description: opts.Description` — riding
+    // the repositories row since the FN-4 port, migration 0068).
     const defaultBranch = input.form.default_branch ?? template.defaultBranch;
     await drizzle(d1)
       .update(repositories)
-      .set({ defaultBranch, updatedAt: new Date() })
+      .set({ defaultBranch, description: input.form.description ?? "", updatedAt: new Date() })
       .where(eq(repositories.id, created.id));
-    const description = input.form.description ?? "";
-    if (description !== "") {
-      await saveRepoSettings(d1, created.id, { description }, new Date());
-    }
 
     // Steps 3-4 — the content copy rides the fork machinery; both arms end at
     // `status='ready'` with an honest emptiness (the CAS settle is idempotent).
@@ -190,7 +186,16 @@ export async function generateRepoFromTemplate(
   return { repo };
 }
 
-/** The description side-store read for tests/assertions. */
+/** The description row read for tests/assertions (the repositories column —
+ *  the side store retired by the FN-4 port, migration 0068). */
 export async function generatedRepoDescription(d1: D1Database, repoId: string): Promise<string> {
-  return (await loadRepoSettings(d1, repoId)).description;
+  return (
+    (
+      await drizzle(d1)
+        .select({ description: repositories.description })
+        .from(repositories)
+        .where(eq(repositories.id, repoId))
+        .get()
+    )?.description ?? ""
+  );
 }

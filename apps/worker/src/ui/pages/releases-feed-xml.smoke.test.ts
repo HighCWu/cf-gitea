@@ -113,9 +113,10 @@ async function seedBaseFixtures(): Promise<void> {
     .bind(EMPTY_REPO_ID, EMPTY_REPO_ID)
     .run();
 
-  // The RAW channel description (the repo_settings store).
-  await env.DB.prepare("INSERT INTO repo_settings (repo_id, description) VALUES (?, ?)")
-    .bind(REPO_ID, 'A "demo" repo <feed>')
+  // The RAW channel description (the repositories row — the FN-4 port,
+  // migration 0068, retired the repo_settings store).
+  await env.DB.prepare("UPDATE repositories SET description = ? WHERE id = ?")
+    .bind('A "demo" repo <feed>', REPO_ID)
     .run();
 }
 
@@ -383,7 +384,13 @@ describe("the mounted /{owner}/{repo}/releases.rss|.atom route arms", () => {
 
   it("the releases unit disabled → the route 404-shells (reqRepoReleaseReader, web.go:1504's group gate)", async () => {
     await seedBaseFixtures();
-    await env.DB.prepare("UPDATE repo_settings SET has_releases = 0 WHERE repo_id = ?").bind(REPO_ID).run();
+    // The FN-4 port dropped the seed-time settings-row INSERT (it carried the
+    // retired description), so the flag flip is an UPSERT now.
+    await env.DB.prepare(
+      "INSERT INTO repo_settings (repo_id, has_releases) VALUES (?, 0) ON CONFLICT(repo_id) DO UPDATE SET has_releases = 0",
+    )
+      .bind(REPO_ID)
+      .run();
 
     for (const tail of ["releases.rss", "releases.atom"]) {
       const res = await fetchRoute(`/alice/demo/${tail}`);

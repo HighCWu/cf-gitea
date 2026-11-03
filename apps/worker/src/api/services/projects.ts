@@ -314,6 +314,17 @@ export async function createProject(d1: D1Database, scope: ProjectScope, input: 
   if (row === undefined) {
     throw new Error("project insert committed without returning rows");
   }
+  // FN-4: the repo tally's create arm — upstream increments inside the
+  // creation transaction (`UPDATE repository SET num_projects =
+  // num_projects + 1 WHERE id = ?`, project.go:282), gated on RepoID > 0;
+  // owner-scoped projects (repoId "") never touch the tally.
+  if (scope.repoId !== null && scope.repoId !== "") {
+    await drizzle(d1)
+      .update(repositories)
+      .set({ numProjects: sql`num_projects + 1` })
+      .where(eq(repositories.id, scope.repoId))
+      .run();
+  }
   await createDefaultColumns(d1, row, templateType, input.now);
   return row;
 }
@@ -389,7 +400,33 @@ export async function changeProjectStatus(d1: D1Database, row: ProjectRow, isClo
   if (updated === undefined) {
     return row; // lost a concurrent transition — the flip already happened
   }
+  // FN-4: every real transition recounts BOTH tallies (upstream
+  // changeProjectStatus → updateRepositoryProjectCount, project.go:404-416
+  // → :358-375 — the same recount shape as num_milestones).
+  await updateRepositoryProjectCount(d1, row.repoId);
   return updated;
+}
+
+/**
+ * `updateRepositoryProjectCount` (models/projects project.go:358-375) —
+ * recount `num_projects`/`num_closed_projects` from the projects table
+ * (TypeRepository rows only — the repoId non-empty gate is upstream's
+ * id>0 no-op for owner-scoped projects rendered as a skip). The two count
+ * subselects ride ONE statement (the issues/service.ts milestone-recount
+ * shape).
+ */
+export async function updateRepositoryProjectCount(d1: D1Database, repoId: string): Promise<void> {
+  if (repoId === "") {
+    return;
+  }
+  await drizzle(d1)
+    .update(repositories)
+    .set({
+      numProjects: sql`(SELECT count(*) FROM projects WHERE repo_id = ${repoId} AND type = 2)`,
+      numClosedProjects: sql`(SELECT count(*) FROM projects WHERE repo_id = ${repoId} AND type = 2 AND is_closed = 1)`,
+    })
+    .where(eq(repositories.id, repoId))
+    .run();
 }
 
 /**
@@ -399,11 +436,27 @@ export async function changeProjectStatus(d1: D1Database, row: ProjectRow, isClo
  */
 export async function deleteProjectById(d1: D1Database, projectId: number): Promise<void> {
   const db = drizzle(d1);
+  // The tally's delete arm: upstream reads the project first
+  // (DeleteProjectByID, project.go:420-448) and recounts after the row is
+  // gone — the recount rides the SAME batch as its last statement, so the
+  // count subselects see the post-delete state inside the transaction.
+  const target = await db.select({ repoId: projects.repoId }).from(projects).where(eq(projects.id, projectId)).get();
   await db.batch([
     db.delete(projectIssues).where(eq(projectIssues.projectId, projectId)),
     db.delete(projectColumns).where(eq(projectColumns.projectId, projectId)),
     db.delete(projectWorkflows).where(eq(projectWorkflows.projectId, projectId)),
     db.delete(projects).where(eq(projects.id, projectId)),
+    ...(target !== undefined && target.repoId !== ""
+      ? [
+          db
+            .update(repositories)
+            .set({
+              numProjects: sql`(SELECT count(*) FROM projects WHERE repo_id = ${target.repoId} AND type = 2)`,
+              numClosedProjects: sql`(SELECT count(*) FROM projects WHERE repo_id = ${target.repoId} AND type = 2 AND is_closed = 1)`,
+            })
+            .where(eq(repositories.id, target.repoId)),
+        ]
+      : []),
   ]);
 }
 

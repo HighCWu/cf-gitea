@@ -1393,3 +1393,73 @@ describe("project workflows fire from the mutation seams", () => {
     ).toEqual([addedLabel, removedLabel].sort((x, y) => x - y));
   });
 });
+
+describe("the FN-4 project tallies (num_projects/num_closed_projects, migration 0068)", () => {
+  const repoTally = async (repoId: string) => {
+    const rows = await db().select().from(repositories).where(eq(repositories.id, repoId)).all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("repo seed failed");
+    return { numProjects: row.numProjects, numClosedProjects: row.numClosedProjects };
+  };
+
+  it("create increments num_projects (upstream project.go:282); a close/reopen recounts both (project.go:358-375)", async () => {
+    const s = await seedRepoAndActors("tally");
+    const send = router();
+    const post = (title: string) =>
+      send(`/repos/${s.owner.username}/${s.repoId}/projects`, {
+        method: "POST",
+        headers: authHeaders(s.owner.id),
+        body: JSON.stringify({ title }),
+      });
+    const first = await post("One");
+    expect(first.status).toBe(201);
+    const second = await post("Two");
+    expect(second.status).toBe(201);
+    expect(await repoTally(s.repoId)).toEqual({ numProjects: 2, numClosedProjects: 0 });
+
+    // Close the first (PATCH state=closed) — the recount moves BOTH columns.
+    const oneId = String((await first.json<Record<string, unknown>>()).id);
+    const close = await send(`/repos/${s.owner.username}/${s.repoId}/projects/${oneId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(close.status).toBe(200);
+    expect(await repoTally(s.repoId)).toEqual({ numProjects: 2, numClosedProjects: 1 });
+
+    // Reopen — the same recount path back.
+    const reopen = await send(`/repos/${s.owner.username}/${s.repoId}/projects/${oneId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ state: "open" }),
+    });
+    expect(reopen.status).toBe(200);
+    expect(await repoTally(s.repoId)).toEqual({ numProjects: 2, numClosedProjects: 0 });
+  });
+
+  it("delete recounts both tallies inside the delete batch (project.go:420-448)", async () => {
+    const s = await seedRepoAndActors("tallydel");
+    const send = router();
+    const res = await send(`/repos/${s.owner.username}/${s.repoId}/projects`, {
+      method: "POST",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ title: "Doomed" }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<Record<string, unknown>>();
+    const id = String(body.id);
+    // Close BEFORE delete so the delete must clear the closed count too.
+    await send(`/repos/${s.owner.username}/${s.repoId}/projects/${id}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(await repoTally(s.repoId)).toEqual({ numProjects: 1, numClosedProjects: 1 });
+    const del = await send(`/repos/${s.owner.username}/${s.repoId}/projects/${id}`, {
+      method: "DELETE",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(del.status).toBe(204);
+    expect(await repoTally(s.repoId)).toEqual({ numProjects: 0, numClosedProjects: 0 });
+  });
+});

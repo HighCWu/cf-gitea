@@ -67,11 +67,13 @@ import { tombstoneRepoDO } from "../../repos/purge";
  *     placeholder when none is set (upstream derives that domain from instance
  *     config; the fixed invalid-domain placeholder is the documented stand-in).
  *   - `trust_model` mirrors upstream ToTrustModel (models/repo/repo.go:127):
- *     case-insensitive, empty/unknown → `default`. Nothing consumes it yet
- *     (signed-commit trust is a SPEC-0005 surface) — it is validated per
- *     contract enum and stored nowhere, like upstream's column we do not have.
+ *     case-insensitive, empty/unknown → `default`. Stored on the
+ *     repositories row (create.go:248 `TrustModel: opts.TrustModel`; the
+ *     FN-4 `trust_model` port) — 'default' stores NULL, upstream's 0.
  *   - `template` / `object_format_name` are accepted per contract and ignored
- *     (no is_template column; sha1 is the only engine object format).
+ *     (is_template gates generate, but the CREATE form's template flag has no
+ *     landed writer arm; sha1 is the only engine object format — the create
+ *     seed stores 'sha1' unconditionally).
  */
 
 /** Upstream `repo_module.Readmes` — the contents of options/readme/. */
@@ -243,6 +245,9 @@ export async function createUserRepository(
     owner: { id: owner.id, usernameLower: owner.usernameLower },
     name: form.name,
     isPrivate: form.private === true,
+    // FN-4: `TrustModel: opts.TrustModel` (create.go:248 — ToTrustModel of
+    // the form string). NULL stores the default model, upstream's 0.
+    trustModel: form.trust_model === undefined || form.trust_model === "default" ? undefined : form.trust_model,
   });
 
   // Metadata the create call carries: default branch (upstream
