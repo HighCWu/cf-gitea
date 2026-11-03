@@ -886,7 +886,8 @@ describe("the release-detail render shapes (w129 batch-10: tag links, attachment
   it("a slash-carrying tag escapes per segment on the detail's own title link", async () => {
     // Provenance: wave-polish-matrix-10. release-tails pins the slash-tag
     // latest REDIRECT; the detail page's emitted hrefs for the same shape
-    // (pathEscapeSegments keeps the separator, encodes each segment) stayed
+    // (the Go-parity util.PathEscapeSegments — api/services/releases, R2-L2
+    // — keeps the separator, escapes each segment per url.PathEscape) stayed
     // unpinned — the title anchor re-emits the raw-slash URL.
     const { repo } = await theFixture();
     await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "plan/9", title: "Plan nine" });

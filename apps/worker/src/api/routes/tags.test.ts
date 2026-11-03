@@ -36,7 +36,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { protectedTags, releases, repositories, users } from "../../db/schema";
+import { protectedTags, releases, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -361,5 +361,60 @@ describe("the delete arm's release coupling (release.go:376-404)", () => {
       .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, "protected-ghost")))
       .all();
     expect(kept).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The create arm's sender identity (v1.5.5 R2-L7 threading — services/
+// release/release.go:136-143): createTag notifies with rel.Publisher —
+// PushCommits' pusher AND sender, CreateRef's sender — and on the tags API
+// the publisher IS the doer (CreateNewTag's `Publisher: doer`, :243-244), so the
+// payload pair carries the authenticated caller. tagCreatePushPayload now
+// takes the sender as a parameter (the release surfaces thread the ROW's
+// publisher); this pins the tags surface's half of the threading.
+// ---------------------------------------------------------------------------
+describe("the create arm's sender threading (release.go:136-143, CreateNewTag :243-244)", () => {
+  it("the push payload's pusher/sender and the create payload's sender are the authenticated caller (publisher == doer here)", async () => {
+    const repoRow = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG)))
+      .get();
+    if (repoRow === undefined) throw new Error("seed repo missing");
+    const hookRows = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId: repoRow.id,
+        url: "https://hooks.invalid/tags-sender-test",
+        events: JSON.stringify({ choose_events: true, branch_filter: "*", events: { push: true, create: true } }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(T0 * 1000),
+        updatedAt: new Date(T0 * 1000),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+
+    await send(`${REPO_PATH}/tags/sender-check`, authed({ method: "DELETE" })); // idempotency pre-clear
+    const created = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "sender-check", target: TIP2 }));
+    expect(created.status).toBe(200);
+
+    const deliveries = await drizzle(env.DB)
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.hookId, hookId))
+      .all();
+    const byEvent = Object.fromEntries(deliveries.map((d) => [d.eventType, JSON.parse(d.payloadContent) as Record<string, unknown>]));
+    const push = byEvent.push as { pusher: { login: string }; sender: { login: string } } | undefined;
+    expect(push?.pusher).toMatchObject({ login: OWNER }); // PushCommits' pusher — rel.Publisher
+    expect(push?.sender).toMatchObject({ login: OWNER }); // PushCommits' sender — the same identity
+    const create = byEvent.create as { sender: { login: string } } | undefined;
+    expect(create?.sender).toMatchObject({ login: OWNER }); // CreateRef's sender — rel.Publisher
+
+    // cleanup: the tag ref and this test's hook rows (the storage persists per file)
+    await send(`${REPO_PATH}/tags/sender-check`, authed({ method: "DELETE" }));
+    await drizzle(env.DB).delete(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId));
+    await drizzle(env.DB).delete(webhooks).where(eq(webhooks.id, hookId));
   });
 });

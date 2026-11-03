@@ -76,6 +76,7 @@ import { registerActivityFeedRoutes } from "./routes/activity-feeds";
 import { registerReleaseRoutes } from "./routes/releases";
 import { registerTagRoutes } from "./routes/tags";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
+import { pathEscape, pathEscapeSegments } from "./services/releases";
 import { saveRepoSettings } from "./services/repo-settings";
 
 const TOKEN = "stub-token";
@@ -115,11 +116,12 @@ async function seedRelease(options: {
   isPrerelease?: boolean;
   isTag?: boolean;
   minutesOffset?: number;
+  publisherId?: number;
 }): Promise<number> {
   const now = new Date(Date.parse("2026-03-01T00:00:00Z") + (options.minutesOffset ?? 0) * 60_000);
   const row = await new IssuesService(env.DB).createRelease({
     repoId: "7301",
-    publisherId: 1,
+    publisherId: options.publisherId ?? 1,
     tagName: options.tag,
     target: "main",
     title: options.title ?? options.tag,
@@ -1150,6 +1152,72 @@ describe("release assets render in the release payloads (ToAPIRelease attachment
 });
 
 // ---------------------------------------------------------------------------
+// Go-parity path escaping (R2-L2): the release URL family runs the tag
+// through util.PathEscapeSegments (html_url/tarball/zipball — slashes KEPT
+// per segment, models/repo/release.go:136-146) and the R13 download builder
+// through plain url.PathEscape (models/repo/release.go:443). The truth
+// table pins Go's shouldEscape (encodePathSegment) exactly: the unreserved
+// set plus $&+:;=@ stay raw; !'()* and everything else encodes —
+// encodeURIComponent is the INVERSE on those legal tag/asset characters.
+// ---------------------------------------------------------------------------
+
+describe("Go-parity path escaping (R2-L2)", () => {
+  it("pathEscape keeps Go's segment keep-set and escapes the rest (shouldEscape encodePathSegment, derived against Go 1.25.1)", () => {
+    expect(pathEscape("v1.0-beta_2~rc")).toBe("v1.0-beta_2~rc"); // unreserved (RFC 3986 §2.3)
+    expect(pathEscape("$&+:=@")).toBe("$&+:=@"); // reserved but legal in a segment (only / , ; ? escape there)
+    expect(pathEscape(";,")).toBe("%3B%2C"); // the segment arm's extra escape pair, spelled out
+    expect(pathEscape("!'()*")).toBe("%21%27%28%29%2A"); // encodeURIComponent would KEEP these
+    expect(pathEscape("a b/c?d#e%f,\"x\"")).toBe("a%20b%2Fc%3Fd%23e%25f%2C%22x%22");
+    expect(pathEscape("rélease 中文")).toBe("r%C3%A9lease%20%E4%B8%AD%E6%96%87"); // per-byte UTF-8, uppercase
+  });
+
+  it("pathEscapeSegments keeps the separators — a slash tag renders / (release.go:136-146), never %2F", () => {
+    expect(pathEscapeSegments("v1/2")).toBe("v1/2");
+    expect(pathEscapeSegments("release/v1.2!")).toBe("release/v1.2%21");
+    expect(pathEscapeSegments("")).toBe("");
+  });
+
+  it("the wire html_url/tarball_url/zipball_url keep a slash tag's separators AND the segment keep-set (the POST body render)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      // every char here is KEPT by PathEscapeSegments (slash separator +
+      // the $&+:=@ segment set) — encodeURIComponent would encode $&+:=@;
+      // draft: no git ref lands, nothing to clean up
+      body: JSON.stringify({ tag_name: "v1/0+$&=:@", draft: true }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ html_url: string; tarball_url: string; zipball_url: string }>();
+    expect(body.html_url).toBe("https://example.com/cf-gitea-stub/rel/releases/tag/v1/0+$&=:@");
+    expect(body.tarball_url).toBe("https://example.com/cf-gitea-stub/rel/archive/v1/0+$&=:@.tar.gz");
+    expect(body.zipball_url).toBe("https://example.com/cf-gitea-stub/rel/archive/v1/0+$&=:@.zip");
+  });
+
+  it("the R13 download builder runs plain url.PathEscape per value (release.go:443) — keep-set raw, a %2F slash tag", async () => {
+    // Plain PathEscape on the download URL vs the html_url's segments
+    // escaper: the SAME slash tag renders %2F here, kept in html_url.
+    const releaseId = await seedRelease({ tag: "dl/v1", minutesOffset: 0 });
+    await drizzle(env.DB).insert(releaseAssets).values([
+      {
+        uuid: "asset-u-esc-plus",
+        repoId: "7301",
+        releaseId,
+        name: "a+b c!.zip", // $&+ legal, ! encodes, space encodes — encodeURIComponent would flip the halves
+        size: 10,
+        r2Key: "repos/r_7301/release-assets/asset-u-esc-plus",
+        createdAt: new Date(),
+      },
+    ]);
+    const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}`);
+    expect(res.status).toBe(200);
+    const body = await res.json<{ assets: Array<{ name: string; browser_download_url: string }> }>();
+    expect(body.assets[0]?.browser_download_url).toBe(
+      "https://example.com/cf-gitea-stub/rel/releases/download/dl%2Fv1/a+b%20c%21.zip", // + kept, space/! encoded
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // `release` webhook emissions (upstream sendReleaseHook:879 — NewRelease:889
 // "published" / UpdateRelease:893 "updated" / DeleteRelease:897 "deleted",
 // all gated on `!rel.IsDraft`, services/release/release.go:198,358,435).
@@ -1264,6 +1332,74 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     expect(payload.ref_type).toBe("tag");
     expect(payload.sha).toBe(MAIN_TIP); // the lightweight tag's tip == the filled sha1
     await deleteTagRef("v9-draft");
+  });
+
+  // R2-L7 — the sender identity: upstream createTag notifies with
+  // rel.Publisher (release.go:136-143) and the tag-creating edit's "published"
+  // ReleasePayload does too (NewRelease → sendReleaseHook(rel.Publisher),
+  // notifier.go:889-890); rel.Publisher is bound at insert (CreateNewTag's
+  // `Publisher: doer`, release.go:241) and NEVER re-bound by UpdateRelease,
+  // so a publish-from-draft flipped by a NON-publisher carries the ORIGINAL
+  // publisher as pusher/sender — not the editing caller.
+  it("a publish-from-draft by a NON-publisher carries the ROW's publisher as pusher/sender on every emitted payload (R2-L7)", async () => {
+    await drizzle(env.DB).insert(users).values({
+      id: 2,
+      username: "publisher",
+      usernameLower: "publisher",
+      isAdmin: false,
+      status: "active",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    const hookId = await seedHook("7301", ["release", "create"]);
+    const draftId = await seedRelease({ tag: "v7-draft", isDraft: true, publisherId: 2 });
+    await deleteTagRef("v7-draft"); // the fresh-create arm's precondition, every run
+
+    const published = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
+      method: "PATCH",
+      headers: jsonAuth, // the stub (id 1) flips user 2's draft
+      body: JSON.stringify({ draft: false }),
+    });
+    expect(published.status).toBe(200);
+    await deleteTagRef("v7-draft");
+
+    const deliveries = await deliveriesFor(hookId);
+    // The push event matches no subscription here — the create + release pair.
+    expect(deliveries.map((d) => d.eventType).sort()).toEqual(["create", "release"]);
+    const createPayload = JSON.parse(
+      deliveries.find((d) => d.eventType === "create")!.payloadContent,
+    ) as { sender: { login: string } };
+    expect(createPayload.sender).toMatchObject({ login: "publisher" }); // CreateRef's sender — rel.Publisher
+    const releasePayload = JSON.parse(
+      deliveries.find((d) => d.eventType === "release")!.payloadContent,
+    ) as { action: string; sender: { login: string } };
+    expect(releasePayload).toMatchObject({ action: "published", sender: { login: "publisher" } }); // NewRelease — rel.Publisher
+  });
+
+  it("a riding (non-tag-creating) edit keeps the DOER as sender even when the row's publisher differs (R2-L7 — UpdateRelease passes doer, notifier.go:893-894)", async () => {
+    await drizzle(env.DB).insert(users).values({
+      id: 2,
+      username: "publisher",
+      usernameLower: "publisher",
+      isAdmin: false,
+      status: "active",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    const hookId = await seedHook("7301", ["release"]);
+    const releaseId = await seedRelease({ tag: "ride-tag", publisherId: 2, minutesOffset: 0 });
+
+    const patched = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth, // the stub (id 1) edits user 2's release
+      body: JSON.stringify({ name: "Renamed by the stub" }),
+    });
+    expect(patched.status).toBe(200);
+
+    const payload = JSON.parse((await deliveriesFor(hookId))[0]!.payloadContent) as {
+      action: string;
+      sender: { login: string };
+    };
+    expect(payload.action).toBe("updated");
+    expect(payload.sender).toMatchObject({ login: "cf-gitea-stub" }); // the doer — the publisher only on the published arm
   });
 
   it("stays silent while a release is a draft (create, edit, delete) and on a lost PATCH race", async () => {

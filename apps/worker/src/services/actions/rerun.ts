@@ -154,7 +154,8 @@ export type RerunRejection =
   | "trigger-user-required"
   /** rerun.go:89-102 — the repo-level map (cfg.IsWorkflowDisabled) or the
    *  scoped twin (run.IsScopedRun → IsScopedWorkflowOptedOut over the run's
-   *  WorkflowRepoID; the web twin view.go:929-936). */
+   *  WorkflowRepoID and the repo's CURRENT owner — rerun.go:93's
+   *  repo.OwnerID, R1-F9; the web twin view.go:929-936). */
   | "workflow-disabled"
   /** rerun.go:104-114 — the latest attempt is already at MAX_RERUN_ATTEMPTS. */
   | "max-attempts"
@@ -250,10 +251,28 @@ export async function validateRerun(
   // flag must not block rerun" (rerun.go:90-99, the landed
   // isScopedWorkflowOptedOut in config.ts). The web handler's twin gate
   // (checkRunRerunAllowed, view.go:929-936) funnels through this validation
-  // — one guard, the same disabled posture as dispatch.
+  // — one guard, the same disabled posture as dispatch. The opt-out's owner
+  // argument is the RESOLVED repo's CURRENT owner (R1-F9 — rerun.go:93
+  // `repo.OwnerID`: validateRerun receives the repo object, not the run's
+  // frozen columns), so after a transfer the rerun consults the NEW owner's
+  // registrations; the run row's ownerId is the pre-transfer value and
+  // misses them.
   const cfg = await loadRepoActionsConfig(d1, run.repoId);
+  const repo = await drizzle(d1)
+    .select({ ownerId: repositories.ownerId })
+    .from(repositories)
+    .where(eq(repositories.id, repoId))
+    .get();
+  if (repo === undefined) {
+    // rerun.go:75-77's repo==nil arm ("repo is required") — a dangling
+    // repo id beyond the run/repo match above.
+    return rejected("repo-mismatch", "repo is required");
+  }
   if (run.isScopedRun) {
-    if (await isScopedWorkflowOptedOut(d1, cfg, run.ownerId, run.workflowRepoId, run.workflowId)) {
+    // the column is nullable in the store; 0 = upstream's impossible no-owner
+    // row (anonymous never holds a registration — the (0, ownerId) scan
+    // degrades to instance-level rows only)
+    if (await isScopedWorkflowOptedOut(d1, cfg, repo.ownerId ?? 0, run.workflowRepoId, run.workflowId)) {
       return rejected("workflow-disabled", `scoped workflow ${run.workflowId} is disabled`); // rerun.go:98-99's text
     }
   } else if (cfg.disabledWorkflows.includes(run.workflowId)) {

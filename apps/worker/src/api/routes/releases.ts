@@ -33,6 +33,7 @@ import {
   findReleaseByTag,
   findReleaseForRepoById,
   listReleases,
+  releasePublisherSender,
   toApiRelease,
 } from "../services/releases";
 import { emitRefWebhook } from "../services/tags";
@@ -272,6 +273,13 @@ function releasePayload(
  * the RELEASE PUBLISHER (rel.PublisherID), NOT the flipping doer — the
  * draft→published PATCH keeps the original publisher. Same caught-and-logged
  * posture as the webhook fan-out, awaited inline.
+ *
+ * Sender identity (R2-L7): the payload's sender mirrors the notifier's doer
+ * argument — NewRelease passes `rel.Publisher` (notifier.go:889-890, the
+ * "published" arm), UpdateRelease/DeleteRelease pass the DOER (notifier.go
+ * :893-899, "updated"/"deleted"). So "published" renders the ROW's
+ * publisher (releasePublisherSender — LoadAttributes' ghost swap on a
+ * missing row), the other actions the editing caller, unchanged.
  */
 async function emitReleaseEvent(
   c: Context<ApiEnv>,
@@ -292,7 +300,9 @@ async function emitReleaseEvent(
       action,
       await toApiRelease(c.env.DB, viewerOf(c), found, row, assets),
       repository,
-      c.get("authUser"),
+      action === "published"
+        ? await releasePublisherSender(c.env.DB, row.publisherId, viewerOf(c).origin)
+        : c.get("authUser"),
     ),
   });
   if (action !== "published") {
@@ -548,14 +558,17 @@ export function registerReleaseRoutes(
       // GetCommit(target) BEFORE writing, so BOTH events carry the peeled
       // commit, never the annotated tag object oid). The payload shape is
       // the §2.3 tag-create pair (tagCreatePushPayload — the tags route's
-      // corrected builder, emitUserPushCreatedRef's exact shape).
+      // corrected builder, emitUserPushCreatedRef's exact shape). Both events
+      // carry rel.Publisher as pusher/sender (:137, :143 — R2-L7); on a
+      // create the publisher IS the requester (`PublisherID: doer.ID`,
+      // release.go:243).
       if (tagCreated && tagCommitSha !== undefined) {
         const fullName = tagRef(row.tagName);
         await emitRefWebhook(
           c,
           found,
           "push",
-          await tagCreatePushPayload(c, found, fullName, ZERO_OID, tagCommitSha, tagCommitSha),
+          await tagCreatePushPayload(c, found, fullName, ZERO_OID, tagCommitSha, tagCommitSha, requester),
           fullName,
         );
         await emitRefWebhook(
@@ -567,7 +580,7 @@ export function registerReleaseRoutes(
             ref: row.tagName,
             ref_type: "tag",
             repository: toApiRepository(viewerOf(c), found),
-            sender: c.get("authUser") ?? null,
+            sender: requester,
           },
           fullName,
         );
@@ -681,11 +694,17 @@ export function registerReleaseRoutes(
       // createTag emission the create path runs (release.go:125-148, R16-e:
       // both events carry the PEELED COMMIT — the edit-created tag is
       // lightweight (msg="", release.go:269) so the tip IS the filled sha1,
-      // and the payload shape is the §2.3 tag-create pair).
+      // and the payload shape is the §2.3 tag-create pair). Pusher/sender =
+      // rel.Publisher (release.go:137/:143, R2-L7) — UNCHANGED by the edit:
+      // a publish-from-draft (or rename) by a non-publisher still carries
+      // the ORIGINAL publisher, not the editing caller (CreateNewTag binds
+      // Publisher at insert, release.go:243-244; UpdateRelease never
+      // re-binds).
       if (updated.tagCreated) {
         const fullName = tagRef(updated.row.tagName);
         const tip = updated.row.sha1 ?? ZERO_OID;
-        await emitRefWebhook(c, found, "push", await tagCreatePushPayload(c, found, fullName, ZERO_OID, tip, tip), fullName);
+        const publisher = await releasePublisherSender(c.env.DB, updated.row.publisherId, viewerOf(c).origin);
+        await emitRefWebhook(c, found, "push", await tagCreatePushPayload(c, found, fullName, ZERO_OID, tip, tip, publisher), fullName);
         await emitRefWebhook(
           c,
           found,
@@ -695,7 +714,7 @@ export function registerReleaseRoutes(
             ref: updated.row.tagName,
             ref_type: "tag",
             repository: toApiRepository(viewerOf(c), found),
-            sender: c.get("authUser") ?? null,
+            sender: publisher,
           },
           fullName,
         );

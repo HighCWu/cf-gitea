@@ -888,6 +888,54 @@ function isoOrZero(date: Date | null): string {
   return date === null ? "0001-01-01T00:00:00Z" : date.toISOString();
 }
 
+// ---------------------------------------------------------------------------
+// Go-parity path escaping (R2-L2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `url.PathEscape` safe set — `shouldEscape(c, encodePathSegment)`
+ * returning false (Go net/url/url.go; the mode `url.PathEscape` selects).
+ * Truth table derived byte-by-byte against Go 1.25.1's stdlib
+ * (`url.PathEscape` over every printable ASCII rune):
+ *
+ *   KEPT    : A-Z a-z 0-9 - . _ ~    (unreserved, RFC 3986 §2.3)
+ *             $ & + : = @            (reserved §2.2 but that arm only
+ *                                     escapes / , ; ? inside a segment)
+ *   ESCAPED : ! " # % ' ( ) * , / ; < > ? [ \ ] ^ ` { | }
+ *             + space/controls, and every non-ASCII byte (per-byte UTF-8
+ *             %XX, uppercase hex)
+ *
+ * encodeURIComponent is the INVERSE on the legal tag/asset characters — it
+ * keeps `! ' ( ) *` and escapes `$ & + : ; = @` — hence this port instead
+ * of the platform builtin (R2-L2).
+ */
+const PATH_SEGMENT_SAFE = new Set(
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~$&+:=@".split("").map((ch) => ch.charCodeAt(0)),
+);
+
+/** Go `url.PathEscape` — escape one path segment (net/url escape(s,
+ *  encodePathSegment)); byte-wise like Go, so multibyte runes encode as one
+ *  %XX triplet per UTF-8 byte. */
+export function pathEscape(segment: string): string {
+  const bytes = new TextEncoder().encode(segment);
+  let out = "";
+  for (const byte of bytes) {
+    if (PATH_SEGMENT_SAFE.has(byte)) {
+      out += String.fromCharCode(byte);
+    } else {
+      out += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+  }
+  return out;
+}
+
+/** Upstream `util.PathEscapeSegments` (gitea/modules/util/url.go:12-19):
+ *  `PathEscape` each "/"-separated segment, KEEP the separators — a slash
+ *  tag renders `/releases/tag/v1/2`, never %2F. */
+export function pathEscapeSegments(path: string): string {
+  return path.split("/").map(pathEscape).join("/");
+}
+
 function releaseUrls(pair: RepositoryWithOwner, origin: string, row: ReleaseRow): {
   url: string;
   htmlUrl: string;
@@ -897,7 +945,9 @@ function releaseUrls(pair: RepositoryWithOwner, origin: string, row: ReleaseRow)
 } {
   const apiRepoUrl = `${origin}/api/v1/repos/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
   const htmlRepoUrl = `${origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
-  const tag = encodeURIComponent(row.tagName);
+  // HTMLURL/TarURL/ZipURL all run the tag through util.PathEscapeSegments
+  // (models/repo/release.go:136-146) — slashes KEPT per segment.
+  const tag = pathEscapeSegments(row.tagName);
   return {
     url: `${apiRepoUrl}/releases/${row.id}`,
     htmlUrl: `${htmlRepoUrl}/releases/tag/${tag}`,
@@ -961,14 +1011,32 @@ function hasDuplicateName(assets: ReleaseAssetRow[]): boolean {
 }
 
 /**
+ * The release row's PUBLISHER rendered as the webhook `sender`/`pusher`
+ * (R2-L7): upstream notifies with `rel.Publisher` — createTag's PushCommits
+ * + CreateRef pass it (services/release/release.go:137, :143), NewRelease
+ * does too (services/webhook/notifier.go:889-890) — and `rel.Publisher` is
+ * set once at insert (`Publisher: doer`, CreateNewTag release.go:243-244) and
+ * NEVER touched by UpdateRelease, so publish-from-draft by a non-publisher
+ * still carries the ORIGINAL publisher. Rendered through LoadAttributes'
+ * ghost swap: a publisher id with no surviving user row renders
+ * NewGhostUser() (models/repo/release.go:116-125), never null.
+ */
+export async function releasePublisherSender(d1: D1Database, publisherId: number, origin: string): Promise<User> {
+  const row = publisherId > 0 ? await drizzle(d1).select().from(users).where(eq(users.id, publisherId)).get() : undefined;
+  return row === undefined ? ghostApiUser(origin) : apiUserFromRow(row, { origin, requester: null });
+}
+
+/**
  * The R13 name-based download-url builder: `release.Repo.HTMLURL() +
- * /releases/download/ + PathEscape(tag) + / + PathEscape(name)` (models/repo/
- * release.go:430-443's CustomDownloadURL assignment), returned ONLY when the
- * release's asset names are unique — `undefined` means the caller keeps the
- * uuid shape (upstream's DownloadURL fallback). Shared by toApiRelease (which
- * unwraps its RepositoryWithOwner to the repo row) and the UI asset rows
- * (list.tmpl renders `$att.DownloadURL` — the same flip); both pass the flat
- * repo row (`ownerNamespace`/`slug`), the HTMLURL() stand-in.
+ * /releases/download/ + url.PathEscape(tag) + / + url.PathEscape(name)`
+ * (models/repo/release.go:430-443's CustomDownloadURL assignment — plain
+ * `url.PathEscape` per value here, NOT PathEscapeSegments: a slash in a
+ * tag/asset name encodes %2F), returned ONLY when the release's asset names
+ * are unique — `undefined` means the caller keeps the uuid shape (upstream's
+ * DownloadURL fallback). Shared by toApiRelease (which unwraps its
+ * RepositoryWithOwner to the repo row) and the UI asset rows (list.tmpl
+ * renders `$att.DownloadURL` — the same flip); both pass the flat repo row
+ * (`ownerNamespace`/`slug`), the HTMLURL() stand-in.
  */
 export function uniqueNameDownloadUrlBuilder(
   origin: string,
@@ -979,8 +1047,8 @@ export function uniqueNameDownloadUrlBuilder(
   if (hasDuplicateName(assets)) {
     return undefined;
   }
-  const base = `${origin}/${encodeURIComponent(pair.ownerNamespace)}/${encodeURIComponent(pair.slug)}/releases/download/${encodeURIComponent(tagName)}`;
-  return (name: string) => `${base}/${encodeURIComponent(name)}`;
+  const base = `${origin}/${encodeURIComponent(pair.ownerNamespace)}/${encodeURIComponent(pair.slug)}/releases/download/${pathEscape(tagName)}`;
+  return (name: string) => `${base}/${pathEscape(name)}`;
 }
 
 /**

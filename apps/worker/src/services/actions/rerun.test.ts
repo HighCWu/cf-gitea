@@ -819,5 +819,40 @@ describe("validateRerun's arms (rerun.go:71-117) + the plan guards", () => {
       });
       expect((await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(scoped.runId), USER_ID, [])).ok).toBe(true);
     });
+
+    // R1-F9 — rerun.go:93 reads `repo.OwnerID` (the RESOLVED repo's CURRENT
+    // owner), not the run row's frozen ownerId: after a transfer the opt-out
+    // store consults the NEW owner's registrations, and the pre-transfer
+    // owner's registrations no longer rescue the rerun.
+    it("after a transfer the scoped opt-out consults the NEW owner's registrations (rerun.go:93 repo.OwnerID)", async () => {
+      await seedRepo();
+      await db().insert(users).values({ id: 8, username: "bob", usernameLower: "bob", status: "active", createdAt: T0 });
+      const store = scopedWorkflowSourcesStore(env.DB);
+      const seeded = await seedDoneScopedRun(); // the run row keeps ownerId USER_ID (frozen at insert)
+      await db().update(repositories).set({ ownerId: 8 }).where(eq(repositories.id, REPO_ID)); // the transfer
+      await store.addSource(8, SRC_ID); // bob's registration
+      await store.setSourceConfigs(8, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
+      await flagOptOut(); // a stale pre-transfer flag
+      // a run.ownerId read would scan (0, 7) — miss bob's required row and refuse
+      expect((await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, [])).ok).toBe(true);
+    });
+
+    it("after a transfer the OLD owner's registrations no longer rescue the rerun (the read is repo.OwnerID, not run.OwnerID)", async () => {
+      await seedRepo();
+      await db().insert(users).values({ id: 8, username: "bob", usernameLower: "bob", status: "active", createdAt: T0 });
+      const store = scopedWorkflowSourcesStore(env.DB);
+      await store.addSource(USER_ID, SRC_ID); // the PRE-transfer owner's registration
+      await store.setSourceConfigs(USER_ID, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
+      const seeded = await seedDoneScopedRun(); // the run row keeps ownerId USER_ID
+      await db().update(repositories).set({ ownerId: 8 }).where(eq(repositories.id, REPO_ID)); // the transfer
+      await flagOptOut();
+      // a run.ownerId read would find alice's required row and rerun — the
+      // current-owner read answers the stale-flag refusal (rerun.go:98-99)
+      expect(await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, [])).toMatchObject({
+        ok: false,
+        reason: "workflow-disabled",
+        message: `scoped workflow ${WORKFLOW_ID} is disabled`,
+      });
+    });
   });
 });

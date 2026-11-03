@@ -197,6 +197,7 @@ import {
   findReleaseByTagExact,
   findReleaseForRepoById,
   listReleases,
+  pathEscapeSegments,
   toApiRelease,
   uniqueNameDownloadUrlBuilder,
 } from "../../api/services/releases";
@@ -214,7 +215,7 @@ import { users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { REACTION_EMOJI, groupReactions, renderIssueMarkdown, type ReactionGroup } from "./issue-detail";
 import { parseFormBool } from "./notifications";
-import { formatByteSize, parsePageNumber, pathEscapeSegments, shortSha } from "../page-data";
+import { formatByteSize, parsePageNumber, shortSha } from "../page-data";
 import { userLink } from "../links";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
@@ -1012,6 +1013,9 @@ export function ReleaseReactionBar(props: { actionUrl: string; groups: ReactionG
 export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string; firstOpen: boolean; canEdit?: boolean; singleTag?: boolean; viewer?: Viewer; repoArchived?: boolean }) {
   const { entry, repoLink } = props;
   const { row } = entry;
+  // The Go-parity util.PathEscapeSegments (api/services/releases — R2-L2):
+  // keeps the `/` separators and url.PathEscape's keep-set ($&+:;=@ stay,
+  // !'()* encode) — list.tmpl renders $release.HTMLURL, the same escaper.
   const escapedTag = pathEscapeSegments(row.tagName);
   // R16(f): the reaction bar's gates (list.tmpl:110-115's render gate —
   // `not (or $release.IsTag $release.IsDraft)` — and shared/reactions.tmpl's

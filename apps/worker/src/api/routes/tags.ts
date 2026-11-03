@@ -16,6 +16,7 @@ import {
   ZERO_OID,
 } from "../services/engine";
 import { annotatedTagSchema, createTagOptionSchema, tagSchema, type Tag } from "../models/git";
+import type { User } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
 import { compareUrl } from "../services/hooks";
@@ -399,6 +400,15 @@ function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: s
  * here the write already committed, so the payload degrades instead).
  * Exported for routes/releases.ts — upstream runs ONE createTag emission for
  * both surfaces (the release create/edit paths share this function's shape).
+ *
+ * `sender` is the PUBLISHER (R2-L7): upstream createTag notifies with
+ * `rel.Publisher` — PushCommits' pusher AND sender plus CreateRef's sender
+ * are that one identity (services/release/release.go:136-143, the
+ * notifier.go:821/:852 renders) — and `rel.Publisher` is set at insert
+ * (CreateNewTag's `Publisher: doer`, release.go:243-244) and never re-bound by
+ * an edit, so the release surfaces thread the ROW's publisher here instead
+ * of the calling context. On THIS (tags API) surface publisher == doer ==
+ * the authenticated caller.
  */
 export async function tagCreatePushPayload(
   c: Context<ApiEnv>,
@@ -407,9 +417,9 @@ export async function tagCreatePushPayload(
   before: string,
   after: string,
   headCommitSha: string,
+  sender: User | null,
 ): Promise<Record<string, unknown>> {
   const origin = viewerOf(c).origin;
-  const sender = c.get("authUser") ?? null;
   let headCommit: unknown = null;
   try {
     const commit = await engineReads(c.env, pair.repo).readCommit(headCommitSha);
@@ -593,13 +603,15 @@ export function registerTagRoutes(
 
       // Upstream's API tag create fires the zero-commit `push` event around
       // the `create` event (services/release/release.go:136-143 — PushCommits
-      // :136 first, CreateRef :143). The push payload is the §2.3 tag-create
-      // shape (tagCreatePushPayload, the W5 correction): before = the zero
-      // oid, after = the new ref tip — the TAG OBJECT oid for the annotated
-      // case — head_commit = the PEELED tip commit and
-      // compare/{zero}...{raw tip}; the create event's `sha` stays the raw
-      // tip (the push path's `Sha: refID` semantics, the module header).
-      await emitRefWebhook(c, pair, "push", await tagCreatePushPayload(c, pair, tagRef(name), ZERO_OID, newTarget, commitSha), tagRef(name));
+      // :136 first, CreateRef :143, BOTH carrying rel.Publisher). The push
+      // payload is the §2.3 tag-create shape (tagCreatePushPayload, the W5
+      // correction): before = the zero oid, after = the new ref tip — the
+      // TAG OBJECT oid for the annotated case — head_commit = the PEELED tip
+      // commit and compare/{zero}...{raw tip}; the create event's `sha` stays
+      // the raw tip (the push path's `Sha: refID` semantics, the module
+      // header). The publisher IS the doer on this surface (CreateNewTag's
+      // `Publisher: doer`, release.go:243-244).
+      await emitRefWebhook(c, pair, "push", await tagCreatePushPayload(c, pair, tagRef(name), ZERO_OID, newTarget, commitSha, doer), tagRef(name));
 
       // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
       // (never an oid — the annotated peel stays out of `ref`), ref_type
