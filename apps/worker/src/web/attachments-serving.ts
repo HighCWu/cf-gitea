@@ -314,9 +314,19 @@ function isTSpecial(r: string): boolean {
   return `()<>@,;:\\"/[]?=`.includes(r);
 }
 
-/** isTokenChar: any US-ASCII CHAR except SPACE, CTLs, or tspecials. */
+/** isTokenChar (mime/grammar.go, go1.25.1): the RFC 2045 prose says "any
+ *  CHAR except SPACE, CTLs, or tspecials", but Go does NOT compute that set —
+ *  it tests an explicit 128-bit bitmap admitting exactly alnum plus
+ *  `!#$%&'*+-.^_`|~`. The printable non-tspecials `{` and `}` are therefore
+ *  NOT token chars: a filename `a{b}.txt` takes the quoted-string arm.
+ *  go1.25.1 byte-probe evidence: the bitmap's true set is alnum + those 14
+ *  specials; the excluded printable set is `" ( ) , / : ; < = > ? @ [ \ ]
+ *  { }` (tspecials + the two braces); and
+ *  FormatMediaType("attachment", "a{b}.txt") = `attachment; filename="a{b}.txt"`. */
 function isTokenChar(code: number): boolean {
-  return code > 0x20 && code < 0x7f && !isTSpecial(String.fromCharCode(code));
+  const isAlnum =
+    (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
+  return isAlnum || `!#$%&'*+-.^_\`|~`.includes(String.fromCharCode(code));
 }
 
 function isToken(value: string): boolean {

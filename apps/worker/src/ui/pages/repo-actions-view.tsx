@@ -159,6 +159,7 @@ import { getTaskStepsByTaskId, readTaskLogs, type TaskStepRow } from "../../serv
 import { avatarLinkWithSize, defaultAvatarLink, type AvatarChainUser } from "../../services/avatars";
 import { BaseLayout, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
+import { pathEscapeSegments } from "../page-data";
 
 type D1 = D1Database;
 
@@ -1657,15 +1658,15 @@ function shortRefName(ref: string): string {
 /** git.RefName.RefWebLinkPath (modules/git/ref.go:238-247) — the exact port:
  *  branches/tags prefix their segment, a valid object id prefixes "commit",
  *  ANY other ref spelling (e.g. a bare PR head branch name) carries NO type
- *  and returns the empty string (the link composes "/src/" bare). */
+ *  and returns the empty string (the link composes "/src/" bare). The name
+ *  escapes through util.PathEscapeSegments (ref.go:247 → the landed
+ *  `pathEscapeSegments` port), NOT encodeURIComponent: PathEscape keeps the
+ *  segment-legal `$&+:=@` and escapes the divergent set `!'()*` per segment
+ *  while "/" survives as the separator — the inverse class of
+ *  encodeURIComponent on exactly the characters git refs legally carry. */
 function refWebLinkPath(ref: string): string {
-  const escapeSegments = (name: string): string =>
-    name
-      .split("/")
-      .map((segment) => encodeURIComponent(segment))
-      .join("/");
-  if (ref.startsWith("refs/heads/")) return `branch/${escapeSegments(ref.slice("refs/heads/".length))}`;
-  if (ref.startsWith("refs/tags/")) return `tag/${escapeSegments(ref.slice("refs/tags/".length))}`;
+  if (ref.startsWith("refs/heads/")) return `branch/${pathEscapeSegments(ref.slice("refs/heads/".length))}`;
+  if (ref.startsWith("refs/tags/")) return `tag/${pathEscapeSegments(ref.slice("refs/tags/".length))}`;
   if (/^[0-9a-f]{40,64}$/.test(ref)) return `commit/${ref}`; // IsStringValidObjectID
   return "";
 }

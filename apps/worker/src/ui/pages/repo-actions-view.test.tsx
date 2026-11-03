@@ -797,6 +797,26 @@ describe("the ViewResponse JSON (POST — pinned against view.go's field list)",
     expect(body.state.run.commit.branch.isDeleted).toBe(false);
   });
 
+  it("the ref link escapes per util.PathEscapeSegments, NOT encodeURIComponent (ref.go:243-247)", async () => {
+    await enableActions();
+    // The divergent character classes, both directions, on the two ref
+    // families the view links: `$` is a segment-legal char url.PathEscape
+    // KEEPS (encodeURIComponent escaped it), `! ( ) *` are the divergent set
+    // PathEscape ESCAPES per segment (encodeURIComponent kept them), and "/"
+    // survives as the separator (PathEscapeSegments escapes each segment).
+    const seeded = await seedRun(1, { ref: "refs/heads/feat$ure/a!b(c)*" });
+    const res = await postJson(`/alice/demo/actions/runs/${seeded.run.id}`, 1, {});
+    const body = await res.json<ViewResponse>();
+    expect(body.state.run.commit.branch.name).toBe("feat$ure/a!b(c)*");
+    expect(body.state.run.commit.branch.link).toBe(`/alice/demo/src/branch/feat$ure/a%21b%28c%29%2A`);
+    // the tag arm shares the port (shortRefName + RefWebLinkPath)
+    const tag = await seedRun(2, { ref: "refs/tags/v1!2(x)" });
+    const tagRes = await postJson(`/alice/demo/actions/runs/${tag.run.id}`, 1, {});
+    const tagBody = await tagRes.json<ViewResponse>();
+    expect(tagBody.state.run.commit.branch.name).toBe("v1!2(x)");
+    expect(tagBody.state.run.commit.branch.link).toBe(`/alice/demo/src/tag/v1%212%28x%29`);
+  });
+
   // --- the arm-3 lookup (view.go:436-453 — the ⑲A7 row) ----------------------
 
   /** Seed one PR row pair (the join the arm-3 lookup rides). */

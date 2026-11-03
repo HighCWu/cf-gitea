@@ -320,6 +320,17 @@ describe("encodeContentDisposition (content_disposition.go + mime.FormatMediaTyp
     expect(encodeContentDisposition("inline", "a\tb.txt")).toBe('inline; filename="a\tb.txt"');
     expect(encodeContentDisposition("attachment", "trace.log")).toBe("attachment; filename=trace.log");
   });
+
+  it("quotes { } like Go's isTokenChar bitmap (printable non-tspecial is NOT token, go1.25.1 probe)", () => {
+    // Go mime/grammar.go admits exactly alnum + !#$%&'*+-.^_`|~ — the
+    // printable non-tspecials { } are NOT token chars, so a brace-bearing
+    // name takes the quoted-string arm (a printable-minus-tspecial test
+    // wrongly emits it token-raw).
+    expect(encodeContentDisposition("attachment", "a{b}.txt")).toBe('attachment; filename="a{b}.txt"');
+    expect(encodeContentDisposition("inline", "{leading}.bin")).toBe('inline; filename="{leading}.bin"');
+    // the bitmap's adjoining specials stay token-raw
+    expect(encodeContentDisposition("attachment", "a|b~c^d_e$f.txt")).toBe("attachment; filename=a|b~c^d_e$f.txt");
+  });
 });
 
 describe("goPathBase (Go path.Base port for the serve sites)", () => {

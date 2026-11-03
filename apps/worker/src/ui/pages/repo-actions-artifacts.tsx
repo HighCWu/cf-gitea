@@ -102,6 +102,7 @@ import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { pathEscapeSegments } from "../page-data";
 import { pathEscape } from "../../api/services/releases";
+import { encodeContentDisposition } from "../../web/attachments-serving";
 
 type D1 = D1Database;
 
@@ -567,87 +568,18 @@ export function artifactPreviewContentType(filename: string, sniffed: string): s
   return sniffed;
 }
 
-/** getSafeName (content_disposition.go:25-36): non-printable/non-ASCII runes
- *  (tab kept) mask to '_'; the flag decides the filename* twin. */
-function getSafeName(filename: string): { safe: string; needsEncoding: boolean } {
-  let safe = "";
-  let needsEncoding = false;
-  for (const char of filename) {
-    const code = char.codePointAt(0) ?? 0;
-    if ((code < 0x20 || code > 0x7e) && code !== 0x09) {
-      needsEncoding = true;
-      safe += "_";
-    } else {
-      safe += char;
-    }
-  }
-  return { safe, needsEncoding };
-}
-
-/** isTSpecial (mime/grammar.go): `()<>@,;:\"/[]?=`. */
-function isTSpecial(char: string): boolean {
-  return `()<>@,;:\\"/[]?=`.includes(char);
-}
-
-/** mime.FormatMediaType's one-parameter shape over "filename" (mime/
- *  mediatype.go): token values ride raw, everything else quotes with `"`
- *  and `\` backslash-escaped. The token set is Go's RFC 2045 isTokenChar
- *  bitmap (alnum + `!#$%&'*+-.^_`|~`) — `{ }` are printable non-tspecials
- *  yet NOT token chars, so they still quote. Go 1.25.1 probe truth table:
- *  `a b.txt` → `"a b.txt"`, `back\slash{x}.bin` → `"back\\slash{x}.bin"`,
- *  `bang!(x)*.txt` → `"bang!(x)*.txt"` (the ( ) tspecials force quoting but
- *  ride raw inside the quotes). */
-function formatMediaTypeFilename(kind: string, value: string): string {
-  if (/^[A-Za-z0-9!#$%&'*+.^_`|~]+$/.test(value)) return `${kind}; filename=${value}`;
-  return `${kind}; filename="${value.replace(/["\\]/g, "\\$&")}"`;
-}
-
-/** The RFC 2231 §4/§7 extended-value escaper (mediatype.go's needEnc arm):
- *  percent-encode space/controls, 0x7f+, and the attribute-reserved
- *  `*'%"` + tspecials; everything else rides raw (one %XX per UTF-8 byte,
- *  uppercase hex, Go's len/value[index] walk). This is NEITHER class of
- *  url.PathEscape (`!` PathEscape-escapes and RFC 2231 keeps it; `@` the
- *  other way) NOR encodeURIComponent (the inverse on `!'()*` vs `$&+:;=@`):
- *  Go 1.25.1 probe — `résumé$(file)*.log` →
- *  `r%C3%A9sum%C3%A9$%28file%29%2A.log` ($ kept, ()* escaped). */
-function rfc2231Escape(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let out = "";
-  for (const byte of bytes) {
-    const char = String.fromCharCode(byte);
-    if (byte <= 0x20 || byte >= 0x7f || `*'%`.includes(char) || isTSpecial(char)) {
-      out += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
-    } else {
-      out += char;
-    }
-  }
-  return out;
-}
-
-/** encodeContentDisposition (content_disposition.go:47-65): the safe-name
- *  form, plus the `; filename*=utf-8''…` suffix cut from the raw-name
- *  FormatMediaType shape like upstream's TrimPrefix. The filename* twin
- *  spells the charset LOWERCASE and percent-encodes per the RFC 2231 class
- *  above — encodeURIComponent was byte-divergent here (charset case, and
- *  the `!'()*` vs `$&+:;=@` class inversion). `kind` is the disposition
- *  word — upstream carries it as ContentDispositionType (inline for the
- *  preview content, attachment for the download arms: ServeSetHeaders'
- *  default and the zip-compose set, view.go:1245). */
-function encodeContentDisposition(kind: "inline" | "attachment", filename: string): string {
-  const { safe, needsEncoding } = getSafeName(filename);
-  const base = formatMediaTypeFilename(kind, safe);
-  if (!needsEncoding) return base;
-  return `${base}; filename*=utf-8''${rfc2231Escape(filename)}`;
-}
-
-/** EncodeContentDispositionInline (content_disposition.go:35). */
+/** EncodeContentDispositionInline (content_disposition.go:35) and its
+ *  Attachment twin (content_disposition.go:38) — the Go-parity port (the
+ *  mime.FormatMediaType safe-name + quoted-string forms, the RFC 2231
+ *  filename* escaper, and Go's exact isTokenChar bitmap) lives in the SHARED
+ *  module `web/attachments-serving.ts`; this page folds onto it now that the
+ *  shared bitmap is Go-exact (the `{`/`}` token divergence that kept this
+ *  local copy alive at c28498f is fixed). The export names stay: the
+ *  runs-artifact download module and the differential battery import them. */
 export function encodeContentDispositionInline(filename: string): string {
   return encodeContentDisposition("inline", filename);
 }
 
-/** EncodeContentDispositionAttachment (content_disposition.go:38) — the
- *  download family's twin (the runs-artifact module composes both arms from
- *  it). */
 export function encodeContentDispositionAttachment(filename: string): string {
   return encodeContentDisposition("attachment", filename);
 }
