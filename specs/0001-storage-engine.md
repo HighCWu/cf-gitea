@@ -77,7 +77,122 @@ the vendored `PACK_CACHE` name is renamed in M2 (SPEC-0001a §3 site 11).
 - `leases(lease_token PK, kind, expires_at, payload)`
 
 D1 (defined in 0002/0003, referenced here): `repositories(id, storage_key, refs_version,
-backend='self-hosted', …)`.
+backend='self-hosted', …)` — that one line was §4's whole `repositories`
+record until the ADR-0007 table-alignment census; the as-built record in
+§4.1 below replaces it as the standing description of the D1 row. The
+sketch line stays for the cross-references that cite it (e.g. SPEC-0003
+§3.1's "additions beyond the SPEC-0001 §4 sketch").
+
+### 4.1 The D1 `repositories` row — the as-built record (2026-11-03)
+
+Derived from the ADR-0007 repositories disposition (the audit's §4
+`repository` → `repositories` Tables 1/2, unit GR, upstream pin
+`fc4936884584`; applied by unit GU — upstream cites are exact-line at that
+pin, ours cites are the worktree `schema.ts`). Applied with four cite
+corrections over the staged draft, each re-verified at the pin: `ID` is
+repo.go:154 (draft said :153), `OwnerID` :155 (draft :154), `RepositoryReady`
+iota :146 (draft :145), and the counters' upstream span is repo.go:167-177
+(the draft's stray ":221-222" names the struct's closing brace).
+`repositories` (as-built; SPEC-0003 §3.1's original sketch named
+`id integer`, `name`/`lower_name`, `is_private` — the landed table diverged
+from that sketch; SPEC-0003 §3.1 now carries an as-built note pointing here,
+and THIS block is the record of record):
+
+| column | type / notes (ours, schema.ts) | upstream counterpart (models/repo/repo.go, pin `fc4936884584`) | ground |
+|---|---|---|---|
+| `id` | TEXT pk (schema.ts:33) — the TEXT id-space record is ADR-0007 item 2 (the K11 fact pinned in `3ed025d`); non-upstream shape | `ID int64 pk autoincr` (repo.go:154) | intentional-recorded |
+| `storage_key` | TEXT unique NOT NULL (schema.ts:35), `r_<id>`, immutable across renames; all R2/DO addressing | none (upstream derives paths from owner/name on a local disk) | platform-adapted (SPEC-0001 §3 key layout) |
+| `owner_namespace` | TEXT NOT NULL (schema.ts:37) — the owner's case-folded slug (repos/service.ts:405), kept in lockstep by the rename/transfer service; the git gate's lookup key | `OwnerName string` (repo.go:156; display case, services/repository/create.go:231) | fold of `owner_name` — the folded-value reduction (fold 2 below) |
+| `owner_id` | INTEGER nullable (schema.ts:41) — `users.id`, plain column per the schema conventions | `OwnerID int64 xorm:"UNIQUE(s) index"` (repo.go:155) | parity (nullable-by-ALTER history, ours-looser) |
+| `slug` | TEXT NOT NULL (schema.ts:43) — stored case-FOLDED (repos/service.ts:395,407); with `owner_namespace`, the `UNIQUE(owner_namespace, slug)` create/rename arbitration point (schema.ts:248) | `LowerName string xorm:"UNIQUE(s) INDEX NOT NULL"` (repo.go:158); `Name` (repo.go:159) | fold of `lower_name`; the folded `name` carrier (fold 1 below) |
+| `visibility` | TEXT enum `public\|private` NOT NULL (schema.ts:45); the API `private` render derives from it (api/services/repository.ts:829) | `IsPrivate bool xorm:"INDEX"` (repo.go:186) | intentional-recorded (SPEC-0004 §3 registry shape; the audit's §2.3 TEXT-enum convention) |
+| `default_branch` | TEXT NOT NULL default 'main' (schema.ts:48) | `DefaultBranch string` (repo.go:164) | parity |
+| `is_empty` | BOOLEAN NOT NULL default true (schema.ts:51) | `IsEmpty bool xorm:"INDEX"` (repo.go:187) | parity |
+| `is_archived` | BOOLEAN NOT NULL default false (schema.ts:53) | `IsArchived bool xorm:"INDEX"` (repo.go:188) | parity |
+| `status` | TEXT enum `ready\|creating\|migrating\|broken` NOT NULL default 'ready' (schema.ts:56-58) — mirrors `RepositoryStatus`; upstream 0 = `RepositoryReady` (iota, repo.go:146), so the default value is parity across encodings | `Status RepositoryStatus xorm:"NOT NULL DEFAULT 0"` (repo.go:191) | intentional-recorded (SPEC-0003 §3.1; the §2.3 TEXT-enum convention) |
+| `refs_version` | INTEGER NOT NULL default 0 (schema.ts:60) — the denormalized DO mirror (documented exception to no-duplicated-state, SPEC-0003 §3.1) | none | intentional-recorded + platform arm (SPEC-0001 §4/§5, the edge-cache key, acceptance T4) |
+| `backend` | TEXT NOT NULL default 'self-hosted' (schema.ts:62) | none | intentional-recorded (ADR-0001 D1 adapter routing; SPEC-0001 §4) |
+| `num_issues`/`num_closed_issues`/`num_pulls`/`num_closed_pulls`/`num_milestones`/`num_closed_milestones`/`num_stars`/`num_watches`/`num_forks` | INTEGER NOT NULL default 0 (schema.ts:66-70 + the migrated tallies, e.g. `num_stars` :169) — the SPEC-0005 §3.2 counters + the social tallies (migrations 0027-0061) | repo.go:167-177 (the Num* block; the interleaved `NumOpen*` renders are `xorm:"-"`) | parity |
+| `close_issues_via_commit_in_any_branch` | BOOLEAN (drizzle `mode:"boolean"`) NOT NULL default false (schema.ts:73-77) — storage-equal to upstream bool (the audit's §2.4 same-family rule) | repo.go:209 | parity |
+| `created_at` / `updated_at` | INTEGER unix seconds (`mode:"timestamp"`; schema.ts:79,85); `updated_at` nullable (the ALTER ADD COLUMN non-constant-default constraint, stamped by the writers) | `CreatedUnix`/`UpdatedUnix` (repo.go:218-219) | intentional-recorded — SPEC-0005 §3.2 as-built item 2 names `repositories` in the `*_at` exception |
+| `fork_parent` | TEXT nullable (schema.ts:101; index `repositories_fork_parent_idx` :251) — the source's `repositories.id`; NULL = not a fork (so `is_fork` is derivable and NOT stored); indexed for the fork-list scan | `ForkID int64 xorm:"INDEX"` (repo.go:199) + `IsFork bool` (repo.go:198) | fold of the fork pair — SPEC-0001b §5.2 + the TEXT id family (ADR-0007 item 2) |
+| `is_mirror` | BOOLEAN NOT NULL default false | `IsMirror bool xorm:"INDEX"` (repo.go:189) | parity (SPEC-0009 §3.1) |
+| `original_url` | TEXT nullable (schema.ts:116) — sanitized source URL | `OriginalURL string xorm:"VARCHAR(2048)"` (repo.go:163) | parity (SPEC-0009 §3.1) |
+| `is_template` | BOOLEAN NOT NULL default false | `IsTemplate bool xorm:"INDEX NOT NULL DEFAULT false"` (repo.go:201) | parity (migration 0027) |
+| `size_kb` | INTEGER NOT NULL default 0 (schema.ts:145) — the settled GIT footprint in KiB; upstream `Size` = git + LFS (update.go:110) — the FN-4 sizes leg widens the writer scope | `Size int64 xorm:"NOT NULL DEFAULT 0"` (repo.go:203) | fold at a NARROWER scope; scope parity rides FN-4(c) |
+| indexes | `repositories_owner_slug_uq(owner_namespace, slug)` (schema.ts:248) — the arbitration point; `repositories_fork_parent_idx` (:251); `repositories_owner_id_idx` | upstream: `UNIQUE(s)` over (OwnerID, LowerName) + the field INDEXes (repo.go:153-220) | the fold's index shape (fold 1 below) |
+
+**The fold records** — the dispositions with no prior SPEC text; each
+carries its upstream field line, our schema line, and the SPEC or decision
+ground (the ADR-0007 both-side-cite test):
+
+1. **`slug` folds `lower_name` (+ the `name` carrier), folded at write.**
+   Upstream keeps a display-case `Name` and a case-folded `LowerName`
+   (repo.go:158-159) with `UNIQUE(owner_id, lower_name)` as the arbitration;
+   ours keeps ONE name column, `slug`, stored case-folded
+   (repos/service.ts:395,407) under `UNIQUE(owner_namespace, slug)`
+   (schema.ts:248). Consequences recorded here: (a) no display-case copy
+   exists — the API `name` field renders the folded slug
+   (api/services/repository.ts:819) where upstream renders display case;
+   `name` is therefore a REAL upstream column ours lacks, and FN-4 ports it
+   additively (create/rename stamp display case; the slug copy is the
+   best-effort backfill — display case for existing rows is unrecoverable,
+   accepted and recorded). (b) A separate `lower_name` column is declined —
+   it would duplicate the folded slug (state duplication, AGENTS.md).
+2. **`owner_namespace` folds `owner_name`, folded at write.** Upstream
+   `OwnerName` stores the owner's display-case name
+   (services/repository/create.go:231); ours stores the folded owner slug
+   (repos/service.ts:405, `input.owner.usernameLower`) and keeps it in
+   lockstep through rename/transfer. `full_name` renders
+   `ownerNamespace/slug` (api/services/repository.ts:820). A separate
+   `owner_name` column is declined for the same state-duplication ground.
+   (Display-case owner names are carried by `users.display_name` — the API
+   owner payload renders that today.)
+3. **`is_fork` is derivable, not stored.** `fork_parent` (schema.ts:101) is
+   the single nullable edge: NULL = not a fork. The API `fork` field already
+   derives (`fork: row.forkParent !== null`, api/services/repository.ts:835,
+   matching upstream `Fork: repo.IsFork`, services/convert/repository.go:208).
+   Storing the bool would duplicate the edge.
+4. **`size_kb` covers `size` at a narrower scope.** Upstream's `Size` = git
+   + LFS (update.go:110) with `git_size`/`lfs_size` split out
+   (repo.go:204-205); ours accounts the git footprint only (schema.ts:145).
+   FN-4's sizes leg splits the accounting (adds `git_size`/`lfs_size`) and
+   widens the `size` writer to git+LFS at the SPEC-0014 settle points (the
+   §5 size-observability row, `services/repo-size.ts:146-159`). The KiB unit
+   stays (render divides nothing; upstream divides by 1024 at render,
+   services/convert/repository.go:207).
+
+**The FN-4 port columns — PENDING (recorded 2026-11-03; not yet landed).**
+One additive migration carries all 18 port columns (every add is
+ALTER-legal — constant DEFAULT or NULL; the one index add is a CREATE INDEX;
+no table rebuild): `name`, `description`, `website`, `avatar`,
+`archived_unix`, `default_wiki_branch`, `git_size`, `is_fsck_enabled`,
+`lfs_size`, `num_action_runs`, `num_closed_action_runs`,
+`num_closed_projects`, `num_projects`, `object_format_name`,
+`original_service_type`, `template_id` (+index), `topics`, `trust_model`.
+Shapes and writer seams per the audit §4 repositories Tables 1/2 (the
+disposition matrix is the source of truth; not re-derived here). Real
+backfills ride the migration: topics ← repo_topics recount (the upstream
+`syncTopicsInRepository` shape, models/repo/topic.go:340-352);
+description/website ← repo_settings rows (today's value source,
+api/services/repository.ts:821/:865); name ← slug copy (display case
+unrecoverable for existing rows — the limitation is recorded, fold 1).
+The FN-4 port unit updates THIS section's table with the landed columns
+when the migration lands (the SPEC-0003 §3.1 FN-6 as-built pattern: the
+landed annotation goes into the SPEC, the derivation stays in the audit).
+
+**schema.ts comment cite errata** (for the FN-4 port unit — schema.ts was
+NOT edited by this record; it is sibling-owned):
+
+- CONFIRMED: the `isTemplate` comment (schema.ts:122) cites
+  `models/repo/repo.go:190`; the actual field line at the pin is repo.go:201.
+- DISPROVEN — do NOT "fix": the audit's finding 3 claims the `status`
+  comment's `repo.go:146-149` should be `:144-149` with `RepositoryReady`
+  at `:145`. Exact-line verification at the pin shows `RepositoryReady =
+  iota` at repo.go:146 and `RepositoryBroken` at :149 — the schema.ts
+  comment (`models/repo/repo.go:146-149`, schema.ts:55) is already exact.
+  The erratum's ":144-149" is the const block's leading comment line
+  (:144) plus `const (` (:145) — no value lines.
 
 ## 5. Receive and serve paths
 

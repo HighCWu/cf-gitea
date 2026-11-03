@@ -480,6 +480,24 @@ the last good tip, which the next run force-overwrites.
 | `refs_version` | integer — **denormalized mirror** of the authoritative DO `meta.refs_version`, updated by the Worker after each `finalizeReceive`; used only for API ETags/observability, never for cache keying (those read the DO) — documented exception to "do not duplicate state" (AGENTS.md) because the DO cannot write D1 |
 | timestamps | `created_at`, `updated_at` |
 
+**As-built note (2026-11-03, the ADR-0007 repositories disposition) on the
+three sketch cells above that the landed table outgrew.** The sketch stands
+unedited as the original design record; the as-built record of record is
+SPEC-0001 §4.1 (the `repositories` column table with both-side cites).
+(a) `id` is TEXT, not an integer autoincrement — the TEXT id family,
+ADR-0007 item 2 (the K11 fact pinned in `3ed025d`). (b) The name pair is
+ONE column, `slug` (`schema.ts:43`), stored case-folded at write
+(`repos/service.ts:395,407`) under the `UNIQUE(owner_namespace, slug)`
+arbitration (`schema.ts:248`) — no display-case `name` column exists today
+(the fold is recorded at SPEC-0001 §4.1 fold 1; the FN-4 port adds `name`
+additively with a slug-copy backfill, display case for existing rows being
+unrecoverable). (c) Visibility is the TEXT enum `public|private`
+(`visibility`, `schema.ts:45`; the SPEC-0004 §3 registry shape; the audit's
+§2.3 TEXT-enum convention), not an `is_private` bool — upstream `IsPrivate`
+(`models/repo/repo.go:186`) is its counterpart. The other rows landed as
+sketched, including the `status` row's upstream cite (`repo.go:146-149`,
+exact at the pin).
+
 `repo_redirects`: `id PK`, `owner_id`, `lower_name`, `redirect_repo_id`,
 `UNIQUE(owner_id, lower_name)` — port of upstream `repo_redirect`
 (`models/repo/redirect.go:27-33`).
