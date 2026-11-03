@@ -34,11 +34,12 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { ActionType } from "../api/services/activity-feeds";
 import { createCommitStatus } from "../api/services/commit-status";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { ZERO_OID, branchRef, pullHeadRef } from "../api/services/engine";
 import { stampAutoMergeCommit } from "../api/services/pull-engine";
-import { comments, issueDependencies, PRStatus, protectedBranches, pullAutoMerges, pullRequests, users } from "../db/schema";
+import { actions, comments, issueDependencies, PRStatus, protectedBranches, pullAutoMerges, pullRequests, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "./branch-protection";
@@ -228,6 +229,15 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     expect(after.issue.isClosed).toBe(true);
     const rows = await d1().select().from(comments).where(eq(comments.issueId, found.issue.id)).all();
     expect(rows.some((row) => row.type === CommentType.MergePull)).toBe(true);
+    // The feed action rides the AUTO flavor: ActionAutoMergePullRequest (27,
+    // feed/notifier.go:279-289) — the manual route writes the plain 11
+    // (:271-281); same row shape otherwise (Content "index|title").
+    const feedRows = await d1().select().from(actions).where(eq(actions.repoId, repoId)).all();
+    const mergeFeed = feedRows.find((row) => row.opType === ActionType.AutoMergePullRequest);
+    expect(mergeFeed).toBeDefined();
+    expect(mergeFeed!.actUserId).toBe(alice.id);
+    expect(mergeFeed!.content).toBe(`${found.issue.index}|feat: greenpr`);
+    expect(feedRows.some((row) => row.opType === ActionType.MergePullRequest)).toBe(false);
   });
 
   it("FN-7: the winner arm's landing stamps the schedule's merged_commit_id (merge.go:265-274) before consuming it", async () => {

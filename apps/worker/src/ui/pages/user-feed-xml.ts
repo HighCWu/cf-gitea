@@ -390,6 +390,14 @@ export function feedItemFromActivity(
       titleExtra = `merged pull request <a href="${esc(pullLink)}">${esc(shortRepoPath)}#${esc(rawIndex)}</a>`;
       break;
     }
+    case "auto_merge_pull_request": {
+      // convert.go:123-129 — the auto-merge flavor's own locale arm
+      // ("action.auto_merge_pull_request"), same link rescue + arg shape as
+      // the plain merge above; the wire enum gains it with the FN-7 store.
+      if (link === "#") link = pullLink;
+      titleExtra = `auto merged pull request <a href="${esc(pullLink)}">${esc(shortRepoPath)}#${esc(rawIndex)}</a>`;
+      break;
+    }
     case "close_issue": {
       if (link === "#") link = issueLink;
       titleExtra = `closed issue <a href="${esc(issueLink)}">${esc(shortRepoPath)}#${esc(rawIndex)}</a>`;
@@ -459,6 +467,8 @@ export function feedItemFromActivity(
       break;
     }
     case "merge_pull_request":
+    case "auto_merge_pull_request":
+      // convert.go:234 — the description arm covers BOTH merge flavors.
       description = infos[1] ?? "";
       break;
     case "close_issue":

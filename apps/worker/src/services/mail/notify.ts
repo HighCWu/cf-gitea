@@ -31,8 +31,9 @@
  *     recipient is NOT the participants resolution, SPEC §12). Slice six
  *     adds `MergePullRequest` (:138-146 — the winning-merge mail over the
  *     same funnel, SPEC §12.4); its `AutoMergePullRequest` twin (:148-156)
- *     stays STAGED — unreachable while no scheduled-merge store exists
- *     (SPEC §1.3). Slice eight lands the REVIEW family's three receivers
+ *     lands with FN-7's scheduled-merge store (the scheduled automerge's
+ *     mail — the arms split ONLY on `ForceDoerNotification`, mail_issue.go:
+ *     185; see the twin's doc below). Slice eight lands the REVIEW family's three receivers
  *     (SPEC §14.6 — the review-service extraction's firing points):
  *     `PullRequestReview` (:98-111, MailParticipantsComment over the
  *     type-22 comment), `PullRequestCodeComment` (:113-117,
@@ -174,6 +175,7 @@ export type MailNotifyEvent =
   | "NewPullRequest"
   | "IssueChangeAssignee"
   | "MergePullRequest"
+  | "AutoMergePullRequest"
   | "PullRequestReview"
   | "PullRequestCodeComment"
   | "PullRequestReviewRequest"
@@ -564,6 +566,17 @@ export async function resolveIssueMailRecipients(
      *  issue-unwatchers do NOT (the unwatcher block joins visited after
      *  the mention batch, :104-109). */
     mentions?: UserRow[];
+    /** `mailComment.ForceDoerNotification` (mail_issue.go:44) — the
+     *  auto-merge flavor's bypass of the doer exclusion (:94-97):
+     *  `if comment.Doer.EmailNotificationsPreference != AndYourOwn &&
+     *  !comment.ForceDoerNotification { visited.Add(comment.Doer.ID) }` —
+     *  forced, the doer is NEVER seeded into visited, so wherever they
+     *  appear in a recipient source (poster/assignee/participant/issue
+     *  watcher/repo watcher) they receive the mail like any other
+     *  participant. The batch preference filter (:135-146) still applies —
+     *  a disabled doer stays silent; the forced arm only lifts the
+     *  visited-seed exclusion. */
+    forceDoerNotification?: boolean;
   },
 ): Promise<UserRow[]> {
   const db = drizzle(d1);
@@ -710,7 +723,11 @@ export async function resolveIssueMailRecipients(
   const doerPref = (
     await db.select().from(userSettings).where(eq(userSettings.userId, input.doer.id)).get()
   )?.emailNotificationsPreference ?? "enabled";
-  if (doerPref !== "andyourown") {
+  // The doer exclusion (mail_issue.go:94-97) — skipped entirely under the
+  // auto-merge flavor's ForceDoerNotification (the forced arm never seeds
+  // the doer into visited).
+  const doerExcluded = doerPref !== "andyourown" && input.forceDoerNotification !== true;
+  if (doerExcluded) {
     visited.add(input.doer.id);
   }
 
@@ -721,7 +738,11 @@ export async function resolveIssueMailRecipients(
       // ignorers + the doer only); the explicit-unwatcher block joins
       // visited AFTER the mention batch (:104-109), so a mention who is
       // ONLY an explicit unwatcher still receives the mention mail.
-      if (!mentionIdSet.has(id) || ignorerIds.has(id) || (id === input.doer.id && doerPref !== "andyourown")) {
+      if (
+        !mentionIdSet.has(id) ||
+        ignorerIds.has(id) ||
+        (id === input.doer.id && doerExcluded)
+      ) {
         continue;
       }
     }
@@ -948,6 +969,11 @@ interface NotifyIssueArmInput {
   /** The pull-create arm's repo-watcher WIP-gate exception (the
    *  resolveIssueMailRecipients flag, mail_issue.go:67-76). */
   pullCreate?: boolean;
+  /** `mailComment.ForceDoerNotification` (mail_issue.go:44/:191) — the
+   *  AutoMergePullRequest arm's doer-exclusion bypass (:94-97); see the
+   *  resolution flag's doc. Only the scheduled-auto-merge receiver sets it
+   *  (upstream computes it from the action type, mail_issue.go:185). */
+  forceDoerNotification?: boolean;
   /** `.Issue.PullRequest.BaseBranch` — the merge line's %[3]s locale arg
    *  (default.tmpl's merge branch; the merge arm passes the PR row's
    *  baseBranch, every other arm leaves it unset). */
@@ -1083,6 +1109,7 @@ async function notifyIssueArm(
       repo: pair.repo,
       doer: input.doer,
       pullCreate: input.pullCreate,
+      forceDoerNotification: input.forceDoerNotification,
       mentions: input.mentions,
     }));
   if (recipients.length === 0) return { outcome: "no-recipients" };
@@ -1423,13 +1450,7 @@ export async function notifyIssueTitleChanged(
  * watchers upstream-shaped, mail_issue.go:67-76; our merge route refuses WIP
  * anyway, the same unreachable-but-faithful posture). Dedupe
  * `pull-merge:<issueId>:merge:<unixMilli>:<recipientId>` — the ms discipline
- * (the issue-status family). The sibling `AutoMergePullRequest` receiver
- * (notify.go:148-156) is STAGED, not landed: its only differences are the
- * ActionAutoMergePullRequest constant (same "merge" template name,
- * :235-236), the same `/merge/` Message-ID extra and
- * `ForceDoerNotification` (mail_issue.go:191 — the merger receives their
- * own merge mail bypassing the :94-97 doer exclusion); none is reachable
- * while this backend has no scheduled-merge store (see SPEC §1.3).
+ * (the issue-status family).
  */
 export async function notifyMergePullRequest(
   env: MailNotifyEnv,
@@ -1445,6 +1466,55 @@ export async function notifyMergePullRequest(
       content: "",
       dedupePrefix: "pull-merge",
       baseBranch: input.baseBranch,
+    },
+    options,
+  );
+}
+
+/**
+ * The `AutoMergePullRequest` arm's mail (notify.go:148-156 → MailParticipants
+ * with ActionAutoMergePullRequest, doer = the scheduled merge's user, mentions
+ * nil) — upstream fires it from the same `markAsMergedPostProcess` dispatch
+ * when `wasAutoMerged` holds (merge.go:403-405; ours keys the same computed
+ * flavor at the pull-engine emit site). The FLAVOR SPLIT, pinned at the
+ * upstream receivers + MailParticipants:
+ *   - SAME mail bytes: actionToTemplate maps both constants to the name
+ *     "merge" (mail_issue_common.go:235-236) → the identical template
+ *     (no `mail/repo/pull/merge` file exists at the pin — the fallback
+ *     chain lands on issue/default, :237-247), the same emptied content
+ *     (mail_issue.go:184 covers both), the same `/merge/<unixMilli>`
+ *     Message-ID extra (mail_issue_common.go:296-297), the same
+ *     "Re: "-prefixed fallback subject and the same merge line over the
+ *     base branch — so the subject/body DELTA between the arms is ZERO
+ *     upstream, not a reworded mail;
+ *   - SAME recipient pool (the participants resolution — poster, assignees,
+ *     participants, issue watchers, repo watchers, with the same WIP gate
+ *     and the same batch preference filter);
+ *   - the ONE recipient DELTA: `ForceDoerNotification` is computed from the
+ *     action type (mail_issue.go:185, `opType == ActionAutoMergePullRequest`)
+ *     and lifts the doer exclusion (:94-97) — the scheduled merge's user
+ *     receives their own merge mail whenever they appear in a recipient
+ *     source (preference filters still apply, :135-146), where the manual
+ *     merger never does (unless andyourown).
+ * Dedupe rides the same `pull-merge:<issueId>:merge:<unixMilli>:
+ * <recipientId>` family (the ms distinguishes events; the flavors compose
+ * identically, so no family split is owed).
+ */
+export async function notifyAutoMergePullRequest(
+  env: MailNotifyEnv,
+  input: { issue: IssueMailRow; doer: UserRow; baseBranch: string },
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      actionName: "merge",
+      content: "",
+      dedupePrefix: "pull-merge",
+      baseBranch: input.baseBranch,
+      forceDoerNotification: true,
     },
     options,
   );

@@ -430,6 +430,27 @@ describe("the feed link escaper pins (convert.go:38-43 url.PathEscape)", () => {
     expect(rss).not.toContain("%24");
   });
 
+  it("the auto_merge_pull_request flavor renders its own title arm and never hits the unknown-op throw (convert.go:123-129, the FN-7 store's feed flavor)", async () => {
+    await seedBaseFixtures();
+    // Content "9|scheduled merge" — infos[0] the pull index, infos[1] the
+    // description arm's excerpt (convert.go:234 covers BOTH merge flavors).
+    await insertAction(ActionType.AutoMergePullRequest, { content: "9|scheduled merge", createdAt: T0 });
+    const data = await loadUserFeedData(env.DB, aliceSubject, anonymous, ORIGIN, new URLSearchParams());
+    expect(data.items).toHaveLength(1);
+    const item = data.items[0];
+    // The flavor's own locale arm: "auto merged pull request" over the pull
+    // link (the plain 11 renders "merged pull request" — the split is real).
+    // The item title carries the RAW anchor HTML; the envelope XML-escapes.
+    expect(item?.title).toContain("auto merged pull request");
+    expect(item?.title).toContain(`<a href="${ORIGIN}/alice/demo/pulls/9">alice/demo#9</a>`);
+    expect(item?.link).toBe(`${ORIGIN}/alice/demo/pulls/9`);
+    expect(item?.description).toBe("scheduled merge");
+    // The envelope renders without the default arm's "unknown action type"
+    // throw and carries the flavored title.
+    const rss = renderUserFeedRss(data);
+    expect(rss).toContain("auto merged pull request");
+  });
+
   it("repoHref's owner/name segments ride the gated charset — encodeURIComponent ≡ url.PathEscape there", () => {
     // GetRepoAbsoluteLink (activities/action.go:286-288) spells
     // url.PathEscape per segment; our segments only ever come out of the

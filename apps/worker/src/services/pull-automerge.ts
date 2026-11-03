@@ -45,9 +45,11 @@
  *   branch protections failed → skip; an open dependency remains
  *   (CheckPullMergeable's final arm, check.go:219-222) → skip; otherwise
  *   MERGE with the row's style/message/delete-branch, DELETE the row,
- *   re-issue the merge webhook + feed action (the landed merge route's emit
- *   arms), and run the flagged delete-branch after merge
- *   (ShouldDeleteBranchAfterMerge's best-effort tail).
+ *   re-issue the merge webhook (the landed merge route's emit arm — the
+ *   webhook payload is flavor-uniform upstream, webhook/notifier.go:684-687)
+ *   + the AUTO-merge feed action (ActionAutoMergePullRequest, feed/notifier.go:
+ *   279-289 — the manual route writes the plain 11), and run the flagged
+ *   delete-branch after merge (ShouldDeleteBranchAfterMerge's best-effort tail).
  *
  * A skip LEAVES the row scheduled (upstream's errSkipAutoMerge) — the next
  * tick re-probes. Only the closed/merged arm and the successful merge
@@ -693,7 +695,14 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
       await recordAction(d1, {
         actUserId: scheduled.doerId,
         repoId: pair.repo.id,
-        opType: ActionType.MergePullRequest,
+        // The auto-merge FLAVOR: upstream's feed notifier splits the arms —
+        // `AutoMergePullRequest` writes ActionAutoMergePullRequest (27,
+        // services/feed/notifier.go:279-289) where the manual route's
+        // webhook-derived draft writes ActionMergePullRequest (11,
+        // :271-281). Same action-row shape otherwise (ActUser/Content
+        // "index|title"/RepoID/IsPrivate — :280-288). The wire name rides
+        // ActionType.String's "auto_merge_pull_request" (action.go:121-122).
+        opType: ActionType.AutoMergePullRequest,
         isPrivate: pair.repo.visibility === "private",
         content: `${merged.issue.index}|${merged.issue.title}`,
       });

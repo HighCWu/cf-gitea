@@ -54,6 +54,7 @@ import {
 } from "./inbound";
 import { isMailOutboxMessage, processMailOutbox, type MailOutboxMessage } from "./outbox";
 import {
+  notifyAutoMergePullRequest,
   notifyIssueAssigneeChanged,
   notifyIssueComment,
   notifyIssueCreated,
@@ -1030,8 +1031,11 @@ describe("notifyIssueAssigneeChanged — the IssueChangeAssignee receiver", () =
 // ---------------------------------------------------------------------------
 // The MergePullRequest arm — the winning-merge mail (services/pull/merge.go:
 // 385-412 markAsMergedPostProcess → notify.go:138-146 → MailParticipants with
-// ActionMergePullRequest). The AutoMergePullRequest twin is STAGED
-// (unreachable — no scheduled-merge store; SPEC §1.3).
+// ActionMergePullRequest) — and the AutoMergePullRequest twin (notify.go:
+// 148-156, landed with FN-7's scheduled-merge store): the arms split ONLY on
+// ForceDoerNotification (mail_issue.go:185) — the template/name/Message-ID/
+// subject bytes are IDENTICAL (actionToTemplate maps both constants to
+// "merge", mail_issue_common.go:235-236).
 // ---------------------------------------------------------------------------
 
 describe("notifyMergePullRequest — the MergePullRequest receiver", () => {
@@ -1101,6 +1105,105 @@ describe("notifyMergePullRequest — the MergePullRequest receiver", () => {
     expect((await notifyMergePullRequest(off, { issue, doer, baseBranch: "main" }, {})).outcome).toBe("disabled");
     const malformed = armedEnv({ MAIL_FROM: "no address here" });
     expect((await notifyMergePullRequest(malformed, { issue, doer, baseBranch: "main" }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+describe("notifyAutoMergePullRequest — the AutoMergePullRequest receiver (notify.go:148-156, the FN-7 store's flavor)", () => {
+  /** A PR issue over the seeded fixture (the merge describe's seedPullIssue
+   *  twin — describe-local helpers don't leak across). */
+  async function seedPullIssue(title = "Merge me"): Promise<IssueRow> {
+    const issue = await seedIssue(title);
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    return (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+  }
+
+  /** seedPullIssue + the doer IN a recipient source (a repo watcher) — the
+   *  force flag only matters when the doer appears in one (upstream: the
+   *  visited-seed exclusion is the only mechanism the flag lifts;
+   *  mail_issue.go:94-97). */
+  async function seedPullIssueWithDoerWatcher(title = "Merge me"): Promise<IssueRow> {
+    const issue = await seedPullIssue(title);
+    await db().insert(repoWatchers).values({ repoId: REPO_ID, userId: 60 });
+    return issue;
+  }
+
+  it("the flavor split: the manual arm excludes the doer-in-source, the auto arm FORCES them in (mail_issue.go:185 → :94-97 bypass)", async () => {
+    const issue = await seedPullIssueWithDoerWatcher();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    // Manual: the doer exclusion (:94-97) — 60 is a repo watcher source but
+    // their preference ('enabled' default) is not andyourown, so visited
+    // drops them.
+    await notifyMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, {});
+    let rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).not.toContain("doer@example.com");
+    expect(rows.length).toBeGreaterThan(0);
+    // Clear the manual arm's rows so the auto arm's landing reads alone.
+    await db().delete(emailOutbox);
+    // Auto: ForceDoerNotification — 60 never joins visited and receives the
+    // mail like any other participant.
+    const outcome = await notifyAutoMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, {});
+    expect(outcome.outcome).toBe("enqueued");
+    rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toContain("doer@example.com");
+    // Every OTHER recipient is unchanged — the flag lifts ONLY the doer
+    // exclusion (the participants pool is the same resolution).
+    expect(rows.map((row) => row.toAddr)).toContain("rw@example.com");
+    expect(rows.map((row) => row.toAddr)).toContain("poster@example.com");
+    expect(rows.map((row) => row.toAddr)).not.toContain("un@example.com");
+  });
+
+  it("the auto arm's mail bytes are IDENTICAL to the manual arm's — same Re: subject, /merge/ Message-ID, merge line, emptied content, pull-merge dedupe family", async () => {
+    const issue = await seedPullIssueWithDoerWatcher();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const now = new Date(1_700_000_099_123);
+    const outcome = await notifyAutoMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, { now });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    for (const row of rows) {
+      expect(row.subject).toBe(`Re: [repoowner/repo] ${issue.title} (#${issue.index})`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // mail_issue_common.go:296-297 — the /merge/ extra covers BOTH
+      // constants; no flavor delta in the Message-ID.
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/merge/${now.getTime()}@mail.example>`);
+      // actionToTemplate maps ActionAutoMergePullRequest to the SAME "merge"
+      // name (:235-236) — the merge line is byte-identical, not reworded.
+      expect(row.bodyHtml).toContain(`<b>doer</b> merged #${issue.index} into main.`);
+      expect(row.bodyHtml).not.toContain("<p>body</p>");
+      expect(row.dedupeKey).toMatch(new RegExp(`^pull-merge:${issue.id}:merge:${now.getTime()}:\\d+$`));
+    }
+    // The forced doer's row carries the same compose as everyone else's.
+    const doerRow = rows.find((row) => row.toAddr === "doer@example.com")!;
+    expect(doerRow.bodyHtml).toContain(`<b>doer</b> merged #${issue.index} into main.`);
+  });
+
+  it("a disabled doer stays silent even forced — ForceDoerNotification lifts only the visited seed, never the batch preference filter (mail_issue.go:135-146)", async () => {
+    const issue = await seedPullIssueWithDoerWatcher();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await db().insert(userSettings).values({ userId: 60, emailNotificationsPreference: "disabled" });
+    const outcome = await notifyAutoMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, {});
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).not.toContain("doer@example.com");
+    expect(rows.length).toBeGreaterThan(0);
+  });
+
+  it("the WIP gate outranks the force for the watcher source; MAIL off / malformed degrade like the manual arm", async () => {
+    const issue = await seedPullIssueWithDoerWatcher("WIP: auto merge me");
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyAutoMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, {});
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).not.toContain("rw@example.com"); // the WIP repo-watcher drop
+    // The doer rode ONLY the watcher source, which the WIP gate emptied —
+    // upstream's force lifts the visited seed, it never ADDS a source, so
+    // a doer outside every surviving source gets nothing (mail_issue.go:
+    // 43-76 vs :94-97).
+    expect(rows.map((row) => row.toAddr)).not.toContain("doer@example.com");
+    expect(rows.map((row) => row.toAddr)).toContain("poster@example.com");
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyAutoMergePullRequest(off, { issue, doer, baseBranch: "main" }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyAutoMergePullRequest(malformed, { issue, doer, baseBranch: "main" }, {})).outcome).toBe("misconfigured");
   });
 });
 
@@ -1215,6 +1318,45 @@ describe("mergePullRequest's winning-merge emit — the real merge flow (pull-en
       now: new Date(1_700_000_123_456),
     });
     expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+  });
+
+  it("wasAutoMerged dispatches the AUTO arm through the merge flow — the doer-in-source is forced past the exclusion (markAsMergedPostProcess merge.go:403-405)", async () => {
+    const { issue, pr, pair, mainTip } = await seedMergablePull("512", "repoowner", "merge-mail-c");
+    // The doer rides a recipient source (a repo watcher) — the only situation
+    // the flavor is observable in.
+    await db().insert(repoWatchers).values({ repoId: "512", userId: 60 });
+    const now = new Date(1_700_000_123_456);
+    await mergePullRequest(mergeContext(armedBindings()), pair, issue, pr, {
+      style: "manually-merged",
+      message: "",
+      deleteBranchAfterMerge: false,
+      mergeCommitId: mainTip,
+      wasAutoMerged: true, // the consumer's flag (automerge.go:262)
+      doerId: 60,
+      now,
+    });
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toContain("doer@example.com"); // ForceDoerNotification
+    expect(rows.map((row) => row.toAddr)).toContain("rw@example.com");
+    for (const row of rows) {
+      expect(row.dedupeKey).toMatch(new RegExp(`^pull-merge:${issue.id}:merge:${now.getTime()}:\\d+$`));
+    }
+  });
+
+  it("a MANUAL landing keeps the plain arm — the same doer-in-source stays excluded (merge.go:406)", async () => {
+    const { issue, pr, pair, mainTip } = await seedMergablePull("513", "repoowner", "merge-mail-d");
+    await db().insert(repoWatchers).values({ repoId: "513", userId: 60 });
+    await mergePullRequest(mergeContext(armedBindings()), pair, issue, pr, {
+      style: "manually-merged",
+      message: "",
+      deleteBranchAfterMerge: false,
+      mergeCommitId: mainTip,
+      doerId: 60,
+      now: new Date(1_700_000_123_456),
+    });
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).not.toContain("doer@example.com");
+    expect(rows.map((row) => row.toAddr)).toContain("rw@example.com");
   });
 });
 

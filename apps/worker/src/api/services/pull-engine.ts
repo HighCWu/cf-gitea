@@ -32,7 +32,7 @@ import { IssuesService } from "../../issues/service";
 import { issueNoDependenciesLeft } from "./issues";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
-import { notifyMergePullRequest } from "../../services/mail/notify";
+import { notifyAutoMergePullRequest, notifyMergePullRequest } from "../../services/mail/notify";
 import { setIssueReadBy } from "../../services/mentions/carrier";
 import { carryLooseRefs, type CarrySource, type CarryTarget } from "../../repos/carry";
 import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
@@ -703,7 +703,11 @@ export async function mergePullRequest(
     // the same two-statement order upstream runs across its recordMergeIntent
     // and MarkAsMerged transactions; a crash between them leaves the stamped
     // row, which the consumer's first ladder arm (already-merged) reaps.
-    if (opts.wasAutoMerged === true && commitOid !== null) {
+    // This SAME condition is the computed wasAutoMerged flavor upstream
+    // hands markAsMergedPostProcess (merge.go:863 reads it back off the
+    // stamped row) — the MAIL arm below keys on it (unit MAILFLAVOR).
+    const wasAutoMerged = opts.wasAutoMerged === true && commitOid !== null;
+    if (wasAutoMerged) {
       await stampAutoMergeCommit(c.env.DB, issue.id, commitOid);
     }
     // The scheduled auto merge's cleanup (services/pull/merge.go:827-837):
@@ -716,11 +720,13 @@ export async function mergePullRequest(
     // pure redirect into MergePullRequest (services/webhook/notifier.go
     // :684-687 — same ToPayloadPullRequest payload @715 with HookIssueClosed
     // @718, same secret pipeline), so the merged webhook needs no stamp read —
-    // the non-port record (unit TAILS2, 2026-11-04); the flavor split lives in
-    // the non-webhook notifiers only (mail notify.go:148-156
-    // ActionAutoMergePullRequest — STAGED per the services/mail/notify.ts
-    // merge-arm doc; feed notifier.go:279-289; the actions notifier redirects
-    // like the webhook, notifier.go:674-677). The delete is composed directly
+    // the non-port record (unit TAILS2, 2026-11-04). The flavor split lives in
+    // the non-webhook notifiers: the MAIL arm dispatches on wasAutoMerged
+    // below (notify.go:148-156 ActionAutoMergePullRequest — landed,
+    // services/mail/notify.ts's notifyAutoMergePullRequest) and the FEED arm
+    // rides the consumer's own emit (ActionAutoMergePullRequest, feed/
+    // notifier.go:279-289 — pull-automerge.ts); the actions notifier redirects
+    // like the webhook, notifier.go:674-677. The delete is composed directly
     // over the table (the
     // service's deleteScheduledAutoMerge — automerge.go:98-100 — is the same
     // statement, but pull-automerge.ts imports THIS module, so reaching back
@@ -750,7 +756,7 @@ export async function mergePullRequest(
     } catch (error) {
       console.error(`[pull-engine] merge mark-read failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
     }
-    await notifyMailMergePullRequest(c.env, mergedIssue, opts.doerId, pr.baseBranch, opts.now);
+    await notifyMailMergePullRequest(c.env, mergedIssue, opts.doerId, pr.baseBranch, opts.now, wasAutoMerged);
     // The project-workflow arm (workflow_notifier.go:44-50): the merge's
     // MergePullRequest notification's workflow consumer — pull_request_merged
     // over the RELOADED closed issue (markAsMergedPostProcess's position,
@@ -769,8 +775,12 @@ export async function mergePullRequest(
 /**
  * The emit site's best-effort wrapper — loads the merger (upstream passes
  * the `merger` user to markAsMergedPostProcess, merge.go:863) and hands the
- * arm to the notify hub (notifyMergePullRequest — services/mailer/notify.go:
- * 138-146). Failures log; the merge stays committed.
+ * arm to the notify hub with the computed wasAutoMerged flavor: the
+ * scheduled automerge's landing fires the AutoMergePullRequest receiver
+ * (services/mailer/notify.go:148-156 — the ForceDoerNotification flavor,
+ * mail_issue.go:185), the manual merge keeps MergePullRequest (:138-146),
+ * exactly markAsMergedPostProcess's dispatch (merge.go:403-407). Failures
+ * log; the merge stays committed.
  */
 async function notifyMailMergePullRequest(
   env: ApiEnv["Bindings"],
@@ -778,6 +788,7 @@ async function notifyMailMergePullRequest(
   doerId: number,
   baseBranch: string,
   now: Date,
+  wasAutoMerged: boolean,
 ): Promise<void> {
   try {
     const doer = (await drizzle(env.DB).select().from(users).where(eq(users.id, doerId)).get()) ?? null;
@@ -785,7 +796,9 @@ async function notifyMailMergePullRequest(
       console.error(`[pull-engine] merge notify skipped: doer row missing [id: ${doerId}]`);
       return;
     }
-    const outcome = await notifyMergePullRequest(env, { issue, doer, baseBranch }, { now });
+    const outcome = wasAutoMerged
+      ? await notifyAutoMergePullRequest(env, { issue, doer, baseBranch }, { now })
+      : await notifyMergePullRequest(env, { issue, doer, baseBranch }, { now });
     if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
       console.warn(`[pull-engine] merge notify: some rows stayed pending-unqueued (issue ${issue.id})`);
     }
