@@ -41,6 +41,11 @@ import {
 } from "../services/repo-settings";
 import { deleteRepoTopics } from "../services/repo-topics";
 import { deleteRepoWatchers } from "../services/repo-watchers";
+import {
+  updateMirrorSettings,
+  MirrorCredentialKeyError,
+  MirrorValidationError,
+} from "../services/mirror";
 import { switchSchedulesToDefaultBranch } from "../../services/actions/schedule";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
@@ -55,6 +60,7 @@ import {
   formString,
   formTrim,
   canViewRepository,
+  findMirrorByRepoId,
   searchRepositories,
   toApiRepository,
   toApiRepositoryFull,
@@ -84,9 +90,12 @@ import {
  * updateBasicProperties repo.go:699-701), and the stored settings subset;
  * since the repoEdit parity wave that subset includes the PR-merge
  * configuration family + projects_mode (the repo_units config carriers,
- * updateRepoUnits repo.go:754-985 — services/repo-settings.ts); upstream
- * registers NO mustNotBeArchived on this PATCH, so 423 is never emitted
- * here.
+ * updateRepoUnits repo.go:754-985 — services/repo-settings.ts); since the
+ * mirror-settings wave it also includes the five mirror fields
+ * (`mirror_interval`/`enable_prune`/`mirror_username`/`mirror_password`/
+ * `mirror_token` — upstream updateMirror repo.go:1023-1135, SPEC-0009
+ * §2.3.1); upstream registers NO mustNotBeArchived on this PATCH, so 423 is
+ * never emitted here.
  * repoDelete runs the landed §2.5.5 pipeline (D1 cascade → DO tombstone →
  * queue purge) plus the raw-D1 housekeeping of this batch's tables.
  * repoTransfer files the pending `repo_transfer` row via the repos service
@@ -677,6 +686,44 @@ export function registerRepoRoutes(
         await setRepoArchived(c.env.DB, found.repo.id, form.archived, now);
       }
 
+      // Mirror settings (SPEC-0009 §2.3.1): upstream dispatches updateMirror
+      // when ANY of the five EditRepoOption mirror fields is present
+      // (repo.go:620-628), AFTER updateRepoArchivedState — the same position.
+      // NOT a mirror → the service returns null and the PATCH carries on
+      // SILENTLY (repo.go:1029-1033: "Skip this update if the repo is not a
+      // mirror, do not return error") — no refusal exists upstream either.
+      // The interval arm re-arms the sync inside the service
+      // (ScheduleNextUpdate, mirror.go:71-77); credentials re-seal the §4.2
+      // envelope (KEK missing = the 500 family); the validation refusals are
+      // the declared-422 validationError family. The API cannot move the
+      // source address (EditRepoOption has no address field, structs/
+      // repo.go:246-255) — the service accepts none.
+      const mirrorTouched =
+        form.mirror_interval !== undefined ||
+        form.enable_prune !== undefined ||
+        form.mirror_username !== undefined ||
+        form.mirror_password !== undefined ||
+        form.mirror_token !== undefined;
+      if (mirrorTouched) {
+        try {
+          await updateMirrorSettings(c.env.DB, c.env, found.repo.id, {
+            interval: form.mirror_interval,
+            enablePrune: form.enable_prune,
+            username: form.mirror_username,
+            password: form.mirror_password,
+            token: form.mirror_token,
+          });
+        } catch (error) {
+          if (error instanceof MirrorValidationError) {
+            throw new ApiError(422, error.message);
+          }
+          if (error instanceof MirrorCredentialKeyError) {
+            throw new ApiError(500, error.message);
+          }
+          throw error;
+        }
+      }
+
       // Template flag (upstream updateBasicProperties, repo.go:699-701:
       // `if opts.Template != nil { repo.IsTemplate = *opts.Template }`,
       // persisted by UpdateRepository at repo.go:727). D1-only — the flag
@@ -790,6 +837,10 @@ export function registerRepoRoutes(
 
       // Re-render through the same converter as GET (the rename may have
       // moved the row's slug; the settings read picks up this PATCH's write).
+      // The mirror triple rides when the repo IS a mirror — upstream's
+      // innerToRepo reads the mirror row on EVERY render of a mirror repo
+      // (convert/repository.go:160-170), so the PATCH answer carries the
+      // updated mirror_interval/mirror_updated/mirror_last_sync_at too.
       const fresh = await findRepositoryByPath(
         c.env.DB,
         found.repo.ownerNamespace,
@@ -800,7 +851,8 @@ export function registerRepoRoutes(
       }
       const settings = await loadRepoSettings(c.env.DB, found.repo.id);
       const viewer = viewerOf(c);
-      return c.json(toApiRepository(viewer, fresh, settings), 200);
+      const mirrorRow = fresh.repo.isMirror ? await findMirrorByRepoId(c.env.DB, fresh.repo.id) : null;
+      return c.json(toApiRepository(viewer, fresh, settings, undefined, { mirrorRow }), 200);
     },
     repoBodyHook,
   );

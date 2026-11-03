@@ -206,14 +206,15 @@
  * Synchronize Now POST is upstream handleSettingsPostMirrorSync
  * (setting.go:379-390) over the API's mirror-sync arm's queue enqueue
  * (routes/mirror.ts:282-300 — inlined there is no service function; the
- * same-origin guard rides the write families' posture). The API exposes NO
- * settings-write arm (no PUT /repos/{owner}/{repo}/mirror landed — the
- * registerMirror row comment "PATCH owns it" is aspirational), so the edit
- * form (prune/interval/address/auth/LFS) renders as the honest absence note
- * and the current interval/prune values as read-only lines; dead controls
- * are forbidden (§2.4.1). `?sync=queued` renders the upstream
- * pull_mirror_sync_in_progress flash text as an info message (the flash
- * reduction — no session-flash plumbing exists; the param is display-only).
+ * same-origin guard rides the write families' posture). Since the
+ * mirror-settings wave (SPEC-0009 §2.3.1) the edit form (prune/interval/
+ * address/auth/LFS) is EDITABLE: the save POST (action=mirror — upstream
+ * handleSettingsPostMirror, setting.go:279-372) runs saveMirrorSettingsFromForm
+ * over the landed updateMirrorSettings service; validation refusals re-render
+ * the page with the message, success 303s back. `?sync=queued` renders the
+ * upstream pull_mirror_sync_in_progress flash text as an info message (the
+ * flash reduction — no session-flash plumbing exists; the param is
+ * display-only).
  *
  * ## The per-hook page (wave 14 — upstream repo/settings/webhook/{new,
  *  settings,history}.tmpl over WebHooksEdit/TestWebhook/DeleteWebhook)
@@ -292,7 +293,15 @@ import {
 } from "../../api/services/hooks";
 import { apiUserFromRow, findRepositoryById, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
 import { isRepositoryAdmin } from "../../api/services/repo-access";
-import { getMirrorStatus, type MirrorStatus } from "../../api/services/mirror";
+import {
+  getMirrorStatus,
+  updateMirrorSettings,
+  MirrorValidationError,
+  MIRROR_MIN_INTERVAL_SECONDS,
+  renderGoDuration,
+  type MirrorSettingsEnv,
+  type MirrorStatus,
+} from "../../api/services/mirror";
 import {
   loadRepoSettings,
   saveRepoSettings,
@@ -1538,15 +1547,28 @@ export const mirrorLocale = {
   last_update: "Last update", // "repo.settings.mirror_settings.last_update"
   sync_mirror: "Synchronize Now", // "repo.settings.sync_mirror"
   sync_in_progress: "Pulling changes from the remote %s at the moment.", // "repo.settings.pull_mirror_sync_in_progress"
-  mirror_interval: "Interval", // "repo.mirror_interval" (the label, %s-minimum tail dropped — no editable field)
+  mirror_interval: "Interval", // "repo.mirror_interval" (the short label, the status line's)
+  mirror_interval_field:
+    "Mirror Interval (valid time units are 'h', 'm', 's'). 0 to disable periodic sync. (Minimum interval: %s)", // "repo.mirror_interval" (the full form label)
+  mirror_interval_invalid: "The mirror interval is not valid.", // "repo.mirror_interval_invalid"
   mirror_prune: "Prune", // "repo.mirror_prune"
   mirror_prune_desc: "Remove obsolete remote-tracking references", // "repo.mirror_prune_desc"
+  mirror_address: "Clone From URL", // "repo.mirror_address"
+  mirror_address_desc: "Put any required credentials in the Authorization section.", // "repo.mirror_address_desc"
+  need_auth: "Authorization", // "repo.need_auth"
+  username: "Username", // "username"
+  password: "Password", // "password"
+  mirror_password_placeholder: "(Unchanged)", // "repo.mirror_password_placeholder"
+  mirror_password_blank_placeholder: "(Unset)", // "repo.mirror_password_blank_placeholder"
+  mirror_password_help: "Change the username to erase a stored password.", // "repo.mirror_password_help"
+  mirror_lfs: "Large File Storage (LFS)", // "repo.mirror_lfs"
+  mirror_lfs_desc: "Activate mirroring of LFS data.", // "repo.mirror_lfs_desc"
+  mirror_lfs_endpoint: "LFS Endpoint", // "repo.mirror_lfs_endpoint"
+  update_mirror_settings: "Update Mirror Settings", // "repo.settings.update_mirror_settings"
   last_synced: "Last Synchronized", // "repo.mirror_last_synced"
   not_a_mirror: "This repository is not a pull mirror.", // cf-gitea addition
   not_a_mirror_attach: "Attach one through the API: POST /api/v1/repos/{owner}/{repo}/migrate with mirror=true on an empty repository.", // cf-gitea addition
   archived_mirrors_unavailable: "Mirrors are not available if the repo is archived.", // "repo.settings.archive.mirrors_unavailable"
-  editing_unavailable:
-    "Editing the interval, prune or source address is not supported yet: the mirror API exposes no settings-write arm (no PUT /repos/{owner}/{repo}/mirror landed).", // cf-gitea addition (the honest absence)
   sync_state: "Sync state", // cf-gitea addition
   next_sync: "Next sync", // cf-gitea addition
   not_scheduled: "Not scheduled", // cf-gitea addition
@@ -1612,13 +1634,73 @@ export async function syncMirrorNow(
   return { outcome: "queued" };
 }
 
+export type MirrorSettingsSaveResult =
+  | { outcome: "saved" }
+  | { outcome: "not-mirror" } // upstream NotFound arm (setting.go:283-286)
+  | { outcome: "archived" } // upstream NotFound arm (setting.go:283-286)
+  | { outcome: "invalid"; message: string }; // the RenderWithErr re-render arm
+
+/**
+ * The settings-save write (upstream handleSettingsPostMirror, setting.go:279-372
+ * — action=mirror — over the landed §2.3.1 service). The form's blank-keep
+ * semantics ARE the service's recomposition: a blank username maps to
+ * undefined (the stored username backfills, setting.go:312-318), a blank
+ * password to undefined (the stored secret carries over unless the username
+ * changed — repo.go:1083-1090's condition; a NEW username with a blank
+ * password composes the empty-password form, the mirror_password_help arm).
+ * The prune checkbox and the LFS toggle are bool bindings — absent = false,
+ * they always write (upstream's form binding). The interval is ALWAYS
+ * validated (an invalid one refuses the whole form, setting.go:299-303),
+ * rendering the locale text through the service error's field tag. Success
+ * 303s back onto the page; there is no flash plumbing (the mirror page's
+ * reduction, the module header).
+ */
+export async function saveMirrorSettingsFromForm(
+  d1: D1Database,
+  env: MirrorSettingsEnv,
+  repo: RepoRow,
+  form: URLSearchParams,
+): Promise<MirrorSettingsSaveResult> {
+  // The web gate (setting.go:283-286): `!repo.IsMirror || repo.IsArchived` →
+  // NotFound — the row alone is not the gate, the flag is conjunct.
+  if (repo.isArchived) return { outcome: "archived" };
+  if (!repo.isMirror || !(await getMirrorStatus(d1, repo.id))) return { outcome: "not-mirror" };
+  const formUsername = form.get("mirror_username") ?? "";
+  const blank = (name: string) => {
+    const value = form.get(name);
+    return value === null || value === "" ? undefined : value;
+  };
+  try {
+    await updateMirrorSettings(d1, env, repo.id, {
+      interval: form.get("interval") ?? "",
+      enablePrune: form.has("enable_prune"),
+      username: formUsername === "" ? undefined : formUsername,
+      password: blank("mirror_password"),
+      token: undefined, // the web form has no token field (upstream's form neither)
+      // The address is a REQUIRED form field (options.tmpl:154) — a blank
+      // value refuses through the URL gate, like upstream's composed-address
+      // error arm (setting.go:332-340); it is never a silent skip.
+      address: form.get("mirror_address") ?? "",
+      lfs: form.has("mirror_lfs"),
+      lfsEndpoint: form.get("mirror_lfs_endpoint") ?? "",
+    });
+  } catch (error) {
+    if (error instanceof MirrorValidationError) {
+      const message =
+        error.field === "interval" ? mirrorLocale.mirror_interval_invalid : error.message;
+      return { outcome: "invalid", message };
+    }
+    throw error; // the KEK 500 family — the route's plain-text 500 arm
+  }
+  return { outcome: "saved" };
+}
+
 /** The mirror panel (§2.4.1 discriminator: `repository settings mirror` —
  *  upstream renders the section on options.tmpl; the brief's dedicated
  *  sub-page keeps the settings layout pair). The sync_state row renders the
  *  upstream table (remote address | Pull | last update | Synchronize Now)
  *  plus the status lines the API's MirrorStatus carries; the edit form
- *  (prune/interval/address — options.tmpl's second row) renders as the
- *  honest absence note: no settings-write arm exists. */
+ *  (options.tmpl:136-191's second row) is the landed §2.3.1 write arm. */
 export function renderMirrorSettingsPage(options: {
   ctx: UiContext;
   data: MirrorSettingsData;
@@ -1689,6 +1771,9 @@ function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; e
                       <td>{fullTime(status.updated_at)}</td>
                       <td class="tw-text-right">
                         <form method="post" class="tw-inline-block" action={`${repoLink}/settings/mirror`}>
+                          {/* options.tmpl:169 — the sync button posts its own
+                              action; the POST dispatches on it (§2.3.1). */}
+                          <input type="hidden" name="action" value="mirror-sync" />
                           <button type="submit" class="ui primary tiny button inline">
                             {mirrorLocale.sync_mirror}
                           </button>
@@ -1731,10 +1816,70 @@ function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; e
                     </div>
                   ) : null}
                 </div>
-                {/* The honest absence: options.tmpl's edit form (prune
-                    checkbox, interval, address, auth) has no landed write arm
-                    — rendered read-only, never dead controls (§2.4.1). */}
-                <p class="tw-text-placeholder-text">{mirrorLocale.editing_unavailable}</p>
+                {/* options.tmpl's edit form (options.tmpl:136-191, action=
+                    mirror): prune checkbox, interval, address, Authorization
+                    details, LFS toggle + endpoint. The write arm is the
+                    landed §2.3.1 service; blank credentials keep the stored
+                    ones (the placeholder arms). */}
+                <form class="ui form" method="post" action={`${repoLink}/settings/mirror`}>
+                  <input type="hidden" name="action" value="mirror" />
+                  <div class="inline field">
+                    <label>{mirrorLocale.mirror_prune}</label>
+                    <div class="ui checkbox">
+                      <input id="enable_prune" name="enable_prune" type="checkbox" checked={status.enable_prune} />
+                      <label>{mirrorLocale.mirror_prune_desc}</label>
+                    </div>
+                  </div>
+                  <div class="inline field">
+                    <label for="interval">
+                      {mirrorLocale.mirror_interval_field.replace(
+                        "%s",
+                        renderGoDuration(MIRROR_MIN_INTERVAL_SECONDS),
+                      )}
+                    </label>
+                    <input id="interval" name="interval" value={status.mirror_interval} />
+                  </div>
+                  <div class="field">
+                    <label for="mirror_address">{mirrorLocale.mirror_address}</label>
+                    <input id="mirror_address" name="mirror_address" value={status.remote_address} required />
+                    <p class="help">{mirrorLocale.mirror_address_desc}</p>
+                  </div>
+                  <details class="ui optional field" open={status.credentials_username !== null}>
+                    <summary class="tw-p-1">{mirrorLocale.need_auth}</summary>
+                    <div class="tw-p-1">
+                      <div class="inline field">
+                        <label for="mirror_username">{mirrorLocale.username}</label>
+                        <input id="mirror_username" name="mirror_username" value={status.credentials_username ?? ""} />
+                      </div>
+                      <div class="inline field">
+                        <label for="mirror_password">{mirrorLocale.password}</label>
+                        <input
+                          id="mirror_password"
+                          name="mirror_password"
+                          type="password"
+                          placeholder={status.has_credentials ? mirrorLocale.mirror_password_placeholder : mirrorLocale.mirror_password_blank_placeholder}
+                          value=""
+                          autocomplete="off"
+                        />
+                      </div>
+                      <p class="help">{mirrorLocale.mirror_password_help}</p>
+                    </div>
+                  </details>
+                  <div class="inline field">
+                    <label>{mirrorLocale.mirror_lfs}</label>
+                    <div class="ui checkbox">
+                      <input id="mirror_lfs" name="mirror_lfs" type="checkbox" checked={status.lfs_enabled} />
+                      <label>{mirrorLocale.mirror_lfs_desc}</label>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="mirror_lfs_endpoint">{mirrorLocale.mirror_lfs_endpoint}</label>
+                    <input id="mirror_lfs_endpoint" name="mirror_lfs_endpoint" value={status.lfs_endpoint ?? ""} />
+                  </div>
+                  <div class="field">
+                    <button type="submit" class="ui primary button">{mirrorLocale.update_mirror_settings}</button>
+                  </div>
+                </form>
               </>
             )}
           </div>

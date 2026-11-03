@@ -25,7 +25,15 @@ import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
 import { registerMirrorRoutes } from "./routes/mirror";
 import { mirrorAuthHeader } from "../services/mirror/sync";
-import { parseGoDuration, renderGoDuration } from "./services/mirror";
+import {
+  MIRROR_MIN_INTERVAL_SECONDS,
+  MirrorCredentialKeyError,
+  MirrorValidationError,
+  parseGoDuration,
+  parsePatchMirrorInterval,
+  renderGoDuration,
+  updateMirrorSettings,
+} from "./services/mirror";
 
 const TOKEN = "stub-token"; // STUB_USER (id 1) — the repo owner
 const TOKEN_OTHER = "other-token"; // 'other' — a plain user
@@ -127,7 +135,7 @@ async function seedRepo(overrides: Partial<typeof repositories.$inferInsert> = {
   });
 }
 
-async function seedMirrorRow(): Promise<void> {
+async function seedMirrorRow(overrides: Partial<typeof repoMirrors.$inferInsert> = {}): Promise<void> {
   await drizzle(env.DB).insert(repoMirrors).values({
     repoId: "7401",
     intervalSeconds: 28800,
@@ -135,6 +143,7 @@ async function seedMirrorRow(): Promise<void> {
     remoteAddress: SOURCE_URL,
     syncState: "idle",
     nextSyncAt: 0,
+    ...overrides,
   });
 }
 
@@ -656,5 +665,254 @@ describe("POST /repos/{owner}/{repo}/mirror-sync", () => {
     await env.DB.prepare("UPDATE repositories SET visibility = 'public'").run();
     expect((await app(`${repoBase}/mirror-sync`, { method: "POST", headers: otherHeaders })).status).toBe(403);
     expect((await app(`${repoBase}/mirror-sync`, { method: "POST" })).status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// updateMirrorSettings — the settings WRITE arm (SPEC-0009 §2.3.1): the
+// field matrix over the landed repo_mirrors row. Upstream updateMirror
+// (routers/api/v1/repo/repo.go:1023-1135) + handleSettingsPostMirror
+// (routers/web/repo/setting/setting.go:279-372) semantics.
+// ---------------------------------------------------------------------------
+
+/** A MirrorSettingsEnv over the workerd env (KEK armed; the egress policy
+ *  fields default to the lax posture). */
+function settingsEnv(extra: Record<string, string | undefined> = {}): MirrorSettingsTestEnv {
+  return { ...env, MIRROR_SYNC_QUEUE: recordingQueue(), ...extra };
+}
+type MirrorSettingsTestEnv = Parameters<typeof updateMirrorSettings>[1];
+
+/** Seeds the mirror row WITH credentials by riding the into-empty migrate
+ *  route (the sealing half is the register arm's; the matrix then exercises
+ *  the decrypt-recompose-reseal chain through the §4.2 envelope). */
+async function seedCredentialedMirror(
+  auth: { username?: string; password?: string; token?: string } = {},
+): Promise<void> {
+  await seedRepo();
+  const queue = recordingQueue();
+  const body: Record<string, unknown> = { clone_addr: SOURCE_URL, mirror: true };
+  if (auth.username !== undefined) body.auth_username = auth.username;
+  if (auth.password !== undefined) body.auth_password = auth.password;
+  if (auth.token !== undefined) body.auth_token = auth.token;
+  const res = await makeApp(queue, { MIRROR_CREDENTIAL_KEY: KEK })(`${repoBase}/migrate`, {
+    method: "POST",
+    headers: jsonAuth,
+    body: JSON.stringify(body),
+  });
+  if (res.status !== 202) throw new Error(`seedCredentialedMirror failed: ${res.status} ${await res.text()}`);
+}
+
+const mirrorRow = () => drizzle(env.DB).select().from(repoMirrors).where(eq(repoMirrors.repoId, "7401")).get();
+
+/** Decrypts the stored envelope through the sync consumer's half (the row
+ *  carries the AAD halves — never a hardcoded id under AUTOINCREMENT). */
+async function storedAuthHeader(): Promise<string | null> {
+  const row = await mirrorRow();
+  return mirrorAuthHeader({ ...env, MIRROR_CREDENTIAL_KEY: KEK }, row!);
+}
+
+describe("parsePatchMirrorInterval (the PATCH validation texts)", () => {
+  it("carries the API arm's exact refusal texts (repo.go:1044-1057)", () => {
+    const below = (() => {
+      try {
+        parsePatchMirrorInterval("5m");
+        return null;
+      } catch (error) {
+        return error as MirrorValidationError;
+      }
+    })();
+    expect(below?.message).toBe(
+      `invalid mirror interval: 5m0s is below minimum interval: ${renderGoDuration(MIRROR_MIN_INTERVAL_SECONDS)}`,
+    );
+    expect(below?.field).toBe("interval");
+    try {
+      parsePatchMirrorInterval("soon");
+      expect.unreachable();
+    } catch (error) {
+      expect((error as MirrorValidationError).message).toBe('time: invalid duration "soon"');
+    }
+    // "0" disables; a compound form parses to seconds.
+    expect(parsePatchMirrorInterval("0")).toBe(0);
+    expect(parsePatchMirrorInterval("8h30m")).toBe(30600);
+  });
+
+  it("our grammar refuses signed forms as unparseable (the register-arm divergence — upstream parses them into the below-minimum arm; same 422)", () => {
+    try {
+      parsePatchMirrorInterval("-5m");
+      expect.unreachable();
+    } catch (error) {
+      expect((error as MirrorValidationError).message).toBe('time: invalid duration "-5m"');
+    }
+  });
+});
+
+describe("updateMirrorSettings — interval (the reschedule arm)", () => {
+  it("writes seconds and re-arms next_sync_at = now + interval (ScheduleNextUpdate, mirror.go:71-77)", async () => {
+    await seedRepo();
+    await seedMirrorRow();
+    const before = Math.floor(Date.now() / 1000);
+    const status = await updateMirrorSettings(env.DB, settingsEnv(), "7401", { interval: "30m" });
+    expect(status?.interval_seconds).toBe(1800);
+    expect(status?.mirror_interval).toBe("30m0s");
+    const row = await mirrorRow();
+    expect(row?.intervalSeconds).toBe(1800);
+    expect(Math.abs((row?.nextSyncAt ?? 0) - (before + 1800))).toBeLessThanOrEqual(2);
+    // The write touches nothing else: sync_state stays, no message enqueued.
+    expect(row?.syncState).toBe("idle");
+  });
+
+  it("interval 0 disables scheduling (next_sync_at = 0)", async () => {
+    await seedRepo();
+    await seedMirrorRow({ nextSyncAt: 1700000000 });
+    const status = await updateMirrorSettings(env.DB, settingsEnv(), "7401", { interval: "0" });
+    expect(status?.interval_seconds).toBe(0);
+    expect(status?.next_sync_at).toBe(0);
+  });
+
+  it("refuses a below-minimum interval with the upstream text and writes nothing", async () => {
+    await seedRepo();
+    await seedMirrorRow({ intervalSeconds: 28800, nextSyncAt: 1700000000 });
+    await expect(updateMirrorSettings(env.DB, settingsEnv(), "7401", { interval: "5m" })).rejects.toThrow(
+      MirrorValidationError,
+    );
+    const row = await mirrorRow();
+    expect(row?.intervalSeconds).toBe(28800); // untouched
+    expect(row?.nextSyncAt).toBe(1700000000); // untouched
+  });
+});
+
+describe("updateMirrorSettings — prune (no reschedule)", () => {
+  it("flips enable_prune without touching the schedule", async () => {
+    await seedRepo();
+    await seedMirrorRow({ enablePrune: true, nextSyncAt: 1700000000 });
+    const status = await updateMirrorSettings(env.DB, settingsEnv(), "7401", { enablePrune: false });
+    expect(status?.enable_prune).toBe(false);
+    const row = await mirrorRow();
+    expect(row?.nextSyncAt).toBe(1700000000);
+  });
+});
+
+describe("updateMirrorSettings — the silent non-mirror skip", () => {
+  it("returns null when there is no mirror row (repo.go:1029-1033)", async () => {
+    await seedRepo();
+    const status = await updateMirrorSettings(env.DB, settingsEnv(), "7401", { interval: "30m", enablePrune: false });
+    expect(status).toBeNull();
+    const rows = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(rows).toEqual([]);
+  });
+});
+
+describe("updateMirrorSettings — credentials (the recomposition matrix)", () => {
+  it("keeps the stored password on a username-only unchanged-or-blank write, resealed (repo.go:1083-1090)", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    const before = await storedAuthHeader();
+    expect(before).toContain("Basic");
+
+    const status = await updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: KEK }), "7401", {
+      username: "alice",
+    });
+    expect(status?.credentials_username).toBe("alice");
+    expect(status?.has_credentials).toBe(true);
+    const after = await storedAuthHeader();
+    expect(after).toBe(before); // the same Authorization header, a FRESH envelope (re-sealed)
+  });
+
+  it("a NEW username drops the stored password (the empty-password compose — mirror_password_help)", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    await updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: KEK }), "7401", { username: "bob" });
+    const row = await mirrorRow();
+    expect(row?.credentialsUsername).toBe("bob");
+    // Basic base64("bob:")
+    expect(await storedAuthHeader()).toBe(`Basic ${btoa("bob:")}`);
+  });
+
+  it("the token wins as the Bearer form (repo.go:1091-1092)", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    await updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: KEK }), "7401", { token: "tok-1" });
+    expect(await storedAuthHeader()).toBe("Bearer tok-1");
+  });
+
+  it("an explicit empty username+password composes the anonymous form (the envelope clears)", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    const status = await updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: KEK }), "7401", {
+      username: "",
+      password: "",
+    });
+    expect(status?.credentials_username).toBeNull();
+    expect(status?.has_credentials).toBe(false);
+    expect((await mirrorRow())?.credentialsCiphertext).toBeNull();
+  });
+
+  it("an absent credential trio leaves the envelope byte-stable", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    const before = (await mirrorRow())?.credentialsCiphertext;
+    await updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: KEK }), "7401", { enablePrune: false });
+    expect((await mirrorRow())?.credentialsCiphertext).toBe(before);
+  });
+
+  it("the KEK-missing credential write fails closed (the 500 family)", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    await expect(
+      updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: undefined }), "7401", { password: "new" }),
+    ).rejects.toBeInstanceOf(MirrorCredentialKeyError);
+  });
+
+  it("the auth arm re-runs the egress gate on the stored address (repo.go:1108-1112)", async () => {
+    await seedCredentialedMirror({ username: "alice", password: "s3cret" });
+    await expect(
+      updateMirrorSettings(env.DB, settingsEnv({ MIRROR_CREDENTIAL_KEY: KEK, MIRROR_EGRESS_MODE: "strict" }), "7401", {
+        password: "new",
+      }),
+    ).rejects.toThrow(MirrorValidationError);
+  });
+});
+
+describe("updateMirrorSettings — the web-only address + LFS arms", () => {
+  it("moves remote_address AND repositories.original_url (UpdateAddress's halves), with NO reschedule", async () => {
+    await seedRepo();
+    await seedMirrorRow({ nextSyncAt: 1700000000 });
+    const status = await updateMirrorSettings(env.DB, settingsEnv(), "7401", {
+      address: "https://other.example.com/org/repo.git",
+    });
+    expect(status?.remote_address).toBe("https://other.example.com/org/repo.git");
+    const row = await mirrorRow();
+    expect(row?.remoteAddress).toBe("https://other.example.com/org/repo.git");
+    expect(row?.nextSyncAt).toBe(1700000000); // an address change never re-arms
+    const repo = await drizzle(env.DB).select({ originalUrl: repositories.originalUrl }).from(repositories).where(eq(repositories.id, "7401")).get();
+    expect(repo?.originalUrl).toBe("https://other.example.com/org/repo.git");
+  });
+
+  it("refuses an invalid address with the URL text and writes nothing", async () => {
+    await seedRepo();
+    await seedMirrorRow();
+    await expect(
+      updateMirrorSettings(env.DB, settingsEnv(), "7401", { address: "http://insecure.example.com/x.git" }),
+    ).rejects.toThrow(/The provided URL is invalid/);
+    expect((await mirrorRow())?.remoteAddress).toBe(SOURCE_URL);
+  });
+
+  it("refuses a disallowed host with the egress text", async () => {
+    await seedRepo();
+    await seedMirrorRow();
+    await expect(
+      updateMirrorSettings(env.DB, settingsEnv({ MIRROR_EGRESS_MODE: "strict" }), "7401", {
+        address: "https://src.example.com/org/repo.git",
+      }),
+    ).rejects.toThrow(/disallowed hosts/);
+  });
+
+  it("stores the LFS toggle + a gated endpoint (empty clears to null)", async () => {
+    await seedRepo();
+    await seedMirrorRow();
+    const status = await updateMirrorSettings(env.DB, settingsEnv(), "7401", {
+      lfs: true,
+      lfsEndpoint: "https://lfs.example.com/api/lfs",
+    });
+    expect(status?.lfs_enabled).toBe(true);
+    expect(status?.lfs_endpoint).toBe("https://lfs.example.com/api/lfs");
+
+    const cleared = await updateMirrorSettings(env.DB, settingsEnv(), "7401", { lfs: false, lfsEndpoint: "" });
+    expect(cleared?.lfs_enabled).toBe(false);
+    expect(cleared?.lfs_endpoint).toBeNull();
   });
 });

@@ -4,8 +4,9 @@
  * mirror, the wave-10 block in ui/__tests__/pages-wave10.test.ts). Checked
  * first — deliberately NOT re-covered here: the wave-10 block owns the
  * parser tuple + the anonymous 303 / non-admin 404 on the GET, the admin's
- * base render (table cells, the ✓ prune arm, the idle sync state, the
- * honest-absence note), the not-a-mirror + archived-warning texts, the bare
+ * base render (table cells, the ✓ prune arm, the idle sync state; the
+ * settings-edit wave retired the honest-absence note — the form renders
+ * editable, SPEC-0009 §2.3.1), the not-a-mirror + archived-warning texts, the bare
  * POST 303 + `?sync=queued` flash presence/absence, the POST refusals
  * (not-mirror/archived 404, anon 303, non-admin 404) and the family's a11y
  * smoke. THIS FILE adds the open arms, driven over the mounted uiRouter on
@@ -22,10 +23,11 @@
  *     writes from the route itself, the no-queue 500 (the queue-missing
  *     text) and the enqueue-failed 500 — plus the FORCE/PRUNE FLAGS arm:
  *     upstream options.tmpl's edit-form fields (force, enable_prune,
- *     interval, mirror_address, mirror_lfs) ride the body INERTLY — the
- *     handler never reads it (no settings-write arm exists), so a flag
- *     bearing POST enqueues the identical single message and mutates no
- *     mirror setting,
+ *     interval, mirror_address, mirror_lfs) ride an ACTION-LESS body
+ *     INERTLY — the dispatch reads only `action` (the settings-edit wave's
+ *     save arm answers action=mirror, SPEC-0009 §2.3.1; the action-less
+ *     back-compat POST stays the sync arm), so a flag-bearing POST enqueues
+ *     the identical single message and mutates no mirror setting,
  *   - the `?sync=queued` flash semantics beyond wave-10's presence pin: the
  *     %s substitution cites original_url while the table cell shows
  *     remote_address (the two MirrorStatus fields CAN diverge), the
@@ -584,17 +586,17 @@ describe("the render shapes wave-10's fixture could not carry", () => {
     expect(html).toContain("tw-text-red"); // the error line's red tint
   });
 
-  it("keeps the LFS half of MirrorStatus off the page (the honest reduction — no dead controls)", async () => {
+  it("binds the LFS pair into the edit form (the settings-edit wave retired the honest reduction — MIRROR fold, disclosed)", async () => {
     const res = await get("/smx-owner/smx-shapes/settings/mirror", "smx-owner");
     expect(res.status).toBe(200);
     const html = await res.text();
-    // The settings navbar's LFS item renders now (the census R11 arm's mount
-    // retired the SettingsNav omission); the PANEL keeps neither a section
-    // nor an input for the seeded lfs_enabled/lfs_endpoint pair (upstream's
-    // LFS fields ride the edit form that the no-settings-write-arm reduction
-    // dropped) — the endpoint value stays absent.
+    // The settings navbar's LFS item renders (the census R11 arm's mount);
+    // since SPEC-0009 §2.3.1 the PANEL's edit form renders upstream's LFS
+    // fields (options.tmpl's LFSStartServer arm) with the seeded pair bound —
+    // the checkbox carries lfs_enabled, the endpoint input carries the value.
     expect(html).toContain('href="/smx-owner/smx-shapes/settings/lfs">LFS</a>');
-    expect(html).not.toContain("lfs.invalid");
+    expect(html).toContain('<input id="mirror_lfs" name="mirror_lfs" type="checkbox" checked=""/>');
+    expect(html).toContain('<input id="mirror_lfs_endpoint" name="mirror_lfs_endpoint" value="https://lfs.invalid/pull"/>');
   });
 
   it("renders the scheduled Next sync / Last Synchronized as relative-time stamps", async () => {

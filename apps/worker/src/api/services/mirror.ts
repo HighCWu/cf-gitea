@@ -52,11 +52,17 @@ export interface MirrorSettingsEnv extends Pick<Env, "MIRROR_SYNC_QUEUE"> {
   MIRROR_CREDENTIAL_KEY?: string;
 }
 
-/** 422 family — upstream's migrate validation errors (SPEC-0009 §2.2 table). */
+/** 422 family — upstream's migrate validation errors (SPEC-0009 §2.2 table).
+ *  `field` tags which input refused (SPEC-0009 §2.3.1): the web settings form
+ *  renders the interval refusal as the locale text
+ *  ("The mirror interval is not valid.", setting.go:299-303) and the others
+ *  with the message itself; the API ignores the tag. */
 export class MirrorValidationError extends Error {
-  constructor(message: string) {
+  readonly field?: "interval" | "address" | "lfs_endpoint" | "auth";
+  constructor(message: string, field?: "interval" | "address" | "lfs_endpoint" | "auth") {
     super(message);
     this.name = "MirrorValidationError";
+    this.field = field;
   }
 }
 
@@ -235,7 +241,11 @@ export function deriveMirrorAuthHeader(options: MigrateOptions): string | null {
 
 /** Wire shape of GET/POST mirror responses — a non-contract surface (like
  *  the imports family): sync_state and schedule are ours to shape. Epoch
- *  fields are unix seconds (0 = unscheduled); credentials NEVER appear. */
+ *  fields are unix seconds (0 = unscheduled); the SECRET never appears (the
+ *  §4.2 envelope has no read arm). The §3.1 non-secret username and the
+ *  has-credentials marker DO render — upstream's form binds the same pair
+ *  ($address.Username + the "(Unchanged)"/"(Unset)" password placeholder,
+ *  options.tmpl:165-171); the API status response carries them harmlessly. */
 export interface MirrorStatus {
   remote_address: string;
   original_url: string;
@@ -245,6 +255,11 @@ export interface MirrorStatus {
   enable_prune: boolean;
   lfs_enabled: boolean;
   lfs_endpoint: string | null;
+  /** The §3.1 non-secret username (upstream's remote-URL userinfo render). */
+  credentials_username: string | null;
+  /** Whether a credential envelope is stored — the password placeholder's
+   *  "(Unchanged)" vs "(Unset)" arm; never the secret itself. */
+  has_credentials: boolean;
   sync_state: "idle" | "queued" | "syncing";
   next_sync_at: number;
   last_sync_at: number | null;
@@ -425,6 +440,8 @@ export async function getMirrorStatus(db: D1Database, repoId: string): Promise<M
     enable_prune: row.enablePrune,
     lfs_enabled: row.lfsEnabled,
     lfs_endpoint: row.lfsEndpoint,
+    credentials_username: row.credentialsUsername,
+    has_credentials: row.credentialsCiphertext !== null,
     sync_state: row.syncState,
     next_sync_at: row.nextSyncAt,
     last_sync_at: row.lastSyncAt,
@@ -432,6 +449,248 @@ export async function getMirrorStatus(db: D1Database, repoId: string): Promise<M
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Settings WRITE arm (SPEC-0009 §2.3.1) — upstream `updateMirror`
+// (routers/api/v1/repo/repo.go:1023-1135) for the API PATCH's five fields and
+// `handleSettingsPostMirror` (routers/web/repo/setting/setting.go:279-372)
+// for the web form's address/LFS extras, over the landed repo_mirrors row.
+// ---------------------------------------------------------------------------
+
+/** Wire shape of a settings write. Undefined = untouched (the API PATCH's
+ *  Go-pointer semantics, structs/repo.go:246-255). `address`, `lfs` and
+ *  `lfs_endpoint` are WEB-ONLY inputs — `EditRepoOption` has no address or
+ *  LFS field (the cite decides: the API cannot move the source address, only
+ *  the credential triple, repo.go:1104-1108 over structs/repo.go:246-255). */
+export interface MirrorSettingsInput {
+  /** Go-duration string; `"0"` disables scheduling (§2.3.1 validation). */
+  interval?: string;
+  enablePrune?: boolean;
+  username?: string;
+  password?: string;
+  token?: string;
+  /** New source address (web `mirror_address`); gated + sanitized. */
+  address?: string;
+  /** LFS mirror toggle (web `mirror_lfs` — the checkbox binding means the
+   *  form ALWAYS sends it; unchecked arrives as `false` and disables). */
+  lfs?: boolean;
+  /** LFS endpoint (web `mirror_lfs_endpoint`); `""` clears to null. */
+  lfsEndpoint?: string;
+}
+
+/** PATCH-side interval validation (§2.3.1 — the API arm's exact texts,
+ *  repo.go:1044-1057): unparseable → `time: invalid duration "x"` (our
+ *  grammar's signed-form refusals carry this text too — upstream parses
+ *  negatives and hits the below-minimum arm instead; same 422 status, the
+ *  documented register-arm grammar divergence); below the minimum →
+ *  `invalid mirror interval: 5m0s is below minimum interval: 10m0s`. */
+export function parsePatchMirrorInterval(raw: string): number {
+  const seconds = parseGoDuration(raw);
+  if (seconds === null) {
+    throw new MirrorValidationError(`time: invalid duration ${JSON.stringify(raw)}`, "interval");
+  }
+  if (seconds !== 0 && seconds < MIRROR_MIN_INTERVAL_SECONDS) {
+    throw new MirrorValidationError(
+      `invalid mirror interval: ${renderGoDuration(seconds)} is below minimum interval: ${renderGoDuration(
+        MIRROR_MIN_INTERVAL_SECONDS,
+      )}`,
+      "interval",
+    );
+  }
+  return seconds;
+}
+
+/**
+ * The settings write (§2.3.1). Loads the 1:1 row; **null when the repo has no
+ * mirror** — the API arm's silent skip (repo.go:1029-1033: "Skip this update
+ * if the repo is not a mirror, do not return error"), the web caller 404s on
+ * it (setting.go:283-286).
+ *
+ * Field order ports upstream's: interval (parse + `ScheduleNextUpdate`
+ * RE-SCHEDULE, mirror.go:71-77 — `now + interval`, `0` = unscheduled; the
+ * ONLY reschedule in the surface — prune/credentials/address/LFS writes
+ * neither reschedule nor wake the sync, upstream enqueues nothing) → prune →
+ * credentials (decrypt-recompose-reseal per repo.go:1067-1103; the stored
+ * §4.2 envelope stands in for upstream's credentials-in-remote-URL) →
+ * address (the web-only move: gated + sanitized, written to the row AND
+ * `repositories.original_url` — upstream `UpdateAddress`'s OriginalURL write,
+ * mirror_pull.go:55-60; there is no git remote to rewrite, the sync reads
+ * the row) → LFS columns. Every credential change re-runs the egress gate on
+ * the stored address (upstream re-gates the composed address,
+ * repo.go:1108-1112).
+ *
+ * `sync_state` is never touched here: the cron/consumer CAS owns it; a
+ * settings write racing an in-flight sync can be overwritten by that sync's
+ * settle (upstream holds the same race — its settle re-schedules from the
+ * in-memory mirror copy).
+ */
+export async function updateMirrorSettings(
+  db: D1Database,
+  env: MirrorSettingsEnv,
+  repoId: string,
+  input: MirrorSettingsInput,
+): Promise<MirrorStatus | null> {
+  const row = await drizzle(db).select().from(repoMirrors).where(eq(repoMirrors.repoId, repoId)).get();
+  if (row === undefined) return null;
+
+  const set: Partial<typeof repoMirrors.$inferInsert> = { updatedAt: new Date() };
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // -- interval (repo.go:1041-1059): validate, then ScheduleNextUpdate ------
+  if (input.interval !== undefined) {
+    const seconds = parsePatchMirrorInterval(input.interval);
+    set.intervalSeconds = seconds;
+    // models/repo/mirror.go:71-77 — the interval arm is the only re-arm.
+    set.nextSyncAt = seconds > 0 ? nowSec + seconds : 0;
+  }
+
+  // -- prune (repo.go:1061-1065) --------------------------------------------
+  if (input.enablePrune !== undefined) {
+    set.enablePrune = input.enablePrune;
+  }
+
+  // -- credentials (repo.go:1067-1103): compose from stored + patch ----------
+  if (input.username !== undefined || input.password !== undefined || input.token !== undefined) {
+    // Upstream re-gates the composed address (repo.go:1108-1112); the base
+    // cannot change here, so the gate re-runs on the stored address — a host
+    // the policy has since denied refuses the credential write (422 family).
+    checkMirrorSourceUrl(row.remoteAddress, env);
+
+    // The stored secret decomposed into upstream's remote-URL equivalents:
+    // "Basic base64(u:p)" → (u, p); "Bearer t" → (username, t) — upstream
+    // embeds the token AS the password. Decrypting needs the KEK; the 500
+    // family fires closed (§4.2) exactly when the sync's decrypt would.
+    let storedUsername: string | null = row.credentialsUsername ?? null;
+    let storedPassword = "";
+    if (row.credentialsCiphertext !== null) {
+      const header = await decryptMirrorCredentials(env, row.id, repoId, row.credentialsCiphertext);
+      if (header.startsWith("Bearer ")) {
+        storedPassword = header.slice("Bearer ".length);
+      } else if (header.startsWith("Basic ")) {
+        const decoded = atob(header.slice("Basic ".length));
+        const colon = decoded.indexOf(":");
+        storedPassword = colon === -1 ? "" : decoded.slice(colon + 1);
+        // The envelope's user half wins when the metadata column is bare.
+        if ((storedUsername ?? "") === "" && colon > 0) storedUsername = decoded.slice(0, colon);
+      }
+    }
+
+    // The recomposition (repo.go:1072-1090), verbatim semantics:
+    const username = input.username !== undefined ? input.username : (storedUsername ?? "");
+    let password = "";
+    let token = "";
+    if (input.password !== undefined) password = input.password;
+    if (input.token !== undefined) token = input.token;
+    // The stored password carries over ONLY when neither secret was given
+    // AND the username is unchanged-or-empty — a username-only change to a
+    // DIFFERENT username drops it (the `mirror_password_help` locale:
+    // "Change the username to erase a stored password.").
+    if (input.password === undefined && input.token === undefined && storedUsername !== null) {
+      if (username === "" || username === storedUsername) password = storedPassword;
+    }
+    if (token !== "") password = token;
+
+    // The header derivation = the register arm's (deriveMirrorAuthHeader):
+    // a non-empty token wins as Bearer; otherwise Basic over the pair; both
+    // empty = anonymous (upstream's len(user)+len(pass) == 0 anonymous
+    // remote, modules/git/remote.go:84-87).
+    const authHeader = token !== "" ? `Bearer ${token}` : deriveBasicHeader(username, password);
+    set.credentialsUsername = authHeader === null ? null : username;
+    if (authHeader === null) {
+      set.credentialsCiphertext = null;
+    } else {
+      const kek = readyKek(env);
+      set.credentialsCiphertext = await encryptMirrorCredentials(kek, row.id, repoId, authHeader);
+    }
+  }
+
+  // -- address (web-only; setting.go:332-345 + UpdateAddress) ----------------
+  let repoOriginalUrl: string | undefined;
+  if (input.address !== undefined) {
+    const source = checkMirrorSourceUrl(input.address, env);
+    set.remoteAddress = source.sanitized;
+    // UpdateAddress's second half (mirror_pull.go:55-60): the repo's
+    // sanitized origin moves with the mirror's address.
+    repoOriginalUrl = source.sanitized;
+  }
+
+  // -- LFS columns (setting.go:346-367) --------------------------------------
+  if (input.lfs !== undefined) {
+    set.lfsEnabled = input.lfs;
+  }
+  if (input.lfsEndpoint !== undefined) {
+    if (input.lfsEndpoint === "") {
+      set.lfsEndpoint = null;
+    } else {
+      // The register arm's identical gate (§4.1); upstream validates the
+      // endpoint URL and runs IsMigrateURLAllowed (setting.go:348-361).
+      set.lfsEndpoint = checkMirrorSourceUrl(input.lfsEndpoint, env).sanitized;
+    }
+  }
+
+  const dbd = drizzle(db);
+  if (repoOriginalUrl !== undefined) {
+    await dbd.batch([
+      dbd.update(repoMirrors).set(set).where(eq(repoMirrors.repoId, repoId)),
+      dbd
+        .update(repositories)
+        .set({ originalUrl: repoOriginalUrl, updatedAt: new Date() })
+        .where(eq(repositories.id, repoId)),
+    ]);
+  } else {
+    await dbd.update(repoMirrors).set(set).where(eq(repoMirrors.repoId, repoId));
+  }
+
+  const status = await getMirrorStatus(db, repoId);
+  if (status === null) {
+    // The row existed at load; a delete racing the write is the only path.
+    throw new MirrorConflictError("mirror row vanished during the settings write");
+  }
+  return status;
+}
+
+/** `Basic base64(user:pass)` over the composed pair; both empty → null (the
+ *  anonymous form — deriveMirrorAuthHeader's register-arm shape). */
+function deriveBasicHeader(username: string, password: string): string | null {
+  if (username === "" && password === "") return null;
+  return `Basic ${base64Encode(new TextEncoder().encode(`${username}:${password}`))}`;
+}
+
+/** The decrypt half of the §4.2 envelope — byte-for-byte sync.ts
+ *  `mirrorAuthHeader`'s format (nonce[12] || AES-256-GCM, AAD
+ *  `${mirrorId}:${repoId}`), re-implemented LOCALLY because this module is
+ *  deliberately engine-free (the route-graph boundary, the module header):
+ *  sync.ts imports the engine, this file must not reach it. The
+ *  mirror.test.ts round-trip cross-verifies the two halves. */
+async function decryptMirrorCredentials(
+  env: MirrorSettingsEnv,
+  mirrorId: number,
+  repoId: string,
+  ciphertext: string,
+): Promise<string> {
+  const kek = env.MIRROR_CREDENTIAL_KEY;
+  if (kek === undefined || kek === "") {
+    throw new MirrorCredentialKeyError(
+      "MIRROR_CREDENTIAL_KEY is not configured; stored mirror credentials cannot be recomposed",
+    );
+  }
+  const raw = base64Decode(ciphertext);
+  if (raw.length < 12 + 16) {
+    throw new MirrorCredentialKeyError("mirror credential ciphertext is truncated");
+  }
+  const key = await crypto.subtle.importKey("raw", base64Decode(kek), "AES-GCM", false, ["decrypt"]);
+  const plain = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: raw.slice(0, 12),
+      additionalData: new TextEncoder().encode(`${mirrorId}:${repoId}`),
+      tagLength: 128,
+    },
+    key,
+    raw.slice(12),
+  );
+  return new TextDecoder().decode(plain);
 }
 
 // ---------------------------------------------------------------------------

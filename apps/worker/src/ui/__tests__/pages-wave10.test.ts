@@ -16,8 +16,9 @@
  * owner/watcher/poster/subscriber/commenter arms — and the foreign-activity
  * rule that keeps a poster's own issue out of their own mailbox), the
  * mark/unread/pin state machine through the POST arms, the mark-all purge,
- * the mirror panel's admin gate, and the honest absences (the API's missing
- * settings-write arm, the non-mirror empty state).
+ * the mirror panel's admin gate, and the empty states (the non-mirror
+ * attach hint, the archived warning; the settings-edit wave retired the
+ * panel's own honest absence — the form renders editable, SPEC-0009 §2.3.1).
  */
 
 import { env } from "cloudflare:test";
@@ -455,10 +456,20 @@ describe("mirror settings panel (/settings/mirror)", () => {
     expect(html).toContain("Interval: 8h0m0s");
     expect(html).toContain("Prune (Remove obsolete remote-tracking references): ✓");
     expect(html).not.toContain("Last error");
-    // The honest absence (no PUT arm — no edit form controls rendered).
-    expect(html).toContain("Editing the interval, prune or source address is not supported yet");
-    expect(html).not.toContain('<input id="interval"');
-    expect(html).not.toContain('<input id="enable_prune"');
+    // The settings-edit wave (SPEC-0009 §2.3.1 — MIRROR unit fold, disclosed:
+    // the honest-absence note retired with its landed write arm): the edit
+    // form renders EDITABLE controls — prune checkbox, interval, address,
+    // the Authorization details, LFS pair.
+    expect(html).toContain('<input type="hidden" name="action" value="mirror"/>');
+    expect(html).toContain('<input id="interval" name="interval" value="8h0m0s"/>');
+    expect(html).toContain('<input id="enable_prune" name="enable_prune" type="checkbox" checked=""/>');
+    expect(html).toContain(
+      '<input id="mirror_address" name="mirror_address" value="https://mirrors.invalid/wave10.git" required=""/>',
+    );
+    expect(html).toContain('<input id="mirror_username" name="mirror_username" value=""/>');
+    expect(html).toContain('<input id="mirror_password" name="mirror_password" type="password"');
+    expect(html).toContain("Update Mirror Settings");
+    expect(html).not.toContain("Editing the interval, prune or source address is not supported yet");
   });
 
   it("renders the not-a-mirror empty state and the archived warning", async () => {

@@ -189,6 +189,101 @@ empty advertisement and push is `409` (SPEC-0003 §2.6).
   they are carried as deferred rows in SPEC-0004's swagger contract inventory
   (documented absence, like SPEC-0003's dumb-HTTP endpoints).
 
+#### 2.3.1 Mirror settings WRITE arms (the settings-edit port, 2026-11-04)
+
+The mirror settings are writable on BOTH surfaces, ported over the landed
+`repo_mirrors` row (api/services/mirror.ts `updateMirrorSettings`). Upstream
+derivation at the pin:
+
+- **API PATCH** — upstream dispatches `updateMirror` when ANY of
+  `mirror_interval` / `enable_prune` / `mirror_username` / `mirror_password` /
+  `mirror_token` is present (repo.go:620-628; fields at structs/repo.go:246-255).
+  A repo that is not a mirror SILENTLY SKIPS the arm — no error, 200 with the
+  unchanged repo (repo.go:1029-1033). Route gate `reqToken + reqAdmin`
+  (api.go:1244) — the PATCH's landed admin gate. Response renders the mirror
+  triple (`mirror_interval` / `mirror_updated` / `mirror_last_sync_at`,
+  structs/repo.go:127-133) — upstream's `innerToRepo` reads the mirror row on
+  EVERY render of a mirror repo (convert/repository.go:160-170), not only on
+  mirror-field PATCHes; ours renders it identically (the PATCH passes the
+  relations `mirrorRow` when `is_mirror`).
+- **Web settings form** — options.tmpl:136-191 (action `mirror` →
+  `handleSettingsPostMirror`, routers/web/repo/setting/setting.go:279-372),
+  editable: `enable_prune`, `interval`, `mirror_address`, `mirror_username` +
+  `mirror_password` (the Authorization details), `mirror_lfs` +
+  `mirror_lfs_endpoint`. Gate `!repo.IsMirror || repo.IsArchived → NotFound`
+  (setting.go:283-286).
+- **The address restriction**: the API CANNOT change the source address —
+  `EditRepoOption` has no address field, only the credential triple (structs/
+  repo.go:246-255; the auth arm recomposes credentials over the UNCHANGED
+  `repo.OriginalURL` base, repo.go:1104-1108). The web form CAN change it
+  (options.tmpl:152-155): new address through the migrate URL gate, then
+  `UpdateAddress` (services/mirror/mirror_pull.go:31-60) — upstream rewrites
+  the git remote with credentials embedded and stores the sanitized URL in
+  `OriginalURL`; the mirror's `RemoteAddress` gets `SanitizeURL` of the form
+  value (setting.go:340-345). Our port: there is no git remote to rewrite —
+  the sync fetches from the ROW (`sync.ts` reads `remote_address` per sync,
+  sync.ts:734) — so the write is `repo_mirrors.remote_address` +
+  `repositories.original_url` (both sanitized), gated by the same
+  `checkMirrorSourceUrl` the register arm uses (https-only + egress policy,
+  §4.1; upstream's web gate `IsMigrateURLAllowed` + the API's
+  `handleRemoteAddrError` 422 family, migrate.go:258-274).
+
+Validation (both surfaces; upstream checks are identical modulo the error
+rendering):
+
+- **interval**: Go duration; unparseable → 422 (`time: invalid duration "x"`,
+  the API arm's `err.Error()` text, repo.go:1044-1048); `0` allowed =
+  scheduling disabled; `interval != 0 && interval < MIRROR.MinInterval
+  (default 10m, modules/setting/mirror.go:21)` → 422 with the API arm's exact
+  text `invalid mirror interval: 5m0s is below minimum interval: 10m0s`
+  (repo.go:1050-1057). The web form renders the same refusal as the locale
+  string `repo.mirror_interval_invalid` ("The mirror interval is not valid.",
+  setting.go:299-303).
+- **storage unit semantics**: upstream `Mirror.Interval` is a `time.Duration`
+  (xorm int64 nanoseconds, models/repo/mirror.go:28); the FORM and API carry
+  Go-duration STRINGS. Our landed column is `repo_mirrors.interval_seconds`
+  (INTEGER seconds, schema.ts) — the write arm parses the string with the
+  landed Go-duration parser (`parseGoDuration`) and stores SECONDS; the
+  render is `Duration.String()` whole-second form (`renderGoDuration`). No
+  MINUTES representation exists anywhere upstream — the column is Duration.
+- **credentials**: composition ports repo.go:1067-1103 exactly — username =
+  provided or stored; password = provided; token wins over password
+  (`authToken != "" → authPassword = authToken`); when neither password nor
+  token is provided AND the username is unchanged-or-empty, the stored
+  password carries over; a username-only change to a DIFFERENT username drops
+  the stored password (composes an empty one — the `mirror_password_help`
+  locale "Change the username to erase a stored password."). Ours: the stored
+  secret lives in the §4.2 envelope, so "carry over" = decrypt-recompose-reseal
+  (KEK required → the 500 family when missing, §4.2); the Authorization
+  header value is never echoed back. An explicit empty password with an empty
+  username composes the anonymous form (header null, `credentials_username`
+  null) — upstream's `len(user)+len(pass) == 0` anonymous remote
+  (modules/git/remote.go:84-87). The egress gate re-runs on the stored
+  address whenever the auth arm fires (upstream re-gates the composed
+  address, repo.go:1108-1112).
+- **reschedule side effect**: an interval WRITE re-arms the sync —
+  `ScheduleNextUpdate` (mirror.go:71-77): `next_sync = now + interval`, or
+  `0` (unscheduled) when the interval is `0`. Prune/credential/address writes
+  do NOT reschedule and do NOT wake the sync — the change takes effect at the
+  next due scan (or the next sync's settle, which schedules from the row it
+  read; a settings write racing an in-flight sync can be overwritten by that
+  sync's settle — upstream holds the same race, its settle uses the in-memory
+  mirror copy). No immediate sync is enqueued on a settings write (upstream
+  enqueues nothing; `UpdateAddress`/`UpdateMirror` only persist).
+
+Web form posture: the blank-username/blank-password fields backfill from the
+stored credentials (setting.go:312-318) — blank = unchanged; the password
+input never receives the stored secret (placeholder "(Unchanged)"). The form
+keeps the upstream dispatch: the sync button posts `action=mirror-sync`, the
+edit form posts `action=mirror` (options.tmpl:169/151); the landed
+empty-body POST = sync reduction is retained for back-compat. The honest-
+absence note is retired; the form renders the upstream field set (prune
+checkbox, interval, address, Authorization details, LFS checkbox + endpoint —
+the LFS fields store into the reserved `lfs_*` columns like the register arm;
+the sync ignores them until the LFS-mirror wave, per the schema reservation).
+Validation failures re-render the page with the message (upstream
+`RenderWithErrDeprecated`); success 303s back onto the page.
+
 ### 2.4 ACL matrix addition (SPEC-0003 §2.4 extension)
 
 | # | Caller | Repo | Op | Response | Upstream cite |
