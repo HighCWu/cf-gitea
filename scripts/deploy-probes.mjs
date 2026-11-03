@@ -9207,7 +9207,11 @@ const AUDIT_TABLES = [
   // outlives it. The 389da18 delete sweep still cascades action rows away
   // WITH their repo, so every EPHEMERAL battery repo leaves 0 — NO hand-sweep;
   // a THIRD survivor (another leaked standing repo) still fails this check.
-  { key: "action_rows", sql: `(SELECT COUNT(*) FROM "action")`, want: 2, label: `"action" (whole table — the two standing p0-shallow fixtures' create-repo events, the 0219256 calibration + one more since; the 389da18 delete sweep cascades every deleted repo's rows away, so NO hand-sweep)` },
+  // v1.5.6 re-baseline (2026-11-03): want 2 -> 3 — the THIRD standing
+  // p0-shallow (p0probe2/3/4's set; its repo EXISTS, verified) joined with
+  // its own create-repo event since the v1.5.1 pair. Same mechanism the
+  // v1.5.1 comment predicted ("one more since"); a FOURTH still fails.
+  { key: "action_rows", sql: `(SELECT COUNT(*) FROM "action")`, want: 3, label: `"action" (whole table — the THREE standing p0-shallow fixtures' create-repo events, the v1.5.6 re-baseline; the 389da18 delete sweep cascades every deleted repo's rows away, so NO hand-sweep)` },
   { key: "stars", sql: `(SELECT COUNT(*) FROM "stars")`, want: 0, label: `stars` },
   { key: "push_mirrors", sql: `(SELECT COUNT(*) FROM "push_mirrors")`, want: 0, label: `push_mirrors` },
   { key: "protected_branches", sql: `(SELECT COUNT(*) FROM "protected_branches")`, want: 0, label: `protected_branches` },

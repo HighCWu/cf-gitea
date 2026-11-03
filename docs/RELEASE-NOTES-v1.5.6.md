@@ -1,12 +1,19 @@
 # cf-gitea v1.5.6 — Release Notes (the table-alignment wave)
 
-**Range**: RANGE=`f032241..5afe965` — **COMMIT_COUNT=41** commits, landed
+**Range**: RANGE=`f032241..<release HEAD>` — **COMMIT_COUNT=48** commits, landed
 across 2026-11-03's day and evening — the ADR-0007 schema-parity wave and
 its adversarial-review loops.
-Deployed as **`[[ORCHESTRATOR-FILLS: DEPLOY_ID]]`** (version
-`[[ORCHESTRATOR-FILLS: version]]`). Probe battery **[[ORCHESTRATOR-FILLS:
-planned/passed/warn counts]]** under the NEW four-way monitor taxonomy (see
-§3). The full-suite composite gate: **[[ORCHESTRATOR-FILLS: gate result]]**.
+Deployed as **`DEPLOY_ID=9cb84065`** (version
+`9cb84065-24fa-4f2c-a335-cdc725d35078`). Probe battery **253 planned, all green on the release run (exit 0 — zero
+FAIL-class) with 6 warns** (the documented token-unconfigured classes; under
+the NEW four-way monitor taxonomy, see §3). The full-suite composite gate was accepted **green-with-adjudication on R3**:
+480 files, 477 pass, ZERO assertion failures (R1's 15 assert-files and R2's 9
+fully dispositioned: two REAL FN-4 blast regressions fixed — the D1
+result-set-column-cap 500ing the notifications wide query, and TEN
+batched-description readers still on the retired repo_settings store — plus
+thirteen stale-pin re-pins), 3 timeout-files solo-exonerated ×2 deterministic
+(webhooks, pull-engine — the v1.5.3-documented class; gitlink-dir-diff), and
+the `87621de` EnvironmentTeardownError known unhandled class.
 **Seven migrations land with this release** — `0062` (the Actions schedule
 registry), `0063` (the federation follower store), `0064` (the PRStatus
 stored-enum swap, data-only), `0065` (FN-3's `review_state.updated_files`),
@@ -491,16 +498,24 @@ review's LOW findings tracked to disposition.
   bullet).
 - **Gate-line arithmetic**: FY flagged that `049c09a`'s committed gate line
   ("41/41 + 91/91 across the seven files") mis-states the arithmetic; the
-  corrected reading is [[ORCHESTRATOR-FILLS: corrected totals from FY's
-  report — the freeze carries the CORRECTED version of 049c09a's gate line,
-  not the commit message's]].
+  corrected reading: FP's own scope was 41/41 (user-profile.matrix) + 35
+  across the other four files = 76 total — the committed "91/91" was FO's
+  suite count bleeding into FP's message (adjacent landings, minutes apart);
+  all suites were green, only the arithmetic was wrong. This record carries
+  the corrected line.
 
 ## 3. Gate, deploy, and probe evidence
 
-- Full-suite composite gate: **[[ORCHESTRATOR-FILLS: files, passed, assertion
-  failures, solo-exonerated flakes, known teardown classes, adjudication]]**.
-- Build: **[[ORCHESTRATOR-FILLS: build/dist check result]]**.
-- Deploy: **[[ORCHESTRATOR-FILLS: DEPLOY_ID + version]]**. DEPLOY-ORDER
+- Full-suite composite gate: accepted green-with-adjudication on R3 — 480
+  files / 477 pass / ZERO asserts; R1 (465/15) and R2 (470/9) fully
+  dispositioned (the two FN-4 regressions + the seed/pin migrations, commits
+  `a606ecc` + the round-2 batch); 3 timeouts solo ×2 (webhooks, pull-engine,
+  gitlink-dir-diff); the 87621de teardown class (activity-author-data.smoke).
+- Build: `pnpm build` clean (vite, 161ms); the drizzle single-chunk pin verified.
+- Deploy: **`9cb84065`** (version `9cb84065-24fa-4f2c-a335-cdc725d35078`),
+  the full trigger/queue table mounted; the migration chain 0062→0068 applied
+  remote FIRST (`pnpm db:migrate:remote` — all seven ✅, "No migrations to
+  apply!" on verify). DEPLOY-ORDER
   NOTE: the migration chain 0062 → 0063 → 0064 → 0065 → 0066 applies
   BEFORE the new worker serves traffic (`pnpm db:migrate:remote` first —
   0064 is data-only and production pull_requests rows carry the swapped
@@ -517,7 +532,8 @@ review's LOW findings tracked to disposition.
   tooling note from the same commit: `pnpm db:generate` cannot pass `--`
   through to drizzle-kit (pnpm's brocli swallow) — custom migrations invoke
   `pnpm exec drizzle-kit generate --custom` directly.
-- Probes: **[[ORCHESTRATOR-FILLS: planned/passed/warn/fail counts]]** — run
+- Probes: **the release run: 253 planned, exit 0 (zero FAIL), 6 warns** —
+  run
   under FV's NEW taxonomy: the monitor warn class is now four-way
   (missing-auth `[warn]` pre-authorization / permission-denied 401-403 FAIL
   / api-unsupported 405-415-410-451-501 + entitlement-403 `[warn]` /
@@ -532,8 +548,21 @@ review's LOW findings tracked to disposition.
   diff is empty.
   (The oauth2-userinfo baseline was already re-based in v1.5.5 — the probe
   expects the PAT 200 with the OIDC shape, per FJ's M2 as-built.)
-- PAT posture: **[[ORCHESTRATOR-FILLS: mint → battery → row deleted
-  evidence]]**.
+- PAT posture: minted via bootstrap-admin (v156probe) → battery runs →
+  row deleted by sha256 + token file shredded (the standing discipline).
+  EVIDENCE-RERUN DISCLOSURE: the release run's tally was captured through a
+  tail pipe (only the audit tail survived), so a full-capture rerun was run
+  for the record; its 8 fails are ALL double-run/transient classes,
+  each dispositioned — the fw-pr trio healed on targeted rerun; the org-web
+  trio is the double-run-non-idempotent class (run 1's add/leave arms
+  consumed the shared org fixture's state — the battery cleans sessions but
+  not the org; the SAME build served run 1 all-green); wikigit was the
+  transient-uplink window (TLS handshake → fetch failed, ×3 attempts — the
+  v1.5.3 class) then green; and audit-action-rows was a stale CALIBRATION
+  re-baselined 2->3 (the third STANDING p0-shallow fixture's create event —
+  the v1.5.1 comment's own predicted mechanism) plus one p0probe-namespace
+  orphan repo hand-swept (children-then-row, the battery's DELETE-arm
+  network-window miss). The calibration change rides this commit.
 
 ## 4. The recorded remainders
 
