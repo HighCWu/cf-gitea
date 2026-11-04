@@ -106,7 +106,7 @@ export const orgHomeLocale = {
 export const ORG_HOME_PAGE_SIZE = 15;
 
 /** One rendered row: the full repository row (the pulls counter lives on it)
- *  plus the repo_settings description. */
+ *  plus the repositories.description column (the FN-4/0068 port). */
 export interface OrgHomeRepoItem {
   repo: typeof repositories.$inferSelect;
   description: string;
@@ -134,8 +134,10 @@ export function orgDisplayName(org: OrgRecord): string {
 /**
  * Load the page (§3.2 — the landed services, never a self-fetch): the
  * visible-row listing (the §4.7 owner predicate lives in the service), then
- * one batched description read for the page's rows (the wave-2 batching
- * pattern — loadRepoSettings is per-repo; the list needs the column only),
+ * one batched description read for the page's rows — the
+ * `repositories.description` column (the FN-4/0068 port; the wave-2
+ * batching pattern kept — loadRepoSettings is per-repo, the list needs
+ * the column only),
  * then the org-header follow state (org/header.tmpl:17's
  * `{{template "org/follow_unfollow"}}` arm — IsFollowing(doer, org), the
  * users-row org id the landed follows table keys).

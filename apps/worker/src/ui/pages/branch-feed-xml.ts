@@ -99,9 +99,9 @@
  * - A failed log read degrades to the empty item list (the §4.9 posture —
  *   the tags twin's "a failed ref read degrades to the empty list";
  *   upstream ServerErrors, the twins degrade).
- * - The channel description is the RAW repo_settings description (the
- *   store upstream's `repo.Description` reads through on this side — the
- *   tags twin's convention).
+ * - The channel description is the RAW repositories.description column
+ *   (the FN-4/0068 port — the store upstream's `repo.Description` reads
+ *   through on this side — the tags twin's convention).
  * - Times format in UTC (the user-feed header's zone reduction; the
  *   committer line carries its own offset — the format helpers pin UTC,
  *   upstream renders the server zone, UTC in every default deployment).
@@ -384,8 +384,8 @@ export function renderBranchFeedAtom(input: BranchFeedEnvelopeInput): string {
  * universe (upstream RepoRefByType's middleware arm; a failed refs read is
  * indistinguishable from a missing branch here) — then the tip-backwards
  * log page (`listLog(branchRef, {ofs: 0, n: 10})`, CommitsByRange's shape
- * at the handler's fixed size), the RAW repo_settings description for the
- * channel. `null` = the unknown-branch answer the route must 404-shell:
+ * at the handler's fixed size), the RAW repositories.description column
+ * for the channel (the FN-4/0068 port). `null` = the unknown-branch answer the route must 404-shell:
  * the group (web.go:1683-1762) carries NO MustBeNotEmpty — an EMPTY repo
  * 404s through this same arm (no refs exist to resolve).
  */

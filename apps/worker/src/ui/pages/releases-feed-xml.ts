@@ -398,7 +398,8 @@ interface PublisherRow {
  * :280-292), `created_unix DESC, id DESC` (ToOrders), NO pagination (the
  * zero ListOptions — every matching row). Prereleases are NOT filtered.
  * The publisher join carries the ghost arm; the channel description is
- * the RAW repo description (the landed repo_settings store). `null` =
+ * the RAW repo description (the `repositories.description` column — the
+ * FN-4/0068 port; the repo_settings store is superseded). `null` =
  * upstream's group-gate answer the route must 404-shell:
  * `repo.MustBeNotEmpty` — an EMPTY repo never reaches the handler
  * (web.go:1504; the route ALSO runs `releasesReadGate`, the loader's arm

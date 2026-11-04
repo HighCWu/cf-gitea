@@ -198,7 +198,8 @@ export const userWatchingTabLocale = {
 export const USER_WATCHING_TAB_PAGE_SIZE = 15;
 
 /** One rendered watched-repo row: the repository row plus the per-row owner
- *  visibility (the internal-badge arm) and the repo_settings description. */
+ *  visibility (the internal-badge arm) and the repositories.description
+ *  column (the FN-4/0068 port). */
 export interface WatchingRepoItem {
   repo: typeof repositories.$inferSelect;
   /** The owning user's visibility — the list.tmpl internal-badge arm. */

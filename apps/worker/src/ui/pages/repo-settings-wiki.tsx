@@ -41,10 +41,13 @@
  * - NOT rendered — no dead controls (§2.4.1):
  *   - the `enable_external_wiki` radio pair + `external_wiki_url` input:
  *     the landed PATCH arm accepts-and-ignores the `external_wiki` object
- *     (src/api/models/repository.ts:260-262 — "accepted per shape and
+ *     (src/api/models/repository.ts:268-269 — "accepted per shape and
  *     ignored"), there is no external-wiki store; the built-in wiki is the
  *     only landed flavor. Rendered as a read-only line + the honest absence
- *     note (the mirror panel's `editing_unavailable` pattern).
+ *     note (a recorded accepted-and-ignored arm, cite above; the mirror
+ *     panel's old `editing_unavailable` honest-absence pattern is RETIRED —
+ *     MIRROR 27abab8, SPEC-0009 §2.3.1's edit form renders the real field
+ *     set — so it is cited as precedent no more).
  *   - the `default_wiki_branch` input: upstream posts it to
  *     `wiki_service.ChangeDefaultWikiBranch` (setting.go:600-611); the
  *     landed wiki's branch IS the repository's default branch with no

@@ -31,8 +31,9 @@
  *     case-folded lookup (display case preserved in the DOM and the links);
  *   - the repo-list SHAPE through /{org}: the anonymous 15-row cap
  *     rendering pager-less at the exact cap, the Internal badge (a public
- *     repo under a private org) for the admitted plain member, the batched
- *     repo_settings description body, the open-pulls chip (the
+ *     repo under a private org) for the admitted plain member, the
+ *     repositories.description body (the FN-4/0068 port), the open-pulls
+ *     chip (the
  *     num_pulls − num_closed_pulls subtraction, the 0/0 → 0 floor), the
  *     Updated relative-time line, and the Archived row badge;
  *   - the pagination GRAMMAR through /{org}: page 2's Newer folding onto
@@ -396,7 +397,7 @@ describe("the repo-list shape through /{org}", () => {
     const res = await getRoute("/ohmpub", world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
-    // The batched repo_settings description…
+    // The batched repositories.description body (the FN-4/0068 port)…
     expect(html).toContain("The public workhorse.");
     // …and the pulls chip with the open subtraction (3 − 1 → 2) linked to
     // the live /pulls page.

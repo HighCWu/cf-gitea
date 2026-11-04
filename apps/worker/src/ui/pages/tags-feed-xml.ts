@@ -458,7 +458,8 @@ interface PublisherRow {
  * (upstream's `FindReleasesOptions{IncludeTags: true}` semantics:
  * `is_draft = false`, no `is_tag` condition — models/repo/release.go
  * :276-281), the batched publisher join carrying the ghost arm. The
- * channel description is the RAW repo description (repo_settings store).
+ * channel description is the RAW repo description (the
+ * `repositories.description` column — the FN-4/0068 port).
  * `canReadReleases` is the loaded `has_releases` setting (the releases
  * twin's gate pair's unit clause — the route must NOT 404 on it, the
  * tags group's gate is reqUnitCodeReader, web.go:1502). `null` =
@@ -537,7 +538,8 @@ export async function loadTagsFeedData(
 
   // The channel fields (feed/release.go:30-46): the tags_for locale title
   // over FullName(), the plain `/tags` link, the RAW description
-  // (repo_settings store — no markdown render), Created = now.
+  // (the repositories.description column — the FN-4/0068 port; no markdown
+  // render), Created = now.
   return {
     title: TAGS_FOR.replace("%s", `${repo.ownerNamespace}/${repo.slug}`),
     link: `${repoHref}/tags`,

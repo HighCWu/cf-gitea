@@ -30,8 +30,9 @@
  *     SQL through the UI list) and the site admin rides the isAdmin bypass;
  *   - the repo-list shape beyond wave-23's href probes: the org-header
  *     visibility badge pair, the Internal badge (a public repo under a
- *     private org), the Archived/Private row badges, the batched
- *     repo_settings description body, the open-pulls counter chip (the
+ *     private org), the Archived/Private row badges, the
+ *     repositories.description body (the FN-4/0068 port), the open-pulls
+ *     counter chip (the
  *     num_pulls − num_closed_pulls subtraction), and the Repositories tab's
  *     visible-count label;
  *   - the pagination grammar at the landed 15-per-page cap: an exact-count
@@ -394,7 +395,7 @@ describe("the repo-list shape (the DOM arms wave-23's href probes never pinned)"
     expect(html).toContain('class="page-content organization profile"');
     // 15 rows on page 1 (16 total, slug ASC).
     expect(html.split('<div class="item">').length - 1).toBe(15);
-    // alpha's body: the batched repo_settings description…
+    // alpha's body: the repositories.description body (FN-4/0068 port)…
     expect(html).toContain("The public workhorse.");
     // …and the pulls chip with the open subtraction (3 − 1 → 2).
     const alphaRow = html.split('href="/reposmx/alpha"')[1] ?? "";

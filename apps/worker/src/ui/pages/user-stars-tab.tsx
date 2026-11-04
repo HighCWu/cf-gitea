@@ -135,7 +135,8 @@ export const userStarsTabLocale = {
 export const USER_STARS_TAB_PAGE_SIZE = 15;
 
 /** One rendered starred-repo row: the repository row plus the per-row owner
- *  visibility (the internal-badge arm) and the repo_settings description. */
+ *  visibility (the internal-badge arm) and the repositories.description
+ *  column (the FN-4/0068 port). */
 export interface StarsRepoItem extends StarredByUserItem {
   description: string;
 }

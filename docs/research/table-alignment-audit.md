@@ -38,7 +38,20 @@ sources and found accurate.
   figure was 65); of the 31 MISSING, 8 — the four original_author pairs —
   are recorded-absent per §7.11, not port targets (the three
   flipped-table pairs of §7.11 §7 plus comment's own pair, which is why
-  FN-2 ports 5, not 7). The 4-missing-table
+  FN-2 ports 5, not 7). **Post-landing reconciliation (DOCWAVE unit,
+  2026-11-04):** the drift columns since consumed are 29 — RENAME 17 (FN-5,
+  migration `0069_fn5-upstream-column-names`: 16 annotated in their §4
+  sections here + `project_board.default`, annotated by CENSUS2) and
+  MISSING 12 (FN-3 `updated_files` 0065; FN-6's repo_units trio 0066;
+  FN-2's comment five 0067; FN-7 `merged_commit_id` 0070; FN-8
+  `context_hash` + `index` 0072) — so the live drift-column residual is
+  **34 = 19 MISSING + 4 RENAME + 4 OURS-EXTRA + 7 TYPE** (arithmetic:
+  63 − 17 − 12 = 34; of the 19 MISSING, 8 are the §7.11 recorded-absent
+  pairs and 11 are open port targets — FN-10/FN-12's in-flight 0073
+  strictness batch not counted). The RENAME residual is exactly the 4
+  columns the FN-5 batch never contained: `repo_transfer.created_unix`,
+  `repo_collaborators.created_unix`/`updated_unix`, `lfs_locks.created`.
+  The 4-missing-table
   figure undercounts by counting only data tables a reader would touch;
   this census counts every registered upstream table.
 - **Recommended first three migration units: FN-1 (pull_requests.status
@@ -54,11 +67,16 @@ sources and found accurate.
   comments mutation-metadata five after §7.11 recorded the original_author
   pair absent — the §4 `comment` row, the derivation expansion's column
   rows, and the §5 section carry the landed annotations; SPEC-0005 §7 is
-  the as-built record). The next OPENING units per this
-  audit's own ordering (API-visible first, records last) are therefore
-  FN-7 (pull_auto_merges,
-  riding FN-5's renames), and FN-4 (repositories upstream-column
-  completion, purely additive).
+  the as-built record), FN-4 LANDED (migration 0068, the repositories port
+  columns + writer legs — §5's row carries the status), FN-5 LANDED
+  (migration 0069, the gonic/project rename batch — the nine FN-5-member
+  §4 sections carry the landed annotations), FN-8 LANDED (migration 0072,
+  commit_statuses `context_hash`/`index` + commit_status_indexes — §3.1's
+  rows carry the flips), and FN-7 LANDED (migration 0070,
+  `merged_commit_id` + the stamp arm — §5's row carries the status).
+  The remaining open arms are the strictness batch FN-10/FN-12 (in
+  flight, 0073), FN-11 (port-or-record), FN-14 (port-when-read), and the
+  4 residual RENAMEs of the reconciliation above.
 
 ## 1. Method (reproducible)
 
@@ -744,9 +762,12 @@ upstream: models/asymkey/gpg_key.go (struct `GPGKey`)
 
 ### `issue` → `issues` schema.ts:776
 
-upstream: models/issues/issue.go (struct `Issue`)
+upstream: models/issues/issue.go (struct `Issue`) — the RENAME line below
+LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04): the column
+is upstream's `name` again — ours upstream-EXACT; the property name
+(`title`) is kept per the property-kept contract (§7.10)
 
-- RENAME `name` → `title` (ours `issues`; schema.ts:792) — column-NAME tag, not mapper output: upstream `Title string xorm:"name"` (models/issues/issue.go:63) sets the SQL column to `name`, and upstream's own SQL binds that literal (title writes: `UpdateIssueCols(ctx, issue, "name")` inside ChangeIssueTitle, models/issues/issue_update.go:198; keyword search: `BuildCaseInsensitiveLike` over the backticked column, models/issues/issue.go:536) — name-only divergence; FN-5 carrier (§7.8)
+- RENAME `name` → `title` (ours `issues`; schema.ts:792) — column-NAME tag, not mapper output: upstream `Title string xorm:"name"` (models/issues/issue.go:63) sets the SQL column to `name`, and upstream's own SQL binds that literal (title writes: `UpdateIssueCols(ctx, issue, "name")` inside ChangeIssueTitle, models/issues/issue_update.go:198; keyword search: `BuildCaseInsensitiveLike` over the backticked column, models/issues/issue.go:536) — name-only divergence; FN-5 carrier (§7.8) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `name`
 
 ### `issue_label` → `issue_labels` schema.ts:1030
 
@@ -769,9 +790,12 @@ upstream: models/issues/dependency.go (struct `IssueDependency`)
 
 ### `tracked_time` → `tracked_time` schema.ts:2103
 
-upstream: models/issues/tracked_time.go (struct `TrackedTime`)
+upstream: models/issues/tracked_time.go (struct `TrackedTime`) — the RENAME
+line below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04):
+the column is upstream's `time` again — ours upstream-EXACT; the property
+name (`seconds`) is kept per the property-kept contract (§7.10)
 
-- RENAME `time` → `seconds` (ours `tracked_time`; schema.ts:2111) — rename; unit stays seconds upstream API json "time" is seconds too (modules/structs)
+- RENAME `time` → `seconds` (ours `tracked_time`; schema.ts:2111) — rename; unit stays seconds upstream API json "time" is seconds too (modules/structs) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `time`
 
 ### `review` → `pull_reviews` schema.ts:2629
 
@@ -804,33 +828,52 @@ was the table's ONLY drift; the cite-audit propagated the flip)
 
 upstream: models/pull/review_state.go (struct `ReviewState`) — the updated_files
 line below LANDED by FN-3 (2026-11-03, migration 0065; `updated_files` TEXT NOT
-NULL DEFAULT '{}', the numeric ViewedState JSON; `specs/table-alignment-fn3-review-state.md`)
+NULL DEFAULT '{}', the numeric ViewedState JSON; `specs/table-alignment-fn3-review-state.md`);
+the pull_id NAME below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069,
+2026-11-04) — the column is upstream's `pull_id` again (property `issueId`
+kept, §7.10); the VALUE-SPACE half stands
 
-- RENAME `pull_id` → `issue_id` (ours `review_state`; schema.ts:5217) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs)
+- RENAME `pull_id` → `issue_id` (ours `review_state`; schema.ts:5217) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs) — **NAME half LANDED by FN-5** (4b9d555, migration 0069): the column is `pull_id` again; the VALUE-SPACE half stands
 - MISSING `updated_files` (text(json) NOT NULL) — upstream models/pull/review_state.go:46 (`UpdatedFiles`); no ours counterpart — **LANDED by FN-3**
 
 ### `pull_auto_merge` → `pull_auto_merges` schema.ts:5249
 
-upstream: models/pull/automerge.go (struct `AutoMerge`)
+upstream: models/pull/automerge.go (struct `AutoMerge`) — both RENAME lines
+below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04): the
+columns are upstream's `message` and `pull_id` again — ours upstream-EXACT
+on the names; the export/property names are kept per the property-kept
+contract (§7.10); the pull_id VALUE-SPACE note stands. (The
+merged_commit_id line is FN-7's, LANDED by migration 0070 — its §5 row
+carries the status.)
 
-- RENAME `message` → `merge_message` (ours `pull_auto_merges`; schema.ts:5250) — rename-only divergence (name, not semantics)
-- RENAME `pull_id` → `issue_id` (ours `pull_auto_merges`; schema.ts:5256) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs)
+- RENAME `message` → `merge_message` (ours `pull_auto_merges`; schema.ts:5250) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `message`; rename resolved
+- RENAME `pull_id` → `issue_id` (ours `pull_auto_merges`; schema.ts:5256) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs) — **NAME half LANDED by FN-5** (4b9d555, migration 0069): the column is `pull_id` again; the VALUE-SPACE half stands
 - MISSING `merged_commit_id` (text(varchar64)) — upstream models/pull/automerge.go:26 (`MergedCommitID`); no ours counterpart
 - OURS-EXTRA `sha` — schema.ts:5244 (`pull_auto_merges.sha`)
 
 ### `protected_branch` → `protected_branches` schema.ts:2676
 
-upstream: models/git/protected_branch.go (struct `ProtectedBranch`)
+upstream: models/git/protected_branch.go (struct `ProtectedBranch`) — both
+RENAME lines below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069,
+2026-11-04): the columns are upstream's `branch_name` and `config` again —
+ours upstream-EXACT; the unique index was rebuilt onto
+(`repo_id`, `branch_name`) under the unchanged index name
+protected_branches_repo_rule_uq; the export/property names are kept per
+the property-kept contract (§7.10)
 
-- RENAME `branch_name` → `rule_name` (ours `protected_branches`; schema.ts:2687) — rename-only divergence (name, not semantics)
-- RENAME `config` → `rules` (ours `protected_branches`; schema.ts:2694) — rename-only divergence (name, not semantics)
+- RENAME `branch_name` → `rule_name` (ours `protected_branches`; schema.ts:2687) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `branch_name`; rename resolved
+- RENAME `config` → `rules` (ours `protected_branches`; schema.ts:2694) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `config`; rename resolved
 
 ### `protected_tag` → `protected_tags` schema.ts:3321
 
-upstream: models/git/protected_tag.go (struct `ProtectedTag`)
+upstream: models/git/protected_tag.go (struct `ProtectedTag`) — both RENAME
+lines below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04):
+the columns are upstream's gonic-mapper outputs `allowlist_team_i_ds` and
+`allowlist_user_i_ds` again — ours upstream-EXACT; the export/property
+names are kept per the property-kept contract (§7.10)
 
-- RENAME `allowlist_team_i_ds` → `allowlist_team_ids` (ours `protected_tags`; schema.ts:3336) — rename-only divergence (name, not semantics)
-- RENAME `allowlist_user_i_ds` → `allowlist_user_ids` (ours `protected_tags`; schema.ts:3333) — rename-only divergence (name, not semantics)
+- RENAME `allowlist_team_i_ds` → `allowlist_team_ids` (ours `protected_tags`; schema.ts:3336) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `allowlist_team_i_ds`; rename resolved
+- RENAME `allowlist_user_i_ds` → `allowlist_user_ids` (ours `protected_tags`; schema.ts:3333) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `allowlist_user_i_ds`; rename resolved
 
 ### `package_blob_upload` → `package_blob_uploads` schema.ts:4042
 
@@ -851,25 +894,39 @@ export/property names are kept per the property-kept contract (§7.10)
 
 ### `project_issue` → `project_issues` schema.ts:3236
 
-upstream: models/project/issue.go (struct `ProjectIssue`)
+upstream: models/project/issue.go (struct `ProjectIssue`) — the RENAME line
+below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04): the
+column is upstream's `project_board_id` again — ours upstream-EXACT; the
+property name (`projectColumnId`) is kept per the property-kept contract
+(§7.10)
 
-- RENAME `project_board_id` → `project_column_id` (ours `project_issues`; schema.ts:3246) — rename-only divergence (name, not semantics)
+- RENAME `project_board_id` → `project_column_id` (ours `project_issues`; schema.ts:3246) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `project_board_id`; rename resolved
 
 ### `project_workflow` → `project_workflows` schema.ts:3268
 
-upstream: models/project/workflows.go (struct `Workflow`)
+upstream: models/project/workflows.go (struct `Workflow`) — all three RENAME
+lines below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04):
+the columns are upstream's `workflow_event`/`workflow_filters`/
+`workflow_actions` again — ours upstream-EXACT; the export/property names
+(`event`/`filters`/`actions`) are kept per the property-kept contract
+(§7.10)
 
-- RENAME `workflow_actions` → `actions` (ours `project_workflows`; schema.ts:3285) — rename-only divergence (name, not semantics)
-- RENAME `workflow_event` → `event` (ours `project_workflows`; schema.ts:3277) — rename-only divergence (name, not semantics)
-- RENAME `workflow_filters` → `filters` (ours `project_workflows`; schema.ts:3281) — rename-only divergence (name, not semantics)
+- RENAME `workflow_actions` → `actions` (ours `project_workflows`; schema.ts:3285) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `workflow_actions`; rename resolved
+- RENAME `workflow_event` → `event` (ours `project_workflows`; schema.ts:3277) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `workflow_event`; rename resolved
+- RENAME `workflow_filters` → `filters` (ours `project_workflows`; schema.ts:3281) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `workflow_filters`; rename resolved
 
 ### `repo_transfer` → `repo_transfer` schema.ts:411
 
-upstream: models/repo/transfer.go (struct `RepoTransfer`)
+upstream: models/repo/transfer.go (struct `RepoTransfer`) — TWO of the
+three RENAME lines below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069,
+2026-11-04): the columns are upstream's `recipient_id` and `team_i_ds`
+again — ours upstream-EXACT; the property names (`newOwnerId`/`teamIds`)
+are kept per the property-kept contract (§7.10). The `created_unix` line
+is NOT an FN-5 member — ours keeps `created_at`; still open.
 
-- RENAME `created_unix` → `created_at` (ours `repo_transfer`; schema.ts:421) — rename-only divergence (name, not semantics)
-- RENAME `recipient_id` → `new_owner_id` (ours `repo_transfer`; schema.ts:420) — rename-only divergence (name, not semantics)
-- RENAME `team_i_ds` → `team_ids` (ours `repo_transfer`; schema.ts:441) — rename-only divergence (name, not semantics)
+- RENAME `created_unix` → `created_at` (ours `repo_transfer`; schema.ts:421) — rename-only divergence (name, not semantics) — open (not an FN-5 member; migration 0069 did not touch it)
+- RENAME `recipient_id` → `new_owner_id` (ours `repo_transfer`; schema.ts:420) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `recipient_id`; rename resolved
+- RENAME `team_i_ds` → `team_ids` (ours `repo_transfer`; schema.ts:441) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `team_i_ds`; rename resolved
 - MISSING `recipient_access_granted` (boolean NOT NULL, DEFAULT false) — upstream models/repo/transfer.go:75 (`RecipientAccessGranted`); no ours counterpart
 - MISSING `updated_unix` (integer NOT NULL) — upstream models/repo/transfer.go:78 (`UpdatedUnix`); no ours counterpart
 
@@ -897,9 +954,13 @@ upstream: models/repo/collaboration.go (struct `Collaboration`)
 
 ### `audit_event` → `audit_event` schema.ts:3720
 
-upstream: models/audit/audit_event.go (struct `Event`)
+upstream: models/audit/audit_event.go (struct `Event`) — the RENAME line
+below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069, 2026-11-04): the
+column is upstream's `timestamp_unix` again — ours upstream-EXACT; the
+property name (`createdUnix`) is kept per the property-kept contract
+(§7.10)
 
-- RENAME `timestamp_unix` → `created_unix` (ours `audit_event`; schema.ts:3757) — rename-only divergence (name, not semantics)
+- RENAME `timestamp_unix` → `created_unix` (ours `audit_event`; schema.ts:3757) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `timestamp_unix`; rename resolved
 - TYPE `action`: upstream integer (models/audit/audit_event.go:24) vs ours text (schema.ts:3727 (`audit_event`))
 - TYPE `origin`: upstream integer (models/audit/audit_event.go:33) vs ours text (schema.ts:3748 (`audit_event`))
 - TYPE `scope_type`: upstream integer (models/audit/audit_event.go:31) vs ours text (schema.ts:3739 (`audit_event`))
@@ -1309,8 +1370,11 @@ applies).
   (schema.ts:785-787, present-but-unwritten) is recorded RESERVED by the
   same record.
 - **FN-10: issue_pins + issue_labels pk completion.** `issue_pins`: add
-  `id`, `is_pull` (issue_pin.go:18,21) and settle the inverted
-  nullability on `repo_id`/`issue_id`; `issue_labels`: add `id`
+  `id`, `is_pull` (issue_pin.go:18,21); the `repo_id` nullability arm
+  **LANDED** 2026-11-04 (migration `0073_fn10-12-strictness` — the
+  single-column issue_id PK untouched, the composite-PK option DEAD per
+  the §7.1 shape erratum: only repo_id's nullability was ever a real
+  inversion on this table); `issue_labels`: add `id`
   (issue_label.go:20) or record the composite-PK choice.
 - **FN-11: package_blob_upload resumable state.** Missing
   `hash_state_bytes` (package_blob_upload.go:27 — the rolling upload
@@ -1395,8 +1459,8 @@ record. Verified members:
 
 | column | ours | upstream | disposition |
 |---|---|---|---|
-| `issue_subscriptions.created_unix` / `.updated_unix` | NULLable (schema.ts:1189-1190) | `NOT NULL` (models/issues/issue_watch.go:22-23) | **stays DRIFT** — tightening queued; recommended carrier FN-12 (small completions, same-table DDL); census row §3.1 reclassified aligned → drift |
-| `issue_pins.repo_id` | NULLable TEXT (schema.ts:1287) | `int64 UNIQUE(s) NOT NULL` (models/issues/issue_pin.go:19) | **stays DRIFT** — rides FN-10 (also a TEXT id-family column, §2.1) |
+| `issue_subscriptions.created_unix` / `.updated_unix` | NULLable (schema.ts:1189-1190) | `NOT NULL` (models/issues/issue_watch.go:22-23) | **LANDED** 2026-11-04 — migration `0073_fn10-12-strictness` (the FN-12 carrier): the strictness flip via the table rebuild; the one writer (setIssueSubscription, issue-extras.ts) stamps both arms, so no NULL path existed; the 0073 battery in schema.test.ts pins the DDL, the violation probes, and the writer shapes |
+| `issue_pins.repo_id` | NULLable TEXT (schema.ts:1287) | `int64 UNIQUE(s) NOT NULL` (models/issues/issue_pin.go:19) | **LANDED** 2026-11-04 — migration `0073_fn10-12-strictness` (the FN-10 carrier): the NOT NULL flip only, the single-column issue_id PK untouched — the earlier "composite PK" option is DEAD per the §7.1 shape erratum (ours' PK is issue_id alone; repo_id's NULLability was the real inversion); upstream's `UNIQUE(s)` rides the `issue_pins_repo_order_idx` lead as the recorded divergence; the one writer (insertIssuePin) copies issues.repo_id (itself NOT NULL), so no NULL path existed |
 | `users.email` / `users.avatar_email` | NULLable (schema.ts:604, 641) | `NOT NULL` (models/user/user.go:101, 149) | **intentional-recorded** via SPEC-0002 §4.6 item 16 — part of the recorded users reduction: orgs ARE user rows here and the org-create surface writes `email: input.email ?? null`, `avatarEmail: null` (services/orgs/orgs.ts:430-437); upstream's org-as-user-row survives the same NOT NULL only because xorm writes the Go zero `''` for the never-set fields (CreateOrganization, models/organization/org.go:316-337, sets no Email) — ours models "no email" as NULL where upstream stores `''`; same information, different zero convention |
 | `repo_transfer.created_at` | NOT NULL DEFAULT unixepoch (schema.ts:421-423) | `INDEX NOT NULL created` (models/repo/transfer.go:77) | parity-strict — checked because §2.7's itemization hinted at it; no inversion |
 
