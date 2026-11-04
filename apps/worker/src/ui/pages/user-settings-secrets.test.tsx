@@ -17,6 +17,7 @@
  */
 
 import { env } from "cloudflare:test";
+import { decryptInstanceSecretData } from "../../services/instance-key";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -174,14 +175,14 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
     });
     rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.data).toBe("v2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("v2");
     expect(rows[0]!.description).toBe("second");
   });
 
   it("EOL-normalizes the submitted value before the service call (the web write path)", async () => {
     await applyUserSettingsSecretForm(env.DB, 1, { name: "MULTILINE", data: "line1\r\nline2\r\nline3", description: "" });
     const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("line1\nline2\nline3");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("line1\nline2\nline3");
   });
 
   it("surfaces the service's exact validation texts as invalid outcomes", async () => {
@@ -275,7 +276,7 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
       outcome: "saved",
     });
     let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(new TextEncoder().encode(rows[0]!.data).length).toBe(65536);
+    expect(new TextEncoder().encode(await decryptInstanceSecretData(env.DB, rows[0]!.data)).length).toBe(65536);
 
     // 32768 two-byte runes = exactly 65536 bytes: inside the byte cap.
     expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "MULTIBYTE_OK", data: "é".repeat(32768), description: "" })).toEqual({
@@ -316,7 +317,7 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
     // length-units note: "secret data is not" normalized) — the API PUT arm.
     await createOrUpdateSecret(env.DB, ownerScope(1), "API_RAW", "line1\r\nline2", "");
     const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("line1\r\nline2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("line1\r\nline2");
   });
 
   it("the WEB path folds CRLF→LF in data only — a bare CR and the description pass through", async () => {
@@ -326,12 +327,12 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
       description: "desc\r\nkeeps\r\nCRLF",
     });
     let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("win\nold-mac\rend\n"); // util.NormalizeStringEOL folds only \r\n pairs (util.go:312)
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("win\nold-mac\rend\n"); // util.NormalizeStringEOL folds only \r\n pairs (util.go:312)
     expect(rows[0]!.description).toBe("desc\r\nkeeps\r\nCRLF"); // PerformSecretsPost normalizes form.Data only (secrets.go:42)
     // The update arm folds too.
     await applyUserSettingsSecretForm(env.DB, 1, { name: "WEB_EOL", data: "again\r\n", description: "" });
     rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("again\n");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("again\n");
   });
 
   it("the empty-form POST answers the pattern violation and writes nothing (the untouched-form no-JS submit)", async () => {
@@ -347,7 +348,7 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
       outcome: "saved",
     });
     const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("");
   });
 
   it("upsert matches case-insensitively on UPPER(name) — one row, data+description replaced, createdAt untouched", async () => {
@@ -365,7 +366,7 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
     rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
     expect(rows).toHaveLength(1); // the SAME row — the find-by-UPPER-name hit, no duplicate
     expect(rows[0]!.name).toBe("PROD_KEY");
-    expect(rows[0]!.data).toBe("v2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("v2");
     expect(rows[0]!.description).toBe("second");
     expect(rows[0]!.createdAt.getTime()).toBe(1_000_000_000); // UpdateSecret touches data+description only (secret.go:132-152)
   });
@@ -375,14 +376,14 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
     await applyUserSettingsSecretForm(env.DB, 2, { name: "SHARED_NAME", data: "theirs", description: "user 2" });
     let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.data).toBe("mine");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("mine");
     rows = (await listSecretRows(env.DB, ownerScope(2), 1, 10)).rows;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.data).toBe("theirs");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("theirs");
     // The UNIQUE(owner_repo_name) triple is (owner, repo, name) — user 2's re-save stays in its scope.
     await applyUserSettingsSecretForm(env.DB, 2, { name: "SHARED_NAME", data: "theirs-v2", description: "" });
     rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("mine"); // untouched by the foreign upsert
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("mine"); // untouched by the foreign upsert
   });
 });
 
@@ -439,7 +440,7 @@ describe("deleteUserSettingsSecret (SecretsDelete → PerformSecretsDelete)", ()
     expect(await deleteUserSettingsSecret(env.DB, 2, { id: theirs.id })).toBe("deleted");
     const after = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows.filter((row) => row.name === "TWINS");
     expect(after).toHaveLength(1);
-    expect(after[0]!.data).toBe("mine"); // the name-keyed hop resolved within the deleting doer's scope only
+    expect(await decryptInstanceSecretData(env.DB, after[0]!.data)).toBe("mine"); // the name-keyed hop resolved within the deleting doer's scope only
   });
 
   it("a repo-scoped row's id is foreign to the user scope — the hop answers missing and deletes nothing", async () => {

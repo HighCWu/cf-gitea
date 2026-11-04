@@ -240,7 +240,7 @@ async function ensureWave41Repos(): Promise<Wave41Fixture> {
   // The release fixtures through the LANDED create arm + the asset relay.
   const svc = new IssuesService(env.DB);
   const t = (offsetSeconds: number): Date => new Date((T0 + offsetSeconds) * 1000);
-  const existing = await db.select({ id: releases.id }).from(releases).where(eq(releases.repoId, row.id)).limit(1).all();
+  const existing = await db.select({ id: releases.id }).from(releases).where(and(eq(releases.repoId, row.id), eq(releases.isTag, false))).limit(1).all();
   let v41Id: number;
   let draftId: number;
   let txtUuid: string;

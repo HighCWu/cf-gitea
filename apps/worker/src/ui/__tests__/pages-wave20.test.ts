@@ -154,7 +154,7 @@ async function seedWave20Repos(): Promise<Wave20Repo> {
     .get())!;
   const t = (offsetSeconds: number): Date => new Date((T0 + offsetSeconds) * 1000);
   const svc = new IssuesService(env.DB);
-  if ((await db.select({ id: releases.id }).from(releases).where(eq(releases.repoId, repo.id)).limit(1).all()).length === 0) {
+  if ((await db.select({ id: releases.id }).from(releases).where(and(eq(releases.repoId, repo.id), eq(releases.isTag, false))).limit(1).all()).length === 0) {
     // The slash-tag stable (OLDER than v1 — v1 keeps the Latest mark).
     await svc.createRelease({
       repoId: repo.id,
@@ -204,7 +204,7 @@ async function seedWave20Repos(): Promise<Wave20Repo> {
       now: t(120),
     });
   }
-  if ((await db.select({ id: releases.id }).from(releases).where(eq(releases.repoId, draftRepo.id)).limit(1).all()).length === 0) {
+  if ((await db.select({ id: releases.id }).from(releases).where(and(eq(releases.repoId, draftRepo.id), eq(releases.isTag, false))).limit(1).all()).length === 0) {
     await svc.createRelease({
       repoId: draftRepo.id,
       publisherId: alice.id,
@@ -307,7 +307,13 @@ describe("wave-20 parser family (parseUiRoute / handlesUiRoute)", () => {
       owner: "octo",
       repo: "hello",
     });
-    expect(parseUiRoute("/octo/hello/releases/generate-notes")).toBeNull();
+    // B-55 (RLTAILS, 19af9c8): the generate-notes/attachments write tails
+    // are CLAIMED now — the old null pin predates the mounts.
+    expect(parseUiRoute("/octo/hello/releases/generate-notes")).toEqual({
+      family: "release-generate-notes",
+      owner: "octo",
+      repo: "hello",
+    });
     // Wave-41 fold disclosure: `/releases/attachments/{uuid}` (web.go:1513)
     // is the shared attachments-serving seam's repo-scoped twin now —
     // parseUiRoute disowns the whole shape (the src/index.ts dispatcher carve
@@ -315,7 +321,13 @@ describe("wave-20 parser family (parseUiRoute / handlesUiRoute)", () => {
     // no uiRouter registration claims it); only the `/download` half stays a
     // ui family. The write tails stay unclaimed.
     expect(parseUiRoute("/octo/hello/releases/attachments/abc")).toBeNull();
-    expect(parseUiRoute("/octo/hello/releases/attachments")).toBeNull();
+    // B-55: the bare /attachments upload tail is CLAIMED now (the POST
+    // mount); the old null pin predates RLTAILS.
+    expect(parseUiRoute("/octo/hello/releases/attachments")).toEqual({
+      family: "release-attachment-upload",
+      owner: "octo",
+      repo: "hello",
+    });
   });
 });
 
@@ -380,9 +392,14 @@ describe("GET /{owner}/{repo}/releases (the list)", () => {
     expect(html).toContain('<span class="ui yellow label">Draft</span>');
     expect(html).not.toContain('<span class="ui orange label">Pre-Release</span>');
     expect(html.indexOf("Wave20 draft")).toBeLessThan(html.indexOf(">Wave20 v1</a>"));
-    // The draft's own segment (between its title and the next entry) carries
-    // no released-this line.
-    const draftSegment = html.slice(html.indexOf("Wave20 draft"), html.indexOf(">Wave20 v1</a>"));
+    // The draft's own segment (between its title and the NEXT entry's title)
+    // carries no released-this line. B-54's stamp sourcing re-ordered the
+    // list (the adopt keeps v1's mint-era created stamp, so the slash seed
+    // sorts between) — the boundary is the next entry, whichever it is.
+    const nextEntry = Math.min(
+      ...[html.indexOf("Wave20 v1.1 RC"), html.indexOf(">Wave20 v1</a>")].filter((i) => i > -1),
+    );
+    const draftSegment = html.slice(html.indexOf("Wave20 draft"), nextEntry);
     expect(draftSegment).not.toContain("released this");
   });
 
@@ -486,7 +503,14 @@ describe("GET /{owner}/{repo}/releases/latest", () => {
   it("303s onto the newest stable release's detail page", async () => {
     const res = await fetchUi("/alice/wave20rel/releases/latest");
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/alice/wave20rel/releases/tag/w20-v1");
+    // B-54 (d784794) changed the created-stamp sourcing: v1 now rides the
+    // ADOPT arm (the push mint pre-created its is_tag row), which keeps the
+    // mint's commit-era created stamp ("no re-stamp" — the upstream rule the
+    // service cites); the slash-tag fresh seed stamps its `now`. The bare
+    // service's now-vs-the-API-path's commit-stamp seam is recorded on the
+    // convergence backlog — under the landed semantics the slash (t60)
+    // outranks the mint-era v1 here.
+    expect(res.headers.get("location")).toBe("/alice/wave20rel/releases/tag/w20-v1.1/rc");
   });
 
   it("404-shells when no stable release exists", async () => {

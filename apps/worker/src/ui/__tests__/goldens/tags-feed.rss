@@ -5,15 +5,12 @@
     <description></description>
     <pubDate>Tue, 14 Nov 2023 22:13:20 +0000</pubDate>
     <item>
-      <title>Golden v1</title>
-      <link>https://test.local/alice/golden/releases/tag/v1</link>
+      <title>v1</title>
+      <link>https://test.local/alice/golden/src/tag/v1</link>
       <description></description>
-      <content:encoded><![CDATA[<p>First golden release.</p>
-<p>Ships the <strong>seed</strong> fixtures.</p>
-]]></content:encoded>
       <author>alice</author>
-      <guid>1: https://test.local/alice/golden/releases/tag/v1</guid>
-      <pubDate>Tue, 14 Nov 2023 22:14:50 +0000</pubDate>
+      <guid>1: https://test.local/alice/golden/src/tag/v1</guid>
+      <pubDate>Tue, 14 Nov 2023 22:15:20 +0000</pubDate>
     </item>
   </channel>
 </rss>

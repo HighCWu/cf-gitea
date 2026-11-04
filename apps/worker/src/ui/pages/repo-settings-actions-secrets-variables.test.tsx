@@ -21,6 +21,7 @@
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { decryptInstanceSecretData } from "../../services/instance-key";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -190,14 +191,14 @@ describe("applyRepoActionsSecretForm (SecretsPost → PerformSecretsPost over cr
     });
     rows = (await listSecretRows(env.DB, repoScope(repo.id), 1, 10)).rows;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.data).toBe("v2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("v2");
     expect(rows[0]!.description).toBe("second");
   });
 
   it("EOL-normalizes the submitted value before the service call (the web write path, scope-shared)", async () => {
     await applyRepoActionsSecretForm(env.DB, repo.id, { name: "MULTILINE", data: "line1\r\nline2\r\nline3", description: "" });
     const rows = (await listSecretRows(env.DB, repoScope(repo.id), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("line1\nline2\nline3");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("line1\nline2\nline3");
   });
 
   it("the upsert is scope-guarded — another scope's same-name row is untouched", async () => {
@@ -207,8 +208,8 @@ describe("applyRepoActionsSecretForm (SecretsPost → PerformSecretsPost over cr
     });
     const all = await drizzle(env.DB).select().from(secrets);
     expect(all).toHaveLength(2);
-    expect(all.find((row) => row.repoId === "other-repo")!.data).toBe("theirs");
-    expect(all.find((row) => row.repoId === repo.id)!.data).toBe("ours");
+    expect(await decryptInstanceSecretData(env.DB, all.find((row) => row.repoId === "other-repo")!.data)).toBe("theirs");
+    expect(await decryptInstanceSecretData(env.DB, all.find((row) => row.repoId === repo.id)!.data)).toBe("ours");
   });
 
   it("surfaces the service's exact validation texts as invalid outcomes", async () => {
@@ -313,7 +314,7 @@ describe("applyRepoActionsVariableCreate (VariableCreate → CreateVariable)", (
     const rows = (await listVariableRows(env.DB, repoScope(repo.id), 1, 10)).rows;
     expect(rows).toHaveLength(1);
     expect(rows[0]!.name).toBe("REPO_VAR");
-    expect(rows[0]!.data).toBe("line1\nline2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("line1\nline2");
     expect(rows[0]!.description).toBe("d");
   });
 
@@ -347,7 +348,7 @@ describe("applyRepoActionsVariableUpdate (VariableUpdate over the landed updateV
     const rows = (await listVariableRows(env.DB, repoScope(repo.id), 1, 10)).rows;
     expect(rows).toHaveLength(1);
     expect(rows[0]!.name).toBe("RENAMED_VAR"); // the rename re-normalizes
-    expect(rows[0]!.data).toBe("new-value");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("new-value");
     expect(rows[0]!.description).toBe("new-desc");
   });
 
@@ -358,7 +359,7 @@ describe("applyRepoActionsVariableUpdate (VariableUpdate over the landed updateV
     });
     const rows = (await listVariableRows(env.DB, repoScope(repo.id), 1, 10)).rows;
     expect(rows[0]!.name).toBe("EDITABLE");
-    expect(rows[0]!.data).toBe("kept-value");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("kept-value");
   });
 
   it("an invalid rename surfaces the service text without writing", async () => {
@@ -853,7 +854,7 @@ describe("the mounted repo actions routes (the census C8: the minted-session rou
     expect(res.headers.get("location")).toBe("/alice/demo/settings/actions/variables");
     const rows = (await listVariableRows(env.DB, repoScope(repo.id), 1, 10)).rows;
     expect(rows.map((row) => row.name)).toEqual(["ROUTE_VAR"]); // the service's UPPERCASE arm
-    expect(rows[0]!.data).toBe("route-open-value");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("route-open-value");
   });
 
   it("the admin's invalid variable POST re-renders with ALL THREE fields carried (the value rides along, unlike secrets)", async () => {
@@ -886,7 +887,7 @@ describe("the mounted repo actions routes (the census C8: the minted-session rou
     expect(res.headers.get("location")).toBe("/alice/demo/settings/actions/variables");
     const after = (await listVariableRows(env.DB, repoScope(repo.id), 1, 10)).rows[0]!;
     expect(after.id).toBe(row.id);
-    expect(after.data).toBe("new-value");
+    expect(await decryptInstanceSecretData(env.DB, after.data)).toBe("new-value");
     expect(after.description).toBe("new description");
   });
 
@@ -970,7 +971,7 @@ describe("the mounted repo actions routes (the census C8: the minted-session rou
     expect(del.status).toBe(303);
     const rivalSecrets = (await listSecretRows(env.DB, repoScope("other-repo"), 1, 10)).rows;
     expect(rivalSecrets).toHaveLength(1);
-    expect(rivalSecrets[0]!.data).toBe("theirs-plaintext");
+    expect(await decryptInstanceSecretData(env.DB, rivalSecrets[0]!.data)).toBe("theirs-plaintext");
 
     // The variable edit/delete answer the genuine 404 shell — the row
     // survives untouched.
@@ -984,7 +985,7 @@ describe("the mounted repo actions routes (the census C8: the minted-session rou
     await expectNotFoundShell(await postRoute(`/alice/demo/settings/actions/variables/${rivalVariable.id}/delete`, 1, {}));
     const after = (await listVariableRows(env.DB, repoScope("other-repo"), 1, 10)).rows[0]!;
     expect(after.name).toBe("THEIR_VAR");
-    expect(after.data).toBe("their-open-value");
+    expect(await decryptInstanceSecretData(env.DB, after.data)).toBe("their-open-value");
   });
 });
 

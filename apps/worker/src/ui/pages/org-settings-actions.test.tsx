@@ -18,6 +18,7 @@
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { decryptInstanceSecretData } from "../../services/instance-key";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -186,14 +187,14 @@ describe("applyOrgActionsSecretForm (SecretsPost → PerformSecretsPost over cre
     });
     rows = (await listSecretRows(env.DB, ownerScope(ORG_ID), 1, 10)).rows;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.data).toBe("v2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("v2");
     expect(rows[0]!.description).toBe("second");
   });
 
   it("EOL-normalizes the submitted value before the service call (the web write path, scope-shared)", async () => {
     await applyOrgActionsSecretForm(env.DB, ORG_ID, { name: "MULTILINE", data: "line1\r\nline2\r\nline3", description: "" });
     const rows = (await listSecretRows(env.DB, ownerScope(ORG_ID), 1, 10)).rows;
-    expect(rows[0]!.data).toBe("line1\nline2\nline3");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("line1\nline2\nline3");
   });
 
   it("the upsert is scope-guarded — another owner's same-name row is untouched", async () => {
@@ -203,8 +204,8 @@ describe("applyOrgActionsSecretForm (SecretsPost → PerformSecretsPost over cre
     });
     const all = await drizzle(env.DB).select().from(secrets);
     expect(all).toHaveLength(2);
-    expect(all.find((row) => row.ownerId === 9)!.data).toBe("theirs");
-    expect(all.find((row) => row.ownerId === ORG_ID)!.data).toBe("ours");
+    expect(await decryptInstanceSecretData(env.DB, all.find((row) => row.ownerId === 9)!.data)).toBe("theirs");
+    expect(await decryptInstanceSecretData(env.DB, all.find((row) => row.ownerId === ORG_ID)!.data)).toBe("ours");
   });
 
   it("surfaces the service's exact validation texts as invalid outcomes", async () => {
@@ -309,7 +310,7 @@ describe("applyOrgActionsVariableCreate (VariableCreate → CreateVariable)", ()
     const rows = (await listVariableRows(env.DB, ownerScope(ORG_ID), 1, 10)).rows;
     expect(rows).toHaveLength(1);
     expect(rows[0]!.name).toBe("ORG_VAR");
-    expect(rows[0]!.data).toBe("line1\nline2");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("line1\nline2");
     expect(rows[0]!.description).toBe("d");
   });
 
@@ -343,7 +344,7 @@ describe("applyOrgActionsVariableUpdate (VariableUpdate over the landed updateVa
     const rows = (await listVariableRows(env.DB, ownerScope(ORG_ID), 1, 10)).rows;
     expect(rows).toHaveLength(1);
     expect(rows[0]!.name).toBe("RENAMED_VAR"); // the rename re-normalizes
-    expect(rows[0]!.data).toBe("new-value");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("new-value");
     expect(rows[0]!.description).toBe("new-desc");
   });
 
@@ -354,7 +355,7 @@ describe("applyOrgActionsVariableUpdate (VariableUpdate over the landed updateVa
     });
     const rows = (await listVariableRows(env.DB, ownerScope(ORG_ID), 1, 10)).rows;
     expect(rows[0]!.name).toBe("EDITABLE");
-    expect(rows[0]!.data).toBe("kept-value");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("kept-value");
   });
 
   it("an invalid rename surfaces the service text without writing", async () => {
@@ -830,7 +831,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     expect(res.headers.get("location")).toBe("/org/coalition/settings/actions/variables");
     const rows = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows;
     expect(rows.map((row) => row.name)).toEqual(["ROUTE_VAR"]); // the service's UPPERCASE arm
-    expect(rows[0]!.data).toBe("route-open-value");
+    expect(await decryptInstanceSecretData(env.DB, rows[0]!.data)).toBe("route-open-value");
   });
 
   it("the owner's invalid variable POST re-renders with ALL THREE fields carried (the value rides along, unlike secrets)", async () => {
@@ -861,7 +862,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     expect(res.headers.get("location")).toBe("/org/coalition/settings/actions/variables");
     const after = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
     expect(after.id).toBe(row.id);
-    expect(after.data).toBe("new-value");
+    expect(await decryptInstanceSecretData(env.DB, after.data)).toBe("new-value");
     expect(after.description).toBe("new description");
   });
 
@@ -939,7 +940,7 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     expect(del.status).toBe(303);
     const rivalSecrets = (await listSecretRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows;
     expect(rivalSecrets).toHaveLength(1);
-    expect(rivalSecrets[0]!.data).toBe("theirs-plaintext");
+    expect(await decryptInstanceSecretData(env.DB, rivalSecrets[0]!.data)).toBe("theirs-plaintext");
 
     // The variable edit/delete answer the genuine 404 shell — the row
     // survives untouched.
@@ -953,6 +954,6 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     await expectNotFoundShell(await postRoute(`/org/coalition/settings/actions/variables/${rivalsVariable.id}/delete`, 1, {}));
     const after = (await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!;
     expect(after.name).toBe("THEIR_VAR");
-    expect(after.data).toBe("their-open-value");
+    expect(await decryptInstanceSecretData(env.DB, after.data)).toBe("their-open-value");
   });
 });
