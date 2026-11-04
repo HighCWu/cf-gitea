@@ -226,6 +226,12 @@ export function authUserToApiUser(u: AuthUser, origin: string): User {
     visibility: u.visibility ?? "public",
     numStars: u.numStars ?? 0,
     lastLoginAt: u.lastLoginAt ?? null,
+    // The restricted carry (`rowToUser` maps the row's `is_restricted` —
+    // auth-context.ts): `?? false` is upstream's zero value, the default the
+    // hand-built predicate-only slices render (services/convert/user.go:90
+    // renders `Restricted` UNconditionally, so the field must always be
+    // populated here).
+    restricted: u.restricted ?? false,
   };
   return apiUserFromRow(row, {
     origin,

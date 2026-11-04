@@ -773,3 +773,104 @@ describe("repository reads with an admin token", () => {
     expect(body.permissions.admin).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The RESTRICTED identity chain, END TO END through the mounted worker
+// (SELF — src/index.ts's /api/v1 mount: resolveAuth → TokenService row →
+// `rowToUser` → `authUserToApiUser` → the wire render → `viewerOf`'s
+// requester → the landed restrictedArcCondition arms). The service-level
+// battery (repository-search-filters.test.ts) pins the arms over hand-built
+// viewers; this block proves the `users.is_restricted` COLUMN actually drives
+// them for a real token doer — the SPEC-0002 restricted projection note's
+// "production-inert until the identity chain threads" caveat, retired.
+// ---------------------------------------------------------------------------
+
+describe("the restricted identity chain (resolveAuth → wire render → restricted arms)", () => {
+  it("renders the row's is_restricted on every User payload — authed self-view and anonymous directory view", async () => {
+    const rest = await seedVerifiedUser({ username: "ChainRest" });
+    await db().update(users).set({ restricted: true }).where(eq(users.id, rest.id));
+    const plain = await seedVerifiedUser({ username: "ChainPlain" });
+    const restToken = (await mintFor(rest.id, "chain-rest", "all")).plaintext;
+    const plainToken = (await mintFor(plain.id, "chain-plain", "all")).plaintext;
+
+    // The authed self-view (GET /user — `authUserToApiUser`'s render, the
+    // SELF-viewer posture): the restricted row says true, the control false.
+    const selfRest = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user`, {
+      headers: { authorization: basicTokenHeader(restToken) },
+    });
+    expect(selfRest.status).toBe(200);
+    expect((await selfRest.json<{ restricted?: boolean }>()).restricted).toBe(true);
+
+    const selfPlain = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user`, {
+      headers: { authorization: basicTokenHeader(plainToken) },
+    });
+    expect(selfPlain.status).toBe(200);
+    expect((await selfPlain.json<{ restricted?: boolean }>()).restricted).toBe(false);
+
+    // The anonymous directory view (GET /users/{username} — the canonical
+    // `apiUserFromRow` body): upstream renders `Restricted` UNconditionally
+    // (services/convert/user.go:90; struct tag `json:"restricted"` with no
+    // omitempty, modules/structs/user.go:44) — the flag rides every payload,
+    // it is not an authed gate.
+    const dirRest = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/ChainRest`);
+    expect(dirRest.status).toBe(200);
+    expect((await dirRest.json<{ restricted?: boolean }>()).restricted).toBe(true);
+    const dirPlain = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/ChainPlain`);
+    expect(dirPlain.status).toBe(200);
+    expect((await dirPlain.json<{ restricted?: boolean }>()).restricted).toBe(false);
+  });
+
+  it("a restricted doer's private=true search drops limited-owner publics; the non-restricted twin keeps them", async () => {
+    const rest = await seedVerifiedUser({ username: "ChainSearcher" });
+    await db().update(users).set({ restricted: true }).where(eq(users.id, rest.id));
+    const plain = await seedVerifiedUser({ username: "ChainTwin" });
+    const openOwner = await seedVerifiedUser({ username: "ChainOpenOwner" });
+    const limitedOwner = await seedVerifiedUser({ username: "ChainLimitedOwner" });
+    await db().update(users).set({ visibility: "limited" }).where(eq(users.id, limitedOwner.id));
+    const secretOwner = await seedVerifiedUser({ username: "ChainSecretOwner" });
+    await db().update(users).set({ visibility: "private" }).where(eq(users.id, secretOwner.id));
+
+    await seedRepo("chainopenowner", "open", { ownerId: openOwner.id });
+    await seedRepo("chainlimitedowner", "limpub", { ownerId: limitedOwner.id });
+    await seedRepo("chainsecretowner", "secpub", { ownerId: secretOwner.id });
+    await seedRepo("chainsearcher", "restown", { ownerId: rest.id });
+    await seedRepo("chainsearcher", "restvault", { visibility: "private", ownerId: rest.id });
+
+    // The restricted doer — real column, real token, real route: the own rows
+    // plus the replacement public arm (publics under PUBLIC-visibility
+    // owners). limpub DROPPED (the [Private, Limited] owner limit the
+    // restricted replacement carries, repo_list.go:697-699 over :651-658) and
+    // secpub DROPPED (arm 5 skipped, :694-700); restvault survives (own rows
+    // are unrestricted, :693).
+    const restToken = (await mintFor(rest.id, "chain-search", "all")).plaintext;
+    const restricted = await SELF.fetch(`${SELF_ORIGIN}/api/v1/repos/search?private=true`, {
+      headers: { authorization: basicTokenHeader(restToken) },
+    });
+    expect(restricted.status).toBe(200);
+    expect(restricted.headers.get("X-Total-Count")).toBe("3");
+    const restrictedBody = await restricted.json<{ data: Array<{ full_name: string }> }>();
+    expect(restrictedBody.data.map((r) => r.full_name).sort()).toEqual([
+      "chainopenowner/open",
+      "chainsearcher/restown",
+      "chainsearcher/restvault",
+    ]);
+
+    // The non-restricted control — identical query, identical fixture
+    // visibility, only the users.is_restricted column differs: the signed
+    // arm-1 [Private]-only owner limit KEEPS the limited owner's public and
+    // drops only the private-profile owner's (repo_list.go:651-658 via
+    // :667-673), and the other user's private row stays invisible.
+    const plainToken = (await mintFor(plain.id, "chain-search", "all")).plaintext;
+    const control = await SELF.fetch(`${SELF_ORIGIN}/api/v1/repos/search?private=true`, {
+      headers: { authorization: basicTokenHeader(plainToken) },
+    });
+    expect(control.status).toBe(200);
+    expect(control.headers.get("X-Total-Count")).toBe("3");
+    const controlBody = await control.json<{ data: Array<{ full_name: string }> }>();
+    expect(controlBody.data.map((r) => r.full_name).sort()).toEqual([
+      "chainlimitedowner/limpub",
+      "chainopenowner/open",
+      "chainsearcher/restown",
+    ]);
+  });
+});

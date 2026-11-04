@@ -289,5 +289,11 @@ export function rowToUser(row: typeof users.$inferSelect): AuthUser {
     visibility: row.visibility,
     numStars: row.numStars,
     lastLoginAt: row.lastLoginAt,
+    // `users.is_restricted` (upstream `User.IsRestricted`, user.go:138) —
+    // the restricted-user arm's source: without this carry a production
+    // `Viewer.requester.restricted` reads undefined and the landed
+    // restrictedArcCondition arms stay production-inert (SPEC-0002's
+    // restricted projection note).
+    restricted: row.restricted,
   };
 }

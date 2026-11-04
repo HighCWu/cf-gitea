@@ -472,6 +472,7 @@ export type ApiUserRow = Pick<
   | "visibility"
   | "numStars"
   | "lastLoginAt"
+  | "restricted"
 >;
 
 /**
@@ -550,7 +551,16 @@ export function apiUserFromRow(row: ApiUserRow, viewer: Viewer, followCounts?: A
     // TimeStamp, whose AsTime() marshals the same zero time (P3-7).
     last_login: authed ? (row.lastLoginAt?.toISOString() ?? GO_ZERO_TIME) : GO_ZERO_TIME,
     created: row.createdAt.toISOString(),
-    restricted: false,
+    // Upstream renders `Restricted: user.IsRestricted` UNconditionally in the
+    // base literal (services/convert/user.go:90 — struct tag
+    // `json:"restricted"`, modules/structs/user.go:44, no omitempty): every
+    // User payload carries the row's `is_restricted`, whatever the viewer.
+    // This is the identity-chain sink — `rowToUser` (auth/token-service.ts)
+    // carries the column onto AuthUser, `authUserToApiUser`
+    // (services/user.ts) rebuilds this slice from it, and the landed
+    // restrictedArcCondition arms (`visibilityConditions`/`searchRepositories`
+    // below) read the rendered flag off `Viewer.requester`.
+    restricted: row.restricted,
     active: authed ? row.status === "active" : false,
     prohibit_login: authed ? row.status === "prohibited" : false,
     location: row.location ?? "",

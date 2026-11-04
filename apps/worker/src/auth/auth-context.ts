@@ -46,6 +46,18 @@ export interface AuthUser {
    *  render-relevant carry: hand-built AuthUser slices omit it and the
    *  adapter renders Go zero time (upstream's zero TimeStamp). */
   lastLoginAt?: Date | null;
+  /** The row's `is_restricted` — upstream `User.IsRestricted` (user.go:138):
+   *  a restricted doer's repo-listing composition swaps in the restricted
+   *  ARC arms (repo_list.go:665-674 arm-1 skip + :694-700 arm-5 skip, the
+   *  strict-gated replacement) — the flag the api identity conversion
+   *  (`authUserToApiUser`, api/services/user.ts) renders onto the wire
+   *  `restricted` field (services/convert/user.go:90 renders it
+   *  UNconditionally) and every `Viewer.requester.restricted` reads. Optional
+   *  for the same reason as the other render-relevant carry: hand-built
+   *  AuthUser slices omit it and the adapter renders upstream's zero value
+   *  (false — the NON-restricted reading, the safe default for predicate-only
+   *  bridges). */
+  restricted?: boolean;
 }
 
 export interface AuthToken {
