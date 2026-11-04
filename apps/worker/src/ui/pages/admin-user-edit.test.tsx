@@ -293,9 +293,12 @@ describe("the render (edit.tmpl at the pin)", () => {
     expect(html).toContain('name="email" type="email" value="alice@example.com" required');
     expect(html).toContain('name="website" type="url" value="https://alice.example"');
     expect(html).toContain('name="location" value="Berlin"');
-    // The password field renders for parity and NEVER echoes; the helper rides.
-    expect(html).toContain('name="password" type="password" autocomplete="new-password"');
-    expect(html).toContain(adminUserEditLocale.password_helper);
+    // The password field renders DISABLED with the not-supported notice
+    // (ADR-0008 rule 4 — accept-and-ignore is forbidden until PWD-2) and
+    // NEVER echoes a value.
+    expect(html).toContain('name="password" type="password" autocomplete="new-password" disabled');
+    expect(html).toContain(adminUserEditLocale.password_not_supported);
+    expect(html).not.toContain("Leave the password empty to keep it unchanged.");
     expect(html).not.toContain('type="password" value=');
   });
 
@@ -589,8 +592,15 @@ describe("the submit — the flag folds", () => {
   });
 });
 
-describe("the submit — the password arm's validation shapes (deviation 1)", () => {
-  it("accepts ANY password — short, long, junk — and stores nothing (no arm exists to hit)", async () => {
+describe("the submit — the password arm's interim posture (ADR-0008 rule 4)", () => {
+  it("the rendered field is DISABLED (never offers the operation) yet never echoes", async () => {
+    const seeded = await seedEdit();
+    const html = await renderEdit(seeded);
+    expect(html).toContain('name="password" type="password" autocomplete="new-password" disabled');
+    expect(html).not.toContain('type="password" value=');
+  });
+
+  it("a hand-crafted POST with ANY password value stores nothing (no arm exists to hit)", async () => {
     const seeded = await seedEdit();
     for (const password of ["a", "password123", "x".repeat(300)]) {
       expect(await submit(seeded, aliceForm({ password }))).toEqual({ outcome: "updated" });
@@ -598,10 +608,6 @@ describe("the submit — the password arm's validation shapes (deviation 1)", ()
       expect(row.location).toBe("Berlin"); // the rest of the round-trip landed
       expect(Object.keys(row)).not.toContain("password"); // no password store exists
     }
-    // The rendered field never echoes a value.
-    const html = await renderEdit(seeded);
-    expect(html).toContain('name="password" type="password" autocomplete="new-password"');
-    expect(html).not.toContain('type="password" value=');
   });
 });
 

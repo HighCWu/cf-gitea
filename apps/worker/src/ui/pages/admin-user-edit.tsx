@@ -78,10 +78,15 @@
  *     flagged with form.email_been_used. The domain-allowlist flash
  *     warning (users.go:511-513) has no allowlist config landed — dead
  *     arm, not ported.
- *   - `password` — rendered for form parity (upstream renders it for
- *     local users; every row is local) and ACCEPTED AND IGNORED (SPEC-0002
- *     §4.6.7, PAT-only auth — admin-t2.ts deviation 1: no password store,
- *     no length/complexity/pwned arm exists to hit). Never echoes.
+ *   - `password` — rendered DISABLED with an explicit not-supported notice
+ *     (the ADR-0008 rule-4 remedy: accept-and-ignore is a contract defect;
+ *     until the real admin-set arm lands — SPEC-0002 §11's PWD-2 unit — the
+ *     input cannot carry an operation the backend cannot execute). A
+ *     disabled input never posts, so the rendered form no longer offers the
+ *     operation at all; the parse keeps the field for wire parity and the
+ *     submit keeps ignoring any hand-crafted value (no store exists to
+ *     hit — upstream's min-length/complexity/pwned arms, users.go:464-474,
+ *     are unreachable until PWD-2). Never echoes.
  *   - `language` — DROPPED: users has no language column (the detail
  *     page's unproducible-language-line posture) and the landed
  *     EditUserOption contract (admin-t2.ts editUserOptionSchema) declares
@@ -268,7 +273,11 @@ export const adminUserEditLocale = {
   full_name: "Full Name", // "settings.full_name" (:75)
   email: "Email Address", // "email" (:79)
   password: "Password", // "password" (:84)
-  password_helper: "Leave the password empty to keep it unchanged.", // "admin.users.password_helper" (:86)
+  // NOT upstream's "admin.users.password_helper" (:86, "Leave the password
+  // empty to keep it unchanged.") — that text would promise an operation the
+  // backend cannot execute (ADR-0008 rule 4). The interim disabled-state
+  // notice; flips to upstream's helper when PWD-2 lands the admin-set arm.
+  password_not_supported: "Password setting is not supported yet — this instance cannot store passwords. The field stays disabled until the password system lands.",
   website: "Website", // "settings.website" (:105)
   location: "Location", // "settings.location" (:109)
   max_repo_creation: "Maximum Number of Repositories", // "admin.users.max_repo_creation" (:116)
@@ -397,8 +406,8 @@ export function parseAdminUserEditForm(params: URLSearchParams): AdminUserEditFo
 
 /** The fields the re-render can flag (upstream's Err_UserName /
  *  Err_LoginType / Err_Visibility / Err_Email / Err_MaxRepoCreation class
- *  hooks; Err_Password / Err_LoginName are unreachable — the deviation-1
- *  accepted-and-ignored set). */
+ *  hooks; Err_Password / Err_LoginName are unreachable — no password store
+ *  (the field renders disabled, ADR-0008 rule 4) and no login-name column). */
 export type AdminUserEditErrorField = "userName" | "loginType" | "visibility" | "email" | "maxRepoCreation";
 
 /** The arm's outcome union (the wiring's map, the module header's recipe):
@@ -561,10 +570,14 @@ export async function submitAdminUserEdit(
   }
 
   // --- the auth arm (users.go:464-495 → UpdateAuth): password /
-  // login_name / login_type are the deviation-1 accepted-and-ignored set
-  // (no password store, no login-source column — no arm exists to hit);
-  // the prohibit fold with the SKIP-SELF guard (users.go:476-480), then
-  // the deviation-6 status fold (admin-t2.ts's PATCH posture).
+  // login_name / login_type carry no arm — the UI renders the password
+  // field DISABLED with the not-supported notice (ADR-0008 rule 4, the
+  // module header), so the rendered form cannot offer the operation; the
+  // parse still tolerates a hand-crafted `password` value and the submit
+  // ignores it (no store exists to hit — upstream's min-length /
+  // complexity / pwned arms are unreachable until PWD-2). The prohibit
+  // fold with the SKIP-SELF guard (users.go:476-480), then the
+  // deviation-6 status fold (admin-t2.ts's PATCH posture).
   const prohibitLogin = form.prohibitLogin && doerId !== user.id;
   const prohibited = prohibitLogin || form.active === false;
   const activated = form.active === true || form.prohibitLogin === false;
@@ -725,12 +738,16 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
             <label for="email">{adminUserEditLocale.email}</label>
             <input id="email" name="email" type="email" value={user.email ?? ""} required />
           </div>
-          {/* password (:82-88) — form parity, accepted-and-ignored; never
-              echoes (no value attr upstream). */}
+          {/* password (:82-88) — the ADR-0008 rule-4 interim posture: the
+              input is DISABLED (it never posts; the rendered form cannot
+              offer an operation the backend cannot execute) with the
+              not-supported notice replacing upstream's password_helper.
+              Never echoes (no value attr upstream). Flips live when PWD-2
+              lands the admin-set arm. */}
           <div class="js-local js-non-bot field">
             <label for="password">{adminUserEditLocale.password}</label>
-            <input id="password" name="password" type="password" autocomplete="new-password" />
-            <p class="help">{adminUserEditLocale.password_helper}</p>
+            <input id="password" name="password" type="password" autocomplete="new-password" disabled />
+            <p class="help">{adminUserEditLocale.password_not_supported}</p>
           </div>
 
           {/* The language field (:90-102) is DROPPED — no column, no
