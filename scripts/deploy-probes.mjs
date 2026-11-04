@@ -570,7 +570,7 @@
  *     failure reads "request failed" with the same bracketed URL) with
  *     sync_state back to 'idle' and next_sync_at=0 (row re-read via wrangler
  *     d1, --d1-scope) -> DELETE 204 and the list back to [].
- *   - login: POST /login form-urlencoded user_name + password=<PAT> answers
+ *   - login: POST /login form-urlencoded user_name + the D1-seeded probe password answers
  *     303 with a gitea_session cookie; the labels page then shows the
  *     writer's "New Label" form (4 occurrences canonically on the EMPTY
  *     list since 3265258 — the navbar button, the empty-list templates_info
@@ -1891,9 +1891,9 @@ const uiSteps = (ctx) => [
   },
   {
     id: "ui-login-303",
-    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie (the value is scrubbed from all output)`,
+    expect: `POST /login (form-urlencoded user_name + password=<the D1-seeded probe password>) → 303 + gitea_session cookie (the value is scrubbed from all output)`,
     run: async () => {
-      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const form = new URLSearchParams({ user_name: ctx.user, password: await ensureWebPassword(ctx.user) });
       const res = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -2038,9 +2038,9 @@ const window2PostForm = async (ctx, pathname, fields) => {
 const window2Steps = (ctx) => [
   {
     id: "w2-login-303",
-    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the session value is scrubbed from all output)`,
+    expect: `POST /login (form-urlencoded user_name + password=<the D1-seeded probe password>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the session value is scrubbed from all output)`,
     run: async () => {
-      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const form = new URLSearchParams({ user_name: ctx.user, password: await ensureWebPassword(ctx.user) });
       const res = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -2422,9 +2422,9 @@ const window3ProfileTab = async (ctx, tab, markers) => {
 const window3Steps = (ctx) => [
   {
     id: "w3-login-303",
-    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the session value is scrubbed from all output)`,
+    expect: `POST /login (form-urlencoded user_name + password=<the D1-seeded probe password>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the session value is scrubbed from all output)`,
     run: async () => {
-      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const form = new URLSearchParams({ user_name: ctx.user, password: await ensureWebPassword(ctx.user) });
       const res = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -2756,7 +2756,7 @@ const window3Steps = (ctx) => [
   })),
   {
     id: "w3-settings-account-200",
-    expect: `cookie GET /user/settings/account → 200 text/html carrying class="page-content user settings account" + the no-password-model info ("Non-local users cannot update their password through the Gitea web interface.") + "Manage Email Addresses" (POST arms NOT probed — the read-only battery; mount-at-run-time: a 404 warns)`,
+    expect: `cookie GET /user/settings/account → 200 text/html carrying class="page-content user settings account" + the LANDED change-password form (PWD-2: the Password heading, old_password + the /user/settings/account POST) + "Manage Email Addresses" (POST arms NOT probed — the read-only battery; mount-at-run-time: a 404 warns)`,
     run: async () => {
       const probe = await window3GetOrWarn(`${opts.baseUrl}/user/settings/account`, { cookie: ctx.cookie });
       if (probe === null) {
@@ -2765,10 +2765,10 @@ const window3Steps = (ctx) => [
       expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
       expect(probe.body.includes(`class="page-content user settings account"`),
         "the account pageClass discriminator is missing");
-      expect(probe.body.includes("Non-local users cannot update their password through the Gitea web interface."),
-        "the settings.password_change_disabled info is missing");
+      expect(probe.body.includes(`>Password</h4>`), "the password section heading is missing (PWD-2's change arm)");
+      expect(probe.body.includes(`name="old_password"`), "the change-password form's old_password field is missing (PWD-2's change arm)");
       expect(probe.body.includes("Manage Email Addresses"), "the manage_emails section is missing");
-      return `200 — the account tab renders (no-password arm + the email section)`;
+      return `200 — the account tab renders (the change-password form + the email section)`;
     },
   },
   {
@@ -3040,7 +3040,7 @@ const window3FailureCleanup = async (ctx) => {
  *      to a repo") and the label list stays empty.
  *   9. The org/team membership WEB actions (9b45d68 U1): anonymous team
  *      action POST → 303 /login?redirect_to=…, the API-revoked member's own
- *      web session (PAT-as-password login) POSTs the owner-only add → the
+ *      web session (the D1-seeded password login) POSTs the owner-only add → the
  *      404 shell, the OWNER's web session POST action=add (uname) → 303 the
  *      team slice + the API membership read-back 200, and the member's web
  *      session POST /org/{org}/members/action/leave (uid) → 303 "/" + the
@@ -3468,9 +3468,9 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-web-session-303",
-    expect: `the run user's web session for the danger family (the rotation family's row below stays independent): POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session (the ui-login methodology; the value scrubbed from all output); the 10-char row id captured for the cleanup sweep`,
+    expect: `the run user's web session for the danger family (the rotation family's row below stays independent): POST /login (form-urlencoded user_name + password=<the D1-seeded probe password>) → 303 + gitea_session (the ui-login methodology; the value scrubbed from all output); the 10-char row id captured for the cleanup sweep`,
     run: async () => {
-      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const form = new URLSearchParams({ user_name: ctx.user, password: await ensureWebPassword(ctx.user) });
       const res = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -3490,27 +3490,27 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-org-web-gate-404",
-    expect: `THE ACTION GATES (9b45d68 U1 — POST /${"{org}"}/teams/${"{team}"}/action/${"{action}"} is LIVE): ANONYMOUS POST action=add → 303 EXACTLY /login?redirect_to=<encoded action path> (the RequireMember prologue's anonymous arm); the API-revoked team member's own WEB session (PAT-as-password login — the ui-login methodology) POST action=add → the 404 SHELL (a signed-in outsider 404-shells, org.go:106-120's gate — never a redirect, never a grant); their session row id captured for the cleanup sweep`,
+    expect: `THE ACTION GATES (9b45d68 U1 — POST /${"{org}"}/teams/${"{team}"}/action/${"{action}"} is LIVE): ANONYMOUS POST action=add → 303 EXACTLY /login?redirect_to=<encoded action path> (the RequireMember prologue's anonymous arm); the API-revoked team member's own WEB session (the D1-seeded password login — the ui-login methodology) POST action=add → the 404 SHELL (a signed-in outsider 404-shells, org.go:106-120's gate — never a redirect, never a grant); their session row id captured for the cleanup sweep`,
     run: async () => {
       expect(ctx.memberToken !== null && Number.isInteger(ctx.teamId), "no member token / team from the prior arms (fixture missing)");
-      const actionPath = `/${ctx.org}/teams/${ctx.teamId}/action/add`;
+      const actionPath = `/org/${ctx.org}/teams/${ctx.teamId}/action/add`;
       const anon = await fetchT(`${opts.baseUrl}${actionPath}`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ uname: ctx.user }).toString(),
       });
-      await anon.text();
-      expect(anon.status === 303, `anonymous team-action POST status ${anon.status} (expected 303 — the login round-trip)`);
+      const anonBody = await anon.text();
+      expect(anon.status === 303, `anonymous team-action POST ${actionPath} status ${anon.status} (expected 303 — the login round-trip); body head: ${anonBody.slice(0, 160)}`);
       expect(anon.headers.get("location") === `/login?redirect_to=${encodeURIComponent(actionPath)}`,
         `anonymous location ${JSON.stringify(anon.headers.get("location"))} (expected /login?redirect_to=<encoded action path>)`);
-      const form = new URLSearchParams({ user_name: ctx.member, password: ctx.memberToken });
+      const form = new URLSearchParams({ user_name: ctx.member, password: await ensureWebPassword(ctx.member) });
       const login = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: form.toString(),
       });
       await login.text();
-      expect(login.status === 303, `member web login status ${login.status} (expected 303 — the PAT-as-password methodology)`);
+      expect(login.status === 303, `member web login status ${login.status} (expected 303 — the seeded-password methodology)`);
       const setCookie = login.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
       expect(setCookie !== undefined, `no gitea_session cookie on the member login (${login.headers.getSetCookie().length} cookies)`);
       ctx.memberCookie = setCookie.split(";")[0];
@@ -3533,7 +3533,7 @@ const fixwaveSteps = (ctx) => [
     run: async () => {
       expect(typeof ctx.webCookie === "string" && Number.isInteger(ctx.teamId) && ctx.memberCreated,
         "no owner session / team / member from the prior arms (fixture missing)");
-      const actionPath = `/${ctx.org}/teams/${ctx.teamId}/action/add`;
+      const actionPath = `/org/${ctx.org}/teams/${ctx.teamId}/action/add`;
       const res = await fetchT(`${opts.baseUrl}${actionPath}`, {
         method: "POST",
         headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
@@ -3541,8 +3541,8 @@ const fixwaveSteps = (ctx) => [
       });
       await res.text();
       expect(res.status === 303, `owner add POST status ${res.status} (expected 303): ${res.status === 404 ? "the owner gate 404-shelled — canManageOrgTeams did not see the org owner" : ""}`);
-      expect(res.headers.get("location") === `/${ctx.org}/teams/${ctx.teamId}`,
-        `location ${JSON.stringify(res.headers.get("location"))} (expected the team slice /${ctx.org}/teams/${ctx.teamId})`);
+      expect(res.headers.get("location") === `/org/${ctx.org}/teams/${ctx.teamId}`,
+        `location ${JSON.stringify(res.headers.get("location"))} (expected the team slice /org/${ctx.org}/teams/${ctx.teamId})`);
       const member = await api(`/teams/${ctx.teamId}/members/${ctx.member}`);
       expect(member.status === 200 && member.json?.login === ctx.member,
         `membership GET after the web add: ${member.status} ${member.text.slice(0, 80)} (expected 200 with the member's login)`);
@@ -3669,9 +3669,9 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-session-mint-303",
-    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie (the ui-login methodology; the value is scrubbed from all output) — the rotation family's live row`,
+    expect: `POST /login (form-urlencoded user_name + password=<the D1-seeded probe password>) → 303 + gitea_session cookie (the ui-login methodology; the value is scrubbed from all output) — the rotation family's live row`,
     run: async () => {
-      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const form = new URLSearchParams({ user_name: ctx.user, password: await ensureWebPassword(ctx.user) });
       const res = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -7880,9 +7880,9 @@ const oauth2Steps = (ctx) => [
   },
   {
     id: "oauth2-login-cookie",
-    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the consent dance rides the SESSION row's oauth_state seam; the value is scrubbed from all output)`,
+    expect: `POST /login (form-urlencoded user_name + password=<the D1-seeded probe password>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the consent dance rides the SESSION row's oauth_state seam; the value is scrubbed from all output)`,
     run: async () => {
-      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const form = new URLSearchParams({ user_name: ctx.user, password: await ensureWebPassword(ctx.user) });
       const res = await fetchT(`${opts.baseUrl}/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -9251,6 +9251,37 @@ const auditCounts = async () => {
     AUDIT_TABLES.map((t) => `${t.sql} AS ${t.key}`).join(", ") +
     `, (SELECT COUNT(*) FROM "personal_access_tokens") AS personal_access_tokens`;
   return d1Row(sql);
+};
+
+/** PWD-2 (2026-11-04, v1.5.7) removed PAT-as-password from the web login —
+ * the ui-login methodology now seeds a REAL password record straight into D1
+ * (the exact derivation of src/auth/password.ts: pbkdf2$50000$50, SHA-256,
+ * a 16-random-byte salt hex-encoded to the 32-char form the worker
+ * hex-decodes) and logs in with the plaintext. The password SET is probe
+ * fixture, not the behavior under test; the login round-trip itself stays
+ * fully end-to-end (the deployed worker's real verify ladder). Cached per
+ * run — each user is seeded at most once, and the plaintext never reaches
+ * any expect() message or output (scrub discipline, same as TOKEN). */
+const seededWebPasswords = new Map();
+const ensureWebPassword = async (username) => {
+  const key = username.toLowerCase();
+  if (seededWebPasswords.has(key)) return seededWebPasswords.get(key);
+  const password = `probe-web-${crypto.randomUUID()}`;
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const salt = [...saltBytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: saltBytes, iterations: 50_000 },
+    keyMaterial, 50 * 8,
+  );
+  const passwd = [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  await d1Exec(
+    `UPDATE users SET passwd='${passwd}', salt='${salt}', passwd_hash_algo='pbkdf2$50000$50' WHERE username_lower='${key}'`,
+  );
+  seededWebPasswords.set(key, password);
+  return password;
 };
 
 const auditSteps = (ctx) => [
