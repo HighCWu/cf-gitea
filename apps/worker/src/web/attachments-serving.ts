@@ -1835,7 +1835,25 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/:owner/:repo/attachments/:uuid", 
 // `Allow: GET` (the node's only registered method; HEAD rides GET upstream's
 // tree fallback). The bare-405 OPTIONS above is the site route's
 // optionsCorsHandler twin — different registration, different wire word.
-attachmentsServingRouter.on(["OPTIONS", "POST", "PUT", "DELETE", "PATCH"], "/:owner/:repo/releases/attachments/:uuid", () =>
+//
+// THE B-55 WRITE-TAIL CARVE (POST on the RELEASE twin only): upstream mounts
+// `m.Post("/releases/attachments/remove", repo.DeleteAttachment)` at
+// web.go:1524 — the literal `remove` segment is a WRITE TAIL, not a uuid,
+// and the ui sub-app's static POST registration serves it. This seam's
+// earlier-mounted param-pattern deny would otherwise shadow that
+// registration (Hono keeps registration order across merged routers — a
+// param pattern registered earlier beats a static segment registered later;
+// confirmed empirically — `POST .../remove` answered the deny 405 with the
+// ui route in place). The POST arm therefore passes the literal through to
+// the next matching handler (the ui registration) and keeps the deny for
+// every other uuid — GET/HEAD are untouched (the GET `remove` literal stays
+// the plain-uuid lookup's 404, exactly upstream's GetAttachment("remove")).
+// The COMPAT twin has no write tail (web.go:1529-1532's group is GET-only).
+attachmentsServingRouter.on(["POST"], "/:owner/:repo/releases/attachments/:uuid", (c, next) => {
+  if ((c.req.param("uuid") ?? "") === "remove") return next();
+  return new Response(null, { status: 405, headers: { allow: "GET" } });
+});
+attachmentsServingRouter.on(["OPTIONS", "PUT", "DELETE", "PATCH"], "/:owner/:repo/releases/attachments/:uuid", () =>
   new Response(null, { status: 405, headers: { allow: "GET" } }),
 );
 attachmentsServingRouter.on(["OPTIONS", "POST", "PUT", "DELETE", "PATCH"], "/:owner/:repo/attachments/:uuid", () =>

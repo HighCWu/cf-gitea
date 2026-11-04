@@ -214,6 +214,9 @@ import { emitIssueEvent, type IssueEventRequest } from "../../services/issue-eve
 import { users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { REACTION_EMOJI, groupReactions, renderIssueMarkdown, type ReactionGroup } from "./issue-detail";
+// The B-55 write tails' form faces: the dropzone fragment (repo/upload.tmpl
+// over AddUploadContext's release arm) rides the landed upload/remove POSTs.
+import { ReleaseAttachmentsDropzone } from "./release-attachment-writes";
 import { parseFormBool } from "./notifications";
 import { formatByteSize, parsePageNumber, shortSha } from "../page-data";
 import { userLink } from "../links";
@@ -279,6 +282,11 @@ export const releasesLocale = {
   deletion_failed(name: string): string {
     return `Deleting the release ${name} failed.`;
   },
+  /** The B-55 generate-notes button + dropzone chrome (the upstream locale
+   *  keys cited; repo-release.ts reads the data attributes). */
+  generate_notes: "Generate release notes", // "repo.release.generate_notes"
+  generate_notes_desc: "Automatically add merged pull requests and a changelog link for this release.", // "repo.release.generate_notes_desc"
+  generate_notes_missing_tag: "Enter a tag name to generate release notes.", // "repo.release.generate_notes_missing_tag"
 } as const;
 
 /** Upstream `setting.Repository.Release.DefaultPagingNum`
@@ -1403,9 +1411,32 @@ export function NewReleasePage(props: {
           </div>
           <div class="field">
             <label for="release-content">{releasesLocale.notes}</label>
+            {/* The B-55 generate-notes button (new.tmpl:58-66): the JS island
+             *  POSTs the urlencoded trio to data-generate-url and appends the
+             *  response's `content` to the editor; without JS the button is
+             *  inert exactly like upstream's (the modal is JS-rendered). */}
+            <button
+              type="button"
+              class="ui small compact button generate-release-notes"
+              data-generate-url={`${repoLink}/releases/generate-notes`}
+              data-tooltip-content={releasesLocale.generate_notes_desc}
+              data-text-missing-tag={releasesLocale.generate_notes_missing_tag}
+            >
+              {releasesLocale.generate_notes}
+            </button>
             <textarea id="release-content" name="content" rows={5} placeholder={releasesLocale.message_placeholder}>
               {form.content}
             </textarea>
+          </div>
+          {/* The B-55 dropzone (new.tmpl:92-100's upload block — frozen
+            * IsAttachmentEnabled true; upload.go:108-117's release arm: the
+            * repo-level upload/remove/link URLs, no accept filter, no uuid
+            * link). Upstream precedes it with the existing-attachments rows
+            * (new.tmpl:79-90) — the landed form write carries no `files`
+            * consumer, so this module renders the upload block only (the
+            * module doc's divergence note in release-attachment-writes.tsx). */}
+          <div class="field">
+            <ReleaseAttachmentsDropzone repoLink={repoLink} />
           </div>
           <div class="field">
             <div class="ui checkbox">

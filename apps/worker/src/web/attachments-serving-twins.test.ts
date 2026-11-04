@@ -489,6 +489,43 @@ describe("GET /{owner}/{repo}/releases/attachments/{uuid} — the release twin",
     expect((await releaseAssetRow(uuid)).downloadCount).toBe(1); // HEAD's GET ride only
   });
 
+  it("passes the POST `remove` literal through (the B-55 write-tail carve) and keeps the deny for real uuids", async () => {
+    const owner = await seedUser("twins-remove-carve");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public", "pub");
+    const uuid = await seedReleaseAsset({ repoId: PUBLIC_REPO_ID, isDraft: false, name: "a.bin", content: pngPayload() });
+
+    // POST on a REAL uuid: the deny arm unchanged (chi's methodNotAllowed
+    // shape for a plain m.Get registration — upstream registers POST only at
+    // /releases/attachments, the 1-segment literal, never the uuid shape).
+    const deny = await serve(`/${owner.usernameLower}/pub/releases/attachments/${uuid}`, { method: "POST" });
+    expect(deny.status).toBe(405);
+    expect(deny.headers.get("allow")).toBe("GET");
+
+    // POST on the literal `remove`: web.go:1524's DeleteAttachment write
+    // tail — this seam's earlier-mounted param-pattern deny would otherwise
+    // shadow the ui sub-app's static POST registration (Hono keeps
+    // registration order across merged routers; a param pattern registered
+    // earlier beats a static segment registered later — confirmed
+    // empirically), so the POST arm passes the literal to the NEXT matching
+    // handler. The STANDALONE seam has no later handler → Hono's 404
+    // default; on the live wire the next match is the ui registration (the
+    // release-tails matrix pins that arm; the composition note lives in
+    // attachments-serving.ts's carve comment).
+    const remove = await serve(`/${owner.usernameLower}/pub/releases/attachments/remove`, { method: "POST" });
+    expect(remove.status).toBe(404);
+
+    // The GET of the literal is UNCHANGED: the plain-uuid lookup (no asset
+    // carries "remove" → the shared pipeline's 404 — upstream's
+    // GetAttachment("remove") answer).
+    const get = await serve(`/${owner.usernameLower}/pub/releases/attachments/remove`, { method: "GET" });
+    expect(get.status).toBe(404);
+    // The other mismatch verbs keep the deny on the literal too (only POST
+    // was carved).
+    const options = await serve(`/${owner.usernameLower}/pub/releases/attachments/remove`, { method: "OPTIONS" });
+    expect(options.status).toBe(405);
+    expect(options.headers.get("allow")).toBe("GET");
+  });
+
   it("answers the 304 arms: ETag + Last-Modified ONLY (no Cache-Control), weak/`*` INM, the empty-INM IMS consult, Go-exact IMS parsing", async () => {
     const owner = await seedUser("twins-release-cache");
     await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public", "pub");
