@@ -111,11 +111,15 @@
  *     module-local): unsetting the last admin re-renders with
  *     auth.last_admin, no field flag (upstream's exact arm,
  *     users.go:539-541).
- *   - `restricted` — rendered unchecked DISABLED with the not-supported
- *     notice (the rule-4 remedy: upstream's arm is real — users.go:528 →
- *     user.IsRestricted, user.go:138 — ADR-0008 re-opens it; no column
- *     here, so the constant-false store cannot take the posted value and
- *     the checkbox never offers it), the posted value still ignored.
+ *   - `restricted` — the REAL arm (users.go:523 binds
+ *     `IsRestricted: optional.Some(form.Restricted)`, always applied like
+ *     IsAdmin): the landed `users.is_restricted` column (the d32b0a4
+ *     rule-4 interim flipped live — the disabled-with-notice posture, the
+ *     password field's PWD-2 pattern) renders the row's stored flag, posts,
+ *     and stores in the one column patch. The flag arms the restricted-user
+ *     composition on the repo listings (repo_list.go:665-674's arm-1 skip +
+ *     :694-700's strict-gated replacement, api/services/repository.ts
+ *     restrictedArcCondition).
  *   - `allow_git_hook` / `allow_import_local` — rendered hidden+disabled
  *     exactly like upstream's DEFAULT-config render (setting.
  *     DisableGitHooks defaults true, security.go:71; ImportLocalPaths
@@ -158,8 +162,10 @@
  * enum-int binds — misses re-render flagged at 200, no banner, NOTHING
  * else runs) → the rename arm (commits immediately, upstream's own tx
  * boundary) → the auth fold (status; the disabled-fields' hand-crafted
- * values — password/max_repo_creation/restricted/allow_create_organization —
- * absorbed) → the email arm (org / duplicate) → the UpdateUser position
+ * values — password/max_repo_creation/allow_create_organization — absorbed;
+ * `restricted` is REAL since the is_restricted column landed, stored in the
+ * column patch like admin) → the email arm (org / duplicate) → the
+ * UpdateUser position
  * (the type arms, the last-admin guard, then ONE column UPDATE) → the
  * reset-2FA arm → the 303 onto `adminUserLink(targetId)` (upstream's
  * Flash success + redirect; the no-flash reduction drops the banner —
@@ -301,8 +307,6 @@ export const adminUserEditLocale = {
   // each flips to upstream's posture when the arm's column lands.
   max_repo_creation_not_supported:
     "Per-user repository limits are not supported yet — the field stays disabled and the global default (-1) applies until the repository-limit system lands.",
-  restricted_not_supported:
-    "Restricted accounts are not supported yet — the flag stays disabled until the restricted-user system lands.",
   allow_create_organization_not_supported:
     "Per-user organization-creation permission is not supported yet — the flag stays disabled until the org-creation permission system lands.",
   is_activated: "User Account Is Activated", // "admin.users.is_activated" (:125)
@@ -669,6 +673,10 @@ export async function submitAdminUserEdit(
     website: form.website,
     location: form.location,
     isAdmin: form.admin,
+    // users.go:523 `IsRestricted: optional.Some(form.Restricted)` — always
+    // applied (the users.is_restricted column; the repo-listing visibility
+    // composition reads it, api/services/repository.ts restrictedArcCondition).
+    restricted: form.restricted,
     visibility: visibilityFromString(form.visibility),
   };
   if (emailChanged) patch.email = form.email;
@@ -846,17 +854,17 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
           <div class="divider"></div>
 
           {/* The checkbox block (:123-168): active; prohibit_login
-              (disabled for self, :132); admin; restricted + 
-              allow_create_organization DISABLED (the ADR-0008 rule-4
-              interim posture — upstream's arms are real: users.go:528 →
-              user.go:138 `IsRestricted`, users.go:527 → user.go:142
-              `AllowCreateOrganization`; neither column exists here, and a
-              disabled checkbox never posts, so the form cannot offer a
-              store the backend lacks; the submit keeps ignoring
-              hand-crafted values — both flip live when their columns
-              land); allow_git_hook + allow_import_local hidden+disabled
-              (the DEFAULT-config render — DisableGitHooks true,
-              ImportLocalPaths false, the module header). */}
+              (disabled for self, :132); admin; restricted REAL (the
+              users.is_restricted column landed — see the field comment
+              below); allow_create_organization DISABLED (the ADR-0008
+              rule-4 interim posture — upstream's arm is real:
+              users.go:527 → user.go:142 `AllowCreateOrganization`; the
+              column does not exist here, and a disabled checkbox never
+              posts, so the form cannot offer a store the backend lacks;
+              the submit keeps ignoring hand-crafted values — flips live
+              when the column lands); allow_git_hook + allow_import_local
+              hidden+disabled (the DEFAULT-config render — DisableGitHooks
+              true, ImportLocalPaths false, the module header). */}
           <div class="inline field">
             <div class="ui checkbox">
               <label>
@@ -881,14 +889,21 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               <input name="admin" type="checkbox" checked={user.isAdmin} />
             </div>
           </div>
+          {/* restricted (:147-152) — the REAL arm (users.go:528 → the landed
+              users.is_restricted column, the d32b0a4 rule-4 interim flipped
+              live exactly like the password field's PWD-2 flip): the row's
+              stored flag renders checked/unchecked, the checkbox posts, and
+              the submit stores it in the one column patch (the sibling
+              `admin` checkbox's shape — upstream binds
+              `IsRestricted: optional.Some(form.Restricted)`, users.go:523,
+              always applied like IsAdmin). */}
           <div class="inline field">
             <div class="ui checkbox">
               <label>
                 <strong>{adminUserEditLocale.is_restricted}</strong>
               </label>
-              <input name="restricted" type="checkbox" disabled />
+              <input name="restricted" type="checkbox" checked={user.restricted} />
             </div>
-            <p class="help">{adminUserEditLocale.restricted_not_supported}</p>
           </div>
           <div class="inline field tw-hidden">
             <div class="ui checkbox" data-tooltip-content={adminUserEditLocale.allow_git_hook_tooltip}>

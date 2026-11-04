@@ -1108,3 +1108,257 @@ describe("comma needles vs the whole-keyword pair gate (repo_list.go:477-483)", 
     expect(hits.items.map((p) => p.repo.slug).sort()).toEqual(["org-shared", "second"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The RESTRICTED-USER arms (repo_list.go:661-703's restricted composition +
+// SearchRepositoryCondition's :516-518 second ARC AND) over the search and
+// both list routes.
+//
+// Upstream, a RESTRICTED doer (`user.IsRestricted`, the users.is_restricted
+// column) SKIPS AccessibleRepositoryCondition's arm 1 (:665-674 runs the
+// all-publics arm only for `user == nil || !user.IsRestricted ||
+// user.ID <= 0`) and arm 5 (:694-700's else), getting instead — when
+// `!RequireSignInViewStrict` — the `userAllPublicRepoCond` with the
+// [Private, Limited] limit (:697-699): publics under PUBLIC-visibility
+// owners, the ANONYMOUS arm's limit — never the signed-in [Private]-only
+// one. Under RequireSignInViewStrict the restricted viewer gets NO public
+// arm at all (own/granted rows only). The search ALSO ANDs the identical
+// condition a second time for a restricted actor (:516-518, no admin
+// exemption) — vacuous against either base when non-strict, load-bearing
+// under strict. `GetUserRepositories` never calls ARC (repo_list.go
+// :813-842), so /users/{u}/repos carries NO restricted delta; ListMyRepos's
+// :516 AND is row-vacuous over the own arm.
+//
+// The `restrictedViewerFor` helper is the publicOnlyViewerFor precedent: a
+// viewer whose contract `restricted` flag is set (the flag the identity
+// chain will carry from the row once it lands) plus the optional instance
+// strict flag and token scope — the service seam reads all three.
+// ---------------------------------------------------------------------------
+
+/** The RESTRICTED doer's viewer: `requester.restricted` (the users.
+ * is_restricted column's contract field) + `requireSignInViewStrict`
+ * (undefined = upstream's OFF default) + `publicOnlyToken` (the
+ * :662-664 precedence seam). */
+const restrictedViewerFor = (
+  user: { id: number; username: string },
+  opts: { isAdmin?: boolean; strict?: boolean; publicOnlyToken?: boolean } = {},
+): Viewer => {
+  const base = viewerFor(user, opts.isAdmin ?? false);
+  return {
+    ...base,
+    requester: { ...base.requester!, restricted: true },
+    ...(opts.publicOnlyToken ? { publicOnlyToken: true } : {}),
+    ...(opts.strict ? { requireSignInViewStrict: true } : {}),
+  };
+};
+
+describe("the RESTRICTED-USER arms (repo_list.go:665-674/:694-700 skips, :697-699 replacement, :516-518 AND)", () => {
+  /**
+   * rest = the restricted doer (owns restown/restvault, collaborates on the
+   * private `granted` and the private-profile owner's `vault`, member of the
+   * private-visibility org shh whose `pubinpriv` is public). plain = the
+   * NON-restricted control carrying the same edges (own plainown, granted,
+   * shh membership). The discriminating rows: `limpub` (a limited-profile
+   * owner's public — the signed arm-1 [Private]-only limit keeps it, the
+   * restricted replacement's [Private, Limited] limit drops it) and
+   * `pubinpriv` (a private org's public — arm 5 keeps it for plain, SKIPPED
+   * for restricted). `open` passes both; `secpub` (private-profile owner's
+   * public) passes neither (arm 1's owner half). adminown (the admin's own
+   * public) rides the public arms of everyone.
+   */
+  async function seedRestrictedFixture() {
+    const openOwner = await seedVerifiedUser({ username: "OpenOwner" });
+    const limitedOwner = await seedVerifiedUser({ username: "LimitedOwner" });
+    await drizzle(env.DB).update(users).set({ visibility: "limited" }).where(eq(users.id, limitedOwner.id));
+    const secretOwner = await seedVerifiedUser({ username: "SecretOwner" });
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, secretOwner.id));
+    const rest = await seedVerifiedUser({ username: "RestUser" });
+    await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.id, rest.id));
+    const plain = await seedVerifiedUser({ username: "PlainUser" });
+    const admin = await seedVerifiedUser({ username: "RestAdmin", isAdmin: true });
+    await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.id, admin.id));
+
+    await seedRepo(openOwner.id, "openowner", "open", "public");
+    await seedRepo(limitedOwner.id, "limitedowner", "limpub", "public");
+    await seedRepo(secretOwner.id, "secretowner", "secpub", "public");
+    const secretVaultId = await seedRepo(secretOwner.id, "secretowner", "vault", "private");
+    await seedRepo(rest.id, "restuser", "restown", "public");
+    await seedRepo(rest.id, "restuser", "restvault", "private");
+    const grantedId = await seedRepo(openOwner.id, "openowner", "granted", "private");
+    await seedCollaborator(rest.id, grantedId);
+    await seedCollaborator(plain.id, grantedId);
+    await seedCollaborator(rest.id, secretVaultId);
+    await seedCollaborator(admin.id, grantedId);
+    await seedRepo(plain.id, "plainuser", "plainown", "public");
+    await seedRepo(admin.id, "restadmin", "adminown", "public");
+
+    const orgOwner = await seedVerifiedUser({ username: "OrgOwner" });
+    const shh = await seedOrg("shh", orgOwner.id);
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, shh.id));
+    await seedRepo(shh.id, shh.usernameLower, "pubinpriv", "public");
+    await seedOrgMember(shh, rest.id, true);
+    await seedOrgMember(shh, plain.id, true);
+
+    return { rest, plain, admin };
+  }
+
+  it("a restricted viewer's includePrivate search skips arm 1 ([Private] limit) and arm 5; the plain control keeps both", async () => {
+    const { rest, plain } = await seedRestrictedFixture();
+
+    // The restricted composition: own + granted rows (the real edges
+    // survive) plus the replacement publics (public-profile owners only) —
+    // limpub DROPPED (limited-profile owner: the [Private, Limited] limit
+    // the signed arm-1 keeps) and pubinpriv DROPPED (arm 5 skipped).
+    const restricted = await searchRepositories(env.DB, restrictedViewerFor(rest), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(restricted.items.map((p) => p.repo.slug).sort()).toEqual([
+      "adminown",
+      "granted",
+      "open",
+      "plainown",
+      "restown",
+      "restvault",
+      "vault",
+    ]);
+
+    // The plain twin — same grants, same org membership — keeps limpub
+    // (arm 1's [Private]-only limit) and pubinpriv (arm 5); the two
+    // restricted drops are exactly the delta.
+    const control = await searchRepositories(env.DB, viewerFor(plain), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(control.items.map((p) => p.repo.slug).sort()).toEqual([
+      "adminown",
+      "granted",
+      "limpub",
+      "open",
+      "plainown",
+      "pubinpriv",
+      "restown",
+    ]);
+  });
+
+  it("RequireSignInViewStrict drops the replacement arm entirely (repo_list.go:697-699's else)", async () => {
+    const { rest } = await seedRestrictedFixture();
+    const strict = await searchRepositories(env.DB, restrictedViewerFor(rest, { strict: true }), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    // No public arm at all: open/adminown/plainown drop; only the
+    // own/granted rows remain.
+    expect(strict.items.map((p) => p.repo.slug).sort()).toEqual(["granted", "restown", "restvault", "vault"]);
+  });
+
+  it("the search's :516-518 second AND — vacuous non-strict, narrows the public base under strict", async () => {
+    const { rest } = await seedRestrictedFixture();
+
+    // Non-strict, private=false: the forced-public base (publics under
+    // public owners) AND the restricted OR whose replacement arm EQUALS the
+    // base — the base stands (the upstream :516 AND is present but inert).
+    const publicSearch = await searchRepositories(env.DB, restrictedViewerFor(rest), { ...searchOpts });
+    expect(publicSearch.items.map((p) => p.repo.slug).sort()).toEqual(["adminown", "open", "plainown", "restown"]);
+
+    // Strict, private=false: no replacement arm exists, so the AND keeps
+    // only the actor's own/granted PUBLICS — open drops (neither owned nor
+    // granted). The load-bearing restricted search narrowing.
+    const strictPublic = await searchRepositories(env.DB, restrictedViewerFor(rest, { strict: true }), {
+      ...searchOpts,
+    });
+    expect(strictPublic.items.map((p) => p.repo.slug)).toEqual(["restown"]);
+  });
+
+  it("the owner-listing keeps its bare-public shape for a restricted viewer (GetUserRepositories never calls ARC)", async () => {
+    const { rest } = await seedRestrictedFixture();
+    // A restricted viewer listing a LIMITED-profile owner still sees the
+    // public repo — the listing's !Private arm is bare is_private=false
+    // upstream (repo_list.go:823-825), no owner-visibility conjunct,
+    // restricted or not; the same row is INVISIBLE through the restricted
+    // search (the arm-1 skip above).
+    const limitedListing = await listUserRepositories(env.DB, "limitedowner", restrictedViewerFor(rest), listOpts);
+    expect(limitedListing.items.map((p) => p.repo.slug)).toEqual(["limpub"]);
+
+    // The self listing keeps both rows through the own arm (includePrivate
+    // rides the restricted composition there; own rows are unrestricted).
+    const self = await listUserRepositories(env.DB, "restuser", restrictedViewerFor(rest), listOpts);
+    expect(self.items.map((p) => p.repo.slug).sort()).toEqual(["restown", "restvault"]);
+  });
+
+  it("listOwnedRepositories is ARC-stable for a restricted doer under both strict polarities", async () => {
+    const { rest } = await seedRestrictedFixture();
+    // ListMyRepos's :516-518 AND intersects the owner block with the
+    // restricted ARC — but the ARC always contains the own arm
+    // (repo_list.go:693), so the AND never drops an owned row:
+    const nonStrict = await listOwnedRepositories(env.DB, restrictedViewerFor(rest), listOpts);
+    expect(nonStrict.items.map((p) => p.repo.slug).sort()).toEqual(["restown", "restvault"]);
+    const strict = await listOwnedRepositories(env.DB, restrictedViewerFor(rest, { strict: true }), listOpts);
+    expect(strict.items.map((p) => p.repo.slug).sort()).toEqual(["restown", "restvault"]);
+  });
+
+  it("the :662-664 precedence — a restricted public-only token takes the restricted arms + the tail AND, not the early return", async () => {
+    const { rest, plain } = await seedRestrictedFixture();
+
+    // The token floor (:702's cond.And(DoerTokenRepoCond) —
+    // GetUserRepositories ANDs it at :822) collapses the restricted
+    // composition to
+    // the genuinely-public pairs: restown survives (public repo,
+    // public-profile owner), restvault dies under the AND. Upstream's
+    // non-restricted early return produces the same narrowing for a plain
+    // token; the restricted doer just reaches it through the tail AND
+    // (no early return for them — the guard carries `&& !user.IsRestricted`).
+    const floored = await listUserRepositories(
+      env.DB,
+      "restuser",
+      restrictedViewerFor(rest, { publicOnlyToken: true }),
+      listOpts,
+    );
+    expect(floored.items.map((p) => p.repo.slug)).toEqual(["restown"]);
+
+    // Search (the route forces private=false for a public-only token,
+    // repo_list.go:366-368 — no restricted guard, modeled by
+    // includePrivate: false): STRICT the :516-518 AND narrows the
+    // restricted token to its own publics — restown only.
+    const strictToken = await searchRepositories(env.DB, restrictedViewerFor(rest, { strict: true, publicOnlyToken: true }), {
+      ...searchOpts,
+    });
+    expect(strictToken.items.map((p) => p.repo.slug)).toEqual(["restown"]);
+
+    // The NON-restricted token control under strict keeps the whole public
+    // base (no :516 AND fires for it — the early return's precedence).
+    const strictPlainToken = await searchRepositories(
+      env.DB,
+      { ...publicOnlyViewerFor(plain), requireSignInViewStrict: true },
+      { ...searchOpts },
+    );
+    expect(strictPlainToken.items.map((p) => p.repo.slug).sort()).toEqual(["adminown", "open", "plainown", "restown"]);
+  });
+
+  it("a restricted ADMIN's search is ARC-shaped — :516-518 has no admin exemption", async () => {
+    const { admin } = await seedRestrictedFixture();
+    // A FULL admin sees every row (the [] base arm):
+    const fullAdmin = await searchRepositories(env.DB, viewerFor(admin, true), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(fullAdmin.total).toBe(10);
+
+    // The same admin RESTRICTED: the :516-518 AND narrows to the restricted
+    // composition (own ∪ grants ∪ replacement) — the admin flag never
+    // restores the dropped publics (limpub/pubinpriv/secpub stay out) and
+    // adds no rows the edges don't carry (the admin's only grant is
+    // `granted`; `vault` is rest's edge, not the admin's).
+    const restrictedAdmin = await searchRepositories(env.DB, restrictedViewerFor(admin, { isAdmin: true }), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(restrictedAdmin.items.map((p) => p.repo.slug).sort()).toEqual([
+      "adminown",
+      "granted",
+      "open",
+      "plainown",
+      "restown",
+    ]);
+  });
+});

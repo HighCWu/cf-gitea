@@ -741,6 +741,28 @@ export const users = sqliteTable(
      *  account.go:79). NOT NULL DEFAULT false mirrors the xorm DDL verbatim;
      *  the ALTER backfills existing rows to false. */
     mustChangePassword: integer("must_change_password", { mode: "boolean" }).notNull().default(false),
+    // -------------------------------------------------------------------------
+    // Restricted user (the d32b0a4 rule-4 trio's first column) — kept LAST for
+    // the same reason as the ALTER-appended columns above.
+    // -------------------------------------------------------------------------
+    /** Upstream `User.IsRestricted` (user.go:138, `NOT NULL DEFAULT false`)
+     *  — the restricted-user arm: a restricted doer is read-pinned to the
+     *  publics (plus their own/granted rows) regardless of grants they hold:
+     *  `AccessibleRepositoryCondition` skips arm 1 for them (repo_list.go
+     *  :665-674 — the guard runs arm 1 only for
+     *  `user == nil || !user.IsRestricted || user.ID <= 0`) and arm 5
+     *  (:694-700 — the else-branch swaps it for a `[Private, Limited]`
+     *  public arm when `!RequireSignInViewStrict`, nothing when strict), and
+     *  `SearchRepositoryCondition` ANDs the same condition a second time for
+     *  a restricted actor (:516-518). Consumers: the repo-listing visibility
+     *  composition (api/services/repository.ts, keyed off the doer's
+     *  `restricted` contract field) and the admin-user-edit page's real arm
+     *  (the disabled-with-notice interim from the rule-4 trio flips live).
+     *  NOT NULL DEFAULT false mirrors the xorm DDL verbatim; the ALTER
+     *  backfills existing rows to false. The default-create write stays
+     *  upstream's `setting.Service.DefaultUserIsRestricted` (user.go:712,
+     *  default false — no config surface landed, so no writer arm here). */
+    restricted: integer("is_restricted", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [
     uniqueIndex("users_username_lower_uq").on(t.usernameLower),

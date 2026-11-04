@@ -16,6 +16,7 @@ import {
   type TeamAccessMode,
 } from "../../db/schema";
 import type { ApiEnv } from "../env";
+import { requireSignInViewEnabled } from "../config";
 import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
 import type { User } from "../models/user";
@@ -101,11 +102,23 @@ export interface RepositoryWithOwner {
  * same read route-side `authScopePublicOnly` makes. Optional so hand-built
  * viewers (the explore/session seams — cookie doers have no token scope,
  * upstream `IsPublicOnlyDoer` false for them) keep the full-scope reading.
+ *
+ * `requireSignInViewStrict` is the instance flag `[service]
+ * REQUIRE_SIGNIN_VIEW` (upstream `setting.Service.RequireSignInViewStrict`,
+ * config.ts): REQUEST-INVARIANT (env config, not request state), so it rides
+ * the viewer — `viewerOf` populates it from `c.env` — and the service
+ * composition stays env-free. Optional so hand-built viewers without the
+ * flag keep the DEFAULT polarity: upstream's default is OFF (a plain
+ * deployment is anonymous-readable), so `undefined` reads as not-strict and
+ * the restricted replacement arm (:697-699's `!RequireSignInViewStrict`
+ * gate) stays appended — the only polarity hand-built seams can honestly
+ * claim.
  */
 export interface Viewer {
   origin: string;
   requester: User | null;
   publicOnlyToken?: boolean;
+  requireSignInViewStrict?: boolean;
 }
 
 /** Requester accessor for optional-auth routes (middleware absent → null). */
@@ -115,6 +128,7 @@ export function viewerOf(c: Context<ApiEnv>): Viewer {
     origin: new URL(c.req.url).origin,
     requester: requester ?? null,
     publicOnlyToken: c.get("auth")?.scope?.publicOnly === true,
+    requireSignInViewStrict: requireSignInViewEnabled(c.env),
   };
 }
 
@@ -1353,13 +1367,89 @@ function updatedSortKey(): SQL {
  * `visibility = 'public'`: `/users/{username}/repos`'s `!Private` arm is bare
  * `is_private = false` upstream (GetUserRepositories, repo_list.go:823-825),
  * and it shares this helper.
+ *
+ * The RESTRICTED doer replaces all of that with `restrictedArcCondition`
+ * (repo_list.go:665-674 runs arm 1 only for
+ * `user == nil || !user.IsRestricted || user.ID <= 0`, so a restricted doer
+ * SKIPS it; :694-700 swaps arm 5 for the strict-gated `[Private, Limited]`
+ * public arm): a restricted viewer reads publics like an anonymous viewer —
+ * limited-profile owners' publics DROPPED, the row class the signed-in
+ * `[Private]`-only limit keeps — keeps their own/granted rows, and loses the
+ * private-org-publics arm. Admins still see all: this helper's admin arm
+ * returns [] first (the caller-side exemption upstream's ARC callers carry at
+ * :372; the :516-518 search AND — which has NO admin exemption — rides
+ * `searchRepositories` instead). `GetUserRepositories` upstream never calls
+ * ARC at all (repo_list.go:813-842 — owner rows plus the :822
+ * DoerTokenRepoCond plus the route's HasAnyUnitAccess post-filter,
+ * user/repo.go:46), so the restricted arms make no delta on that listing
+ * shape: the `!includePrivate` anonymous-style base stays the restricted
+ * viewer's arm there too (public rows pass the post-filter through their
+ * public read access, restricted or not).
  */
+/**
+ * `userAllPublicRepoCond` with the `[Private, Limited]` orgVisibilityLimit
+ * (repo_list.go:651-658 via :697-699): public repositories whose OWNER's
+ * visibility is neither 'limited' nor 'private' — on our 3-value enum, public
+ * repos under PUBLIC-visibility owners. This is the RESTRICTED doer's
+ * replacement public arm: upstream appends it to the restricted composition
+ * instead of arm 5 whenever `!RequireSignInViewStrict` (:697-699), so a
+ * restricted signed-in viewer reads publics the way an ANONYMOUS viewer does
+ * (the anonymous arm's limit, :669-671 — never the signed-in `[Private]`-only
+ * limit, which would admit limited-profile owners' publics).
+ */
+function publicReposUnderPublicOwnerVisibilityCondition(): SQL {
+  return and(
+    eq(repositories.visibility, "public"),
+    sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN ('limited', 'private'))`,
+  ) as SQL;
+}
+
+/**
+ * The RESTRICTED doer's `AccessibleRepositoryCondition` (repo_list.go
+ * :661-703 with both restricted skips applied): arm 1 is SKIPPED (:665-674
+ * runs the all-publics arm only for
+ * `user == nil || !user.IsRestricted || user.ID <= 0` — a restricted
+ * signed-in doer never rides it) and arm 5 is SKIPPED (:694-700's else —
+ * the private-org-publics twin `publicInPrivateOrgCondition` is gated on
+ * `!user.IsRestricted`). What remains: arms 2-4 (the collaborator + team
+ * grant twins and the own rows — a restricted doer keeps every REAL edge)
+ * plus, when `!RequireSignInViewStrict`, the replacement public arm
+ * (:697-699 — publics under public-visibility owners). Under strict the
+ * restricted viewer gets NO public arm at all: only own/granted rows. This
+ * same composition is what the search's :516-518 second AND and the
+ * `visibilityConditions` restricted base share (upstream ANDs the identical
+ * condition twice in a `Private=true` restricted search — :374 base plus
+ * :517 — logical idempotence, kept faithful).
+ */
+function restrictedArcCondition(viewer: Viewer): SQL {
+  const userId = viewer.requester?.id;
+  const arms: SQL[] =
+    userId === undefined
+      ? []
+      : [collaboratorGrantCondition(userId), teamGrantCondition(userId)];
+  // Arm 4 — the own rows, unrestricted (repo_list.go:693; a restricted doer
+  // sees their own repositories exactly like anyone else).
+  arms.push(eq(repositories.ownerNamespace, requesterLoginLower(viewer) ?? ""));
+  if (viewer.requireSignInViewStrict !== true) {
+    // The :697-699 replacement arm (undefined reads as upstream's OFF
+    // default — see Viewer.requireSignInViewStrict).
+    arms.push(publicReposUnderPublicOwnerVisibilityCondition());
+  }
+  return or(...arms) as SQL;
+}
+
 function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
   if (!includePrivate || viewer.requester === null) {
     return [eq(repositories.visibility, "public")];
   }
   if (viewer.requester.is_admin === true) {
     return [];
+  }
+  if (viewer.requester.restricted === true) {
+    // The RESTRICTED composition (repo_list.go:665-674 arm-1 skip +
+    // :694-700 arm-5 skip — restrictedArcCondition above): no public arm
+    // beyond the strict-gated replacement, no private-org-publics arm.
+    return [restrictedArcCondition(viewer)];
   }
   const userId = viewer.requester.id;
   const grantArms =
@@ -1390,7 +1480,18 @@ function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
  * ANDs the cond unconditionally in `GetUserRepositories`, repo_list.go:822,
  * and `AccessibleRepositoryCondition` early-returns to the same narrowing for
  * a public-only doer, :662-664; `IsPublicOnlyDoer` has no admin exemption).
- * Empty for every other viewer (`builder.NewCond()` upstream). The SEARCH
+ * The :662-664 early return fires only for a NON-restricted doer
+ * (`IsPublicOnlyDoer(user) && !user.IsRestricted`): a RESTRICTED public-only
+ * doer takes the restricted arms (:665-674 arm-1 skip + :694-700's
+ * strict-gated replacement) with THIS cond ANDed at the tail (:702
+ * `cond.And(DoerTokenRepoCond(user))`) instead of early-returning — the AND
+ * collapses their composition to the genuinely-public pairs, exactly like the
+ * early return does for everyone else (their own private rows included-none).
+ * The search route's public-only forcing (repo_list.go:366-368) has NO
+ * restricted guard either, so `resolveIncludePrivate` forces it for restricted
+ * tokens too — the restricted :516-518 AND then rides on top of the
+ * anonymous-style base. Empty for every other viewer (`builder.NewCond()`
+ * upstream). The SEARCH
  * path needs no extra arm here: a public-only token's `includePrivate` is
  * forced false route-side (repo.ts resolveIncludePrivate — upstream
  * `SearchRepositoryCondition` :366-368), so the anonymous-style base
@@ -1587,6 +1688,14 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
  *    compat suite's repoSearch scenario rides bare needles (corrected from
  *    the pre-SEARCH per-segment pair divergence; pinned in
  *    repository-search-filters.test.ts).
+ *  - restricted actors: `SearchRepositoryCondition` ANDs the restricted
+ *    `AccessibleRepositoryCondition` a SECOND time (:516-518, no admin
+ *    exemption — landed here as `restrictedArcCondition` right after the
+ *    base). Non-strict it is vacuous against either base (the replacement
+ *    arm equals the public base; the `private=true` base IS the restricted
+ *    composition, the upstream :374/:517 double-AND); under
+ *    `REQUIRE_SIGNIN_VIEW=true` it is load-bearing — a restricted searcher's
+ *    public search keeps only their own/granted publics.
  *  - keyword ordering (repo_list.go:614-618): with `priorityOwnerId` unset,
  *    an exactly-one-slash keyword prepends `CASE WHEN owner_namespace =
  *    <owner half> THEN 0 ELSE 1 END` to the order-by — the owner-name match
@@ -1616,6 +1725,24 @@ export async function searchRepositories(
     conditions.push(
       sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN ('limited', 'private'))`,
     );
+  }
+
+  // The RESTRICTED actor's SECOND AccessibleRepositoryCondition AND
+  // (repo_list.go:516-518 — `if opts.Actor != nil && opts.Actor.IsRestricted`:
+  // no admin exemption here, unlike the :372 base arm, so a restricted admin's
+  // search is ARC-shaped exactly like a restricted user's). The condition is
+  // restrictedArcCondition — the same composition the restricted
+  // visibilityConditions base carries — so:
+  //  - `private=true` restricted search: ANDed with the identical base (the
+  //    upstream :374/:517 double-AND, logically idempotent),
+  //  - `private=false` restricted search, non-strict: the base
+  //    (publics-under-public-owners) is a SUBSET of the OR (the replacement
+  //    arm equals the base) — vacuous, upstream's own shape,
+  //  - `private=false` restricted search, STRICT: no replacement arm exists,
+  //    so only the actor's own/granted PUBLIC repos survive the AND — the
+  //    load-bearing restricted search narrowing.
+  if (viewer.requester !== null && viewer.requester.restricted === true) {
+    conditions.push(restrictedArcCondition(viewer));
   }
 
   if (opts.isPrivate !== null) {
@@ -1904,6 +2031,14 @@ export async function listUserRepositories(
  * (public + public-owner) ahead of the owned rows — the token cannot read
  * its own private repos here either. The identity comes from the auth
  * middleware; a token user without a D1 row owns nothing (empty list).
+ *
+ * RESTRICTED doers need no arm here: upstream routes this listing through
+ * `SearchRepository` (ListMyRepos, user/repo.go:106-114), whose :516-518
+ * restricted AND intersects the owner block with the restricted ARC — but
+ * the ARC always contains the own arm (repo_list.go:693), so the AND never
+ * drops an owned row (the landed own-only shape is ARC-stable under both
+ * strict polarities; the landed own-only-vs-(own-OR-collaborate) reduction is
+ * the pre-existing documented divergence, unchanged by this arm).
  */
 export async function listOwnedRepositories(
   d1: D1Database,
