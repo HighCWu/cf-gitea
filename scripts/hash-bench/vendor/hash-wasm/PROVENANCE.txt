@@ -1,0 +1,72 @@
+hash-wasm vendored build — provenance
+=====================================
+
+Files:    index.esm.js   (byte-identical copy of hash-wasm@4.12.0 dist/index.esm.js)
+          argon2.wasm    (extracted from index.esm.js by lib/extract-wasm.mjs)
+          bcrypt.wasm    (extracted from index.esm.js by lib/extract-wasm.mjs)
+          blake2b.wasm   (extracted from index.esm.js by lib/extract-wasm.mjs —
+                          hash-wasm's argon2id computes the H0 with its blake2b build)
+License:  MIT (see LICENSE, upstream)
+Source:   npm tarball hash-wasm@4.12.0 (registry.npmjs.org), dist/index.esm.js
+SHA256:   2d6333a619d7f64adc313a38732425fc0c6f0baaa36c1419cf05672bcd89340d  index.esm.js.vendored
+          83b5829d20b4312aca1a56819f95eef20492e058c70f282c9ed6929f579b20ed  argon2.wasm
+          6a204dc0bc5d7ebfe386a4969095b5319627397f3c3cc1cb0a16ea0e7fbaf313  bcrypt.wasm
+          b478c0d889d97d7a8db4d10501457ad78dd406d02dcb4c892c0d844805ef05bb  blake2b.wasm
+Obtained: 2026-11-04, `npm install hash-wasm@4.12.0` into a throwaway scratch
+          directory (NOT into this repo), then the dist file copied here and the
+          three wasm binaries extracted from it by lib/extract-wasm.mjs (the
+          bundle embeds each algorithm's binary as a base64 string; extraction
+          is a pure decode of those literals, so the .wasm files are
+          byte-identical to what hash-wasm ships). This harness NEVER installs
+          anything; these files are the only artifacts and are imported in place.
+
+Why vendored (and not an npm dependency):
+  Phase B (docs/research/hash-bench-phase-b.md) must not add dependencies to
+  the product (mission constraint). The wasm files are the viable
+  no-dependency approach for argon2/bcrypt on Workers — but ONLY in the
+  static-module shape (see the platform constraint below); hash-wasm's own
+  loader shape (base64-embedded binaries + WebAssembly.compile(bytes)) is
+  BLOCKED on workerd. If a later phase adopts argon2/bcrypt for real, the
+  SPEC must require a static .wasm import (wrangler rules type
+  "CompiledWasm", i.e. `rules: [{ type: "CompiledWasm", globs:
+  ["**/*.wasm"] }]` in wrangler.jsonc) and a loader that takes the
+  precompiled WebAssembly.Module — this harness's worker-bench.mjs +
+  extract-wasm.mjs pair is a working reference for that shape.
+
+PLATFORM CONSTRAINT (measured, workerd 1.20261023.1 via miniflare
+5.20261023.0-beta, and documented for production Workers):
+  Dynamic wasm compilation is hard-blocked by the runtime:
+    WebAssembly.compile(bytes) -> CompileError: "Wasm code generation
+    disallowed by embedder" (same for WebAssembly.instantiate(bytes)).
+  There is NO compatibility flag to lift it (cloudflare/workers-sdk#1366,
+  nickb.dev "Wasm is not an implementation detail"). The supported shape is
+  a STATICALLY IMPORTED .wasm module (compiled at deploy/startup; the import
+  yields a precompiled WebAssembly.Module, which instantiate() accepts).
+  Consequence: hash-wasm AS SHIPPED does not run on Workers — any adoption
+  needs the extracted .wasm files (or equivalent) imported statically, with
+  hash-wasm's WebAssembly.compile redirected to them (exactly what
+  lib/worker-bench.mjs does via a byte-length-keyed shim).
+
+Cross-validation (scratch prototype, before this file landed):
+  1. argon2id: hash-wasm output == @noble/hashes@latest argon2id output on two
+     parameter sets — (t=2, m=65536, p=8, dkLen=50, salt "somesalt") and
+     (t=2, m=32768, p=4, dkLen=50, salt = 16 raw bytes 0x07) — both hex tags
+     byte-identical. (argon2id v=0x13 semantics: t=passes, m=KiB, p=lanes.)
+  2. bcrypt: hash-wasm digest == python3-bcrypt 5.0.0 (crypt_blowfish lineage)
+     digest for the identical (password, raw-16-byte-salt, cost=10) inputs —
+     "$2a$10$a0DqbBXgcVPjax.vKhKyLOZN7fD1uNNwB2HvHFn8SqtczTgRM3jvW" vs python's
+     "$2b$10$..." (same tag; the 2a/2b prefix convention is the only delta,
+     digests are identical for ASCII passwords).
+  3. bcrypt >72-byte passwords: hash-wasm REJECTS with "Password should be at
+     most 72 bytes long" — matching golang.org/x/crypto/bcrypt's behavior
+     (GenerateFromPassword errors above 72 bytes), so no silent-truncation
+     divergence vs upstream.
+
+Reproducibility:
+  # bundle hash must match the SHA256 above:
+  node -e "console.log(require('crypto').createHash('sha256')
+    .update(require('fs').readFileSync('scripts/hash-bench/vendor/hash-wasm/index.esm.js.vendored'))
+    .digest('hex'))"
+  # wasm extraction is deterministic — re-running it reproduces the same
+  # bytes (and therefore the same SHA256s):
+  node scripts/hash-bench/lib/extract-wasm.mjs
