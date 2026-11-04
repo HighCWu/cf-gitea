@@ -3287,7 +3287,7 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-user-create-201",
-    expect: `POST /api/v1/admin/users {"username":"${ctx.member}","visibility":"private"} → 201 with visibility:"private" (the admin API; PAT-only store — no password)`,
+    expect: `POST /api/v1/admin/users {"username":"${ctx.member}","visibility":"private","password":<probe>} → 201 with visibility:"private" (the admin API; PWD-4's ladder requires a password — the probe carries one, mcp explicit-false)`,
     run: async () => {
       const res = await api("/admin/users", {
         method: "POST",
@@ -3295,6 +3295,7 @@ const fixwaveSteps = (ctx) => [
           username: ctx.member,
           email: `${ctx.member}@probes.cf-gitea.invalid`,
           visibility: "private",
+          password: `Probe-${crypto.randomUUID()}`,
           must_change_password: false,
         },
       });
