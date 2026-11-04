@@ -343,24 +343,32 @@ describe("the instance seed (SPEC-0019 §3.1 step 1's R02 arm)", () => {
     expect(adminSlugs).toEqual(["vault", "a-open"]);
   });
 
-  it("seeds a public repo under a private-visibility owner (the explore-listing parity — the recorded reduction)", async () => {
-    // Upstream's PublicRepoUnderPublicOwnerCond (repo_list.go:755-763) would
-    // narrow the anonymous set to genuinely-public pairs; the landed explore
-    // repos posture lists a public repo under a private owner with the
-    // Private badge instead, and this seed mirrors the listing (the module
-    // header's recorded reduction: the code page is never narrower — nor
-    // wider — than the instance's own discovery surface for the same viewer).
+  it("seeds a public repo under a private-visibility owner (the explore-listing parity — S-FIXES' S2 port)", async () => {
+    // Upstream's owner-visibility exclusion (the anonymous-search arm
+    // repo_list.go:380-384; the shared narrowing condition's family at
+    // repo_list.go:755-763) hides a public repo under a limited/private
+    // owner from public discovery; S-FIXES' S2 ported the exclusion, so the
+    // recorded reduction this test used to pin (listing the row with a
+    // Private badge) is OBSOLETE — the code page and the repos listing now
+    // agree with upstream's genuinely-public-pairs-only set.
     const { ownerA } = await seedOwners();
     await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.usernameLower, "ecc-owner"));
     await seedPaddingRepo(ownerA, "under-private-owner");
 
     const anonSeeds = await loadExploreCodeSearchSeeds(env.DB, exploreCodeDoer(ANON_VIEWER));
-    expect(anonSeeds.map((seed) => seed.slug)).toEqual(["under-private-owner"]);
+    expect(anonSeeds.map((seed) => seed.slug)).toEqual([]);
 
-    // the repos listing admits the same row for the same viewer (the parity
+    // the repos listing hides the same row for the same viewer (the parity
     // this seed is built on)
     const reposHtml = await renderReposPage(ANON_VIEWER, "q=under-private-owner");
-    expect(reposHtml).toContain('href="/ecc-owner/under-private-owner"');
+    expect(reposHtml).not.toContain('href="/ecc-owner/under-private-owner"');
+
+    // The ADMIN arm stays unfiltered (code.go:55-66 — no repoIDs guard,
+    // every owner's rows visible): the row reappears for an admin viewer.
+    const adminSlugs = (await loadExploreCodeSearchSeeds(env.DB, { id: 999_999, isAdmin: true, usernameLower: null })).map(
+      (seed) => seed.slug,
+    );
+    expect(adminSlugs).toEqual(["under-private-owner"]);
   });
 
   it("caps through the loader: 30 visible → 25 covered greps, overCap with the FULL count", async () => {

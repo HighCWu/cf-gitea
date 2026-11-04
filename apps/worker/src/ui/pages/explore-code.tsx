@@ -207,17 +207,26 @@ function teamGrantCondition(userId: number): SQL {
 
 /** The seed's WHERE arms — `visibilityConditions(viewer, includePrivate:
  *  true)`'s three arms (module header: anonymous = public rows; signed-in
- *  non-admin = public ∪ own ∪ grants; admin = unfiltered, code.go:55-66). */
+ *  non-admin = public ∪ own ∪ grants; admin = unfiltered, code.go:55-66) —
+ *  with the public arm's owner-visibility half folded in (repo_list.go:
+ *  380-384, S-FIXES' S2 condition, the same shape searchRepositories
+ *  pushes): a public repo under a limited/private-visibility owner is
+ *  invisible to every viewer who isn't the owner/admin — their own rows
+ *  ride the owner arm, unaffected. */
 function exploreCodeVisibilityConditions(doer: ExploreCodeDoer): SQL[] {
+  const publicPair = and(
+    eq(repositories.visibility, "public"),
+    sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN ('limited', 'private'))`,
+  );
   if (doer.id === null) {
-    return [eq(repositories.visibility, "public")];
+    return [publicPair as SQL];
   }
   if (doer.isAdmin) {
     return [];
   }
   return [
     or(
-      eq(repositories.visibility, "public"),
+      publicPair,
       eq(repositories.ownerNamespace, doer.usernameLower ?? ""),
       collaboratorGrantCondition(doer.id),
       teamGrantCondition(doer.id),
