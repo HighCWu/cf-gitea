@@ -453,7 +453,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
-      "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
+      "Job queue",
+      "Audit Log", // B70's AdminFamilyNav monitor fold (c13b23c) // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
       "Queues",
@@ -517,7 +518,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
-      "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
+      "Job queue",
+      "Audit Log", // B70's AdminFamilyNav monitor fold (c13b23c) // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
       "Queues",
@@ -597,7 +599,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
-      "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
+      "Job queue",
+      "Audit Log", // B70's AdminFamilyNav monitor fold (c13b23c) // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
       "Queues",
@@ -674,7 +677,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
-      "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
+      "Job queue",
+      "Audit Log", // B70's AdminFamilyNav monitor fold (c13b23c) // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
       "Queues",
