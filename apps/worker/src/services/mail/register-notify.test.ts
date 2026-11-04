@@ -112,6 +112,9 @@ const createBody = (sendNotify: boolean | undefined) =>
     body: JSON.stringify({
       username: "alice",
       email: "alice@example.org",
+      // PWD-4's create-arm password ladder (50dce36) requires a valid
+      // password — the pre-PWD-4 fixture predates the column.
+      password: "Fixture-1a password",
       ...(sendNotify === undefined ? {} : { send_notify: sendNotify }),
     }),
   }) satisfies RequestInit;
