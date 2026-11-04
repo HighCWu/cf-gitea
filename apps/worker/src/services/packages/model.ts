@@ -866,17 +866,31 @@ async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number
  * non-public owners (the anonymous arm of the ladder); every authenticated
  * doer reaches the ladder, whose member checks and visibility arm produce
  * the mode.
+ *
+ * The require-sign-in-view instance flag rides upstream's own seam
+ * (services/context/package.go:120 — INSIDE determineAccessMode, after the
+ * site-admin arm): `strictSignInView: true` zeroes an anonymous doer's mode
+ * regardless of owner visibility, so every reqPackageAccess wrap answers its
+ * 401 challenge and no per-route arm is needed. Upstream's check is
+ * `doer == nil || doer.IsGhost()` — our ghost arrives at this ladder as
+ * doer === null on every path (the container family maps the ghost token's
+ * userId -1 to null before the gate), so the null check covers both classes.
+ * Callers pass `requireSignInViewEnabled(env)` (the SPEC-0003 §2.4 row 6
+ * flag); the default (undefined) is the flag-off posture.
  */
 export async function determinePackageAccessMode(
   d1: D1Database,
   owner: PackageOwnerRow,
   doer: PackageDoer | null,
-  opts: { ownerVisibleToDoer?: boolean } = {},
+  opts: { ownerVisibleToDoer?: boolean; strictSignInView?: boolean } = {},
 ): Promise<PackageAccessMode> {
   const visibleToDoer =
     opts.ownerVisibleToDoer ?? (doer === null ? owner.visibility === "public" : true);
   if (!visibleToDoer) return "none";
   if (doer !== null && doer.isAdmin) return "owner";
+  // package.go:120 — the strict arm sits between the site-admin and the
+  // owner-self arms in upstream's ladder; preserved verbatim.
+  if (opts.strictSignInView === true && doer === null) return "none";
   if (doer !== null && doer.id === owner.id) return "owner";
 
   if (owner.type === "org") {

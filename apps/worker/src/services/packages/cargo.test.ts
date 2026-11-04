@@ -482,6 +482,32 @@ describe("config.json, search, owners, download", () => {
     });
   });
 
+  it("config.json arms auth-required on the require-sign-in-view flag alone (cargo.go:53 — the RequireSignInViewStrict OR-arm)", async () => {
+    const owner = await seedUser("cfgstrict");
+    const reader = await token(owner, "read:package");
+    // Flag OFF (the default env): a PUBLIC owner's config stays anonymous-open.
+    const off = await protocol({ REQUIRE_SIGNIN_VIEW: "false" })(`/api/packages/cfgstrict/cargo/config.json`, {});
+    expect(off.status).toBe(200);
+    expect((await off.json<{ "auth-required": boolean }>())["auth-required"]).toBe(false);
+    // Flag ON: the anonymous caller never reaches the body (the read gate
+    // 401s — the strict arm in determinePackageAccessMode, package.go:120);
+    // an AUTHENTICATED caller sees the OR-arm — upstream ORs
+    // RequireSignInViewStrict into BuildConfig per request (cargo.go:53).
+    const anonOn = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })(`/api/packages/cfgstrict/cargo/config.json`, {});
+    expect(anonOn.status).toBe(401);
+    expect(anonOn.headers.get("WWW-Authenticate")).toBe('Basic realm="Gitea Package API"');
+    await anonOn.text();
+    const on = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })(`/api/packages/cfgstrict/cargo/config.json`, {
+      headers: authHeaders(reader),
+    });
+    expect(on.status).toBe(200);
+    expect(await on.json<{ dl: string; api: string; "auth-required": boolean }>()).toEqual({
+      dl: "https://example.com/api/packages/cfgstrict/cargo/api/v1/crates",
+      api: "https://example.com/api/packages/cfgstrict/cargo",
+      "auth-required": true,
+    });
+  });
+
   it("search answers the SearchResult shape with the ToCorrectPageSize clamps", async () => {
     const owner = await seedUser("searcher");
     await seedCrate(owner, { name: "left-pad", vers: "1.0.0", description: "the left pad" });

@@ -32,7 +32,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageFiles, packageProperties, packageVersions, users } from "../../db/schema";
+import { packageFiles, packageProperties, packageVersions, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 
@@ -45,6 +45,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "webhook_deliveries",
+    "webhooks",
     "package_properties",
     "package_files",
     "package_blobs",
@@ -916,6 +918,50 @@ describe("nuget validation and delete arms", () => {
     expect(unknown.status).toBe(404);
     expect(messageOf(await unknown.json())).toBe("package does not exist");
   });
+
+  it("the delete fires the package webhook deleted (nuget.go:679 → packages.go:532); the 404 arm stays silent", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: owner.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    expect((await push("alice", await makeNupkg(), authHeaders(writer))).status).toBe(201);
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the created arm
+
+    // The 404 arm resolves no descriptor — silent.
+    const unknown = await protocol()("/api/packages/alice/nuget/System.Gitea/9.9.9", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(unknown.status).toBe(404);
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1);
+
+    const del = await protocol()("/api/packages/alice/nuget/System.Gitea/1.0.1", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(del.status).toBe(204);
+    await del.text();
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const payload = JSON.parse(rows[1]!.payloadContent) as { action: string; package: { type: string; version: string }; sender: { login: string } };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("nuget");
+    expect(payload.package.version).toBe("1.0.1");
+    expect(payload.sender.login).toBe("alice");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1071,5 +1117,38 @@ describe("nuget auth, quota, and gates", () => {
     const enabled = await protocol({ PACKAGES_ENABLED: "true" })("/api/packages/alice/nuget/index.json");
     expect(enabled.status).toBe(200);
     await enabled.text();
+  });
+});
+
+// The require-sign-in-view flag (package.go:120 via protocolAccessGate's
+// strict arm) does NOT close the service-index carve-out: upstream's trio
+// sits OUTSIDE every reqPackageAccess wrap (api.go:342-346), so the flag —
+// which only zeroes the anonymous ACCESS MODE the wraps consult — leaves
+// the trio anonymous, exactly like the swift login pair. The GATED nuget
+// arms answer the 401 challenge under the flag.
+describe("REQUIRE_SIGNIN_VIEW (the nuget carve-out posture)", () => {
+  it("flag on: the service-index trio stays anonymous (200); a gated arm answers the 401 challenge", async () => {
+    const owner = await seedUser("flagcarve");
+    const writer = await token(owner, "write:package");
+    const pushed = await push("flagcarve", await makeNupkg({ id: "Carve.Pkg" }), authHeaders(writer));
+    expect(pushed.status).toBe(201);
+    await pushed.text();
+
+    const caller = protocol({ REQUIRE_SIGNIN_VIEW: "true" });
+    const v2 = await caller("/api/packages/flagcarve/nuget");
+    expect(v2.status).toBe(200);
+    await v2.text();
+    const v3 = await caller("/api/packages/flagcarve/nuget/index.json");
+    expect(v3.status).toBe(200);
+    await v3.text();
+    const metadata = await caller("/api/packages/flagcarve/nuget/$metadata");
+    expect(metadata.status).toBe(200);
+    await metadata.text();
+
+    // The gated read arm (registration) refuses the anonymous caller.
+    const gated = await caller("/api/packages/flagcarve/nuget/registration/Carve.Pkg/index.json");
+    expect(gated.status).toBe(401);
+    expect(gated.headers.get("www-authenticate")).toBe('Basic realm="Gitea Package API"');
+    await gated.text();
   });
 });

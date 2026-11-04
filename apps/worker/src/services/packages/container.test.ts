@@ -26,12 +26,13 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
-import { packageBlobUploads, packageVersions, users } from "../../db/schema";
+import { packageBlobUploads, packageVersions, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createContainerProtocolRouter } from "../../api/routes/packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 import {
   cleanupExpiredContainerUploads,
   createContainerBlobUpload,
+  mintContainerToken,
   resetContainerTokenCacheForTests,
   verifyContainerToken,
   CONTAINER_GHOST_USER_ID,
@@ -46,6 +47,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "webhook_deliveries",
+    "webhooks",
     "package_blob_uploads",
     "package_properties",
     "package_files",
@@ -745,6 +748,54 @@ describe("container manifests", () => {
     expect(missing.status).toBe(404);
   });
 
+  it("the tag delete fires the package webhook deleted (container.go:697's RemovePackageVersion loop)", async () => {
+    const call = protocol();
+    const user = await seedUser(OWNER);
+    const auth = basicAuth(await token(user.id, "write:package"));
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: user.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    const configDigest = await pushBlob(call, auth, imageConfigBytes());
+    const manifest = await buildManifest(configDigest, imageConfigBytes().byteLength, []);
+    await call(`/v2/${OWNER}/${IMAGE}/manifests/doomed`, {
+      method: "PUT",
+      headers: { ...auth, "Content-Type": "application/vnd.oci.image.manifest.v1+json" },
+      body: manifest.bytes,
+    });
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the created arm (manifest.go:95)
+
+    const removed = await call(`/v2/${OWNER}/${IMAGE}/manifests/doomed`, { method: "DELETE", headers: auth });
+    expect(removed.status).toBe(202);
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const payload = JSON.parse(rows[1]!.payloadContent) as {
+      action: string;
+      package: { type: string; name: string };
+      sender: { login: string };
+    };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("container");
+    expect(payload.package.name).toBe(IMAGE);
+    expect(payload.sender.login).toBe(OWNER);
+
+    // The missing-manifest delete resolves no versions — silent.
+    const missing = await call(`/v2/${OWNER}/${IMAGE}/manifests/neverwas`, { method: "DELETE", headers: auth });
+    expect(missing.status).toBe(404);
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(2);
+  });
+
   it("builds and serves the multi-arch index (manifest.go:161-229)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
@@ -972,5 +1023,81 @@ describe("container gates + cleanup", () => {
     expect(upload.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(upload.bytesReceived).toBe(0);
     expect(upload.chunkCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The require-sign-in-view flag — the container arms (SPEC-0003 §2.4 row 6
+// handoff): ReqContainerAccess (container.go:133-137) refuses
+// `doer == nil || (RequireSignInViewStrict && doer.IsGhost())`; the
+// APIUnauthorizedError twin folds the flag in (container.go:122-127); the
+// /token anonymous arm refuses BEFORE the ghost mint (:156-159). Flag off
+// keeps the landed posture (the two controls).
+// ---------------------------------------------------------------------------
+
+describe("REQUIRE_SIGNIN_VIEW (the container arms)", () => {
+  it("flag on: the anonymous /v2/ ping answers Bearer + Basic twin (the flag folds into the twin)", async () => {
+    const ping = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })("/v2/", {});
+    expect(ping.status).toBe(401);
+    const challenges = ping.headers.get("WWW-Authenticate");
+    expect(challenges).toContain('Bearer realm="https://example.com/v2/token"');
+    expect(challenges).toContain('Basic realm="Gitea Container Registry"');
+    expect((await readOciError(ping)).errors[0]?.code).toBe("UNAUTHORIZED");
+  });
+
+  it("flag on: a ghost bearer is refused at /v2/ and at the {username} gate (ReqContainerAccess :135)", async () => {
+    const call = protocol({ REQUIRE_SIGNIN_VIEW: "true" });
+    // Under the flag /v2/token refuses anonymous (the arm below), so the
+    // ghost JWT is minted directly — a stale pre-flag token a client might
+    // still present.
+    const ghost = await mintContainerToken(env.DB, CONTAINER_GHOST_USER_ID, "");
+    const claims = await verifyContainerToken(env.DB, ghost);
+    expect(claims?.userId).toBe(CONTAINER_GHOST_USER_ID);
+
+    const ping = await call("/v2/", { headers: bearerAuth(ghost) });
+    expect(ping.status).toBe(401);
+    expect(ping.headers.get("WWW-Authenticate")).toContain('Basic realm="Gitea Container Registry"');
+    await readOciError(ping);
+
+    // The {username} group: upstream's ReqContainerAccess runs BEFORE the
+    // owner assignment (api.go:537) — the OCI envelope, not the shared
+    // Gitea-Package-API plain challenge the flag-off ladder answers.
+    await seedUser("strictowner");
+    const tags = await call("/v2/strictowner/app/tags/list", { headers: bearerAuth(ghost) });
+    expect(tags.status).toBe(401);
+    expect(tags.headers.get("WWW-Authenticate")).toContain('Basic realm="Gitea Container Registry"');
+    expect((await readOciError(tags)).errors[0]?.code).toBe("UNAUTHORIZED");
+  });
+
+  it("flag on: /v2/token refuses anonymous BEFORE the ghost mint (container.go:156-159)", async () => {
+    const response = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })("/v2/token", {});
+    expect(response.status).toBe(401);
+    expect(response.headers.get("WWW-Authenticate")).toContain('Basic realm="Gitea Container Registry"');
+    expect((await readOciError(response)).errors[0]?.code).toBe("UNAUTHORIZED");
+  });
+
+  it("flag on: an authenticated scoped user keeps the full flow (the ladder is anonymous-only)", async () => {
+    const user = await seedUser("strictauth");
+    const pat = await token(user.id, "write:package");
+    const call = protocol({ REQUIRE_SIGNIN_VIEW: "true" });
+    const jwt = await bearerFor(call, pat);
+    const ping = await call("/v2/", { headers: bearerAuth(jwt) });
+    expect(ping.status).toBe(200);
+    await ping.text();
+  });
+
+  it("flag off (the default env): the landed posture — anonymous token mints the ghost, the bare ping carries no Basic twin", async () => {
+    const call = protocol({ REQUIRE_SIGNIN_VIEW: "false" });
+    const tokenResponse = await call("/v2/token", {});
+    expect(tokenResponse.status).toBe(200);
+    const ghost = ((await tokenResponse.json<{ token: string }>())).token;
+    expect((await verifyContainerToken(env.DB, ghost))?.userId).toBe(CONTAINER_GHOST_USER_ID);
+
+    const ping = await call("/v2/", {});
+    expect(ping.status).toBe(401);
+    const challenges = ping.headers.get("WWW-Authenticate");
+    expect(challenges).toContain('Bearer realm="https://example.com/v2/token"');
+    expect(challenges).not.toContain('Basic realm="Gitea Container Registry"');
+    await readOciError(ping);
   });
 });

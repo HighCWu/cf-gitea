@@ -263,12 +263,20 @@ async function indexPerson(
 }
 
 /** The root `config.json` bytes — `json.Encoder.Encode` appends "\n"
- *  (index.go:249-251), so the file is the JSON document plus a newline. */
+ *  (index.go:249-251), so the file is the JSON document plus a newline.
+ *  `opts.strictSignInView` is the require-sign-in-view OR-arm upstream
+ *  bakes into the committed file at initialize/rebuild time
+ *  (index.go:250) — the flag's value is EVALUATED WHEN THE FILE IS
+ *  WRITTEN, so a later flag flip persists until the next rebuild (the
+ *  upstream posture; the registry route evaluates it per request). */
 export function cargoIndexConfigBytes(
   owner: { username: string; visibility: "public" | "limited" | "private" },
   origin: string,
+  opts: { strictSignInView?: boolean } = {},
 ): Uint8Array {
-  return new TextEncoder().encode(`${JSON.stringify(buildCargoRegistryConfig(owner, origin))}\n`);
+  return new TextEncoder().encode(
+    `${JSON.stringify(buildCargoRegistryConfig(owner, origin, opts))}\n`,
+  );
 }
 
 // ---------------------------------------------------------------------------

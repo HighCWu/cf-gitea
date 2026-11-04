@@ -496,19 +496,21 @@ export interface CargoRegistryConfig {
 
 /**
  * `BuildConfig` (index.go:267-272): dl → the crates prefix, api → the family
- * root, auth-required → the private-owner posture. Upstream also ORs
- * `setting.Service.RequireSignInViewStrict` — off-by-default and not carried
- * in our config surface (the landed families' posture for that setting), so
- * the visibility arm alone decides.
+ * root, auth-required → the private-owner posture OR'd with the
+ * require-sign-in-view instance flag (cargo.go:53 /
+ * index.go:250: `RequireSignInViewStrict || !public`) — the flag rides
+ * `strictSignInView` (`requireSignInViewEnabled(env)` at the callers;
+ * default undefined = the flag-off posture, the app.ini default).
  */
 export function buildCargoRegistryConfig(
   owner: { username: string; visibility: PackageOwnerVisibility },
   origin: string,
+  opts: { strictSignInView?: boolean } = {},
 ): CargoRegistryConfig {
   return {
     dl: `${origin}/api/packages/${owner.username}/cargo/api/v1/crates`,
     api: `${origin}/api/packages/${owner.username}/cargo`,
-    "auth-required": owner.visibility !== "public",
+    "auth-required": opts.strictSignInView === true || owner.visibility !== "public",
   };
 }
 

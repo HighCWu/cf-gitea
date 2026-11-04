@@ -964,3 +964,30 @@ describe("parseSwiftTarget", () => {
     expect(parseSwiftTarget(["identifiers"], "POST")).toEqual({ arm: "not-found", gated: false });
   });
 });
+
+// The require-sign-in-view flag (package.go:120) does not change the swift
+// login pair: the unauthenticated group (api.go:451-457) sits outside the
+// reqPackageAccess wraps, so CheckAuthenticate's own doer-nil 401 governs —
+// anonymous → 401, any valid credential → 200 — under both flag postures.
+describe("REQUIRE_SIGNIN_VIEW (the swift login pair carve-out)", () => {
+  it("flag on: anonymous stays CheckAuthenticate's 401; a valid credential still gets the bare 200", async () => {
+    await seedUser("flagcarve");
+    const writer = await token(await seedUser("flagauthed"), "read:repository");
+
+    const anon = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })("/api/packages/flagcarve/swift", {
+      method: "POST",
+      body: "",
+    });
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get("content-type")).toBe("application/problem+json");
+    await anon.text();
+
+    const authed = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })("/api/packages/flagcarve/swift/login", {
+      method: "POST",
+      headers: authHeaders(writer),
+      body: "",
+    });
+    expect(authed.status).toBe(200);
+    await authed.text();
+  });
+});

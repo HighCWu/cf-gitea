@@ -1083,3 +1083,64 @@ describe("PACKAGES_ENABLED=false", () => {
     await proto.text();
   });
 });
+
+// ---------------------------------------------------------------------------
+// The require-sign-in-view instance flag — the PACKAGES arm (SPEC-0003 §2.4
+// row 6 handoff, census B-34): upstream's gate lives INSIDE
+// determineAccessMode (services/context/package.go:120), so every
+// reqPackageAccess wrap answers its 401 challenge for an anonymous caller
+// once the flag arms the zeroing — no per-route arm. Flag off = the landed
+// anonymous posture byte-for-byte (the two controls re-pin it beside the
+// flag-on arms, gate.test.ts's row-6 pattern).
+// ---------------------------------------------------------------------------
+
+describe("REQUIRE_SIGNIN_VIEW (the packages arm)", () => {
+  it("flag on: anonymous GET on a PUBLIC owner's package answers the 401 challenge (package.go:120 → reqPackageAccess)", async () => {
+    const owner = await seedUser("flagowner");
+    const writer = await token(owner, "write:package");
+    await putFile("flagowner", "locked", "1.0", "f.bin", "flagged-bytes", { Authorization: `token ${writer}` });
+
+    const caller = protocol({ REQUIRE_SIGNIN_VIEW: "true" });
+    const get = await caller("/api/packages/flagowner/generic/locked/1.0/f.bin", { method: "GET" });
+    expect(get.status).toBe(401);
+    expect(get.headers.get("www-authenticate")).toBe('Basic realm="Gitea Package API"');
+    await get.text();
+
+    const push = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })(
+      "/api/packages/flagowner/generic/locked/1.0/g.bin",
+      { method: "PUT", headers: { "content-type": "application/octet-stream", "content-length": "1" }, body: "x" },
+    );
+    expect(push.status).toBe(401);
+    expect(push.headers.get("www-authenticate")).toBe('Basic realm="Gitea Package API"');
+    await push.text();
+  });
+
+  it("flag on: an AUTHENTICATED caller rides the unchanged ladder (read on a public owner still 200s)", async () => {
+    const owner = await seedUser("flagauth");
+    const writer = await token(owner, "write:package");
+    const reader = await token(owner, "read:package");
+    await putFile("flagauth", "signed", "1.0", "f.bin", "authed-bytes", { Authorization: `token ${writer}` });
+
+    const get = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })("/api/packages/flagauth/generic/signed/1.0/f.bin", {
+      method: "GET",
+      headers: authHeaders(reader),
+    });
+    expect(get.status).toBe(200);
+    expect(await get.text()).toBe("authed-bytes");
+  });
+
+  it("flag off (the default env): both anonymous classes are the landed posture", async () => {
+    const owner = await seedUser("flagoff");
+    const writer = await token(owner, "write:package");
+    await putFile("flagoff", "open", "1.0", "f.bin", "open-bytes", { Authorization: `token ${writer}` });
+
+    const caller = protocol({ REQUIRE_SIGNIN_VIEW: "false" });
+    const get = await caller("/api/packages/flagoff/generic/open/1.0/f.bin", { method: "GET" });
+    expect(get.status).toBe(200);
+    expect(await get.text()).toBe("open-bytes");
+    const put = await putFile("flagoff", "open", "1.0", "g.bin", "x");
+    expect(put.status).toBe(401);
+    expect(put.headers.get("www-authenticate")).toBe('Basic realm="Gitea Package API"');
+    await put.text();
+  });
+});

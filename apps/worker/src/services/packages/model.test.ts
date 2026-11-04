@@ -580,6 +580,51 @@ describe("determinePackageAccessMode", () => {
     expect(await determinePackageAccessMode(env.DB, privateRow, { id: outsider.id, isAdmin: false })).toBe("none");
     expect(await determinePackageAccessMode(env.DB, privateRow, null)).toBe("none");
   });
+
+  // The require-sign-in-view instance flag (SPEC-0003 §2.4 row 6, packages
+  // arm): services/context/package.go:120 — INSIDE determineAccessMode,
+  // `RequireSignInViewStrict && (doer == nil || doer.IsGhost())` → none. The
+  // ghost class arrives here as doer === null on every path (the container
+  // family maps the ghost token to the anonymous ladder), so the null check
+  // covers both.
+  it("strict sign-in-view: anonymous → none even on a public owner (package.go:120)", async () => {
+    const alice = await seedUser("alice");
+    const owner = asOwner(alice);
+    expect(await determinePackageAccessMode(env.DB, owner, null, { strictSignInView: true })).toBe("none");
+    // The flag does not degrade authenticated callers — the whole ladder
+    // stays (self, stranger on public, limited-authenticated).
+    expect(
+      await determinePackageAccessMode(env.DB, owner, { id: alice.id, isAdmin: false }, { strictSignInView: true }),
+    ).toBe("owner");
+    const bob = await seedUser("bob");
+    expect(
+      await determinePackageAccessMode(env.DB, owner, { id: bob.id, isAdmin: false }, { strictSignInView: true }),
+    ).toBe("read");
+    const limited = await seedUser("lim", { visibility: "limited" });
+    expect(
+      await determinePackageAccessMode(env.DB, asOwner(limited), { id: bob.id, isAdmin: false }, { strictSignInView: true }),
+    ).toBe("read");
+    // Admin keeps the site-admin arm above the strict check (upstream order:
+    // DoerIsSiteAdminFullAccess runs BEFORE the flag).
+    const admin = await seedUser("root", { isAdmin: true });
+    const privateOwner = await seedUser("privx", { visibility: "private" });
+    expect(
+      await determinePackageAccessMode(
+        env.DB,
+        asOwner(privateOwner),
+        { id: admin.id, isAdmin: true },
+        { strictSignInView: true },
+      ),
+    ).toBe("owner");
+  });
+
+  it("strict sign-in-view off (undefined/false): the anonymous ladder is unchanged", async () => {
+    const alice = await seedUser("alice2");
+    const owner = asOwner(alice);
+    expect(await determinePackageAccessMode(env.DB, owner, null)).toBe("read");
+    expect(await determinePackageAccessMode(env.DB, owner, null, { strictSignInView: false })).toBe("read");
+    expect(await determinePackageAccessMode(env.DB, owner, null, {})).toBe("read");
+  });
 });
 
 // The properties ref-type iota is exercised implicitly by the cascades above;

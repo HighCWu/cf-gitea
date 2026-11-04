@@ -45,6 +45,7 @@ import {
 } from "./cargo";
 import {
   cargoIndexBindings,
+  cargoIndexConfigBytes,
   CARGO_INDEX_REF,
   ensureCargoIndexMirror,
   rebuildCargoIndexMirror,
@@ -540,5 +541,28 @@ describe("the D1 posture the mirror reads", () => {
     expect(props.find((prop) => prop.name === CARGO_YANKED_PROPERTY)?.value).toBe("false");
     const versions = await db().select().from(packageVersions).where(eq(packageVersions.id, published.versionId)).all();
     expect(versions).toHaveLength(1);
+  });
+});
+
+// The require-sign-in-view write-side arm (index.go:250): the mirror FILE
+// bakes the flag into config.json at initialize/rebuild time — evaluated
+// WHEN THE FILE IS WRITTEN, so a later flag flip persists until the next
+// rebuild (the registry route evaluates it per request instead).
+describe("cargoIndexConfigBytes strict sign-in-view opt", () => {
+  const owner = { username: "mirrorowner", visibility: "public" as const };
+  it("defaults to the flag-off posture (auth-required from visibility alone)", () => {
+    expect(new TextDecoder().decode(cargoIndexConfigBytes(owner, ORIGIN))).toBe(
+      `${JSON.stringify({
+        dl: `${ORIGIN}/api/packages/mirrorowner/cargo/api/v1/crates`,
+        api: `${ORIGIN}/api/packages/mirrorowner/cargo`,
+        "auth-required": false,
+      })}\n`,
+    );
+  });
+  it("the strict OR-arm bakes auth-required into the committed bytes (index.go:250)", () => {
+    const bytes = cargoIndexConfigBytes(owner, ORIGIN, { strictSignInView: true });
+    expect((JSON.parse(new TextDecoder().decode(bytes)) as { "auth-required": boolean })["auth-required"]).toBe(true);
+    // json.Encoder appends the newline — byte parity holds with the flag on.
+    expect(bytes[bytes.length - 1]).toBe(0x0a);
   });
 });

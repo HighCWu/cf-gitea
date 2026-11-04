@@ -1404,9 +1404,9 @@ Upstream `routers/api/packages/cargo/cargo.go` + `services/packages/cargo/index.
 + the cargo arms in `packages-protocols.ts` (the section after the GO family —
 the file's per-family split). Mount: the sparse-index family over
 `/api/packages/{owner}/cargo` — `GET config.json` (index.go:260-272:
-`{dl, api, auth-required}`; `auth-required` = the non-public owner — the
-`RequireSignInViewStrict` OR-arm is off-by-default and not carried in our
-config surface), the sparse index through all FOUR path shapes
+`{dl, api, auth-required}`; `auth-required` = the non-public owner OR'd with
+the `RequireSignInViewStrict` instance flag — the OR-arm landed with the
+require-sign-in-view packages arm, §as-built below), the sparse index through all FOUR path shapes
 (`/1/{p}`, `/2/{p}`, `/3/{_}/{p}`, `/{_}/{__}/{p}` — the placeholders are
 dummies, the name is the last segment; registration order mirrors upstream
 api.go:129-145, statics first so the generic 3-segment shape cannot shadow
@@ -2500,3 +2500,104 @@ that suite is untouched by this unit.
   **TWENTY-THREE of TWENTY-THREE** protocol surfaces (the 22
   CommonRoutes groups + container) — the parity claim the 2056
   section's TWENTY-TWO row staged for.
+
+## As-built — the require-sign-in-view instance flag, packages arm (2026-11-04 — the SPEC-0003 §2.4 row 6 / census B-34 handoff closed)
+
+Upstream arms the packages surface INSIDE the access ladder, not per route:
+`services/context/package.go:120` — `determineAccessMode` returns
+`AccessModeNone` when `Service.RequireSignInViewStrict && (doer == nil ||
+doer.IsGhost())`, so EVERY `reqPackageAccess(read|write)` wrap (api.go:43-63)
+answers its own refusal for the anonymous caller and no per-surface arm
+exists. Ours rides the same seam:
+`determinePackageAccessMode` (src/services/packages/model.ts) grew the
+`strictSignInView` opt — `true && doer === null` → `"none"`, placed between
+the site-admin and owner-self arms exactly like upstream's ordering — and the
+route gates thread `requireSignInViewEnabled(env)` (the SPEC-0003 flag seam,
+strict polarity, default off): `requirePackageContext` (the §3.1 nine ops —
+production's anonymous caller is pre-empted by `requireSignInViewApiGate`'s
+group 403, api.go:961; the threading covers the standalone-router posture)
+and both `protocolAccessGate` copies (the generic family's, now taking `env`,
+and packages-protocols.ts's — consumed by `protocolContext`,
+`containerOwnerContext`, the chef prologue and the conan minted gate).
+Refusal shapes are the landed reqPackageAccess ports, unchanged by the flag:
+the registry families' `401` + `WWW-Authenticate: Basic realm="Gitea
+Package API"` (§5.10), the container family's OCI envelope.
+
+**Per-surface refusals under the flag** (both-side cites: off = the landed
+battery; on = these arms):
+
+- Registry protocol families (generic, pypi, helm, npm, cargo, conan, conda,
+  cran, debian, go, alpine, arch, maven, nuget's gated arms, pub, rpm,
+  rubygems, swift's gated arms, terraform, vagrant, chef): anonymous pull AND
+  push classes answer the 401 challenge on ANY owner visibility — the ladder
+  zeroing is visibility-blind (package.go:120 runs before the visibility
+  arms). Authenticated callers ride the unchanged ladder (flag on: a scoped
+  reader still downloads a public owner's file — 200).
+- Container (§7): upstream's `ReqContainerAccess`
+  (container.go:133-137) refuses `doer == nil || (strict && doer.IsGhost())`
+  — so the flag arms are: `containerUnauthorizedResponse` gains the
+  `Basic realm="Gitea Container Registry"` twin whenever the flag is on
+  (container.go:122-127's fold `requireSignIn = owner-non-public || strict` —
+  the twin appears even with no path owner, the /v2 and /token posture);
+  `containerPing` and `containerCatalog` refuse a ghost bearer under the flag;
+  `/v2/token`'s anonymous arm refuses BEFORE the ghost mint
+  (container.go:156-159 — a stale pre-flag ghost token still verifies, so the
+  {username} group needs its own arm); and `containerOwnerContext` refuses
+  anonymous AND ghost with the OCI envelope + twin BEFORE the owner
+  assignment (upstream's group-wrap order, api.go:537 — ReqContainerAccess
+  runs first, so the flag-on refusal is upstream's OCI shape, not the shared
+  plain challenge the flag-off ladder answers). Flag off: the landed posture
+  byte-for-byte (the anonymous /token still mints the ghost, the bare ping
+  carries no Basic twin, ghost pulls of public owners stay 200).
+- Cargo config content (the §as-built M7 tail's recorded deviation, CLOSED):
+  `buildCargoRegistryConfig` ORs the flag into `auth-required`
+  (cargo.go:53), evaluated per request on the registry route; the mirror FILE
+  bakes it at initialize/rebuild time (`cargoIndexConfigBytes` opts —
+  index.go:250's write-time evaluation, so a later flag flip persists until
+  the next rebuild).
+
+**Carve-outs (the anonymous classes upstream keeps under the flag)** — the
+flag only zeroes the mode the reqPackageAccess wraps consult, so surfaces
+upstream registers OUTSIDE every wrap stay anonymous: the nuget service-index
+trio (`GET /{u}/nuget`, `/index.json`, `/$metadata` — api.go:342-346 "Needs
+to be unauthenticated for the NuGet client"; landed as `protocolContext`
+`required: "none"`, a private owner's index still answers 200) and the swift
+login pair (`POST /{u}/swift`, `/swift/login` — CheckAuthenticate's own
+doer-nil 401 governs, api.go:451-457). The container family has NO
+anonymous-allowed class under the flag (the ghost-token flow is the refused
+class, container.go:134).
+
+**Handoff (the web-page arm — NOT landed here):** upstream's web package
+pages (`/{username}/-/packages`, web.go:1108) sit under `optSignIn`
+(web.go:354 — `SignInRequired: RequireSignInViewStrict`) so an anonymous
+viewer is login-redirected (web.go:222); upstream's group ALSO carries
+`PackageAssignment + reqPackageAccess(Read)` (web.go:937, `< mode` →
+NotFound), so the flag-on refusal through the ladder alone is the 404 shape.
+Our web pages route through `ui/index.ts`'s owner-packages handlers + the
+gate seam `ownerPackagesAccessMode`
+(src/ui/pages/packages.tsx:431 — the group-wrap's AccessMode port, which
+calls `determinePackageAccessMode` WITHOUT the flag today). PRECISE HANDOFF
+to the ui wave (ui/index.ts + ui/pages are that unit's files this wave):
+thread `strictSignInView: requireSignInViewEnabled(env)` into
+`ownerPackagesAccessMode` (thread `env` or an opts through
+`ownerPackagesReadable` and its callers, incl. ui/index.ts:17817's
+settings-write arm) — under the flag every subtree route then answers the
+404-shell posture (our recorded web divergence from upstream's
+RedirectForLogin, SPEC-0003 §2.4 arm-3 note) instead of anonymous reads, and
+the shell tab hides with the page (packages.tsx:1125's mode read). The cargo
+mirror init/rebuild callers (ui/index.ts's `ensureCargoIndexMirror` /
+`rebuildCargoIndexMirror` calls) may pass the flag through
+`cargoIndexConfigBytes`' new opts when that wave lands it (default off keeps
+today's bytes).
+
+**Battery** (scoped vitest, own eyes on the Tests lines): model.test.ts +
+cargo.test.ts + cargo-index.test.ts 69/69; packages.test.ts +
+packages-nuget.test.ts + packages-swift.test.ts 70/70 (the flag-on pull/push
+401s, the authenticated-unchanged 200, the flag-off controls, the two
+carve-outs under the flag); container.test.ts 42/42 (the OCI twin arms, the
+pre-mint refusal, the ghost refusals, the flag-off controls); the remaining
+route families 213/213 (alpine/arch/cargo-routes/composer/conda/debian/go 81
++ helm/npm/pypi/rpm/rubygems/terraform/package-webhooks 132). Tree
+`tsc --noEmit`: this unit's files clean (the run's single error sits in an
+in-flight sibling's ui/pages/admin-user-edit.test.tsx hunk — attributed,
+not ours). Scoped eslint over the twelve touched files: clean.
