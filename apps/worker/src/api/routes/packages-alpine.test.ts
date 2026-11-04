@@ -24,7 +24,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageVersions, packages as packagesTable, users } from "../../db/schema";
+import { packageVersions, packages as packagesTable, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 import {
@@ -52,6 +52,8 @@ beforeEach(async () => {
     "package_blobs",
     "package_versions",
     "package_cleanup_rules",
+    "webhook_deliveries",
+    "webhooks",
     "packages",
     "personal_access_tokens",
     "auth_failures",
@@ -324,6 +326,42 @@ describe("alpine upload → APKINDEX → download", () => {
 
     const index = await protocol()("/api/packages/alice/alpine/v3.19/main/x86_64/APKINDEX.tar.gz");
     expect(index.status).toBe(404); // the empty arm deleted the index
+  });
+
+  it("the version-cascading delete fires the package webhook deleted (alpine.go:269 → packages.go:572's pd != nil gate)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: owner.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    await uploadApk("alice", "v3.19", "main", await apkBytes("helloworld", "1.2-r0", "x86_64"), authHeaders(writer));
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the created arm
+
+    // The single-file delete cascades the version — the deleted arm fires.
+    const del = await protocol()("/api/packages/alice/alpine/v3.19/main/x86_64/helloworld-1.2-r0.apk", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(del.status).toBe(204);
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const payload = JSON.parse(rows[1]!.payloadContent) as { action: string; package: { type: string; version: string }; sender: { login: string } };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("alpine");
+    expect(payload.package.version).toBe("1.2-r0");
+    expect(payload.sender.login).toBe("alice");
   });
 });
 

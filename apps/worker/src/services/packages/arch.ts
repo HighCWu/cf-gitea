@@ -127,7 +127,13 @@ import {
 } from "./model";
 import { DuplicatePackageFileError } from "./generic";
 import { writeVersionMetadata } from "./protocol-common";
-import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
+import {
+  emitPackageCreated,
+  emitPackageDeleted,
+  type PackageDeleteEmitOptions,
+  type PackageEventDescriptor,
+  type PackageEventEnv,
+} from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream constants (modules/packages/arch/metadata.go:24-39 +
@@ -1237,10 +1243,11 @@ export async function deleteArchPackageVersion(
   name: string,
   version: string,
   now?: Date,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<DeleteArchPackageResult> {
   const db = drizzle(d1);
   const pv = await db
-    .select({ version: packageVersions })
+    .select({ version: packageVersions, pkg: packages })
     .from(packageVersions)
     .innerJoin(packages, eq(packages.id, packageVersions.packageId))
     .where(
@@ -1264,10 +1271,19 @@ export async function deleteArchPackageVersion(
   const fileRow = pfs[0]?.file;
   if (fileRow === undefined) return { ok: false, missing: "file" };
 
+  // The deleted arm (arch.go:290 → RemovePackageFileAndVersionIfUnreferenced,
+  // packages.go:570-574 — `if pd != nil { PackageDelete }` fired INSIDE the
+  // service when the version cascaded): the descriptor resolves BEFORE the
+  // version row dies, the emission rides after the cascade.
+  const descriptor: PackageEventDescriptor | null =
+    emit?.webhookEnv !== undefined ? { pkg: pv.pkg, version: pv.version } : null;
   await deletePackageFile(d1, fileRow.id);
   const stillReferenced = await hasVersionFileReferences(d1, fileRow.versionId);
   if (!stillReferenced) {
     await deletePackageVersionAndReferences(d1, fileRow.versionId);
+    if (descriptor !== null && emit?.webhookEnv !== undefined) {
+      await emitPackageDeleted(emit.webhookEnv, [descriptor], emit.doerId ?? 0);
+    }
   }
   await buildArchRepositoryFiles(d1, bucket, owner, repository, architecture, now);
   return { ok: true };

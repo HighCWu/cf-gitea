@@ -38,7 +38,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageVersions, packages as packagesTable, users } from "../../db/schema";
+import { packageVersions, packages as packagesTable, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 import {
@@ -67,6 +67,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "webhook_deliveries",
+    "webhooks",
     "package_properties",
     "package_files",
     "package_blobs",
@@ -670,6 +672,41 @@ describe("arch delete → rebuild → the empty arm", () => {
     const index = await protocol()("/api/packages/alice/arch/main/x86_64/packages.db");
     expect(index.status).toBe(404); // the empty arm deleted the index
     expect(await index.text()).toBe("");
+  });
+
+  it("the version-cascading delete fires the package webhook deleted (arch.go:290 → packages.go:572's pd != nil gate)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: owner.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    await uploadPkg("alice", "main", await archPkgBytes("helloworld", "1.0-1", "x86_64"), authHeaders(writer));
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the created arm
+
+    const del = await protocol()("/api/packages/alice/arch/main/helloworld/1.0-1/x86_64", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(del.status).toBe(204);
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const payload = JSON.parse(rows[1]!.payloadContent) as { action: string; package: { type: string; version: string }; sender: { login: string } };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("arch");
+    expect(payload.package.version).toBe("1.0-1");
+    expect(payload.sender.login).toBe("alice");
   });
 
   it("distinguishes the two 404 bodies on delete (resource-missing vs empty)", async () => {

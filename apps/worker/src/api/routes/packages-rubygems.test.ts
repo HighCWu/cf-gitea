@@ -33,7 +33,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
-import { packageVersions, packages, users } from "../../db/schema";
+import { packageVersions, packages, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 import {
@@ -65,6 +65,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "webhook_deliveries",
+    "webhooks",
     "package_properties",
     "package_files",
     "package_blobs",
@@ -691,6 +693,47 @@ describe("rubygems yank + missing arms", () => {
     expect(info.status).toBe(404);
     const versions = await protocol()("/api/packages/alice/rubygems/versions");
     expect(await versions.text()).toBe("---\n");
+  });
+
+  it("the yank IS the deleted arm: the package webhook fires action=deleted (rubygems.go:281 → packages.go:532)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: owner.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    await uploadGem("alice", await makeRubyGem("gitea", "1.0.5"), authHeaders(writer));
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the created arm
+
+    const form = new FormData();
+    form.set("gem_name", "gitea");
+    form.set("version", "1.0.5");
+    const yank = await protocol()("/api/packages/alice/rubygems/api/v1/gems/yank", {
+      method: "DELETE",
+      headers: { ...authHeaders(writer) },
+      body: form,
+    });
+    expect(yank.status).toBe(200);
+    await yank.text();
+
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2); // exactly one added
+    const payload = JSON.parse(rows[1]!.payloadContent) as { action: string; package: { type: string; version: string }; sender: { login: string } };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("rubygems");
+    expect(payload.package.version).toBe("1.0.5");
+    expect(payload.sender.login).toBe("alice");
   });
 
   it("yank of an unknown gem answers 404 'package does not exist'", async () => {

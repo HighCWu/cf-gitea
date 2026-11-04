@@ -37,6 +37,8 @@ import { giteaErrorHandler } from "../errors";
 import { mintFor } from "../../auth/testing/seeds";
 import type { ApiEnv } from "../env";
 import { createPackagesProtocolRouter, registerPackagesRoutes } from "./packages";
+import { createEcosystemProtocolRouter } from "./packages-protocols";
+import { buildTar, gzipCompress } from "../../services/packages/distro-common";
 import type { User } from "../models/user";
 
 beforeAll(async () => {
@@ -163,6 +165,96 @@ function protocol() {
   const boundEnv = { ...env, APP_URL };
   return async (path: string, init?: RequestInit): Promise<Response> =>
     parent.fetch(new Request(`https://hooks.example${path}`, init), boundEnv);
+}
+
+/** The 21-protocol ecosystem router (the npm/terraform arms ride it —
+ *  packages-npm.test.ts's mount shape). */
+function eco() {
+  const parent = new Hono<{ Bindings: Env }>();
+  parent.route("/api/packages", createEcosystemProtocolRouter());
+  const boundEnv = { ...env, APP_URL };
+  return async (path: string, init?: RequestInit): Promise<Response> =>
+    parent.fetch(new Request(`https://hooks.example${path}`, init), boundEnv);
+}
+
+const encoder = new TextEncoder();
+
+// ---------------------------------------------------------------------------
+// The npm publish fixtures (packages-npm.test.ts's rig, trimmed) — a real
+// ustar+gzip tarball and the creator.go publish document.
+// ---------------------------------------------------------------------------
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function tarHeader(name: string, size: number): Uint8Array {
+  const header = new Uint8Array(512);
+  header.set(encoder.encode(name.slice(0, 100)), 0);
+  header.set(encoder.encode("0000644\0"), 100); // mode
+  header.set(encoder.encode("0000000\0"), 108); // uid
+  header.set(encoder.encode("0000000\0"), 116); // gid
+  header.set(encoder.encode(`${size.toString(8).padStart(11, "0")} `), 124); // size
+  header.set(encoder.encode("00000000000 "), 136); // mtime
+  header.set(encoder.encode("        "), 148); // checksum placeholder (spaces)
+  header[156] = 0x30; // '0' regular file
+  header.set(encoder.encode("ustar\0"), 257);
+  header.set(encoder.encode("00"), 263);
+  let sum = 0;
+  for (const byte of header) sum += byte;
+  header.set(encoder.encode(`${sum.toString(8).padStart(6, "0")}\0 `), 148);
+  return header;
+}
+
+async function makeTarball(files: Record<string, string>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for (const [name, content] of Object.entries(files)) {
+    const bytes = encoder.encode(content);
+    chunks.push(tarHeader(name, bytes.byteLength));
+    chunks.push(bytes);
+    const padding = (512 - (bytes.byteLength % 512)) % 512;
+    if (padding > 0) chunks.push(new Uint8Array(padding));
+  }
+  chunks.push(new Uint8Array(1024)); // two zero blocks close the archive
+  const gzipped = new Response(
+    new Blob([concatBytes(chunks)]).stream().pipeThrough(new CompressionStream("gzip")),
+  );
+  return new Uint8Array(await gzipped.arrayBuffer());
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function publishDocument(name: string, version: string, tarball: Uint8Array): Promise<string> {
+  const integrity = `sha512-${toBase64(new Uint8Array(await crypto.subtle.digest("SHA-512", tarball)))}`;
+  const doc: Record<string, unknown> = {
+    _id: name,
+    name,
+    description: "a test package",
+    "dist-tags": { latest: version },
+    versions: {
+      [version]: {
+        name,
+        version,
+        description: "a test package",
+        author: { name: "The Author" },
+        license: "MIT",
+        dist: { integrity },
+      },
+    },
+    _attachments: { [`${name}-${version}.tgz`]: { data: toBase64(tarball), length: tarball.byteLength } },
+  };
+  return JSON.stringify(doc);
 }
 
 function v1Router() {
@@ -381,6 +473,167 @@ describe("package webhook emissions (GAPS #8)", () => {
     expect(rows[5]!.payload.package.version).toBe("2.0.0");
     expect(rows[4]!.payload.action).toBe("deleted");
     expect(rows[5]!.payload.action).toBe("deleted");
+  });
+
+  it("npm unpublish fires deleted — by tarball exactly one, the whole package one per version", async () => {
+    const owner = await seedUser("alice");
+    const hookId = await seedHook(owner.id, { send_everything: true });
+    const auth = await token(owner.id);
+    const tarball = await makeTarball({ "package/package.json": JSON.stringify({ name: "pkg", version: "1.0.0" }) });
+    const publish = async (name: string, version: string): Promise<void> => {
+      const body = await publishDocument(name, version, tarball);
+      const res = await eco()(`/api/packages/alice/npm/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(body.length),
+          Authorization: `token ${auth}`,
+        },
+        body,
+      });
+      expect(res.status).toBe(201);
+      await res.text();
+    };
+    await publish("mytool", "1.0.0");
+    await publish("mytool", "2.0.0");
+    expect(await deliveries()).toHaveLength(2); // the two created arms
+
+    const caller = eco();
+    // npm unpublish BY TARBALL (npm.go:337-350): RemovePackageVersion —
+    // notifies ALWAYS (packages.go:532), exactly one event.
+    const delVersion = await caller(`/api/packages/alice/npm/mytool/-/mytool-2.0.0.tgz/-rev/1`, {
+      method: "DELETE",
+      headers: { Authorization: `token ${auth}` },
+    });
+    expect(delVersion.status).toBe(200);
+    await delVersion.text();
+    let rows = await deliveries();
+    expect(rows).toHaveLength(3);
+    expect(rows[2]!.hookId).toBe(hookId);
+    expect(rows[2]!.payload.action).toBe("deleted");
+    expect(rows[2]!.payload.package.type).toBe("npm");
+    expect(rows[2]!.payload.package.version).toBe("2.0.0");
+
+    // npm unpublish WHOLE PACKAGE (npm.go:352-375): RemovePackageVersion
+    // PER VERSION (the :368 loop) — one event per surviving version.
+    const delPackage = await caller(`/api/packages/alice/npm/mytool/-rev/1`, {
+      method: "DELETE",
+      headers: { Authorization: `token ${auth}` },
+    });
+    expect(delPackage.status).toBe(200);
+    await delPackage.text();
+    rows = await deliveries();
+    expect(rows).toHaveLength(4);
+    expect(rows[3]!.payload.action).toBe("deleted");
+    expect(rows[3]!.payload.package.version).toBe("1.0.0");
+  });
+
+  it("chef deletes fire the package webhook: the version arm once, the cookbook arm per version (chef.go:359/:395)", async () => {
+    const owner = await seedUser("alice");
+    const hookId = await seedHook(owner.id, { send_everything: true });
+    const auth = await token(owner.id);
+    const caller = eco();
+    const cookbook = async (version: string): Promise<Uint8Array> =>
+      gzipCompress(
+        buildTar(
+          [{ name: "test/metadata.json", mode: 0o600, data: new TextEncoder().encode(JSON.stringify({ name: "test", version })) }],
+          true,
+        ),
+      );
+    const upload = async (version: string): Promise<void> => {
+      const boundary = "chefboundary9182";
+      const tarball = await cookbook(version);
+      const head = new TextEncoder().encode(
+        `--${boundary}\r\nContent-Disposition: form-data; name="tarball"; filename="${version}.tar.gz"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      );
+      const tail = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
+      const body = new Uint8Array(head.byteLength + tarball.byteLength + tail.byteLength);
+      body.set(head, 0);
+      body.set(tarball, head.byteLength);
+      body.set(tail, head.byteLength + tarball.byteLength);
+      const res = await caller(`/api/packages/alice/chef/api/v1/cookbooks`, {
+        method: "POST",
+        headers: { "content-type": `multipart/form-data; boundary=${boundary}`, Authorization: `token ${auth}` },
+        body,
+      });
+      expect(res.status).toBe(201);
+      await res.text();
+    };
+    await upload("1.0.1");
+    await upload("1.0.2");
+    expect(await deliveries()).toHaveLength(2); // the two created arms (one per new version)
+
+    // The version arm (chef.go:359 → RemovePackageVersionByNameAndVersion →
+    // packages.go:532 — notifies ALWAYS): exactly one event.
+    const delVersion = await caller(`/api/packages/alice/chef/api/v1/cookbooks/test/versions/1.0.1`, {
+      method: "DELETE",
+      headers: { Authorization: `token ${auth}` },
+    });
+    expect(delVersion.status).toBe(200);
+    await delVersion.text();
+    let rows = await deliveries();
+    expect(rows).toHaveLength(3);
+    expect(rows[2]!.hookId).toBe(hookId);
+    expect(rows[2]!.payload.action).toBe("deleted");
+    expect(rows[2]!.payload.package.type).toBe("chef");
+    expect(rows[2]!.payload.package.version).toBe("1.0.1");
+    expect(rows[2]!.payload.sender.login).toBe("alice");
+
+    // The cookbook arm (chef.go:395 — RemovePackageVersion PER VERSION):
+    // one event per surviving version.
+    const delCookbook = await caller(`/api/packages/alice/chef/api/v1/cookbooks/test`, {
+      method: "DELETE",
+      headers: { Authorization: `token ${auth}` },
+    });
+    expect(delCookbook.status).toBe(200);
+    await delCookbook.text();
+    rows = await deliveries();
+    expect(rows).toHaveLength(4);
+    expect(rows[3]!.payload.action).toBe("deleted");
+    expect(rows[3]!.payload.package.version).toBe("1.0.2");
+  });
+
+  it("terraform whole-state delete fires one event per version; the by-serial delete stays silent (terraform.go:233's model-level cascade)", async () => {
+    const owner = await seedUser("alice");
+    await seedHook(owner.id, { send_everything: true });
+    const auth = await token(owner.id);
+    const caller = eco();
+    const postState = async (serial: number): Promise<Response> =>
+      caller(`/api/packages/alice/terraform/state/prod-network`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream", Authorization: `token ${auth}` },
+        body: encoder.encode(
+          JSON.stringify({ version: 4, terraform_version: "1.9.0", serial, lineage: "9b5d3cf1", outputs: {}, resources: [] }),
+        ),
+      });
+    expect((await postState(1)).status).toBe(201);
+    expect((await postState(2)).status).toBe(201);
+    expect(await deliveries()).toHaveLength(2);
+
+    // DeleteStateBySerial (terraform.go:196-234): the model-level
+    // DeletePackageVersionAndReferences cascade — NO PackageDelete upstream.
+    const delSerial = await caller(`/api/packages/alice/terraform/state/prod-network/versions/1`, {
+      method: "DELETE",
+      headers: { Authorization: `token ${auth}` },
+    });
+    expect(delSerial.status).toBe(204);
+    await delSerial.text();
+    expect(await deliveries()).toHaveLength(2);
+
+    // DeleteState (terraform.go:238-297): RemovePackageVersion PER VERSION
+    // (the :285 loop) — one event per surviving version, then the silent
+    // model-level DeletePackageByID.
+    const delState = await caller(`/api/packages/alice/terraform/state/prod-network`, {
+      method: "DELETE",
+      headers: { Authorization: `token ${auth}` },
+    });
+    expect(delState.status).toBe(200);
+    await delState.text();
+    const rows = await deliveries();
+    expect(rows).toHaveLength(3);
+    expect(rows[2]!.payload.action).toBe("deleted");
+    expect(rows[2]!.payload.package.type).toBe("terraform");
+    expect(rows[2]!.payload.package.version).toBe("2");
   });
 
   it("inactive hooks and non-package subscriptions stay silent; the owner scope routes", async () => {

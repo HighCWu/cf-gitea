@@ -27,7 +27,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageVersions, packages, users } from "../../db/schema";
+import { packageVersions, packages, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { parseRpmPackage, parseRpmTarget } from "../../services/packages/rpm";
 import { mintFor } from "../../auth/testing/seeds";
@@ -47,6 +47,8 @@ beforeEach(async () => {
     "package_blobs",
     "package_versions",
     "package_cleanup_rules",
+    "webhook_deliveries",
+    "webhooks",
     "packages",
     "personal_access_tokens",
     "auth_failures",
@@ -645,6 +647,54 @@ describe("rpm groups, delete, errata", () => {
       .all();
     expect(rows.filter((row) => row.pkg.name === "gitea-test")).toHaveLength(0);
     expect(rows.filter((row) => row.pkg.isInternal === true).map((row) => row.pkg.name)).toContain("_rpm");
+  });
+
+  it("the version-cascading delete fires the package webhook deleted; the surviving-file delete stays silent (rpm.go:319's pd != nil gate)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: owner.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    const rpmBytes = await fixtureRpmBytes();
+    // The same version in TWO groups: the first delete leaves the version
+    // alive (el8 still references it) — silent; the second cascades — fires.
+    expect((await uploadRpm("alice", "el9", rpmBytes, authHeaders(writer))).status).toBe(201);
+    expect((await uploadRpm("alice", "el8", rpmBytes, authHeaders(writer))).status).toBe(201);
+    // ONE created arm — the el8 upload is the same version (the group is the
+    // file's composite key), the versionCreated gate keeps it silent.
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1);
+
+    const del9 = await protocol()("/api/packages/alice/rpm/el9/package/gitea-test/1.0.2-1/x86_64", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(del9.status).toBe(204);
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the version survives
+
+    const del8 = await protocol()("/api/packages/alice/rpm/el8/package/gitea-test/1.0.2-1/x86_64", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(del8.status).toBe(204);
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2); // exactly one added
+    const payload = JSON.parse(rows[1]!.payloadContent) as { action: string; package: { type: string; version: string }; sender: { login: string } };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("rpm");
+    expect(payload.package.version).toBe("1.0.2-1");
+    expect(payload.sender.login).toBe("alice");
   });
 
   it("404s a missing version/file on delete and a missing package on download", async () => {

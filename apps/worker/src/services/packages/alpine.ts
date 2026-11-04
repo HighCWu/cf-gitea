@@ -82,7 +82,13 @@ import {
 } from "./model";
 import { DuplicatePackageFileError } from "./generic";
 import { writeVersionMetadata } from "./protocol-common";
-import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
+import {
+  emitPackageCreated,
+  emitPackageDeleted,
+  type PackageDeleteEmitOptions,
+  type PackageEventDescriptor,
+  type PackageEventEnv,
+} from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream constants (modules/packages/alpine/metadata.go:26-41)
@@ -843,6 +849,7 @@ export async function deleteAlpinePackageFile(
   architecture: string,
   filename: string,
   now?: Date,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<boolean> {
   const db = drizzle(d1);
   const pairs = await db
@@ -865,11 +872,38 @@ export async function deleteAlpinePackageFile(
   if (fileId === undefined) return false;
   const fileRow = (await db.select().from(packageFiles).where(eq(packageFiles.id, fileId)).get()) ?? null;
   if (fileRow === null) return false;
+  // The deleted arm (alpine.go:269 → RemovePackageFileAndVersionIfUnreferenced,
+  // packages.go:570-574 — `if pd != nil { PackageDelete }` fired INSIDE the
+  // service when the version cascaded): the descriptor resolves BEFORE the
+  // version row dies (the pre-delete render, packages.go:560-566's
+  // GetVersionByID/GetPackageDescriptor order), the emission rides after the
+  // cascade (the post-tx notify position).
+  const descriptor = emit?.webhookEnv !== undefined ? await resolveAlpineDeleteDescriptor(d1, fileRow.versionId) : null;
   await deletePackageFile(d1, fileRow.id);
   const stillReferenced = await hasVersionFileReferences(d1, fileRow.versionId);
   if (!stillReferenced) {
     await deletePackageVersionAndReferences(d1, fileRow.versionId);
+    if (descriptor !== null && emit?.webhookEnv !== undefined) {
+      await emitPackageDeleted(emit.webhookEnv, [descriptor], emit.doerId ?? 0);
+    }
   }
   await buildAlpineRepositoryFiles(d1, bucket, owner, branch, repository, architecture, now);
   return true;
+}
+
+/** The alpine deleted descriptor — the (package, version) pair behind one
+ *  file, resolved pre-delete; null when either row is missing (the notify
+ *  would error away upstream too). */
+async function resolveAlpineDeleteDescriptor(
+  d1: D1Database,
+  versionId: number,
+): Promise<PackageEventDescriptor | null> {
+  const row = await drizzle(d1)
+    .select({ version: packageVersions, pkg: packages })
+    .from(packageVersions)
+    .innerJoin(packages, eq(packages.id, packageVersions.packageId))
+    .where(eq(packageVersions.id, versionId))
+    .get();
+  if (row === undefined) return null;
+  return { pkg: row.pkg, version: row.version };
 }

@@ -67,6 +67,7 @@ import {
   checkSizeQuotaExceeded,
   countVersions,
   getFileDescriptors,
+  getPackageByName,
   getOrInsertPackage,
   getOrInsertVersion,
   getVersionByNameAndVersion,
@@ -83,7 +84,12 @@ import {
 } from "./blobs";
 import { writeVersionMetadata } from "./protocol-common";
 import { deletePackageFile, deletePackageVersionAndReferences } from "./model";
-import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
+import {
+  emitPackageCreated,
+  emitPackageDeleted,
+  type PackageDeleteEmitOptions,
+  type PackageEventEnv,
+} from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // The reference grammar (modules/packages/conan/reference.go)
@@ -1026,6 +1032,7 @@ export async function deleteConanRecipeOrPackage(
   ignoreRecipeRevision: boolean,
   pref: ConanPackageReference | null,
   ignorePackageRevision: boolean,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<ConanDeleteOutcome> {
   const version = await getVersionByNameAndVersion(d1, ownerId, "conan", recipe.name, recipe.version);
   if (version === null) return { kind: "not-found" };
@@ -1048,6 +1055,12 @@ export async function deleteConanRecipeOrPackage(
   const matched = files.filter((entry) => entry.version.id === version.id && conanPropsMatch(entry.props, filter));
   if (matched.length === 0) return { kind: "reference-not-exist" };
 
+  // The deleted arm (conan.go:691-692 — `if versionDeleted { PackageDelete }`
+  // fired from INSIDE deleteRecipeOrPackage, once per cascade): the
+  // descriptor resolves BEFORE the version row dies (the pre-delete render,
+  // packages.go:521-523's GetPackageDescriptor order), the emission rides
+  // AFTER the cascade landed (the post-tx notify position).
+  const pkg = emit?.webhookEnv !== undefined ? await getPackageByName(d1, ownerId, "conan", recipe.name) : null;
   for (const entry of matched) {
     await deletePackageFile(d1, entry.file.id);
   }
@@ -1055,6 +1068,9 @@ export async function deleteConanRecipeOrPackage(
   if (!(await hasVersionFileReferences(d1, version.id))) {
     versionDeleted = true;
     await deletePackageVersionAndReferences(d1, version.id);
+    if (pkg !== null && emit?.webhookEnv !== undefined) {
+      await emitPackageDeleted(emit.webhookEnv, [{ pkg, version }], emit.doerId ?? 0);
+    }
   }
   return { kind: "deleted", versionDeleted };
 }
@@ -1062,16 +1078,26 @@ export async function deleteConanRecipeOrPackage(
 /**
  * DeleteRecipeV1 (conan.go:509-521) — the revision-ignoring sweep.
  */
-export function deleteConanRecipeV1(d1: D1Database, ownerId: number, recipe: ConanRecipeReference): Promise<ConanDeleteOutcome> {
-  return deleteConanRecipeOrPackage(d1, ownerId, recipe, true, null, false);
+export function deleteConanRecipeV1(
+  d1: D1Database,
+  ownerId: number,
+  recipe: ConanRecipeReference,
+  emit?: PackageDeleteEmitOptions,
+): Promise<ConanDeleteOutcome> {
+  return deleteConanRecipeOrPackage(d1, ownerId, recipe, true, null, false, emit);
 }
 
 /**
  * DeleteRecipeV2 (conan.go:524-536) — the pinned revision, or the full
  * sweep when the reference carried none.
  */
-export function deleteConanRecipeV2(d1: D1Database, ownerId: number, recipe: ConanRecipeReference): Promise<ConanDeleteOutcome> {
-  return deleteConanRecipeOrPackage(d1, ownerId, recipe, recipe.revision === "", null, false);
+export function deleteConanRecipeV2(
+  d1: D1Database,
+  ownerId: number,
+  recipe: ConanRecipeReference,
+  emit?: PackageDeleteEmitOptions,
+): Promise<ConanDeleteOutcome> {
+  return deleteConanRecipeOrPackage(d1, ownerId, recipe, recipe.revision === "", null, false, emit);
 }
 
 /**
@@ -1083,6 +1109,7 @@ export async function deleteConanPackageV1(
   ownerId: number,
   recipe: ConanRecipeReference,
   packageIds: string[],
+  emit?: PackageDeleteEmitOptions,
 ): Promise<ConanDeleteOutcome> {
   const revisions = await listConanRecipeRevisions(d1, ownerId, recipe);
   let outcome: ConanDeleteOutcome = { kind: "deleted", versionDeleted: false };
@@ -1096,7 +1123,7 @@ export async function deleteConanPackageV1(
     }
     for (const reference of references) {
       const pref = newConanPackageReference(current, reference.value, CONAN_DEFAULT_REVISION);
-      const deleted = await deleteConanRecipeOrPackage(d1, ownerId, current, true, pref, true);
+      const deleted = await deleteConanRecipeOrPackage(d1, ownerId, current, true, pref, true, emit);
       if (deleted.kind !== "deleted") return deleted;
       outcome = deleted;
     }
@@ -1114,9 +1141,10 @@ export async function deleteConanPackageV2(
   ownerId: number,
   recipe: ConanRecipeReference,
   pref: ConanPackageReference | null,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<ConanDeleteOutcome> {
   if (pref !== null) {
-    return deleteConanRecipeOrPackage(d1, ownerId, recipe, false, pref, pref.revision === "");
+    return deleteConanRecipeOrPackage(d1, ownerId, recipe, false, pref, pref.revision === "", emit);
   }
   const references = await listConanPackageReferences(d1, ownerId, recipe);
   if (references.length === 0) return { kind: "reference-not-exist" };

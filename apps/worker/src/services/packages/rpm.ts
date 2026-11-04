@@ -112,6 +112,7 @@ import {
   deletePackageVersionAndReferences,
   getFileForVersionByName,
   getVersionByNameAndVersion,
+  getPackageByName,
   getOrInsertPackage,
   getOrInsertVersion,
   hasVersionFileReferences,
@@ -124,7 +125,13 @@ import {
 } from "./model";
 import { DuplicatePackageFileError } from "./generic";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
-import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
+import {
+  emitPackageCreated,
+  emitPackageDeleted,
+  type PackageDeleteEmitOptions,
+  type PackageEventDescriptor,
+  type PackageEventEnv,
+} from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream constants (modules/packages/rpm/metadata.go:16-26)
@@ -1480,17 +1487,43 @@ export async function openRpmPackageFile(
  * fallback), the version-if-unreferenced fold, the rebuild rider. Answers
  * `false` for the 404 arm.
  */
-export async function deleteRpmPackageFile(d1: D1Database, bucket: R2Bucket, ownerId: number, group: string, name: string, version: string, architecture: string, now?: Date): Promise<boolean> {
+export async function deleteRpmPackageFile(d1: D1Database, bucket: R2Bucket, ownerId: number, group: string, name: string, version: string, architecture: string, now?: Date, emit?: PackageDeleteEmitOptions): Promise<boolean> {
   const pv = await getVersionByNameAndVersion(d1, ownerId, "rpm", name, version);
   if (pv === null) return false;
   const pf = await getFileForVersionByName(d1, pv.id, `${name}-${version}.${architecture}.rpm`, group);
   if (pf === null) return false;
+  // The deleted arm (rpm.go:319 — the ROUTER-direct `if pd != nil
+  // { PackageDelete }`, upstream resolving the descriptor in the router
+  // before the model cascade; the emission seam rides the service here
+  // because the version fold only this function can see decides it): the
+  // descriptor resolves BEFORE the version row dies, the emission fires
+  // only when the version cascaded.
+  const descriptor: PackageEventDescriptor | null =
+    emit?.webhookEnv !== undefined ? await resolveRpmDeleteDescriptor(d1, ownerId, name, version) : null;
   await deletePackageFile(d1, pf.id);
   if (!(await hasVersionFileReferences(d1, pv.id))) {
     await deletePackageVersionAndReferences(d1, pv.id);
+    if (descriptor !== null && emit?.webhookEnv !== undefined) {
+      await emitPackageDeleted(emit.webhookEnv, [descriptor], emit.doerId ?? 0);
+    }
   }
   await buildRpmRepositoryFiles(d1, bucket, ownerId, group, now);
   return true;
+}
+
+/** The rpm deleted descriptor — the (package, version) rows, fetched
+ *  pre-delete; null when either row is missing. */
+async function resolveRpmDeleteDescriptor(
+  d1: D1Database,
+  ownerId: number,
+  name: string,
+  version: string,
+): Promise<PackageEventDescriptor | null> {
+  const pkg = await getPackageByName(d1, ownerId, "rpm", name);
+  if (pkg === null) return null;
+  const versionRow = await getVersionByNameAndVersion(d1, ownerId, "rpm", name, version);
+  if (versionRow === null) return null;
+  return { pkg, version: versionRow };
 }
 
 /** The errata merge (rpm.go:368-451): merge by ID, collections by `short`,

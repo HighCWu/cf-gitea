@@ -27,7 +27,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageVersions, packages, users } from "../../db/schema";
+import { packageVersions, packages, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 import { asciiBytes, buildTar, concatBytes, gzipCompress } from "../../services/packages/distro-common";
@@ -41,6 +41,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "webhook_deliveries",
+    "webhooks",
     "package_properties",
     "package_files",
     "package_blobs",
@@ -320,6 +322,51 @@ describe("debian delete → rebuild", () => {
     expect(nonInternal).toHaveLength(0);
     const internal = rows.filter((row) => row.pkg.isInternal === true);
     expect(internal.map((row) => row.pkg.name)).toContain("_debian");
+  });
+
+  it("the version-cascading delete fires the package webhook deleted; the 404 arm stays silent (debian.go:297's pd != nil gate)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: owner.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    await uploadDeb("alice", "stable", "main", await helloDebBytes(), authHeaders(writer));
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1); // the created arm
+
+    // A MISSING file's delete resolves no descriptor — silent.
+    const miss = await protocol()("/api/packages/alice/debian/pool/stable/main/nope/1.0/amd64", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(miss.status).toBe(404);
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(1);
+
+    // The real delete cascades the version (one file only) — the deleted
+    // arm fires exactly once.
+    const del = await protocol()("/api/packages/alice/debian/pool/stable/main/hello/1.0/amd64", {
+      method: "DELETE",
+      headers: authHeaders(writer),
+    });
+    expect(del.status).toBe(204);
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const payload = JSON.parse(rows[1]!.payloadContent) as { action: string; package: { type: string; version: string }; sender: { login: string } };
+    expect(rows[1]!.hookId).toBe(hookId);
+    expect(rows[1]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("debian");
+    expect(payload.package.version).toBe("1.0");
+    expect(payload.sender.login).toBe("alice");
   });
 
   it("404s a missing file/version on delete", async () => {

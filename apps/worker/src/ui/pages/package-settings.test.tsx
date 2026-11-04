@@ -46,7 +46,7 @@ import { RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
 import { getOrInsertPackage, getOrInsertVersion, linkPackageToRepo } from "../../services/packages/model";
 import { getTerraformLock, isTerraformLockLocked } from "../../services/packages/terraform";
-import { packages, projects, users } from "../../db/schema";
+import { packages, projects, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -97,6 +97,8 @@ const FIXTURE_TABLES = [
   "teams",
   "org_members",
   "user_redirects",
+  "webhook_deliveries",
+  "webhooks",
   "users",
 ];
 
@@ -293,6 +295,77 @@ describe("the delete seam — mismatch first, then the locked guard, then the ca
     expect(await db().select().from(packages).where(eq(packages.id, pkg.id)).all()).toHaveLength(1);
     expect(await unlockPackageTerraformState(env.DB, pkg)).toBe("ok");
     expect(await applyPackageSettingsDelete(env.DB, pkg, "state")).toBe("ok");
+  });
+});
+
+describe("the deleted-arm webhook emissions (user/package.go:487/:510)", () => {
+  it("the settings delete fires one event per version descriptor; the guards fire nothing", async () => {
+    const alice = await seedUser("webhook-deleter");
+    const first = await seedPackageVersion(alice.id, "hooked", "1.0.0", { now: new Date(T0.getTime() + 1000) });
+    const second = await seedPackageVersion(alice.id, "hooked", "2.0.0", { now: new Date(T0.getTime() + 2000) });
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: alice.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: T0,
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    const emit = { webhookEnv: { DB: env.DB }, doerId: alice.id };
+
+    // The guards precede every write — no deliveries.
+    expect(await applyPackageSettingsDelete(env.DB, first.pkg, "wrong", emit)).toBe("mismatch");
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
+
+    // The whole-package delete: ONE EVENT PER VERSION (user/package.go:487's
+    // RemovePackage loop), both rendered from the PRE-delete state.
+    expect(await applyPackageSettingsDelete(env.DB, first.pkg, "hooked", emit)).toBe("ok");
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const payloads = rows.map((row) => JSON.parse(row.payloadContent) as { action: string; package: { version: string }; sender: { login: string } });
+    expect(rows.map((row) => row.hookId)).toEqual([hookId, hookId]);
+    expect(payloads.map((payload) => payload.action)).toEqual(["deleted", "deleted"]);
+    expect(payloads.map((payload) => payload.package.version).sort()).toEqual(
+      [first.ver.version, second.ver.version].sort(),
+    );
+    expect(payloads[0]!.sender.login).toBe("webhook-deleter");
+
+    // No emit input → the same guard refusal stays fully silent.
+    expect(await deletePackageVersionGuarded(env.DB, first.pkg, first.ver)).toBe("ok"); // no emit — silent
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(2);
+  });
+
+  it("the version delete fires exactly one deleted event (user/package.go:510)", async () => {
+    const alice = await seedUser("webhook-version-deleter");
+    const seeded = await seedPackageVersion(alice.id, "single", "1.0.0");
+    await db()
+      .insert(webhooks)
+      .values({
+        ownerId: alice.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: T0,
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    expect(
+      await deletePackageVersionGuarded(env.DB, seeded.pkg, seeded.ver, {
+        webhookEnv: { DB: env.DB },
+        doerId: alice.id,
+      }),
+    ).toBe("ok");
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(1);
+    const payload = JSON.parse(rows[0]!.payloadContent) as { action: string; package: { version: string } };
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.version).toBe("1.0.0");
   });
 });
 

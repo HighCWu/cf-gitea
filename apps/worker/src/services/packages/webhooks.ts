@@ -122,6 +122,20 @@ export interface PackageEventDescriptor {
  */
 export type PackageWebhookOptions = PackageEventEnv;
 
+/**
+ * The delete-arm emission input — the trailing optional parameter the
+ * cascade-gated delete ops carry (`emit`): `webhookEnv` present means the
+ * caller wants the `deleted` event (every registry route passes it);
+ * `doerId` is the authenticated remover (upstream ctx.Doer). The descriptor
+ * resolution stays INSIDE the delete op, before the version row dies, so
+ * the payload renders the pre-delete state exactly like upstream's
+ * GetPackageDescriptor-then-delete order (packages.go:521-523).
+ */
+export interface PackageDeleteEmitOptions {
+  webhookEnv?: PackageEventEnv;
+  doerId?: number;
+}
+
 /** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired — the
  *  repo-events.ts structural probe. */
 function webhookDeliveryQueue(env: PackageEventEnv): {

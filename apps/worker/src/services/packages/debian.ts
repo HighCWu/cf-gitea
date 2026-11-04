@@ -81,6 +81,7 @@ import {
   deletePackageFile,
   deletePackageVersionAndReferences,
   getVersionByNameAndVersion,
+  getPackageByName,
   getOrInsertPackage,
   getOrInsertVersion,
   hasVersionFileReferences,
@@ -93,7 +94,13 @@ import {
 } from "./model";
 import { DuplicatePackageFileError } from "./generic";
 import { writeVersionMetadata } from "./protocol-common";
-import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
+import {
+  emitPackageCreated,
+  emitPackageDeleted,
+  type PackageDeleteEmitOptions,
+  type PackageEventDescriptor,
+  type PackageEventEnv,
+} from "./webhooks";
 
 // ---------------------------------------------------------------------------
 // Upstream constants (modules/packages/debian/metadata.go:24-38 + :57-68)
@@ -1009,6 +1016,7 @@ export async function deleteDebianPackageFile(
   version: string,
   architecture: string,
   now?: Date,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<boolean> {
   const versionRow = await getVersionByNameAndVersion(d1, owner.id, "debian", name, version);
   if (versionRow === null) return false;
@@ -1025,11 +1033,39 @@ export async function deleteDebianPackageFile(
     )
     .get();
   if (fileRow === undefined) return false;
+  // The deleted arm (debian.go:297 — the ROUTER-direct `if pd != nil
+  // { PackageDelete }`, upstream resolving the descriptor in the router
+  // before the model cascade; the emission seam rides the service here
+  // because the version fold only this function can see decides it): the
+  // descriptor resolves BEFORE the version row dies, the emission fires
+  // only when the version cascaded.
+  const descriptor: PackageEventDescriptor | null =
+    emit?.webhookEnv !== undefined
+      ? ((await resolveDebianDeleteDescriptor(d1, owner.id, name, version)) ?? null)
+      : null;
   await deletePackageFile(d1, fileRow.id);
   const stillReferenced = await hasVersionFileReferences(d1, versionRow.id);
   if (!stillReferenced) {
     await deletePackageVersionAndReferences(d1, versionRow.id);
+    if (descriptor !== null && emit?.webhookEnv !== undefined) {
+      await emitPackageDeleted(emit.webhookEnv, [descriptor], emit.doerId ?? 0);
+    }
   }
   await buildDebianRepositoryFiles(d1, bucket, owner, distribution, component, architecture, now);
   return true;
+}
+
+/** The debian deleted descriptor — the (package, version) rows, fetched
+ *  pre-delete; null when either row is missing. */
+async function resolveDebianDeleteDescriptor(
+  d1: D1Database,
+  ownerId: number,
+  name: string,
+  version: string,
+): Promise<PackageEventDescriptor | null> {
+  const pkg = await getPackageByName(d1, ownerId, "debian", name);
+  if (pkg === null) return null;
+  const versionRow = await getVersionByNameAndVersion(d1, ownerId, "debian", name, version);
+  if (versionRow === null) return null;
+  return { pkg, version: versionRow };
 }

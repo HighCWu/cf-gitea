@@ -29,7 +29,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
-import { packageFiles, packageProperties, packageVersions, packages, users } from "../../db/schema";
+import { packageFiles, packageProperties, packageVersions, packages, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { packagesQuotaFromEnv } from "./model";
 import {
   CONAN_DEFAULT_REVISION,
@@ -74,6 +74,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "webhook_deliveries",
+    "webhooks",
     "package_properties",
     "package_files",
     "package_blobs",
@@ -532,6 +534,67 @@ describe("the conan deletes (conan.go:509-696)", () => {
     // The [] sweep deletes PACKAGES only — the recipe files stay.
     expect((await db().select().from(packageFiles).all()).map((file) => file.name)).toEqual(["conanfile.py", "conanfile.py"]);
     expect(await db().select().from(packageVersions).all()).toHaveLength(1);
+  });
+
+  it("the deleted arm fires the package webhook when the version cascades (conan.go:691-692's versionDeleted gate)", async () => {
+    const hookRows = await db()
+      .insert(webhooks)
+      .values({
+        ownerId: ownerRow.id,
+        url: "https://hooks.example.com/target",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hookId = hookRows[0]!.id;
+    await seed(); // one recipe version (rev1+rev2) + two package references
+    // The service-rig uploads carry NO webhookEnv — the created arm stays
+    // silent here by the same undefined-env posture the route lacks.
+    const createdCount = (await db().select().from(webhookDeliveries).all()).length;
+    expect(createdCount).toBe(0);
+
+    const rref = newConanRecipeReference("ConanPackage", "1.2", "gitea", "test", "");
+    const emit = { webhookEnv: { DB: env.DB }, doerId: doerRow.id };
+
+    // DeletePackageV2 unpinned sweeps rev1's references; the VERSION survives
+    // (rev2's recipe file remains) — silent.
+    const sweep = await deleteConanPackageV2(env.DB, ownerRow.id, conanRecipeWithRevision(rref, "rev1"), null, emit);
+    expect(sweep).toEqual({ kind: "deleted", versionDeleted: false });
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(createdCount);
+
+    // DeleteRecipeV2 rev1: the recipe file goes but the VERSION survives
+    // (rev2's recipe file remains — revisions share one version row) —
+    // silent, exactly the versionDeleted false arm.
+    const del1 = await deleteConanRecipeV2(env.DB, ownerRow.id, conanRecipeWithRevision(rref, "rev1"), emit);
+    expect(del1).toEqual({ kind: "deleted", versionDeleted: false });
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(createdCount);
+
+    // DeleteRecipeV2 rev2: the last file goes, the version folds — ONE
+    // deleted event with the PRE-delete descriptor.
+    const del = await deleteConanRecipeV2(env.DB, ownerRow.id, conanRecipeWithRevision(rref, "rev2"), emit);
+    expect(del).toEqual({ kind: "deleted", versionDeleted: true });
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(createdCount + 1);
+    const payload = JSON.parse(rows[createdCount]!.payloadContent) as {
+      action: string;
+      package: { type: string; version: string; name: string };
+      sender: { id: number; login: string };
+    };
+    expect(rows[createdCount]!.hookId).toBe(hookId);
+    expect(rows[createdCount]!.eventType).toBe("package");
+    expect(payload.action).toBe("deleted");
+    expect(payload.package.type).toBe("conan");
+    expect(payload.package.name).toBe("ConanPackage");
+    expect(payload.package.version).toBe("1.2");
+    expect(payload.sender.login).toBe(DOER);
+
+    // The gone version answers not-found and fires NOTHING more.
+    const miss = await deleteConanRecipeV2(env.DB, ownerRow.id, conanRecipeWithRevision(rref, "rev1"), emit);
+    expect(miss.kind).toBe("not-found");
+    expect((await db().select().from(webhookDeliveries).all())).toHaveLength(createdCount + 1);
   });
 
   it("DeleteRecipeV1 ignores the revision; DeleteRecipeV2 pins it", async () => {

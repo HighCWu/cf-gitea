@@ -135,6 +135,11 @@ import {
   setTerraformLock,
   type TerraformLockInfo,
 } from "../../services/packages/terraform";
+import {
+  emitPackageDeleted,
+  resolvePackageEventAllVersions,
+  type PackageDeleteEmitOptions,
+} from "../../services/packages/webhooks";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
@@ -357,31 +362,47 @@ async function terraformDeleteGuardVersion(
  *  RemovePackage's :681 specialization hook): the typed-name equality
  *  first (upstream compares BEFORE removing), then the locked guard, then
  *  the landed delete cascade. No partial state: every refusal precedes
- *  the first write. */
+ *  the first write. `emit` carries the deleted-arm webhook input
+ *  (user/package.go:487 — RemovePackage notifies PER VERSION DESCRIPTOR,
+ *  the packages.go:714 loop, all rendered from the pre-delete state). */
 export async function applyPackageSettingsDelete(
   d1: D1Database,
   pkg: PackageRow,
   packageName: string,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<"mismatch" | "locked" | "ok"> {
   if (packageName !== pkg.name) return "mismatch";
   const locked = await terraformDeleteGuardAll(d1, pkg);
   if (locked !== null) return locked;
+  const descriptors =
+    emit?.webhookEnv !== undefined
+      ? await resolvePackageEventAllVersions(d1, pkg.ownerId, pkg.type, pkg.name)
+      : [];
   await deletePackageAndReferences(d1, pkg.id);
+  if (emit?.webhookEnv !== undefined && descriptors.length > 0) {
+    await emitPackageDeleted(emit.webhookEnv, descriptors, emit.doerId ?? 0);
+  }
   return "ok";
 }
 
 /** PackageVersionDelete's body (:503-528) with the OnBeforeRemovePackageVersion
  *  hook (:520): the guard union, then the landed version delete. The
  *  caller answers the redirect split below (upstream answers the SAME
- *  target on the flash-error arms — no partial state here either). */
+ *  target on the flash-error arms — no partial state here either).
+ *  `emit` carries the deleted-arm webhook input (user/package.go:510 —
+ *  RemovePackageVersion notifies ALWAYS, packages.go:532). */
 export async function deletePackageVersionGuarded(
   d1: D1Database,
   pkg: PackageRow,
   version: PackageVersionRow,
+  emit?: PackageDeleteEmitOptions,
 ): Promise<"locked" | "latest" | "ok"> {
   const guard = await terraformDeleteGuardVersion(d1, pkg, version);
   if (guard !== null) return guard;
   await deletePackageVersionAndReferences(d1, version.id);
+  if (emit?.webhookEnv !== undefined) {
+    await emitPackageDeleted(emit.webhookEnv, [{ pkg, version }], emit.doerId ?? 0);
+  }
   return "ok";
 }
 
