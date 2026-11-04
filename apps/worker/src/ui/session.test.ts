@@ -74,6 +74,8 @@ import {
   impersonateSessionUser,
   lookupValidSession,
   mintSession,
+  MUST_CHANGE_PASSWORD_PATH,
+  mustChangePasswordArm,
   oauth2ErrorMessage,
   rotateSession,
   safeRedirectTarget,
@@ -1925,5 +1927,168 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     expect(res.status).toBe(500);
     // the clear directive's shape (a constant, pinned once here)
     expect(clearTwofaSetCookie()).toBe(`${TWOFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The MUST-CHANGE password gate (web.go:197-206 — the PWD-4 enforcement
+// half's WEB arm, SPEC-0002 §6.3). Upstream's verifyAuthWithOptionsWeb runs
+// on EVERY signed-in webRoute request: a flagged session's every page
+// answers the 303 onto /user/settings/change_password (or the git-UA 401),
+// with the change page itself the only carve-out and NO logout carve-out at
+// the pin (GET /logout sits under reqSignOut, web.go:613/765 — its
+// middleware redirects before SignOut runs). Impersonated sessions never
+// gate (routers/common/auth.go:71's isImpersonated derivation). The page +
+// POST arms live in pages/change-password.test.tsx (uiRouter mounts); this
+// suite pins the sessionRouter arms.
+// ---------------------------------------------------------------------------
+
+/** Flip the admin-set flag directly (the admin-API arm landed in 50dce36;
+ *  the service-level clears are the change-password POSTs under test). */
+async function flagMustChange(userId: number): Promise<void> {
+  await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, userId)).run();
+}
+
+describe("the MUST-CHANGE password gate (web.go:197-206)", () => {
+  it("GET /login with a flagged session answers 303 /user/settings/change_password BEFORE the signed-in '/' arm (web.go:197-206 over the SignOutRequired arm)", async () => {
+    const alice = await seedUser();
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    const res = await request("/login", { headers: { cookie: sessionSetCookie(cookie, false) } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+  });
+
+  it("the gate 303 carries a PENDING rotation directive (the forced-logout rule — a rotation that never reaches the client trips reuse detection)", async () => {
+    const alice = await seedUser();
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    // Force the rotation clock: the secret is 25 h old (ROTATION_INTERVAL_MS
+    // is 24 h) while the idle expiry is still live.
+    await drizzle(env.DB)
+      .update(sessions)
+      .set({ rotatedAt: new Date(Date.now() - 25 * 60 * 60 * 1000), expiresAt: new Date(Date.now() + 60 * 60 * 1000) })
+      .where(eq(sessions.userId, alice.id))
+      .run();
+    const res = await request("/login", { headers: { cookie: sessionSetCookie(cookie, false) } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    // The rotated directive rode the gate response: a fresh non-clear
+    // gitea_session directive (the browser adopts the new secret; §2.4).
+    const directive = cookieHeader(res);
+    expect(directive).toContain(`${SESSION_COOKIE_NAME}=`);
+    expect(directive).not.toContain("Max-Age=0");
+    // And the presented (old) secret now sits in the 60 s grace — the verify
+    // answers anonymous-but-no-clear for it, exactly the §2.4 step 3 shape.
+    const after = await verifySession(env.DB, cookie);
+    expect(after.outcome).toBe("anonymous");
+    if (after.outcome === "anonymous") expect(after.clearCookie).toBe(false);
+  });
+
+  it("an UNFLAGGED session's /login keeps the '/' landing (web.go:206-210's negative arm)", async () => {
+    const alice = await seedUser();
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    const res = await request("/login", { headers: { cookie: sessionSetCookie(cookie, false) } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+  });
+
+  it("POST /logout with a flagged session redirects to the change page and leaves the session alive (NO logout carve-out at the pin — web.go:613/765)", async () => {
+    const alice = await seedUser();
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    const res = await request("/logout", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: sessionSetCookie(cookie, false), origin: "https://test.local" },
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    // Upstream's middleware redirect precedes SignOut: the row survives and
+    // NO cookie directives ride the answer (the session continues).
+    expect(await lookupValidSession(env.DB, cookie)).not.toBeNull();
+    expect(cookieHeader(res)).toBe("");
+  });
+
+  it("an IMPERSONATED flagged session's logout still runs the EXIT arm first (common/auth.go:71 — impersonated sessions never gate)", async () => {
+    const admin = await seedUser({ username: "RootAdmin", isAdmin: true });
+    const target = await seedUser({ username: "FlaggedTarget" });
+    await flagMustChange(target.id);
+    const cookie = await mintSession(env.DB, admin.id, { remember: false });
+    expect(await impersonateSessionUser(env.DB, cookie.split(":")[0] ?? "", admin.id, target.id)).toBe("impersonating");
+    const res = await request("/logout", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: sessionSetCookie(cookie, false), origin: "https://test.local" },
+    });
+    // The exit, not the gate: the session continues as the ADMIN on /-/admin.
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/-/admin");
+    expect(cookieHeader(res)).toBe("");
+    const restored = await lookupValidSession(env.DB, cookie);
+    expect(restored?.id).toBe(admin.id);
+    expect(restored?.impersonatorUserId).toBeNull();
+  });
+
+  it("GET /user/two_factor with a flagged signed-in session redirects to the change page BEFORE the already-authenticated '/' arm", async () => {
+    const alice = await seedUser();
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    const res = await request("/user/two_factor", { headers: { cookie: sessionSetCookie(cookie, false) } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+  });
+
+  it("the forgot/reset pages gate a flagged session first (upstream's middleware precedes those handlers too)", async () => {
+    const alice = await seedUser();
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    const headers = { cookie: sessionSetCookie(cookie, false) };
+    const forgot = await request("/user/forgot_password", { headers });
+    expect(forgot.status).toBe(303);
+    expect(forgot.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    // The flagged-session POST also redirects — the gate precedes the
+    // no-mailer NotFound (upstream's middleware precedes ForgotPasswdPost).
+    const forgotPost = await request("/user/forgot_password", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", ...headers, origin: "https://test.local" },
+      body: "email=alice@example.com",
+    });
+    expect(forgotPost.status).toBe(303);
+    expect(forgotPost.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    const reset = await request("/user/reset_password?code=whatever", { headers });
+    expect(reset.status).toBe(303);
+    expect(reset.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+  });
+
+  it("the git-UA arm answers upstream's HTTPError(401) plain text (web.go:199-201 — base.go:105-111's http.Error)", async () => {
+    const alice = await seedUser();
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+    // A REAL page (resolveUiSession) — /explore's bare redirect precedes any
+    // session work, the page handlers are where the middleware-equivalent
+    // lives.
+    const res = await request("/explore/repos", {
+      headers: { cookie: sessionSetCookie(cookie, false), "user-agent": "git/2.45.2" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await res.text()).toBe("Update your password\n");
+  });
+
+  it("the decision arm's unit shape: carve-out path passes, unflagged passes, impersonation is the caller's carve (mustChangePasswordArm)", () => {
+    const req = (path: string, ua?: string): Request =>
+      new Request(`https://test.local${path}`, { headers: ua === undefined ? {} : { "user-agent": ua } });
+    // The change page itself is the ONLY carve-out.
+    expect(mustChangePasswordArm(req(MUST_CHANGE_PASSWORD_PATH), true)).toBeNull();
+    expect(mustChangePasswordArm(req("/"), false)).toBeNull();
+    // A git UA gets the 401 shape; a browser UA the 303.
+    const git = mustChangePasswordArm(req("/dashboard", "git-remote-helper"), true);
+    expect(git?.status).toBe(401);
+    const browser = mustChangePasswordArm(req("/dashboard", "Mozilla/5.0"), true);
+    expect(browser?.status).toBe(303);
+    expect(browser?.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    // An optional directive rides both failure shapes (the forced-logout rule).
+    const withCookie = mustChangePasswordArm(req("/dashboard", "git/2.45"), true, sessionSetCookie("x:y", false));
+    expect(withCookie?.headers.get("set-cookie")).toContain(SESSION_COOKIE_NAME);
   });
 });

@@ -396,3 +396,68 @@ describe("the failure-limiter interplay on the wire", () => {
     expect(((await res.json<{ message: string }>()).message)).toBe("too many authentication failures, retry later");
   });
 });
+
+// --- the must-change-password 403 arm (api.go:886-893) ------------------------
+//
+// Upstream's verifyAuthWithOptionsAPI NeedChangePassword branch, mounted
+// AfterRouting straight after apiAuth (api.go:958-961) — the post-auth path
+// ahead of every route handler and scope gate, for EVERY credential carrier
+// (PAT / OAuth2 grant / Basic password). The body is the BARE `{message}`
+// JSON (api.go:888-891's literal ctx.JSON — no APIError `url` field):
+// `You must change your password. Change it at: ` + MakeAbsoluteURL of
+// /user/settings/change_password. The `CheckSignedInUser` derivations
+// (routers/common/auth.go:71) don't apply here: the API has no sessions
+// (no impersonation carve-out) and no bot rows (no IsTypeBot carve-out).
+
+import { TokenService } from "./token-service";
+
+describe("the must-change-password 403 arm (api.go:886-893)", () => {
+  /** Flip the admin-set flag directly (the admin-API arm landed in
+   *  50dce36; the clears are the change-password/reset arms). */
+  async function flagMustChange(userId: number): Promise<void> {
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, userId)).run();
+  }
+
+  it("a flagged PAT doer answers the bare {message} 403 with the absolute change URL, BEFORE the scope gate", async () => {
+    const alice = await seedUser("MustChangePat");
+    const token = await new TokenService(env.DB).mint({ userId: alice.id, name: "t", scopes: "all" }).then((m) => m.plaintext);
+    await flagMustChange(alice.id);
+
+    const res = await call("/_repo", { headers: { Authorization: `token ${token}` } });
+    expect(res.status).toBe(403);
+    const body = await res.json<{ message: string }>();
+    // No APIError `url` field — the bare shape (the middleware.ts header's
+    // TWO documented bare-403 exceptions gain this third).
+    expect(body.message).toBe(
+      "You must change your password. Change it at: https://example.com/user/settings/change_password",
+    );
+    expect((body as { url?: string }).url).toBeUndefined();
+  });
+
+  it("a flagged Basic-password doer answers the same 403 (the arm covers every carrier)", async () => {
+    const alice = await seedUser("MustChangeBasic");
+    const pw = await seedPassword(alice);
+    await flagMustChange(alice.id);
+
+    const res = await call("/_whoami", { headers: { Authorization: basicHeader("MustChangeBasic", pw) } });
+    expect(res.status).toBe(403);
+    const body = await res.json<{ message: string }>();
+    expect(body.message).toBe(
+      "You must change your password. Change it at: https://example.com/user/settings/change_password",
+    );
+    // The failure limiter did NOT count a failure (the credential verified —
+    // this is an authorization posture, not a failed attempt).
+    expect(await failureCountFor("203.0.113.10")).toBe(0);
+  });
+
+  it("once the flag clears, the same credential passes again (the change-password arms' clear is the exit)", async () => {
+    const alice = await seedUser("MustChangeExit");
+    const token = await new TokenService(env.DB).mint({ userId: alice.id, name: "t", scopes: "all" }).then((m) => m.plaintext);
+    await flagMustChange(alice.id);
+    expect((await call("/_repo", { headers: { Authorization: `token ${token}` } })).status).toBe(403);
+
+    await drizzle(env.DB).update(users).set({ mustChangePassword: false }).where(eq(users.id, alice.id)).run();
+    const res = await call("/_repo", { headers: { Authorization: `token ${token}` } });
+    expect(res.status).toBe(200);
+  });
+});

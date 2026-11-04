@@ -373,9 +373,11 @@ export type ChangePasswordOutcome =
  * The change-password arm (upstream AccountPost, routers/web/user/setting/
  * account.go:60-96 folded with UpdateAuth's password block, update.go:
  * 247-283): the old-password check when a password IS set, the retype
- * match, the validation ladder, SetPassword, and the invalidation =
- * REMEMBER-ME SESSION ROWS ONLY (upstream DeleteAuthTokensByUserID —
- * live browser sessions and PATs are untouched).
+ * match, the validation ladder, SetPassword, the MustChangePassword=false
+ * clear (account.go:78's `optional.Some(false)` — ANY own-password change
+ * clears the admin-set must-change flag, the PWD-4 enforcement half), and
+ * the invalidation = REMEMBER-ME SESSION ROWS ONLY (upstream
+ * DeleteAuthTokensByUserID — live browser sessions and PATs are untouched).
  */
 export async function changeOwnPassword(
   d1: D1Database,
@@ -403,7 +405,16 @@ export async function changeOwnPassword(
   const record = await newPasswordRecord(form.newPassword);
   const updated = await db
     .update(users)
-    .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+    .set({
+      passwd: record.passwd,
+      salt: record.salt,
+      passwdHashAlgo: record.passwdHashAlgo,
+      // account.go:78 — MustChangePassword: optional.Some(false): an
+      // own-password change always clears the must-change flag (the PWD-4
+      // enforcement half — an admin-created account's forced change lands
+      // through here too when the user finishes via the settings tab).
+      mustChangePassword: false,
+    })
     .where(eq(users.id, userId))
     .returning()
     .all();
@@ -700,12 +711,18 @@ export async function deleteUserCascade(
 }
 
 /**
- * The reset-complete password apply (upstream ResetPasswdPost's UpdateAuth
- * arm, routers/web/auth/password.go:216-244 folded with update.go:247-283 —
- * NO old-password check: the code's HMAC already binds the hash data, so a
- * valid code IS the credential). Ladder + SetPassword + the remember-me
- * invalidation + the audit row. The caller owns the code verification and
- * the 2FA arms.
+ * The SHARED UpdateAuth password arm with the MustChangePassword=false
+ * clear — upstream's one `UpdateAuth(Password, MustChangePassword:
+ * optional.Some(false))` call (services/user/update.go:247-283) answers
+ * BOTH no-old-password surfaces at the pin: ResetPasswdPost's apply
+ * (routers/web/auth/password.go:204-207) and MustChangePasswordPost's
+ * apply (password.go:298-301, the admin-created account's forced change —
+ * the PWD-4 enforcement half). NO old-password check: a valid reset code's
+ * HMAC already binds the hash data, and the must-change flow's credential
+ * IS the live session (password.go:286's NeedChangePassword guard runs in
+ * the caller). Ladder + retype match + SetPassword + the mcp clear + the
+ * remember-me invalidation + the audit row. The caller owns the code
+ * verification and the 2FA arms (reset) or the flag pre-check (must-change).
  */
 export async function applyPasswordReset(
   d1: D1Database,
@@ -724,7 +741,14 @@ export async function applyPasswordReset(
   const record = await newPasswordRecord(newPassword);
   const updated = await db
     .update(users)
-    .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+    .set({
+      passwd: record.passwd,
+      salt: record.salt,
+      passwdHashAlgo: record.passwdHashAlgo,
+      // password.go:206/300 — MustChangePassword: optional.Some(false) on
+      // both arms of the shared UpdateAuth call.
+      mustChangePassword: false,
+    })
     .where(eq(users.id, userId))
     .returning()
     .all();

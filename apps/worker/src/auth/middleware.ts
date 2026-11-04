@@ -47,6 +47,35 @@ export function userRedirectDoesNotExist(username: string): string {
   return `user redirect does not exist [name: ${username}]`;
 }
 
+/** The must-change-password gate's target path — upstream
+ *  `setting.AppSubURL+"/user/settings/change_password"` (api.go:887). The
+ *  literal is local to this module (the auth layer must not import from
+ *  ui/session.ts, which carries the WEB twin); both cite the same pin. */
+const MUST_CHANGE_PASSWORD_PATH = "/user/settings/change_password";
+
+/** The `users.must_change_password` read for the api.go:886-893 arm — one
+ *  PK probe per credentialed request (the comment at the arm). */
+async function doerMustChangePassword(db: D1Database, userId: number): Promise<boolean> {
+  const row = await drizzle(db)
+    .select({ mustChangePassword: users.mustChangePassword })
+    .from(users)
+    .where(eq(users.id, userId))
+    .get();
+  return row?.mustChangePassword === true;
+}
+
+/** The arm's exact wire answer — api.go:888-891's literal bare `{message}`
+ *  403. One builder so both mount paths (the token post-auth block and the
+ *  Basic-password ok branch) cannot drift. */
+function mustChangePasswordResponse(c: Context<AuthEnv>): Response {
+  return c.json(
+    {
+      message: `You must change your password. Change it at: ${new URL(c.req.url).origin}${MUST_CHANGE_PASSWORD_PATH}`,
+    },
+    403,
+  );
+}
+
 /** The `users.visibility` enum (SPEC-0003 §2.5.6 / upstream VisibleType). */
 export type UserVisibility = "public" | "limited" | "private";
 
@@ -215,6 +244,11 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
           return apiErrorResponse(c, 401, "basic authorization is not allowed while WebAuthn enrolled");
         }
         if (outcome.kind === "ok") {
+          // THE MUST-CHANGE ARM rides the Basic path too (api.go:886-893's
+          // verify runs for EVERY authenticated request — Basic doers
+          // included; the post-auth block below covers only the token-arm
+          // flow). The arm holds the FULL users row, so no extra read.
+          if (outcome.user.mustChangePassword) return mustChangePasswordResponse(c);
           const auth: AuthInfo = {
             user: authUserFromRow(outcome.user),
             // A password-Basic doer holds NO token row (upstream
@@ -282,15 +316,35 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
     };
 
     // Post-auth option checks — upstream `verifyAuthWithOptionsAPI`
-    // (api.go:877–894); no activation/password cases exist yet, so only the
-    // prohibited-account gate applies. The body is upstream's BARE
-    // `{message}` JSON (api.go:889–893's literal ctx.JSON — no APIError
-    // `url` field).
+    // (api.go:877–894); no activation case exists yet, so the
+    // prohibited-account gate and the must-change-password gate apply. Both
+    // bodies are upstream's BARE `{message}` JSON (api.go:889–893's literal
+    // ctx.JSON — no APIError `url` field). The placement is upstream's own:
+    // verifyAuthWithOptionsAPI is mounted `m.AfterRouting` straight after
+    // `apiAuth(buildAuthGroup())` (api.go:958-961) — the post-auth path,
+    // ahead of every route handler and scope gate.
     if (verified.user.status === "prohibited") {
       return c.json(
         { message: "This account is prohibited from signing in, please contact your site administrator." },
         403,
       );
+    }
+    // api.go:886-893's NeedChangePassword branch: `You must change your
+    // password. Change it at: ` + `httplib.MakeAbsoluteURL(ctx,
+    // setting.AppSubURL+"/user/settings/change_password")` — the request's
+    // absolute origin (the same request-origin posture swaggerUrl carries,
+    // recorded divergence from the configured AppURL). Upstream derives the
+    // need via `CheckSignedInUser` (routers/common/auth.go:71) whose
+    // impersonation carve-out is API-inapplicable (no sessions here) and
+    // whose bot carve-out cannot trip (the users.type enum has no bot
+    // value) — a plain flag check on the doer's row is the whole
+    // derivation. The PK read is this arm's cost: AuthUser (auth-context.ts,
+    // outside this unit's ownership) does not project the column, so the
+    // uniform read covers the PAT and OAuth2-grant carriers on the one code
+    // path (the Basic-password carrier checks its full row at its own
+    // branch, above).
+    if (await doerMustChangePassword(c.env.DB, verified.user.id)) {
+      return mustChangePasswordResponse(c);
     }
 
     c.set("auth", auth);

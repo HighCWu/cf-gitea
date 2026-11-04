@@ -153,6 +153,7 @@ import {
   renderForgotPasswordPage,
   renderResetPasswordPage,
 } from "./pages/password-reset";
+import { changePasswordLocale } from "./pages/change-password";
 import {
   clearTwofaSetCookie,
   getTwoFactorByUid,
@@ -181,7 +182,7 @@ import { readUrlEncodedForm } from "./forms";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import { locale } from "./locale";
 import { AssetBuildError, loadManifest } from "./manifest";
-import { renderServerErrorShellResponse } from "./not-found-response";
+import { renderNotFoundShellResponse, renderServerErrorShellResponse } from "./not-found-response";
 import { oauth2LoginSourceButtons, renderLoginPage } from "./pages/login";
 import { renderTwofaGatePage, renderTwofaScratchPage, twofaLocale } from "./pages/twofa";
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
@@ -353,6 +354,15 @@ export interface SessionUser {
   readonly id: number;
   readonly username: string;
   readonly isAdmin: boolean;
+  /** The `users.must_change_password` flag (migration 0059's column — the
+   *  PWD-4 enforcement half): the WEB force-change gate reads it off the
+   *  verification the request already paid for (upstream's
+   *  `CheckSignedInUser().NeedChangePassword` — routers/common/auth.go:71 —
+   *  reads `doer.MustChangePassword` off the resolved doer, never a second
+   *  read). The VIEWER projection drops it (viewer.ts is additive-only for
+   *  the goldens), so page-level consumers that hold only a viewer id use
+   *  `userMustChangePassword` below. */
+  readonly mustChangePassword: boolean;
 }
 
 export type SessionVerification =
@@ -393,6 +403,21 @@ export type SessionVerification =
       /** Background work: the throttled `last_seen_at` touch when due (§3). */
       background: Promise<unknown>[];
     };
+
+/**
+ * The sessionRouter pages' MUST-CHANGE gate prologue (the gate section
+ * above): a read-only verify (`lookupValidSession` — the logout/gate-pages
+ * precedent: no rotation writes on pages that never carried them) feeding
+ * `mustChangePasswordArm`. `null` = the request passes (no/invalid session,
+ * unflagged, impersonated — or the carved-out path).
+ */
+async function sessionMustChangeGate(d1: D1Database, req: Request): Promise<Response | null> {
+  const value = sessionCookieValue(req);
+  if (value === null) return null;
+  const valid = await lookupValidSession(d1, value);
+  if (valid === null || valid.impersonatorUserId !== null) return null;
+  return mustChangePasswordArm(req, valid.mustChangePassword);
+}
 
 /**
  * Verify a presented `gitea_session` value — the port of upstream
@@ -505,7 +530,12 @@ export async function verifySession(
 
   return {
     outcome: "authenticated",
-    user: { id: row.user.id, username: row.user.username, isAdmin: row.user.isAdmin },
+    user: {
+      id: row.user.id,
+      username: row.user.username,
+      isAdmin: row.user.isAdmin,
+      mustChangePassword: row.user.mustChangePassword,
+    },
     setCookie,
     remember: row.session.remember,
     impersonatorUserId: row.session.impersonatorUserId,
@@ -774,6 +804,7 @@ export async function lookupValidSession(
     id: row.user.id,
     username: row.user.username,
     isAdmin: row.user.isAdmin,
+    mustChangePassword: row.user.mustChangePassword,
     sessionId: row.session.id,
     impersonatorUserId: row.session.impersonatorUserId,
   };
@@ -801,6 +832,87 @@ export async function deleteSessionBySecret(d1: D1Database, value: string): Prom
  *  (routers/web/auth/auth.go:86,382). No cron exists (§3). */
 export async function sweepExpiredSessions(d1: D1Database, now?: Date): Promise<void> {
   await drizzle(d1).delete(sessions).where(lt(sessions.expiresAt, now ?? new Date())).run();
+}
+
+// ---------------------------------------------------------------------------
+// THE MUST-CHANGE-PASSWORD GATE (SPEC-0002 §6.3 — the PWD-4 enforcement
+// half's WEB arm). Upstream: verifyAuthWithOptionsWeb's NeedChangePassword
+// branch (routers/web/web.go:197-206) runs on EVERY signed-in web request —
+// the derived semantics are "every page, one carve-out":
+//
+//   - signed-in + `CheckSignedInUser().NeedChangePassword`
+//     (routers/common/auth.go:71 = doer.MustChangePassword && !impersonated
+//     && !IsTypeBot) + path != /user/settings/change_password:
+//       * UserAgent starting with "git" → HTTPError(401, locale
+//         "auth.must_change_password") — Go http.Error's plain text
+//         (services/context/base.go:105-111);
+//       * else → redirect to /user/settings/change_password;
+//   - path == /user/settings/change_password → the request PASSES (the
+//     change page GET/POST, web.go:637-638 — the ONLY carve-out);
+//   - signed-in WITHOUT the need + path == /user/settings/change_password →
+//     redirect to "/" (web.go:206-210's else-if);
+//   - NO other carve-outs at the pin: /logout sits under reqSignOut
+//     (web.go:613's group wrapping GET /logout, web.go:765) whose middleware
+//     redirects BEFORE SignOut runs — a must-change user cannot log out
+//     until the flag clears (upstream's own posture); static assets ride the
+//     outer mux, OUTSIDE webRoutes' middleware, and never see the gate.
+//   - the flag clears through ANY own-password change carrying upstream's
+//     MustChangePassword=Some(false) UpdateAuth (account.go:78 /
+//     password.go:206/300 — services/user-accounts.ts
+//     changeOwnPassword/applyPasswordReset here).
+// ---------------------------------------------------------------------------
+
+/** The gate's carved-out path (web.go:198/203's literal). */
+export const MUST_CHANGE_PASSWORD_PATH = "/user/settings/change_password";
+
+/**
+ * The gate's DECISION arm — pure request math, no D1. `flagged` is the
+ * caller's already-verified doer's flag (`CheckSignedInUser` shape:
+ * impersonated sessions never gate — the common/auth.go:71 derivation; bot
+ * rows cannot exist here, the users.type enum carries no bot value).
+ * `setCookie` attaches the caller's pending §2.4 directive to BOTH failure
+ * shapes — a rotation that silently never reaches the client is the
+ * documented forced-logout bug (the loginPage comment): the stale cookie
+ * would trip reuse detection past the grace and delete the row. `null` =
+ * the request passes (anonymous, unflagged, impersonated, or the carved-
+ * out path); otherwise the ready Response: the git-UA 401 or the 303.
+ */
+export function mustChangePasswordArm(req: Request, flagged: boolean, setCookie?: string): Response | null {
+  if (!flagged) return null;
+  const url = new URL(req.url);
+  if (url.pathname === MUST_CHANGE_PASSWORD_PATH) return null;
+  // web.go:199-201 — `strings.HasPrefix(ctx.Req.UserAgent(), "git")`:
+  // a git client pointed at the WEB surface gets upstream's HTTPError(401)
+  // — http.Error's exact wire (text/plain; charset=utf-8, nosniff, the
+  // locale string + "\n").
+  if (req.headers.get("user-agent")?.startsWith("git") === true) {
+    const headers: Record<string, string> = {
+      "content-type": "text/plain;charset=utf-8",
+      "x-content-type-options": "nosniff",
+    };
+    if (setCookie !== undefined) headers["set-cookie"] = setCookie;
+    return new Response(`${changePasswordLocale.must_change_password}\n`, { status: 401, headers });
+  }
+  return seeOther(MUST_CHANGE_PASSWORD_PATH, setCookie);
+}
+
+/**
+ * The flag read for consumers that hold only a viewer/doer id (the
+ * uiRouter's resolveUiSession — viewer.ts drops the flag additively — and
+ * the API middleware's post-auth arm, which keeps its own local copy of the
+ * same shape). One PK read; upstream avoids it by reading the doer row the
+ * request already resolved, which the Viewer projection cannot carry
+ * without touching viewer.ts (not this unit's file) — the read is the
+ * disclosed ownership-shape cost, one indexed PK probe per signed-in page
+ * request.
+ */
+export async function userMustChangePassword(d1: D1Database, userId: number): Promise<boolean> {
+  const row = await drizzle(d1)
+    .select({ mustChangePassword: users.mustChangePassword })
+    .from(users)
+    .where(eq(users.id, userId))
+    .get();
+  return row?.mustChangePassword === true;
 }
 
 /**
@@ -1085,6 +1197,17 @@ async function loginPage(c: RouteContext): Promise<Response> {
         verification.setCookie === null
           ? undefined
           : sessionSetCookie(verification.setCookie, verification.remember);
+      // THE MUST-CHANGE GATE (web.go:197-206): a flagged session's /login
+      // visit redirects to the change page BEFORE the signed-in arm below —
+      // upstream's verifyAuthWithOptionsWeb runs the NeedChangePassword
+      // branch ahead of the SignOutRequired handling on every webRoute.
+      // Impersonated sessions never gate (common/auth.go:71's
+      // isImpersonated carve-out): the admin behind the session keeps the
+      // ordinary "/" landing.
+      if (verification.user.mustChangePassword && verification.impersonatorUserId === null) {
+        const arm = mustChangePasswordArm(c.req.raw, true, directive);
+        if (arm !== null) return arm;
+      }
       return seeOther("/", directive);
     }
     if (verification.clearCookie) setCookie = clearSessionSetCookie();
@@ -1333,6 +1456,21 @@ async function logout(c: RouteContext): Promise<Response> {
     // must not delete rows); the (id, digest) delete covers only a valid
     // presentation.
     const valid = await lookupValidSession(c.env.DB, value);
+    // THE MUST-CHANGE GATE (web.go:197-206 — NO logout carve-out at the
+    // pin): upstream's GET /logout sits under reqSignOut (web.go:613's
+    // group, route web.go:765) whose verifyAuthWithOptionsWeb instance
+    // redirects a flagged doer to the change page BEFORE SignOut runs, so
+    // the session (and the cookie) survive untouched — a must-change user
+    // cannot log out until the flag clears. Impersonated sessions never
+    // gate (common/auth.go:71), so the EXIT arm below keeps its precedence
+    // exactly. (Ordering note: upstream's cross-origin protection runs
+    // AFTER this gate in the same middleware; the house §2.8 guard runs
+    // first here — the divergence only moves cross-origin forgeries, never
+    // the flagged user's own browser.)
+    if (valid !== null && valid.mustChangePassword && valid.impersonatorUserId === null) {
+      const arm = mustChangePasswordArm(c.req.raw, true);
+      if (arm !== null) return arm;
+    }
     if (valid === null || valid.impersonatorUserId !== null) {
       // The exit attempt (valid-impersonating AND the unreachable-status
       // arms alike): keyed (id, digest) + the impersonator stamp — the same
@@ -1390,8 +1528,10 @@ async function logout(c: RouteContext): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 /** The GET arms' shared ladder: a fully-signed-in visitor is already past
- *  the gate (performAutoLogin's arm — 303 "/"); otherwise a valid GATE
- *  ticket renders the page, anything else is upstream's ServerError. */
+ *  the gate (performAutoLogin's arm — 303 "/" unless the MUST-CHANGE gate
+ *  redirects first, web.go:197-206 — the same lookupValidSession check the
+ *  logout arm rides; impersonated sessions never gate); otherwise a valid
+ *  GATE ticket renders the page, anything else is upstream's ServerError. */
 async function gatePageResponse(
   c: RouteContext,
   render: (options: { ctx: UiContext; error: string | null }) => string,
@@ -1399,7 +1539,13 @@ async function gatePageResponse(
   const sessionValue = sessionCookieValue(c.req.raw);
   if (sessionValue !== null) {
     const valid = await lookupValidSession(c.env.DB, sessionValue);
-    if (valid !== null) return seeOther("/");
+    if (valid !== null) {
+      if (valid.mustChangePassword && valid.impersonatorUserId === null) {
+        const arm = mustChangePasswordArm(c.req.raw, true);
+        if (arm !== null) return arm;
+      }
+      return seeOther("/");
+    }
   }
   const ticketValue = twofaCookieValue(c.req.raw);
   const ticket = ticketValue === null ? null : await verifyPendingTicket(c.env.DB, ticketValue, "gate");
@@ -1572,26 +1718,58 @@ sessionRouter.post("/user/two_factor/scratch", (c) => twofaScratchSubmit(c));
 // (handleSignIn — mint + cookie + the "/" redirect).
 // ---------------------------------------------------------------------------
 
-/** GET /user/forgot_password — the reset-disabled page. */
+/** GET /user/forgot_password — the reset-disabled page. The MUST-CHANGE
+ *  gate prologue rides first (the gate section — upstream's middleware
+ *  precedes the handler on every webRoute). */
 async function forgotPasswordPage(c: RouteContext): Promise<Response> {
+  const gate = await sessionMustChangeGate(c.env.DB, c.req.raw);
+  if (gate !== null) return gate;
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
   return c.html(renderForgotPasswordPage(assembled.ctx), 200);
 }
 
+/**
+ * Upstream `ctx.NotFound(nil)` on the wire (password.go:53-57 →
+ * notFoundInternal, services/context/context_response.go:130-155): the
+ * response negotiates on the request's Accept — ANY Accept part containing
+ * "text/html" renders the status/404 page, everything else (the non-browser
+ * arm — the form never renders without a mailer, so this is curl/git/
+ * scripts) gets `plainTextInternal`'s exact body: `Not found.\n` at 404,
+ * text/plain with nosniff. `renderNotFoundShellResponse` is the house's
+ * status/404 twin (the HTML arm); the plain arm is the literal body.
+ */
+function forgotPasswordNotFound(env: Env, req: Request): Response | Promise<Response> {
+  const accept = req.headers.get("accept") ?? "";
+  if (!accept.split(",").some((part) => part.includes("text/html"))) {
+    return new Response("Not found.\n", {
+      status: 404,
+      headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+    });
+  }
+  return renderNotFoundShellResponse(env, req);
+}
+
 /** POST /user/forgot_password — upstream NotFound without a mailer
  *  (password.go:53-57; the form never renders, so this is the
- *  non-browser-client arm). */
+ *  non-browser-client arm). The MUST-CHANGE gate prologue rides first —
+ *  upstream's middleware precedes the handler, so a flagged session's POST
+ *  redirects to the change page before this 404 ever applies. */
 async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
-  return renderServerErrorShellResponse(c.env, c.req.raw);
+  const gate = await sessionMustChangeGate(c.env.DB, c.req.raw);
+  if (gate !== null) return gate;
+  const answer = forgotPasswordNotFound(c.env, c.req.raw);
+  return answer instanceof Response ? answer : await answer;
 }
 
 /** GET /user/reset_password?code=… — the code verifies BEFORE the form
  *  renders (commonResetPassword, password.go:110-160): a valid code renders
  *  the password form (with the passcode field when TOTP-enrolled), an
  *  invalid/expired one renders the invalid-code message
- *  ("auth.invalid_code"). */
+ *  ("auth.invalid_code"). The MUST-CHANGE gate prologue rides first. */
 async function resetPasswordPage(c: RouteContext): Promise<Response> {
+  const gate = await sessionMustChangeGate(c.env.DB, c.req.raw);
+  if (gate !== null) return gate;
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
   const url = new URL(c.req.url);
@@ -1610,11 +1788,14 @@ async function resetPasswordPage(c: RouteContext): Promise<Response> {
 }
 
 /** POST /user/reset_password — the reset-complete arm (ResetPasswdPost,
- *  password.go:164-265). */
+ *  password.go:164-265). The MUST-CHANGE gate prologue rides first —
+ *  upstream's middleware precedes the handler. */
 async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   // §2.8 layer 2 — a non-GET UI write.
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
+  const gate = await sessionMustChangeGate(c.env.DB, c.req.raw);
+  if (gate !== null) return gate;
 
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;

@@ -9,8 +9,8 @@
  * Pins (upstream routers/web/auth/password.go at the submodule):
  *   - the forgot-REQUEST arm stays GATED OFF (no Workers mailer): the GET
  *     renders the IsResetDisable state (password.go:40-45) and the POST is
- *     the non-browser arm (password.go:53-57) — see the FINDING note on that
- *     arm's status;
+ *     the non-browser arm (password.go:53-57) — the LANDED 404 (the PWD-WIRE
+ *     finding cured 2026-11-04; the pin below);
  *   - the reset link verifies BEFORE the form renders (commonResetPassword,
  *     password.go:110-160) over the HMAC time-limit code
  *     (models/user/user.go:920-973 at our auth/reset-code.ts port): bad
@@ -279,16 +279,28 @@ describe("GET/POST /user/forgot_password (password.go:40-57)", () => {
     expect(html).not.toContain("<form");
   });
 
-  it("POST is the non-browser arm: the house server-error shell, NOT a form-driven arm", async () => {
-    // FINDING (recorded, orchestrator adjudicates): upstream answers
-    // ctx.NotFound(nil) → 404 here (password.go:53-57; notFoundInternal,
-    // services/context/context_response.go:130-155); the landed arm renders
-    // the 500 server-error shell instead (session.ts forgotPasswordSubmit —
-    // "the form never renders, so this is the non-browser-client arm").
-    // The test pins the LANDED wire; the status divergence is reported.
+  it("POST is the non-browser arm: upstream's NotFound(nil) — 404 plain `Not found.` without an HTML Accept (password.go:53-57)", async () => {
+    // LANDED-WIRE (the PWD-WIRE finding cured, 2026-11-04): the arm used to
+    // answer the 500 server-error shell; it now answers upstream's
+    // ctx.NotFound(nil) exactly (password.go:53-57 → notFoundInternal,
+    // services/context/context_response.go:130-155): without `text/html` in
+    // the Accept, plainTextInternal's literal body at 404.
     const res = await request("/user/forgot_password", { method: "POST", body: "email=alice@example.com", headers: { "content-type": "application/x-www-form-urlencoded" } });
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await res.text()).toBe("Not found.\n");
+  });
+
+  it("POST with an HTML Accept renders the 404 shell (notFoundInternal's text/html arm)", async () => {
+    const res = await request("/user/forgot_password", {
+      method: "POST",
+      body: "email=alice@example.com",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/html,application/xhtml+xml" },
+    });
+    expect(res.status).toBe(404);
     expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("Page Not Found");
   });
 });
 
@@ -472,6 +484,18 @@ describe("POST /user/reset_password — the apply ladder", () => {
     const bad = await request("/user/reset_password", form({ code: `${code}zz`, password: NEW_PASSWORD, retype: NEW_PASSWORD }));
     expect(bad.status).toBe(200);
     expect(await bad.text()).toContain(passwordResetLocale.invalid_code);
+  });
+
+  it("the apply clears the admin-set must_change_password flag (password.go:204-207's MustChangePassword: optional.Some(false) — the PWD-4 exit)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, alice.id)).run();
+    const code = await mintCode(alice);
+
+    const res = await request("/user/reset_password", form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD }));
+    expect(res.status).toBe(303);
+    const row = await userRow(alice.id);
+    expect(row.mustChangePassword).toBe(false);
+    expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
   });
 });
 
