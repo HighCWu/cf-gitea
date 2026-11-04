@@ -28,11 +28,14 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { createCommitStatus, hashCommitStatusContext, latestCommitStatuses } from "../api/services/commit-status";
 import { insertIssuePin, setIssueSubscription } from "../api/services/issue-extras";
 import { mergeableOfRow, statusFromMergeability } from "../api/services/pull-engine";
+import { addOrUpdateCollaborator } from "../api/services/repo-collaborators";
 import { HAS_CHANGED, parseUpdatedFiles, UNVIEWED, updateReviewStateAtHead, VIEWED } from "../ui/pages/pull-files";
 import {
   comments,
   commitStatuses,
   follows,
+  gpgKeys,
+  issueDependencies,
   issuePins,
   issues,
   issueSubscriptions,
@@ -44,6 +47,7 @@ import {
   repoMirrors,
   repoSettings,
   repoTopics,
+  repoTransfer,
   repoUnits,
   repoWatchers,
   renamedBranches,
@@ -333,17 +337,24 @@ describe("batch-7 stores parity (superseded REPO_*_DDL_STATEMENTS)", () => {
     ).toEqual({ mode: 1, include_pull_requests: 1, include_issues: 1, include_releases: 1 });
   });
 
-  it("repo_collaborators: composite PK, 'write' default, upsert arbitration", async () => {
+  it("repo_collaborators: surrogate id pk, UNIQUE(s) pair, 'write' default, upsert arbitration", async () => {
     const db = drizzle(env.DB);
     const columns = await tableColumns("repo_collaborators");
+    // Migration 0077 (FN-12) demoted the composite PK to the
+    // repo_collaborators_repo_user_uq uniqueIndex (upstream UNIQUE(s),
+    // collaboration.go:22-23) in favor of the upstream id pk
+    // (collaboration.go:21) — column order follows the upstream struct.
     expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
-      ["repo_id", "TEXT", 1, 1],
-      ["user_id", "INTEGER", 1, 2],
+      ["id", "INTEGER", 1, 1],
+      ["repo_id", "TEXT", 1, 0],
+      ["user_id", "INTEGER", 1, 0],
       ["mode", "TEXT", 1, 0],
       ["created_at", "INTEGER", 0, 0],
       ["updated_at", "INTEGER", 0, 0],
     ]);
-    expect(await indexNames("repo_collaborators")).toContain("idx_repo_collaborators_user");
+    expect(await indexNames("repo_collaborators")).toEqual(
+      expect.arrayContaining(["repo_collaborators_repo_user_uq", "idx_repo_collaborators_user"]),
+    );
 
     // Raw insert with omitted columns → the raw DDL's DEFAULT 'write'.
     await env.DB.prepare("INSERT INTO repo_collaborators (repo_id, user_id) VALUES ('c1', 3)").run();
@@ -2103,5 +2114,177 @@ describe("issue_pins / issue_subscriptions strictness parity (ADR-0007 FN-10/FN-
     await insertIssuePin(env.DB, issue, 900, now);
     const pins = await db.select().from(issuePins).all();
     expect(pins).toEqual([{ issueId: issue.id, repoId: "fn10-12-writers", pinOrder: 1 }]);
+  });
+});
+
+/**
+ * ADR-0007 FN-12 (migration 0077): the "small completions" batch — the four
+ * small pure-metadata tables the reconciliation still counted as open MISSING
+ * ports. Per table, against the upstream struct:
+ * - `repo_transfer` gains `recipient_access_granted` (transfer.go:75,
+ *   `NOT NULL DEFAULT false`) and the updated stamp under the §7.2 RECORDED
+ *   family name `updated_at` (transfer.go:78 `INDEX NOT NULL updated` — the
+ *   upstream literal SQL name is `updated_unix`; DEFAULT 0 is the
+ *   ALTER-legal constant, the FN-4 archived_unix precedent) + the INDEX tag
+ *   as an explicit index.
+ * - `repo_collaborators` gains the surrogate `id` pk (collaboration.go:21)
+ *   via a REBUILD — the composite pair demotes to
+ *   `repo_collaborators_repo_user_uq` (upstream UNIQUE(s),
+ *   collaboration.go:22-23) and stays the upsert arbiter; the generated
+ *   copy's `"id"` leg was hand-corrected out (the 0066 double-quoted-copy
+ *   trap: the old table has no id column, so selecting it would materialize
+ *   the string literal under the double-quote rule and collide the pk).
+ * - `issue_dependency.updated_unix` (dependency.go:107, `xorm:"updated"`,
+ *   nullable upstream — the table is a §7.2 arm-2 parity-named member, so
+ *   the literal name lands) and `gpg_keys.emails` (gpg_key.go:33, the bare
+ *   `[]*user_model.EmailAddress` slice → TEXT JSON, nullable) are pure ADD
+ *   COLUMNs. Both stay unwritten for now: the dependency writers stamp
+ *   created_unix only, and the GPG add flow has no identity-matching arm
+ *   (the API render keeps its recorded `emails: []`,
+ *   api/services/account-keys.ts) — structure-alignment landings, the
+ *   writer arms are the port-when-read pieces.
+ * No product wiring rides this migration (the FN-12 mission: structure
+ * only); the one behavioral pin is that the EXISTING writers keep working
+ * on the new shapes (the 0073 discipline: every landed column must have a
+ * verified no-NULL-path/no-value-drift story or an explicit default).
+ */
+describe("FN-12 small completions (ADR-0007 FN-12, migration 0077)", () => {
+  it("0077's DDL: the four tables land at upstream's postures (PRAGMA pins) and the rebuilt collaborator table carries the full index set", async () => {
+    const transfer = await tableColumns("repo_transfer");
+    expect(transfer).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "doer_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "recipient_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 4, name: "created_at", type: "INTEGER", notnull: 1, dflt_value: "unixepoch()", pk: 0 },
+      { cid: 5, name: "team_i_ds", type: "TEXT", notnull: 1, dflt_value: "'[]'", pk: 0 },
+      { cid: 6, name: "recipient_access_granted", type: "INTEGER", notnull: 1, dflt_value: "false", pk: 0 },
+      { cid: 7, name: "updated_at", type: "INTEGER", notnull: 1, dflt_value: "0", pk: 0 },
+    ]);
+    expect(await indexNames("repo_transfer")).toEqual(["repo_transfer_repo_id_unique", "repo_transfer_updated_at_idx"]);
+
+    const collabs = await tableColumns("repo_collaborators");
+    // Column order follows the upstream struct verbatim (collaboration.go:21-26)
+    // — the rebuild made the order free, so it is upstream's.
+    expect(collabs).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "user_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "mode", type: "TEXT", notnull: 1, dflt_value: "'write'", pk: 0 },
+      { cid: 4, name: "created_at", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 5, name: "updated_at", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+    ]);
+    // The composite pair is the UNIQUE(s) uniqueIndex now; the reverse index
+    // survives the rebuild.
+    expect(await indexNames("repo_collaborators")).toEqual(["repo_collaborators_repo_user_uq", "idx_repo_collaborators_user"]);
+
+    const deps = await tableColumns("issue_dependency");
+    expect(deps).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "user_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "issue_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "dependency_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 4, name: "created_unix", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 5, name: "updated_unix", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+    ]);
+    expect(await indexNames("issue_dependency")).toEqual(["issue_dependency_issue_dep_uq", "issue_dependency_dependency_idx"]);
+
+    const gpg = await tableColumns("gpg_keys");
+    expect(gpg[13]).toEqual({ cid: 13, name: "emails", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+    expect(gpg).toHaveLength(14); // nothing else moved under the ADD COLUMN
+    expect(await indexNames("gpg_keys")).toEqual(["gpg_keys_owner_idx", "gpg_keys_key_id_idx", "gpg_keys_primary_key_id_idx"]);
+  });
+
+  it("the pre-0077 writer shapes keep landing: a transfer insert omitting both new columns reads the declared defaults, a dependency/gpg insert reads NULL on the new nullable columns", async () => {
+    const db = drizzle(env.DB);
+    // Exactly the fileTransfer shape (repos/service.ts): no access flag, no
+    // updated stamp — the defaults cover both.
+    await db.insert(repoTransfer).values({
+      repoId: "fn12-transfer",
+      doerId: 1,
+      newOwnerId: 2,
+      teamIds: "[]",
+      createdAt: new Date(1_700_000_000_000),
+    });
+    const transfer = await db.select().from(repoTransfer).where(eq(repoTransfer.repoId, "fn12-transfer")).get();
+    expect(transfer?.recipientAccessGranted).toBe(false); // upstream DEFAULT false
+    // DEFAULT 0 decodes through the timestamp mode as the epoch — the
+    // recorded "never updated" zero convention (upstream's zero TimeStamp).
+    expect(transfer?.updatedAt).toEqual(new Date(0));
+
+    // The nullable ports: omitted → NULL (upstream-exact — both upstream
+    // fields carry no NOT NULL tag; §7.1's ours-looser class does not apply).
+    await db.insert(issueDependencies).values({
+      userId: 1,
+      issueId: 9001,
+      dependencyId: 9002,
+      createdAt: new Date(1_700_000_100_000),
+    });
+    const dep = await db.select().from(issueDependencies).where(eq(issueDependencies.issueId, 9001)).get();
+    expect(dep?.updatedAt).toBeNull();
+
+    const [ownerId] = await seedUsers("fn12-gpg-owner");
+    if (ownerId === undefined) throw new Error("seedUsers returned no id");
+    await db.insert(gpgKeys).values({
+      ownerId,
+      keyId: "ABCDEF0123456789",
+      content: "fn12-armored",
+      createdAt: new Date(1_700_000_200_000),
+      addedAt: new Date(1_700_000_200_000),
+    });
+    const key = await db.select().from(gpgKeys).where(eq(gpgKeys.ownerId, ownerId)).get();
+    expect(key?.emails).toBeNull();
+  });
+
+  it("the new columns store upstream's value spaces when written; the collaborator upsert arbitrates through the demoted unique index and preserves its stamp and id", async () => {
+    const db = drizzle(env.DB);
+    // Upstream's value spaces round-trip: the access flag flips true (the
+    // recipient-authorization arm's value, port-when-read), the transfer's
+    // updated stamp takes a real instant, the dependency edge stamps its
+    // change instant, and the GPG key carries the parse-time email list
+    // (AddGPGKey's shape, gpg_key.go:202 — array of EmailAddress fields).
+    await db
+      .update(repoTransfer)
+      .set({ recipientAccessGranted: true, updatedAt: new Date(1_700_000_300_000) })
+      .where(eq(repoTransfer.repoId, "fn12-transfer"));
+    const transfer = await db.select().from(repoTransfer).where(eq(repoTransfer.repoId, "fn12-transfer")).get();
+    expect(transfer?.recipientAccessGranted).toBe(true);
+    expect(transfer?.updatedAt).toEqual(new Date(1_700_000_300_000));
+
+    await db
+      .update(issueDependencies)
+      .set({ updatedAt: new Date(1_700_000_400_000) })
+      .where(eq(issueDependencies.issueId, 9001));
+    expect((await db.select().from(issueDependencies).where(eq(issueDependencies.issueId, 9001)).get())?.updatedAt).toEqual(
+      new Date(1_700_000_400_000),
+    );
+
+    const [ownerId] = await seedUsers("fn12-gpg-owner2");
+    if (ownerId === undefined) throw new Error("seedUsers returned no id");
+    await db.insert(gpgKeys).values({
+      ownerId,
+      keyId: "FEDCBA9876543210",
+      content: "fn12-armored-2",
+      createdAt: new Date(1_700_000_200_000),
+      addedAt: new Date(1_700_000_200_000),
+      emails: '[{"id":7,"email":"fn12@example.com","verified":true}]',
+    });
+    expect((await db.select().from(gpgKeys).where(eq(gpgKeys.ownerId, ownerId)).get())?.emails).toBe(
+      '[{"id":7,"email":"fn12@example.com","verified":true}]',
+    );
+
+    // The rebuild's arbiter: addOrUpdateCollaborator's ON CONFLICT target is
+    // the (repo_id, user_id) pair — a unique INDEX now, not the pk — and the
+    // upsert still updates in place, leaving id and created_at alone.
+    const now = new Date(1_700_000_500_000);
+    await addOrUpdateCollaborator(env.DB, "fn12-collab", 42, "read", now);
+    const first = await db.select().from(repoCollaborators).where(eq(repoCollaborators.repoId, "fn12-collab")).get();
+    expect(first).toMatchObject({ userId: 42, mode: "read", createdAt: now, updatedAt: now });
+    expect(first?.id).toBeGreaterThan(0);
+
+    await addOrUpdateCollaborator(env.DB, "fn12-collab", 42, "write", new Date(1_700_000_600_000));
+    const rows = await db.select().from(repoCollaborators).where(eq(repoCollaborators.repoId, "fn12-collab")).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: first?.id, userId: 42, mode: "write", createdAt: now, updatedAt: new Date(1_700_000_600_000) });
   });
 });

@@ -62,6 +62,17 @@ sources and found accurate.
   4 RENAME (all four §7.2-recorded — NOT port targets; open rename
   targets: 0) + 4 OURS-EXTRA + 7 TYPE**, and the open migration-target
   count drops from 15 (11 open MISSING + 4 RENAME) to 11 open MISSING.
+  **Reconciliation 3 (TABLEMISS2 unit, 2026-11-04):** FN-12's
+  small-completions batch LANDED (migration `0077_smooth_rick_jones`) —
+  the 5 open port columns it contained are consumed (`gpg_keys.emails`,
+  `issue_dependency.updated_unix`, `repo_transfer.recipient_access_granted`
+  + its §7.2-family updated stamp, `repo_collaborators.id`), so the
+  residual drops **34 → 29 = 19 MISSING (8 recorded-absent + 6 open) +
+  4 RENAME (all four §7.2-recorded — NOT port targets; open rename
+  targets: 0) + 4 OURS-EXTRA + 7 TYPE** (arithmetic: 63 − 17 − 12 − 5 =
+  29; the open migration-target count drops 11 → 6: `issue_labels.id` +
+  `issue_pins.id`/`is_pull` (FN-10), `package_blob_uploads.hash_state_bytes`
+  (FN-11 port-or-record), `pull_requests.type` + `changed_protected_files`).
   The 4-missing-table
   figure undercounts by counting only data tables a reader would touch;
   this census counts every registered upstream table.
@@ -85,11 +96,12 @@ sources and found accurate.
   commit_statuses `context_hash`/`index` + commit_status_indexes — §3.1's
   rows carry the flips), and FN-7 LANDED (migration 0070,
   `merged_commit_id` + the stamp arm — §5's row carries the status).
-  The remaining open arms are the strictness batch FN-10/FN-12 (in
-  flight, 0073), FN-11 (port-or-record), and FN-14 (port-when-read) —
-  the 4 residual RENAMEs of the reconciliation above are DISPOSITIONED
-  as FN-13 §7.2-recorded (CENSUS3, 2026-11-04; see Reconciliation 2):
-  no FN assignee needed, the RENAME backlog is empty.
+  The remaining open arms are FN-10's remainder (`issue_labels.id`,
+  `issue_pins.id`/`is_pull`), FN-11 (port-or-record), and FN-14
+  (port-when-read) — FN-12 LANDED (2026-11-04, migration 0077; see
+  Reconciliation 3) — the 4 residual RENAMEs of the reconciliation above
+  are DISPOSITIONED as FN-13 §7.2-recorded (CENSUS3, 2026-11-04; see
+  Reconciliation 2): no FN assignee needed, the RENAME backlog is empty.
 
 ## 1. Method (reproducible)
 
@@ -302,7 +314,7 @@ classes only.
 | `dbfs_meta` | models/dbfs/dbfs.go:48 | — | missing-table | platform: R2 replaces dbfs (schema.ts:4111,4644) |
 | `dbfs_data` | models/dbfs/dbfs.go:57 | — | missing-table | platform: R2 replaces dbfs (schema.ts:4111,4644) |
 | `secret` | models/secret/secret.go:39 | schema.ts:2817 `secrets` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `gpg_key` | models/asymkey/gpg_key.go:23 | schema.ts:2564 `gpg_keys` | drift | missing emails column (upstream serializes the address list) |
+| `gpg_key` | models/asymkey/gpg_key.go:23 | schema.ts:2749 `gpg_keys` | drift — LANDED by FN-12 (2026-11-04, migration `0077_smooth_rick_jones`: `emails` ported as the nullable TEXT JSON column, schema.ts:2787) | was: missing emails column (upstream serializes the address list) |
 | `public_key` | models/asymkey/ssh_key.go:39 | schema.ts:2518 `public_keys` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `gpg_key_import` | models/asymkey/gpg_key_import.go:28 | — | missing-table | recorded unmodeled — raw armor not kept (schema.ts:2463-2464,2557) |
 | `audit_event` | models/audit/audit_event.go:22 | schema.ts:3817 `audit_event` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — ours' SQL column is upstream's `timestamp_unix` again (schema.ts:3854 re-grepped 2026-11-04, was :3757), matching TimestampUnix `xorm:"INDEX NOT NULL"` (audit_event.go:37); the property name (`createdUnix`) is kept per §7.10; the rest is blanket families (the id family — `scope_id` is §2 item 1's explicit member, TEXT per the ADR-0001 D3 record; the TEXT enum convention — §2 item 3's explicit `origin`/`scope_type` members plus `action`'s hierarchical-colon text port) |
@@ -317,7 +329,7 @@ classes only.
 | `comment` | models/issues/comment.go:273 | schema.ts:911 `comments` | drift | missing 7 mutation-metadata cols (comment_meta_data, project_id, old_project_id, time_id, assignee_team_id, original_author, original_author_id); the census's 8th, patch_quoted, WITHDRAWN by the §4 erratum (upstream's column IS patch: parity); the original_author pair now recorded-absent (§7.11), leaving 5 PORT columns for FN-2 — the 5 LANDED (migration 0067, pure ADD COLUMN + the JSON-gated backfills; the writers/readers ride SPEC-0005 §7 as-built; patch untouched) |
 | `issue_content_history` | models/issues/content_history.go:20 | schema.ts:3658 `issue_content_history` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `tracked_time` | models/issues/tracked_time.go:22 | schema.ts:2103 `tracked_time` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — the column is upstream's `time` again (schema.ts:2208 re-grepped 2026-11-04); the unit stays seconds on both sides (upstream API json "time" is seconds too, modules/structs); the property name (`seconds`) is kept per §7.10 |
-| `issue_dependency` | models/issues/dependency.go:101 | schema.ts:2075 `issue_dependency` | drift | missing updated_unix |
+| `issue_dependency` | models/issues/dependency.go:101 | schema.ts:2252 `issue_dependency` | drift — LANDED by FN-12 (2026-11-04, migration `0077_smooth_rick_jones`: `updated_unix` ported verbatim, nullable — upstream's bare `xorm:"updated"` carries no NOT NULL tag, dependency.go:107; schema.ts:2270) | was: missing updated_unix |
 | `issue_user` | models/issues/issue_user.go:15 | schema.ts:1224 `issue_user` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `issue_watch` | models/issues/issue_watch.go:17 | schema.ts:1182 `issue_subscriptions` | drift | FN-13 §7.1: created_unix/updated_unix ours-NULLable vs upstream NOT NULL (issue_watch.go:22-23 vs schema.ts:1189-1190) — the ours-looser arm, NOT covered by the strictness record; recommended carrier FN-12; table name + the rest are the FN-13 §7.2/§7.5 recorded families |
 | `task` | models/admin/task.go:26 | — | missing-table | platform: admin task queue rides Cloudflare Queues/REPO_TASKS (SPEC-0020) |
@@ -337,7 +349,7 @@ classes only.
 | `oauth2_grant` | models/auth/oauth2.go:504 | schema.ts:3418 `oauth2_grant` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `mirror` | models/repo/mirror.go:23 | schema.ts:1910 `repo_mirrors` | intentional-recorded | sync-state/credentials restructure; SPEC-0009 §3 (schema.ts:1910) |
 | `repo_archiver` | models/repo/archiver.go:65 | — | missing-table | archives built on demand and streamed; SPEC-0004 §2.4 (api/services/archive.ts:1-8) |
-| `collaboration` | models/repo/collaboration.go:20 | schema.ts:1690 `repo_collaborators` | drift | missing id (FN-12); created_unix/updated_unix are PRESENT as created_at/updated_at (FN-13 §7.2 recorded family — the old reason miscounted them missing); mode is the TEXT-enum blanket (§2.3) |
+| `collaboration` | models/repo/collaboration.go:20 | schema.ts:1866 `repo_collaborators` | drift — LANDED by FN-12 (2026-11-04, migration `0077_smooth_rick_jones`: the surrogate `id` pk landed via table rebuild, schema.ts:1869 — the composite pair demoted to the `repo_collaborators_repo_user_uq` uniqueIndex, upstream's UNIQUE(s), which stays the upsert arbiter) | was: missing id (FN-12); created_unix/updated_unix are PRESENT as created_at/updated_at (FN-13 §7.2 recorded family — the old reason miscounted them missing); mode is the TEXT-enum blanket (§2.3) |
 | `watch` | models/repo/watch.go:39 | schema.ts:1665 `repo_watchers` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `release` | models/repo/release.go:67 | schema.ts:1120 `releases` | intentional-recorded | original_author/original_author_id recorded-absent (§7.11, SPEC-0005 §9; cites :74-75 — the off-by-one :75-76 corrected by the cite-audit) |
 | `language_stat` | models/repo/language_stats.go:19 | — | missing-table | on-demand extension-sum reduction; SPEC-0004 divergence note (api/services/languages.ts:1-15) |
@@ -346,7 +358,7 @@ classes only.
 | `repo_indexer_status` | models/repo/repo_indexer.go:27 | — | missing-table | indexer-class store DEFERRED with reopen triggers; SPEC-0019 §3/§4.2 |
 | `star` | models/repo/star.go:17 | schema.ts:1774 `stars` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `push_mirror` | models/repo/pushmirror.go:20 | schema.ts:3035 `push_mirrors` | intentional-recorded | sync-state/credentials restructure; SPEC push-mirror-outbound (schema.ts:3035) |
-| `repo_transfer` | models/repo/transfer.go:64 | schema.ts:411 `repo_transfer` | drift — LANDED-RESOLVED by FN-5 (4b9d555, migration 0069: `recipient_id` + `team_i_ds` restored upstream-EXACT); the `created_unix` → `created_at` arm is the FN-13 §7.2 recorded timestamp-name family (record-not-rename — CENSUS3, 2026-11-04) | was: team_i_ds gonic rename; recipient_id → new_owner_id; recipient_access_granted missing — still open: recipient_access_granted (transfer.go:75) + updated_unix (transfer.go:78), FN-12's arms (to land under the recorded family names, §7.2 knock-on) |
+| `repo_transfer` | models/repo/transfer.go:64 | schema.ts:411 `repo_transfer` | drift — LANDED-RESOLVED by FN-5 (4b9d555, migration 0069: `recipient_id` + `team_i_ds` restored upstream-EXACT); the `created_unix` → `created_at` arm is the FN-13 §7.2 recorded timestamp-name family (record-not-rename — CENSUS3, 2026-11-04); FN-12's last two arms LANDED (2026-11-04, migration `0077_smooth_rick_jones`: `recipient_access_granted` + the updated stamp under the recorded family name `updated_at` — INTEGER NOT NULL DEFAULT 0, upstream's zero-TimeStamp posture, schema.ts:478; the fileTransfer writer's missing stamp is the recorded port-when-read follow-up) | was: team_i_ds gonic rename; recipient_id → new_owner_id; recipient_access_granted missing; updated_unix missing (transfer.go:78) |
 | `repo_license` | models/repo/license.go:17 | schema.ts:3547 `repo_license` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `upload` | models/repo/upload.go:43 | schema.ts:2286 `issue_attachments` | intentional-recorded | merged into issue_attachments (pre-confirm staging absorbed); SPEC-0005 (schema.ts:2286) |
 | `topic` | models/repo/topic.go:28 | — | missing-table | names stored directly in repo_topics (schema.ts:1628); SPEC-0004 §2.4 |
@@ -771,7 +783,7 @@ upstream: models/git/commit_status.go (struct `CommitStatus`)
 
 upstream: models/asymkey/gpg_key.go (struct `GPGKey`)
 
-- MISSING `emails` (text(json)) — upstream models/asymkey/gpg_key.go:33 (`Emails`); no ours counterpart
+- MISSING `emails` (text(json)) — upstream models/asymkey/gpg_key.go:33 (`Emails`); no ours counterpart — **LANDED by FN-12** (2026-11-04, migration `0077_smooth_rick_jones`): nullable TEXT JSON (schema.ts:2787), upstream-exact shape; the WRITER arm is the port-when-read piece — upstream computes it at parse time (AddGPGKey, gpg_key.go:202) and renders it back through ToGPGKey (convert.go:870-873), ours' key-add flow has no identity-matching arm so rows stay NULL and the API render keeps its recorded `emails: []` (api/services/account-keys.ts)
 
 ### `issue` → `issues` schema.ts:776
 
@@ -799,7 +811,7 @@ upstream: models/issues/issue_pin.go (struct `IssuePin`)
 
 upstream: models/issues/dependency.go (struct `IssueDependency`)
 
-- MISSING `updated_unix` (integer) — upstream models/issues/dependency.go:107 (`UpdatedUnix`); no ours counterpart
+- MISSING `updated_unix` (integer) — upstream models/issues/dependency.go:107 (`UpdatedUnix`); no ours counterpart — **LANDED by FN-12** (2026-11-04, migration `0077_smooth_rick_jones`): nullable INTEGER (upstream's bare `xorm:"updated"` carries no NOT NULL tag — upstream-exact; schema.ts:2270), the §7.2 arm-2 parity name lands verbatim; the edge writers stamp created_unix only, the update stamp is port-when-read
 
 ### `tracked_time` → `tracked_time` schema.ts:2103
 
@@ -942,8 +954,8 @@ record-not-rename, closed).
 - RECORDED NAME `created_unix` → `created_at` (ours `repo_transfer`; schema.ts:421) — NOT a rename: the FN-13 §7.2 recorded timestamp-name family, member row `repo_transfer` (§7.2's member census; upstream `CreatedUnix` renders `created_unix`, transfer.go:77 — ours keeps `created_at`, schema.ts:421) — record-not-rename (§7.2's decision: the backlog's rename alternative declined) — classification flipped from RENAME-drift, CLOSED (CENSUS3, 2026-11-04; nothing queues — the §7.2 knock-on also pins FN-12's future `updated_unix` port to the family name)
 - RENAME `recipient_id` → `new_owner_id` (ours `repo_transfer`; schema.ts:420) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `recipient_id`; rename resolved
 - RENAME `team_i_ds` → `team_ids` (ours `repo_transfer`; schema.ts:441) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `team_i_ds`; rename resolved
-- MISSING `recipient_access_granted` (boolean NOT NULL, DEFAULT false) — upstream models/repo/transfer.go:75 (`RecipientAccessGranted`); no ours counterpart
-- MISSING `updated_unix` (integer NOT NULL) — upstream models/repo/transfer.go:78 (`UpdatedUnix`); no ours counterpart
+- MISSING `recipient_access_granted` (boolean NOT NULL, DEFAULT false) — upstream models/repo/transfer.go:75 (`RecipientAccessGranted`); no ours counterpart — **LANDED by FN-12** (2026-11-04, migration `0077_smooth_rick_jones`): boolean-mode INTEGER NOT NULL DEFAULT false (schema.ts:452; the constant default is ALTER-legal). Port-when-read: upstream's flip arm is the recipient-authorization flow; ours' accept arm deletes the pending row without a grants phase, so rows carry the default
+- MISSING `updated_unix` (integer NOT NULL) — upstream models/repo/transfer.go:78 (`UpdatedUnix`); no ours counterpart — **LANDED by FN-12** (2026-11-04, migration `0077_smooth_rick_jones`) under the §7.2 recorded family name `updated_at` (the knock-on the created_unix line pinned): INTEGER NOT NULL DEFAULT 0 (schema.ts:478) — upstream's zero-TimeStamp posture: a never-updated pending request reads the epoch, not fill-now; the ALTER-legal constant follows the FN-4 archived_unix precedent, and the INDEX tag rides as the explicit `repo_transfer_updated_at_idx`. The DEFAULT-VALUE-FORM note (the repair this landing went through): drizzle inlines VALUE-type column defaults through the timestamp mode's mapToDriverValue at insert-build, so a bare numeric `0` default crashes every drizzle transfer insert (`value.getTime is not a function`) and a `new Date(0)` default serializes the ISO string into the DDL — the default rides as raw SQL (the sql`0` form) which renders `DEFAULT 0` in the migration, binds the literal 0 for drizzle inserts, and leaves raw-D1 inserts on the DDL constant. PORT-WHEN-READ follow-up: ours' only writer (repos/service.ts fileTransfer) does not stamp the update — recorded, not wired (the FN-12 mission: structure only; the writer arm lands when a reader needs it)
 
 ### `repo_unit` → `repo_units` schema.ts:460
 
@@ -964,7 +976,7 @@ upstream: models/repo/collaboration.go (struct `Collaboration`)
 
 - RECORDED NAME `created_unix` → `created_at` (ours `repo_collaborators`; schema.ts:1793 re-grepped 2026-11-04, was :1696) — NOT a rename: the FN-13 §7.2 recorded timestamp-name family, member row `repo_collaborators` (upstream `CreatedUnix` renders `created_unix`, collaboration.go:25) — record-not-rename, CLOSED (CENSUS3, 2026-11-04)
 - RECORDED NAME `updated_unix` → `updated_at` (ours `repo_collaborators`; schema.ts:1794 re-grepped 2026-11-04, was :1697) — NOT a rename: same §7.2 family, same member row (upstream `UpdatedUnix` renders `updated_unix`, collaboration.go:26) — record-not-rename, CLOSED (CENSUS3, 2026-11-04)
-- MISSING `id` (integer) — upstream models/repo/collaboration.go:21 (`ID`); no ours counterpart
+- MISSING `id` (integer) — upstream models/repo/collaboration.go:21 (`ID`); no ours counterpart — **LANDED by FN-12** (2026-11-04, migration `0077_smooth_rick_jones`): INTEGER autoincrement pk via table rebuild (the §2.1 non-referencing-pk family, schema.ts:1869); the composite (repo_id, user_id) pair demoted to the `repo_collaborators_repo_user_uq` uniqueIndex — upstream's `UNIQUE(s)` (collaboration.go:22-23) — which stays the upsert arbiter (AddOrUpdateCollaborator's ON CONFLICT target is unchanged: SQLite matches a conflict target against any uniqueness constraint); column order now follows the upstream struct verbatim (the FN-6/0066 precedent). The 0066 double-quoted-copy trap re-hit and re-corrected at landing: drizzle regenerated the copy selecting the new `id` from the old table, where the double-quoted-string misfeature materializes the literal `'id'` into the rowid alias — a `datatype mismatch` the moment legacy rows exist (empty-table fresh-chain applies hide it); the copy omits `id` from both legs so SQLite assigns fresh autoincrement values
 - TYPE `mode`: upstream integer (models/repo/collaboration.go:24) vs ours text (schema.ts:1695 (`repo_collaborators`))
 
 ### `audit_event` → `audit_event` schema.ts:3720
@@ -1400,7 +1412,12 @@ applies).
   (dependency.go:107), `repo_transfer.recipient_access_granted` +
   `updated_unix` (transfer.go:75,78), `repo_collaborators.id` +
   timestamp arm (collaboration.go:21), `lfs_locks.lower_path` record
-  (ours-extra — keep, record in SPEC-0006).
+  (ours-extra — keep, record in SPEC-0006) — **LANDED 2026-11-04**
+  (migration `0077_smooth_rick_jones`; the four tables' port columns
+  landed, §3.1 rows + §4 sections carry the annotations; the
+  port-when-read writer arms are recorded follow-ups: the transfer
+  update stamp — fileTransfer doesn't stamp — and the GPG
+  identity-match emails writer)
 - **FN-13: the record unit (no DDL) — DISPOSITIONED (2026-11-03), see §7.**
   The backlog's "ADR-0007 appendix" phrasing is superseded: ADR-0007's own
   test is "if the SPEC does not record it, it is drift", so the records
@@ -1531,7 +1548,7 @@ three arms, and the true divergence is SMALLER than "~30 tables":
 | our table (ours cite) | upstream cite | upstream names | ours names |
 |---|---|---|---|
 | `repositories` (schema.ts:79,85) | models/repo/repo.go:218-219 | created_unix, updated_unix | created_at, updated_at |
-| `repo_transfer` (schema.ts:421) | models/repo/transfer.go:77 | created_unix (updated_unix MISSING on ours — FN-12) | created_at |
+| `repo_transfer` (schema.ts:421) | models/repo/transfer.go:77-78 | created_unix, updated_unix (both PRESENT on ours — the updated arm landed as the family name `updated_at`, migration 0077) | created_at, updated_at |
 | `users` (schema.ts:654,695) | models/user/user.go:122-124 | created_unix, updated_unix, last_login_unix | created_at, last_login_at |
 | `personal_access_tokens` (schema.ts:732) | models/auth/access_token.go:30-31 | created_unix, updated_unix | created_at (no updated column on ours — upstream `updated_unix` feeds only `HasUsed`/`HasRecentActivity`, replaced by the SPEC-0002 §2.7/§4.6 items 5+13 last-used-throttle record) |
 | `lfs_objects` (schema.ts:1442-1443) | models/git/lfs.go:84-85 | created_unix, updated_unix | created_at, updated_at |
@@ -1559,9 +1576,10 @@ above is the member census. Knock-on dispositions: FN-4's
 "`created_unix`/`updated_unix` arm" for `repositories` is superseded —
 when FN-4 lands, do NOT port those as new columns; the existing
 `created_at`/`updated_at` carry the values. FN-12's new timestamp
-columns (`repo_transfer.updated_unix`, `issue_dependency.updated_unix`
-is already parity-named) land under the RECORDED family names of their
-table, not upstream's literal names.
+columns landed per this decision (2026-11-04, migration 0077):
+`repo_transfer`'s landed under the family name `updated_at`
+(schema.ts:478); `issue_dependency.updated_unix` was already
+parity-named and landed verbatim.
 
 Not members (parity `*_unix`/`created` names already): `two_factor`
 (schema.ts:5303-5304), `webauthn_credentials` (:5387-5389),

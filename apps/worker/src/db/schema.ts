@@ -439,7 +439,46 @@ export const repoTransfer = sqliteTable(
     // FN-5: the SQL name is upstream's mapper output `team_i_ds` (TeamIDs
     // untagged, transfer.go:72 — GonicMapper splits the ID run).
     teamIds: text("team_i_ds").notNull().default("[]"),
+    // -------------------------------------------------------------------------
+    // FN-12 completion (migration 0077; audit §4 repo_transfer): the two open
+    // port columns, kept LAST per the ALTER ADD COLUMN append convention.
+    // -------------------------------------------------------------------------
+    /** Whether the recipient granted team access (upstream
+     *  `RecipientAccessGranted bool xorm:"NOT NULL DEFAULT false"`,
+     *  models/repo/transfer.go:75). Constant default → ALTER-legal.
+     *  Port-when-read: upstream's flip arm is the recipient authorization
+     *  flow; ours' accept arm deletes the pending row without a grants
+     *  phase, so rows carry the default (no writer, no reader yet). */
+    recipientAccessGranted: integer("recipient_access_granted", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    /** Last change to the pending request (upstream `UpdatedUnix
+     *  timeutil.TimeStamp xorm:"INDEX NOT NULL updated"`,
+     *  models/repo/transfer.go:78) — landed under this table's RECORDED
+     *  timestamp-name family (audit §7.2: repo_transfer keeps `*_at`; the
+     *  upstream literal SQL name is `updated_unix`). The default is the
+     *  ALTER-legal constant 0 (the FN-4 archived_unix precedent) —
+     *  upstream's zero-TimeStamp posture: a pending request written by an
+     *  arm that never stamped the update reads the epoch, not fill-now
+     *  (created_at's `DEFAULT (unixepoch())` expression form is wrong
+     *  here on purpose: ours' only writer, repos/service.ts fileTransfer,
+     *  omits the stamp, and a stamp-less insert must carry upstream's
+     *  zero instant — the writer-side stamp arm is the recorded
+     *  port-when-read follow-up, not a default-side auto-fill). The
+     *  default rides as raw SQL (the sql`0` form, the created_at
+     *  expression default's constant cousin) because drizzle inlines
+     *  VALUE-type column
+     *  defaults through the timestamp mode's mapToDriverValue at
+     *  insert-build (expecting a Date — a bare 0 crashes `value.getTime
+     *  is not a function`, and a Date(0) default serializes the ISO
+     *  string into the DDL, not 0); the SQL form renders `DEFAULT 0` in
+     *  the migration and drizzle inserts bind the literal 0, while
+     *  raw-D1 inserts omit the column and read the DDL constant
+     *  directly. The INDEX tag rides as the explicit index below (the
+     *  FN-4 template_id precedent). */
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`0`),
   },
+  (t) => [index("repo_transfer_updated_at_idx").on(t.updatedAt)],
 );
 
 /**
@@ -1813,14 +1852,22 @@ export const repoWatchers = sqliteTable(
 /**
  * Repo collaborators (upstream `collaboration`,
  * models/repo/collaboration.go) — one row per (repo, user) with the
- * `read|write|admin` access mode. The composite PK is the upsert arbiter
- * (AddOrUpdateCollaborator), `mode` defaults to 'write' when the Add
- * Collaborator body omits `permission`; implicit rowid order = upstream's
+ * `read|write|admin` access mode. FN-12 (migration 0077) added the surrogate
+ * `id` pk (upstream `ID int64 xorm:"pk autoincr"`, collaboration.go:21 —
+ * the §2.1 non-referencing-pk family; the column order now follows the
+ * upstream struct verbatim, the FN-6/0066 precedent) and demoted the
+ * composite pair to the `repo_collaborators_repo_user_uq` uniqueIndex —
+ * upstream's `UNIQUE(s)` (collaboration.go:22-23) — which remains the
+ * upsert arbiter: AddOrUpdateCollaborator's ON CONFLICT target columns are
+ * unchanged and SQLite matches a conflict target against any uniqueness
+ * constraint. `mode` defaults to 'write' when the Add Collaborator body
+ * omits `permission`; id order = insertion order = upstream's
  * `collaboration.id` order (the list/assignee renders order by it).
  */
 export const repoCollaborators = sqliteTable(
   "repo_collaborators",
   {
+    id: integer("id").primaryKey({ autoIncrement: true }),
     repoId: text("repo_id").notNull(),
     userId: integer("user_id").notNull(),
     mode: text("mode", { enum: ["read", "write", "admin"] }).notNull().default("write"),
@@ -1828,7 +1875,7 @@ export const repoCollaborators = sqliteTable(
     updatedAt: integer("updated_at", { mode: "timestamp" }),
   },
   (t) => [
-    primaryKey({ columns: [t.repoId, t.userId] }),
+    uniqueIndex("repo_collaborators_repo_user_uq").on(t.repoId, t.userId),
     index("idx_repo_collaborators_user").on(t.userId),
   ],
 );
@@ -2214,6 +2261,14 @@ export const issueDependencies = sqliteTable(
     /** The blocker issue. */
     dependencyId: integer("dependency_id").notNull(),
     createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** FN-12 completion (migration 0077): last change to the edge (upstream
+     *  `UpdatedUnix timeutil.TimeStamp xorm:"updated"`,
+     *  models/issues/dependency.go:107 — no NOT NULL tag, so nullable
+     *  upstream and nullable here: upstream-exact, the ours-looser inversion
+     *  class of §7.1 does not apply). This table is a §7.2 arm-2 parity
+     *  member — upstream's literal `updated_unix` name lands verbatim. No
+     *  writer stamps it yet (the edge insert stamps created_unix only). */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }),
   },
   (t) => [
     uniqueIndex("issue_dependency_issue_dep_uq").on(t.issueId, t.dependencyId),
@@ -2720,6 +2775,17 @@ export const gpgKeys = sqliteTable(
     /** Row insertion time (upstream `AddedUnix`, BeforeInsert
      *  gpg_key.go:46-48). */
     addedAt: integer("added_unix", { mode: "timestamp" }).notNull(),
+    /** FN-12 completion (migration 0077): the identity emails the key's
+     *  user-IDs matched at add time, JSON-serialized by xorm into this TEXT
+     *  column (upstream `Emails []*user_model.EmailAddress`, gpg_key.go:33 —
+     *  a bare slice field: the mapper names it `emails`, the slice type maps
+     *  TEXT/JSON, no NOT NULL tag → nullable). Upstream computes it at parse
+     *  time (AddGPGKey, gpg_key.go:202) and renders it back through
+     *  ToGPGKey (convert.go:870-873). Ours stores the column only — the key
+     *  add flow has no identity-matching arm, so rows stay NULL and the API
+     *  render keeps its recorded `emails: []` (api/services/
+     *  account-keys.ts:70-71); the writer arm is the port-when-read piece. */
+    emails: text("emails"),
   },
   (t) => [
     index("gpg_keys_owner_idx").on(t.ownerId),
