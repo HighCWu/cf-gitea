@@ -17,9 +17,10 @@
  * union shapes (object vs array), the write family through the commit builder
  * (create 201 / update 200-vs-201 / delete 200 / batch / new_branch), raw's
  * legacy {ref}/{filepath} parsing, editorconfig section resolution, the
- * issue-template front-matter read, and the API-side create/delete ref
- * webhook emissions (upstream CreateRef/DeleteRef shapes, push-only-hook
- * silence).
+ * issue-template arm at upstream parity (valid-only list, the X-Gitea-Warning
+ * count header, Go-marshal defaults, ref-prefix rule, ?ref ignored), and the
+ * API-side create/delete ref webhook emissions (upstream CreateRef/DeleteRef
+ * shapes, push-only-hook silence).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -62,8 +63,34 @@ const SEED_COMMITS: SeedCommit[] = [
       { path: "src/lib.txt", content: "lib v1\n" },
       { path: ".editorconfig", content: "root = true\n\n[*.md]\nindent_size = 2\n\n[*.py]\nindent_size = 4\n" },
       {
+        // An upstream-style YAML form template (services/issue/template.go
+        // unmarshal.go: id autofill, visible autofill, Content stays "")
         path: ".gitea/ISSUE_TEMPLATE/bug.yml",
-        content: "---\nname: Bug report\nabout: File a bug\nlabels: [bug]\nassignees: [apisuite]\n---\nDescribe the bug\n",
+        content:
+          "name: Bug report\ntitle: \"[Bug]\"\nabout: File a bug\nlabels: bug\nbody:\n  - type: markdown\n    attributes:\n      value: Describe the bug\n  - type: input\n    id: environment\n    attributes:\n      label: Environment\n      description: Which environment?\n    validations:\n      required: true\n",
+      },
+      {
+        // VALID metadata but no body — the validateYaml "'body' is required" arm
+        path: ".gitea/ISSUE_TEMPLATE/invalid.yaml",
+        content: "name: Broken\nabout: Missing body\n",
+      },
+      {
+        // malformed YAML — the "yaml unmarshal" arm
+        path: ".gitea/ISSUE_TEMPLATE/broken.yml",
+        content: "name: [Bug report\nabout: unclosed flow scalar\n",
+      },
+      {
+        // a markdown template exercising the description→about compat, the
+        // ref prefix rule (bare `main` → refs/heads/main) and content/body null
+        path: ".github/ISSUE_TEMPLATE/feature.md",
+        content: "---\nname: Feature request\ndescription: Suggest an idea\nref: main\nlabels: [enhancement]\n---\n### Describe the feature\n",
+      },
+      {
+        // front-matter-less markdown in the LOWERCASE dir candidate — the
+        // unmarshal.go:99-111 fallback arm (content = whole file, name = base,
+        // about = ellipsized preview), never a parse error
+        path: ".gitea/issue_template/notes.md",
+        content: "Just a plain note\n",
       },
     ],
   },
@@ -76,8 +103,13 @@ const SEED_COMMITS: SeedCommit[] = [
       { path: ".editorconfig", content: "root = true\n\n[*.md]\nindent_size = 2\n\n[*.py]\nindent_size = 4\n" },
       {
         path: ".gitea/ISSUE_TEMPLATE/bug.yml",
-        content: "---\nname: Bug report\nabout: File a bug\nlabels: [bug]\nassignees: [apisuite]\n---\nDescribe the bug\n",
+        content:
+          "name: Bug report\ntitle: \"[Bug]\"\nabout: File a bug\nlabels: bug\nbody:\n  - type: markdown\n    attributes:\n      value: Describe the bug\n  - type: input\n    id: environment\n    attributes:\n      label: Environment\n      description: Which environment?\n    validations:\n      required: true\n",
       },
+      { path: ".gitea/ISSUE_TEMPLATE/invalid.yaml", content: "name: Broken\nabout: Missing body\n" },
+      { path: ".gitea/ISSUE_TEMPLATE/broken.yml", content: "name: [Bug report\nabout: unclosed flow scalar\n" },
+      { path: ".github/ISSUE_TEMPLATE/feature.md", content: "---\nname: Feature request\ndescription: Suggest an idea\nref: main\nlabels: [enhancement]\n---\n### Describe the feature\n" },
+      { path: ".gitea/issue_template/notes.md", content: "Just a plain note\n" },
       { path: "docs/guide/deep.txt", content: "deep doc\n" },
     ],
   },
@@ -498,7 +530,7 @@ describe("contents reads (repoGetContentsList / repoGetContents) — the union s
     expect(res.status).toBe(200);
     const entries: Array<Record<string, unknown>> = await res.json();
     const names = entries.map((entry) => entry.name).sort();
-    expect(names).toEqual([".editorconfig", ".gitea", "README.md", "docs", "src"]);
+    expect(names).toEqual([".editorconfig", ".gitea", ".github", "README.md", "docs", "src"]);
     const readme = entries.find((entry) => entry.name === "README.md") as Record<string, unknown>;
     expect(readme.type).toBe("file");
     expect(readme.content).toBeNull(); // listings render metadata only
@@ -700,15 +732,87 @@ describe("editorconfig + issue_templates", () => {
     expect((await get(`${REPO_PATH}/editorconfig/code.rs`)).status).toBe(404);
   });
 
-  it("lists issue templates with parsed front matter", async () => {
+  /** The seed repo's template fixture set: two valid templates (a YAML form
+   *  template + two markdown templates) and two parse errors — pinned against
+   *  upstream repoGetIssueTemplates (repo.go:1195-1202 + services/issue/
+   *  template.go ParseTemplatesFromDefaultBranch at the pin). */
+  it("lists only the VALID templates with the IssueTemplate Go-marshal shape and warns per parse error", async () => {
     const res = await get(`${REPO_PATH}/issue_templates`);
     expect(res.status).toBe(200);
+    // repo.go:1197-1199 — the exact header text over len(TemplateErrors)
+    expect(res.headers.get("X-Gitea-Warning")).toBe("error occurs when parsing issue template: count=2");
     const templates: Array<Record<string, unknown>> = await res.json();
-    expect(templates).toHaveLength(1);
-    expect(templates[0]?.file_name).toBe("bug.yml");
-    expect(templates[0]?.name).toBe("Bug report");
-    expect(templates[0]?.labels).toEqual(["bug"]);
-    expect(templates[0]?.assignees).toEqual(["apisuite"]);
+    expect(templates).toHaveLength(3);
+    // dir-candidate order (templateDirCandidates: .gitea/ISSUE_TEMPLATE →
+    // .gitea/issue_template → .github/ISSUE_TEMPLATE); file_name is the FULL
+    // tree path (unmarshalFromEntry path.Join(dir, name))
+    expect(templates.map((t) => t["file_name"])).toEqual([
+      ".gitea/ISSUE_TEMPLATE/bug.yml",
+      ".gitea/issue_template/notes.md",
+      ".github/ISSUE_TEMPLATE/feature.md",
+    ]);
+    // YAML form template: Go-marshal defaults — content "" (yaml:"-"),
+    // ref "refs/heads/" (the prefix rule appends to the empty ref too —
+    // template.go:147-149), absent slices null, id autofill, visible autofill
+    expect(templates[0]).toEqual({
+      name: "Bug report",
+      title: "[Bug]",
+      about: "File a bug",
+      labels: ["bug"], // IssueTemplateStringSlice scalar → comma-split
+      assignees: null,
+      ref: "refs/heads/",
+      content: "",
+      body: [
+        { type: "markdown", id: "0", attributes: { value: "Describe the bug" }, validations: null, visible: ["form"] },
+        {
+          type: "input",
+          id: "environment",
+          attributes: { label: "Environment", description: "Which environment?" },
+          validations: { required: true },
+          visible: ["form", "content"],
+        },
+      ],
+      file_name: ".gitea/ISSUE_TEMPLATE/bug.yml",
+    });
+    // front-matter-less markdown: the unmarshal.go:99-111 fallback arm (not an
+    // error) — content = whole file, name = base, about = ellipsized preview
+    expect(templates[1]).toEqual({
+      name: "notes.md",
+      title: "",
+      about: "Just a plain note\n",
+      labels: null,
+      assignees: null,
+      ref: "refs/heads/",
+      content: "Just a plain note\n",
+      body: null,
+      file_name: ".gitea/issue_template/notes.md",
+    });
+    // markdown with front matter: description→about compat, bare ref →
+    // refs/heads/ prefix (template.go:147-149), flow-list labels, body null
+    expect(templates[2]).toEqual({
+      name: "Feature request",
+      title: "",
+      about: "Suggest an idea",
+      labels: ["enhancement"],
+      assignees: null,
+      ref: "refs/heads/main",
+      content: "### Describe the feature\n",
+      body: null,
+      file_name: ".github/ISSUE_TEMPLATE/feature.md",
+    });
+  });
+
+  it("ignores a ref query param entirely — the parse is default-branch-only (upstream declares no ?ref)", async () => {
+    const plain = await get(`${REPO_PATH}/issue_templates`);
+    const plainBody: unknown = await plain.json();
+    const plainWarning = plain.headers.get("X-Gitea-Warning");
+    for (const qs of ["?ref=v1.0.0", "?ref=nonexistent-branch", "?ref="]) {
+      const res = await get(`${REPO_PATH}/issue_templates${qs}`);
+      expect(res.status).toBe(200);
+      // identical result — Go never consults the unknown query param
+      expect(res.headers.get("X-Gitea-Warning")).toBe(plainWarning);
+      expect(await res.json()).toEqual(plainBody);
+    }
   });
 });
 
@@ -906,7 +1010,16 @@ describe("API tag push-pair + branch-rename webhook emissions (ref family wave 2
     // Added/Removed/Modified in push payloads; W3 keeps the three keys
     // always-emitted): the peeled seed commit's whole tree is ADDED (a root
     // commit), the other two lists empty.
-    expect(headCommit.added).toEqual([".editorconfig", ".gitea/ISSUE_TEMPLATE/bug.yml", "README.md", "src/lib.txt"]);
+    expect(headCommit.added).toEqual([
+      ".editorconfig",
+      ".gitea/ISSUE_TEMPLATE/broken.yml",
+      ".gitea/ISSUE_TEMPLATE/bug.yml",
+      ".gitea/ISSUE_TEMPLATE/invalid.yaml",
+      ".gitea/issue_template/notes.md",
+      ".github/ISSUE_TEMPLATE/feature.md",
+      "README.md",
+      "src/lib.txt",
+    ]);
     expect(headCommit.removed).toEqual([]);
     expect(headCommit.modified).toEqual([]);
     // The corrected shape (push.go:125): ComposeCompareURL over the

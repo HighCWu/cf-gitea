@@ -13,6 +13,7 @@
  */
 
 import type { Context } from "hono";
+import { parse } from "yaml";
 import type { CommitJson, Person } from "@cf-gitea/git-engine";
 
 import type { ApiEnv } from "../env";
@@ -246,83 +247,524 @@ export function editorconfigSection(iniText: string, filepath: string): Record<s
 }
 
 // ---------------------------------------------------------------------------
-// Issue templates — modules/issue_template: the template directories of the
-// default branch (.gitea/.github/ISSUE_TEMPLATE(+lowercase), ISSUE_TEMPLATE)
-// plus the single-file forms; .md and .yml/.yaml with YAML front matter.
-// The minimal front-matter parser covers the scalar/simple-list keys of the
-// contract model (name/about/title/ref/labels/assignees); form-type bodies
-// (array<form_field>) stay opaque (documented divergence).
+// Issue templates — the API arm of upstream's template discovery, ported from
+// the pinned tree: services/issue/template.go (ParseTemplatesFromDefaultBranch,
+// templateDirCandidates), modules/issue/template (unmarshal.go, template.go
+// Validate) and the IssueTemplate JSON contract of modules/structs/issue.go.
+// The caller resolves the DEFAULT BRANCH tip; a `ref` query param does not
+// exist upstream (v1-swagger repoGetIssueTemplates) and never reaches here.
 // ---------------------------------------------------------------------------
 
+/** services/issue/template.go templateDirCandidates — same order (the output
+ *  order follows it). DIRECTORIES only: the single-file `issue_template.*`
+ *  forms are web-UI-only (routers/web/repo/issue.go IssueTemplateCandidates)
+ *  and never enter the API arm. */
 const TEMPLATE_DIRS = [
+  "ISSUE_TEMPLATE",
+  "issue_template",
   ".gitea/ISSUE_TEMPLATE",
   ".gitea/issue_template",
   ".github/ISSUE_TEMPLATE",
   ".github/issue_template",
-  "ISSUE_TEMPLATE",
-  "issue_template",
+  ".gitlab/ISSUE_TEMPLATE",
+  ".gitlab/issue_template",
 ];
 
-const TEMPLATE_FILES = [".gitea/issue_template.md", ".gitea/ISSUE_TEMPLATE.md", ".github/issue_template.md", ".github/ISSUE_TEMPLATE.md", "issue_template.md"];
+/** setting.UI.MaxDisplayFileSize default (setting/ui.go:98) — a template blob
+ *  over this is a parse error (upstream checks entry.Blob().Size() BEFORE the
+ *  content read; ours reads the whole blob via the RPC then rejects on
+ *  byteLength — a memory-only difference, the observable result is identical). */
+const MAX_DISPLAY_FILE_SIZE = 8_388_608;
 
-export interface ParsedTemplate {
-  fileName: string;
-  frontMatter: Record<string, string>;
-  /** .md body after the front-matter block (content field) */
-  content: string;
+/** unmarshal.go ReadWithLimit(r, 1024*1024) — content is hard-truncated to
+ *  1 MiB (ReadWithLimit caps the read, it does not fail). */
+const TEMPLATE_CONTENT_LIMIT = 1_048_576;
+
+export type IssueTemplateType = "md" | "yaml";
+
+/** structs/issue.go IssueTemplate.Type() — `config.yaml`/`config.yml` basenames
+ *  are the special config file (skipped); only .md/.yaml/.yml could be a
+ *  template (template.CouldBe's low-cost check). */
+export function issueTemplateType(fileName: string): IssueTemplateType | "" {
+  const base = fileName.slice(fileName.lastIndexOf("/") + 1);
+  if (base === "config.yaml" || base === "config.yml") return "";
+  if (base.endsWith(".md")) return "md";
+  if (base.endsWith(".yaml") || base.endsWith(".yml")) return "yaml";
+  return "";
 }
 
-export function parseIssueTemplate(fileName: string, text: string): ParsedTemplate {
-  const frontMatter: Record<string, string> = {};
-  let content = text;
-  if (/^---\r?\n/.test(text)) {
-    const end = text.indexOf("\n---", 4);
-    if (end >= 0) {
-      for (const line of text.slice(4, end).split(/\r?\n/)) {
-        const pair = line.split(":", 2);
-        if (pair.length === 2) {
-          frontMatter[(pair[0] ?? "").trim()] = (pair[1] ?? "").trim();
-        }
-      }
-      content = text.slice(end + 4).replace(/^\r?\n/, "");
+/** structs/issue.go IssueFormField — attributes/validations marshal null when
+ *  absent; `visible` is omitempty (dropped when empty). */
+export interface TemplateFormField {
+  type: string;
+  id: string;
+  attributes: Record<string, unknown> | null;
+  validations: Record<string, unknown> | null;
+  visible?: string[];
+}
+
+/** One VALID template, in the IssueTemplate struct's Go-marshal semantics:
+ *  string empties stay "", nil slices arrive as null (no omitempty). */
+export interface ParsedIssueTemplate {
+  fileName: string;
+  name: string;
+  title: string;
+  about: string;
+  labels: string[] | null;
+  assignees: string[] | null;
+  ref: string;
+  content: string;
+  body: TemplateFormField[] | null;
+}
+
+/** ParseTemplatesFromDefaultBranch's ret: the valid templates plus the
+ *  TemplateErrors map (path → first error). Only the error COUNT crosses the
+ *  wire (the X-Gitea-Warning header), but the shape mirrors the upstream map. */
+export interface IssueTemplatesResult {
+  templates: ParsedIssueTemplate[];
+  errors: Record<string, string>;
+}
+
+/** truncate.go ellipsisDisplayString — ASCII-width-guessed truncation with a
+ *  "…" tail; the .md fallback's about (EllipsisDisplayString(content, 80)). */
+function ellipsisDisplayString(str: string, limit: number): string {
+  const runeBytes = (r: string): number => {
+    const cp = r.codePointAt(0) ?? 0;
+    return cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+  };
+  const widthOf = (r: string): number => {
+    const cp = r.codePointAt(0) ?? 0;
+    if (cp <= 255) return 1;
+    if (cp === 0x3000) return 2;
+    return /[\p{M}\p{Cf}\p{Cs}\p{Z}]/u.test(r) ? 1 : 2;
+  };
+  const runes = Array.from(str);
+  const bytesAt = (start: number): number => runes.slice(start).reduce((n, r) => n + runeBytes(r), 0);
+  if (bytesAt(0) <= limit) return str;
+  // Go: for i, r := range str { pos = i; if used+w+3 > limit { break }; used += w; offset += runeLen }
+  let pos = 0;
+  let used = 0;
+  const kept: string[] = [];
+  for (let i = 0; i < runes.length; i++) {
+    pos = i;
+    const w = widthOf(runes[i] ?? "");
+    if (used + w + 3 > limit) break;
+    used += w;
+    kept.push(runes[i] ?? "");
+  }
+  // the remaining-few-runes arm: fewer than 3 runes left → keep everything
+  if (bytesAt(pos) <= 12) {
+    let nextCnt = 0;
+    let nextWidth = 0;
+    for (const r of runes.slice(pos)) {
+      if (nextCnt >= 4) break;
+      nextWidth += widthOf(r);
+      nextCnt++;
+    }
+    if (nextCnt <= 3 && used + nextWidth <= limit) return str;
+  }
+  if (limit < 3) return kept.join("");
+  return `${kept.join("")}…`;
+}
+
+/** meta.go isYAMLSeparator: optional leading spaces, 3+ dashes, then only
+ *  spaces (the ASCII space subset — upstream also tolerates unicode spaces,
+ *  unobservable on real templates). */
+function isYamlSeparator(line: string): boolean {
+  let idx = 0;
+  while (idx < line.length && line[idx] === " ") idx++;
+  let dashes = 0;
+  while (idx < line.length && line[idx] === "-") {
+    dashes++;
+    idx++;
+  }
+  if (dashes < 3) return false;
+  while (idx < line.length) {
+    if (line[idx] !== " ") return false;
+    idx++;
+  }
+  return true;
+}
+
+/** meta.go ExtractMetadataBytes' line scan: front matter between the two
+ *  separator lines, content after the second. Null = the upstream error arms
+ *  (missing leading/closing separator or an empty front block). */
+function extractMetadata(contents: string): { front: string; body: string } | null {
+  const lines = contents.split("\n");
+  if (!isYamlSeparator(lines[0] ?? "")) return null;
+  for (let i = 1; i < lines.length; i++) {
+    if (isYamlSeparator(lines[i] ?? "")) {
+      const front = lines.slice(1, i).join("\n");
+      if (front === "") return null; // "could not determine metadata"
+      return { front, body: lines.slice(i + 1).join("\n") };
     }
   }
-  return { fileName, frontMatter, content };
+  return null;
+}
+
+const YAML_STRING = "yaml: unmarshal"; // error-family prefix, unobservable (count-only)
+
+/** structs/issue.go IssueTemplateStringSlice.UnmarshalYAML: a comma-separated
+ *  scalar or a sequence of strings; absent/null → nil (marshals null); a
+ *  scalar that splits to nothing also lands nil; non-string entries error. */
+function decodeStringSlice(value: unknown): string[] | null | string {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") {
+    const list = value
+      .split(",")
+      .map((part) => part.trim())
+      .filter((part) => part !== "");
+    return list.length > 0 ? list : null;
+  }
+  if (Array.isArray(value)) {
+    const list: string[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "string") return `${YAML_STRING}: cannot unmarshal into string slice`;
+      list.push(entry);
+    }
+    return list;
+  }
+  return `${YAML_STRING}: cannot unmarshal into IssueTemplateStringSlice`;
+}
+
+/** The metadata keys of an IssueTemplate yaml decode (front matter for .md,
+ *  whole document for .yaml). Returns the typed record or an error message.
+ *  Every non-string scalar under a string key is a decode error (go-yaml
+ *  refuses !!int/!!bool into string fields). */
+function decodeTemplateMeta(data: unknown): { meta: Pick<ParsedIssueTemplate, "name" | "title" | "about" | "ref" | "labels" | "assignees">; description: string } | string {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return `${YAML_STRING}: cannot unmarshal into IssueTemplate`;
+  }
+  const map = data as Record<string, unknown>;
+  const strings: Record<string, string> = {};
+  for (const key of ["name", "title", "about", "ref"]) {
+    const value = map[key];
+    if (value === undefined) continue; // absent key → the Go zero value ""
+    if (typeof value !== "string") return `${YAML_STRING}: cannot unmarshal non-string scalar into string field`;
+    strings[key] = value;
+  }
+  const labels = decodeStringSlice(map["labels"]);
+  if (typeof labels === "string") return labels;
+  const assignees = decodeStringSlice(map["assignees"]);
+  if (typeof assignees === "string") return assignees;
+  // unmarshal.go compatibleTemplate — "description" fills an empty about
+  // (decode errors of the compat pass are swallowed upstream)
+  const description = typeof map["description"] === "string" ? map["description"] : "";
+  return {
+    meta: {
+      name: strings["name"] ?? "",
+      title: strings["title"] ?? "",
+      about: strings["about"] ?? "",
+      ref: strings["ref"] ?? "",
+      labels,
+      assignees,
+    },
+    description,
+  };
+}
+
+/** One `body` array entry (unmarshal.go's yaml arm into []*IssueFormField). */
+function decodeFormField(value: unknown): TemplateFormField | string {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return `${YAML_STRING}: cannot unmarshal into IssueFormField`;
+  }
+  const map = value as Record<string, unknown>;
+  // absent string keys decode to the Go zero value "" (only a PRESENT
+  // non-string scalar is a decode error)
+  const stringOrEmpty = (key: string): string | null => {
+    const v = map[key];
+    if (v === undefined) return "";
+    if (typeof v === "string") return v;
+    return null;
+  };
+  const type = stringOrEmpty("type");
+  const id = stringOrEmpty("id");
+  if (type === null || id === null) {
+    return `${YAML_STRING}: cannot unmarshal non-string scalar into string field`;
+  }
+  const asRecordOrNull = (v: unknown): Record<string, unknown> | null | string => {
+    if (v === undefined || v === null) return null;
+    if (typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+    return `${YAML_STRING}: cannot unmarshal into map field`;
+  };
+  const attributes = asRecordOrNull(map["attributes"]);
+  if (typeof attributes === "string") return attributes;
+  const validations = asRecordOrNull(map["validations"]);
+  if (typeof validations === "string") return validations;
+  const visibleRaw = map["visible"];
+  let visible: string[] | undefined;
+  if (visibleRaw !== undefined && visibleRaw !== null) {
+    if (!Array.isArray(visibleRaw)) return `${YAML_STRING}: cannot unmarshal into []string`;
+    for (const entry of visibleRaw) {
+      if (typeof entry !== "string") return `${YAML_STRING}: cannot unmarshal into []string`;
+    }
+    visible = visibleRaw as string[];
+  }
+  return { type, id, attributes, validations, ...(visible !== undefined ? { visible } : {}) };
+}
+
+/** template.go Validate — returns the first error or null. The type comes
+ *  from issueTemplateType, whose "" arm (a non-.md/.yml/.yaml name — Cannot
+ *  happen behind the CouldBe filter, but typed honestly) leaves the zero
+ *  template to fail the metadata check like upstream's unmarshal no-op. */
+function validateTemplate(template: ParsedIssueTemplate, type: IssueTemplateType | ""): string | null {
+  // validateMetadata
+  if (template.name.trim() === "") return "'name' is required";
+  if (template.about.trim() === "") return "'about' is required";
+  if (type !== "yaml") return null; // validateYaml is the yaml-only arm
+  // validateYaml
+  const body = template.body;
+  if (body === null || body.length === 0) return "'body' is required";
+  const ids = new Set<string>();
+  for (const [idx, field] of body.entries()) {
+    const position = `body[${idx}](${field.type})`;
+    // validateID (markdown exempt)
+    if (field.type !== "markdown") {
+      if (field.id === "") return `${position}: 'id' is required`;
+      if (/[^A-Za-z0-9_-]/.test(field.id)) return `${position}: 'id' should contain only alphanumeric, '-' and '_'`;
+      if (ids.has(field.id)) return `${position}: 'id' should be unique`;
+      ids.add(field.id);
+    }
+    const attrs = field.attributes ?? {};
+    const validations = field.validations ?? {};
+    const stringItem = (m: Record<string, unknown>, name: string, required: boolean): string | null => {
+      const v = m[name];
+      if (v === undefined) return required ? `${position}: '${name}' is required` : null;
+      if (typeof v !== "string") return `${position}: '${name}' should be a string`;
+      if (v.trim() === "" && required) return `${position}: '${name}' is required`;
+      return null;
+    };
+    const boolItem = (m: Record<string, unknown>, name: string): string | null => {
+      const v = m[name];
+      if (v === undefined) return null;
+      if (typeof v !== "boolean") return `${position}: '${name}' should be a bool`;
+      return null;
+    };
+    // validateLabel (markdown exempt)
+    if (field.type !== "markdown") {
+      const err = stringItem(attrs, "label", true);
+      if (err !== null) return err;
+    }
+    switch (field.type) {
+      case "markdown": {
+        const err = stringItem(attrs, "value", true);
+        if (err !== null) return err;
+        break;
+      }
+      case "textarea": {
+        for (const name of ["description", "placeholder", "value", "render"]) {
+          const err = stringItem(attrs, name, false);
+          if (err !== null) return err;
+        }
+        break;
+      }
+      case "input": {
+        for (const name of ["description", "placeholder", "value"]) {
+          const err = stringItem(attrs, name, false);
+          if (err !== null) return err;
+        }
+        const isNumber = boolItem(validations, "is_number");
+        if (isNumber !== null) return isNumber;
+        const regex = stringItem(validations, "regex", false);
+        if (regex !== null) return regex;
+        break;
+      }
+      case "dropdown": {
+        const description = stringItem(attrs, "description", false);
+        if (description !== null) return description;
+        const multiple = boolItem(attrs, "multiple");
+        if (multiple !== null) return multiple;
+        const list = boolItem(attrs, "list");
+        if (list !== null) return list;
+        const options = attrs["options"];
+        if (!Array.isArray(options) || options.length === 0) {
+          return `${position}: 'options' is required and should be an array`;
+        }
+        for (const option of options) {
+          if (typeof option !== "string") return `${position}, option[${options.indexOf(option)}]: should be a string`;
+        }
+        const def = attrs["default"];
+        if (def !== undefined) {
+          if (typeof def !== "number" || !Number.isInteger(def)) {
+            return `${position}: 'default' should be an int`;
+          }
+          if (def < 0 || def >= options.length) {
+            return `${position}: the value of 'default' is out of range`;
+          }
+        }
+        break;
+      }
+      case "checkboxes": {
+        const description = stringItem(attrs, "description", false);
+        if (description !== null) return description;
+        const options = attrs["options"];
+        if (!Array.isArray(options) || options.length === 0) {
+          return `${position}: 'options' is required and should be an array`;
+        }
+        for (const [optIdx, option] of options.entries()) {
+          const optPosition = `${position}, option[${optIdx}]`;
+          if (option === null || typeof option !== "object" || Array.isArray(option)) {
+            return `${optPosition}: should be a dictionary`;
+          }
+          const dict = option as Record<string, unknown>;
+          const label = dict["label"];
+          if (typeof label !== "string" || label === "") {
+            return `${optPosition}: 'label' is required and should be a string`;
+          }
+          if ("visible" in dict) {
+            const visibility = dict["visible"];
+            if (!Array.isArray(visibility)) return `${optPosition}: 'visible' should be list`;
+            for (const visibleType of visibility) {
+              if (visibleType !== "form" && visibleType !== "content") {
+                return `${optPosition}: 'visible' list can only contain strings of 'form' and 'content'`;
+              }
+            }
+          }
+          if ("required" in dict) {
+            if (typeof dict["required"] !== "boolean") {
+              return `${optPosition}: 'required' should be a bool`;
+            }
+            if (dict["required"] === true && "visible" in dict) {
+              const isVisible = (dict["visible"] as unknown[]).some((v) => v === "form");
+              if (!isVisible) return `${optPosition}: can not require a hidden checkbox`;
+            }
+          }
+        }
+        break;
+      }
+      default:
+        return `${position}: unknown type`;
+    }
+    // validateRequired (markdown/checkboxes exempt)
+    if (field.type !== "markdown" && field.type !== "checkboxes") {
+      const required = boolItem(validations, "required");
+      if (required !== null) return required;
+      if (validations["required"] === true) {
+        const visible = field.visible ?? [];
+        const visibleOnForm = visible.length === 0 || visible.includes("form");
+        if (!visibleOnForm) return `${position}: can not require a hidden field`;
+      }
+    }
+  }
+  return null;
+}
+
+/** unmarshal.go Unmarshal over one blob — returns the parsed template or the
+ *  first error message (the TemplateErrors map value). */
+function unmarshalTemplate(fileName: string, data: Uint8Array): ParsedIssueTemplate | string {
+  const type = issueTemplateType(fileName);
+  // ReadWithLimit: hard truncation at 1 MiB, never a size error (io.go:36)
+  const content =
+    data.byteLength > TEMPLATE_CONTENT_LIMIT
+      ? new TextDecoder().decode(data.slice(0, TEMPLATE_CONTENT_LIMIT))
+      : new TextDecoder().decode(data);
+  const template: ParsedIssueTemplate = { fileName, name: "", title: "", about: "", labels: null, assignees: null, ref: "", content: "", body: null };
+  if (type === "md") {
+    const extracted = extractMetadata(content);
+    const fallback = (): void => {
+      // unmarshal.go:99-111 — unreadable metadata is NOT an error: the whole
+      // file is the content, name falls back to the base name, about to an
+      // ellipsized content preview
+      template.content = content;
+      template.name = fileName.slice(fileName.lastIndexOf("/") + 1);
+      template.about = ellipsisDisplayString(content, 80);
+    };
+    if (extracted === null) {
+      fallback();
+    } else {
+      // ExtractMetadata's yaml.Unmarshal error arm — a malformed front block
+      // degrades to the fallback shape, never a TemplateError
+      let parsedFront: unknown;
+      try {
+        parsedFront = parse(extracted.front);
+      } catch {
+        parsedFront = null; // decodeTemplateMeta(null) → error message → fallback
+      }
+      const decoded = decodeTemplateMeta(parsedFront);
+      if (typeof decoded === "string") {
+        fallback(); // the ExtractMetadata error arm — same fallback shape
+      } else {
+        template.content = extracted.body;
+        template.name = decoded.meta.name;
+        template.title = decoded.meta.title;
+        template.ref = decoded.meta.ref;
+        template.labels = decoded.meta.labels;
+        template.assignees = decoded.meta.assignees;
+        template.about = decoded.meta.about !== "" ? decoded.meta.about : decoded.description;
+      }
+    }
+  } else if (type === "yaml") {
+    let parsed: unknown;
+    try {
+      parsed = parse(content);
+    } catch (error) {
+      return `${YAML_STRING}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    const decoded = decodeTemplateMeta(parsed);
+    if (typeof decoded === "string") return decoded;
+    template.name = decoded.meta.name;
+    template.title = decoded.meta.title;
+    template.ref = decoded.meta.ref;
+    template.labels = decoded.meta.labels;
+    template.assignees = decoded.meta.assignees;
+    template.about = decoded.meta.about !== "" ? decoded.meta.about : decoded.description;
+    // the body array
+    const rawBody = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>)["body"] : undefined;
+    if (rawBody !== undefined && rawBody !== null) {
+      if (!Array.isArray(rawBody)) return `${YAML_STRING}: cannot unmarshal into []*IssueFormField`;
+      const body: TemplateFormField[] = [];
+      for (const entry of rawBody) {
+        const field = decodeFormField(entry);
+        if (typeof field === "string") return field;
+        body.push(field);
+      }
+      template.body = body;
+    }
+    // unmarshal.go:130-143 — default id / default visibility
+    for (const [i, field] of (template.body ?? []).entries()) {
+      if (field.id === "") field.id = String(i);
+      if (field.visible === undefined) {
+        field.visible = field.type === "markdown" ? ["form"] : ["form", "content"];
+      }
+    }
+  }
+  const validationError = validateTemplate(template, type);
+  if (validationError !== null) return validationError;
+  return template;
 }
 
 /**
- * Discover the template files of one ref: dir listings first (every
- * .md/.yml/.yaml entry), then the single-file forms. Ordered per upstream's
- * IssueTemplatesFromDefaultBranch (gitea → github → root).
+ * ParseTemplatesFromDefaultBranch (services/issue/template.go:111-155) over
+ * one ref target — the caller passes the DEFAULT BRANCH tip (upstream
+ * GetBranchCommit). Returns valid templates + the parse-error map; the route
+ * emits the X-Gitea-Warning header from `Object.keys(errors).length`.
  */
-export async function listIssueTemplates(
-  reads: EngineReads,
-  refTarget: string,
-): Promise<ParsedTemplate[]> {
-  const out: ParsedTemplate[] = [];
-  const seen = new Set<string>();
+export async function listIssueTemplates(reads: EngineReads, refTarget: string): Promise<IssueTemplatesResult> {
+  const result: IssueTemplatesResult = { templates: [], errors: {} };
   for (const dir of TEMPLATE_DIRS) {
     const tree = await reads.listTree(refTarget, dir);
-    if (tree === null) continue;
+    if (tree === null) continue; // SubTree miss → next candidate (template.go:129-132)
     for (const entry of tree.entries) {
       if (entry.type !== "blob") continue;
-      if (!/\.(md|yaml|yml)$/.test(entry.name)) continue;
-      const path = `${dir}/${entry.name}`;
-      if (seen.has(path)) continue;
-      seen.add(path);
-      const blob = await reads.readBlob(refTarget, path);
+      if (issueTemplateType(entry.name) === "") continue; // template.CouldBe
+      const fullName = `${dir}/${entry.name}`; // path.Join(dirName, entry.Name())
+      const blob = await reads.readBlob(refTarget, fullName);
       if (blob === null) continue;
-      out.push(parseIssueTemplate(entry.name, new TextDecoder().decode(blob.data)));
+      if (blob.data.byteLength > MAX_DISPLAY_FILE_SIZE) {
+        result.errors[fullName] = `too large: ${blob.data.byteLength} > MaxDisplayFileSize`;
+        continue;
+      }
+      const parsed = unmarshalTemplate(fullName, blob.data);
+      if (typeof parsed === "string") {
+        result.errors[fullName] = parsed;
+        continue;
+      }
+      // template.go:147-149 — a bare ref is assumed to be a branch (tags need refs/tags/)
+      if (!parsed.ref.startsWith("refs/")) parsed.ref = `refs/heads/${parsed.ref}`;
+      result.templates.push(parsed);
     }
   }
-  for (const file of TEMPLATE_FILES) {
-    if (seen.has(file)) continue;
-    const blob = await reads.readBlob(refTarget, file);
-    if (blob === null) continue;
-    seen.add(file);
-    out.push(parseIssueTemplate(file.split("/").pop() ?? file, new TextDecoder().decode(blob.data)));
-  }
-  return out;
+  return result;
 }
 
 /** The last commit touching a path — the ContentsResponse enrichment input. */

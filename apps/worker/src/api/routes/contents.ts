@@ -532,20 +532,6 @@ async function getRawBytes(
   return plain();
 }
 
-/**
- * The `IssueTemplateStringSlice` front-matter value: a YAML flow list
- * (`[bug, ui]`) or a comma-separated string — both arrive as arrays.
- */
-function templateList(value: string | undefined): string[] | undefined {
-  if (value === undefined) return undefined;
-  const trimmed = value.trim();
-  const flow = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
-  return flow
-    .split(",")
-    .map((part) => part.trim().replace(/^"(.*)"$/, "$1"))
-    .filter((part) => part !== "");
-}
-
 /** The repo-relative tail of a plain catchall path (owner/repo may contain case). */
 function tailAfter(c: Context<ApiEnv>, prefix: string): string {
   const index = c.req.path.indexOf(prefix);
@@ -856,7 +842,11 @@ export function registerContentsRoutes(
       tags: ["repository"],
       summary: "Get an issue templates of a repository",
       operationId: "repoGetIssueTemplates",
-      request: { params: z.object(ownerRepoParams), query: z.object(refQuery) },
+      // upstream declares NO query parameters on this route (frozen contract,
+      // repoGetIssueTemplates) and the parse is default-branch-only — the
+      // handler never consults a `ref`, so a stray ?ref= is ignored (Go
+      // drops unknown query params; zod strips them identically).
+      request: { params: z.object(ownerRepoParams) },
       responses: {
         200: { description: "IssueTemplates", content: { "application/json": { schema: z.array(issueTemplateSchema) } } },
         404: notFoundResponse,
@@ -866,18 +856,42 @@ export function registerContentsRoutes(
       const { owner, repo } = c.req.valid("param");
       const pair = await requireVisibleRepo(c, { owner, repo });
       const reads = engineReads(c.env, pair.repo);
-      const refTarget = await refTargetOf(c, pair, c.req.valid("query").ref ?? null);
-      const templates = await listIssueTemplates(reads, refTarget);
+      // ReferencesGitRepo() skips empty repos (services/context/api.go:263-267)
+      // and the handler's IsEmpty / GetBranchCommit-miss arms both yield the
+      // empty ret (services/issue/template.go:119-126) — 200 [], never a 404.
+      const refTarget = refTipMap(await reads.listRefs()).get(branchRef(pair.repo.defaultBranch))?.target;
+      if (refTarget === undefined) {
+        return c.json([], 200);
+      }
+      const { templates, errors } = await listIssueTemplates(reads, refTarget);
+      const errorCount = Object.keys(errors).length;
+      if (errorCount > 0) {
+        // repo.go:1198 — the EXACT upstream header text
+        c.header("X-Gitea-Warning", `error occurs when parsing issue template: count=${errorCount}`);
+      }
+      // The IssueTemplate struct marshals in Go field order with no omitempty
+      // (structs/issue.go:198-208): empty strings stay "" and nil slices null;
+      // IssueFormField carries visible omitempty.
       return c.json(
         templates.map((template) => ({
+          name: template.name,
+          title: template.title,
+          about: template.about,
+          labels: template.labels,
+          assignees: template.assignees,
+          ref: template.ref,
+          content: template.content,
+          body:
+            template.body === null
+              ? null
+              : template.body.map((field) => ({
+                  type: field.type,
+                  id: field.id,
+                  attributes: field.attributes,
+                  validations: field.validations,
+                  ...(field.visible !== undefined && field.visible.length > 0 ? { visible: field.visible } : {}),
+                })),
           file_name: template.fileName,
-          name: template.frontMatter.name ?? null,
-          about: template.frontMatter.about ?? template.frontMatter.description ?? null,
-          title: template.frontMatter.title ?? null,
-          ref: template.frontMatter.ref ?? null,
-          labels: templateList(template.frontMatter.labels),
-          assignees: templateList(template.frontMatter.assignees),
-          content: template.content === "" ? null : template.content,
         })),
         200,
       );

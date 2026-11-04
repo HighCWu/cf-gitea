@@ -224,28 +224,35 @@ export type ChangeFilesOptions = z.infer<typeof changeFilesOptionsSchema>;
 
 /**
  * `#/definitions/IssueTemplateStringSlice` — string OR string[] upstream
- * (swagger types it `[]string` with a custom unmarshaller); rendered as an
- * array here.
+ * (swagger types it `[]string` with a custom unmarshaller). Go-marshal
+ * semantics: a nil slice marshals null (labels/assignees absent in the
+ * template file), a present-but-empty sequence marshals [].
  */
-export const issueTemplateStringSliceSchema = z.array(z.string()).optional();
+export const issueTemplateStringSliceSchema = z.array(z.string()).nullable();
 
 /**
- * `#/definitions/IssueFormField` — form-type template bodies; opaque for this
- * surface (the array entries are echoed as parsed-JSON blobs).
+ * `#/definitions/IssueFormField` — one form-type body entry; attributes /
+ * validations marshal null when absent, `visible` is omitempty.
  */
-export const issueFormFieldSchema = z.unknown().optional();
+export const issueFormFieldSchema = z.unknown();
 
-/** `#/definitions/IssueTemplate` — issue_templates list entries. */
+/**
+ * `#/definitions/IssueTemplate` — issue_templates list entries. Upstream's
+ * struct carries NO omitempty (structs/issue.go:198-208): every key is
+ * present, string empties marshal "" (content is always "" for .yaml
+ * templates), `body` is null for .md templates. `ref` arrives prefixed
+ * `refs/heads/` (services/issue/template.go:147-149).
+ */
 export const issueTemplateSchema = z.object({
-  about: z.string().nullable().optional(),
-  assignees: issueTemplateStringSliceSchema,
-  body: z.array(issueFormFieldSchema).optional(),
-  content: z.string().nullable().optional(),
-  file_name: z.string().optional(),
+  name: z.string(),
+  title: z.string(),
+  about: z.string(),
   labels: issueTemplateStringSliceSchema,
-  name: z.string().nullable().optional(),
-  ref: z.string().nullable().optional(),
-  title: z.string().nullable().optional(),
+  assignees: issueTemplateStringSliceSchema,
+  ref: z.string(),
+  content: z.string(),
+  body: z.array(issueFormFieldSchema).nullable(),
+  file_name: z.string(),
 });
 
 export type IssueTemplate = z.infer<typeof issueTemplateSchema>;
