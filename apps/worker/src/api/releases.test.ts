@@ -76,7 +76,7 @@ import { registerActivityFeedRoutes } from "./routes/activity-feeds";
 import { registerReleaseRoutes } from "./routes/releases";
 import { registerTagRoutes } from "./routes/tags";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
-import { pathEscape, pathEscapeSegments } from "./services/releases";
+import { pathEscape, pathEscapeSegments, splitCommitTitleBody } from "./services/releases";
 import { saveRepoSettings } from "./services/repo-settings";
 
 const TOKEN = "stub-token";
@@ -602,6 +602,63 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     // No git tag exists to fill FROM (the publish-time fill rides the still-open
     // UpdateRelease tag arm — see services/releases.ts's draft-posture note).
     expect((await makeApp()(`${REPO_PATH}/tags/fill-draft`)).status).toBe(404);
+  });
+
+  it("the ADOPT stamps published_unix with the conversion moment and the doer (isConvertedFromTag, release.go:283-285)", async () => {
+    const tagOnlyId = await seedRelease({ tag: "adopt-stamp", isTag: true });
+    await drizzle(env.DB).update(releases).set({ publishedUnix: 0 }).where(eq(releases.id, tagOnlyId));
+    const before = await releaseRow("adopt-stamp");
+    expect(before.publisherId).toBe(1);
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "adopt-stamp", name: "Adopted" }),
+    });
+    expect(res.status).toBe(201);
+    const row = await releaseRow("adopt-stamp");
+    expect(row.id).toBe(tagOnlyId); // the conversion keeps the id
+    expect(row.isTag).toBe(false);
+    expect(row.isDraft).toBe(false);
+    // The conversion stamps the PUBLISH MOMENT (oldRelease.IsTag && !rel.IsTag
+    // → now), overwriting whatever the push mint had put there.
+    expect(row.publishedUnix).toBeGreaterThan(1_700_000_000);
+    // The publisher fills from the calling doer (release.go:299).
+    expect(row.publisherId).toBe(1);
+  });
+
+  it("the ADOPT of a draft zeroes published_unix back (the zero-means-draft rule, release.go:281-283)", async () => {
+    const tagOnlyId = await seedRelease({ tag: "adopt-draft", isTag: true });
+    await drizzle(env.DB).update(releases).set({ publishedUnix: 1_700_000_000 }).where(eq(releases.id, tagOnlyId));
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "adopt-draft", name: "Adopted draft", draft: true }),
+    });
+    expect(res.status).toBe(201);
+    const row = await releaseRow("adopt-draft");
+    expect(row.isDraft).toBe(true);
+    expect(row.publishedUnix).toBe(0);
+  });
+
+  it("the ADOPT's missing-tag write is LIGHTWEIGHT even with tag_message set (UpdateRelease's createTag(\"\") — release.go:269)", async () => {
+    await seedRelease({ tag: "adopt-light", isTag: true });
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "adopt-light", name: "Adopted", tag_message: "must not annotate" }),
+    });
+    expect(res.status).toBe(201);
+    // The ref landed LIGHTWEIGHT (no peel on the refs row) — the adopt path
+    // never forwards TagMessage; the annotated arm is the fresh create's own.
+    const cell = env.REPO.getByName("cf-gitea-stub/rel");
+    const ref = (await cell.listRefs()).refs.find((r) => r.name === tagRef("adopt-light"));
+    expect(ref).toBeDefined();
+    expect(ref?.peeled).toBeUndefined();
+    expect(ref?.target).toBe(MAIN_TIP);
+    const row = await releaseRow("adopt-light");
+    expect(row.sha1).toBe(MAIN_TIP);
+    expect(row.numCommits).toBe(2);
+    await deleteTagRef("adopt-light"); // the tag-CREATING pin's cleanup (idempotence)
   });
 
   it("422s the release-specific protected-tag message on a fresh protected tag (release.go:281)", async () => {
@@ -1222,6 +1279,55 @@ describe("Go-parity path escaping (R2-L2)", () => {
 // "published" / UpdateRelease:893 "updated" / DeleteRelease:897 "deleted",
 // all gated on `!rel.IsDraft`, services/release/release.go:198,358,435).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The B-54 push mint's title/note split — git.SplitCommitTitleBody
+// (modules/git/utils.go:47-58) over util.EllipsisTruncateRunes
+// (modules/util/truncate.go:121): first-"\n" cut, rune-truncation at the
+// limit with the "…"-prefixed remainder moved INTO the body, and the
+// ≤12-remaining-bytes grace that absorbs a ≤3-rune tail whole.
+// ---------------------------------------------------------------------------
+describe("splitCommitTitleBody (SplitCommitTitleBody, push.go:356's splitter)", () => {
+  it("cuts at the first newline and passes short titles through", () => {
+    expect(splitCommitTitleBody("subject\nbody one\nbody two\n", 255)).toEqual({ title: "subject", body: "body one\nbody two\n" });
+    expect(splitCommitTitleBody("single line\n", 255)).toEqual({ title: "single line", body: "" });
+    expect(splitCommitTitleBody("no newline at all", 255)).toEqual({ title: "no newline at all", body: "" });
+    expect(splitCommitTitleBody("", 255)).toEqual({ title: "", body: "" });
+  });
+
+  it("moves an over-limit remainder into the body with the ellipsis prefix (EllipsisTruncateRunes' right half)", () => {
+    const longTitle = "t".repeat(300);
+    const { title, body } = splitCommitTitleBody(longTitle, 255);
+    // The loop breaks when used+4 > 255 — at rune 252 — so the left is
+    // 252 runes + "…" and the right "…" + the 48-rune remainder.
+    expect(title).toBe(`${"t".repeat(252)}…`);
+    expect(body).toBe(`…${"t".repeat(48)}`);
+    // An existing body gains the remainder AHEAD of it, newline-joined.
+    const withBody = splitCommitTitleBody(`${"a".repeat(300)}\nreal body\n`, 255);
+    expect(withBody.title).toBe(`${"a".repeat(252)}…`);
+    expect(withBody.body).toBe(`…${"a".repeat(48)}\nreal body\n`);
+  });
+
+  it("absorbs a ≤3-rune tail whole when it still fits (truncate.go:106-115's grace); multi-byte inputs truncate at 252 runes", () => {
+    // ASCII 256: the loop breaks at rune 252, the tail is 4 runes → nextCnt
+    // hits 4 → NO grace → the split. (ASCII can never grace-fire at 255:
+    // >255 bytes forces a ≥4-rune remainder past the break.)
+    const split256 = splitCommitTitleBody("a".repeat(256), 255);
+    expect(split256.title).toBe(`${"a".repeat(252)}…`);
+    expect(split256.body).toBe(`…${"a".repeat(4)}`);
+    // The grace: 85 CJK (255 bytes) + "ab" = 257 bytes > 255 but every rune
+    // fits width-wise; the loop completes, and the ≤3-rune tail (1 rune,
+    // 1 byte from pos) absorbs whole — no ellipsis anywhere.
+    const grace = splitCommitTitleBody("字".repeat(85) + "ab", 255);
+    expect(grace.title).toBe("字".repeat(85) + "ab");
+    expect(grace.body).toBe("");
+    // Multi-byte TRUNCATION: 300 CJK = 900 bytes; the loop breaks at rune
+    // 252 (756 bytes from pos → 144 bytes > 12 → no grace).
+    const cjk = splitCommitTitleBody("字".repeat(300), 255);
+    expect(cjk.title).toBe(`${"字".repeat(252)}…`);
+    expect(cjk.body).toBe(`…${"字".repeat(48)}`);
+  });
+});
 
 describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDeleteRelease)", () => {
   it("emits `release` action=published on create, with the upstream ReleasePayload field set", async () => {

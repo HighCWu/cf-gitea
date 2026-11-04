@@ -41,6 +41,7 @@ import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import { registerTagRoutes } from "./tags";
+import { ZERO_OID } from "../services/engine";
 import type { User } from "../models/user";
 
 const ORIGIN = "https://apisuite.test";
@@ -361,6 +362,143 @@ describe("the delete arm's release coupling (release.go:376-404)", () => {
       .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, "protected-ghost")))
       .all();
     expect(kept).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The B-54 mint — CreateNewTag's db.Insert (services/release/release.go:
+// 244-261 + createTag's fill :145-158): every POST /tags now mints the
+// is_tag releases row with THIS arm's divergent columns (published_unix =
+// the publish moment NOW, num_commits = the real count, title/note EMPTY —
+// upstream's own divergence from the push mint), and a pushed-but-rowless
+// ref RIDES (createTag's IsTagExist, release.go:83) instead of 409ing.
+// ---------------------------------------------------------------------------
+describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
+  const repoIdOf = async (): Promise<string> => {
+    const row = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG)))
+      .get();
+    if (row === undefined) throw new Error("seed repo missing");
+    return row.id;
+  };
+
+  const rowFor = async (repoId: string, tagName: string) => {
+    const row = await drizzle(env.DB)
+      .select()
+      .from(releases)
+      .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, tagName.toLowerCase())))
+      .get();
+    if (row === undefined) throw new Error(`minted row missing: ${tagName}`);
+    return row;
+  };
+
+  it("the fresh LIGHTWEIGHT create mints the is_tag row with the arm's divergent columns", async () => {
+    await send(`${REPO_PATH}/tags/b54-light`, authed({ method: "DELETE" })); // idempotency pre-clear
+    const created = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "b54-light", target: TIP1 }));
+    expect(created.status).toBe(200);
+    const repoId = await repoIdOf();
+    const row = await rowFor(repoId, "b54-light");
+    expect(row.isTag).toBe(true);
+    expect(row.isDraft).toBe(false);
+    expect(row.isPrerelease).toBe(false);
+    expect(row.sha1).toBe(TIP1);
+    expect(row.target).toBe(TIP1); // rel.Target = commit (release.go:250)
+    expect(row.numCommits).toBe(1); // the REAL count (release.go:155) — not the push mint's -1
+    expect(row.title).toBe(""); // Title/Note EMPTY (msg never copied — release.go:248-251)
+    expect(row.note).toBe("");
+    expect(row.createdAt?.getTime()).toBe(T0 * 1000); // the commit's committer time (release.go:154)
+    expect(row.publisherId).toBe(OWNER_ID); // PublisherID: doer.ID (release.go:243)
+    // PublishedUnix = the PUBLISH moment (createTag's zero arm :145-147),
+    // NOT the commit's committer time — the push mint's key divergence.
+    expect(row.publishedUnix).toBeGreaterThan(T0);
+    // cleanup: the tag delete takes the ref AND the minted row.
+    await send(`${REPO_PATH}/tags/b54-light`, authed({ method: "DELETE" }));
+    expect(
+      await drizzle(env.DB)
+        .select()
+        .from(releases)
+        .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, "b54-light")))
+        .all(),
+    ).toEqual([]);
+  });
+
+  it("the ANNOTATED create still keeps title/note EMPTY and stamps now, not the tagger time", async () => {
+    await send(`${REPO_PATH}/tags/b54-annotated`, authed({ method: "DELETE" }));
+    const created = await send(
+      `${REPO_PATH}/tags`,
+      jsonInit("POST", { tag_name: "b54-annotated", target: TIP2, message: "annotated subject\nbody\n" }),
+    );
+    expect(created.status).toBe(200);
+    const repoId = await repoIdOf();
+    const row = await rowFor(repoId, "b54-annotated");
+    expect(row.title).toBe("");
+    expect(row.note).toBe("");
+    expect(row.sha1).toBe(TIP2); // the PEELED commit
+    expect(row.numCommits).toBe(2);
+    expect(row.createdAt?.getTime()).toBe((T0 + 60) * 1000);
+    expect(row.publishedUnix).toBeGreaterThan(T0 + 60);
+    await send(`${REPO_PATH}/tags/b54-annotated`, authed({ method: "DELETE" }));
+  });
+
+  it("a pushed-but-rowless ref RIDES (200, no ref write) and still mints (createTag's IsTagExist, release.go:83)", async () => {
+    const repoId = await repoIdOf();
+    // A ref created OUTSIDE the receive flow (direct cell CAS — no tail, no
+    // mint): the shape upstream's legacy arm serves.
+    const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+    const landed = await cell.commitApiChange({ ref: "refs/tags/ride-direct", expectedOldOid: ZERO_OID, newOid: TIP2 });
+    expect(landed.tag).toBe("committed");
+    try {
+      const created = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "ride-direct", target: TIP1 }));
+      expect(created.status).toBe(200); // NOT the old ref-existence 409
+      const row = await rowFor(repoId, "ride-direct");
+      // The fill reads the REF's commit (GetTagCommit(rel.TagName),
+      // release.go:148) while rel.Target keeps the REQUEST's resolution
+      // (release.go:250) — the two differ here on purpose.
+      expect(row.sha1).toBe(TIP2);
+      expect(row.numCommits).toBe(2);
+      expect(row.target).toBe(TIP1);
+      expect(row.isTag).toBe(true);
+      expect(row.publishedUnix).toBeGreaterThan(T0);
+    } finally {
+      await send(`${REPO_PATH}/tags/ride-direct`, authed({ method: "DELETE" }));
+    }
+  });
+
+  it("the protected check sits INSIDE the fresh arm: a protected rowless ref rides (upstream release.go:83's branch order)", async () => {
+    const repoId = await repoIdOf();
+    await drizzle(env.DB).insert(protectedTags).values({
+      repoId,
+      namePattern: "ride-*",
+      allowlistUserIds: "[424242]",
+      allowlistTeamIds: "[]",
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+    const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+    const landed = await cell.commitApiChange({ ref: "refs/tags/ride-prot", expectedOldOid: ZERO_OID, newOid: TIP1 });
+    expect(landed.tag).toBe("committed");
+    try {
+      const created = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "ride-prot", target: TIP1 }));
+      // Upstream's IsUserAllowedToControlTag runs only in createTag's
+      // !IsTagExist branch (:89-102) — the ride mints without the check.
+      expect(created.status).toBe(200);
+      expect((await rowFor(repoId, "ride-prot")).isTag).toBe(true);
+    } finally {
+      await send(`${REPO_PATH}/tags/ride-prot`, authed({ method: "DELETE" }));
+      await drizzle(env.DB).delete(protectedTags).where(and(eq(protectedTags.repoId, repoId), eq(protectedTags.namePattern, "ride-*")));
+    }
+  });
+
+  it("the duplicate ROW still 409s with the upstream text (IsReleaseExist, release.go:224-232)", async () => {
+    await send(`${REPO_PATH}/tags/b54-dup`, authed({ method: "DELETE" }));
+    const first = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "b54-dup", target: TIP1 }));
+    expect(first.status).toBe(200);
+    const second = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "b54-dup", target: TIP1 }));
+    expect(second.status).toBe(409);
+    expect((await jsonBody(second)).message).toBe("tag already exists [name: b54-dup]");
+    await send(`${REPO_PATH}/tags/b54-dup`, authed({ method: "DELETE" }));
   });
 });
 

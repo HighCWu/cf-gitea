@@ -7,6 +7,7 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import { releases } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
+import { createNewTagRecord } from "../services/releases";
 import {
   deleteApiRefError,
   engineCell,
@@ -48,6 +49,13 @@ import { emitRefWebhook, readTagData, renderAnnotatedTag, renderTag, resolveTagT
  *     not copy (contract compatibility is the goal);
  *   - POST on an empty repo → **405**; a missing `target` → 404
  *     "target not found: …"; a duplicate tag → 409 "tag already exists";
+ *   - POST MINTS the is_tag releases record (B-54 — CreateNewTag's
+ *     db.Insert, release.go:261) with this arm's own column semantics
+ *     (published_unix = the publish moment NOW, num_commits = the real
+ *     count, title/note EMPTY — upstream's divergence from the push mint,
+ *     services/releases.ts createNewTagRecord); an existing ref with no row
+ *     RIDES (createTag's IsTagExist, release.go:83 — no write, no protected
+ *     check, no ref events) and still mints;
  *   - DELETE refuses a tag that has a release attached with 409 "a tag
  *     attached to a release cannot be deleted directly" (the releases table
  *     lookup the release routes share);
@@ -544,7 +552,7 @@ export function registerTagRoutes(
       // Target resolution: explicit `target` (a branch/tag name, full ref, or
       // oid) or the default branch (CreateTag → GetTargetCommit) — the
       // shared tag-store service (services/tags.ts), one listRefs serving
-      // the duplicate check below.
+      // the duplicate/ride checks below.
       const resolved = await resolveTagTarget(c.env, pair.repo, form.target);
       if (resolved.tag === "not-found") {
         throw new ApiError(404, `target not found: ${resolved.target}`);
@@ -556,81 +564,118 @@ export function registerTagRoutes(
       // lookup over the releases table, ANY row kind, R3; answered
       // ErrTagAlreadyExists → 409 `err.Error()` = "tag already exists
       // [name: X]" (services/release/release.go:212-217 + tag.go:212-214,
-      // R16-a's suffix)). The git-ref existence arm below is our engine
-      // boundary's second gate (upstream rides a bare pushed ref with no
-      // releases row through createTag's IsTagExist — a divergence kept:
-      // this surface does not mint the is_tag record pushUpdateAddTags
-      // would) — the same upstream text.
+      // R16-a's suffix)). The git REF existence is NOT a second gate here —
+      // upstream's createTag rides an existing ref (release.go:83
+      // `IsTagExist`: skip the write, `created = false`, no notifications)
+      // and CreateNewTag still INSERTS the row (the B-54 mint below) — a
+      // pushed-but-rowless tag POSTs into a ride + mint, never a 409.
+      const existingTip = resolved.tips.get(tagRef(name));
       if ((await findReleaseRecord(c.env.DB, pair.repo.id, name)) !== undefined) {
         throw new ApiError(409, `tag already exists [name: ${name}]`);
       }
-      if (resolved.tips.has(tagRef(name))) {
-        throw new ApiError(409, `tag already exists [name: ${name}]`);
-      }
 
-      // Protected-tag enforcement on the create arm (upstream CreateTag →
-      // release_service.CreateNewTag's IsUserAllowedToControlTag check,
-      // services/release/release.go:87-102, answered 422 "user not allowed
-      // to create protected tag", routers/api/v1/repo/tag.go:224-227 — the
-      // check runs after the duplicate arm, exactly here). An unresolvable
-      // viewer id evaluates as anonymous (0 — never allowlisted).
       const doer = c.get("authUser");
-      if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), name, doer?.id ?? 0))) {
-        throw new ApiError(422, "user not allowed to create protected tag");
+      let newTarget: string;
+      let mintCommitSha: string;
+      if (existingTip !== undefined) {
+        // The ride arm (createTag's IsTagExist, release.go:83): no write, no
+        // protected check (upstream's IsUserAllowedToControlTag sits INSIDE
+        // the !IsTagExist branch), no ref events (`created = false` skips
+        // the notify block, release.go:127-148). The mint's fill reads the
+        // REF's commit — upstream's GetTagCommit(rel.TagName) peels the tag
+        // NAME (release.go:148), not the request's resolved target.
+        newTarget = existingTip.target;
+        mintCommitSha = existingTip.peeled ?? existingTip.target;
+      } else {
+        // Protected-tag enforcement on the create arm (upstream CreateTag →
+        // release_service.CreateNewTag's IsUserAllowedToControlTag check,
+        // services/release/release.go:87-102, answered 422 "user not allowed
+        // to create protected tag", routers/api/v1/repo/tag.go:224-227 — the
+        // check runs after the duplicate arm, inside createTag's
+        // !IsTagExist branch, exactly here). An unresolvable viewer id
+        // evaluates as anonymous (0 — never allowlisted).
+        if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), name, doer?.id ?? 0))) {
+          throw new ApiError(422, "user not allowed to create protected tag");
+        }
+
+        // The write itself — a message creates the ANNOTATED tag object
+        // (serializeTag → putApiObjects → ref CAS); without one the tag is
+        // lightweight (the shared tag-store service).
+        const written = await writeTagRef(c.env, pair.repo, {
+          name,
+          commitSha,
+          message: form.message,
+          doer,
+          requestHost: new URL(c.req.url).hostname,
+        });
+        if (written.tag === "invalid") {
+          // ErrInvalidTagName is UNMAPPED on this surface (R16-d): upstream's
+          // handler forks only IsErrTagAlreadyExists (409) and
+          // IsErrProtectedTagName (422) out of CreateNewTag; everything else
+          // falls to ctx.APIErrorInternal → 500 (tag.go:211-222).
+          throw new Error(written.reason);
+        }
+        if (written.tag === "conflict") {
+          throw written.error;
+        }
+        newTarget = written.refTip;
+        mintCommitSha = commitSha;
+
+        // Upstream's API tag create fires the zero-commit `push` event around
+        // the `create` event (services/release/release.go:136-143 — PushCommits
+        // :136 first, CreateRef :143, BOTH carrying rel.Publisher). The push
+        // payload is the §2.3 tag-create shape (tagCreatePushPayload, the W5
+        // correction): before = the zero oid, after = the new ref tip — the
+        // TAG OBJECT oid for the annotated case — head_commit = the PEELED tip
+        // commit and compare/{zero}...{raw tip}; the create event's `sha` stays
+        // the raw tip (the push path's `Sha: refID` semantics, the module
+        // header). The publisher IS the doer on this surface (CreateNewTag's
+        // `Publisher: doer`, release.go:243-244). The RIDE arm emits nothing
+        // (created = false) — the events sit inside createTag's
+        // !IsTagExist branch, release.go:127-148.
+        await emitRefWebhook(c, pair, "push", await tagCreatePushPayload(c, pair, tagRef(name), ZERO_OID, newTarget, commitSha, doer), tagRef(name));
+
+        // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
+        // (never an oid — the annotated peel stays out of `ref`), ref_type
+        // "tag", sha the created ref's tip — the TAG OBJECT oid for the
+        // annotated case (newTarget), matching the push family's create
+        // payloads for the same action; the sender is the authenticated caller.
+        await emitRefWebhook(
+          c,
+          pair,
+          "create",
+          {
+            sha: newTarget,
+            ref: name,
+            ref_type: "tag",
+            repository: toApiRepository(viewerOf(c), pair),
+            sender: c.get("authUser") ?? null,
+          },
+          tagRef(name),
+        );
       }
 
-      // The write itself — a message creates the ANNOTATED tag object
-      // (serializeTag → putApiObjects → ref CAS); without one the tag is
-      // lightweight (the shared tag-store service).
-      const written = await writeTagRef(c.env, pair.repo, {
-        name,
-        commitSha,
-        message: form.message,
-        doer,
-        requestHost: new URL(c.req.url).hostname,
-      });
-      if (written.tag === "invalid") {
-        // ErrInvalidTagName is UNMAPPED on this surface (R16-d): upstream's
-        // handler forks only IsErrTagAlreadyExists (409) and
-        // IsErrProtectedTagName (422) out of CreateNewTag; everything else
-        // falls to ctx.APIErrorInternal → 500 (tag.go:211-222).
-        throw new Error(written.reason);
-      }
-      if (written.tag === "conflict") {
-        throw written.error;
-      }
-      const newTarget = written.refTip;
-
-      // Upstream's API tag create fires the zero-commit `push` event around
-      // the `create` event (services/release/release.go:136-143 — PushCommits
-      // :136 first, CreateRef :143, BOTH carrying rel.Publisher). The push
-      // payload is the §2.3 tag-create shape (tagCreatePushPayload, the W5
-      // correction): before = the zero oid, after = the new ref tip — the
-      // TAG OBJECT oid for the annotated case — head_commit = the PEELED tip
-      // commit and compare/{zero}...{raw tip}; the create event's `sha` stays
-      // the raw tip (the push path's `Sha: refID` semantics, the module
-      // header). The publisher IS the doer on this surface (CreateNewTag's
-      // `Publisher: doer`, release.go:243-244).
-      await emitRefWebhook(c, pair, "push", await tagCreatePushPayload(c, pair, tagRef(name), ZERO_OID, newTarget, commitSha, doer), tagRef(name));
-
-      // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
-      // (never an oid — the annotated peel stays out of `ref`), ref_type
-      // "tag", sha the created ref's tip — the TAG OBJECT oid for the
-      // annotated case (newTarget), matching the push family's create
-      // payloads for the same action; the sender is the authenticated caller.
-      await emitRefWebhook(
-        c,
+      // The B-54 mint — CreateNewTag's db.Insert (release.go:261), AFTER the
+      // ref write and the notifications (createTag runs first, release.go:
+      // 259). The row's column semantics are this arm's own (upstream's
+      // divergence from the push mint, ported verbatim): PublishedUnix = the
+      // publish moment NOW (createTag's zero arm :145-147), NumCommits = the
+      // real count, Title/Note EMPTY (msg is never copied into the row
+      // here), created_unix = the REF's commit's committer time, sha1 = the
+      // peeled commit, Target = the request's resolved commit (rel.Target
+      // = commit, release.go:250 — the ride arm can carry a different
+      // commit than the ref). A failed insert leaves the tag in git —
+      // upstream's wedge, faithfully (the retry 409s on the row lookup).
+      await createNewTagRecord({
+        env: c.env,
+        d1: c.env.DB,
         pair,
-        "create",
-        {
-          sha: newTarget,
-          ref: name,
-          ref_type: "tag",
-          repository: toApiRepository(viewerOf(c), pair),
-          sender: c.get("authUser") ?? null,
-        },
-        tagRef(name),
-      );
+        tagName: name,
+        commitSha: mintCommitSha,
+        targetCommit: commitSha,
+        publisherId: doer?.id ?? 0,
+        now: new Date(),
+      });
 
       const viewer = viewerOf(c);
       // The response renders what a subsequent GET of the same name would
@@ -639,9 +684,10 @@ export function registerTagRoutes(
       // message), for a lightweight create the target commit's message
       // (upstream GetTag(form.TagName) → ToTag, tag.go:225-230). A degraded
       // read degrades to the pre-P3-11 shape (message ""), never a 500.
-      const newTip = newTarget === commitSha ? { target: newTarget } : { target: newTarget, peeled: commitSha };
+      const renderSha = mintCommitSha;
+      const newTip = newTarget === renderSha ? { target: newTarget } : { target: newTarget, peeled: renderSha };
       const data = await readTagData(c.env, pair.repo, newTip);
-      return c.json(renderTag(name, newTip, commitSha, data, pair, viewer.origin), 200);
+      return c.json(renderTag(name, newTip, renderSha, data, pair, viewer.origin), 200);
     },
     bindValidationHook,
   );

@@ -288,6 +288,79 @@ function ellipsisDisplayString(s: string, limit: number): string {
   return runes.slice(0, Math.max(0, limit - 1)).join("") + "…";
 }
 
+/**
+ * `git.SplitCommitTitleBody(msg, titleRuneLimit)` (modules/git/utils.go:47-58):
+ * cut the message at the first "\n" into title + body, then
+ * `util.EllipsisTruncateRunes(title, 255)` the title — and a truncated
+ * remainder moves to the BODY prefixed with "…" (ellipsisDisplayStringX's
+ * right half), ahead of any existing body. The push mint's title/note shape
+ * (services/repository/push.go:356).
+ *
+ * EllipsisTruncateRunes is EllipsisDisplayString's rune-width twin
+ * (modules/util/truncate.go:121-123 — widthGuess = 1/rune) whose exact
+ * grace arms port as follows: byte-length pre-check (`len(str) <= limit`),
+ * the accumulate-until-`used+1+3 > limit` loop (it breaks at rune 252 for
+ * the 255 limit), the ≤12-remaining-bytes peek that absorbs a tail of ≤3
+ * runes instead of ellipsing (reachable only for multi-byte inputs at 255
+ * — ASCII past the byte limit always has a ≥4-rune remainder), the `< 3`
+ * limit that drops the ellipsis, and the ellipsis + right-half pairing
+ * (BOTH halves carry the "…"). Invalid-UTF-8 downgrade (asciiEllipsis
+ * "...") is unreachable here — the engine hands us decoded JS strings
+ * (TagJson.message / CommitJson.message), so the "…" form is the only one
+ * this port can produce.
+ */
+export function splitCommitTitleBody(commitMessage: string, titleRuneLimit: number): { title: string; body: string } {
+  const cut = commitMessage.indexOf("\n");
+  let title = cut === -1 ? commitMessage : commitMessage.slice(0, cut);
+  let body = cut === -1 ? "" : commitMessage.slice(cut + 1);
+
+  // EllipsisTruncateRunes(title, titleRuneLimit) — left + right halves.
+  const byteLen = new TextEncoder().encode(title).length;
+  if (byteLen > titleRuneLimit) {
+    let used = 0;
+    let offsetUnits = 0; // rune start offsets, code-unit tracked (Go: byte offsets)
+    let posUnits = 0;
+    let posBytes = 0;
+    let units = 0;
+    let bytes = 0;
+    for (const rune of title) {
+      const cp = rune.codePointAt(0)!;
+      const runeBytes = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+      posUnits = units;
+      posBytes = bytes;
+      if (used + 1 + 3 > titleRuneLimit) break;
+      used += 1;
+      units += rune.length;
+      offsetUnits = units;
+      bytes += runeBytes;
+    }
+    // The ≤12-remaining-bytes grace: a tail of ≤3 runes whose widths still
+    // fit absorbs whole, no ellipsis (truncate.go:106-115).
+    let graceApplies = false;
+    if (byteLen - posBytes <= 12) {
+      let nextCnt = 0;
+      let nextWidth = 0;
+      // widthGuess = 1/rune (truncate.go:121-123) — the binding is the
+      // iteration vehicle only; both counters advance one per rune.
+      for (const _rune of title.slice(posUnits)) {
+        if (nextCnt >= 4) break;
+        nextWidth += 1;
+        nextCnt++;
+      }
+      graceApplies = nextCnt <= 3 && used + nextWidth <= titleRuneLimit;
+    }
+    if (!graceApplies) {
+      const head = title.slice(0, offsetUnits);
+      const tail = title.slice(offsetUnits);
+      title = titleRuneLimit < 3 ? head : `${head}…`;
+      if (tail !== "") {
+        body = body === "" ? `…${tail}` : `…${tail}\n${body}`;
+      }
+    }
+  }
+  return { title, body };
+}
+
 export interface CreateReleaseWithGitTagInput {
   /** The worker bindings — the engine cell client's source. */
   env: ApiEnv["Bindings"];
@@ -498,7 +571,15 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
       const written = await writeTagRef(input.env, pair.repo, {
         name: tagName,
         commitSha: resolved.commitSha,
-        message: input.tagMessage,
+        // The message rides the FRESH-create arm only: CreateRelease's
+        // createTag(rel, msg) copies form.TagMessage into the ANNOTATED tag
+        // object (release.go:110-121 + :186), but the conversion arm (an
+        // existing is_tag row) reaches the write through UpdateRelease's
+        // createTag(ctx, gitRepo, rel, "") — release.go:269's EMPTY message,
+        // release.go:306's handler never forwards TagMessage — so an
+        // adopted row's missing tag is always LIGHTWEIGHT (B-54's adopt
+        // arm; the B-54 landing's disclosed fix).
+        message: existing === undefined ? input.tagMessage : undefined,
         doer: input.doer,
         requestHost: input.requestHost,
       });
@@ -863,6 +944,189 @@ export async function pushUpdateDeleteTags(d1: D1Database, repoId: string, tags:
       .set({ isDraft: true, numCommits: 0, sha1: "", publishedUnix: 0 })
       .where(and(eq(releases.repoId, repoId), eq(releases.isTag, false), inArray(releases.lowerTagName, lowerTags))),
   ]);
+}
+
+/** One pushed tag's engine-read record — the gate tail's per-tag read answer
+ *  (upstream pushUpdateAddTags reads the same facts off gitRepo: GetTag's
+ *  message/tagger arms, GetTagCommit's peel, the commit's committer time). */
+export interface PushTagAdd {
+  /** The tag name as the push carried it (original case — the row's
+   *  tag_name; upstream iterates lowerTags but stores `tags[i]`). */
+  name: string;
+  /** The PEELED commit (GetTagCommit's dereference) — the row's sha1. */
+  commitSha: string;
+  /** commit.Committer.When — "tagged whenever, but dated by its commit"
+   *  (push.go:350) — the row's created_unix. */
+  createdUnix: number;
+  /** tag.Tagger.When for an annotated tag, createdUnix for a lightweight
+   *  one (push.go:351-354 — Tagger == nil on the commit-arm shape) — the
+   *  row's published_unix. */
+  publishedUnix: number;
+  /** The tag's message: the annotated object's payload or the commit's
+   *  message (GetTag's commit arm) — split into the row's title/note. */
+  message: string;
+}
+
+/**
+ * `pushUpdateAddTags` (services/repository/push.go:323-409, reached from
+ * PushUpdateAddDeleteTags :316-322 ← the post-receive tail :214) — the
+ * GIT-PUSH tag-creation lifecycle, the B-54 mint arm beside the landed
+ * pushUpdateDeleteTags above. Statement for statement:
+ *
+ *   - the ROW lookup: FindReleasesOptions{RepoID, TagNames, IncludeDrafts,
+ *     IncludeTags} (:328-333) → relMap keyed by lower_tag_name (caseless
+ *     like every release resolution, R3);
+ *   - the per-tag title/note: SplitCommitTitleBody(tag.MessageUTF8(), 255)
+ *     (:356 — title cut at the first "\n", rune-truncated at 255 with the
+ *     "…"-prefixed remainder moved into the note);
+ *   - NO row → INSERT the is_tag record (:361-378): Target "", NumCommits
+ *     -1 ("the commits count will be updated when the UI needs it"),
+ *     IsDraft/IsPrerelease false, IsTag true, Publisher = the pusher,
+ *     created_unix = the commit's committer time, published_unix = the
+ *     tagger time (createdUnix for a lightweight tag);
+ *   - row EXISTS → UPDATE (:380-402): sha1 + created_unix always; an
+ *     is_tag row's Title/Note/PublishedUnix refresh from the tag; a REAL
+ *     release un-drafts (IsDraft=false) and stamps a still-zero
+ *     published_unix with now; PublisherID = the pusher in BOTH arms —
+ *     a pushed-over release's publisher becomes the pusher, upstream's own
+ *     semantics (push.go:403). NumCommits/Target/IsPrerelease ride
+ *     untouched (upstream's AllCols update persists the loaded values).
+ *
+ * The engine reads (tag object / commit) happen in the gate tail — this
+ * function is D1-only like pushUpdateDeleteTags, fed the tail's verified
+ * per-tag records. Dedupe by lowered name mirrors the deletes arm; a name
+ * pushed twice in one receive applies once. Idempotent: re-pushing a tag
+ * re-runs the same refresh (the eventual-consistency shape both trees
+ * tolerate — upstream's queue lag can replay an add the same way).
+ */
+export async function pushUpdateAddTags(d1: D1Database, repoId: string, pusherId: number, adds: PushTagAdd[]): Promise<void> {
+  if (adds.length === 0) return;
+  const byLower = new Map<string, PushTagAdd>();
+  for (const add of adds) byLower.set(add.name.toLowerCase(), add);
+
+  // push.go:328-333 — the Find over IncludeDrafts+IncludeTags rows.
+  const rows = await drizzle(d1)
+    .select()
+    .from(releases)
+    .where(and(eq(releases.repoId, repoId), inArray(releases.lowerTagName, [...byLower.keys()])))
+    .all();
+  const relMap = new Map(rows.map((row) => [row.lowerTagName, row]));
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const inserts: (typeof releases.$inferInsert)[] = [];
+  const updates: Promise<unknown>[] = [];
+  for (const [lower, add] of byLower) {
+    // push.go:356 — the title/note split.
+    const { title, body: note } = splitCommitTitleBody(add.message, 255);
+    const row = relMap.get(lower);
+    if (row === undefined) {
+      // push.go:361-378 — the mint.
+      inserts.push({
+        repoId,
+        publisherId: pusherId,
+        tagName: add.name,
+        lowerTagName: lower,
+        target: "",
+        sha1: add.commitSha,
+        numCommits: -1, // "the commits count will be updated when the UI needs it"
+        title,
+        note,
+        isDraft: false,
+        isPrerelease: false,
+        isTag: true,
+        createdAt: new Date(add.createdUnix * 1000),
+        publishedUnix: add.publishedUnix,
+      });
+      continue;
+    }
+    // push.go:380-402 — the refresh. (The model UpdateRelease these rows
+    // write through ellipsifies the title (release.go:169-173); with the
+    // tree's rune-based port that is a no-op on a split title already
+    // capped at 255 runes, so the write carries the split values directly.)
+    updates.push(
+      drizzle(d1)
+        .update(releases)
+        .set({
+          sha1: add.commitSha,
+          createdAt: new Date(add.createdUnix * 1000),
+          ...(row.isTag
+            ? { title, note, publishedUnix: add.publishedUnix }
+            : { isDraft: false, publishedUnix: row.publishedUnix === 0 ? nowSec : row.publishedUnix }),
+          publisherId: pusherId,
+        })
+        .where(eq(releases.id, row.id)),
+    );
+  }
+  // push.go:405-409 — the batched insert; the updates loop one by one like
+  // upstream's UpdateRelease loop.
+  if (inserts.length > 0) await drizzle(d1).insert(releases).values(inserts);
+  for (const update of updates) await update;
+}
+
+export interface CreateNewTagRecordInput {
+  /** The engine reads client's source (the fill's commit/count reads). */
+  env: ApiEnv["Bindings"];
+  d1: D1Database;
+  /** The repo — engine cell name + D1 scope. */
+  pair: RepositoryWithOwner;
+  /** The tag name (original case — the row's tag_name). */
+  tagName: string;
+  /** The commit the fill reads — the REF's tip peeled (upstream's
+   *  GetTagCommit(rel.TagName), release.go:148): the created commit on the
+   *  fresh arm, the existing ref's commit on the ride arm. The row's sha1
+   *  and created_unix/num_commits source. */
+  commitSha: string;
+  /** rel.Target (release.go:250 — `Target: commit`): the REQUEST's resolved
+   *  commit (GetTargetCommit), even when the ride arm's ref points
+   *  elsewhere. */
+  targetCommit: string;
+  /** The doer (CreateNewTag's `PublisherID: doer.ID`). */
+  publisherId: number;
+  /** The request moment — PublishedUnix (createTag's zero arm stamps the
+   *  PUBLISH moment, release.go:145-147 — NOT the tagger time). */
+  now: Date;
+}
+
+/**
+ * `CreateNewTag`'s row (services/release/release.go:244-261 + createTag's
+ * fill :145-158) — the API tag-create mint (B-54's second arm). The COLUMN
+ * semantics deliberately DIVERGE from the push mint above — upstream's own
+ * divergence between the two arms, ported verbatim:
+ *   - PublishedUnix = the PUBLISH MOMENT (now), not the tagger time —
+ *     createTag's `if rel.PublishedUnix.IsZero()` stamps the fresh row;
+ *   - NumCommits = the REAL reachable count (CommitsCountOfCommit), not
+ *     the push mint's -1 placeholder;
+ *   - Title/Note stay EMPTY — `msg` creates the annotated tag OBJECT but is
+ *     never copied into the row's title/note (CreateNewTag builds the rel
+ *     without either field);
+ *   - created_unix = the commit's committer time, sha1 = the peeled commit
+ *     (the shared fill);
+ *   - Target = the resolved commit (`rel.Target = commit`, release.go:250).
+ * The row INSERTs AFTER the ref write (release.go:261), so a failed insert
+ * leaves the tag in git — upstream's wedge (the retry 409s on the row
+ * lookup) reproduced faithfully. The duplicate guard is the CALLER's
+ * (IsReleaseExist order, release.go:224-232); the (repo_id, tag_name)
+ * unique index arbitrates the race as an untyped error, upstream's
+ * db.Insert failure shape.
+ */
+export async function createNewTagRecord(input: CreateNewTagRecordInput): Promise<void> {
+  const fill = await readTaggedCommitFill(engineReads(input.env, input.pair.repo), input.commitSha);
+  await drizzle(input.d1).insert(releases).values({
+    repoId: input.pair.repo.id,
+    publisherId: input.publisherId,
+    tagName: input.tagName,
+    lowerTagName: input.tagName.toLowerCase(),
+    target: input.targetCommit,
+    title: "",
+    note: "",
+    isDraft: false,
+    isPrerelease: false,
+    isTag: true,
+    sha1: fill.sha1,
+    numCommits: fill.numCommits,
+    createdAt: fill.createdAt,
+    publishedUnix: Math.floor(input.now.getTime() / 1000),
+  });
 }
 
 /** Drafts are invisible without release-write access (the release family's

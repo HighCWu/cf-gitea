@@ -113,7 +113,7 @@ import {
   scopeForbidden,
 } from "./respond";
 import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
-import { pushUpdateDeleteTags } from "../api/services/releases";
+import { pushUpdateAddTags, pushUpdateDeleteTags, type PushTagAdd } from "../api/services/releases";
 import { loadRepoSettings } from "../api/services/repo-settings";
 import type { AuthUser } from "../auth/auth-context";
 import { ScopeSet } from "../auth/scopes";
@@ -336,7 +336,7 @@ export async function gitHttpGate(
   // the worker entry — a file this gate does not own), so the wrapper
   // records the policy-allowed tag-delete / PR-head commands beside the
   // ordinary evaluation.
-  const pushTail: PushTailCommands = { tagDeletes: [], prHeadPushes: [] };
+  const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: pusher?.id ?? 0 };
   const response = await forwardToEngine(
     req,
     url,
@@ -362,13 +362,15 @@ export async function gitHttpGate(
   // rejected receive is a no-op and a probe/advert never schedules it (this
   // arm runs only on the receive-pack RPC).
   //
-  // The R5/D-7c tail rides the same post-commit window (see applyPushTail):
-  // one listRefs verifies what actually landed, then the tag-deletion
-  // draft-flips and the auto-merge re-check enqueues run — upstream's
-  // hook_post_receive → PushUpdate ordering (push.go:317) reduced to the
-  // gate's process. Scheduled for every authenticated receive with a
-  // collected command; a push with neither is a no-op return before any
-  // RPC (applyPushTail's head guard).
+  // The R5/B-54/D-7c tail rides the same post-commit window (see
+  // applyPushTail): one listRefs verifies what actually landed, then the
+  // tag mint (adds) / draft-flips (deletes) and the auto-merge re-check
+  // enqueues run — upstream's hook_post_receive → PushUpdate ordering
+  // (push.go:317) reduced to the gate's process. Scheduled for every
+  // authenticated receive with a collected command — the main forward here
+  // AND the push-create forwards (handleUnknownRepository: the FIRST push
+  // of a push-created repo carries the seed tags); a push with neither is a
+  // no-op return before any RPC (applyPushTail's head guard).
   if (isPush) {
     ctx.waitUntil(applyPushTail(env, resolved.repo, `${route.owner}/${route.repo}`, pushTail));
     if (resolved.repo.isEmpty) {
@@ -1057,7 +1059,12 @@ async function handleUnknownRepository(
       // §2.5.2 finalize handshake (scheduled AFTER the response below — the
       // async settle body starts at call time, so scheduling it before the
       // forward would race the receive's finalize with an empty-DO listRefs).
-      const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), protectedBranchValidator(env, raced.repo));
+      // The B-54/R5 tail rides the raced push-create forward too (the loser
+      // of the create race is a normal receive — its tag commands mint/flip
+      // like every other push).
+      const racedTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: verified.user.id };
+      const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), pushTailValidator(env, raced.repo, racedTail));
+      ctx.waitUntil(applyPushTail(env, raced.repo, `${route.owner}/${route.repo}`, racedTail));
       ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`, url.origin));
       return response;
     }
@@ -1097,7 +1104,14 @@ async function handleUnknownRepository(
   // race the finalize with an empty-DO listRefs). The forward carries the
   // fresh row's storage key: the very first receive already addresses R2 by
   // r_<id>, so no name-addressed prefix ever gets written for this repo.
-  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), protectedBranchValidator(env, created));
+  // The forward carries the B-54/R5 tail collector like every receive: the
+  // FIRST push of a push-created repo is where upstream's hook_post_receive
+  // runs its full tag sync (a seed push that lands main + tags in one
+  // receive mints their is_tag rows right here — without the collector the
+  // push-created repos' first push silently skipped every tag arm).
+  const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: verified.user.id };
+  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), pushTailValidator(env, created, pushTail));
+  ctx.waitUntil(applyPushTail(env, created, `${route.owner}/${route.repo}`, pushTail));
   ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`, url.origin));
   return response;
 }
@@ -1445,8 +1459,15 @@ export interface PushTailEnv extends Pick<Env, "DB" | "REPO"> {
 export interface PushTailCommands {
   /** Tag names (refs/tags/ stripped) with an allowed delete command. */
   tagDeletes: string[];
+  /** Tag names (refs/tags/ stripped) with an allowed create/update
+   *  command — the B-54 mint arm's collection. */
+  tagAdds: string[];
   /** Issue indexes (refs/pull/N/head's N) with an allowed create/move. */
   prHeadPushes: number[];
+  /** The authenticated pusher's user id — the minted rows' publisher
+   *  (upstream pushUpdateAddTags' `pusher.ID`); 0 when no identity was
+   *  resolved (anonymous cannot reach an allowed write; kept as defense). */
+  pusherId: number;
 }
 
 /**
@@ -1468,8 +1489,14 @@ function pushTailValidator(env: Env, repo: RepositoryRow, tail: PushTailCommands
       for (let i = 0; i < commands.length; i++) {
         const cmd = commands[i]!;
         if (verdicts[i]?.reject !== undefined) continue; // ng-rendered, never applies
-        if (cmd.ref.startsWith("refs/tags/") && cmd.kind === "delete") {
-          tail.tagDeletes.push(cmd.ref.slice("refs/tags/".length));
+        if (cmd.ref.startsWith("refs/tags/")) {
+          // B-54: every non-delete tag command is an add (upstream's "is new
+          // tag" branch — a force-update lands in addTags too, push.go:111).
+          if (cmd.kind === "delete") {
+            tail.tagDeletes.push(cmd.ref.slice("refs/tags/".length));
+          } else {
+            tail.tagAdds.push(cmd.ref.slice("refs/tags/".length));
+          }
         }
         const head = PR_HEAD_REF_PATTERN.exec(cmd.ref);
         if (head !== null && cmd.kind !== "delete") {
@@ -1492,14 +1519,16 @@ function repoTasksQueue(env: { REPO_TASKS?: unknown }): { sendBatch(messages: { 
 }
 
 /**
- * The R5/D-7c push tail — upstream's hook_post_receive tag arm reduced to
- * the gate's process (models/repo/release.go:465-492 PushUpdateDeleteTags,
- * reached from services/repository/push.go:317; upstream reads the applied
- * commands off its own hook pipeline, ours collects them in the validator
- * and verifies against the post-commit refs). Runs in waitUntil AFTER the
- * forward resolved — the engine commits refs before its response returns
- * (the settle-safety argument) — and NEVER fails the push: the applied
- * push stands, a tail failure is a logged no-op.
+ * The R5/B-54/D-7c push tail — upstream's hook_post_receive tag arm reduced
+ * to the gate's process (models/repo/release.go:465-492
+ * PushUpdateDeleteTags + services/repository/push.go:323-409
+ * pushUpdateAddTags, both reached from PushUpdateAddDeleteTags push.go:317;
+ * upstream reads the applied commands off its own hook pipeline, ours
+ * collects them in the validator and verifies against the post-commit
+ * refs). Runs in waitUntil AFTER the forward resolved — the engine commits
+ * refs before its response returns (the settle-safety argument) — and NEVER
+ * fails the push: the applied push stands, a tail failure is a logged
+ * no-op.
  *
  * R5 — tag deletions: only the collected deletes whose ref is GONE from the
  * post-commit refs land the D1 lifecycle (services/releases.ts
@@ -1510,6 +1539,23 @@ function repoTasksQueue(env: { REPO_TASKS?: unknown }): { sendBatch(messages: { 
  * re-created same-name tag between the verify read and the D1 write flips a
  * brand-new release the same way upstream's queue lag could — the
  * eventual-consistency shape both trees tolerate.
+ *
+ * B-54 — tag creations/updates (the mint arm, upstream push.go's "is new
+ * tag" branch :111-140 — every non-delete tag update lands in addTags the
+ * same way): only the collected adds whose ref EXISTS in the post-commit
+ * refs mint (a CAS-conflicted create is filtered like its delete twin).
+ * The per-tag engine reads happen here (the tail owns the REPO binding —
+ * the annotated readTag for the message/tagger arms, the readCommit peel
+ * for created_unix/sha1; upstream reads the same off gitRepo inside
+ * pushUpdateAddTags), then services/releases.ts pushUpdateAddTags runs the
+ * D1 mint/refresh (INSERT the is_tag record — Target "", numCommits -1,
+ * title/note from SplitCommitTitleBody, published_unix from the tagger —
+ * or refresh the found row; a REAL release un-drafts and stamps a zero
+ * publish; the publisher follows the pusher in both arms). An unreadable
+ * tag skips ITSELF with a logged warn (upstream's notify-loop dirty-data
+ * tolerance, push.go:114-119 — one dirty tag never kills the batch), and
+ * a tag ref that vanished between the verify and the read degrades the
+ * same way.
  *
  * D-7c — PR-head pushes: ONE {kind:"auto-merge-check", issueId} message per
  * pushed/moved head through the standing REPO_TASKS queue (the same
@@ -1523,19 +1569,92 @@ function repoTasksQueue(env: { REPO_TASKS?: unknown }): { sendBatch(messages: { 
  * "not scheduled → skip" (pull-automerge.ts) is the named idempotence, and
  * the cron producer re-probes every scheduled row each tick regardless.
  */
+/**
+ * The B-54 tail's per-add engine reads — upstream pushUpdateAddTags'
+ * GetTag/GetTagCommit pair reduced to the refs table + two RPCs. The refs
+ * row's peel cache distinguishes the kinds: a PEELED tip is an annotated
+ * tag (readTag → the payload message + the tagger; MessageUTF8's
+ * signature-stripped form is what the engine stores), an unpeeled tip is
+ * lightweight (the commit's own message — GetTag's commit arm,
+ * modules/git/repo_tag.go:213-219; Tagger nil → published_unix falls to
+ * created_unix). Each tag reads inside its own catch: an unreadable object
+ * skips THAT tag with a logged warn — upstream's notify-loop dirty-data
+ * tolerance (push.go:114-119 skips an unresolvable tip the same way), and
+ * one dirty tag never kills the batch (the D1 half only sees clean
+ * records).
+ */
+async function readPushTagAdds(
+  cell: ReturnType<PushTailEnv["REPO"]["getByName"]>,
+  refList: { name: string; target: string; peeled?: string }[],
+  addedTags: string[],
+): Promise<PushTagAdd[]> {
+  const tips = new Map(refList.map((ref) => [ref.name, ref]));
+  const records: PushTagAdd[] = [];
+  for (const tag of addedTags) {
+    try {
+      const tip = tips.get(`refs/tags/${tag}`);
+      if (tip === undefined) continue; // filtered by the caller — defense
+      let taggerTime: number | null = null;
+      let message: string;
+      let commitSha: string;
+      if (tip.peeled !== undefined) {
+        const tagObj = await cell.readTag(tip.target);
+        taggerTime = tagObj?.tagger?.time ?? null;
+        message = tagObj?.message ?? "";
+        commitSha = tip.peeled;
+      } else {
+        message = ""; // the commit read below carries the lightweight message
+        commitSha = tip.target;
+      }
+      const commit = await cell.readCommit(commitSha);
+      if (commit === null) {
+        console.error(`[push-tail] tag ${tag}: the tagged commit is unreadable — skipped (dirty-data tolerance)`);
+        continue;
+      }
+      const createdUnix = commit.committer.time; // "dated by its commit" (push.go:350)
+      records.push({
+        name: tag,
+        commitSha: commit.oid,
+        createdUnix,
+        publishedUnix: taggerTime ?? createdUnix, // push.go:351-354 — Tagger nil → created
+        message: tip.peeled !== undefined ? message : commit.message,
+      });
+    } catch (error) {
+      console.error(
+        `[push-tail] tag ${tag}: object read failed — skipped (dirty-data tolerance): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  return records;
+}
+
 export async function applyPushTail(
   env: PushTailEnv,
   repo: RepositoryRow,
   engineRepo: string,
   tail: PushTailCommands,
 ): Promise<void> {
-  if (tail.tagDeletes.length === 0 && tail.prHeadPushes.length === 0) return;
+  if (tail.tagDeletes.length === 0 && tail.tagAdds.length === 0 && tail.prHeadPushes.length === 0) return;
   try {
-    const refNames = new Set(((await env.REPO.getByName(engineRepo).listRefs()).refs ?? []).map((ref) => ref.name));
+    const refList = (await env.REPO.getByName(engineRepo).listRefs()).refs ?? [];
+    const refNames = new Set(refList.map((ref) => ref.name));
 
     const deletedTags = [...new Set(tail.tagDeletes)].filter((tag) => !refNames.has(`refs/tags/${tag}`));
     if (deletedTags.length > 0) {
       await pushUpdateDeleteTags(env.DB, repo.id, deletedTags);
+    }
+
+    // B-54 — the mint arm: only adds whose ref EXISTS in the post-commit
+    // refs (the create's CAS ran after the policy hook, so a "fetch first"
+    // ng create is filtered like its delete twin).
+    const addedTags = [...new Set(tail.tagAdds)].filter((tag) => refNames.has(`refs/tags/${tag}`));
+    if (addedTags.length > 0) {
+      const records = await readPushTagAdds(env.REPO.getByName(engineRepo), refList, addedTags);
+      if (records.length > 0) {
+        await pushUpdateAddTags(env.DB, repo.id, tail.pusherId, records);
+      }
     }
 
     const headIndexes = [...new Set(tail.prHeadPushes)];

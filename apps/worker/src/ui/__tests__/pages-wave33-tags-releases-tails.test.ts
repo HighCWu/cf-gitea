@@ -37,7 +37,7 @@
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
@@ -49,6 +49,7 @@ import { RepoService } from "../../repos/service";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
+import { ZERO_OID } from "../../api/services/engine";
 import { T0, uiEnv } from "./harness";
 
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
@@ -82,6 +83,8 @@ interface Wave33Fixture {
   repoId: string;
   v1ReleaseId: number;
   v2TagRecordId: number;
+  rel10TagRecordId: number;
+  keepMeTagRecordId: number;
 }
 
 let wave33Fixture: Wave33Fixture | null = null;
@@ -115,6 +118,37 @@ async function ensureWave33Fixture(): Promise<Wave33Fixture> {
     .get();
   if (repoRow === undefined) throw new Error("wave33 tagged row missing");
   await addOrUpdateCollaborator(env.DB, repoRow.id, read.id, "read", now);
+
+  // The B-54 mint lands in the push tail's waitUntil — poll the four rows
+  // in before the guarded creates below read them (the settle precedent),
+  // so every downstream pin sees the mint-first order deterministically.
+  await vi.waitFor(
+    async () => {
+      const landed = await drizzle(env.DB)
+        .select({ lower: releases.lowerTagName })
+        .from(releases)
+        .where(eq(releases.repoId, repoRow.id))
+        .all();
+      for (const name of ["v1", "rel/1.0", "v2", "keep/me"]) {
+        if (!landed.some((row) => row.lower === name)) {
+          throw new Error(`B-54 mint not landed: ${name}`);
+        }
+      }
+    },
+    { timeout: 15_000, interval: 300 }, // the settle precedent (the tail is waitUntil-async)
+  );
+
+  // The rowless engine tag (direct cell CAS — no receive, no tail, no
+  // mint): the tags page's NAME-keyed delete carrier stays exercisable now
+  // that every pushed tag carries a row (the B-54 landing reshapes the
+  // carrier pins — rel/1.0 grew one).
+  const bareCell = env.REPO.getByName("wave33-owner/tagged");
+  const bareRefs = await bareCell.listRefs();
+  if (!(bareRefs.refs ?? []).some((ref) => ref.name === "refs/tags/bare-tag")) {
+    const mainTip = (bareRefs.refs ?? []).find((ref) => ref.name === "refs/heads/main")!.target;
+    const landed = await bareCell.commitApiChange({ ref: "refs/tags/bare-tag", expectedOldOid: ZERO_OID, newOid: mainTip });
+    if (landed.tag !== "committed") throw new Error("bare-tag ref landing failed");
+  }
 
   // The release-backed v1 (the pencil + the 409 arm) and the tag-only D1
   // record on v2 (the `?id=` carrier arm) — idempotent creates.
@@ -186,12 +220,19 @@ async function ensureWave33Fixture(): Promise<Wave33Fixture> {
     });
   }
 
+  const rel10Record = await findReleaseByTag(env.DB, repoRow.id, "rel/1.0");
+  if (rel10Record === null || !rel10Record.isTag) throw new Error("wave33 rel/1.0 minted record missing");
+  const keepMeRecord = await findReleaseByTag(env.DB, repoRow.id, "keep/me");
+  if (keepMeRecord === null || !keepMeRecord.isTag) throw new Error("wave33 keep/me minted record missing");
+
   wave33Fixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
     readCookie: await mintSession(env.DB, read.id),
     repoId: repoRow.id,
     v1ReleaseId: v1Row.id,
     v2TagRecordId: v2Record.id,
+    rel10TagRecordId: rel10Record.id,
+    keepMeTagRecordId: keepMeRecord.id,
   };
   return wave33Fixture;
 }
@@ -254,21 +295,25 @@ describe("wave-33 parser families (parseUiRoute / handlesUiRoute)", () => {
 // --- the tags aux JSON -----------------------------------------------------------
 
 describe("GET /{owner}/{repo}/tags/list", () => {
-  it("serves the branchTagSearchResponse byte shape over the creator-date order (R10)", async () => {
+  it("serves the branchTagSearchResponse byte shape over the release-table order (B-54: GetTagNamesByRepoID's rows, created_unix DESC id DESC)", async () => {
     const res = await fetchUi("/wave33-owner/tagged/tags/list");
     expect(res.status).toBe(200);
     // ctx.JSON's content type + the middleware's zero-option prod stamp (the
     // wave-32 containedRefsResponse sibling).
     expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
     expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
-    // No filter, no query: every tag name, creator-date DESC (R10 — the
-    // release-table Desc(created_unix,id) semantics over the engine tag
-    // universe; v1@c0 sorts last, the c1 tags keep name order as the
-    // tiebreak: "keep/me" < "rel/1.0" < "v2"). ?q= is IGNORED like
-    // upstream's handler.
-    expect(await res.text()).toBe('{"results":["keep/me","rel/1.0","v2","v1"]}');
+    // No filter, no query: the RELEASE TABLE's sha1-carrying rows
+    // (GetTagNamesByRepoID — the B-54 landing retires the creator-date
+    // engine-universe substitution, since every pushed tag now mints its
+    // row). Order: created_unix DESC, id DESC — the three c1 (T0+60) rows
+    // keep mint order (v1 minted first, so id ASC v1<rel/1.0<v2<keep/me →
+    // id DESC puts keep/me first); v1@c0 (its converted release keeps the
+    // minted created_unix = the c0 commit time) sorts last. The rowless
+    // bare-tag is invisible, like upstream. ?q= is IGNORED like upstream's
+    // handler.
+    expect(await res.text()).toBe('{"results":["keep/me","v2","rel/1.0","v1"]}');
     const filtered = await fetchUi("/wave33-owner/tagged/tags/list?q=v1&page=2");
-    expect(await filtered.text()).toBe('{"results":["keep/me","rel/1.0","v2","v1"]}');
+    expect(await filtered.text()).toBe('{"results":["keep/me","v2","rel/1.0","v1"]}');
   });
 
   it("404s the empty repo (MustBeNotEmpty) and the deeper tails", async () => {
@@ -283,13 +328,18 @@ describe("GET /{owner}/{repo}/tags/list", () => {
 
 describe("the tags page delete control (wave-33 hunks)", () => {
   it("renders the writer-gated form with the right carrier per row", async () => {
-    const { ownerCookie, readCookie, v2TagRecordId } = await theFixture();
+    const { ownerCookie, readCookie, v2TagRecordId, rel10TagRecordId, keepMeTagRecordId } = await theFixture();
     const ownerHtml = await (await fetchUi("/wave33-owner/tagged/tags", withCookie("/wave33-owner/tagged/tags", ownerCookie))).text();
-    // The D1-record tag carries upstream's `id` carrier...
+    // The D1-record tags carry upstream's `id` carrier — since the B-54
+    // mint, EVERY pushed tag has a row, so the pushed v2 AND the minted
+    // rel/1.0 + keep/me all render ids...
     expect(ownerHtml).toContain('action="/wave33-owner/tagged/tags/delete"');
     expect(ownerHtml).toContain(`name="id" value="${v2TagRecordId}"`);
-    // ...the rowless engine tag the name-keyed arm...
-    expect(ownerHtml).toContain('name="tag" value="rel/1.0"');
+    expect(ownerHtml).toContain(`name="id" value="${rel10TagRecordId}"`);
+    expect(ownerHtml).toContain(`name="id" value="${keepMeTagRecordId}"`);
+    // ...the one ROWLESS engine tag (direct-CAS bare-tag) still exercises
+    // the name-keyed arm...
+    expect(ownerHtml).toContain('name="tag" value="bare-tag"');
     // ...and the release-backed tag carries NO delete control (upstream's
     // `$release.IsTag` gate) — its Detail link stands instead.
     expect(ownerHtml).not.toContain('name="tag" value="v1"');

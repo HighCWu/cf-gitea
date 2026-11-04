@@ -59,7 +59,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
+import { serializeCommit, serializeTag, serializeTree } from "@cf-gitea/git-engine";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
@@ -2112,7 +2112,7 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     // The tail invoked with a delete whose ref is STILL THERE (the shape a
     // CAS-conflicted command leaves behind): the verify filters it, D1
     // untouched.
-    const tail: PushTailCommands = { tagDeletes: ["v1"], prHeadPushes: [] };
+    const tail: PushTailCommands = { tagDeletes: ["v1"], tagAdds: [], prHeadPushes: [], pusherId: ownerId };
     await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, tail);
 
     const row = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).get();
@@ -2120,6 +2120,192 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     // The service stamped published_at on the seeded publish — untouched
     // means the withdrawal never ran.
     expect((row?.publishedUnix ?? 0)).toBeGreaterThan(0);
+  });
+
+  // --- B-54: the mint arm (upstream pushUpdateAddTags, push.go:323-409) ---
+
+  it("a receive-pack LIGHTWEIGHT tag create mints the is_tag row (end-to-end, push.go:361-378)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b54mint");
+    // The commit's committer time is buildPack's fixed 1700000000 and the
+    // message "initial push-create\n" — the mint's created_unix/published_unix
+    // (Tagger nil → published = created) and title/note sources.
+    // The objects already landed with main — a valid pack stream is still
+    // required, so the tag commands ride buildPack's pack verbatim.
+    const { pack } = await buildPack();
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody(
+        [
+          { ref: "refs/tags/v1", oid: tip },
+          { ref: "refs/tags/v2", oid: tip },
+        ],
+        pack,
+      ),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all();
+      expect(rows).toHaveLength(2);
+    });
+    const byTag = new Map(
+      (await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all()).map((row) => [row.tagName, row]),
+    );
+    const v1 = byTag.get("v1");
+    const v2 = byTag.get("v2");
+    expect(v1).toBeDefined();
+    expect(v2).toBeDefined();
+    for (const row of [v1, v2]) {
+      // The minted row's exact shape (push.go:361-378 — Target "", the
+      // numCommits -1 placeholder, IsDraft/IsPrerelease false, IsTag true,
+      // publisher = the pusher, created_unix = the commit's committer time,
+      // published_unix = created_unix on the lightweight shape, title/note
+      // from SplitCommitTitleBody of the commit's message).
+      expect(row?.target).toBe("");
+      expect(row?.sha1).toBe(tip);
+      expect(row?.numCommits).toBe(-1);
+      expect(row?.isDraft).toBe(false);
+      expect(row?.isPrerelease).toBe(false);
+      expect(row?.isTag).toBe(true);
+      expect(row?.publisherId).toBe(ownerId);
+      expect(row?.createdAt?.getTime()).toBe(1700000000 * 1000);
+      expect(row?.publishedUnix).toBe(1700000000);
+      expect(row?.title).toBe("initial push-create");
+      expect(row?.note).toBe("");
+    }
+    // Original-case tag_name rows, lowered lookup keys.
+    expect(v1?.lowerTagName).toBe("v1");
+    expect(v2?.lowerTagName).toBe("v2");
+  });
+
+  it("a receive-pack ANNOTATED tag create mints published_unix from the tagger and title/note from the tag message (push.go:350-356)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b54annotated");
+    const cell = env.REPO.getByName(engineName);
+    const TAGGER_TIME = 1_750_000_000;
+    const tag = serializeTag({
+      object: tip,
+      type: "commit",
+      tag: "v9",
+      tagger: { name: "Tagger User", email: "tagger@example.com", time: TAGGER_TIME, tz: "+0000" },
+      message: "annotated subject\nbody line\n",
+    });
+    const stored = await cell.putApiObjects([{ oid: tag.oid, type: tag.type, data: tag.data }]);
+    expect(stored.tag).toBe("ok");
+    const { pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/tags/v9", oid: tag.oid }], pack);
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      expect(await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all()).toHaveLength(1);
+    });
+    const row = (await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all())[0];
+    // sha1 = the PEELED commit (GetTagCommit), created_unix = the commit's
+    // committer time (1700000000), published_unix = the TAGGER time
+    // (push.go:351-354), title/note split from the annotated message
+    // (push.go:356 — the first "\n" cut).
+    expect(row?.sha1).toBe(tip);
+    expect(row?.createdAt?.getTime()).toBe(1700000000 * 1000);
+    expect(row?.publishedUnix).toBe(TAGGER_TIME);
+    expect(row?.title).toBe("annotated subject");
+    expect(row?.note).toBe("body line\n");
+    expect(row?.isTag).toBe(true);
+    expect(row?.publisherId).toBe(ownerId);
+  });
+
+  it("the mint's verify arm: a collected add whose ref is absent post-push mints nothing (the CAS-conflict shape)", async () => {
+    const { repoId, engineName, ownerId } = await seedTailRepo("b54conflict");
+    const tail: PushTailCommands = { tagDeletes: [], tagAdds: ["ghost"], prHeadPushes: [], pusherId: ownerId };
+    await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, tail);
+    expect(await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all()).toEqual([]);
+  });
+
+  it("the refresh arms (push.go:380-403): a real release keeps its publish stamp and un-drafts, an is_tag row refreshes title/note/published, the publisher follows the pusher", async () => {
+    const { repoId, engineName, ownerId } = await seedTailRepo("b54refresh");
+    const cell = env.REPO.getByName(engineName);
+    const tip = (await cell.listRefs()).refs.find((ref) => ref.name === "refs/heads/main")!.target;
+    // Real release + is_tag record on tags that already exist as refs (the
+    // direct-CAS seeding shape — applyPushTail runs directly, no receive).
+    for (const ref of ["refs/tags/rel-tag", "refs/tags/pure-tag"]) {
+      const landed = await cell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: tip });
+      expect(landed.tag).toBe("committed");
+    }
+    const relId = await seedReleaseRow(repoId, 424242, "rel-tag", false);
+    const pureId = await seedReleaseRow(repoId, 424242, "pure-tag", true);
+    await drizzle(env.DB)
+      .update(releases)
+      .set({ publishedUnix: 1_700_000_000, sha1: "", numCommits: 7, isDraft: true, title: "Real release", note: "kept note" })
+      .where(eq(releases.id, relId));
+    await drizzle(env.DB)
+      .update(releases)
+      .set({ title: "stale title", note: "stale note", publishedUnix: 1, sha1: null, createdAt: new Date(0) })
+      .where(eq(releases.id, pureId));
+
+    await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
+      tagDeletes: [],
+      tagAdds: ["rel-tag", "pure-tag"],
+      prHeadPushes: [],
+      pusherId: ownerId,
+    });
+
+    const rel = (await drizzle(env.DB).select().from(releases).where(eq(releases.id, relId)).get())!;
+    // The REAL release: sha1/created_unix refresh, isDraft=false, a NON-zero
+    // published_unix survives (push.go:388-392's zero arm), title/note/
+    // num_commits untouched, publisher = the PUSHER (push.go:403 — both
+    // arms).
+    expect(rel.sha1).toBe(tip);
+    expect(rel.createdAt?.getTime()).toBe(1700000000 * 1000);
+    expect(rel.isDraft).toBe(false);
+    expect(rel.publishedUnix).toBe(1_700_000_000);
+    expect(rel.title).toBe("Real release");
+    expect(rel.note).toBe("kept note");
+    expect(rel.numCommits).toBe(7);
+    expect(rel.publisherId).toBe(ownerId);
+
+    const pure = (await drizzle(env.DB).select().from(releases).where(eq(releases.id, pureId)).get())!;
+    // The is_tag row: title/note/published_unix refresh from the tag
+    // (push.go:385-387 — the stale stamp goes), sha1/created_unix refresh.
+    expect(pure.isTag).toBe(true);
+    expect(pure.title).toBe("initial push-create");
+    expect(pure.note).toBe("");
+    expect(pure.publishedUnix).toBe(1700000000);
+    expect(pure.sha1).toBe(tip);
+    expect(pure.createdAt?.getTime()).toBe(1700000000 * 1000);
+    expect(pure.publisherId).toBe(ownerId);
+  });
+
+  it("PROBE: one receive carrying main+tags (the ensureSeededRepo shape) mints rows", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const created = await new RepoService(env.DB).create({ owner: { id: alice.id, usernameLower: "alice" }, name: "b54probe", isPrivate: false });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody(
+      [
+        { ref: "refs/heads/main", oid },
+        { ref: "refs/tags/v1", oid },
+      ],
+      pack,
+    );
+    const push = await SELF.fetch(`https://example.com/alice/b54probe.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(push.status).toBe(200);
+    await vi.waitFor(
+      async () => {
+        const rows = await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, created.id)).all();
+        if (rows.length === 0) throw new Error("no minted row");
+        expect(rows[0]?.tagName).toBe("v1");
+        expect(rows[0]?.isTag).toBe(true);
+      },
+      { timeout: 15_000, interval: 300 },
+    );
   });
 
   it("the D-7c producer: a PR-head push enqueues ONE auto-merge-check message, non-PR-head shapes enqueue zero", async () => {
@@ -2136,7 +2322,9 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     // The PR-head push: exactly ONE message, resolved to the global issue id.
     await applyPushTail(tailEnv, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
+      tagAdds: [],
       prHeadPushes: [7],
+      pusherId: 0,
     });
     expect(queue.bodies.length).toBe(1);
     const first = (queue.bodies[0] ?? []).map((wrapper) => wrapper.body as AutoMergeCheckMessage);
@@ -2145,7 +2333,9 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     // A crafted duplicate command for the same head still sends ONE (dedupe).
     await applyPushTail(tailEnv, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
+      tagAdds: [],
       prHeadPushes: [7, 7],
+      pusherId: 0,
     });
     expect((queue.bodies[1] ?? []).length).toBe(1);
 
@@ -2153,11 +2343,15 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     const quiet = spyQueue();
     await applyPushTail({ ...env, REPO_TASKS: quiet }, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
+      tagAdds: [],
       prHeadPushes: [],
+      pusherId: 0,
     });
     await applyPushTail({ ...env, REPO_TASKS: quiet }, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
+      tagAdds: [],
       prHeadPushes: [99], // no issues row at index 99
+      pusherId: 0,
     });
     expect(quiet.bodies).toEqual([]);
   });
