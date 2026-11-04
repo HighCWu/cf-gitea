@@ -66,7 +66,7 @@
  * old "users table empty" gate.
  */
 
-import { asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -94,6 +94,8 @@ import { LastOrgOwnerError } from "./orgs/errors";
 import { scrubUserFromAllRules } from "./branch-protection";
 import { deletePackageAndReferences } from "./packages/model";
 import { usableUsernameError } from "./orgs/orgs";
+import { isComplexEnough, buildComplexityError, MIN_PASSWORD_LENGTH } from "../auth/password-policy";
+import { newPasswordRecord, newSalt, verifyPassword } from "../auth/password";
 
 // ---------------------------------------------------------------------------
 // The ALLOW_SIGNUP gate (upstream DISABLE_REGISTRATION, inverted polarity)
@@ -126,10 +128,14 @@ export function allowSignup(env: FirstRunEnv): boolean {
 // Shared validation (the adminCreateUser ladder's steps 1-2)
 // ---------------------------------------------------------------------------
 
-/** A web account-creation form. `password` is accepted-and-ignored
- *  (module header — PAT-only auth); `retype` is checked for equality with
- *  it (upstream RegisterForm semantics, auth.go:577) but the value itself
- *  never lands anywhere. */
+/** A web account-creation form. `password` handling SPLIT by ladder since
+ *  PWD-2's store landed (SPEC-0002 §6 superseded §4.6.7's PAT-only
+ *  posture): initializeAdminUser requires it non-empty (the retype-match
+ *  arm is the form's confirm) and STORES the hash record (user.go:783-794's
+ *  SetPassword posture); the register ladder still ignores it
+ *  (insertAccountRow takes {username, email} only) until its own arm
+ *  lands. `retype` is checked for equality with the password (upstream
+ *  RegisterForm semantics, auth.go:577). */
 export interface AccountForm {
   username: string;
   email: string;
@@ -295,16 +301,31 @@ export async function initializeAdminUser(
   const invalid = accountFormError(form);
   if (invalid !== null) return { outcome: "invalid", message: invalid };
 
+  // install.go:267-276 — the bootstrap admin's password is REQUIRED
+  // (non-empty; the confirm-match arm is the form's retype, filled equal by
+  // first-run.ts — upstream `err_empty_admin_password`). NO
+  // length/complexity gate on the install arm: upstream validates only
+  // non-empty + match here (the CreateUser prepare runs SetPassword
+  // directly, user.go:783-794).
+  if (form.password === "") {
+    return { outcome: "invalid", message: "Administrator password is empty" };
+  }
+
   const now = options?.now ?? new Date();
   const lower = form.username.toLowerCase();
+  // The password record is hashed BEFORE the guarded insert so the winning
+  // row lands complete (user.go:783-794's prepare step — SetPassword: new
+  // salt + current algorithm; rands rides EVERY upstream create, :786).
+  const record = await newPasswordRecord(form.password);
+  const rands = newSalt();
   // The existence-guarded insert: `meta.changes` is the whole verdict. D1
   // serializes writers, so exactly one concurrent submission sees changes
   // == 1 (module header). The guard rides the SAME NON_SYSTEM_USER_ROW
   // predicate as `initWindowOpen` — GET and POST cannot disagree.
   const result = await drizzle(d1)
     .run(
-      sql`INSERT INTO users (username, username_lower, email, display_name, is_admin, status, visibility, type, created_at)
-          SELECT ${form.username}, ${lower}, ${form.email}, NULL, 1, 'active', 'public', 'user', ${Math.floor(now.getTime() / 1000)}
+      sql`INSERT INTO users (username, username_lower, email, display_name, is_admin, status, visibility, type, created_at, passwd, passwd_hash_algo, salt, rands)
+          SELECT ${form.username}, ${lower}, ${form.email}, NULL, 1, 'active', 'public', 'user', ${Math.floor(now.getTime() / 1000)}, ${record.passwd}, ${record.passwdHashAlgo}, ${record.salt}, ${rands}
           WHERE NOT EXISTS (SELECT 1 FROM ${users} WHERE ${NON_SYSTEM_USER_ROW})`,
     );
   if ((result.meta.changes ?? 0) === 0) {
@@ -317,6 +338,99 @@ export async function initializeAdminUser(
     return { outcome: "already-initialized" };
   }
   return { outcome: "created", user };
+}
+
+// ---------------------------------------------------------------------------
+// The password arms (SPEC-0002 §6 — PWD-2/M8)
+// ---------------------------------------------------------------------------
+
+/**
+ * The shared UpdateAuth password-validation ladder (upstream
+ * services/user/update.go:247-265): minimum length, complexity, pwned
+ * (default-OFF upstream — PASSWORD_CHECK_PWNED MustBool(false), pwn.go:37;
+ * Phase A keeps it off, the config surface is Phase C). Returns the inline
+ * message for the caller's re-render, or null when clean.
+ */
+export function validateNewPassword(password: string): string | null {
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return `Password length cannot be less than ${MIN_PASSWORD_LENGTH} characters.`;
+  }
+  if (!isComplexEnough(password)) return buildComplexityError();
+  return null;
+}
+
+export interface ChangePasswordForm {
+  oldPassword: string;
+  newPassword: string;
+  retype: string;
+}
+
+export type ChangePasswordOutcome =
+  | { outcome: "changed"; user: UserAccountRow }
+  | { outcome: "invalid"; message: string };
+
+/**
+ * The change-password arm (upstream AccountPost, routers/web/user/setting/
+ * account.go:60-96 folded with UpdateAuth's password block, update.go:
+ * 247-283): the old-password check when a password IS set, the retype
+ * match, the validation ladder, SetPassword, and the invalidation =
+ * REMEMBER-ME SESSION ROWS ONLY (upstream DeleteAuthTokensByUserID —
+ * live browser sessions and PATs are untouched).
+ */
+export async function changeOwnPassword(
+  d1: D1Database,
+  userId: number,
+  form: ChangePasswordForm,
+  _options?: { now?: Date },
+): Promise<ChangePasswordOutcome> {
+  const db = drizzle(d1);
+  const user =
+    (await db.select().from(users).where(eq(users.id, userId)).get()) ?? null;
+  if (user === null) return { outcome: "invalid", message: "user not found" };
+
+  // account.go:74 — the old password is REQUIRED only when a password is
+  // set (IsPasswordSet — a password-less row sets its first password
+  // without the old check, upstream's own shape).
+  if (user.passwd !== "" && !(await verifyPassword(form.oldPassword, user.passwd, user.salt, user.passwdHashAlgo))) {
+    return { outcome: "invalid", message: "The current password is incorrect." };
+  }
+  if (form.newPassword !== form.retype) {
+    return { outcome: "invalid", message: "The passwords do not match." };
+  }
+  const policy = validateNewPassword(form.newPassword);
+  if (policy !== null) return { outcome: "invalid", message: policy };
+
+  const record = await newPasswordRecord(form.newPassword);
+  const updated = await db
+    .update(users)
+    .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+    .where(eq(users.id, userId))
+    .returning()
+    .all();
+  const row = updated[0];
+  if (row === undefined) return { outcome: "invalid", message: "user not found" };
+
+  // update.go:279-284 — the invalidation: remember-me rows only (upstream
+  // DeleteAuthTokensByUserID), then the audit row (update.go:283).
+  const { sessions } = await import("../db/schema");
+  await db.delete(sessions).where(and(eq(sessions.userId, userId), eq(sessions.remember, true)));
+  const { AuditActions, emitAudit } = await import("./audit");
+  void emitAudit(db, {
+    action: AuditActions.UserPassword,
+    actorId: userId,
+    actorName: row.username,
+    actorCredential: null,
+    scopeType: "user",
+    scopeId: userId,
+    scopeName: row.username,
+    origin: "ui",
+    ipAddress: null,
+    vars: { scope: row.username },
+  }).catch((error: unknown) => {
+    console.error(`change-password: audit row failed: ${String(error)}`);
+  });
+
+  return { outcome: "changed", user: row };
 }
 
 // ---------------------------------------------------------------------------
@@ -583,4 +697,57 @@ export async function deleteUserCascade(
     // (c) the row — the FK cascades carry the rest of the census.
     db.delete(users).where(eq(users.id, userId)),
   ]);
+}
+
+/**
+ * The reset-complete password apply (upstream ResetPasswdPost's UpdateAuth
+ * arm, routers/web/auth/password.go:216-244 folded with update.go:247-283 —
+ * NO old-password check: the code's HMAC already binds the hash data, so a
+ * valid code IS the credential). Ladder + SetPassword + the remember-me
+ * invalidation + the audit row. The caller owns the code verification and
+ * the 2FA arms.
+ */
+export async function applyPasswordReset(
+  d1: D1Database,
+  userId: number,
+  newPassword: string,
+  retype: string,
+  _options?: { now?: Date },
+): Promise<ChangePasswordOutcome> {
+  if (newPassword !== retype) {
+    return { outcome: "invalid", message: "The passwords do not match." };
+  }
+  const policy = validateNewPassword(newPassword);
+  if (policy !== null) return { outcome: "invalid", message: policy };
+
+  const db = drizzle(d1);
+  const record = await newPasswordRecord(newPassword);
+  const updated = await db
+    .update(users)
+    .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+    .where(eq(users.id, userId))
+    .returning()
+    .all();
+  const row = updated[0];
+  if (row === undefined) return { outcome: "invalid", message: "user not found" };
+
+  const { sessions } = await import("../db/schema");
+  await db.delete(sessions).where(and(eq(sessions.userId, userId), eq(sessions.remember, true)));
+  const { AuditActions, emitAudit } = await import("./audit");
+  void emitAudit(db, {
+    action: AuditActions.UserPassword,
+    actorId: userId,
+    actorName: row.username,
+    actorCredential: null,
+    scopeType: "user",
+    scopeId: userId,
+    scopeName: row.username,
+    origin: "ui",
+    ipAddress: null,
+    vars: { scope: row.username },
+  }).catch((error: unknown) => {
+    console.error(`reset-password: audit row failed: ${String(error)}`);
+  });
+
+  return { outcome: "changed", user: row };
 }

@@ -33,9 +33,13 @@
  *     flag folds (status deviation-6, admin with the last-admin guard, the
  *     skip-self prohibit guard), the PASSWORD ARM'S VALIDATION SHAPES
  *     (deviation 1: accepted-and-ignored — no length/complexity/pwned arm
- *     exists to hit), the type arms (Bot on user/admin/org; junk at the
- *     bind), the reset-2FA arm, the bind arms (silent flagged
- *     re-renders), and the unknown-target LIST redirect.
+ *     exists to hit), THE RULE-4 TRIO's interim posture (max_repo_creation
+ *     / restricted / allow_create_organization rendered DISABLED with
+ *     not-supported notices — upstream's arms are real, users.go:526-528,
+ *     ADR-0008 re-opens them; hand-crafted POSTs store nothing), the type
+ *     arms (Bot on user/admin/org; junk at the bind), the reset-2FA arm,
+ *     the bind arms (silent flagged re-renders), and the unknown-target
+ *     LIST redirect.
  *
  * THE ADMIN GATE is wiring-level (adminPagePrologue — the seams here are
  * POST-gate inputs, the matrix-harness posture: "the module trusts its
@@ -293,13 +297,17 @@ describe("the render (edit.tmpl at the pin)", () => {
     expect(html).toContain('name="email" type="email" value="alice@example.com" required');
     expect(html).toContain('name="website" type="url" value="https://alice.example"');
     expect(html).toContain('name="location" value="Berlin"');
-    // The password field renders DISABLED with the not-supported notice
-    // (ADR-0008 rule 4 — accept-and-ignore is forbidden until PWD-2) and
-    // NEVER echoes a value.
-    expect(html).toContain('name="password" type="password" autocomplete="new-password" disabled');
-    expect(html).toContain(adminUserEditLocale.password_not_supported);
-    expect(html).not.toContain("Leave the password empty to keep it unchanged.");
+    // The password field is LIVE (SPEC-0002 §6.2 admin-set, PWD-2 — the
+    // interim disabled posture is superseded): rendered empty, ENABLED,
+    // with upstream's password_helper, and it NEVER echoes a value.
+    expect(html).toContain('name="password" type="password" autocomplete="new-password"/>');
+    expect(html).toContain(adminUserEditLocale.password_helper);
     expect(html).not.toContain('type="password" value=');
+    // max_repo_creation: the same rule-4 posture — upstream's fresh-row
+    // default -1 rendered, the input DISABLED with the not-supported notice
+    // (upstream's arm is real, users.go:526 → user.go:129).
+    expect(html).toContain('name="max_repo_creation" type="number" min="-1" value="-1" disabled');
+    expect(html).toContain(adminUserEditLocale.max_repo_creation_not_supported);
   });
 
   it("the visibility dropdown posts upstream's 0/1/2 wire values with the current selected", async () => {
@@ -328,27 +336,33 @@ describe("the render (edit.tmpl at the pin)", () => {
     expect(html).toContain('id="login_name" name="login_name" value=""');
   });
 
-  it("the checkbox block: the status pair, admin, restricted, and the DEFAULT-config hidden+disabled pair", async () => {
+  it("the checkbox block: the status pair, admin, the DISABLED rule-4 pair, and the DEFAULT-config hidden+disabled pair", async () => {
     const seeded = await seedEdit();
     const html = await renderEdit(seeded);
     expect(html).toContain('name="active" type="checkbox" checked=""');
     expect(html).toContain('name="prohibit_login" type="checkbox"/>'); // active user → unchecked
     expect(html).not.toContain('prohibit_login" type="checkbox" disabled'); // not self
     expect(html).toContain('name="admin" type="checkbox"/>'); // alice is not admin
-    expect(html).toContain('name="restricted" type="checkbox"/>'); // the constant-false store
+    // restricted + allow_create_organization carry the ADR-0008 rule-4
+    // remedy (the password pattern): the checkboxes render DISABLED with
+    // the not-supported notices (upstream's arms are real — users.go:527-528
+    // — and the disabled input never offers a store the backend lacks).
+    expect(html).toContain('name="restricted" type="checkbox" disabled=""');
+    expect(html).toContain(adminUserEditLocale.restricted_not_supported);
+    expect(html).toContain('name="allow_create_organization" type="checkbox" disabled=""');
+    expect(html).toContain(adminUserEditLocale.allow_create_organization_not_supported);
     // DisableGitHooks (true) + ImportLocalPaths (false) defaults → both
     // fields render tw-hidden with the checkbox disabled.
     expect(html).toContain('data-tooltip-content="Git Hooks are executed');
     expect(html).toContain('name="allow_git_hook" type="checkbox" disabled=""');
     expect(html).toContain('name="allow_import_local" type="checkbox" disabled=""');
-    expect(html).toContain('name="allow_create_organization" type="checkbox"/>');
   });
 
   it("an admin target flips the admin/create-org checks and drops the user_type dropdown", async () => {
     const seeded = await seedEdit();
     const html = await renderEdit(seeded, seeded.adminId);
     expect(html).toContain('name="admin" type="checkbox" checked=""');
-    expect(html).toContain('name="allow_create_organization" type="checkbox" checked=""');
+    expect(html).toContain('name="allow_create_organization" type="checkbox" checked="" disabled=""');
     expect(html).not.toContain('id="user_type"');
   });
 
@@ -592,22 +606,90 @@ describe("the submit — the flag folds", () => {
   });
 });
 
-describe("the submit — the password arm's interim posture (ADR-0008 rule 4)", () => {
-  it("the rendered field is DISABLED (never offers the operation) yet never echoes", async () => {
+describe("the submit — the password arm (SPEC-0002 §6.2 admin-set, PWD-2)", () => {
+  it("the rendered field is LIVE, empty, never echoes", async () => {
     const seeded = await seedEdit();
     const html = await renderEdit(seeded);
-    expect(html).toContain('name="password" type="password" autocomplete="new-password" disabled');
+    expect(html).toContain('name="password" type="password" autocomplete="new-password"/>');
+    expect(html).toContain(adminUserEditLocale.password_helper);
     expect(html).not.toContain('type="password" value=');
   });
 
-  it("a hand-crafted POST with ANY password value stores nothing (no arm exists to hit)", async () => {
+  it("EMPTY password = unchanged (FromNonDefault)", async () => {
     const seeded = await seedEdit();
-    for (const password of ["a", "password123", "x".repeat(300)]) {
-      expect(await submit(seeded, aliceForm({ password }))).toEqual({ outcome: "updated" });
-      const row = await rowOf(seeded.aliceId);
-      expect(row.location).toBe("Berlin"); // the rest of the round-trip landed
-      expect(Object.keys(row)).not.toContain("password"); // no password store exists
-    }
+    const before = await rowOf(seeded.aliceId);
+    expect(await submit(seeded, aliceForm({ password: "" }))).toEqual({ outcome: "updated" });
+    const after = await rowOf(seeded.aliceId);
+    expect(after.passwd).toBe(before.passwd);
+    expect(after.salt).toBe(before.salt);
+    expect(after.passwdHashAlgo).toBe(before.passwdHashAlgo);
+  });
+
+  it("a policy-violating password re-renders with the Err_Password message, field flagged", async () => {
+    const seeded = await seedEdit();
+    const short = await submit(seeded, aliceForm({ password: "a" }));
+    expect(short).toEqual({
+      outcome: "invalid",
+      message: "Password length cannot be less than 8 characters.",
+      field: "password",
+    });
+    const complex = await submit(seeded, aliceForm({ password: "alllowercase123" }));
+    expect(complex).toEqual({
+      outcome: "invalid",
+      message: expect.stringContaining("Password does not pass complexity requirements:"),
+      field: "password",
+    });
+  });
+
+  it("a valid password stores the hashed record + clears remember sessions", async () => {
+    const seeded = await seedEdit();
+    const result = await submit(seeded, aliceForm({ password: "Fresh-1a" }));
+    expect(result).toEqual({ outcome: "updated" });
+    const row = await rowOf(seeded.aliceId);
+    expect(row.passwd).toMatch(/^[0-9a-f]{100}$/);
+    expect(row.salt).toMatch(/^[0-9a-f]{32}$/);
+    expect(row.passwdHashAlgo).toBe("pbkdf2$50000$50");
+    const { sessions } = await import("../../db/schema");
+    const rows = await drizzle(env.DB).select().from(await sessions).all();
+    expect(rows.every((r) => !(r.userId === seeded.aliceId && r.remember))).toBe(true);
+  });
+});
+
+describe("the submit — the rule-4 trio's interim posture (ADR-0008 rule 4)", () => {
+  it("the rendered fields are DISABLED with their not-supported notices (never offer the operation)", async () => {
+    const seeded = await seedEdit();
+    const html = await renderEdit(seeded);
+    // max_repo_creation: rendered at upstream's fresh-row default -1, disabled.
+    expect(html).toContain('name="max_repo_creation" type="number" min="-1" value="-1" disabled');
+    expect(html).toContain(adminUserEditLocale.max_repo_creation_not_supported);
+    // restricted: unchecked + disabled (the constant-false store).
+    expect(html).toContain('name="restricted" type="checkbox" disabled=""');
+    expect(html).toContain(adminUserEditLocale.restricted_not_supported);
+    // allow_create_organization: checked iff isAdmin, disabled.
+    expect(html).toContain('name="allow_create_organization" type="checkbox" disabled=""');
+    expect(html).toContain(adminUserEditLocale.allow_create_organization_not_supported);
+  });
+
+  it("a hand-crafted POST with any trio value stores nothing (no columns exist to hit)", async () => {
+    const seeded = await seedEdit();
+    expect(
+      await submit(
+        seeded,
+        aliceForm({ max_repo_creation: "5", restricted: "on", allow_create_organization: "on" }, [
+          "active",
+          "restricted",
+          "allow_create_organization",
+        ]),
+      ),
+    ).toEqual({ outcome: "updated" });
+    const row = await rowOf(seeded.aliceId);
+    expect(row.location).toBe("Berlin"); // the rest of the round-trip landed
+    // The trio's stores are the absent halves: no column absorbed anything
+    // (users carries no restricted/allow_create_organization/max_repo_creation).
+    expect(Object.keys(row)).not.toContain("restricted");
+    expect(Object.keys(row)).not.toContain("allow_create_organization");
+    expect(Object.keys(row)).not.toContain("maxRepoCreation");
+    expect(row.isAdmin).toBe(false); // the crafted org-permission value changed nothing
   });
 });
 

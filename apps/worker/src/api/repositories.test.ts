@@ -13,6 +13,8 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
+import { SELF } from "cloudflare:test";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { REPO_SETTINGS_DDL_STATEMENTS } from "./services/repo-settings";
@@ -67,6 +69,9 @@ const STUB_LOGIN = STUB_USER.login ?? "cf-gitea-stub";
 const TOKEN = "stub-token";
 const authHeaders = { Authorization: `token ${TOKEN}` };
 const ERROR_URL = "https://example.com/api/swagger";
+/** The SELF fetch origin (any host routes by path; the scope-gate suite's
+ *  convention). */
+const SELF_ORIGIN = "https://example.com";
 
 let repoSeq = 200;
 
@@ -326,6 +331,48 @@ describe("GET /repos/search (repoSearch)", () => {
       headers: authHeaders,
     });
     expect(publicOnly.headers.get("X-Total-Count")).toBe("1");
+  });
+
+  it("a public-only token's search is forced public-only — even with private=true (repo_list.go:366-368)", async () => {
+    // The route resolves `private` against the requester (repo.go:138), but
+    // upstream's SearchRepositoryCondition OVERRIDES it for a public-only
+    // doer (`IsPublicOnlyDoer(opts.Actor)` → `opts.Private = false`,
+    // repo_list.go:366-368) — the token cannot read its own private repos
+    // through the search (the DoerTokenRepoCond posture, repo_list.go:774-779).
+    // The scope rides the SPEC-0002 resolveAuth middleware (`c.get("auth")`),
+    // so this pins through the REAL worker (SELF), not the standalone stub
+    // router whose injected resolver never attaches a scope.
+    const owner = await seedVerifiedUser({ username: "PubOnlyOwner" });
+    await seedRepo(owner.username.toLowerCase(), "pub");
+    await seedRepo(owner.username.toLowerCase(), "vault", { visibility: "private" });
+
+    // `public-only,all` (the canonical normalized form, scopes.ts's
+    // public-only-first layout) — the restriction flag is not a permission
+    // drop, so the token passes every category gate and its IDENTITY is
+    // provable (otherwise a total of 1 would be indistinguishable from the
+    // anonymous posture): /user answers only for a verified identity.
+    const forcedToken = (await mintFor(owner.id, "pub-only", "public-only,all")).plaintext;
+    const who = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(who.status).toBe(200);
+    expect((await who.json<{ login?: string }>()).login).toBe("PubOnlyOwner");
+
+    const forced = await SELF.fetch(`${SELF_ORIGIN}/api/v1/repos/search?private=true`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(forced.status).toBe(200);
+    expect(forced.headers.get("X-Total-Count")).toBe("1");
+    const forcedBody = await forced.json<{ data: Array<{ full_name: string }> }>();
+    expect(forcedBody.data.map((r) => r.full_name)).toEqual(["pubonlyowner/pub"]);
+
+    // The control: the same user's all-scope token keeps the signed reading.
+    const allToken = (await mintFor(owner.id, "all-scope", "all")).plaintext;
+    const signed = await SELF.fetch(`${SELF_ORIGIN}/api/v1/repos/search?private=true`, {
+      headers: { authorization: basicTokenHeader(allToken) },
+    });
+    expect(signed.status).toBe(200);
+    expect(signed.headers.get("X-Total-Count")).toBe("2");
   });
 
   it("sorts by created desc / alpha desc and paginates with clamps and headers", async () => {

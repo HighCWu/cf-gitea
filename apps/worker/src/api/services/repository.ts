@@ -1502,6 +1502,13 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
  *    wildcards); ours uses instr() because D1 caps LIKE patterns at 50 bytes
  *    (the documented user-search precedent, services/user.ts:81-97) —
  *    needles match literally.
+ *  - keyword pair-arm scope (repo_list.go:477): the `owner/repo` arm reads
+ *    the WHOLE keyword's slash count, so a comma list of owner-qualified
+ *    needles (`owner/a,owner/b` — two slashes) matches nothing — such
+ *    needles never satisfy the bare-name arms, exactly as upstream. The
+ *    compat suite's repoSearch scenario rides bare needles (corrected from
+ *    the pre-SEARCH per-segment pair divergence; pinned in
+ *    repository-search-filters.test.ts).
  *  - keyword ordering (repo_list.go:614-618): with `priorityOwnerId` unset,
  *    an exactly-one-slash keyword prepends `CASE WHEN owner_namespace =
  *    <owner half> THEN 0 ELSE 1 END` to the order-by — the owner-name match
@@ -1514,6 +1521,24 @@ export async function searchRepositories(
   opts: RepoSearchOptions,
 ): Promise<{ items: RepositoryWithOwner[]; total: number }> {
   const conditions: SQL[] = visibilityConditions(viewer, opts.includePrivate);
+  if (!opts.includePrivate) {
+    // The !Private base arm's owner-visibility half (repo_list.go:380-384):
+    // upstream ANDs `is_private = false` with `owner_id NOT IN (SELECT id
+    // FROM user WHERE visibility IN (limited, private))` — a public-only
+    // search never surfaces a limited- or private-profile owner's public
+    // repositories. The `visibility = 'public'` half rides
+    // visibilityConditions above; this pushes the owner exclusion as the
+    // second base conjunct (ANDed ahead of the uid block's member arms,
+    // upstream's own composition — a member's private-org public repo is
+    // unreachable in a public-only search too). Scoped to the SEARCH, not
+    // folded into visibilityConditions: upstream's `/users/{username}/repos`
+    // listing carries NO owner-visibility exclusion (!Private there is bare
+    // `is_private = false`, GetUserRepositories, repo_list.go:823-825), and
+    // that listing shares the helper.
+    conditions.push(
+      sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN ('limited', 'private'))`,
+    );
+  }
 
   if (opts.isPrivate !== null) {
     conditions.push(eq(repositories.visibility, opts.isPrivate ? "private" : "public"));
@@ -1581,8 +1606,18 @@ export async function searchRepositories(
       // Some(false) → owned only (repo.go:159-161); `mode=collaborative` =
       // Some(true) → the collaborate arm only (repo.go:172-174); the
       // default (None) is ValueOrDefault(true) → owned OR collaborates.
+      // MODE WINS over exclusive: upstream binds exclusive first
+      // (repo.go:166-168 — Collaborate = Some(false)) and the mode switch
+      // runs AFTER it (repo.go:172-174 — Collaborate = Some(true)
+      // OVERWRITES), so `mode=collaborative&exclusive=true` is the
+      // collaborate-only arm with owned repos excluded; mirroring that
+      // binding order here means checking the mode arm first.
       const owns = eq(repositories.ownerNamespace, uidUser.usernameLower);
-      if (opts.exclusive) {
+      if (opts.mode === "collaborative") {
+        conditions.push(
+          collaborateCondition(opts.uid, uidUser.usernameLower, opts.includePrivate),
+        );
+      } else if (opts.exclusive) {
         conditions.push(owns);
       } else {
         const collaborate = collaborateCondition(
@@ -1590,7 +1625,7 @@ export async function searchRepositories(
           uidUser.usernameLower,
           opts.includePrivate,
         );
-        conditions.push(opts.mode === "collaborative" ? collaborate : (or(owns, collaborate) as SQL));
+        conditions.push(or(owns, collaborate) as SQL);
       }
     }
   }
@@ -1630,7 +1665,12 @@ export async function searchRepositories(
       // The "owner/repo" pair arm splits the WHOLE keyword once and is
       // skipped whenever team_id is set (repo_list.go:477: `opts.TeamID == 0
       // && strings.Count(opts.Keyword, "/") == 1` — a team search pins the
-      // owner context, so the owner half would double-filter).
+      // owner context, so the owner half would double-filter). The slash
+      // count is likewise over the WHOLE keyword: `owner/a,owner/b` (two
+      // slashes) skips this arm and matches nothing, since owner-qualified
+      // needles fail the bare-name arms — upstream's own answer for that
+      // form (the pre-SEARCH per-segment pair arm was our divergence;
+      // pinned in repository-search-filters.test.ts).
       if (opts.teamId === 0 && (opts.keyword.match(/\//g) ?? []).length === 1) {
         const slash = opts.keyword.indexOf("/");
         keywordConditions.push(
@@ -1668,11 +1708,15 @@ export async function searchRepositories(
 
   const orderBy: SQL[] = repositoryOrderBy(opts.sort, opts.order);
   if (opts.priorityOwnerId > 0) {
-    // Upstream: "CASE WHEN owner_id = ? THEN 0 ELSE owner_id END".
+    // Upstream: "CASE WHEN owner_id = ? THEN 0 ELSE owner_id END"
+    // (repo_list.go:612 — the ELSE is the OWNER ID, not a constant, so the
+    // non-priority rows keep a stable owner-ordered key ahead of the
+    // explicit sort; the keyword-float arm at :617 is the one that uses
+    // ELSE 1). Our owner_id is the same integer shape upstream orders by.
     const priorityUser = await findUserById(d1, opts.priorityOwnerId);
     if (priorityUser !== null) {
       orderBy.unshift(
-        sql`(CASE WHEN ${repositories.ownerNamespace} = ${priorityUser.usernameLower} THEN 0 ELSE 1 END)`,
+        sql`(CASE WHEN ${repositories.ownerNamespace} = ${priorityUser.usernameLower} THEN 0 ELSE ${repositories.ownerId} END)`,
       );
     }
   } else if ((opts.keyword.match(/\//g) ?? []).length === 1) {

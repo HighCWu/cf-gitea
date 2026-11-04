@@ -93,8 +93,13 @@
  *     no language field to accept-and-ignore.
  *   - `website` / `location` → the landed columns, empty clears.
  *   - `max_repo_creation` — rendered at upstream's fresh-row default -1,
- *     the int bind enforced (junk re-renders flagged, silent), the value
- *     ACCEPTED AND IGNORED (the contract declares it; no column).
+ *     DISABLED with an explicit not-supported notice (the ADR-0008 rule-4
+ *     remedy, the password pattern: upstream's arm is real — users.go:526
+ *     → the user.MaxRepoCreation column, user.go:129 — and ADR-0008
+ *     re-opens it; until the column lands the disabled input cannot offer
+ *     the operation), the int bind still enforced (junk re-renders
+ *     flagged, silent — the bind is upstream's own wire level), the
+ *     submit keeps ignoring any hand-crafted value (no column to hit).
  *   - `active` / `prohibit_login` — the status-enum fold (admin-t2.ts
  *     deviation 6): either off-signal lands 'prohibited', an explicit-on
  *     lands 'active'. The SKIP-SELF guard (users.go:476-480) forces
@@ -106,8 +111,11 @@
  *     module-local): unsetting the last admin re-renders with
  *     auth.last_admin, no field flag (upstream's exact arm,
  *     users.go:539-541).
- *   - `restricted` — rendered unchecked (the constant-false store), the
- *     posted value accepted and ignored.
+ *   - `restricted` — rendered unchecked DISABLED with the not-supported
+ *     notice (the rule-4 remedy: upstream's arm is real — users.go:528 →
+ *     user.IsRestricted, user.go:138 — ADR-0008 re-opens it; no column
+ *     here, so the constant-false store cannot take the posted value and
+ *     the checkbox never offers it), the posted value still ignored.
  *   - `allow_git_hook` / `allow_import_local` — rendered hidden+disabled
  *     exactly like upstream's DEFAULT-config render (setting.
  *     DisableGitHooks defaults true, security.go:71; ImportLocalPaths
@@ -116,8 +124,11 @@
  *     CanImportLocal fold to false, user.go:306-319), the posted values
  *     accepted and ignored.
  *   - `allow_create_organization` — rendered checked iff isAdmin
- *     (CanCreateOrganization, user.go:301-303 — the flag column is the
- *     absent half), the posted value accepted and ignored.
+ *     (CanCreateOrganization, user.go:301-303) DISABLED with the
+ *     not-supported notice (the rule-4 remedy: upstream's arm is real —
+ *     users.go:527 → user.AllowCreateOrganization, user.go:142 — ADR-0008
+ *     re-opens it; the flag column is the absent half), the posted value
+ *     still ignored.
  *   - `reset_2fa` — present iff upstream's TwoFactorEnabled holds:
  *     hasTOTP || hasWebAuthn (users.go:305-307) — the landed `two_factor`
  *     table (schema.ts migration 0059) is read for the TOTP half; WebAuthn
@@ -146,7 +157,8 @@
  * (required email, the visibility/max_repo_creation/login_type/user_type
  * enum-int binds — misses re-render flagged at 200, no banner, NOTHING
  * else runs) → the rename arm (commits immediately, upstream's own tx
- * boundary) → the auth fold (status; the accepted-and-ignored set
+ * boundary) → the auth fold (status; the disabled-fields' hand-crafted
+ * values — password/max_repo_creation/restricted/allow_create_organization —
  * absorbed) → the email arm (org / duplicate) → the UpdateUser position
  * (the type arms, the last-admin guard, then ONE column UPDATE) → the
  * reset-2FA arm → the 303 onto `adminUserLink(targetId)` (upstream's
@@ -251,6 +263,8 @@ import {
 } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError } from "../../services/orgs/orgs";
 import { findLoginSources, type LoginSourceRow } from "../../services/auth-sources/store";
+import { validateNewPassword } from "../../services/user-accounts";
+import { newPasswordRecord } from "../../auth/password";
 import type { UiContext } from "../ui-context";
 import { AdminFamilyShell, adminUsersLocale } from "./admin-users";
 import { ADMIN_USERS_LIST_LINK, adminUserLink } from "./admin-users-avatar";
@@ -277,11 +291,20 @@ export const adminUserEditLocale = {
   // empty to keep it unchanged.") — that text would promise an operation the
   // backend cannot execute (ADR-0008 rule 4). The interim disabled-state
   // notice; flips to upstream's helper when PWD-2 lands the admin-set arm.
-  password_not_supported: "Password setting is not supported yet — this instance cannot store passwords. The field stays disabled until the password system lands.",
+  password_helper: "Leave the password empty to keep it unchanged.", // "admin.users.password_helper" (:86) — the field is LIVE (SPEC-0002 §6.2 admin-set, PWD-2)
   website: "Website", // "settings.website" (:105)
   location: "Location", // "settings.location" (:109)
   max_repo_creation: "Maximum Number of Repositories", // "admin.users.max_repo_creation" (:116)
   max_repo_creation_desc: "(Enter -1 to use the global default limit.)", // "admin.users.max_repo_creation_desc" (:118)
+  // NOT upstream copy — the ADR-0008 rule-4 disabled-state notices (the
+  // password_not_supported pattern). Each names the field's future arm;
+  // each flips to upstream's posture when the arm's column lands.
+  max_repo_creation_not_supported:
+    "Per-user repository limits are not supported yet — the field stays disabled and the global default (-1) applies until the repository-limit system lands.",
+  restricted_not_supported:
+    "Restricted accounts are not supported yet — the flag stays disabled until the restricted-user system lands.",
+  allow_create_organization_not_supported:
+    "Per-user organization-creation permission is not supported yet — the flag stays disabled until the org-creation permission system lands.",
   is_activated: "User Account Is Activated", // "admin.users.is_activated" (:125)
   prohibit_login: "Disable Sign-In", // "admin.users.prohibit_login" (:131)
   is_admin: "Is Administrator", // "admin.users.is_admin" (:138)
@@ -408,7 +431,7 @@ export function parseAdminUserEditForm(params: URLSearchParams): AdminUserEditFo
  *  Err_LoginType / Err_Visibility / Err_Email / Err_MaxRepoCreation class
  *  hooks; Err_Password / Err_LoginName are unreachable — no password store
  *  (the field renders disabled, ADR-0008 rule 4) and no login-name column). */
-export type AdminUserEditErrorField = "userName" | "loginType" | "visibility" | "email" | "maxRepoCreation";
+export type AdminUserEditErrorField = "userName" | "loginType" | "visibility" | "email" | "maxRepoCreation" | "password";
 
 /** The arm's outcome union (the wiring's map, the module header's recipe):
  *  `invalid` re-renders the FRESH row at 200 with the banner (`message`,
@@ -569,15 +592,45 @@ export async function submitAdminUserEdit(
     }
   }
 
-  // --- the auth arm (users.go:464-495 → UpdateAuth): password /
-  // login_name / login_type carry no arm — the UI renders the password
-  // field DISABLED with the not-supported notice (ADR-0008 rule 4, the
-  // module header), so the rendered form cannot offer the operation; the
-  // parse still tolerates a hand-crafted `password` value and the submit
-  // ignores it (no store exists to hit — upstream's min-length /
-  // complexity / pwned arms are unreachable until PWD-2). The prohibit
-  // fold with the SKIP-SELF guard (users.go:476-480), then the
-  // deviation-6 status fold (admin-t2.ts's PATCH posture).
+  // --- the auth arm (users.go:464-495 → UpdateAuth): the PASSWORD arm is
+  // REAL (SPEC-0002 §6.2 admin-set row — PWD-2 supersedes the interim
+  // disabled field): FromNonDefault semantics — EMPTY = unchanged,
+  // non-empty → the UpdateAuth ladder (validateNewPassword: min length 8 /
+  // complexity → the Err_Password re-render, users.go:486-490), then
+  // SetPassword + the remember-me invalidation + the audit row
+  // (update.go:279-283). Our users table has no bot row type (the enum is
+  // user|org) so the upstream bot-skip has no target here — recorded.
+  // login_name / login_type carry no arm (the interim posture stands for
+  // them). The prohibit fold with the SKIP-SELF guard (users.go:476-480),
+  // then the deviation-6 status fold (admin-t2.ts's PATCH posture).
+  if (form.password !== "") {
+    const policy = validateNewPassword(form.password);
+    if (policy !== null) {
+      return { outcome: "invalid", message: policy, field: "password" };
+    }
+    const record = await newPasswordRecord(form.password);
+    await db
+      .update(users)
+      .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+      .where(eq(users.id, user.id));
+    const { sessions } = await import("../../db/schema");
+    await db.delete(sessions).where(and(eq(sessions.userId, user.id), eq(sessions.remember, true)));
+    const { AuditActions, emitAudit } = await import("../../services/audit");
+    void emitAudit(db, {
+      action: AuditActions.UserPassword,
+      actorId: doerId,
+      actorName: user.username,
+      actorCredential: null,
+      scopeType: "user",
+      scopeId: user.id,
+      scopeName: user.username,
+      origin: "ui",
+      ipAddress: null,
+      vars: { scope: user.username },
+    }).catch((error: unknown) => {
+      console.error(`admin-edit: audit row failed: ${String(error)}`);
+    });
+  }
   const prohibitLogin = form.prohibitLogin && doerId !== user.id;
   const prohibited = prohibitLogin || form.active === false;
   const activated = form.active === true || form.prohibitLogin === false;
@@ -746,8 +799,8 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               lands the admin-set arm. */}
           <div class="js-local js-non-bot field">
             <label for="password">{adminUserEditLocale.password}</label>
-            <input id="password" name="password" type="password" autocomplete="new-password" disabled />
-            <p class="help">{adminUserEditLocale.password_not_supported}</p>
+            <input id="password" name="password" type="password" autocomplete="new-password" />
+            <p class="help">{adminUserEditLocale.password_helper}</p>
           </div>
 
           {/* The language field (:90-102) is DROPPED — no column, no
@@ -773,22 +826,37 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
 
           <div class="divider"></div>
 
-          {/* max_repo_creation (:115-119) — upstream's fresh-row default
-              -1; accepted-and-ignored. */}
+          {/* max_repo_creation (:115-119) — the ADR-0008 rule-4 interim
+              posture (the password pattern): upstream's arm is REAL
+              (users.go:526 → the user.MaxRepoCreation column, user.go:129
+              `NOT NULL DEFAULT -1`) so the field renders at the fresh-row
+              default -1, but DISABLED — a disabled input never posts, so
+              the rendered form cannot offer the store the backend lacks.
+              The int bind stays (junk re-renders flagged, silent — the
+              bind is wire-level, upstream's own) and the submit keeps
+              ignoring any hand-crafted value (no column exists to hit).
+              Flips live when the repository-limit arm lands. */}
           <div class={fieldClass(err, "maxRepoCreation", "inline field")}>
             <label for="max_repo_creation">{adminUserEditLocale.max_repo_creation}</label>
-            <input id="max_repo_creation" name="max_repo_creation" type="number" min={-1} value={-1} />
+            <input id="max_repo_creation" name="max_repo_creation" type="number" min={-1} value={-1} disabled />
             <p class="help">{adminUserEditLocale.max_repo_creation_desc}</p>
+            <p class="help">{adminUserEditLocale.max_repo_creation_not_supported}</p>
           </div>
 
           <div class="divider"></div>
 
           {/* The checkbox block (:123-168): active; prohibit_login
-              (disabled for self, :132); admin; restricted (the
-              constant-false store); allow_git_hook + allow_import_local
-              hidden+disabled (the DEFAULT-config render — DisableGitHooks
-              true, ImportLocalPaths false, the module header);
-              allow_create_organization (checked iff isAdmin). */}
+              (disabled for self, :132); admin; restricted + 
+              allow_create_organization DISABLED (the ADR-0008 rule-4
+              interim posture — upstream's arms are real: users.go:528 →
+              user.go:138 `IsRestricted`, users.go:527 → user.go:142
+              `AllowCreateOrganization`; neither column exists here, and a
+              disabled checkbox never posts, so the form cannot offer a
+              store the backend lacks; the submit keeps ignoring
+              hand-crafted values — both flip live when their columns
+              land); allow_git_hook + allow_import_local hidden+disabled
+              (the DEFAULT-config render — DisableGitHooks true,
+              ImportLocalPaths false, the module header). */}
           <div class="inline field">
             <div class="ui checkbox">
               <label>
@@ -818,8 +886,9 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               <label>
                 <strong>{adminUserEditLocale.is_restricted}</strong>
               </label>
-              <input name="restricted" type="checkbox" />
+              <input name="restricted" type="checkbox" disabled />
             </div>
+            <p class="help">{adminUserEditLocale.restricted_not_supported}</p>
           </div>
           <div class="inline field tw-hidden">
             <div class="ui checkbox" data-tooltip-content={adminUserEditLocale.allow_git_hook_tooltip}>
@@ -842,8 +911,9 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               <label>
                 <strong>{adminUserEditLocale.allow_create_organization}</strong>
               </label>
-              <input name="allow_create_organization" type="checkbox" checked={user.isAdmin} />
+              <input name="allow_create_organization" type="checkbox" checked={user.isAdmin} disabled />
             </div>
+            <p class="help">{adminUserEditLocale.allow_create_organization_not_supported}</p>
           </div>
 
           {/* reset_2fa (:170-178) — the TwoFactorEnabled gate. */}

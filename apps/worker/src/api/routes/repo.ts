@@ -1,6 +1,6 @@
 import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { z } from "zod";
 
 import { and, eq } from "drizzle-orm";
@@ -413,10 +413,33 @@ function validateSearchMode(raw: string): "fork" | "source" | "mirror" | "collab
   }
 }
 
-/** Resolves the upstream `private` query param for a signed search:
- * `ctx.IsSigned && (FormString("private") == "" || FormBool("private"))`. */
-function resolveIncludePrivate(viewer: Viewer, rawPrivate: string): boolean {
+/**
+ * Resolves the upstream `private` query param for a signed search:
+ * `ctx.IsSigned && (FormString("private") == "" || FormBool("private"))`
+ * (repo.go:138). The public-only forcing arm rides here too: upstream zeroes
+ * `opts.Private` for a public-only token INSIDE SearchRepositoryCondition
+ * (repo_list.go:366-368 — `IsPublicOnlyDoer(opts.Actor)` → `opts.Private,
+ * opts.AllLimited = false, false`; we carry no AllLimited, so Private is the
+ * whole arm), which runs after this route-side resolution and overrides it.
+ * The token's scope rides `c.get("auth")` when the SPEC-0002 resolveAuth
+ * middleware ran; standalone stub-resolver usage (tests without resolveAuth)
+ * has no scope var and keeps the signed reading (`authScopePublicOnly`
+ * passes false). `AllLimited` has no landed counterpart — the forcing of it
+ * is vacuous here (the only AllLimited-shaped option upstream's search route
+ * sets is via the explore surface, which our search.ts maps without it).
+ */
+function resolveIncludePrivate(viewer: Viewer, rawPrivate: string, publicOnlyToken: boolean): boolean {
+  if (publicOnlyToken) {
+    return false;
+  }
   return viewer.requester !== null && (rawPrivate === "" || formBoolValue(rawPrivate));
+}
+
+/** The public-only flag of the request's token credential, when resolveAuth
+ * attached one (api/env.ts's `auth` variable; scope-gate.ts:202's same
+ * read). Undefined-safe: no middleware, no scope → not public-only. */
+function authScopePublicOnly(c: Context<ApiEnv>): boolean {
+  return c.get("auth")?.scope?.publicOnly === true;
 }
 
 function errorMessage(error: unknown): string {
@@ -465,7 +488,10 @@ export function registerRepoRoutes(
       priorityOwnerId: formInt64(url.searchParams, "priority_owner_id"),
       teamId: formInt64(url.searchParams, "team_id"),
       starredBy: formInt64(url.searchParams, "starredBy"),
-      includePrivate: resolveIncludePrivate(viewer, query.private ?? ""),
+      // The public-only forcing rides the resolution (repo_list.go:366-368 —
+      // a public-only token's search is a public-only search, its own
+      // private repos included-none).
+      includePrivate: resolveIncludePrivate(viewer, query.private ?? "", authScopePublicOnly(c)),
       isPrivate: query.is_private === undefined || query.is_private === "" ? null : formBool(url.searchParams, "is_private"),
       template: query.template === undefined || query.template === "" ? null : formBool(url.searchParams, "template"),
       archived: query.archived === undefined || query.archived === "" ? null : formBool(url.searchParams, "archived"),
