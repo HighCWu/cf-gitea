@@ -1502,6 +1502,11 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
  *    wildcards); ours uses instr() because D1 caps LIKE patterns at 50 bytes
  *    (the documented user-search precedent, services/user.ts:81-97) —
  *    needles match literally.
+ *  - keyword ordering (repo_list.go:614-618): with `priorityOwnerId` unset,
+ *    an exactly-one-slash keyword prepends `CASE WHEN owner_namespace =
+ *    <owner half> THEN 0 ELSE 1 END` to the order-by — the owner-name match
+ *    floats above every row under ANY sort, explicit included; the
+ *    priority_owner_id arm and this arm are mutually exclusive.
  */
 export async function searchRepositories(
   d1: D1Database,
@@ -1663,13 +1668,33 @@ export async function searchRepositories(
 
   const orderBy: SQL[] = repositoryOrderBy(opts.sort, opts.order);
   if (opts.priorityOwnerId > 0) {
-    // Upstream: "CASE WHEN owner_id = ? THEN 0 ELSE owner_id END, <order>".
+    // Upstream: "CASE WHEN owner_id = ? THEN 0 ELSE owner_id END".
     const priorityUser = await findUserById(d1, opts.priorityOwnerId);
     if (priorityUser !== null) {
       orderBy.unshift(
         sql`(CASE WHEN ${repositories.ownerNamespace} = ${priorityUser.usernameLower} THEN 0 ELSE 1 END)`,
       );
     }
+  } else if ((opts.keyword.match(/\//g) ?? []).length === 1) {
+    // Upstream (models/repo/repo_list.go:614-618): with NO priority_owner_id,
+    // an exactly-one-slash keyword floats the owner-name matches to the top —
+    // `CASE WHEN owner_name LIKE ? THEN 0 ELSE 1 END` PREPENDED to whatever
+    // order-by is in effect (the explicit sort included; upstream only
+    // substitutes SearchOrderByAlphabetically when OrderBy is empty). The
+    // else-if arms are mutually exclusive: priority_owner_id wins outright.
+    // Upstream binds `strings.Cut(keyword, "/")[0]` VERBATIM — no `%`
+    // wildcards — so the LIKE is an equality with SQLite's ASCII case fold;
+    // against our lowercase-stored ownerNamespace that is exactly
+    // `ownerNamespace = lower(orgName)` (the same shape as the priority arm;
+    // the keyword arms' instr() adaptation is unneeded — no pattern — and
+    // LIKE metacharacters in the owner half match literally, the needles'
+    // documented divergence). No team_id gate here: upstream's ordering arm
+    // (unlike the WHERE pair arm at :477) never checks TeamID, so a team
+    // search with a one-slash keyword still gets the float.
+    const orgName = opts.keyword.slice(0, opts.keyword.indexOf("/")).toLowerCase();
+    orderBy.unshift(
+      sql`(CASE WHEN ${repositories.ownerNamespace} = ${orgName} THEN 0 ELSE 1 END)`,
+    );
   }
 
   const items = await db

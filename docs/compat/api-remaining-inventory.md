@@ -1,128 +1,62 @@
-# Remaining API Inventory — the last 64: the feature wall itself
+# Remaining API Inventory — EMPTY: the frozen contract fully declared
 
 Refill ammunition for the wave pool: every operation the frozen contract
 declares that our `/api/v1` spec does not, classified by what it would take to
 declare it, then ranked into dispatchable batches. Companion to
 `ui-parity-survey.md` (the web-UI gap inventory) — this file is the API-side
-equivalent. **Fully regenerated 2026-10-26** at HEAD `fec5c71` after the
-previous edition (written at declared=318, commit `c4577a7`) drove ~129
-declarations to completion — every batch it listed has since landed (the
-tick below closes the last two out).
-**Ticked 2026-10-26** at HEAD `7016ce9`: a maintenance pass, not a regen —
-the second today (the previous one, at `5d9122c`, closed out the regen's
-last two batches: the org-projects stage 2, REG `20512c0`, 447→468, and
-projects-user stage 3, REG `c9a7ef7`, 468→490). The `5d9122c..7016ce9`
-window — 23 commits: two UI waves, the fork-PR / head-render / payload
-pull arc, the annotated-tag carry, the merge-delete ladder completion,
-the generate/fork git-wire fix, the ws1009 mitigation + sweep, a docs
-run — carries **zero new operations**.
-Declared still **490** across **298** paths; the raw diff is **64**, all
-FEATURE-ABSENT (the 64-op tables below are unchanged from the regen); the
-dispatchable pool is empty and the In-flight section is cleared. The
-window's landings are appended to the post-490 ledger below.
-**Ticked 2026-10-26** a third time, at HEAD `9b49cd2`: maintenance only —
-the `7016ce9..9b49cd2` window (the release create empty-gate fix
-`d24dc0f` + its fixtures correction `4619c4f`, the deploy-probes mirror
-battery `4ed277d`, wave-ui-parity-9 `1a7af64`, the projects board
-landing `9b49cd2`, a docs run) carries **zero
-new operations**; the checker re-run reports 490/298, `PASS` unchanged.
-The only ledger entry is the release-gate fix below.
-**Ticked 2026-10-26** a fourth time, at HEAD `2310623`: maintenance only
-again — the `9b49cd2..2310623` window (the tick-4 docs commit
-`48f873f`, the releases fixture isEmpty seeding `3b3a3ae`, the fileicon
-asset+lookup layer `cdf683a`, P0 deploy evidence `305ddc8`, the toolkit
-polish `5fdbc15`, the attachments serving seam `5e082cd` + its dispatch
-wiring `2b5b898`, wave-ui-parity-10 `fdaeaca`, the toolkit PAT
-preflight `2310623`) also carries **zero new operations**; the checker
-re-run at this HEAD reports 490/298, `PASS` unchanged. The window's
-landings join the post-490 ledger below.
-**Ticked 2026-10-26** a fifth time, at HEAD `58c6cf0`: maintenance only
-again — the `2310623..58c6cf0` window (6 commits: the generate-e2e
-failureTail + `--force-red` knob `ee88c1b`, P0 deploy evidence
-`2d64de1`, the tick-5 compat docs commit `64aa06a`, the attachments
-credential walk `7cd1ce9`, the tree-view envelope `831709f`, the
-page-domain rotation Set-Cookie re-wrap `58c6cf0`) carries **zero new
-operations**; the checker re-run at this HEAD reports 490/298, `PASS`
-unchanged. The window's landings join the post-490 ledger below.
-**Ticked 2026-10-26** a sixth time, at HEAD `ae32b1a`: maintenance only
-again — the `58c6cf0..ae32b1a` window (7 commits: the tick-6 compat
-docs commit `7a5861e`, the RELEASE-NOTES-v1.1 Addendum 3 `4f59daa`, P0
-deploy evidence `96cb9d4`, the blob-excerpt machinery `0db7087`, the
-lastcommit fragment `3502ee4`, the toolkit tails `7d4c19a`, the
-repo-scoped projects UI row `ae32b1a`) carries **zero new
-operations**; the checker re-run at this HEAD reports 490/298, `PASS`
-unchanged. The window's landings join the post-490 ledger below.
-**Ticked 2026-10-26** a seventh time, at HEAD `67adfb7`: maintenance
-only again — the `ae32b1a..67adfb7` window (14 commits: the tick-7
-compat docs commit `bff7fdc`, the wrangler esbuild loader fixes
-`4ed30cc` + `52a1f52` (the svg `?raw` rule) + `981c098` (the json
-`?raw` join — the REDEPLOY18 arc), the tag-create carried note closure
-`aaea049` + its two phrasing alignments `42a88c8`, the engine e2e
-health sweep `ac3afd7`, the SPEC-0011 count annotation `84cf4c9`, P0
-deploy evidence `baf28bb`, the payload-stub arc (`3fcbe1a` the
-fork/mirror/parent/search stubs closed + `a55a725` the repo GET
-full-payload swaps), the renamed-fork PR head (`9ecb3e5` the
-FindHeadRepo port + `30995e2` the bare-head divergence comment
-refresh), and the UI index window `67adfb7` — both fragment routes
-mounted) carries **zero new operations**; the checker re-run at this
-HEAD reports 490/298, `PASS` unchanged. The window's landings join the
-post-490 ledger below. The window also emptied the surface's carried
-notes: tag-create CLOSED-WRONG (`aaea049` — the contract declares 200
-per upstream's own swagger, tag.go:185-197, while upstream's runtime
-drifts to 201 (:230); we follow the declaration), the
-payload/serializer stubs CLOSED (`3fcbe1a` + `a55a725`), the
-renamed-fork staleness CLOSED (`9ecb3e5`, its flagged comment
-refreshed `30995e2`) — **the carried-OPEN list is empty** (this
-doc's one ledgered residual, the generated-repo wire `bf8e56f`, was
-already closed by `8828f43`; the 16 SQLITE_LOCKED OPEN in `baf28bb`
-is P0-evidence scope, not an API carry).
-**Ticked 2026-10-26** an eighth time, at HEAD `f696a21`: maintenance
-only again — the `67adfb7..f696a21` window (11 commits: the tick-8
-compat docs commit `075f916`, the SQLITE_LOCKED verdict docs
-`280d4ad`, the search filters `e39adad` — tri-state arms + the
-`SanitizedOriginalUrl` port over EXISTING search/list ops, zero
-declarations — the notifications WIP-draft glyph `8786651`, the
-stuck-syncing sweep `833961d` + its two SPEC records
-`2e11713`/`edf5da1`, and the four UI module commits
-`f26d65b`/`8380cf0`/`ec07fb6`/`f696a21` — the unmounted migrate +
-feeds modules (the latter's glyph allowlist exacted by the last),
-the org settings group + teams/edit page (the survey's
-FINAL numbered row), and the unmounted
-`notification-subscriptions` module + the org-settings-hooks
-follow-up still uncommitted in the tree at measurement, UI-only)
-carries **zero new
-operations**; the checker re-run at this HEAD reports 490/298,
-`PASS` unchanged. The window's landings join the post-490 ledger
-below.
+equivalent. **Fully regenerated 2026-11-04** at HEAD `868f3e6`
+(`868f3e6d28419de57e5b3a7a3344cc52df6515e1`) after the previous edition (regen
+at `fec5c71`, declared=490,
+then eight maintenance ticks through `f696a21` the same day) sat stale through
+the v1.3 wave: every reading it carried — **490/298, 64 ops FEATURE-ABSENT,
+"the actions/packages feature wall"** — is dead. This regen finds the frozen
+contract **fully declared**: the raw diff is **zero**, the dispatchable pool is
+empty, and there is nothing genuinely unmounted left to re-baseline. The
+64-op wall emptied in two features:
+
+- **Package registry, 10 ops** — SPEC-0016 M1 (`8cdf44a`) declared the nine
+  `/packages/*` operations plus `GET /admin/packages` (490→500).
+- **Actions runtime, 54 ops** — SPEC-0012's gate lifted, then the six-commit
+  board arc `fbcfe5e` → `f88f8ee` → `ed5e26f` → `ad8aff8` → `df85f21` →
+  `d22cb51` declared the runners, runs/jobs listings, artifacts, admin, and
+  runs-deep families, reaching **full declaration (554/554)** at `d22cb51`.
+
+The full ladder with per-family reconciliation is below; the historical
+sections at the bottom are frozen at the old edition's last honest measurement
+and kept as record only.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
-  operations across 350 paths: repository 229, user 98, organization 88,
-  issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
-  minus the declared set that `node scripts/check-openapi.mjs` reports
-  (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `f696a21`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
-  operations). Raw diff: **64 undeclared** = **64 remaining**, all
-  FEATURE-ABSENT — no in-flight subtraction applies any more.
-  Issue / notification / miscellaneous / settings families have **zero**
-  remaining — they are fully declared.
+  operations across **350** paths: repository 229, user 98, organization 88,
+  issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4 —
+  re-walked at this regen, unchanged) minus the declared set that
+  `node scripts/check-openapi.mjs` reports (**554** operations across **350**
+  paths, measured 2026-11-04 in the working tree at HEAD `868f3e6`; checker
+  ends `PASS`, tier-1 coverage 78/78 paths, 129/129 operations). Raw diff:
+  **0 undeclared**, and the reverse subtraction is also **0** — no declared op
+  sits outside the contract either (all 554 shared ops carry the contract's
+  own operationId, so both subtractions are unambiguous set operations on
+  `METHOD path`). Every family — repository, organization, user, admin,
+  package, issue, notification, miscellaneous, settings — is **fully
+  declared**.
 - **Reproducing the diff** (the numbers above fall out of exactly these two
   commands, run from the repo root):
-  1. `node scripts/check-openapi.mjs` — prints `declared: 490 operation(s)
-     across 298 path(s)` and every declared op as `[ok] <METHOD> <path>
-     (<operationId>)`. The checker hard-fails any declared op missing from the
-     contract, so declared ⊆ contract and the diff is a plain set subtraction
-     on `METHOD path` (it is unambiguous: all 490 shared ops carry the
-     contract's own operationId).
+  1. `node scripts/check-openapi.mjs` — prints `declared: 554 operation(s)
+     across 350 path(s)`, every declared op as `[ok] <METHOD> <path>
+     (<operationId>)`, the tier-1 line `78/78 paths, 129/129 operations`, and
+     `PASS`. The checker hard-fails any declared op missing from the contract,
+     so declared ⊆ contract.
   2. `node -e` walking `paths` of the contract JSON with the checker's HTTP
      method set (`get put post delete options head patch`), printing
      `<tag> | <METHOD> <path> | <operationId>` per op (554 rows); subtract the
-     checker's 490.
+     checker's 554 → **0 rows remain**, both directions.
 - **Upstream pin**: `fc4936884584a41931906553d96c2601d750e6ef`
   (v1.22.0-rc1-3919-gfc49368845); every `gitea/…` cite below is that commit.
-- **Landed-store references**: `apps/worker/src/db/schema.ts` (**64 tables**,
-  migrations 0000–0032), route modules under `apps/worker/src/api/routes/`,
-  services under `apps/worker/src/{services,api/services,repos,issues,webhooks}/`.
+  Verified unchanged at this regen (`git -C gitea rev-parse HEAD`).
+- **Landed-store references**: `apps/worker/src/db/schema.ts` (**109 tables**,
+  migrations 0000–0073 on disk), route modules under
+  `apps/worker/src/api/routes/`, services under
+  `apps/worker/src/{services,api/services,repos,issues,webhooks}/`.
 
 ## Classification legend
 
@@ -130,59 +64,95 @@ below.
   batch only writes route/service code (plus spec declaration).
 - **TABLE-DEPENDENT** — needs new D1 table(s) (or a column). The missing store
   is named with its upstream model pointer; the batch owns one migration
-  (numbers below are **provisional** — migrations run 0000–0032 today;
-  assign next-free at merge, drizzle journal regenerated then). The class is
-  empty at this tick.
+  (numbers are **provisional** — migrations run 0000–0073 today; assign
+  next-free at merge, drizzle journal regenerated then). The class is
+  empty at this regen.
 - **RUNTIME-ONLY** — declarable only with documented runtime-only response
   exceptions (the `RUNTIME_ONLY_RESPONSES` table in `scripts/check-openapi.mjs`,
   shared file — orchestrator applies or designates), typically because the
   upstream behavior is degenerate on Workers (no filesystem, no signing key).
 - **FEATURE-ABSENT** — gated on a whole feature (actions runtime, package
   registry) that needs its own SPEC; listed with the pointer, not batched.
+  The class is empty at this regen — both of its former members landed.
 
 ## Family summary (remaining)
 
-| Class | repository | organization | user | admin | package | **total** |
-|---|---|---|---|---|---|---|
-| IMPLEMENTABLE-NOW | 0 | 0 | 0 | 0 | 0 | **0** |
-| TABLE-DEPENDENT | 0 | 0 | 0 | 0 | 0 | **0** |
-| RUNTIME-ONLY | 0 | 0 | 0 | 0 | 0 | **0** |
-| FEATURE-ABSENT | 33 | 7 | 7 | 8 | 9 | **64** |
-| **total** | **33** | **7** | **7** | **8** | **9** | **64** |
+| Class | repository | organization | user | admin | package | issue | notification | miscellaneous | settings | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| IMPLEMENTABLE-NOW | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| TABLE-DEPENDENT | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| RUNTIME-ONLY | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| FEATURE-ABSENT | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| **total** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 
-The pool is drained: declared **490/554** — exactly the ceiling short of the
-actions/packages features. Every non-FEATURE-ABSENT class is at zero; the
-64 below move only when an actions or package SPEC lands, never by route
-work.
+Declared **554/554** — the ceiling itself. There is no remaining
+declaration work at this upstream pin; any future rows here require the
+frozen contract to grow (an upstream pin bump), not route work.
+
+---
+
+## The wall's closure — how the last 64 declared
+
+Each row is a committed landing; the declared-count deltas are the commits'
+own messages, and the ops reconcile exactly against the old edition's
+per-family tables (repository 33, organization 7, user 7, admin 8,
+package 9 = 64):
+
+| Ops | Family slice | Commit | Declared |
+|---|---|---|---|
+| 10 | **packages** — the nine `/packages/*` ops + `GET /admin/packages` (SPEC-0016 M1: the model, generic protocol, cleanup; the registry has grown far past the API since — CommonRoutes closed 23/23 groups at `ce9facc`) | `8cdf44a` | 490→500 |
+| 15 | **runner management × repo/org/user** (list/get/delete/patch + registration-token per scope — the board's P1-7 triage first) | `fbcfe5e` | 500→515 |
+| 6 | **runs/jobs listings × repo/org/user** (getWorkflowRuns + listWorkflowJobs twins — P1-8) | `f88f8ee` | 515→521 |
+| 4 | **repo artifacts quartet** (getArtifacts/getArtifact/downloadArtifact/deleteArtifact + the undeclared raw fifth arm — P1-10) | `ed5e26f` | 521→525 |
+| 7 | **admin Actions family** (runners census/jobs/runs/token at the global 0-scope — P1-12; retired the old edition's stale "no-runner-tables" reduction) | `ad8aff8` | 525→532 |
+| 8 | **repo workflows-extras** (workflows list/get/runs, disable/enable, dispatch, getWorkflowJob, job-logs — P1-9) | `df85f21` | 532→540 |
+| 14 | **repo runs DEEP family** (tasks, run get/delete, attempts, attempt/recent jobs, logs, artifacts-of-run, approve/cancel/force-cancel, the rerun trio — P1-11; **full declaration reached here**) | `d22cb51` | 540→554 |
+
+Note: the 490→500 packages jump is also recorded in the v1.3 index syncs
+`4c8277d`/`b6b0180` — "the ten packages ops declared; remaining 54 = Actions
+only". Per-family reconciliation:
+repository 33 = 5 (runners) + 2 (runs/jobs) + 4 (artifacts) + 8
+(workflows-extras) + 14 (runs-deep); organization 7 = 5 + 2; user 7 = 5 + 2;
+admin 8 = 7 (Actions) + 1 (`adminListPackages`); package 9. Feature pointers:
+actions = `specs/0012-actions-feasibility.md` (the upstream-parity gate lift +
+control-plane milestones), packages = `specs/0016-packages.md`.
 
 ---
 
 ## In-flight
 
-Empty at this tick. The regen's three in-flight pools all landed: the
-org-projects 21 (REG `20512c0`), the blocks-enforcement tail (`f2e1710`)
-and license-detection (`03d5fe4`/`04a2903` — the family is complete, 5/5
-arms), and the ui-parity-3 rows (`ca81d5a`). The tree's modifications at
-that tick's measurement time were this doc plus the then-in-flight
-`/{username}/-/projects` wave's uncommitted files under
-`apps/worker/src/ui/` and a scratch script — none of them spec-bearing
-as measured (the checker still reports 490/298 in exactly this tree
-state). At this tick's measurement (`f696a21`) the tree additionally
-carries the machinery wave's OWN uncommitted files — the
-`notification-subscriptions` + `org-settings-hooks` page modules
-untracked and the hooks-tab follow-up modifications under
-`apps/worker/src/ui/` — all UI-only, none spec-bearing; the checker
-reports 490/298 in exactly this tree state (re-run at measurement).
-The org-settings wave LANDED as `8380cf0` (UI-only,
-zero ops — the survey's final numbered row), and the migrate/feeds
-modules (`f26d65b`/`ec07fb6`) are page modules over already-declared
-services, spec-bearing zero (the carried-OPEN list —
-tag-create, serializer stubs, renamed-fork — is empty, closed as the
-seventh tick records).
+Empty — no undeclared operation is in flight, by definition: the diff is zero.
+At this regen's measurement (`868f3e6`, working tree) the tree carried this
+doc's own edit plus concurrent in-flight edits that carry zero declaration
+surface (behavior work on already-declared ops — e.g. the repo-search
+ordering arm — and test/UI files); the checker reports 554/350 `PASS` in
+exactly this tree state (re-run at measurement). FN-10/FN-12's migration 0073
+(`868f3e6`) is store strictness behind already-declared ops.
+
+## Dispatchable batches
+
+**None.** Nothing is undeclared. The API-declaration campaign this doc drove
+(318 → 490 → 554) is complete at the `fc49368845` pin; remaining API work is
+parity-deepening WITHIN declared operations — behavior arms, wire shapes,
+runtime-only exception honest-keeping (the `[warn] (b)` lines the checker
+already documents) — which belongs to the census/SPEC lanes, not to this
+inventory. Re-baseline this doc only when the upstream pin (and with it the
+frozen contract) moves.
 
 ---
 
-## Landed since last regen
+## Historical ledger — the previous editions' record (frozen 2026-10-26, HEAD `f696a21`, declared 490/298)
+
+Everything below is the prior edition's landing ledger, kept as history. Its
+"stays at 490/298" claims were true only through `f696a21` — the
+`f696a21..868f3e6` window (the v1.3 release freeze `88a04cb`, the v1.3.x
+docs/board waves, and the closure ladder above) then emptied the wall this
+doc once ranked. The previous edition's own header (eight maintenance ticks,
+its 64-op FEATURE-ABSENT tables, its stale "actions/packages feature-absent"
+headline — the claim this regen retires) is recoverable from git history at
+the tick-8 docs commit `075f916`.
+
+### Landed since the `c4577a7` edition (318 → 490)
 
 The previous edition (commit `c4577a7`, declared=318) listed 11 numbered
 batches + 4 long-tail candidates. **All 15 landed**, and both batches the
@@ -209,11 +179,11 @@ tables` (`579e872`), `wave-blocks-enforcement` (`f5c0384` — 403 arms on 9
 existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 `5e2c418`), ui waves (`06eee50`), vitest timeout raise (`412facc`).
 
-### After the 490 line — post-regen landings (zero new ops)
+### After the 490 line — post-regen landings (zero new ops through `f696a21`)
 
-Everything merged after REG `c9a7ef7` carries no new declarations — the
-checker stays at 490/298 (re-run at this tick's HEAD `f696a21`). The units,
-grouped:
+Everything merged after REG `c9a7ef7` carried no new declarations through the
+old edition's last measurement — the checker stayed at 490/298 (re-run at
+that tick's HEAD `f696a21`). The units, grouped:
 
 - **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
   in-flight arm set), license arms (`03d5fe4` + `04a2903` — the regen's
@@ -281,7 +251,10 @@ grouped:
   push-mirror-outbound §9.3 by `2e11713`/`edf5da1`).
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
-  still 64 tables; these are store work behind already-declared ops.
+  still 64 tables at the time; these are store work behind already-declared
+  ops. (The store has since grown to 109 tables across migrations
+  0000–0073, incl. the actions model's twelve tables and the packages
+  registry's six — the closure ladder's stores.)
 - **UI parity + web seams**: avatar-byhash seam (`bb67087` + mount
   `98d194d`, default-asset guards `239a4ac`), ui-parity-4 (`0b61554` —
   tags + labels pages), ui-parity-5 (`ca4eb58` — milestone detail/edit +
@@ -409,135 +382,3 @@ grouped:
   built-in .json loader PARSED the object and 500'd every tree-view
   envelope in production; the ?raw-needs-a-glob lesson is the
   REDEPLOY18 arc's record).
-
----
-
-## Dispatchable batches
-
-**None.** The stage-3 batch the regen named as "the only dispatchable work
-left" landed (`f38b218`, REG `c9a7ef7`), and no undeclared op rides a landed
-store or a table-free service any more. Everything remaining is
-FEATURE-ABSENT — declaring it requires the feature, not just a route stub:
-
-- **Actions runtime, 54 ops** (repository 33, organization 7, user 7, admin 7):
-  runners, runs, jobs, artifacts, tasks, workflow dispatch/enable,
-  registration tokens — upstream `gitea/models/actions/` (`runner.go`,
-  `run.go`, `run_job.go`, `run_attempt.go`, `artifact.go`,
-  `runner_token.go`, …) + `gitea/services/actions/`. **No CI-runtime table
-  exists in our schema** (grep of `apps/worker/src/db/schema.ts` for
-  `action_run`/`action_runner`/`action_artifact`/`action_task`/runner-token
-  tables: zero hits — the only `action` table there is the activity feed,
-  schema.ts:2658). A full SPEC is the precondition; note some list/read ops
-  (e.g. `ActionsListRepositoryWorkflows`) read `.gitea/workflows` from the git
-  tree upstream and could ride engine tree reads — still gate them on the same
-  SPEC so the family lands coherently.
-- **Package registry, 10 ops** (9 `/packages/*` + `GET /admin/packages`):
-  upstream `gitea/models/packages/`, `gitea/modules/packages/` — storage-heavy
-  (R2 candidate store per AGENTS; evaluate in a SPEC before adopting). **No
-  package table exists** in our schema (only the `repositories.has_packages`
-  flag column).
-
----
-
-### repository — FEATURE-ABSENT (33)
-
-All actions-runtime. Missing store: the upstream actions tables named above —
-none exist in `apps/worker/src/db/schema.ts` (verified by grep).
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteArtifact` | `DELETE /repos/{owner}/{repo}/actions/artifacts/{artifact_id}` | actions runtime — absent upstream models/actions/ tables (action_run/action_run_job/action_artifact/…; verified absent in schema.ts) + gitea/services/actions/; SPEC first |
-| `deleteRepoRunner` | `DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime — same absent store (gitea/models/actions/runner.go) |
-| `deleteActionRun` | `DELETE /repos/{owner}/{repo}/actions/runs/{run}` | actions runtime — same absent store (gitea/models/actions/run.go) |
-| `getArtifacts` | `GET /repos/{owner}/{repo}/actions/artifacts` | actions runtime — same absent store (artifact.go) |
-| `getArtifact` | `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}` | actions runtime — same absent store (artifact.go) |
-| `downloadArtifact` | `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip` | actions runtime — same absent store; artifact blobs are R2 territory per the storage-service boundary |
-| `listWorkflowJobs` | `GET /repos/{owner}/{repo}/actions/jobs` | actions runtime — same absent store (run_job.go) |
-| `getWorkflowJob` | `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` | actions runtime — same absent store (run_job.go) |
-| `downloadActionsRunJobLogs` | `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs` | actions runtime — same absent store; logs land in R2 when specced |
-| `getRepoRunners` | `GET /repos/{owner}/{repo}/actions/runners` | actions runtime — same absent store (runner.go) |
-| `getRepoRunner` | `GET /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime — same absent store (runner.go) |
-| `getWorkflowRuns` | `GET /repos/{owner}/{repo}/actions/runs` | actions runtime — same absent store (run.go) |
-| `GetWorkflowRun` | `GET /repos/{owner}/{repo}/actions/runs/{run}` | actions runtime — same absent store (run.go) |
-| `getArtifactsOfRun` | `GET /repos/{owner}/{repo}/actions/runs/{run}/artifacts` | actions runtime — same absent store |
-| `getWorkflowRunAttempt` | `GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}` | actions runtime — same absent store (run_attempt.go) |
-| `listWorkflowRunAttemptJobs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}/jobs` | actions runtime — same absent store (run_attempt.go) |
-| `listWorkflowRunJobs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/jobs` | actions runtime — same absent store (run_job.go) |
-| `getWorkflowRunLogs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/logs` | actions runtime — same absent store |
-| `ListActionTasks` | `GET /repos/{owner}/{repo}/actions/tasks` | actions runtime — same absent store |
-| `ActionsListRepositoryWorkflows` | `GET /repos/{owner}/{repo}/actions/workflows` | actions runtime — reads .gitea/workflows from the git tree upstream; could ride engine tree reads, gated on the same SPEC |
-| `ActionsGetWorkflow` | `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}` | actions runtime — same family gate |
-| `ActionsListWorkflowRuns` | `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs` | actions runtime — same absent store |
-| `updateRepoRunner` | `PATCH /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime — same absent store (runner.go) |
-| `repoCreateRunnerRegistrationToken` | `POST /repos/{owner}/{repo}/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
-| `approveWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/approve` | actions runtime (gitea/services/actions/approve.go — absent store) |
-| `cancelWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/cancel` | actions runtime — same absent store |
-| `forceCancelWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/force-cancel` | actions runtime — same absent store |
-| `rerunWorkflowJob` | `POST /repos/{owner}/{repo}/actions/runs/{run}/jobs/{job_id}/rerun` | actions runtime — same absent store |
-| `rerunWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/rerun` | actions runtime — same absent store |
-| `rerunFailedWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/rerun-failed-jobs` | actions runtime — same absent store |
-| `ActionsDispatchWorkflow` | `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` | actions runtime — dispatch creates runs in the absent store |
-| `ActionsDisableWorkflow` | `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable` | actions runtime — same family gate |
-| `ActionsEnableWorkflow` | `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable` | actions runtime — same family gate |
-
-### organization — FEATURE-ABSENT (7)
-
-All actions-runtime, same absent store.
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteOrgRunner` | `DELETE /orgs/{org}/actions/runners/{runner_id}` | actions runtime — absent gitea/models/actions/ runner store (verified absent in schema.ts) |
-| `getOrgWorkflowJobs` | `GET /orgs/{org}/actions/jobs` | actions runtime — same absent store |
-| `getOrgRunners` | `GET /orgs/{org}/actions/runners` | actions runtime — same absent store |
-| `getOrgRunner` | `GET /orgs/{org}/actions/runners/{runner_id}` | actions runtime — same absent store |
-| `getOrgWorkflowRuns` | `GET /orgs/{org}/actions/runs` | actions runtime — same absent store |
-| `updateOrgRunner` | `PATCH /orgs/{org}/actions/runners/{runner_id}` | actions runtime — same absent store |
-| `orgCreateRunnerRegistrationToken` | `POST /orgs/{org}/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
-
-(The org-projects 21 landed — REG `20512c0` — so organization's remainder is
-actions-only.)
-
-### user
-
-The user family's 22 IMPLEMENTABLE-NOW ops (the `/user/projects` +
-`/users/{username}/projects` stage-3 set) landed — REG `c9a7ef7` — so the
-remainder is actions-only.
-
-**FEATURE-ABSENT** (7) — actions-runtime, same absent store.
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteUserRunner` | `DELETE /user/actions/runners/{runner_id}` | actions runtime — absent gitea/models/actions/ runner store (verified absent in schema.ts) |
-| `getUserWorkflowJobs` | `GET /user/actions/jobs` | actions runtime — same absent store |
-| `getUserRunners` | `GET /user/actions/runners` | actions runtime — same absent store |
-| `getUserRunner` | `GET /user/actions/runners/{runner_id}` | actions runtime — same absent store |
-| `getUserWorkflowRuns` | `GET /user/actions/runs` | actions runtime — same absent store |
-| `updateUserRunner` | `PATCH /user/actions/runners/{runner_id}` | actions runtime — same absent store |
-| `userCreateRunnerRegistrationToken` | `POST /user/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
-
-### admin — FEATURE-ABSENT (8)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteAdminRunner` | `DELETE /admin/actions/runners/{runner_id}` | actions runtime — absent gitea/models/actions/ runner store (verified absent in schema.ts) |
-| `listAdminWorkflowJobs` | `GET /admin/actions/jobs` | actions runtime — same absent store |
-| `getAdminRunners` | `GET /admin/actions/runners` | actions runtime — same absent store |
-| `getAdminRunner` | `GET /admin/actions/runners/{runner_id}` | actions runtime — same absent store |
-| `listAdminWorkflowRuns` | `GET /admin/actions/runs` | actions runtime — same absent store |
-| `adminListPackages` | `GET /admin/packages` | package registry (upstream gitea/models/packages/, gitea/modules/packages/) — no package table in schema.ts (only repositories.has_packages); needs SPEC before adoption (R2 candidate store) |
-| `updateAdminRunner` | `PATCH /admin/actions/runners/{runner_id}` | actions runtime — same absent store |
-| `adminCreateRunnerRegistrationToken` | `POST /admin/actions/runners/registration-token` | actions runtime — same absent store |
-
-### package — FEATURE-ABSENT (9)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deletePackage` | `DELETE /packages/{owner}/{type}/{name}` | package registry (upstream gitea/models/packages/, gitea/modules/packages/) — no package table in schema.ts (only repositories.has_packages); needs SPEC before adoption (R2 candidate store) |
-| `deletePackageVersion` | `DELETE /packages/{owner}/{type}/{name}/{version}` | package registry — same absent store, same SPEC gate |
-| `listPackages` | `GET /packages/{owner}` | package registry — same absent store, same SPEC gate |
-| `listPackageVersions` | `GET /packages/{owner}/{type}/{name}` | package registry — same absent store, same SPEC gate |
-| `getLatestPackageVersion` | `GET /packages/{owner}/{type}/{name}/-/latest` | package registry — same absent store, same SPEC gate |
-| `getPackage` | `GET /packages/{owner}/{type}/{name}/{version}` | package registry — same absent store, same SPEC gate |
-| `listPackageFiles` | `GET /packages/{owner}/{type}/{name}/{version}/files` | package registry — same absent store, same SPEC gate |
-| `linkPackage` | `POST /packages/{owner}/{type}/{name}/-/link/{repo_name}` | package registry — same absent store, same SPEC gate |
-| `unlinkPackage` | `POST /packages/{owner}/{type}/{name}/-/unlink` | package registry — same absent store, same SPEC gate |

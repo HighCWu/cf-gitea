@@ -18,6 +18,9 @@
  *   owned-OR-collaborates.
  * - `includeDesc` — the keyword arm's `LOWER(description)` substring match
  *   (repo_list.go:484-486) over the 0068 description column, off by default.
+ * - keyword ordering — the owner-prefix CASE (repo_list.go:614-618): with
+ *   `priorityOwnerId` unset, an exactly-one-slash keyword floats its owner
+ *   half to the top of ANY sort; the priority_owner_id arm suppresses it.
  *
  * Cross-visibility refusals are pinned per filter: an anonymous (or
  * public-only) searcher asking for another user's stars, a team's grants, or
@@ -660,5 +663,114 @@ describe("searchExploreRepos rides the ported builder", () => {
       sort: "",
     });
     expect(self.total).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// keyword ordering — the owner-prefix CASE (repo_list.go:614-618)
+// ---------------------------------------------------------------------------
+
+describe("search keyword owner-prefix CASE (repo_list.go:614-618)", () => {
+  it("floats the keyword's owner half to the top of the default sort", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    await seedRepo(alice.id, "alice", "zeppelin", "public");
+    await seedRepo(bob.id, "bob", "zeal", "public");
+
+    // One comma needle per arm: `ze` matches BOTH slugs (so bob/zeal is in
+    // the result set — a lone `alice/ze` needle can only ever match alice's
+    // repos through the pair arm) while the whole keyword still carries
+    // exactly one "/", the count upstream takes over the WHOLE keyword.
+    // Default sort is slug asc, so without the CASE zeal sorts first; the
+    // owner float flips it.
+    const floated = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "alice/ze,ze",
+    });
+    expect(floated.total).toBe(2);
+    expect(floated.items.map((p) => p.repo.slug)).toEqual(["zeppelin", "zeal"]);
+
+    // Upstream binds the owner half VERBATIM to a wildcard-less LIKE, which
+    // SQLite folds ASCII-case — the same match as lowercase equality against
+    // our lowercase-stored ownerNamespace.
+    const upper = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "ALICE/Ze,ze",
+    });
+    expect(upper.items.map((p) => p.repo.slug)).toEqual(["zeppelin", "zeal"]);
+  });
+
+  it("priorityOwnerId wins: the else-if suppresses the owner float", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    await seedRepo(alice.id, "alice", "aardvark", "public");
+    await seedRepo(bob.id, "bob", "zebra", "public");
+
+    // Comma needles: `a` matches both slugs (zebra's tail) and `alice/a`
+    // additionally rides alice's pair arm — the whole keyword still carries
+    // exactly one "/". Without priority_owner_id the keyword float puts
+    // alice first…
+    const floated = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "alice/a,a",
+    });
+    expect(floated.items.map((p) => p.repo.slug)).toEqual(["aardvark", "zebra"]);
+
+    // …but with it, upstream's arms are mutually exclusive (repo_list.go
+    // :611-618 if/else-if): only the owner_id CASE applies, so bob's repo
+    // leads and alice does NOT float (a double-applied CASE would tie them
+    // at 0 and fall back to slug asc — aardvark first — the wrong order).
+    const pinned = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "alice/a,a",
+      priorityOwnerId: bob.id,
+    });
+    expect(pinned.total).toBe(2);
+    expect(pinned.items.map((p) => p.repo.slug)).toEqual(["zebra", "aardvark"]);
+  });
+
+  it("a slash-less keyword adds no float (plain sort order stands)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    await seedRepo(alice.id, "alice", "zeppelin", "public");
+    await seedRepo(bob.id, "bob", "zeal", "public");
+
+    // Same fixture as the float pin, needle without any slash: both repos
+    // match the slug arm but no CASE is prepended — default slug asc keeps
+    // zeal first.
+    const plain = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "ze",
+    });
+    expect(plain.total).toBe(2);
+    expect(plain.items.map((p) => p.repo.slug)).toEqual(["zeal", "zeppelin"]);
+  });
+
+  it("the float is PREPENDED to an explicit sort, not a replacement", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    await seedRepo(alice.id, "alice", "az", "public");
+    await seedRepo(bob.id, "bob", "aa", "public");
+
+    // Explicit `sort=alpha&order=desc` alone orders owner desc: bob, alice.
+    const explicit = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "a",
+      sort: "alpha",
+      order: "desc",
+    });
+    expect(explicit.items.map((p) => p.repo.slug)).toEqual(["aa", "az"]);
+
+    // Upstream substitutes the default only when OrderBy is empty (:607) and
+    // prepends the CASE to whatever stands (:617) — so the explicit sort
+    // stays as the tie-breaker INSIDE the float.
+    const floated = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "alice/a,a",
+      sort: "alpha",
+      order: "desc",
+    });
+    expect(floated.total).toBe(2);
+    expect(floated.items.map((p) => p.repo.slug)).toEqual(["az", "aa"]);
   });
 });
