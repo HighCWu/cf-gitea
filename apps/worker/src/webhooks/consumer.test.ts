@@ -12,11 +12,13 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { webhookDeliveries, webhooks } from "../db/schema";
 import { createOwnerHook } from "../api/services/hooks";
 import { emitWebhookDeliveries } from "../issues/webhooks";
+import { encryptInstanceSecretData, INSTANCE_ENVELOPE_PREFIX } from "../services/instance-key";
 import {
   WEBHOOK_RESPONSE_LIMIT_BYTES,
   buildWebhookRequest,
   computeWebhookSignatures,
   processWebhookDelivery,
+  resolveWebhookAuthorization,
   runWebhookDeliveryBatch,
   type WebhookDeliveryMessage,
 } from "./consumer";
@@ -89,6 +91,21 @@ async function hookRow(id: number) {
   const row = await db().select().from(webhooks).where(eq(webhooks.id, id)).get();
   if (row === undefined) throw new Error("webhook row vanished");
   return row;
+}
+
+/** Flip one byte of a base64url envelope payload (the tamper pin's helper —
+ *  the instance-key suite's local flipByte twin). */
+function flipOneByte(encoded: string, position: number): string {
+  const padded = encoded.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const target = bytes[position];
+  if (target === undefined) throw new Error(`flipOneByte: position ${position} out of range`);
+  bytes[position] = target ^ 0x01;
+  let out = "";
+  for (const b of bytes) out += String.fromCharCode(b);
+  return btoa(out).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +225,7 @@ describe("buildWebhookRequest (§2.6 header set / §2.7 byte shape)", () => {
     url: "http://receiver.test/hook",
     httpMethod: "POST",
     contentType: 1,
-    headerAuthorizationEncrypted: null,
+    authorizationHeader: null,
   };
 
   it("builds the full upstream header set with target type", () => {
@@ -274,15 +291,38 @@ describe("buildWebhookRequest (§2.6 header set / §2.7 byte shape)", () => {
     ).toThrow("invalid http method: PUT");
   });
 
-  it("adds the Authorization header from the stored column", () => {
+  it("adds the resolved Authorization header (the decrypt arm's output)", () => {
     const built = buildWebhookRequest({
-      hook: { ...hook, headerAuthorizationEncrypted: "Bearer abc" },
+      hook: { ...hook, authorizationHeader: "Bearer abc" },
       payloadText: PAYLOAD,
       delivery,
       targetType: "repository",
       signatures,
     });
     expect(built.headers["Authorization"]).toBe("Bearer abc");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-64 — the Authorization header at rest (the instance-key envelope)
+// ---------------------------------------------------------------------------
+
+describe("resolveWebhookAuthorization (B-64's read dispatch)", () => {
+  it("round-trips the envelope, passes legacy plaintext through, and nulls the empty arms", async () => {
+    const sealed = await encryptInstanceSecretData(env.DB, "Bearer sealed-value");
+    expect(await resolveWebhookAuthorization(env.DB, sealed)).toBe("Bearer sealed-value");
+    // A pre-change row's plaintext serves as-is (the transparent passthrough;
+    // upgrade-on-write converts it at the hook's next edit).
+    expect(await resolveWebhookAuthorization(env.DB, "Bearer legacy-plaintext")).toBe("Bearer legacy-plaintext");
+    expect(await resolveWebhookAuthorization(env.DB, null)).toBeNull();
+    expect(await resolveWebhookAuthorization(env.DB, "")).toBeNull();
+  });
+
+  it("throws on an unopenable envelope (the caller fails the delivery)", async () => {
+    // An unknown-version prefix must not serve raw (the instance-key dispatch).
+    await expect(resolveWebhookAuthorization(env.DB, "v9:AAAAAAAAAAAAAAAAAAAAAA")).rejects.toThrow(
+      /unknown envelope version/,
+    );
   });
 });
 
@@ -541,16 +581,50 @@ describe("§3.6 recording rules", () => {
     expect(response.body).toHaveLength(16);
   });
 
-  it("masks the Authorization header in the stored request", async () => {
-    const hookId = await seedHook({ headerAuthorizationEncrypted: "Bearer super-secret-value" });
+  it("masks the Authorization header in the stored request (B-64: the stored column is the envelope)", async () => {
+    const hookId = await seedHook({
+      headerAuthorizationEncrypted: await encryptInstanceSecretData(env.DB, "Bearer super-secret-value"),
+    });
+    // At-rest pin: the column carries the v1 envelope, never the cleartext
+    // (null would coerce to "" and fail the prefix assertion loudly).
+    const stored = (await hookRow(hookId)).headerAuthorizationEncrypted ?? "";
+    expect(stored.startsWith(INSTANCE_ENVELOPE_PREFIX)).toBe(true);
+    expect(stored).not.toContain("super-secret-value");
+
     const deliveryId = await seedDelivery(hookId);
     const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
     await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
-    expect(calls[0]!.headers["Authorization"]).toBe("Bearer super-secret-value"); // sent verbatim
+    expect(calls[0]!.headers["Authorization"]).toBe("Bearer super-secret-value"); // decrypted, sent verbatim
     const row = await deliveryRow(deliveryId);
     expect(row.requestContent ?? "").not.toContain("super-secret-value");
     const request = JSON.parse(row.requestContent ?? "{}") as { headers: Record<string, string> };
     expect(request.headers["Authorization"]).toBe("******");
+  });
+
+  it("sends a LEGACY plaintext Authorization row verbatim (the transparent passthrough)", async () => {
+    const hookId = await seedHook({ headerAuthorizationEncrypted: "Bearer legacy-row" });
+    const deliveryId = await seedDelivery(hookId);
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: true });
+    expect(calls[0]!.headers["Authorization"]).toBe("Bearer legacy-row");
+  });
+
+  it("fails the delivery terminally when the envelope does not open (upstream's error arm, deliver.go:186-191)", async () => {
+    const sealed = await encryptInstanceSecretData(env.DB, "Bearer sealed-value");
+    const tampered = INSTANCE_ENVELOPE_PREFIX + flipOneByte(sealed.slice(INSTANCE_ENVELOPE_PREFIX.length), 13);
+    const hookId = await seedHook({ headerAuthorizationEncrypted: tampered });
+    const deliveryId = await seedDelivery(hookId);
+    const { calls, fetchImpl } = receiverStub(() => {
+      throw new Error("must not send with an unopenable header");
+    });
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: false });
+    expect(calls).toHaveLength(0);
+    const row = await deliveryRow(deliveryId);
+    expect(row.state).toBe("delivered"); // terminal, not pending/delivering
+    expect(row.isSucceed).toBe(false);
+    expect((row.responseContent ?? "").includes("cannot get Authorization header")).toBe(true);
   });
 
   it("records skipped for an inactive hook without touching the hook status", async () => {

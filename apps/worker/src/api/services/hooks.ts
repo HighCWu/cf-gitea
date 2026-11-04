@@ -4,6 +4,7 @@ import { drizzle } from "drizzle-orm/d1";
 import type { HookEventConfig, HookEventType } from "../../issues/webhooks";
 import { webhookEventGroup } from "../../issues/webhooks";
 import { webhookDeliveries, webhooks } from "../../db/schema";
+import { encryptInstanceSecretData } from "../../services/instance-key";
 import { ApiError } from "../errors";
 import {
   HOOK_TYPES,
@@ -131,7 +132,10 @@ function pullHook(events: string[], event: string): boolean {
  * `["push"]`. The `*_only` pseudo-names and the shared `issues`/`pull_request`
  * group names behave exactly as upstream (subscribing to `issues` turns on
  * every issue sub-event). The two Actions-only events (`workflow_run`,
- * `workflow_job`) are deferred with the Actions surface (SPEC-0004 §2.5).
+ * `workflow_job`) subscribe by PLAIN membership exactly like upstream's
+ * `SliceContainsString(events, name, true)` arms (utils/hook.go — no group
+ * expansion applies to them): census B-62 retired the old accepted-and-ignored
+ * drop here.
  */
 export function updateHookEvents(events: string[]): NonNullable<HookEventConfig["events"]> {
   if (events.length === 0) {
@@ -147,6 +151,10 @@ export function updateHookEvents(events: string[]): NonNullable<HookEventConfig[
     release: hasEvent(events, "release"),
     package: hasEvent(events, "package"),
     status: hasEvent(events, "status"),
+    // The Actions subscription tail (B-62): plain membership, upstream order
+    // (the pair sits between `status` and the issues family in updateHookEvents).
+    workflow_run: hasEvent(events, "workflow_run"),
+    workflow_job: hasEvent(events, "workflow_job"),
     // Issues family: `issues_only` or the group name `issues`.
     issues: issuesHook(events, "issues"),
     issue_assign: issuesHook(events, "issue_assign"),
@@ -167,8 +175,9 @@ export function updateHookEvents(events: string[]): NonNullable<HookEventConfig[
   };
 }
 
-/** `AllEvents()` (modules/webhook/type.go:45) minus the Actions-only pair,
- *  in the same order — the `send_everything` EventsArray body. */
+/** `AllEvents()` (modules/webhook/type.go:45-77) — all 26, in the same order
+ *  (`workflow_run`/`workflow_job` trail `status`), the `send_everything`
+ *  EventsArray body. */
 const ALL_EVENTS: readonly string[] = [
   "create",
   "delete",
@@ -194,6 +203,8 @@ const ALL_EVENTS: readonly string[] = [
   "release",
   "package",
   "status",
+  "workflow_run",
+  "workflow_job",
 ];
 
 /** Insertion order of `updateHookEvents`' map — the choose-events EventsArray
@@ -208,6 +219,8 @@ const SUBSCRIPTION_ORDER: readonly (keyof NonNullable<HookEventConfig["events"]>
   "release",
   "package",
   "status",
+  "workflow_run",
+  "workflow_job",
   "issues",
   "issue_assign",
   "issue_label",
@@ -405,6 +418,26 @@ interface HookScope {
 }
 
 /**
+ * `SetHeaderAuthorization` (models/webhook/webhook.go:218-224) — the store
+ * choke for the Authorization header (census B-64, the B-57 seam): "" clears
+ * (the column's NULL spelling — the consumer treats null and "" alike), any
+ * other cleartext stores the instance-key AEAD envelope via
+ * `encryptInstanceSecretData` (services/instance-key.ts — the v1:
+ * `base64url(iv‖AES-256-GCM(cleartext))` format, the SAME envelope the
+ * actions secrets carry under the shared `general_token_signing_secret`
+ * keystore row). Upstream's AES-256-CFB is the recorded platform adaptation
+ * (WebCrypto has no CFB; GCM is strictly stronger — the instance-key header).
+ * BOTH write arms funnel here (addHook + editRepoHook — every API route and
+ * UI page caller), so no plaintext Authorization value can enter the column
+ * through the service; legacy plaintext rows read transparently (the
+ * consumer's dispatch) and upgrade-on-write the next time the hook is edited.
+ */
+async function sealAuthorizationHeader(d1: D1Database, cleartext: string): Promise<string | null> {
+  if (cleartext === "") return null;
+  return encryptInstanceSecretData(d1, cleartext);
+}
+
+/**
  * `addHook` (routers/api/v1/utils/hook.go) — the checkCreateHookOption
  * validation runs in upstream's exact order with upstream's exact messages:
  *  1. `IsValidHookTaskType` → 422 "Invalid hook type: X" (the declared zod
@@ -485,10 +518,11 @@ async function addHook(d1: D1Database, scope: HookScope, form: CreateHookOption)
       isActive: form.active ?? false,
       type,
       meta,
-      // Upstream encrypts with the instance SecretKey (SetHeaderAuthorization);
-      // the at-rest encryption service lands with the settings module — the
-      // column is read verbatim by the delivery consumer meanwhile.
-      headerAuthorizationEncrypted: form.authorization_header ?? null,
+      // Upstream encrypts with the instance SecretKey (SetHeaderAuthorization,
+      // models/webhook/webhook.go:218-224); ours seals through the B-64 choke
+      // above — the column NEVER carries plaintext from this arm (a consumer
+      // decrypts; legacy rows pass through, upgrade-on-write on the next edit).
+      headerAuthorizationEncrypted: await sealAuthorizationHeader(d1, form.authorization_header ?? ""),
       createdAt: now,
       updatedAt: now,
     })
@@ -569,7 +603,9 @@ export async function editRepoHook(
   } satisfies HookEventConfig);
 
   if (form.authorization_header !== undefined) {
-    patch.headerAuthorizationEncrypted = form.authorization_header === "" ? null : form.authorization_header;
+    // Same choke as the create arm — "" clears, anything else stores sealed
+    // (the legacy row's value converts here too: upgrade-on-write, B-64).
+    patch.headerAuthorizationEncrypted = await sealAuthorizationHeader(d1, form.authorization_header);
   }
   if (form.active !== undefined) {
     patch.isActive = form.active;
@@ -831,6 +867,66 @@ export async function fireTestDelivery(
     .all();
   const id = inserted[0]?.id;
   if (id === undefined) throw new Error("delivery insert lost");
+  if (options.enqueue !== undefined) {
+    await options.enqueue([id]);
+  }
+  return id;
+}
+
+// ---------------------------------------------------------------------------
+// Replay (POST …/hooks/{id}/replay/{uuid}) — census B-63
+// ---------------------------------------------------------------------------
+
+/**
+ * `ReplayHookTask` — the model copy (models/webhook/hooktask.go:179-190) plus
+ * the service enqueue tail (services/webhook/webhook.go:257-264), ported over
+ * the delivery store: the HOOK-SCOPED uuid lookup (`GetHookTaskByUUID(hookID,
+ * uuid)` — a uuid of ANOTHER hook is a miss), then a NEW delivery row carrying
+ * the SAME stored payload/event bytes under a NEW uuid (`CreateHookTask`'s
+ * copy fields: HookID/PayloadContent/EventType/PayloadVersion — our repoId,
+ * eventGroup, and payload_content ride along from the source row), `state=
+ * 'pending'`, and the caller's enqueue callback (`enqueueHookTask(task.ID)`).
+ * `null` = not found (the route 404s — upstream IsErrHookTaskNotExist's
+ * NotFound arm, routers/web/repo/setting/webhook.go:746-749). The source row
+ * is untouched (upstream replays COPY, never re-queue the same row), so the
+ * history keeps both attempts.
+ *
+ * Returns the new delivery id; the ROUTE decides whether to await the
+ * optional enqueue inline or hang it off `c.executionCtx.waitUntil(...)`
+ * (fireTestDelivery's convention).
+ */
+export async function replayHookDelivery(
+  d1: D1Database,
+  hookId: number,
+  uuid: string,
+  options: {
+    enqueue?: (deliveryIds: number[]) => void | Promise<void>;
+    now?: Date;
+  } = {},
+): Promise<number | null> {
+  const source = await drizzle(d1)
+    .select()
+    .from(webhookDeliveries)
+    .where(and(eq(webhookDeliveries.hookId, hookId), eq(webhookDeliveries.uuid, uuid)))
+    .get();
+  if (source === undefined) return null;
+
+  const inserted = await drizzle(d1)
+    .insert(webhookDeliveries)
+    .values({
+      hookId: source.hookId,
+      repoId: source.repoId,
+      uuid: crypto.randomUUID(),
+      eventType: source.eventType,
+      eventGroup: source.eventGroup,
+      payloadContent: source.payloadContent,
+      state: "pending",
+      createdAt: options.now ?? new Date(),
+    })
+    .returning({ id: webhookDeliveries.id })
+    .all();
+  const id = inserted[0]?.id;
+  if (id === undefined) throw new Error("replay delivery insert lost");
   if (options.enqueue !== undefined) {
     await options.enqueue([id]);
   }

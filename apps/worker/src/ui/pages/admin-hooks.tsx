@@ -70,7 +70,7 @@
  * upstream navbar.tmpl's order) with the Webhooks item active here.
  */
 
-import { deleteGlobalHook, listGlobalHooks, type WebhookRow } from "../../api/services/hooks";
+import { deleteGlobalHook, getGlobalHook, listGlobalHooks, replayHookDelivery, type WebhookRow } from "../../api/services/hooks";
 import { HookStatus } from "../../db/schema";
 import type { UiContext } from "../ui-context";
 import { AdminFamilyShell } from "./admin-users";
@@ -133,6 +133,32 @@ export async function loadAdminHooksData(d1: D1Database, oauth2Enabled = true): 
  *  flash-error posture reduced, the module header). */
 export async function applyAdminHookDelete(d1: D1Database, id: number): Promise<boolean> {
   return deleteGlobalHook(d1, id);
+}
+
+export type AdminHookReplayResult = { outcome: "replayed"; deliveryId: number } | { outcome: "missing" };
+
+/**
+ * The replay write (census B-63 — upstream ReplayWebhook's admin arm,
+ * web.go:865, over the landed service): the global-scope hook guard
+ * (getGlobalHook — the `repo_id=0 AND owner_id=0` NULL-adapted condition; a
+ * scoped row 404s), then `replayHookDelivery`'s copy (the NEW pending
+ * delivery row carrying the source's stored payload/event bytes). The admin
+ * EDIT page — the delivery history's home upstream — is the module header's
+ * documented UNLANDED slice, so no replay button renders on this list page;
+ * the helper arms index.ts's route wiring for when that slice lands.
+ */
+export async function applyAdminHookReplay(
+  d1: D1Database,
+  hookId: number,
+  uuid: string,
+  enqueue?: (deliveryId: number) => void,
+): Promise<AdminHookReplayResult> {
+  const hook = await getGlobalHook(d1, hookId);
+  if (hook === null) return { outcome: "missing" };
+  const deliveryId = await replayHookDelivery(d1, hook.id, uuid);
+  if (deliveryId === null) return { outcome: "missing" };
+  enqueue?.(deliveryId);
+  return { outcome: "replayed", deliveryId };
 }
 
 // ---------------------------------------------------------------------------

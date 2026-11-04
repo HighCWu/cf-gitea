@@ -53,10 +53,12 @@
  * (`organization settings new webhook`, CustomHeaderTitle =
  * repo.settings.update_webhook): webhook/new.tmpl → gitea.tmpl's form
  * (payload_url, content_type, name, branch_filter, active — the landed
- * repo-page field set with upstream's field names), the read-only
- * subscription line (settings.tmpl's matrix reduced, the hidden `events`
- * preserve inputs riding the PATCH arm's unconditional rewrite), the red
- * Remove Webhook form, then history.tmpl's Recent Deliveries segment.
+ * repo-page field set with upstream's field names), the Workflow Events
+ * checkbox pair (B-62 — settings.tmpl:337-349's matrix tail; the other
+ * events keep the hidden `events` preserve inputs riding the PATCH arm's
+ * unconditional rewrite), the read-only subscription line, the red Remove
+ * Webhook form, then history.tmpl's Recent Deliveries segment (its
+ * per-delivery replay forms landed with B-63).
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
@@ -73,10 +75,12 @@
  *   (web.go:740 registers `/{id}/test` inside the REPO settings group; the
  *   org group carries no test route, and the fake-push payload needs a repo
  *   pair) — rendering the repo page's button here would be a dead control.
- * - NO replay control: upstream history.tmpl renders a per-delivery replay
- *   form for org owners (web.go:1039's `/{id}/replay/{uuid}`), but no replay
- *   arm is landed anywhere (the repo page omits it too) — the deliveries
- *   segment renders read-only.
+ * - The per-delivery replay control LANDED (census B-63): history.tmpl:50-53's
+ *   POST form rides the visible delivery row (`{hookLink}/replay/{uuid}`,
+ *   disabled while the hook is inactive — upstream's description_disabled
+ *   arm), driven by `replayOrgHookDelivery`; the index.ts route handler that
+ *   takes the POST is this wave's separate wiring window (the button 404s
+ *   until it lands — recorded in the census row).
  * - The provider dropdown on the edit form (webhook/new.tmpl's type menu)
  *   reduces away exactly like the list page's: `gitea` is the only landed
  *   type.
@@ -96,6 +100,7 @@ import {
   hookEventsArray,
   listHookDeliveries,
   listOwnerHooks,
+  replayHookDelivery,
   type WebhookRow,
 } from "../../api/services/hooks";
 import { HookStatus, webhookDeliveries } from "../../db/schema";
@@ -113,7 +118,9 @@ import {
   hookEditFormOf,
   HOOK_DELIVERIES_LIMIT,
   HOOKS_LIST_LIMIT,
+  preserveSubscriptionEvents,
   settingsLocale,
+  WorkflowEventsField,
   type CreateHookForm,
   type HookDeliveryRow,
   type HookEditForm,
@@ -378,6 +385,32 @@ export async function deleteOrgHook(d1: D1Database, org: OrgRecord, hookId: numb
   return deleteOwnerHook(d1, org.id, hookId);
 }
 
+export type OrgHookReplayResult = { outcome: "replayed"; deliveryId: number } | { outcome: "missing" };
+
+/**
+ * The replay write (census B-63 — upstream ReplayWebhook's org arm over the
+ * landed service): the org-scoped hook guard (getOwnerHook — a foreign-org
+ * id 404-shells like the delete miss), then `replayHookDelivery`'s copy (the
+ * NEW pending delivery row carrying the source's stored payload/event bytes
+ * — GetHookTaskByUUID's hook-scoped uuid lookup: a uuid of ANOTHER hook is a
+ * miss too). The optional enqueue callback rides the caller's queue probe +
+ * waitUntil when index.ts's replay route lands.
+ */
+export async function replayOrgHookDelivery(
+  d1: D1Database,
+  org: OrgRecord,
+  hookId: number,
+  uuid: string,
+  enqueue?: (deliveryId: number) => void,
+): Promise<OrgHookReplayResult> {
+  const hook = await getOwnerHook(d1, org.id, hookId);
+  if (hook === null) return { outcome: "missing" };
+  const deliveryId = await replayHookDelivery(d1, hook.id, uuid);
+  if (deliveryId === null) return { outcome: "missing" };
+  enqueue?.(deliveryId);
+  return { outcome: "replayed", deliveryId };
+}
+
 // --- components -----------------------------------------------------------------
 
 /** history.tmpl's status mark for one delivery: succeeded green (check),
@@ -399,7 +432,7 @@ function DeliveryTime(props: { row: HookDeliveryRow }) {
   return <TimeSince unixSeconds={Math.floor(at.getTime() / 1000)} tz="+0000" />;
 }
 
-function DeliveryItem(props: { row: HookDeliveryRow }) {
+function DeliveryItem(props: { row: HookDeliveryRow; replayAction: string | null; replayDisabled?: boolean }) {
   const { row } = props;
   const status = deliveryStatus(row);
   return (
@@ -413,6 +446,25 @@ function DeliveryItem(props: { row: HookDeliveryRow }) {
         </div>
         <div class="flex-text-block">
           <span class="ui tiny label">{row.eventType}</span>
+          {/* history.tmpl:50-53's per-delivery replay form (census B-63) —
+              the repo page's twin: the icon button POSTs /replay/{uuid} on
+              the visible row (the detail panel stays folded), disabled while
+              the hook is inactive (upstream's description_disabled arm).
+              The action is the canonical web path — index.ts's replay
+              handler is this wave's separate wiring window. */}
+          {props.replayAction !== null ? (
+            <form class="tw-inline" method="post" action={props.replayAction}>
+              <button
+                type="submit"
+                class="ui tiny button"
+                title={hookDetailLocale.replay_delivery}
+                aria-label={hookDetailLocale.replay_delivery}
+                disabled={props.replayDisabled === true}
+              >
+                <Icon name="octicon-sync" />
+              </button>
+            </form>
+          ) : null}
           <span class="tw-text-text-light">
             <DeliveryTime row={row} />
           </span>
@@ -435,9 +487,11 @@ export function renderOrgHookDetailPage(options: {
  * The org per-hook page (§2.4.1 discriminator: `organization settings new
  * webhook` — org/settings/hook_new.tmpl's EDIT arm: upstream renders the
  * shared WebHooksEdit through the org new template with CustomHeaderTitle =
- * repo.settings.update_webhook). The edit form + the read-only subscription
- * line + the Remove Webhook form + history.tmpl's deliveries segment
- * (read-only — the module header's test/replay reductions).
+ * repo.settings.update_webhook). The edit form + the Workflow Events matrix
+ * pair + the read-only subscription line + the Remove Webhook form +
+ * history.tmpl's deliveries segment with the per-delivery replay forms
+ * (B-63; the request/response panels stay the folded absence — the module
+ * header).
  */
 export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailData; error: string | null }) {
   const { ctx, data } = props;
@@ -457,9 +511,12 @@ export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailDa
           <div class="ui attached segment">
             <form class="ui form" action={hookLink} method="post">
               {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
-              {form.events.map((event) => (
+              {/* The preserve inputs EXCLUDE the Actions pair (B-62) — the
+                  pair's POST truth is the checkbox matrix below. */}
+              {preserveSubscriptionEvents(form.events).map((event) => (
                 <input type="hidden" name="events" value={event} />
               ))}
+              <WorkflowEventsField events={form.events} />
               <div class="required field">
                 <label for="payload_url">{settingsLocale.payload_url}</label>
                 <input id="payload_url" name="payload_url" type="url" required value={form.payloadUrl} />
@@ -496,8 +553,9 @@ export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailDa
               </div>
             </form>
             {/* The read-only subscription line (settings.tmpl's matrix
-                reduced — the hidden inputs above preserve it through the
-                PATCH arm's unconditional rewrite). */}
+                reduced to the line + the Workflow checkbox pair above — the
+                hidden inputs preserve the rest through the PATCH arm's
+                unconditional rewrite). */}
             <p class="tw-text-placeholder-text">
               {hookDetailLocale.event_desc} {form.events.length > 0 ? form.events.join(", ") : "push"}
             </p>
@@ -508,8 +566,8 @@ export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailDa
             </form>
           </div>
           {/* history.tmpl's header shape: the list title alone — the org arm
-              has no test route upstream and no replay arm is landed (the
-              module header). */}
+              has no test route upstream (the module header); the per-delivery
+              replay forms ride the rows (B-63). */}
           <h4 class="ui top attached header">{hookDetailLocale.recent_deliveries}</h4>
           <div class="ui attached segment">
             {data.deliveries.length === 0 ? (
@@ -517,7 +575,11 @@ export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailDa
             ) : (
               <div class="flex-divided-list">
                 {data.deliveries.map((row) => (
-                  <DeliveryItem row={row} />
+                  <DeliveryItem
+                    row={row}
+                    replayAction={`${hookLink}/replay/${row.uuid}`}
+                    replayDisabled={!data.hook.isActive}
+                  />
                 ))}
               </div>
             )}

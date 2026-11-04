@@ -137,7 +137,7 @@
  *                                          settings.tsx — wave 14; the edit
  *                                          form + the recent-deliveries
  *                                          list; admin viewer only)
- *   /:owner/:repo/settings/hooks/{id}[/test|/delete]
+ *   /:owner/:repo/settings/hooks/{id}[/test|/delete|/replay/{uuid}]
  *                                          the per-hook writes, POST (the
  *                                          edit rides the page URL —
  *                                          upstream type-prefixes it; test
@@ -146,7 +146,9 @@
  *                                          the tail — upstream's shared
  *                                          /delete?id= target exists for
  *                                          the list trash buttons this UI
- *                                          does not render)
+ *                                          does not render; replay is
+ *                                          census B-63's per-delivery tail,
+ *                                          web.go:1237)
  *   /:owner/:repo/settings/branches       protected-branches rules list,
  *                                          GET (pages/branch-protection.tsx
  *                                          — wave 15; admin viewer only)
@@ -621,6 +623,9 @@
  *                                          GET + POST
  *   /org/{org}/settings/hooks/{id}         the org per-hook page, GET + POST
  *   /org/{org}/settings/hooks/{id}/delete  the org hook delete, POST
+ *   /org/{org}/settings/hooks/{id}/replay/{uuid}
+ *                                          the org per-delivery replay, POST
+ *                                          (census B-63 — web.go:1038)
  *                                          (pages/org-settings-hooks.tsx —
  *                                          wave 53; upstream web.go:1033-1044's
  *                                          /hooks group over org/settings/
@@ -698,7 +703,7 @@
  */
 
 import { Hono, type Context } from "hono";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
@@ -713,7 +718,7 @@ import {
   renameProtectedRuleName,
   renameRefusedByProtection,
 } from "../services/branch-protection";
-import { renamedBranches, repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
+import { actionRuns, renamedBranches, repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
@@ -1022,6 +1027,7 @@ import {
   loadOrgHooksSettings,
   renderOrgHookDetailPage,
   renderOrgHooksSettingsPage,
+  replayOrgHookDelivery,
 } from "./pages/org-settings-hooks";
 // Window-2b: the org blocked-users tab + the actions secrets/variables
 // sub-tabs (two-stage waves 55/59, mounted by this window).
@@ -1308,6 +1314,7 @@ import {
   loadUserSettingsHooksPageData,
   renderUserHookDetailPage,
   renderUserSettingsHooksPage,
+  replayUserHookDelivery,
 } from "./pages/user-settings-webhooks";
 import {
   addGpgKeyFromForm,
@@ -1385,6 +1392,10 @@ import {
   renderAdminMonitorTracePage,
 } from "./pages/admin-monitor";
 import type { AdminMonitorPage } from "./pages/admin-monitor";
+// The census B-70 arm: the admin audit-logs page + the NDJSON export over
+// the settings-audit-logs shared renderer (pages/admin-audit-logs.tsx —
+// upstream audit.go:21-71, web.go:797-798).
+import { adminAuditLogExportResponse, renderAdminAuditLogsPage } from "./pages/admin-audit-logs";
 // The SPEC-0021 platform arms' route seams (the 6cc57d8 module's fold — the
 // admin-monitor header's Platform-arms HANDOFF): the queue-set closed loop
 // and the platform config read (the profile trigger rides the module's own
@@ -1416,7 +1427,7 @@ import {
   parseAdminEmailsListParams,
   renderAdminEmailsPage,
 } from "./pages/admin-emails";
-import { applyAdminHookDelete, loadAdminHooksData, renderAdminHooksPage } from "./pages/admin-hooks";
+import { applyAdminHookDelete, applyAdminHookReplay, loadAdminHooksData, renderAdminHooksPage } from "./pages/admin-hooks";
 import {
   addBadgeUserByName,
   adminBadgesLocale,
@@ -1787,6 +1798,7 @@ import {
   renderHooksSettingsPage,
   renderMirrorSettingsPage,
   renderRepoSettingsPage,
+  replayRepoHookDelivery,
   saveMirrorSettingsFromForm,
   syncMirrorNow,
 } from "./pages/settings";
@@ -1816,6 +1828,20 @@ import {
   renderReleasesPage,
 } from "./pages/releases";
 import { releaseReactionSubmit } from "./pages/release-reaction-writes";
+// The B-55 write tails (web.go:1521-1524): the notes generator + the
+// dropzone upload/remove arms over the landed release machinery.
+import {
+  generateReleaseNotes,
+  releaseNotesLocale,
+  type ReleaseNotesOptions,
+} from "./pages/release-notes";
+import {
+  releaseAttachmentRemoveFormValue,
+  releaseAttachmentRemoveResponse,
+  releaseAttachmentUploadResponse,
+  removeReleaseAttachment,
+  uploadReleaseAttachmentFromMultipart,
+} from "./pages/release-attachment-writes";
 import { listReleases } from "../api/services/releases";
 import {
   applyBranchProtectionForm,
@@ -1949,6 +1975,8 @@ import {
 } from "./pages/repo-editor-cherrypick";
 import { commitUploadFromForm, uploadFileToServer, uploadRemoveFromServer } from "../services/upload-staging";
 import { branchRef, commitApiChangeError, deleteApiRefError, engineCell, engineReads, refTipMap, resolveNamedRef, ZERO_OID } from "../api/services/engine";
+// The B-56 approve-all arm's status rows (GetLatestCommitStatus's port).
+import { allLatestCommitStatuses } from "../api/services/commit-status";
 import {
   loadRepoMigrateData,
   migrateRepoFromForm,
@@ -2255,6 +2283,7 @@ export interface SettingsRoute {
     | "settings-hook-detail"
     | "settings-hook-test"
     | "settings-hook-delete"
+    | "settings-hook-replay" // POST /settings/hooks/{id}/replay/{uuid} (census B-63 — web.go:1237)
     | "settings-branches"
     | "settings-branch-edit"
     | "settings-branch-delete"
@@ -2307,12 +2336,15 @@ export interface SettingsRoute {
     | "settings-actions-general-token-permissions"; // POST /settings/actions/general/token_permissions (web.go:1276)
   owner: string;
   repo: string;
-  /** The hook id (the detail/test/delete families only) or the rule id (the
-   *  branch-delete family, the tag-detail family). */
+  /** The hook id (the detail/test/delete/replay families only) or the rule
+   *  id (the branch-delete family, the tag-detail family). */
   id?: number;
   /** The Git hook name (the settings-githook family) or the LFS oid (the
    *  settings-lfs-show family). */
   name?: string;
+  /** The delivery uuid (the settings-hook-replay family — upstream's
+   *  {uuid} path param verbatim, GetHookTaskByUUID's lookup key). */
+  uuid?: string;
 }
 
 /** The wave-5 comment-write family (pages/issue-detail.tsx): upstream
@@ -2470,12 +2502,29 @@ export interface CommitViewRoute {
  *  (web.go:1519-1520 EditRelease/EditReleasePost — the writer gate, the
  *  decoded tail the URL-keyed tag, slashes allowed) and `/releases/delete`
  *  the delete write (web.go:1523 DeleteRelease — the edit page's red
- *  button). The `.rss`/`.atom` feed tails (web.go:1507-1508), the
- *  `/generate-notes` and `/attachments*` write tails and the
- *  `{id}/reactions` POST (web.go:1511-1526) stay unclaimed → the engine's
- *  404, exactly upstream's unregistered-route answer for them. */
+ *  button). The `.rss`/`.atom` feed tails (web.go:1507-1508) and the
+ *  `{id}/reactions` POST (web.go:1515) stay unclaimed → the engine's 404,
+ *  exactly upstream's unregistered-route answer for them. The WRITE TAILS
+ *  landed (census B-55): `/releases/generate-notes` the notes-generator
+ *  POST (web.go:1521 GenerateReleaseNotes — pages/release-notes.ts over the
+ *  pure commit-walk), `/releases/attachments` the dropzone upload POST
+ *  (web.go:1523 UploadReleaseAttachment — pages/release-attachment-writes.tsx,
+ *  the unlinked releaseId-0 rows) and `/releases/attachments/remove` the
+ *  dropzone remove POST (web.go:1524 DeleteAttachment — the issue twin's
+ *  shared handler over both mounts; the GET shape of `{uuid}` rides the
+ *  attachments-serving seam, whose POST-only pass-through hands the
+ *  `remove` literal back to this parser). */
 export interface ReleasesRoute {
-  family: "releases" | "release-new" | "release-latest" | "release-detail" | "release-edit" | "release-delete";
+  family:
+    | "releases"
+    | "release-new"
+    | "release-latest"
+    | "release-detail"
+    | "release-edit"
+    | "release-delete"
+    | "release-generate-notes"
+    | "release-attachment-upload"
+    | "release-attachment-remove";
   owner: string;
   repo: string;
   /** The decoded tag tail after `/releases/tag/` (the detail family only;
@@ -3458,9 +3507,10 @@ export interface RepoActionsJobQueueRoute {
  *  PathParamInt64 parses junk to 0 — the loader's 404/absent arms), the
  *  exact literal tails only; every deeper tail and the remaining siblings
  *  (`/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`,
- *  `/approve-all-checks`, `/runs/{run}/delete`, `/runs/{run}/workflow`,
+ *  `/runs/{run}/delete`, `/runs/{run}/workflow`,
  *  `/runs/{run}/logs`, the artifacts tails) stay unclaimed → the engine's
- *  404 until their units land. */
+ *  404 until their units land. `/approve-all-checks` landed (the B-56
+ *  claim below). */
 export interface RepoActionsRunViewRoute {
   family:
     | "actions-run-view"
@@ -3481,6 +3531,20 @@ export interface RepoActionsRunViewRoute {
   attempt?: string;
   /** The raw {job} segment (the jobs shape only). */
   job?: string;
+}
+
+/** The B-56 approve-all arm (web.go:1572's
+ *  `m.Post("/approve-all-checks", reqRepoActionsWriter,
+ *  actions.ApproveAllChecks)` inside the /actions group — view.go:1284-1316
+ *  at the pin): the commit's latest statuses → the runs their Actions
+ *  target URLs name → the awaiting-approval subset → ApproveRuns + the
+ *  flash. POST-only upstream (the GET twin answers chi's 405 — the mount's
+ *  methodNotAllowed). The group's read ladder (the C1 note) PLUS
+ *  reqRepoActionsWriter's NotFound gates the arm. */
+export interface ActionsApproveAllChecksRoute {
+  family: "actions-approve-all-checks";
+  owner: string;
+  repo: string;
 }
 
 /** The census C4 artifacts preview subtree (pages/repo-actions-artifacts.tsx
@@ -3684,6 +3748,7 @@ export interface AdminRoute {
     | "admin-emails-delete"
     | "admin-hooks"
     | "admin-hooks-delete"
+    | "admin-hooks-replay" // POST /-/admin/hooks/{id}/replay/{uuid} (census B-63 — web.go:865)
     | "admin-badges"
     | "admin-badge-new"
     | "admin-badge-view"
@@ -3749,6 +3814,10 @@ export interface AdminRoute {
     | "admin-monitor-queue-set"
     | "admin-monitor-diagnosis"
     | "admin-monitor-profile"
+    // The census B-70 arm (pages/admin-audit-logs.tsx — web.go:797-798's
+    // monitor group leads: the page + the NDJSON export, both GET-only).
+    | "admin-monitor-audit-logs"
+    | "admin-monitor-audit-logs-export"
     | "admin-user-detail"
     | "admin-user-edit"
     | "admin-users-impersonate"
@@ -3767,6 +3836,9 @@ export interface AdminRoute {
   /** The positive-integer {authid} (the auths edit/delete families —
    *  web.go:876-879's param; the same digits-only PathParamInt64 posture). */
   authId?: number;
+  /** The delivery uuid (the admin-hooks-replay family — upstream's {uuid}
+   *  path param verbatim, GetHookTaskByUUID's lookup key). */
+  uuid?: string;
   /** The parsed {userid} path param (the detail/impersonate/avatar
    *  families — the digits-only PathParamInt64 parity, junk stays
    *  engine-404). */
@@ -3856,6 +3928,7 @@ export interface UserSettingsTabRoute {
     | "user-settings-hooks"
     | "user-settings-hook-detail"
     | "user-settings-hook-delete"
+    | "user-settings-hook-replay" // POST /user/settings/hooks/{id}/replay/{uuid} (census B-63 — web.go:743)
     | "user-settings-keys"
     | "user-settings-keys-delete"
     | "user-settings-applications"
@@ -3886,6 +3959,9 @@ export interface UserSettingsTabRoute {
     | "user-settings-repos";
   /** The numeric path segment (hook/variable id), already parsed. */
   id: number | null;
+  /** The delivery uuid (the user-settings-hook-replay family — upstream's
+   *  {uuid} path param verbatim, GetHookTaskByUUID's lookup key). */
+  uuid?: string;
 }
 
 /** The wave-12 org teams families (pages/org-teams.tsx): upstream's
@@ -4004,6 +4080,7 @@ export interface OrgSettingsRoute {
     | "org-settings-hooks" // GET+POST /org/{org}/settings/hooks (the webhooks list + add form — wave 53)
     | "org-settings-hook-detail" // GET+POST /org/{org}/settings/hooks/{id} (the edit page — wave 53)
     | "org-settings-hook-delete" // POST /org/{org}/settings/hooks/{id}/delete (wave 53)
+    | "org-settings-hook-replay" // POST /org/{org}/settings/hooks/{id}/replay/{uuid} (census B-63 — web.go:1038)
     | "org-settings-blocked" // GET+POST /org/{org}/settings/blocked_users (window-2b)
     | "org-settings-applications" // GET /org/{org}/settings/applications (the R20-a oauth2 list)
     | "org-settings-applications-create" // POST /org/{org}/settings/applications/oauth2 (the R20-a create)
@@ -4044,8 +4121,11 @@ export interface OrgSettingsRoute {
   /** Decoded org segment. */
   owner: string;
   /** The team id (the team-edit/delete families) or hook id (the org
-   * hook-detail/delete families — wave 53). */
+   * hook-detail/delete/replay families — wave 53 + census B-63). */
   id?: number;
+  /** The delivery uuid (the org-settings-hook-replay family — upstream's
+   *  {uuid} path param verbatim, GetHookTaskByUUID's lookup key). */
+  uuid?: string;
 }
 
 /** The census R06 org dashboard family (pages/org-dashboard.tsx): upstream's
@@ -4174,6 +4254,7 @@ export type ParsedUiRoute =
   | GraphRoute
   | RepoActionsRunsRoute
   | RepoActionsJobQueueRoute
+  | ActionsApproveAllChecksRoute
   | RepoActionsRunViewRoute
   | RepoActionsArtifactPreviewRoute
   | ActionsArtifactPreviewRawRoute
@@ -4508,6 +4589,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       const id = numericId(tail[1]);
       if (id !== null) return { family: "user-settings-hook-delete", id };
     }
+    // The per-delivery replay tail (census B-63 — web.go:743's
+    // m.Post("/replay/{uuid}", repo_setting.ReplayWebhook): the uuid segment
+    // is upstream's GetHookTaskByUUID lookup key, claimed verbatim;
+    // POST-only upstream, the GET twin answers the 405).
+    if (tail.length === 4 && tail[2] === "replay") {
+      const id = numericId(tail[1]);
+      if (id !== null) return { family: "user-settings-hook-replay", id, uuid: tail[3] as string };
+    }
     if (tail.length === 1 && tail[0] === "keys") return { family: "user-settings-keys", id: null };
     if (tail.length === 2 && tail[0] === "keys" && tail[1] === "delete") {
       return { family: "user-settings-keys-delete", id: null };
@@ -4707,10 +4796,17 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "emails" && tail[1] === "activate") return { family: "admin-emails-activate" };
     if (tail.length === 2 && tail[0] === "emails" && tail[1] === "delete") return { family: "admin-emails-delete" };
     // The R18 hooks arm (web.go:836-846's /hooks group): the two-list GET
-    // + the delete POST; the /{id} edit and /{default-hooks|system-hooks}
-    // add families stay unclaimed (unlanded — the module's dead-link note).
+    // + the delete POST + the per-delivery replay tail (census B-63 —
+    // web.go:865's m.Post("/replay/{uuid}", repo_setting.ReplayWebhook): the
+    // uuid segment is upstream's GetHookTaskByUUID lookup key, claimed
+    // verbatim; POST-only upstream, the GET twin answers the 405); the
+    // /{id} edit and /{default-hooks|system-hooks} add families stay
+    // unclaimed (unlanded — the module's dead-link note).
     if (tail.length === 1 && tail[0] === "hooks") return { family: "admin-hooks" };
     if (tail.length === 2 && tail[0] === "hooks" && tail[1] === "delete") return { family: "admin-hooks-delete" };
+    if (tail.length === 4 && tail[0] === "hooks" && /^-?\d+$/.test(tail[1] as string) && tail[2] === "replay") {
+      return { family: "admin-hooks-replay", id: Number.parseInt(tail[1] as string, 10), uuid: tail[3] as string };
+    }
     // The R18 badges arm (web.go:815-824's /badges group): the catalog
     // list, the new combo, the slug param families (view/edit-combo/delete/
     // users-combo + users/delete). The slug segment is the decoded
@@ -4873,10 +4969,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return { family: "admin-actions-redirect" };
     }
     if (tail.length === 2 && tail[0] === "monitor") {
+      // The B-70 audit page leads the monitor group upstream (web.go:797-798
+      // are the group's first two claims — navbar.tmpl:110-112's first item).
+      if (tail[1] === "audit_logs") return { family: "admin-monitor-audit-logs" };
       if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
       if (tail[1] === "cron") return { family: "admin-monitor", page: "cron" };
       if (tail[1] === "queue") return { family: "admin-monitor", page: "queue" };
       if (tail[1] === "stacktrace") return { family: "admin-monitor", page: "trace" };
+    }
+    // The B-70 export tail (web.go:798's GET-only literal inside the monitor
+    // group — 3 segments, no shadowing against the 2-segment page block).
+    if (tail.length === 3 && tail[0] === "monitor" && tail[1] === "audit_logs" && tail[2] === "export") {
+      return { family: "admin-monitor-audit-logs-export" };
     }
     // The monitor queue-manage pair (web.go:805-811 — the queue NAME qid;
     // the static-before-dynamic rule puts the literals ahead of the {qid}
@@ -5253,6 +5357,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[4] === "hooks" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "delete") {
       return { family: "org-settings-hook-delete", owner: orgName, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    // The per-delivery replay tail (census B-63 — web.go:1038's
+    // m.Post("/replay/{uuid}", repo_setting.ReplayWebhook): the uuid segment
+    // is upstream's GetHookTaskByUUID lookup key, claimed verbatim;
+    // POST-only upstream, the GET twin answers the 405).
+    if (raw.length === 8 && raw[4] === "hooks" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "replay") {
+      return { family: "org-settings-hook-replay", owner: orgName, id: Number.parseInt(raw[5] as string, 10), uuid: raw[7] as string };
     }
     // The W5 edit arms (the module header's W5 record — web.go:1026-1028's
     // family): the {id} COMBO shape (GET show / POST save — one parse shape,
@@ -5695,13 +5806,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // The census C6 job-queue family (pages/repo-actions-queue.tsx — upstream
   // web.go:1570's `m.Get("/job_queue", actions.JobQueue)` inside the /actions
   // group, beside the C1 runs-list claim above). The exact literal only:
-  // `/actions/job_queue/anything` and every other sibling tail (`/runs/{run}`
-  // C2's, `/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`,
-  // `/approve-all-checks`, the badge route) stay unclaimed → the engine's
-  // 404 until their units land. The `?refresh=1` fragment discriminator
-  // rides the query, not the path.
+  // `/actions/job_queue/anything` and the other sibling tails (`/runs/{run}`
+  // C2's, `/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`, the
+  // badge route) stay unclaimed → the engine's 404 until their units land.
+  // The `?refresh=1` fragment discriminator rides the query, not the path.
   if (head === "actions" && rest.length === 1 && rest[0] === "job_queue") {
     return { family: "repo-actions-job-queue", owner, repo };
+  }
+
+  // The B-56 approve-all arm (web.go:1572's
+  // `m.Post("/approve-all-checks", reqRepoActionsWriter,
+  // actions.ApproveAllChecks)` inside the /actions group — the write tail
+  // over the landed approve machinery): the exact 1-segment literal only;
+  // `/approve-all-checks/anything` stays unclaimed → the engine's 404.
+  // GET stays unclaimed too — upstream registers POST-only (chi's 405
+  // rides the mount's methodNotAllowed twin).
+  if (head === "actions" && rest.length === 1 && rest[0] === "approve-all-checks") {
+    return { family: "actions-approve-all-checks", owner, repo };
   }
 
   // The census C2 run-viewer subtree (pages/repo-actions-view.tsx —
@@ -5711,8 +5832,8 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // PathParamInt64's 0, the loader's 404/absent arms), the exact literal
   // tails only; every deeper tail (`/runs/{run}/attempts/{n}/...`) and the
   // remaining siblings (`/run`, `/disable`, `/enable`,
-  // `/workflow-dispatch-inputs`, `/approve-all-checks`,
-  // `/runs/{run}/delete`, `/runs/{run}/workflow`, `/runs/{run}/logs`, the
+  // `/workflow-dispatch-inputs`, `/approve-all-checks` — landed, the B-56
+  // claim above — `/runs/{run}/workflow`, `/runs/{run}/logs`, the
   // artifacts tails) stay unclaimed → the engine's 404 until their units
   // land (the RepoActionsRunViewRoute interface's note).
   if (head === "actions" && rest.length >= 3 && rest[0] === "runs") {
@@ -6218,19 +6339,25 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // Wave 10: the mirror panel (the brief's literal URL; upstream renders
     // the section on options.tmpl — pages/settings.tsx's divergence note).
     if (rest.length === 1 && rest[0] === "mirror") return { family: "settings-mirror", owner, repo };
-    // Wave 14: the per-hook page + its two POST tails (upstream's
+    // Wave 14: the per-hook page + its POST tails (upstream's
     // /settings/hooks/{id} WebHooksEdit + /{id}/test TestWebhook; the delete
     // rides the arm-scoped tail — upstream's shared /delete?id= form target
     // exists for the list trash buttons this UI does not render;
-    // pages/settings.tsx's wave-14 header). PathParamInt64 parity: "007"
-    // parses as 7, a negative is admitted here and 404-shells on the lookup
-    // (the issue-detail convention). Any other tail (/settings/hooks/abc,
-    // /{id}/edit, deeper) stays engine-owned — upstream has no such routes.
+    // pages/settings.tsx's wave-14 header). B-63 adds the per-delivery
+    // replay tail (web.go:1237's m.Post("/replay/{uuid}",
+    // repo_setting.ReplayWebhook) — the uuid segment is upstream's
+    // GetHookTaskByUUID lookup key, claimed verbatim; POST-only upstream, so
+    // the parse stays method-blind and the GET twin answers the 405).
+    // PathParamInt64 parity: "007" parses as 7, a negative is admitted here
+    // and 404-shells on the lookup (the issue-detail convention). Any other
+    // tail (/settings/hooks/abc, /{id}/edit, deeper) stays engine-owned —
+    // upstream has no such routes.
     if (rest.length >= 2 && rest[0] === "hooks" && /^-?\d+$/.test(rest[1] as string)) {
       const id = Number.parseInt(rest[1] as string, 10);
       if (rest.length === 2) return { family: "settings-hook-detail", owner, repo, id };
       if (rest.length === 3 && rest[2] === "test") return { family: "settings-hook-test", owner, repo, id };
       if (rest.length === 3 && rest[2] === "delete") return { family: "settings-hook-delete", owner, repo, id };
+      if (rest.length === 4 && rest[2] === "replay") return { family: "settings-hook-replay", owner, repo, id, uuid: rest[3] as string };
     }
     // Wave 15: the protected-branches family (pages/branch-protection.tsx —
     // upstream's literal group, web.go:1206-1212): the list, the shared
@@ -6484,9 +6611,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // twin — the src/index.ts dispatcher carve hands it the exact 5-segment
   // shape before this parser is consulted), so only the `/download` family
   // claims here. The feed tails upstream registers
-  // (`.rss`/`.atom` — the dotted-head claims just above), the
-  // `/generate-notes` and the `/attachments`+`/attachments/remove` POST
-  // write tails stay unclaimed → the engine's 404.
+  // (`.rss`/`.atom` — the dotted-head claims just above) stay unclaimed →
+  // the engine's 404. The B-55 write tails landed (web.go:1521-1524): the
+  // `/generate-notes`, `/attachments` and `/attachments/remove` POST
+  // literals claim (the remove shape rides the seam's POST-only
+  // pass-through on the live wire — the seam's GET-uuid arm keeps the
+  // GET answer, upstream's GetAttachment("remove") 404).
   // The releases feed twins (pages/releases-feed-xml.ts — upstream
   // web.go:1506-1507's `/{owner}/{repo}/releases.rss|.atom`): the dotted
   // head is a DISJOINT literal from the `releases` block below
@@ -6518,6 +6648,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
     if (rest.length === 1 && rest[0] === "latest") return { family: "release-latest", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "release-delete", owner, repo };
+    // The B-55 write tails (web.go:1521-1524 — the write group's exact
+    // literals, POST-only upstream; every deeper tail stays unclaimed → the
+    // engine's 404). The remove shape's GET twin does NOT claim: upstream's
+    // GET answer for it is the /releases/attachments/{uuid} route — the
+    // seam's (uuid "remove" → its 404).
+    if (rest.length === 1 && rest[0] === "generate-notes") {
+      return { family: "release-generate-notes", owner, repo };
+    }
+    if (rest.length === 1 && rest[0] === "attachments") {
+      return { family: "release-attachment-upload", owner, repo };
+    }
+    if (rest.length === 2 && rest[0] === "attachments" && rest[1] === "remove") {
+      return { family: "release-attachment-remove", owner, repo };
+    }
     if (rest.length >= 2 && rest[0] === "edit") {
       try {
         return {
@@ -8928,6 +9072,117 @@ async function actionsRunApprove(c: Context<{ Bindings: Env }>): Promise<Respons
   );
 }
 
+/** ParseGiteaActionsTargetURL (models/git/commit_status.go:245-264) over the
+ *  LANDED status rows: the target URL the Actions writer emitted
+ *  (services/actions/trigger.ts + dispatch.ts — the repo-scoped
+ *  `/actions/runs/{run}/jobs/{job}` tail, optionally absolute with the
+ *  instance origin — upstream's writer emits the RELATIVE repo.Link() shape,
+ *  ours prefixes the origin; the parser accepts both, still scoped by the
+ *  owner/slug match + the D1 re-read's repo_id filter, exactly upstream's
+ *  GetRunsByRepoAndID re-scoping). Numeric run/job segments only (ParseInt's
+ *  failure arms), the `/runs/`+`/jobs/` literals required. Returns the run
+ *  id or null (the not-a-gitea-actions-link arm). */
+function parseActionsTargetRunId(targetUrl: string | null, repo: RepoRow): number | null {
+  if (targetUrl === null || targetUrl === "") return null;
+  const prefix = `/${repo.ownerNamespace}/${repo.slug}/actions`;
+  const cut = targetUrl.startsWith(prefix) ? targetUrl.slice(prefix.length) : null;
+  if (cut === null) {
+    // The absolute-URL arm: strip the scheme+origin, then the same cut.
+    const match = /^https?:\/\/[^/]+(\S*)$/.exec(targetUrl);
+    const path = match?.[1];
+    if (path === undefined || !path.startsWith(prefix)) return null;
+    return parseActionsTargetRunId(path, repo);
+  }
+  const parts = cut.split("/"); // expect: /runs/{runID}/jobs/{jobID}
+  if (parts.length < 5 || parts[1] !== "runs" || parts[3] !== "jobs") return null;
+  const runId = Number.parseInt(parts[2] ?? "", 10);
+  const jobId = Number.parseInt(parts[4] ?? "", 10);
+  if (!Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(jobId) || jobId <= 0) return null;
+  return runId;
+}
+
+/** POST /{owner}/{repo}/actions/approve-all-checks (actions.ApproveAllChecks
+ *  — web.go:1572, view.go:1284-1316): the group read ladder (the dispatch
+ *  arm's MustBeNotEmpty + MustEnableActions posture) PLUS reqRepoActionsWriter's
+ *  NotFound, then the commit's latest statuses (GetLatestCommitStatus's port —
+ *  api/services/commit-status.ts allLatestCommitStatuses over the form's
+ *  `commit_id`, ctx.FormString's body-then-query merge), the runs their
+ *  Actions target URLs name (GetRunsFromCommitStatuses' parse +
+ *  GetRunsByRepoAndID's repo-scoped read), the awaiting-approval subset
+ *  approved one-by-one through the LANDED approve service
+ *  (services/actions/approve.ts — ApproveRuns' per-id loop at the v1 stage).
+ *  Upstream answers ctx.JSONOK()'s {"ok":true} dummy on EVERY non-error arm —
+ *  empty run set (:1303-1305) and the approved set alike; the Flash.Success
+ *  (view.go:1313) rides the session-flash middleware upstream, and this
+ *  instance's no-session-flash reduction (the session.ts flash note) drops
+ *  it: the pin's frontend has NO caller for the endpoint (grep over
+ *  web_src/templates is empty — the arm serves API-shaped callers), so no
+ *  flash consumer exists to reduce. The service's rejections and a
+ *  race-deleted run (GetRunByRepoAndID's miss inside ApproveRuns' loop) are
+ *  the 500 chrome. */
+async function actionsApproveAllChecks(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, url, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-approve-all-checks") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // repo.MustBeNotEmpty
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableActions
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // reqRepoActionsWriter's NotFound
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const commitId = form.get("commit_id") ?? url.searchParams.get("commit_id") ?? ""; // FormString's merge, body wins
+  // GetLatestCommitStatus(repo.ID, commitID, ListOptionsAll) (view.go:1287-1289).
+  const statuses = await allLatestCommitStatuses(c.env.DB, repo.id, commitId);
+  // GetRunsFromCommitStatuses (commit_status.go:74-80) + GetRunsByRepoAndID:
+  // the target-URL run ids, insertion-ordered (container.Set's order), then
+  // the repo-scoped read.
+  const runIds: number[] = [];
+  for (const status of statuses) {
+    const runId = parseActionsTargetRunId(status.targetUrl, repo);
+    if (runId !== null && !runIds.includes(runId)) runIds.push(runId);
+  }
+  if (runIds.length === 0) {
+    return respond(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  const runRows = await drizzle(c.env.DB)
+    .select()
+    .from(actionRuns)
+    .where(and(inArray(actionRuns.id, runIds), eq(actionRuns.repoId, repo.id)))
+    .all();
+  const runById = new Map(runRows.map((row) => [row.id, row]));
+  for (const runId of runIds) {
+    const run = runById.get(runId);
+    if (run === undefined) {
+      // GetRunByRepoAndID's miss inside ApproveRuns' loop (approve.go:42-45)
+      // — the race-deleted run aborts the whole arm (the tx's error path).
+      throw new Error(`actions: approve-all-checks: run ${runId} does not exist`); // ctx.ServerError's shape
+    }
+    // IsAwaitingApproval's silent skip rides the service (approve.go:47-49);
+    // the v1-stage approve writes the flag flip + the BLOCKED release.
+    const outcome = await approveRun(c.env.DB, repo.id, run, viewer.id);
+    if (!outcome.ok) {
+      throw new Error(`actions: approve-all-checks for run ${runId}: ${outcome.message}`); // ctx.ServerError's shape
+    }
+  }
+  // ctx.Flash.Success + ctx.JSONOK() (view.go:1312-1315) — the JSONOK dummy
+  // (context.go:243-245); the flash arm is the header's reduction note.
+  return respond(
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The census C6 arm: the Actions JOB QUEUE pages (pages/repo-actions-queue.tsx
 // — the repo tab arm web.go:1570 + the admin instance arm web.go:904 over
@@ -10496,6 +10751,70 @@ async function hookTestSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
 }
 
 /**
+ * The four replay mounts' shared enqueue tail (census B-63): the
+ * WEBHOOK_DELIVERY producer probe rides hookDeliveryQueueOf (routes/hooks.ts's
+ * structural probe twin) and the Queue message hangs off
+ * c.executionCtx.waitUntil when a real worker invocation provides one
+ * (VALUE-position access only — never name ExecutionContext in type
+ * position). Absent either, the callback is undefined and the pending D1 row
+ * stays the durable truth — a later pass enqueues it (SPEC-0005 §3.6; the
+ * consumer's idempotent CAS makes a late enqueue a safe replay).
+ */
+function hookDeliveryEnqueuer(c: Context<{ Bindings: Env }>): ((deliveryId: number) => void) | undefined {
+  const queue = hookDeliveryQueueOf(c.env);
+  if (queue === null) return undefined;
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    return undefined; // in-process test callers have none (the pending D1 row is the truth)
+  }
+  return (deliveryId: number) => {
+    waitUntil(
+      queue.sendBatch([{ body: { deliveryId } }]).then(undefined, (error: unknown) => {
+        console.error(`[hooks] delivery enqueue failed for ${deliveryId}: ${error instanceof Error ? error.message : String(error)}`);
+      }),
+    );
+  };
+}
+
+/**
+ * POST /{owner}/{repo}/settings/hooks/{id}/replay/{uuid} — the per-delivery
+ * replay write (upstream repo_setting.ReplayWebhook, web.go:1236, over the
+ * landed replayRepoHookDelivery arm): the hook-scoped delivery copy becomes a
+ * NEW pending row carrying the source's stored payload/event bytes (upstream
+ * ReplayHookTask's copy semantics — the history keeps both attempts), the
+ * Queue enqueue rides the shared enqueuer's waitUntil (the test-fire write's
+ * convention). An unknown hook id OR a uuid not among THAT hook's deliveries
+ * 404-shells (checkWebhook's miss / IsErrHookTaskNotExist → NotFound);
+ * success 303s back onto the hook's page (upstream's ctx.Redirect target,
+ * orCtx.Link + "/" + w.ID — the flash text has no render surface on this
+ * dispatch).
+ */
+async function hookReplaySubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-hook-replay" || route.id === undefined || route.uuid === undefined) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const outcome = await replayRepoHookDelivery({
+    d1: c.env.DB,
+    repoId: repo.id,
+    hookId: route.id,
+    uuid: route.uuid,
+    enqueue: hookDeliveryEnqueuer(c),
+  });
+  if (outcome.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/hooks/${route.id}` } }));
+}
+
+/**
  * POST /{owner}/{repo}/settings/hooks/{id}/delete — upstream
  * DeleteWebhook's write (the landed deleteRepoHook arm): success 303s onto
  * the hooks list (upstream JSONRedirect's target); a miss 404-shells (the
@@ -11880,6 +12199,31 @@ async function userHookDelete(c: Context<{ Bindings: Env }>, hookId: number): Pr
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/hooks" } }));
 }
 
+/**
+ * POST /user/settings/hooks/{id}/replay/{uuid} — the per-delivery replay
+ * write (upstream repo_setting.ReplayWebhook's user arm, web.go:743, over
+ * the landed replayUserHookDelivery arm): the hook-scoped delivery copy
+ * becomes a NEW pending row carrying the source's stored payload/event bytes
+ * (upstream ReplayHookTask's copy semantics), the Queue enqueue rides the
+ * shared enqueuer's waitUntil. An unknown hook id OR a uuid not among THAT
+ * hook's deliveries 404-shells (checkWebhook's miss / IsErrHookTaskNotExist
+ * → NotFound); success 303s back onto the hook's page (upstream's
+ * ctx.Redirect target — the flash text has no render surface on this
+ * dispatch).
+ */
+async function userHookReplay(c: Context<{ Bindings: Env }>, hookId: number, uuid: string): Promise<Response> {
+  // The Â§2.8 origin guard runs FIRST (the mounts test's pin — a POST
+  // without Origin never reaches the write; the prologue's other consumers
+  // are read-page ladders, this is a write arm).
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const outcome = await replayUserHookDelivery(c.env.DB, p.viewer.id, hookId, uuid, hookDeliveryEnqueuer(c));
+  if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: `/user/settings/hooks/${hookId}` } }));
+}
+
 async function userSettingsKeysPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await userSettingsTabPrologue(c, false);
   if (!p.ok) return p.response;
@@ -12818,6 +13162,33 @@ async function orgHookDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/hooks` } }));
 }
 
+/**
+ * POST /org/{org}/settings/hooks/{id}/replay/{uuid} — the per-delivery
+ * replay write (upstream repo_setting.ReplayWebhook's org arm, web.go:1038,
+ * over the landed replayOrgHookDelivery arm): the §2.8 guard, the shared
+ * prologue, then the org-scoped copy — a NEW pending delivery row carrying
+ * the source's stored payload/event bytes (upstream ReplayHookTask's copy
+ * semantics), the Queue enqueue rides the shared enqueuer's waitUntil. An
+ * unknown org hook id OR a uuid not among THAT hook's deliveries 404-shells
+ * (checkWebhook's miss / IsErrHookTaskNotExist → NotFound); success 303s
+ * back onto the hook's page (upstream's ctx.Redirect target — the flash
+ * text has no render surface on this dispatch).
+ */
+async function orgHookReplaySubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-settings-hook-replay" || route.id === undefined || route.uuid === undefined) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const outcome = await replayOrgHookDelivery(c.env.DB, org, route.id, route.uuid, hookDeliveryEnqueuer(c));
+  if (outcome.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/hooks/${route.id}` } }));
+}
+
 // ---------------------------------------------------------------------------
 // Window-2b: the org blocked-users tab + the actions secrets/variables
 // sub-tabs (the two-stage modules' handoff recipes — same prologue, drift
@@ -13680,6 +14051,35 @@ async function orgWorktimePage(c: Context<{ Bindings: Env }>): Promise<Response>
   return respond(c.html(renderOrgWorktimePage(ctx, data.data), 200));
 }
 
+/**
+ * GET /-/admin/monitor/audit_logs (pages/admin-audit-logs.tsx — the census
+ * B-70 arm; upstream audit.go:21-26's ViewAuditLogs, web.go:797's FIRST
+ * monitor claim): the admin prologue (web.go:779's SignIn+Admin verify —
+ * anonymous 303s onto the login round-trip, a signed-in non-admin
+ * 404-shells), then the shared load at the ADMIN arm — scope `undefined`,
+ * the instance-wide stream ("The admin view leaves ScopeType empty to list
+ * every event", shared/audit/audit.go:21-30) — and the render at 200.
+ */
+async function adminMonitorAuditLogsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadSettingsAuditLogs(c.env.DB, undefined, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminAuditLogsPage({ ctx: p.ctx, data, query: new URL(c.req.raw.url).searchParams }), 200));
+}
+
+/**
+ * GET /-/admin/monitor/audit_logs/export (pages/admin-audit-logs.tsx's
+ * adminAuditLogExportResponse — upstream audit.go:28-71's ExportAuditLogs,
+ * web.go:798): the same gate, then the NDJSON stream over the mirrored
+ * filters (sort forced ascending, the content-type + attachment filename
+ * pair; X-Total-Count omitted — the module's recorded reduction).
+ */
+async function adminMonitorAuditLogsExport(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  return p.respond(await adminAuditLogExportResponse(c.env.DB, new URL(c.req.raw.url).searchParams, routeNow()));
+}
+
 async function adminMonitorPage(c: Context<{ Bindings: Env }>, page: AdminMonitorPage): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
@@ -14061,6 +14461,30 @@ async function adminHooksDelete(c: Context<{ Bindings: Env }>): Promise<Response
   const id = Number.parseInt(form.get("id") ?? "0", 10) || 0;
   await applyAdminHookDelete(c.env.DB, id);
   return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/hooks" } }));
+}
+
+/**
+ * POST /-/admin/hooks/{id}/replay/{uuid} — the per-delivery replay write
+ * (upstream repo_setting.ReplayWebhook's admin arm, web.go:865, over the
+ * landed applyAdminHookReplay arm): the §2.8 guard + the prologue, then the
+ * global-scope copy — a NEW pending delivery row carrying the source's
+ * stored payload/event bytes (upstream ReplayHookTask's copy semantics), the
+ * Queue enqueue rides the shared enqueuer's waitUntil. A scoped (non-global)
+ * hook id OR an unknown uuid 404-shells (GetSystemOrDefaultWebhook's miss /
+ * IsErrHookTaskNotExist → NotFound — existence stays hidden). Success 303s
+ * onto upstream's ctx.Redirect target (orCtx.Link + "/" + w.ID =
+ * /-/admin/hooks/{id}) — that edit page is the admin-hooks module's
+ * documented UNLANDED slice, so the redirect target 404-shells until the
+ * slice lands (the dead-link posture recorded in the module header).
+ */
+async function adminHooksReplay(c: Context<{ Bindings: Env }>, hookId: number, uuid: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const outcome = await applyAdminHookReplay(c.env.DB, hookId, uuid, hookDeliveryEnqueuer(c));
+  if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: `/-/admin/hooks/${hookId}` } }));
 }
 
 /** GET /-/admin/badges (pages/admin-badges.tsx): the prologue → the
@@ -17204,6 +17628,143 @@ async function releaseDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
 }
 
 // ---------------------------------------------------------------------------
+// The B-55 release WRITE TAILS (web.go:1521-1524 — the write group's three
+// POSTs: the notes generator, the dropzone upload, the dropzone remove).
+// All three sit behind the SAME group gates the form routes carry
+// (reqSignIn + RepoMustNotBeArchived + reqRepoReleaseWriter over the read
+// pair — the releasesWriteGate ladder), all three answer JSON (the ctx.JSON
+// arms below; the frontend's fetch arms read the bodies — repo-release.ts's
+// POST/JSON parse and dropzone.ts's {uuid} contract).
+// ---------------------------------------------------------------------------
+
+/** ctx.JSON's content-type plus the web middleware's zero-option prod
+ *  Cache-Control (the fragments-family header set — the issue twin's
+ *  jsonHeaders shape). */
+function releaseJsonHeaders(): Record<string, string> {
+  return { "content-type": "application/json;charset=utf-8", "cache-control": "max-age=0, private, must-revalidate" };
+}
+
+/** ctx.JSONError's 400 shape (context.go:276-284 → buildJsonErrorMap's text
+ *  render): `{"errorMessage": …, "renderFormat": "text"}`. */
+function releaseJsonErrorResponse(message: string): Response {
+  return new Response(JSON.stringify({ errorMessage: message, renderFormat: "text" }), {
+    status: 400,
+    headers: releaseJsonHeaders(),
+  });
+}
+
+/**
+ * POST /{owner}/{repo}/releases/generate-notes (repo.GenerateReleaseNotes —
+ * web.go:1521, release.go:412-436): the write group's gate ladder, then the
+ * form (web.Bind's urlencoded body — repo-release.ts doSubmit's
+ * URLSearchParams POST) validated Required + MaxSize(255) on tag_name
+ * (GenerateReleaseNotesForm, repo_form.go:548-553; the GitRefName rule is
+ * NOT re-declared — an unresolvable ref name lands in the generator's
+ * target-not-found arm, the same user-visible outcome class as upstream's
+ * translatable 400), then the pure commit-walk (pages/release-notes.ts —
+ * notes.go:30-70's port). The arms: `{"content": …}` 200 (release.go:434),
+ * the translatable not-founds as `{"errorMessage": …, "renderFormat":
+ * "text"}` 400 (ctx.JSONError of ErrorAsTranslatable, release.go:421-427),
+ * generator failures as the 500 chrome (ctx.ServerError, release.go:428).
+ */
+async function releaseGenerateNotesSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, respond, repo } = resolved;
+  if (resolved.route.family !== "release-generate-notes") return respond(await c.notFound()); // drift guard
+  const form = await readUrlEncodedForm(c.req.raw);
+  // The form's body-wins merge (web.Bind parses the POST body; FormString
+  // would also merge the query — the dropzone/fetch callers send body-only).
+  const formValue = (key: string): string => form.get(key) ?? "";
+  const options: ReleaseNotesOptions = {
+    tagName: formValue("tag_name"),
+    tagTarget: formValue("tag_target"),
+    previousTag: formValue("previous_tag"),
+  };
+  // GenerateReleaseNotesForm's binding arms (repo_form.go:551): Required →
+  // "form.require_error" ("Tag Name cannot be empty."), MaxSize(255) →
+  // "form.max_size_error" ("Tag Name must be at most 255 characters
+  // long."); ctx.HasError → JSONError 400 (release.go:417-420).
+  if (options.tagName === "") {
+    return respond(releaseJsonErrorResponse("Tag Name cannot be empty."));
+  }
+  if (options.tagName.length > 255) {
+    return respond(releaseJsonErrorResponse("Tag Name must be at most 255 characters long."));
+  }
+  const outcome = await generateReleaseNotes({
+    reads: engineReads(c.env, { ownerNamespace: repo.ownerNamespace, slug: repo.slug }),
+    d1: c.env.DB,
+    repo,
+    origin: url.origin,
+    options,
+  });
+  if (outcome.kind === "ok") {
+    // release.go:434 — ctx.JSON(200, {"content": …}).
+    return respond(new Response(JSON.stringify({ content: outcome.content }), { status: 200, headers: releaseJsonHeaders() }));
+  }
+  if (outcome.kind === "tagNotFound") {
+    return respond(releaseJsonErrorResponse(releaseNotesLocale.tagNotFound(outcome.tag)));
+  }
+  return respond(releaseJsonErrorResponse(releaseNotesLocale.targetNotFound(outcome.ref)));
+}
+
+/**
+ * POST /{owner}/{repo}/releases/attachments (repo.UploadReleaseAttachment —
+ * web.go:1523, attachment.go:42-45's uploadAttachment body over
+ * UploadAttachmentForRelease): the write group's gate ladder (reqSignIn's
+ * anonymous 303 first — the dropzone's session-cookie fetches), then the
+ * STREAMING multipart capture (pages/release-attachment-writes.tsx — the
+ * `file` part into R2 + the unlinked releaseId-0 row; the dropzone's
+ * `{"uuid": …}` 200 contract, attachment.go:75-78; the ServerError class's
+ * plain-text 500).
+ */
+async function releaseAttachmentUploadSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "release-attachment-upload") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const outcome = await uploadReleaseAttachmentFromMultipart(c.env, repo, viewer.id, c.req.raw);
+  return respond(releaseAttachmentUploadResponse(outcome));
+}
+
+/**
+ * POST /{owner}/{repo}/releases/attachments/remove (repo.DeleteAttachment —
+ * web.go:1524, attachment.go:82-132): the write group's gate ladder, then
+ * the form's `file` uuid (ctx.FormString's body-then-query merge), then the
+ * SHARED DeleteAttachment port (the issue twin's removeAttachmentByUuid —
+ * upstream mounts the ONE handler at both remove routes; its release half
+ * is this mount's arm set). The uuid-miss/repo-mismatch 400s, the 403 and
+ * the ServerError 500 ride the shared builder byte-for-byte. NO GET twin
+ * registers here: upstream's GET answer for this path is the
+ * /releases/attachments/{uuid} route — the attachments-serving seam's
+ * (uuid "remove" → its 404), whose POST-only pass-through hands THIS
+ * shape back to the uiRouter on the live wire.
+ */
+async function releaseAttachmentRemoveSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "release-attachment-remove") return respond(await c.notFound()); // drift guard
+  const form = await readUrlEncodedForm(c.req.raw);
+  const file = releaseAttachmentRemoveFormValue(form, url);
+  const outcome = await removeReleaseAttachment(c.env, repo, viewer, file);
+  return respond(releaseAttachmentRemoveResponse(outcome));
+}
+
+// ---------------------------------------------------------------------------
 // The wave-20 releases family (pages/releases.tsx — upstream's web.go:1505-
 // 1527 group at the landed api/services/releases.ts + release-assets.ts
 // reads and the SPEC-0005 create arm)
@@ -19364,6 +19925,10 @@ uiRouter.post("/user/settings/hooks", (c) => userSettingsHooksCreate(c));
 uiRouter.get("/user/settings/hooks/:id", (c) => userHookDetailPage(c, Number(c.req.param("id"))));
 uiRouter.post("/user/settings/hooks/:id", (c) => userHookDetailSubmit(c, Number(c.req.param("id"))));
 uiRouter.post("/user/settings/hooks/:id/delete", (c) => userHookDelete(c, Number(c.req.param("id"))));
+// The per-delivery replay write (census B-63 — web.go:743's POST-only
+// replay tail inside the {id} group; the GET twin answers chi's 405).
+uiRouter.post("/user/settings/hooks/:id/replay/:uuid", (c) => userHookReplay(c, Number(c.req.param("id")), c.req.param("uuid")));
+uiRouter.get("/user/settings/hooks/:id/replay/:uuid", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/keys", (c) => userSettingsKeysPage(c));
 uiRouter.post("/user/settings/keys", (c) => userSettingsKeysSubmit(c));
 uiRouter.post("/user/settings/keys/delete", (c) => userSettingsKeysDelete(c));
@@ -19492,6 +20057,10 @@ uiRouter.post("/org/:owner/settings/hooks", (c) => orgHooksSettingsSubmit(c));
 uiRouter.get("/org/:owner/settings/hooks/:id", (c) => orgHookDetailPage(c));
 uiRouter.post("/org/:owner/settings/hooks/:id", (c) => orgHookDetailSubmit(c));
 uiRouter.post("/org/:owner/settings/hooks/:id/delete", (c) => orgHookDeleteSubmit(c));
+// The per-delivery replay write (census B-63 — web.go:1038's POST-only
+// replay tail inside the {id} group; the GET twin answers chi's 405).
+uiRouter.post("/org/:owner/settings/hooks/:id/replay/:uuid", (c) => orgHookReplaySubmit(c));
+uiRouter.get("/org/:owner/settings/hooks/:id/replay/:uuid", () => methodNotAllowed("POST"));
 // Window-2b: the blocked_users tab + the actions sub-tabs.
 uiRouter.get("/org/:owner/settings/blocked_users", (c) => orgBlockedUsersPage(c));
 uiRouter.post("/org/:owner/settings/blocked_users", (c) => orgBlockedUsersSubmit(c));
@@ -19580,6 +20149,12 @@ uiRouter.post("/org/:owner/settings/audit_logs", () => methodNotAllowed("GET"));
 // Window-2c: the admin group.
 uiRouter.get("/-/admin", (c) => adminDashboardPage(c));
 uiRouter.post("/-/admin", (c) => adminDashboardSubmit(c));
+// The B-70 audit pair leads the monitor group (web.go:797-798 — the group's
+// first two claims; both GET-only upstream, the POSTs answer chi's 405).
+uiRouter.get("/-/admin/monitor/audit_logs", (c) => adminMonitorAuditLogsPage(c));
+uiRouter.post("/-/admin/monitor/audit_logs", () => methodNotAllowed("GET"));
+uiRouter.get("/-/admin/monitor/audit_logs/export", (c) => adminMonitorAuditLogsExport(c));
+uiRouter.post("/-/admin/monitor/audit_logs/export", () => methodNotAllowed("GET"));
 uiRouter.get("/-/admin/monitor/stats", (c) => adminMonitorPage(c, "stats"));
 uiRouter.get("/-/admin/monitor/cron", (c) => adminMonitorPage(c, "cron"));
 uiRouter.post("/-/admin/monitor/cron", (c) => adminMonitorCronSubmit(c));
@@ -19624,6 +20199,10 @@ uiRouter.post("/-/admin/emails/activate", (c) => adminEmailsActivate(c));
 uiRouter.post("/-/admin/emails/delete", (c) => adminEmailsDelete(c));
 uiRouter.get("/-/admin/hooks", (c) => adminHooksPage(c));
 uiRouter.post("/-/admin/hooks/delete", (c) => adminHooksDelete(c));
+// The per-delivery replay write (census B-63 — web.go:865's POST-only
+// replay tail inside the {id} group; the GET twin answers chi's 405).
+uiRouter.post("/-/admin/hooks/:id/replay/:uuid", (c) => adminHooksReplay(c, Number(c.req.param("id")), c.req.param("uuid")));
+uiRouter.get("/-/admin/hooks/:id/replay/:uuid", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/badges", (c) => adminBadgesPage(c));
 uiRouter.get("/-/admin/badges/new", (c) => adminBadgeNewPage(c));
 uiRouter.post("/-/admin/badges/new", (c) => adminBadgeNewSubmit(c));
@@ -20169,6 +20748,10 @@ uiRouter.post("/:owner/:repo/actions/runs/:run/delete", (c) => actionsRunDelete(
 // The ⑲A4 dispatch form POST (view.go:1378-1419 — POST-only upstream).
 uiRouter.get("/:owner/:repo/actions/run", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/actions/run", (c) => repoActionsRunDispatch(c));
+// The B-56 approve-all POST (web.go:1572's `reqRepoActionsWriter,
+// actions.ApproveAllChecks` — POST-only upstream, chi-405 GET twin).
+uiRouter.get("/:owner/:repo/actions/approve-all-checks", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/approve-all-checks", (c) => actionsApproveAllChecks(c));
 // The ⑲A5 kebab's enable/disable POSTs (view.go:1320-1376 — POST-only).
 uiRouter.get("/:owner/:repo/actions/disable", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/actions/enable", () => methodNotAllowed("POST"));
@@ -20203,6 +20786,10 @@ uiRouter.post("/:owner/:repo/settings/hooks/:id/test", (c) => hookTestSubmit(c))
 uiRouter.get("/:owner/:repo/settings/hooks/:id/test", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/settings/hooks/:id/delete", (c) => hookDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
+// The per-delivery replay write (census B-63 — web.go:1237's POST-only
+// replay tail inside the {id} group; the GET twin answers chi's 405).
+uiRouter.post("/:owner/:repo/settings/hooks/:id/replay/:uuid", (c) => hookReplaySubmit(c));
+uiRouter.get("/:owner/:repo/settings/hooks/:id/replay/:uuid", () => methodNotAllowed("POST"));
 // Wave-10 mirror panel (parseUiRoute claims exactly this shape; the same
 // settings gate as the other two sub-pages).
 uiRouter.get("/:owner/:repo/settings/mirror", (c) => mirrorSettingsPage(c));
@@ -20532,6 +21119,19 @@ uiRouter.get("/:owner/:repo/releases/edit/*", (c) => releaseEditPage(c));
 uiRouter.post("/:owner/:repo/releases/edit/*", (c) => releaseEditSubmit(c));
 uiRouter.post("/:owner/:repo/releases/delete", (c) => releaseDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/releases/delete", () => methodNotAllowed("POST"));
+// The B-55 write tails (web.go:1521-1524 — POST-only upstream; the GET
+// twins answer chi's 405 where the path matches only the POST route). The
+// remove shape gets NO GET twin: upstream's GET answer for it is the
+// /releases/attachments/{uuid} route — the attachments-serving seam's
+// (its GET-uuid arm 404s the "remove" literal); the seam's POST-only
+// pass-through hands the remove POST back to this registration (Hono
+// precedence: the seam's earlier-mounted param-pattern deny beat a static
+// registration here — empirical, the twins test pins the carve).
+uiRouter.post("/:owner/:repo/releases/generate-notes", (c) => releaseGenerateNotesSubmit(c));
+uiRouter.get("/:owner/:repo/releases/generate-notes", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/releases/attachments", (c) => releaseAttachmentUploadSubmit(c));
+uiRouter.get("/:owner/:repo/releases/attachments", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/releases/attachments/remove", (c) => releaseAttachmentRemoveSubmit(c));
 // Wave-37 owner projects list (parseUiRoute claims exactly this shape —
 // upstream web.go:1143's read group, `m.Get("", org.Projects)`; GET only,
 // the board depth and the write group stay unclaimed per the page module's

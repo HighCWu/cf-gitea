@@ -52,6 +52,7 @@ import {
   parseHookEditForm,
   renderUserHookDetailPage,
   renderUserSettingsHooksPage,
+  replayUserHookDelivery,
   userSettingsWebhooksLocale,
   UserHookDetailPage,
   UserHooksSettingsPage,
@@ -455,6 +456,12 @@ describe("the per-hook page DOM (hook_new.tmpl's edit arm + webhook/new.tmpl at 
     expect(html).toContain("Trigger On:"); // settings.tmpl's matrix reduced to the line
     expect(html).toContain("push");
     expect(html).toContain("create");
+    // B-62's Workflow Events matrix tail (settings.tmpl:337-349): the pair's
+    // checkboxes ride the form; the pair never appears as hidden preserve
+    // inputs (the checkboxes are its POST-body truth).
+    expect(html).toContain("Workflow Events");
+    expect(html).toContain('name="events" type="checkbox" value="workflow_run"');
+    expect(html).toContain('name="events" type="checkbox" value="workflow_job"');
   });
 
   it("renders the deliveries segment with the row trio and the empty arm", async () => {
@@ -468,10 +475,14 @@ describe("the per-hook page DOM (hook_new.tmpl's edit arm + webhook/new.tmpl at 
     expect(empty).toContain("No deliveries yet.");
   });
 
-  it("keeps the reductions honest: no test-fire, no replay, no provider picker", async () => {
-    const html = await renderedDetail();
+  it("keeps the reductions honest: no test-fire, the B-63 replay form rides the rows, no provider picker", async () => {
+    const html = await renderedDetail({}, 1); // one delivery — the replay form rides the row
     expect(html).not.toContain("Test Push Event"); // no test route in the /user/settings/hooks group (the module header)
-    expect(html).not.toContain("replay"); // registered upstream, not landed anywhere (the module header)
+    // B-63 landed the replay control: history.tmpl's per-delivery POST form
+    // rides the visible row (the index.ts route handler is the separate
+    // wiring window — the module header).
+    expect(html).toContain("/replay/");
+    expect(html).toContain('class="svg octicon-sync"'); // the icon button
     const list = renderToString(<ListPageForTest data={await loadUserSettingsHooksPageData(env.DB, alice.id)} error={null} />);
     expect(list).not.toContain("/gitea/new"); // the provider-picker page is not rendered — one landed provider
     expect(list).not.toContain("type dropdown");
@@ -782,7 +793,7 @@ describe("the parse claim split (parseUiRoute / handlesUiRoute — the id arm)",
     expect(parseUiRoute("/user/settings/hooks/abc")).toBeNull();
     expect(handlesUiRoute("/user/settings/hooks/abc")).toBe(false);
     expect(parseUiRoute("/user/settings/hooks/-3")).toBeNull(); // /^\d+$/ — no sign
-    expect(parseUiRoute("/user/settings/hooks/7/edit")).toBeNull(); // deeper tail (no replay arm landed)
+    expect(parseUiRoute("/user/settings/hooks/7/edit")).toBeNull(); // deeper tails stay unclaimed (the replay POST is this wave's separate wiring window)
     expect(parseUiRoute("/user/settings/hooks/7/delete/extra")).toBeNull();
   });
 });
@@ -836,5 +847,60 @@ describe("the delivery-count chip batching (the one group-by read per page)", ()
     expect(html).toContain("2 deliveries"); // settingsLocale.deliveries (plural)
     expect(html).toContain("1 delivery"); // settingsLocale.deliveries_1 (singular)
     expect(html).toContain("0 deliveries"); // the counts-miss default
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-63 — the replay write (replayUserHookDelivery, the user arm's service
+// steps the index.ts route handler will call)
+// ---------------------------------------------------------------------------
+
+describe("replayUserHookDelivery (the B-63 replay write)", () => {
+  async function seedDelivery(hookId: number): Promise<string> {
+    const rows = await drizzle(env.DB)
+      .insert(webhookDeliveries)
+      .values({
+        hookId,
+        repoId: "repo-user-replay",
+        uuid: crypto.randomUUID(),
+        eventType: "issues",
+        eventGroup: "issues",
+        payloadContent: JSON.stringify({ action: "opened" }, null, 2),
+        state: "delivered",
+        isSucceed: true,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        deliveredAt: new Date("2026-01-01T00:01:00Z"),
+      })
+      .returning({ uuid: webhookDeliveries.uuid })
+      .all();
+    return rows[0]!.uuid;
+  }
+
+  it("copies the delivery into a NEW pending row with the same bytes and a new uuid; the enqueue callback sees the new id", async () => {
+    const hook = await seedOwnerHook(alice.id);
+    const uuid = await seedDelivery(hook.id);
+
+    const enqueued: number[] = [];
+    const result = await replayUserHookDelivery(env.DB, alice.id, hook.id, uuid, (id) => void enqueued.push(id));
+
+    expect(result).toEqual({ outcome: "replayed", deliveryId: enqueued[0] });
+    const rows = await drizzle(env.DB).select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2);
+    const replay = rows.find((row) => row.uuid !== uuid)!;
+    const source = rows.find((row) => row.uuid === uuid)!;
+    expect(replay).toMatchObject({ hookId: hook.id, state: "pending", eventType: "issues", eventGroup: "issues" });
+    expect(replay.payloadContent).toBe(source.payloadContent);
+    expect(replay.uuid).not.toBe(uuid);
+  });
+
+  it("answers missing for an unknown hook id, a foreign-owner id, and a uuid of ANOTHER hook (the caller 404-shells)", async () => {
+    const hook = await seedOwnerHook(alice.id);
+    const foreign = await seedOwnerHook(bob.id, { url: "https://hooks.example.com/bob" });
+    const uuid = await seedDelivery(hook.id);
+
+    expect(await replayUserHookDelivery(env.DB, alice.id, 424242, uuid)).toEqual({ outcome: "missing" });
+    expect(await replayUserHookDelivery(env.DB, bob.id, hook.id, uuid)).toEqual({ outcome: "missing" }); // owner-scoped guard
+    expect(await replayUserHookDelivery(env.DB, alice.id, foreign.id, uuid)).toEqual({ outcome: "missing" }); // hook-scoped uuid
+    expect(await drizzle(env.DB).select().from(webhookDeliveries).all()).toHaveLength(1); // nothing written
   });
 });

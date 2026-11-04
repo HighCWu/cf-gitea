@@ -23,6 +23,7 @@ import {
   getRepoHook,
   listHookDeliveries,
   listRepoHooks,
+  replayHookDelivery,
   toApiDelivery,
   toApiHook,
 } from "../services/hooks";
@@ -47,6 +48,10 @@ import { canViewRepositoryWithTeams, findRepositoryByPath, toApiRepository, view
  *                             400 (invalid slack channel / malformed JSON)
  *   - PATCH /hooks/{id}:      422 (invalid url / content type)
  *   - POST /hooks/{id}/tests: none — empty repo 204s without firing
+ *
+ * Plus the PLAIN-Hono replay arm (census B-63) POST /hooks/{id}/replay/{uuid}
+ * — upstream mounts replay on the web router only (web.go:1236), so the arm
+ * is outside the frozen contract and un-declared (see the route's comment).
  */
 
 const notFoundResponse = {
@@ -235,14 +240,47 @@ async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; rep
  * change. Absent ⇒ rows stay `pending` and the delivery log stays complete
  * (SPEC-0005 §3.6: the queue only ever carries `{deliveryId}`; the D1 row is
  * the source of truth and a later pass enqueues stranded rows).
+ *
+ * Exported for the replay arms of the sibling scope family
+ * (routes/hooks-scopes.ts — B-63's org/user/admin mounts share the probe).
  */
-function webhookDeliveryQueue(
+export function webhookDeliveryQueue(
   env: ApiEnv["Bindings"],
 ): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
   const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
   if (candidate === undefined || candidate === null) return null;
   const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
   return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+/**
+ * The enqueue tail shared by the fire/replay arms (the test route's
+ * waitUntil dance, factored for B-63's replay arm): the Queue message hangs
+ * off `c.executionCtx.waitUntil` when a real worker invocation provides one
+ * (VALUE-position access only — never name ExecutionContext in type
+ * position) and the producer binding exists; absent either, the pending D1
+ * row is the durable truth and a later pass enqueues it (the consumer's
+ * idempotent CAS makes a late enqueue a safe replay).
+ */
+export function enqueueHookDelivery(
+  c: Context<ApiEnv>,
+  queue: { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null,
+  deliveryId: number,
+): void {
+  if (queue === null) return;
+  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+  try {
+    execCtx = c.executionCtx;
+  } catch {
+    execCtx = undefined; // in-process test callers have none (the pending D1 row is the truth)
+  }
+  if (execCtx !== undefined) {
+    execCtx.waitUntil(
+      queue.sendBatch([{ body: { deliveryId } }]).then(undefined, (error: unknown) => {
+        console.error(`[hooks] delivery enqueue failed for ${deliveryId}: ${errorMessage(error)}`);
+      }),
+    );
+  }
 }
 
 export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>): void {
@@ -362,6 +400,32 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
     // Upstream's ListDeliveries omits the payloads from list rows (they are
     // only returned per delivery, tier-2 GET …/deliveries/{uuid}).
     return c.json(items.map((row) => toApiDelivery(row, { omitPayload: true })), 200);
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /repos/{owner}/{repo}/hooks/{id}/replay/{uuid} — census B-63's
+  // replay arm. Upstream keeps replay on the WEB router (web.go:1236's
+  // `m.Post("/replay/{uuid}", repo_setting.ReplayWebhook)` inside the repo
+  // settings group), so the frozen /api/v1 contract has NO path key for it:
+  // this arm registers as PLAIN Hono (the mirror family's non-contract
+  // convention — routes/mirror.ts header) and must NOT enter the generated
+  // OpenAPI document (scripts/check-openapi.mjs fails an undeclared router
+  // path). The handler is ReplayWebhook over the API scope's guards: the
+  // anti-enumeration repo 404, the repo-scoped hook 404, the hook-scoped
+  // delivery 404 (GetHookTaskByUUID's miss — IsErrHookTaskNotExist →
+  // NotFound), then replayHookDelivery's copy + enqueue (the test route's
+  // waitUntil convention). Success answers 204 — the API family's body-less
+  // posture stands in for upstream's redirect + flash.
+  app.post("/repos/:owner/:repo/hooks/:id/replay/:uuid", requireAuth, async (c) => {
+    const { owner, repo } = c.req.param();
+    const { found } = await requireVisibleRepo(c, { owner, repo });
+    const { id, uuid } = c.req.param();
+    const hook = await getRepoHook(c.env.DB, found.repo.id, pathId(id));
+    if (hook === null) throw new ApiError(404, "not found");
+    const deliveryId = await replayHookDelivery(c.env.DB, hook.id, uuid);
+    if (deliveryId === null) throw new ApiError(404, "not found");
+    enqueueHookDelivery(c, webhookDeliveryQueue(c.env), deliveryId);
+    return c.body(null, 204);
   });
 }
 

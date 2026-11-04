@@ -24,8 +24,10 @@ import {
   getOwnerHook,
   listGlobalHooks,
   listOwnerHooks,
+  replayHookDelivery,
   toApiHook,
 } from "../services/hooks";
+import { enqueueHookDelivery, webhookDeliveryQueue } from "./hooks";
 import { orgDoerOf } from "../services/org-repos";
 import type { OrgDoer } from "../services/org-repos";
 import type { OrgRecord } from "../../services/orgs/orgs";
@@ -73,6 +75,12 @@ import {
  * Upstream's `reqWebhooksEnabled()` gate (403 when the instance disables
  * webhooks) has no instance-setting model yet and is not ported — same class
  * as the repo family's documented omission (routes/hooks.ts header).
+ *
+ * Plus the three PLAIN-Hono replay arms (census B-63) POST …/hooks/{id}/
+ * replay/{uuid} — upstream mounts replay on the web routers only
+ * (web.go:1038/:743/:865), so the arms are outside the frozen contract and
+ * un-declared (the route block's comment; the repo arm lives in
+ * routes/hooks.ts).
  *
  * Declared responses mirror the vendored contract exactly — the org family
  * declares 404 next to its success codes; the user and admin families
@@ -633,5 +641,51 @@ export function registerHookScopeRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: M
     const deleted = await deleteGlobalHook(c.env.DB, pathId(id));
     if (!deleted) throw new ApiError(404, "not found");
     return c.body(null, 204);
+  });
+
+  // -----------------------------------------------------------------------
+  // The replay arms (census B-63) — upstream mounts replay on the WEB router
+  // only (web.go:1038 org, :743 user, :865 admin — all
+  // `m.Post("/replay/{uuid}", repo_setting.ReplayWebhook)` inside the scope's
+  // hooks group), so the frozen /api/v1 contract has NO path key for them:
+  // plain Hono (the mirror family's non-contract convention — the repo arm's
+  // comment in routes/hooks.ts), NOT in the generated OpenAPI document. Each
+  // handler is ReplayWebhook over the scope's own guards: the scope 404, the
+  // scope-scoped hook 404, the hook-scoped delivery 404
+  // (GetHookTaskByUUID's miss → IsErrHookTaskNotExist → NotFound), then
+  // replayHookDelivery's copy + enqueue. Success answers 204 — the API
+  // family's body-less posture stands in for upstream's redirect + flash.
+  // -----------------------------------------------------------------------
+
+  /** The three arms' shared tail: the replay + enqueue + 204. */
+  const replayOr404 = async (c: Context<ApiEnv>, hookId: number, uuid: string): Promise<Response> => {
+    const deliveryId = await replayHookDelivery(c.env.DB, hookId, uuid);
+    if (deliveryId === null) throw new ApiError(404, "not found");
+    enqueueHookDelivery(c, webhookDeliveryQueue(c.env), deliveryId);
+    return c.body(null, 204);
+  };
+
+  app.post("/orgs/:org/hooks/:id/replay/:uuid", requireAuth, async (c) => {
+    const doer = authedDoer(c);
+    const { org, id, uuid } = c.req.param();
+    await requireOrgHookAccess(c.env.DB, org, doer, c.req.path, "");
+    const hook = await getOwnerHook(c.env.DB, doer.id, pathId(id));
+    if (hook === null) throw new ApiError(404, "not found");
+    return replayOr404(c, hook.id, uuid);
+  });
+
+  app.post("/user/hooks/:id/replay/:uuid", requireAuth, async (c) => {
+    const doer = authedDoer(c);
+    const { id, uuid } = c.req.param();
+    const hook = await getOwnerHook(c.env.DB, doer.id, pathId(id));
+    if (hook === null) throw new ApiError(404, "not found");
+    return replayOr404(c, hook.id, uuid);
+  });
+
+  app.post("/admin/hooks/:id/replay/:uuid", requireAuth, requireSiteAdmin(), async (c) => {
+    const { id, uuid } = c.req.param();
+    const hook = await getGlobalHook(c.env.DB, pathId(id));
+    if (hook === null) throw new ApiError(404, "not found");
+    return replayOr404(c, hook.id, uuid);
   });
 }

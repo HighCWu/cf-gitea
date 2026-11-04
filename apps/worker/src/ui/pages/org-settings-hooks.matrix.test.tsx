@@ -362,8 +362,14 @@ describe("the mounted org settings hooks routes (the minted-session route-level 
     expect(html).toContain('value="main"'); // the stored branch filter
     // THE preserve inputs: one hidden events input per subscribed event —
     // they are what keeps push alive through the POST's unconditional
-    // subscription rewrite.
+    // subscription rewrite. (The Actions pair is NOT here — B-62 moved its
+    // POST-body truth into the checkbox matrix below.)
     expect(html).toContain('type="hidden" name="events" value="push"');
+    // B-62's Workflow Events matrix tail (settings.tmpl:337-349): the two
+    // Actions-only checkboxes under the same `events` field name.
+    expect(html).toContain("Workflow Events");
+    expect(html).toContain('name="events" type="checkbox" value="workflow_run"');
+    expect(html).toContain('name="events" type="checkbox" value="workflow_job"');
   });
 
   it("the owner's edit POST applies the form and the hidden events KEEP push in the stored blob (303 back onto the page)", async () => {

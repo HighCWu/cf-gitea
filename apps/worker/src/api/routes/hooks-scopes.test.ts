@@ -21,7 +21,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users, webhooks } from "../../db/schema";
+import { users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -707,5 +707,113 @@ describe("GET/PATCH/DELETE /admin/hooks/{id} (adminGetHook / adminEditHook / adm
 
     const anon = await router()(`/admin/hooks/${id}`);
     expect(anon.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The replay arms (B-63) — POST …/hooks/{id}/replay/{uuid} on the three
+// scopes, each behind its own scope gate (upstream mounts them on the WEB
+// routers, web.go:1038/:743/:865; the API arms are the plain-Hono additions)
+// ---------------------------------------------------------------------------
+
+describe("POST …/hooks/{id}/replay/{uuid} (the B-63 replay arms)", () => {
+  /** One delivered source delivery (the replay copy's input). */
+  async function seedDelivery(hookId: number): Promise<string> {
+    const rows = await db()
+      .insert(webhookDeliveries)
+      .values({
+        hookId,
+        repoId: "repo-scope-replay",
+        uuid: crypto.randomUUID(),
+        eventType: "issues",
+        eventGroup: "issues",
+        payloadContent: JSON.stringify({ action: "opened" }, null, 2),
+        state: "delivered",
+        isSucceed: true,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        deliveredAt: new Date("2026-01-01T00:01:00Z"),
+      })
+      .returning({ uuid: webhookDeliveries.uuid })
+      .all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("delivery seed failed");
+    return row.uuid;
+  }
+
+  it("org: the owner replays; a member 403s before any write; a foreign org's hook 404s", async () => {
+    const seed = await seedOrg();
+    const hookId = await seedHook({ ownerId: seed.owner.id });
+    const uuid = await seedDelivery(hookId);
+
+    const res = await router()(`/orgs/acme/hooks/${hookId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(seed.owner.id),
+    });
+    expect(res.status).toBe(204);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(2); // the copy rides
+
+    const member = await router()(`/orgs/acme/hooks/${hookId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(seed.member.id),
+    });
+    expect(member.status).toBe(403);
+    expect(await member.json()).toEqual({ message: "Must be an organization owner", url: ERROR_URL });
+
+    const foreign = await router()(`/orgs/hookrivals/hooks/${hookId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(seed.outsider.id),
+    });
+    expect(foreign.status).toBe(404);
+  });
+
+  it("user: the doer replays their own hook; a neighbor's id is a 404 that writes nothing", async () => {
+    const doer = await seedUser("hook-user");
+    const neighbor = await seedUser("neighbor");
+    const hookId = await seedHook({ ownerId: doer.id });
+    const uuid = await seedDelivery(hookId);
+
+    const res = await router()(`/user/hooks/${hookId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(doer.id),
+    });
+    expect(res.status).toBe(204);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(2);
+
+    const foreign = await router()(`/user/hooks/${hookId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(neighbor.id),
+    });
+    expect(foreign.status).toBe(404); // the owner-scoped hook lookup misses first
+
+    const anon = await router()(`/user/hooks/${hookId}/replay/${uuid}`, { method: "POST" });
+    expect(anon.status).toBe(401);
+  });
+
+  it("admin: a site admin replays a global hook; a non-admin 403s; a scoped id 404s", async () => {
+    const admin = await seedUser("root", true);
+    const systemId = await seedHook({ isSystemWebhook: true });
+    const uuid = await seedDelivery(systemId);
+
+    const res = await router()(`/admin/hooks/${systemId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(admin.id),
+    });
+    expect(res.status).toBe(204);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(2);
+
+    const plain = await seedUser("plain");
+    const forbidden = await router()(`/admin/hooks/${systemId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(plain.id),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual({ message: "user should be the site admin", url: ERROR_URL });
+
+    const ownerId = await seedHook({ ownerId: admin.id }); // a SCOPED row — the global lookup misses
+    const scoped = await router()(`/admin/hooks/${ownerId}/replay/${uuid}`, {
+      method: "POST",
+      headers: authHeaders(admin.id),
+    });
+    expect(scoped.status).toBe(404);
   });
 });

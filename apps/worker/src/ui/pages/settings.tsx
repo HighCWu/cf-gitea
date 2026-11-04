@@ -257,10 +257,15 @@
  * octicon-stopwatch, which is not in the landed icon allowlist —
  * scripts/gen-ui-icons.mjs is outside this wave's ownership), delivered
  * failures red (the dot fill stands in for octicon-alert, same allowlist
- * note). The rows are the collapsed history items: uuid, event type, time
- * — the request/response payload tabs and the per-delivery replay are not
- * rendered (no JS plumbing; the payload bodies would need the tab
- * switcher). The test-fire POST re-plays the landed repoTestHook arm over
+ * note). The rows are the collapsed history items: uuid, event type, time,
+ * and (B-63) the per-delivery replay form — history.tmpl:50-53's POST to
+ * /replay/{uuid}, riding the visible row because the request/response
+ * payload tabs stay unrendered (the folded absence; no JS plumbing). The
+ * replay POST target is the canonical web path, whose index.ts handler is a
+ * separate wiring window until then. The events matrix gains the Actions
+ * pair as real checkboxes (B-62 — settings.tmpl:337-349's Workflow Events
+ * tail; the other events keep the hidden preserve inputs). The test-fire
+ * POST re-plays the landed repoTestHook arm over
  * the same services the API route calls (buildTestPushPayload +
  * fireTestDelivery): an empty repository fires nothing (the arm's
  * early-204), success enqueues through the same structural WEBHOOK_DELIVERY
@@ -288,6 +293,7 @@ import {
   hookEventsArray,
   listHookDeliveries,
   listRepoHooks,
+  replayHookDelivery,
   fireTestDelivery,
   type WebhookRow,
 } from "../../api/services/hooks";
@@ -1907,7 +1913,72 @@ export const hookDetailLocale = {
     "An event has been added to the delivery queue. It may take few seconds before it shows up in the delivery history.", // "repo.settings.webhook.delivery.success" (the ?test=queued flash reduction's text)
   delete_webhook: "Remove Webhook", // "repo.settings.delete_webhook"
   no_deliveries: "No deliveries yet.", // cf-gitea addition (upstream renders an empty segment)
+  // The Workflow Events matrix head + the Actions pair (census B-62 —
+  // settings.tmpl:337-349; the en-US strings of the cited locale keys).
+  event_header_workflow: "Workflow Events", // "repo.settings.event_header_workflow"
+  event_workflow_run: "Workflow Run", // "repo.settings.event_workflow_run"
+  event_workflow_job: "Workflow Job", // "repo.settings.event_workflow_job"
+  // The per-delivery replay control (census B-63 — history.tmpl:50-53's form;
+  // upstream's icon button carries the tooltip of the cited key).
+  replay_delivery: "Replay this delivery", // "repo.settings.webhook.replay.description"
 } as const;
+
+/**
+ * The two Actions-only subscription events (census B-62 — the WH8 tail).
+ * The API/grammar side lives in services/hooks.ts (updateHookEvents +
+ * ALL_EVENTS); the web matrix side is the checkbox pair below. The emitter
+ * (src/issues/webhooks.ts) has delivered both since the Actions wave.
+ */
+export const WORKFLOW_SUBSCRIPTION_EVENTS: readonly string[] = ["workflow_run", "workflow_job"];
+
+/** Whether a subscription event name is one of the Actions-only pair. */
+export function isWorkflowSubscriptionEvent(event: string): boolean {
+  return event === "workflow_run" || event === "workflow_job";
+}
+
+/**
+ * The hidden preserve inputs' event list: everything EXCEPT the Actions pair
+ * — the pair's POST-body truth is the checkbox pair (an unchecked checkbox
+ * submits nothing, so unchecking must unsubscribe; a hidden input carrying
+ * the pair would defeat that).
+ */
+export function preserveSubscriptionEvents(events: string[]): string[] {
+  return events.filter((event) => !isWorkflowSubscriptionEvent(event));
+}
+
+/**
+ * settings.tmpl:337-349's Workflow Events matrix tail (census B-62): the
+ * header + the two Actions-only checkboxes under the SAME `events` field
+ * name the edit POST already binds (`parseHookEditForm` reads
+ * `getAll("events")` — no route change rides this). Checked state renders
+ * the stored subscription; the API grammar accepts the names upstream-exact.
+ */
+const WORKFLOW_EVENT_LABELS: Readonly<Record<string, string>> = {
+  workflow_run: hookDetailLocale.event_workflow_run,
+  workflow_job: hookDetailLocale.event_workflow_job,
+};
+
+export function WorkflowEventsField(props: { events: string[] }) {
+  return (
+    <div class="field">
+      <label>{hookDetailLocale.event_header_workflow}</label>
+      <div class="inline fields">
+        {WORKFLOW_SUBSCRIPTION_EVENTS.map((event) => (
+          <div class="ui checkbox" key={event}>
+            <input
+              id={`event_${event}`}
+              name="events"
+              type="checkbox"
+              value={event}
+              checked={props.events.includes(event)}
+            />
+            <label for={`event_${event}`}>{WORKFLOW_EVENT_LABELS[event] ?? event}</label>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /** One-page cap for the recent-deliveries list (listHookDeliveries is
  *  paginated, newest first; the cap mirrors HOOKS_LIST_LIMIT — upstream
@@ -2082,6 +2153,34 @@ export async function fireHookTestDelivery(args: {
   return { outcome: "fired", deliveryId };
 }
 
+export type HookReplayResult = { outcome: "replayed"; deliveryId: number } | { outcome: "missing" };
+
+/**
+ * The replay write (census B-63 — POST …/hooks/{id}/replay/{uuid}'s service
+ * steps): the repo-scoped hook guard, then `replayHookDelivery` (the NEW
+ * pending delivery row carrying the source's stored payload/event bytes —
+ * upstream ReplayHookTask's copy semantics). `missing` answers an unknown
+ * hook id AND a uuid not among THAT hook's deliveries (GetHookTaskByUUID's
+ * hook-scoped miss → the route 404-shells, upstream's
+ * IsErrHookTaskNotExist → NotFound arm). The optional enqueue callback rides
+ * the caller's queue probe + waitUntil (the test write's convention —
+ * index.ts wires both when the replay route lands).
+ */
+export async function replayRepoHookDelivery(args: {
+  d1: D1Database;
+  repoId: string;
+  hookId: number;
+  uuid: string;
+  enqueue?: (deliveryId: number) => void;
+}): Promise<HookReplayResult> {
+  const hook = await getRepoHook(args.d1, args.repoId, args.hookId);
+  if (hook === null) return { outcome: "missing" };
+  const deliveryId = await replayHookDelivery(args.d1, hook.id, args.uuid);
+  if (deliveryId === null) return { outcome: "missing" };
+  args.enqueue?.(deliveryId);
+  return { outcome: "replayed", deliveryId };
+}
+
 // --- components -----------------------------------------------------------------
 
 /** history.tmpl's status mark for one delivery: succeeded green (check),
@@ -2103,7 +2202,7 @@ function DeliveryTime(props: { row: HookDeliveryRow }) {
   return <TimeSince unixSeconds={Math.floor(at.getTime() / 1000)} tz="+0000" />;
 }
 
-function DeliveryItem(props: { row: HookDeliveryRow }) {
+function DeliveryItem(props: { row: HookDeliveryRow; replayAction: string | null; replayDisabled?: boolean }) {
   const { row } = props;
   const status = deliveryStatus(row);
   return (
@@ -2117,6 +2216,26 @@ function DeliveryItem(props: { row: HookDeliveryRow }) {
         </div>
         <div class="flex-text-block">
           <span class="ui tiny label">{row.eventType}</span>
+          {/* history.tmpl:50-53's per-delivery replay form (census B-63): the
+              icon button POSTs /replay/{uuid} — upstream tucks it into the
+              per-delivery detail panel (folded absent here, the module
+              header), so the form rides the visible row. Disabled while the
+              hook is inactive (upstream's description_disabled arm). The
+              action is the canonical web path; index.ts's replay handler is
+              this wave's separate wiring window. */}
+          {props.replayAction !== null ? (
+            <form class="tw-inline" method="post" action={props.replayAction}>
+              <button
+                type="submit"
+                class="ui tiny button"
+                title={hookDetailLocale.replay_delivery}
+                aria-label={hookDetailLocale.replay_delivery}
+                disabled={props.replayDisabled === true}
+              >
+                <Icon name="octicon-sync" />
+              </button>
+            </form>
+          ) : null}
           <span class="tw-text-text-light">
             <DeliveryTime row={row} />
           </span>
@@ -2163,9 +2282,14 @@ export function HookDetailPage(props: { ctx: UiContext; data: HookDetailData; er
           <div class="ui attached segment">
             <form class="ui form" action={hookLink} method="post">
               {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
-              {form.events.map((event) => (
+              {/* The preserve inputs for every subscribed event EXCEPT the
+                  Actions pair (the pair's POST truth is the checkbox matrix
+                  below — B-62), plus the pair's matrix head per
+                  settings.tmpl:337-349. */}
+              {preserveSubscriptionEvents(form.events).map((event) => (
                 <input type="hidden" name="events" value={event} />
               ))}
+              <WorkflowEventsField events={form.events} />
               <div class="required field">
                 <label for="payload_url">{settingsLocale.payload_url}</label>
                 <input id="payload_url" name="payload_url" type="url" required value={form.payloadUrl} />
@@ -2235,7 +2359,11 @@ export function HookDetailPage(props: { ctx: UiContext; data: HookDetailData; er
             ) : (
               <div class="flex-divided-list">
                 {data.deliveries.map((row) => (
-                  <DeliveryItem row={row} />
+                  <DeliveryItem
+                    row={row}
+                    replayAction={`${hookLink}/replay/${row.uuid}`}
+                    replayDisabled={!data.hook.isActive}
+                  />
                 ))}
               </div>
             )}

@@ -20,6 +20,7 @@ import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { STUB_USER } from "./auth";
 import { ZERO_OID } from "./services/hooks";
 import { createApiRouter } from "./router";
+import { decryptInstanceSecretData, INSTANCE_ENVELOPE_PREFIX } from "../services/instance-key";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(async () => {
@@ -182,6 +183,53 @@ describe("POST /repos/{owner}/{repo}/hooks (repoCreateHook)", () => {
         color: "#ff0000",
       },
     });
+  });
+
+  it("subscribes the Actions pair from the events list (B-62 — plain membership, previously silently dropped)", async () => {
+    await seedRepo("visible");
+
+    const res = await router()("/repos/alice/visible/hooks", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        type: "gitea",
+        config: { url: "https://hooks.example.com/ci", content_type: "json" },
+        events: ["push", "workflow_run", "workflow_job"],
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.events).toEqual(["push", "workflow_run", "workflow_job"]); // hookEventsArray renders both flags
+
+    // The stored blob carries the flags, so the fan-out's webhookHasEvent
+    // (src/issues/webhooks.ts) delivers the Actions emissions.
+    const stored = await db().select().from(webhooks).all();
+    const config = JSON.parse((stored[0] as { events: string }).events) as { events: Record<string, boolean> };
+    expect(config.events.workflow_run).toBe(true);
+    expect(config.events.workflow_job).toBe(true);
+  });
+
+  it("seals the authorization header at rest (B-64 — the column never carries plaintext)", async () => {
+    await seedRepo("visible");
+
+    const res = await router()("/repos/alice/visible/hooks", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        type: "gitea",
+        config: { url: "https://hooks.example.com/ci", content_type: "json" },
+        authorization_header: "Bearer super-secret-value",
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.authorization_header).toBe(""); // the wire still never renders it
+
+    const stored = await db().select().from(webhooks).all();
+    const atRest = (stored[0] as { headerAuthorizationEncrypted: string }).headerAuthorizationEncrypted;
+    expect(atRest.startsWith(INSTANCE_ENVELOPE_PREFIX)).toBe(true);
+    expect(atRest).not.toContain("super-secret-value");
+    expect(await decryptInstanceSecretData(env.DB, atRest)).toBe("Bearer super-secret-value");
   });
 
   it.each([
@@ -372,6 +420,18 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/hooks/{id}", () => {
     expect(body.name).toBe("renamed");
     expect(body.events).toEqual(["push"]); // subscription reset to push-only
     expect(body.branch_filter).toBe(""); // filter cleared
+  });
+
+  it("renders send_everything as all 26 events with the Actions pair trailing (B-62)", async () => {
+    const repoId = await seedRepo("visible");
+    const id = await seedHook(repoId, { events: JSON.stringify({ send_everything: true }) });
+
+    const res = await router()(`/repos/alice/visible/hooks/${id}`, { headers: authHeaders });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    const events = body.events as string[];
+    expect(events).toHaveLength(26); // AllEvents() incl. workflow_run/workflow_job
+    expect(events.slice(-2)).toEqual(["workflow_run", "workflow_job"]); // AllEvents() order at the tail
   });
 
   it("validates a supplied url/content_type on PATCH with upstream's messages", async () => {
@@ -582,5 +642,84 @@ describe("GET /repos/{owner}/{repo}/hooks/{id}/deliveries (repoListHookDeliverie
     const miss = await router()("/repos/alice/visible/hooks/8888/deliveries", { headers: authHeaders });
     expect(miss.status).toBe(404);
     expect(await miss.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+});
+
+describe("POST /repos/{owner}/{repo}/hooks/{id}/replay/{uuid} (the B-63 replay arm)", () => {
+  const replayPath = (hookId: number, uuid: string): string => `/repos/alice/visible/hooks/${hookId}/replay/${uuid}`;
+
+  async function seedDelivery(hookId: number): Promise<string> {
+    const rows = await db()
+      .insert(webhookDeliveries)
+      .values({
+        hookId,
+        repoId: "repo-visible",
+        uuid: crypto.randomUUID(),
+        eventType: "push",
+        eventGroup: "push",
+        payloadContent: JSON.stringify({ ref: "refs/heads/main" }, null, 2),
+        state: "delivered",
+        isSucceed: true,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        deliveredAt: new Date("2026-01-01T00:01:00Z"),
+      })
+      .returning({ id: webhookDeliveries.id, uuid: webhookDeliveries.uuid })
+      .all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("delivery seed failed");
+    return row.uuid;
+  }
+
+  it("copies the delivery: 204, a NEW pending row with the SAME payload/event bytes and a NEW uuid (the source untouched)", async () => {
+    const repoId = await seedRepo("visible");
+    const hookId = await seedHook(repoId);
+    const uuid = await seedDelivery(hookId);
+
+    const res = await router()(replayPath(hookId, uuid), { method: "POST", headers: authHeaders });
+
+    expect(res.status).toBe(204);
+    const rows = await db().select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(2); // the copy, never a re-queue of the source
+    const source = rows.find((row) => row.uuid === uuid);
+    const replay = rows.find((row) => row.uuid !== uuid);
+    expect(source).toBeDefined();
+    expect(replay).toBeDefined();
+    expect(replay).toMatchObject({
+      hookId,
+      repoId: "repo-visible",
+      eventType: "push",
+      eventGroup: "push",
+      state: "pending",
+      isSucceed: false,
+    });
+    expect(replay?.payloadContent).toBe(source?.payloadContent); // the stored payload bytes ride the copy
+    expect(replay?.attempts).toBe(0);
+  });
+
+  it("404s an unknown hook id and an unknown uuid (GetHookTaskByUUID's hook-scoped miss)", async () => {
+    const repoId = await seedRepo("visible");
+    const hookId = await seedHook(repoId);
+
+    const noHook = await router()(replayPath(424242, "some-uuid"), { method: "POST", headers: authHeaders });
+    expect(noHook.status).toBe(404);
+    expect(await noHook.json()).toEqual({ message: "not found", url: ERROR_URL });
+
+    const noDelivery = await router()(replayPath(hookId, crypto.randomUUID()), { method: "POST", headers: authHeaders });
+    expect(noDelivery.status).toBe(404);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
+  });
+
+  it("404s another hook's uuid (the lookup is hook-scoped) and requires a token", async () => {
+    const repoId = await seedRepo("visible");
+    const hookA = await seedHook(repoId);
+    const hookB = await seedHook(repoId);
+    const uuid = await seedDelivery(hookA);
+
+    const foreign = await router()(replayPath(hookB, uuid), { method: "POST", headers: authHeaders });
+    expect(foreign.status).toBe(404);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1); // untouched
+
+    const anon = await router()(replayPath(hookA, uuid), { method: "POST" });
+    expect(anon.status).toBe(401);
   });
 });

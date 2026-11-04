@@ -127,10 +127,12 @@
  * webhook`, CustomHeaderTitle = repo.settings.update_webhook):
  * webhook/new.tmpl → gitea.tmpl's form (payload_url, content_type, name,
  * branch_filter, active — the landed repo-page field set with upstream's
- * field names), the read-only subscription line (settings.tmpl's matrix
- * reduced, the hidden `events` preserve inputs riding the PATCH arm's
- * unconditional rewrite), the red Remove Webhook form, then history.tmpl's
- * Recent Deliveries segment.
+ * field names), the Workflow Events checkbox pair (B-62 — settings.tmpl:337-
+ * 349's matrix tail; the other events keep the hidden `events` preserve
+ * inputs riding the PATCH arm's unconditional rewrite), the read-only
+ * subscription line, the red Remove Webhook form, then history.tmpl's
+ * Recent Deliveries segment (its per-delivery replay forms landed with
+ * B-63).
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
@@ -151,13 +153,16 @@
  *   settings group does; the fake-push payload needs a repo pair) —
  *   rendering the repo page's button here would be a dead control (the org
  *   page's identical reduction).
- * - NO replay control: upstream history.tmpl renders a per-delivery replay
- *   form and the user group DOES register `/{id}/replay/{uuid}`
- *   (web.go:742), but no replay arm is landed anywhere in our stack (the
- *   repo page omits it too) — the deliveries segment renders read-only.
+ * - The per-delivery replay control LANDED (census B-63): history.tmpl:50-53's
+ *   POST form rides the visible delivery row (`{hookLink}/replay/{uuid}`,
+ *   disabled while the hook is inactive — upstream's description_disabled
+ *   arm), driven by `replayUserHookDelivery`; the index.ts route handler
+ *   that takes the POST is this wave's separate wiring window (the button
+ *   404s until it lands — recorded in the census row).
  * - The per-delivery request/response detail panels (history.tmpl's tab
  *   switcher) are not reproduced — the repo/org pages' identical reduction;
- *   the row carries the uuid, the event chip and the timestamp.
+ *   the row carries the uuid, the event chip, the replay form and the
+ *   timestamp.
  */
 
 import { inArray, sql } from "drizzle-orm";
@@ -171,6 +176,7 @@ import {
   hookEventsArray,
   listHookDeliveries,
   listOwnerHooks,
+  replayHookDelivery,
   type WebhookRow,
 } from "../../api/services/hooks";
 import { HookStatus, webhookDeliveries } from "../../db/schema";
@@ -188,7 +194,9 @@ import {
   HOOKS_LIST_LIMIT,
   parseCreateHookForm,
   parseHookEditForm,
+  preserveSubscriptionEvents,
   settingsLocale,
+  WorkflowEventsField,
   type CreateHookForm,
   type HookDeliveryRow,
   type HookEditForm,
@@ -456,6 +464,33 @@ export async function deleteUserHook(d1: D1Database, userId: number, hookId: num
   return deleteOwnerHook(d1, userId, hookId);
 }
 
+export type UserHookReplayResult = { outcome: "replayed"; deliveryId: number } | { outcome: "missing" };
+
+/**
+ * The replay write (census B-63 — upstream ReplayWebhook's user arm
+ * (web.go:743) over the landed service): the owner-scoped hook guard
+ * (getOwnerHook — a foreign-owner id 404-shells like the delete miss), then
+ * `replayHookDelivery`'s copy (the NEW pending delivery row carrying the
+ * source's stored payload/event bytes — GetHookTaskByUUID's hook-scoped
+ * uuid lookup: a uuid of ANOTHER hook is a miss too). The optional enqueue
+ * callback rides the caller's queue probe + waitUntil when index.ts's
+ * replay route lands.
+ */
+export async function replayUserHookDelivery(
+  d1: D1Database,
+  userId: number,
+  hookId: number,
+  uuid: string,
+  enqueue?: (deliveryId: number) => void,
+): Promise<UserHookReplayResult> {
+  const hook = await getOwnerHook(d1, userId, hookId);
+  if (hook === null) return { outcome: "missing" };
+  const deliveryId = await replayHookDelivery(d1, hook.id, uuid);
+  if (deliveryId === null) return { outcome: "missing" };
+  enqueue?.(deliveryId);
+  return { outcome: "replayed", deliveryId };
+}
+
 // --- components -----------------------------------------------------------------
 
 /** history.tmpl's status mark for one delivery: succeeded green (check),
@@ -477,7 +512,7 @@ function DeliveryTime(props: { row: HookDeliveryRow }) {
   return <TimeSince unixSeconds={Math.floor(at.getTime() / 1000)} tz="+0000" />;
 }
 
-function DeliveryItem(props: { row: HookDeliveryRow }) {
+function DeliveryItem(props: { row: HookDeliveryRow; replayAction: string | null; replayDisabled?: boolean }) {
   const { row } = props;
   const status = deliveryStatus(row);
   return (
@@ -491,6 +526,25 @@ function DeliveryItem(props: { row: HookDeliveryRow }) {
         </div>
         <div class="flex-text-block">
           <span class="ui tiny label">{row.eventType}</span>
+          {/* history.tmpl:50-53's per-delivery replay form (census B-63) —
+              the repo/org pages' twin: the icon button POSTs /replay/{uuid}
+              on the visible row (the detail panel stays folded), disabled
+              while the hook is inactive (upstream's description_disabled
+              arm). The action is the canonical web path — index.ts's replay
+              handler is this wave's separate wiring window. */}
+          {props.replayAction !== null ? (
+            <form class="tw-inline" method="post" action={props.replayAction}>
+              <button
+                type="submit"
+                class="ui tiny button"
+                title={hookDetailLocale.replay_delivery}
+                aria-label={hookDetailLocale.replay_delivery}
+                disabled={props.replayDisabled === true}
+              >
+                <Icon name="octicon-sync" />
+              </button>
+            </form>
+          ) : null}
           <span class="tw-text-text-light">
             <DeliveryTime row={row} />
           </span>
@@ -513,9 +567,11 @@ export function renderUserHookDetailPage(options: {
  * The user per-hook page (§2.4.1 discriminator: `user settings new webhook`
  * — hook_new.tmpl's EDIT arm: upstream renders the shared WebHooksEdit
  * through the user new template with CustomHeaderTitle =
- * repo.settings.update_webhook). The edit form + the read-only subscription
- * line + the Remove Webhook form + history.tmpl's deliveries segment
- * (read-only — the module header's test/replay reductions).
+ * repo.settings.update_webhook). The edit form + the Workflow Events matrix
+ * pair + the read-only subscription line + the Remove Webhook form +
+ * history.tmpl's deliveries segment with the per-delivery replay forms
+ * (B-63; the request/response panels stay the folded absence — the module
+ * header).
  */
 export function UserHookDetailPage(props: { ctx: UiContext; data: UserHookDetailData; error: string | null }) {
   const { ctx, data } = props;
@@ -532,9 +588,12 @@ export function UserHookDetailPage(props: { ctx: UiContext; data: UserHookDetail
           <div class="ui attached segment">
             <form class="ui form" action={hookLink} method="post">
               {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
-              {form.events.map((event) => (
+              {/* The preserve inputs EXCLUDE the Actions pair (B-62) — the
+                  pair's POST truth is the checkbox matrix below. */}
+              {preserveSubscriptionEvents(form.events).map((event) => (
                 <input type="hidden" name="events" value={event} />
               ))}
+              <WorkflowEventsField events={form.events} />
               <div class="required field">
                 <label for="payload_url">{settingsLocale.payload_url}</label>
                 <input id="payload_url" name="payload_url" type="url" required value={form.payloadUrl} />
@@ -571,8 +630,9 @@ export function UserHookDetailPage(props: { ctx: UiContext; data: UserHookDetail
               </div>
             </form>
             {/* The read-only subscription line (settings.tmpl's matrix
-                reduced — the hidden inputs above preserve it through the
-                PATCH arm's unconditional rewrite). */}
+                reduced to the line + the Workflow checkbox pair above — the
+                hidden inputs preserve the rest through the PATCH arm's
+                unconditional rewrite). */}
             <p class="tw-text-placeholder-text">
               {hookDetailLocale.event_desc} {form.events.length > 0 ? form.events.join(", ") : "push"}
             </p>
@@ -583,8 +643,8 @@ export function UserHookDetailPage(props: { ctx: UiContext; data: UserHookDetail
             </form>
           </div>
           {/* history.tmpl's header shape: the list title alone — the user
-              group has no test route upstream and no replay arm is landed
-              (the module header). */}
+              group has no test route upstream (the module header); the
+              per-delivery replay forms ride the rows (B-63). */}
           <h4 class="ui top attached header">{hookDetailLocale.recent_deliveries}</h4>
           <div class="ui attached segment">
             {data.deliveries.length === 0 ? (
@@ -592,7 +652,11 @@ export function UserHookDetailPage(props: { ctx: UiContext; data: UserHookDetail
             ) : (
               <div class="flex-divided-list">
                 {data.deliveries.map((row) => (
-                  <DeliveryItem row={row} />
+                  <DeliveryItem
+                    row={row}
+                    replayAction={`${hookLink}/replay/${row.uuid}`}
+                    replayDisabled={!data.hook.isActive}
+                  />
                 ))}
               </div>
             )}

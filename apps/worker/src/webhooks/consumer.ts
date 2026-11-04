@@ -98,6 +98,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import { HookStatus, users, webhookDeliveries, webhooks } from "../db/schema";
+import { decryptInstanceSecretData } from "../services/instance-key";
 import { checkWebhookTarget, parseHostPolicy, type EgressMode } from "./ssrf";
 
 /** The only thing a producer puts on the queue (§3.6). */
@@ -240,13 +241,32 @@ async function resolveTargetType(
   return "default";
 }
 
+/**
+ * The Authorization header's read arm (census B-64 — upstream deliver.go:186
+ * `w.HeaderAuthorization()`, models/webhook/webhook.go:206-215): the stored
+ * `header_authorization_encrypted` value dispatches on the instance-key
+ * envelope prefix — `v1:` opens through `decryptInstanceSecretData`, a value
+ * WITHOUT the prefix is a LEGACY PLAINTEXT row served as-is (the transparent
+ * passthrough; upgrade-on-write converts it the next time the hook is edited),
+ * a newer build's version prefix throws. Null/empty = no header (null).
+ * THROWS on an unopenable envelope — the caller fails the delivery exactly
+ * like upstream's error arm (deliver.go:186-191 wraps and returns the error,
+ * a failed delivery).
+ */
+export async function resolveWebhookAuthorization(d1: D1Database, stored: string | null): Promise<string | null> {
+  if (stored === null || stored === "") return null;
+  return decryptInstanceSecretData(d1, stored);
+}
+
 /** Build the request for one delivery (headers in upstream `addDefaultHeaders` order). */
 export function buildWebhookRequest(input: {
   hook: {
     url: string;
     httpMethod: string;
     contentType: number;
-    headerAuthorizationEncrypted: string | null;
+    /** The DECRYPTED Authorization header (resolveWebhookAuthorization's
+     *  output — upstream deliver.go:186's `authorization` cleartext). */
+    authorizationHeader: string | null;
   };
   /** The stored payload bytes (§2.7 2-space JSON) — signed and logged verbatim. */
   payloadText: string;
@@ -298,11 +318,11 @@ export function buildWebhookRequest(input: {
       throw new WebhookRequestError(`invalid http method: ${method}`);
   }
 
-  // The stored Authorization value is sent verbatim but masked in the log
-  // (upstream decrypts `HeaderAuthorizationEncrypted`; the encryption-at-rest
-  // service lands with the settings module — column read as-is meanwhile).
-  if (hook.headerAuthorizationEncrypted !== null && hook.headerAuthorizationEncrypted !== "") {
-    headers["Authorization"] = hook.headerAuthorizationEncrypted;
+  // The resolved Authorization cleartext is sent verbatim but masked in the
+  // log (upstream deliver.go:186-191 — the decrypted header set on the
+  // request, `******` recorded in the task's RequestInfo).
+  if (hook.authorizationHeader !== null && hook.authorizationHeader !== "") {
+    headers["Authorization"] = hook.authorizationHeader;
   }
 
   return { url, method, headers, body, loggedBody: payloadText };
@@ -428,6 +448,26 @@ export async function processWebhookDelivery(
       now,
     });
 
+  // The Authorization header decrypts at the read (B-64 — upstream
+  // deliver.go:186-191): an unopenable envelope FAILS the delivery here,
+  // upstream's error arm's exact shape (the wrapped text in the recorded
+  // response body, terminal like any delivery error).
+  let authorizationHeader: string | null;
+  try {
+    authorizationHeader = await resolveWebhookAuthorization(d1, hook.headerAuthorizationEncrypted);
+  } catch (error) {
+    return await recordFailure(
+      {
+        status: 0,
+        headers: {},
+        body: `Delivery: cannot get Authorization header for webhook ${hook.type}[${hook.id} ${hook.url}]: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      },
+      null,
+    );
+  }
+
   let built: BuiltWebhookRequest;
   try {
     built = buildWebhookRequest({
@@ -435,7 +475,7 @@ export async function processWebhookDelivery(
         url: hook.url,
         httpMethod: hook.httpMethod,
         contentType: hook.contentType,
-        headerAuthorizationEncrypted: hook.headerAuthorizationEncrypted,
+        authorizationHeader,
       },
       payloadText: delivery.payloadContent,
       delivery: { uuid: delivery.uuid, eventType: delivery.eventType, eventGroup: delivery.eventGroup },

@@ -380,5 +380,10 @@ describe("the edit form's subscription rewrite (POST /{owner}/{repo}/settings/ho
     expect(html).toContain('id="hook_active" name="active" type="checkbox"/>');
     expect(html).toContain("Trigger On: push");
     expect(html).toContain('type="hidden" name="events" value="push"');
+    // B-62's Workflow Events matrix tail (settings.tmpl:337-349): the two
+    // Actions-only checkboxes ride every per-hook edit form.
+    expect(html).toContain("Workflow Events");
+    expect(html).toContain('name="events" type="checkbox" value="workflow_run"');
+    expect(html).toContain('name="events" type="checkbox" value="workflow_job"');
   });
 });
