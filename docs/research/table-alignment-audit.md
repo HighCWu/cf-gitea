@@ -48,9 +48,20 @@ sources and found accurate.
   **34 = 19 MISSING + 4 RENAME + 4 OURS-EXTRA + 7 TYPE** (arithmetic:
   63 − 17 − 12 = 34; of the 19 MISSING, 8 are the §7.11 recorded-absent
   pairs and 11 are open port targets — FN-10/FN-12's in-flight 0073
-  strictness batch not counted). The RENAME residual is exactly the 4
-  columns the FN-5 batch never contained: `repo_transfer.created_unix`,
-  `repo_collaborators.created_unix`/`updated_unix`, `lfs_locks.created`.
+  strictness batch not counted). **Reconciliation 2 (CENSUS3 unit,
+  2026-11-04):** the residual-34 count HOLDS — this unit lands no DDL, and
+  recorded items stay counted per the §7.11 precedent — but its RENAME arm
+  is dispositioned, not open: all four columns the FN-5 batch never
+  contained — `repo_transfer.created_unix`,
+  `repo_collaborators.created_unix`/`updated_unix`, `lfs_locks.created` —
+  are members of the FN-13 §7.2 recorded timestamp-name family (each pair
+  re-derived against schema.ts at HEAD + the upstream struct tag:
+  transfer.go:77, collaboration.go:25-26, lfs_lock.go:27; §7.2's
+  record-not-rename decision owns them — the §4 bullets carry the flips),
+  so the residual reads **34 = 19 MISSING (8 recorded-absent + 11 open) +
+  4 RENAME (all four §7.2-recorded — NOT port targets; open rename
+  targets: 0) + 4 OURS-EXTRA + 7 TYPE**, and the open migration-target
+  count drops from 15 (11 open MISSING + 4 RENAME) to 11 open MISSING.
   The 4-missing-table
   figure undercounts by counting only data tables a reader would touch;
   this census counts every registered upstream table.
@@ -75,8 +86,10 @@ sources and found accurate.
   rows carry the flips), and FN-7 LANDED (migration 0070,
   `merged_commit_id` + the stamp arm — §5's row carries the status).
   The remaining open arms are the strictness batch FN-10/FN-12 (in
-  flight, 0073), FN-11 (port-or-record), FN-14 (port-when-read), and the
-  4 residual RENAMEs of the reconciliation above.
+  flight, 0073), FN-11 (port-or-record), and FN-14 (port-when-read) —
+  the 4 residual RENAMEs of the reconciliation above are DISPOSITIONED
+  as FN-13 §7.2-recorded (CENSUS3, 2026-11-04; see Reconciliation 2):
+  no FN assignee needed, the RENAME backlog is empty.
 
 ## 1. Method (reproducible)
 
@@ -236,7 +249,7 @@ classes only.
 
 | upstream table | upstream cite | our counterpart | verdict | reason (with cite) |
 |---|---|---|---|---|
-| `protected_tag` | models/git/protected_tag.go:21 | schema.ts:3321 `protected_tags` | drift | allowlist_team_i_ds/allowlist_user_i_ds gonic renames |
+| `protected_tag` | models/git/protected_tag.go:21 | schema.ts:3321 `protected_tags` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): both gonic renames resolved upstream-EXACT — the columns are upstream's mapper outputs `allowlist_team_i_ds`/`allowlist_user_i_ds` again (schema.ts:3433/:3430 re-grepped 2026-11-04); the export/property names are kept per §7.10; no other divergence |
 | `package_blob_upload` | models/packages/package_blob_upload.go:24 | schema.ts:4042 `package_blob_uploads` | drift | hash_state_bytes missing (resumable-upload state); chunk_count extra |
 | `package_cleanup_rule` | models/packages/package_cleanup_rule.go:25 | schema.ts:3993 `package_cleanup_rules` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `commit_status_summary` | models/git/commit_status_summary.go:17 | — | missing-table | no reader in worker (grep 0) |
@@ -246,7 +259,7 @@ classes only.
 | `package_blob` | models/packages/package_blob.go:30 | schema.ts:3898 `package_blobs` | intentional-recorded | hash-rename claim WITHDRAWN (§7.8): upstream carries explicit overrides `hash_md5/hash_sha1/hash_sha256/hash_sha512` (package_blob.go:33-36), ours matches verbatim (schema.ts:3905-3909); the real divergence is ours-NULLable md5/sha1/sha512 vs upstream NOT NULL — recorded, SPEC-0016 package_blobs bullet + the schema.ts table comment (WebCrypto has no MD5) |
 | `package` | models/packages/package.go:191 | schema.ts:3818 `packages` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `lfs_meta_object` | models/git/lfs.go:80 | schema.ts:1431 `lfs_objects` | intentional-recorded | lfs_objects state machine, bare keys; SPEC-0006 §3 (schema.ts:1431) |
-| `protected_branch` | models/git/protected_branch.go:30 | schema.ts:2676 `protected_branches` | drift | branch_name → rule_name and config → rules renames |
+| `protected_branch` | models/git/protected_branch.go:30 | schema.ts:2676 `protected_branches` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): both renames resolved upstream-EXACT — the columns are upstream's `branch_name`/`config` again (schema.ts:2784/:2791 re-grepped 2026-11-04); the unique index was rebuilt onto (`repo_id`, `branch_name`) under the unchanged name protected_branches_repo_rule_uq; the property names are kept per §7.10; no other divergence |
 | `package_property` | models/packages/package_property.go:31 | schema.ts:3962 `package_properties` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `package_file` | models/packages/package_file.go:34 | schema.ts:3929 `package_files` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `package_version` | models/packages/package_version.go:27 | schema.ts:3855 `package_versions` | aligned | blanket families only (id / timestamp-name / strictness) |
@@ -262,9 +275,9 @@ classes only.
 | `renamed_branch` | models/git/branch.go:293 | schema.ts:5178 `renamed_branches` | missing-table — LANDED by RB (4f338b2, 2026-11-04, migration 0071; the table + both rename writers' log insert + the stale-link redirect in the raw/media and /src families + the delete cascade, the SPEC record `specs/renamed-branches.md`) | was: no landed arm (ui/pages/raw-files.ts:95) |
 | `email_hash` | models/avatars/avatar.go:33 | schema.ts:5010 `email_hash` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `notification` | models/activities/notification.go:52 | schema.ts:1999 `notification_states` | intentional-recorded | state-row reduction; SPEC email-outbound + user-notification-settings (schema.ts:1999); upstream payload columns not ported (residual) |
-| `review_state` | models/pull/review_state.go:41 | schema.ts:5209 `review_state` | drift — LANDED by FN-3 (2026-11-03, migration 0065; `updated_files` ported, the SPEC record `specs/table-alignment-fn3-review-state.md`) | was: missing updated_files (per-file viewed map; ours stored cursor only, api/ui pull-files.tsx:642) |
+| `review_state` | models/pull/review_state.go:41 | schema.ts:5209 `review_state` | drift — LANDED-RESOLVED on the FN-3 arm (2026-11-03, migration 0065; `updated_files` ported, the SPEC record `specs/table-alignment-fn3-review-state.md`) and on the pull_id NAME half (FN-5, 4b9d555, migration 0069 — the column is upstream's `pull_id` again, schema.ts:5314 re-grepped 2026-11-04) | was: missing updated_files (per-file viewed map; ours stored cursor only, api/ui pull-files.tsx:642); pull_id → issue_id rename — the NAME half resolved upstream-exact; the VALUE-SPACE half stands (upstream pull_id = pull_request.id, gitdiff.go:1513; ours stores issues.id) |
 | `action` | models/activities/action.go:135 | schema.ts:3600 `action` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `pull_auto_merge` | models/pull/automerge.go:17 | schema.ts:5249 `pull_auto_merges` | drift | missing merged_commit_id; pull_id/message renames (value-space differs on pull_id); ours-extra sha |
+| `pull_auto_merge` | models/pull/automerge.go:17 | schema.ts:5249 `pull_auto_merges` | drift — LANDED: FN-7 (2026-11-04, migration `0070_fn7-automerge-merged-commit-id`, `merged_commit_id` text nullable, schema.ts:5373 re-grepped 2026-11-04) + FN-5 (4b9d555, migration 0069, the message/pull_id names upstream-EXACT, schema.ts:5365/:5353) | was: missing merged_commit_id; pull_id/message renames (value-space differs on pull_id) — the pull_id VALUE-SPACE note stands; ours-extra `sha` remains (kept as a recorded addition, §5 FN-7) |
 | `action_schedule_spec` | models/actions/schedule_spec.go:19 | schema.ts:4724 `action_schedule_spec` | intentional-recorded | PENDING FM LANDING — column-faithful port; SPEC-0012 §4.1 conventions (schema.ts:4724) |
 | `action_run_attempt` | models/actions/run_attempt.go:21 | schema.ts:4390 `action_run_attempts` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `action_schedule` | models/actions/schedule.go:21 | schema.ts:4681 `action_schedule` | intentional-recorded | PENDING FM LANDING — column-faithful port; SPEC-0012 §4.1 conventions (schema.ts:4681) |
@@ -280,9 +293,9 @@ classes only.
 | `action_task` | models/actions/task.go:29 | schema.ts:4425 `action_tasks` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `action_variable` | models/actions/variable.go:31 | schema.ts:2859 `action_variables` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `project_board` | models/project/column.go:49 | schema.ts:3188 `project_board` | aligned | FN-5 made ours upstream-EXACT (4b9d555, migration 0069, LANDED 2026-11-03): the SQL table name is upstream's `project_board` again (schema.ts:3192) and the column is `default` again (schema.ts:3202); the export/property names (`projectColumns`/`isDefault`) are kept per the property-kept contract (§7.10) |
-| `project_issue` | models/project/issue.go:15 | schema.ts:3236 `project_issues` | drift | project_board_id → project_column_id rename |
+| `project_issue` | models/project/issue.go:15 | schema.ts:3236 `project_issues` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — the column is upstream's `project_board_id` again (schema.ts:3343 re-grepped 2026-11-04); the property name (`projectColumnId`) is kept per §7.10; no other divergence |
 | `action_run_job` | models/actions/run_job.go:32 | schema.ts:4311 `action_run_jobs` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `project_workflow` | models/project/workflows.go:160 | schema.ts:3268 `project_workflows` | drift | workflow_event/filters/actions → event/filters/actions renames |
+| `project_workflow` | models/project/workflows.go:160 | schema.ts:3268 `project_workflows` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): all three renames resolved upstream-EXACT — the columns are upstream's `workflow_event`/`workflow_filters`/`workflow_actions` again (schema.ts:3374/:3378/:3382 re-grepped 2026-11-04); the property names are kept per §7.10; no other divergence |
 | `project` | models/project/project.go:85 | schema.ts:3129 `projects` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `hook_task` | models/webhook/hooktask.go:58 | schema.ts:1365 `webhook_deliveries` | intentional-recorded | Queues-based delivery redesign; SPEC-0005 §3.6 (schema.ts:1365) — §7.5 erratum: the old cite said §3.7, a section that does not exist |
 | `webhook` | models/webhook/webhook.go:123 | schema.ts:1322 `webhooks` | aligned | blanket families only (id / timestamp-name / strictness) |
@@ -300,10 +313,10 @@ classes only.
 | `pull_request` | models/issues/pull.go:120 | schema.ts:849 `pull_requests` | drift | FN-1 status-enum swap IN FLIGHT (migration 0064 + schema.ts:754-762 re-map); still missing type, changed_protected_files; ours-extra head_sha (documented) |
 | `milestone` | models/issues/milestone.go:47 | schema.ts:1056 `milestones` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `stopwatch` | models/issues/stopwatch.go:20 | schema.ts:2131 `stopwatch` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `issue` | models/issues/issue.go:54 | schema.ts:776 `issues` | drift | upstream column `name` → ours `title`: the field carries the explicit xorm column-NAME tag `xorm:"name"` (issue.go:63), which upstream's own SQL binds (writes: `UpdateIssueCols(ctx, issue, "name")`, issue_update.go:198; search: the backticked column, issue.go:536); ours declares `title` (schema.ts:792) — FN-5 carrier (§7.8); the rest is blanket families (id / timestamp-name / strictness) |
+| `issue` | models/issues/issue.go:54 | schema.ts:776 `issues` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — ours' SQL column is upstream's `name` again (schema.ts:828 re-grepped 2026-11-04), matching the explicit column-NAME tag `xorm:"name"` (issue.go:63) that upstream's own SQL binds (issue_update.go:198; issue.go:536); the property name (`title`) is kept per §7.10; the rest is blanket families (id / timestamp-name / strictness) |
 | `comment` | models/issues/comment.go:273 | schema.ts:911 `comments` | drift | missing 7 mutation-metadata cols (comment_meta_data, project_id, old_project_id, time_id, assignee_team_id, original_author, original_author_id); the census's 8th, patch_quoted, WITHDRAWN by the §4 erratum (upstream's column IS patch: parity); the original_author pair now recorded-absent (§7.11), leaving 5 PORT columns for FN-2 — the 5 LANDED (migration 0067, pure ADD COLUMN + the JSON-gated backfills; the writers/readers ride SPEC-0005 §7 as-built; patch untouched) |
 | `issue_content_history` | models/issues/content_history.go:20 | schema.ts:3658 `issue_content_history` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `tracked_time` | models/issues/tracked_time.go:22 | schema.ts:2103 `tracked_time` | drift | time → seconds column rename (unit kept seconds) |
+| `tracked_time` | models/issues/tracked_time.go:22 | schema.ts:2103 `tracked_time` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — the column is upstream's `time` again (schema.ts:2208 re-grepped 2026-11-04); the unit stays seconds on both sides (upstream API json "time" is seconds too, modules/structs); the property name (`seconds`) is kept per §7.10 |
 | `issue_dependency` | models/issues/dependency.go:101 | schema.ts:2075 `issue_dependency` | drift | missing updated_unix |
 | `issue_user` | models/issues/issue_user.go:15 | schema.ts:1224 `issue_user` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `issue_watch` | models/issues/issue_watch.go:17 | schema.ts:1182 `issue_subscriptions` | drift | FN-13 §7.1: created_unix/updated_unix ours-NULLable vs upstream NOT NULL (issue_watch.go:22-23 vs schema.ts:1189-1190) — the ours-looser arm, NOT covered by the strictness record; recommended carrier FN-12; table name + the rest are the FN-13 §7.2/§7.5 recorded families |
@@ -333,7 +346,7 @@ classes only.
 | `repo_indexer_status` | models/repo/repo_indexer.go:27 | — | missing-table | indexer-class store DEFERRED with reopen triggers; SPEC-0019 §3/§4.2 |
 | `star` | models/repo/star.go:17 | schema.ts:1774 `stars` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `push_mirror` | models/repo/pushmirror.go:20 | schema.ts:3035 `push_mirrors` | intentional-recorded | sync-state/credentials restructure; SPEC push-mirror-outbound (schema.ts:3035) |
-| `repo_transfer` | models/repo/transfer.go:64 | schema.ts:411 `repo_transfer` | drift | team_i_ds gonic rename; recipient_id → new_owner_id; recipient_access_granted missing |
+| `repo_transfer` | models/repo/transfer.go:64 | schema.ts:411 `repo_transfer` | drift — LANDED-RESOLVED by FN-5 (4b9d555, migration 0069: `recipient_id` + `team_i_ds` restored upstream-EXACT); the `created_unix` → `created_at` arm is the FN-13 §7.2 recorded timestamp-name family (record-not-rename — CENSUS3, 2026-11-04) | was: team_i_ds gonic rename; recipient_id → new_owner_id; recipient_access_granted missing — still open: recipient_access_granted (transfer.go:75) + updated_unix (transfer.go:78), FN-12's arms (to land under the recorded family names, §7.2 knock-on) |
 | `repo_license` | models/repo/license.go:17 | schema.ts:3547 `repo_license` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `upload` | models/repo/upload.go:43 | schema.ts:2286 `issue_attachments` | intentional-recorded | merged into issue_attachments (pre-confirm staging absorbed); SPEC-0005 (schema.ts:2286) |
 | `topic` | models/repo/topic.go:28 | — | missing-table | names stored directly in repo_topics (schema.ts:1628); SPEC-0004 §2.4 |
@@ -848,7 +861,7 @@ carries the status.)
 
 - RENAME `message` → `merge_message` (ours `pull_auto_merges`; schema.ts:5250) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `message`; rename resolved
 - RENAME `pull_id` → `issue_id` (ours `pull_auto_merges`; schema.ts:5256) — NAME + VALUE-SPACE: upstream pull_id = pull_request.id (gitdiff.go:1513 passes pull.ID); ours issue_id = issues.id (1:1 rows, but the stored id space differs) — **NAME half LANDED by FN-5** (4b9d555, migration 0069): the column is `pull_id` again; the VALUE-SPACE half stands
-- MISSING `merged_commit_id` (text(varchar64)) — upstream models/pull/automerge.go:26 (`MergedCommitID`); no ours counterpart
+- MISSING `merged_commit_id` (text(varchar64)) — upstream models/pull/automerge.go:26 (`MergedCommitID`); no ours counterpart — **LANDED by FN-7** (2026-11-04, migration `0070_fn7-automerge-merged-commit-id`): ours `text("merged_commit_id")` nullable (schema.ts:5373 re-grepped 2026-11-04), pure ADD COLUMN, no rebuild; the stamp arm rides mergePullRequest's merged section — `MergePullOptions.wasAutoMerged` (automerge.go:262's `true` arg) gates `stampAutoMergeCommit` before the composed schedule-cleanup delete (merge.go:265-274); §5's FN-7 row carries the as-built + the recorded non-port (clearMergeIntent's schedule-stamp revert)
 - OURS-EXTRA `sha` — schema.ts:5244 (`pull_auto_merges.sha`)
 
 ### `protected_branch` → `protected_branches` schema.ts:2676
@@ -922,9 +935,11 @@ three RENAME lines below LANDED-RESOLVED by FN-5 (4b9d555, migration 0069,
 2026-11-04): the columns are upstream's `recipient_id` and `team_i_ds`
 again — ours upstream-EXACT; the property names (`newOwnerId`/`teamIds`)
 are kept per the property-kept contract (§7.10). The `created_unix` line
-is NOT an FN-5 member — ours keeps `created_at`; still open.
+is NOT an FN-5 member — and NOT a rename at all: it is the FN-13 §7.2
+recorded timestamp-name family (CENSUS3 dispositioned it 2026-11-04 —
+record-not-rename, closed).
 
-- RENAME `created_unix` → `created_at` (ours `repo_transfer`; schema.ts:421) — rename-only divergence (name, not semantics) — open (not an FN-5 member; migration 0069 did not touch it)
+- RECORDED NAME `created_unix` → `created_at` (ours `repo_transfer`; schema.ts:421) — NOT a rename: the FN-13 §7.2 recorded timestamp-name family, member row `repo_transfer` (§7.2's member census; upstream `CreatedUnix` renders `created_unix`, transfer.go:77 — ours keeps `created_at`, schema.ts:421) — record-not-rename (§7.2's decision: the backlog's rename alternative declined) — classification flipped from RENAME-drift, CLOSED (CENSUS3, 2026-11-04; nothing queues — the §7.2 knock-on also pins FN-12's future `updated_unix` port to the family name)
 - RENAME `recipient_id` → `new_owner_id` (ours `repo_transfer`; schema.ts:420) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `recipient_id`; rename resolved
 - RENAME `team_i_ds` → `team_ids` (ours `repo_transfer`; schema.ts:441) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `team_i_ds`; rename resolved
 - MISSING `recipient_access_granted` (boolean NOT NULL, DEFAULT false) — upstream models/repo/transfer.go:75 (`RecipientAccessGranted`); no ours counterpart
@@ -947,8 +962,8 @@ as-built block)
 
 upstream: models/repo/collaboration.go (struct `Collaboration`)
 
-- RENAME `created_unix` → `created_at` (ours `repo_collaborators`; schema.ts:1696) — rename-only divergence (name, not semantics)
-- RENAME `updated_unix` → `updated_at` (ours `repo_collaborators`; schema.ts:1697) — rename-only divergence (name, not semantics)
+- RECORDED NAME `created_unix` → `created_at` (ours `repo_collaborators`; schema.ts:1793 re-grepped 2026-11-04, was :1696) — NOT a rename: the FN-13 §7.2 recorded timestamp-name family, member row `repo_collaborators` (upstream `CreatedUnix` renders `created_unix`, collaboration.go:25) — record-not-rename, CLOSED (CENSUS3, 2026-11-04)
+- RECORDED NAME `updated_unix` → `updated_at` (ours `repo_collaborators`; schema.ts:1794 re-grepped 2026-11-04, was :1697) — NOT a rename: same §7.2 family, same member row (upstream `UpdatedUnix` renders `updated_unix`, collaboration.go:26) — record-not-rename, CLOSED (CENSUS3, 2026-11-04)
 - MISSING `id` (integer) — upstream models/repo/collaboration.go:21 (`ID`); no ours counterpart
 - TYPE `mode`: upstream integer (models/repo/collaboration.go:24) vs ours text (schema.ts:1695 (`repo_collaborators`))
 
@@ -977,7 +992,7 @@ upstream: models/issues/pull.go (struct `PullRequest`)
 
 upstream: models/git/lfs_lock.go (struct `LFSLock`)
 
-- RENAME `created` → `created_at` (ours `lfs_locks`; schema.ts:1484; re-grepped 2026-11-04, was :1294) — rename-only divergence (name, not semantics)
+- RECORDED NAME `created` → `created_at` (ours `lfs_locks`; schema.ts:1581 re-grepped 2026-11-04, was :1484/:1294) — NOT a rename: the FN-13 §7.2 recorded timestamp-name family, member row `lfs_locks` (upstream `Created time.Time` renders bare `created`, lfs_lock.go:27 — §7.2 arm 3's "bare-`created` counterparts" clause) — record-not-rename, CLOSED (CENSUS3, 2026-11-04)
 - OURS-EXTRA `lower_path` — schema.ts:1483 (`lfs_locks.lowerPath`; re-grepped 2026-11-04, was :1293) — intentional-recorded (SPEC-0006 §2.7, migration 0045, LANDED 2026-10-30: D1 has no check-then-insert transaction, so the folded case-fold copy's UNIQUE `(repo_id, lower_path)` index turns the create race into a conflict → 409 with the existing lock echoed, wire-invisible)
 
 ### `repository` → `repositories` schema.ts:29
