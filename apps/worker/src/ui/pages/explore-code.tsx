@@ -205,33 +205,57 @@ function teamGrantCondition(userId: number): SQL {
   )`;
 }
 
-/** The seed's WHERE arms — `visibilityConditions(viewer, includePrivate:
- *  true)`'s three arms (module header: anonymous = public rows; signed-in
- *  non-admin = public ∪ own ∪ grants; admin = unfiltered, code.go:55-66) —
- *  with the public arm's owner-visibility half folded in (repo_list.go:
- *  380-384, S-FIXES' S2 condition, the same shape searchRepositories
- *  pushes): a public repo under a limited/private-visibility owner is
- *  invisible to every viewer who isn't the owner/admin — their own rows
- *  ride the owner arm, unaffected. */
+/** The seed's WHERE arms — `AccessibleRepositoryCondition`'s shape
+ * (repo_list.go:662-707; module header: anonymous = public rows; signed-in
+ *  non-admin = public ∪ own ∪ grants ∪ private-org-member publics; admin =
+ *  unfiltered, code.go:55-66). The public arm carries the owner-visibility
+ *  half (repo_list.go:651-658's userAllPublicRepoCond) with the SPLIT
+ *  limit: anonymous excludes [Private, Limited] owners (:667-669 appends
+ *  Limited when user == nil — S-FIXES' S2 / ae88762's anonymous arm);
+ *  signed-in excludes [Private] ONLY (:667-673 — LIMITED owners stay
+ *  visible to signed-in viewers, S-FIX2's service port found ae88762's
+ *  blanket exclusion made the code page NARROWER than the repos listing
+ *  for them). Arm 5 (:695, userOrgPublicRepoCond :330-339 — public repos
+ *  of orgs the doer belongs to) completes the signed-in OR so the seed
+ *  set stays row-equivalent with the repos listing. */
 function exploreCodeVisibilityConditions(doer: ExploreCodeDoer): SQL[] {
-  const publicPair = and(
-    eq(repositories.visibility, "public"),
-    sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN ('limited', 'private'))`,
-  );
+  const publicUnderVisibleOwner = (ownerVisibilityLimit: string) =>
+    and(
+      eq(repositories.visibility, "public"),
+      sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN (${sql.raw(ownerVisibilityLimit)}))`,
+    );
   if (doer.id === null) {
-    return [publicPair as SQL];
+    return [publicUnderVisibleOwner("'limited', 'private'") as SQL];
   }
   if (doer.isAdmin) {
     return [];
   }
   return [
     or(
-      publicPair,
+      publicUnderVisibleOwner("'private'"),
       eq(repositories.ownerNamespace, doer.usernameLower ?? ""),
       collaboratorGrantCondition(doer.id),
       teamGrantCondition(doer.id),
+      publicInPrivateOrgCondition(doer.id),
     ) as SQL,
   ];
+}
+
+/** Upstream arm 5 (`userOrgPublicRepoCond`, repo_list.go:330-339 via
+ * :695): a signed-in non-restricted doer sees PUBLIC repositories of orgs
+ * they belong to — upstream's bare shape adds every member org, but the
+ * public arm already covers non-private owners' publics under the
+ * [Private]-only signed-in limit, so the 'private'-org filter is
+ * row-equivalent; the api/services twin (publicInPrivateOrgCondition,
+ * S-FIX2's port) re-issued verbatim (the module's re-issue precedent). */
+function publicInPrivateOrgCondition(userId: number): SQL {
+  return sql`(${repositories.visibility} = 'public' AND EXISTS (
+    SELECT 1 FROM org_members om
+    JOIN users org ON org.id = om.org_id
+    WHERE om.user_id = ${userId}
+      AND om.org_id = ${repositories.ownerId}
+      AND org.type = 'org' AND org.visibility = 'private'
+  ))`;
 }
 
 /**

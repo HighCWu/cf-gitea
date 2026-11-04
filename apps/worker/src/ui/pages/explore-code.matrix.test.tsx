@@ -55,7 +55,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repoCollaborators, repositories, users } from "../../db/schema";
+import { orgMembers, repoCollaborators, repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
@@ -369,6 +369,40 @@ describe("the instance seed (SPEC-0019 §3.1 step 1's R02 arm)", () => {
       (seed) => seed.slug,
     );
     expect(adminSlugs).toEqual(["under-private-owner"]);
+  });
+
+  it("splits the owner-visibility limit by viewer and adds arm 5's private-org publics (repo_list.go:651-673/:695)", async () => {
+    // ae88762's blanket NOT IN (limited, private) rode BOTH viewer arms —
+    // upstream's signed-in limit is [Private] ONLY (:667-673), so the code
+    // page was NARROWER than the repos listing for limited owners (S-FIX2's
+    // find). And arm 5 (:695, userOrgPublicRepoCond :330-339) admits a
+    // signed-in org member's view of a PRIVATE org's publics. Both halves
+    // pinned here against the same fixtures:
+    const { ownerA, ownerB } = await seedOwners();
+    await drizzle(env.DB).update(users).set({ visibility: "limited" }).where(eq(users.usernameLower, "ecc-mate"));
+    await seedPaddingRepo(ownerB, "m-limited-pub");
+
+    // A PRIVATE org owning one public repo; ownerA is a member.
+    const orgRow = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "ecc-org", usernameLower: "ecc-org", type: "org", visibility: "private", createdAt: new Date() })
+      .returning({ id: users.id })
+      .get();
+    await seedPaddingRepo({ id: orgRow.id, usernameLower: "ecc-org" }, "org-public");
+    await drizzle(env.DB).insert(orgMembers).values({ orgId: orgRow.id, userId: ownerA.id, role: "member", createdAt: new Date() });
+
+    // ANONYMOUS: the limited owner's public AND the private org's public
+    // are both invisible ([Private, Limited] limit; no arm-5 membership).
+    const anonSlugs = (await loadExploreCodeSearchSeeds(env.DB, exploreCodeDoer(ANON_VIEWER))).map((seed) => seed.slug);
+    expect(anonSlugs).toEqual([]);
+
+    // SIGNED-IN non-admin (ownerA): the limited owner's public is VISIBLE
+    // (the [Private]-only limit) and arm 5 admits the private org's public
+    // through the org_members row.
+    const signedSlugs = (
+      await loadExploreCodeSearchSeeds(env.DB, { id: ownerA.id, isAdmin: false, usernameLower: ownerA.usernameLower })
+    ).map((seed) => seed.slug);
+    expect(signedSlugs).toEqual(["org-public", "m-limited-pub"]);
   });
 
   it("caps through the loader: 30 visible → 25 covered greps, overCap with the FULL count", async () => {
