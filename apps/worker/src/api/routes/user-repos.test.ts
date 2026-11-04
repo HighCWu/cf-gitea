@@ -335,3 +335,40 @@ describe("toCreatedOrgRepository (the shared 201 assembly)", () => {
     expect(body.description).toBe("");
   });
 });
+
+// ---------------------------------------------------------------------------
+// B-24 — the object_format_name refusal: the engine is sha1-only (SPEC-0001
+// §5), so a `sha256` create is REFUSED at the create service with upstream's
+// exact Error() text (services/repository/create.go:225 — upstream accepts
+// sha256 on a git ≥ 2.42 host; the honest arm here errors instead of
+// silently building sha1), mapped to the contract-declared 422. Junk values
+// die at the contract enum's bind.
+// ---------------------------------------------------------------------------
+
+describe("POST /user/repos object_format_name (B-24)", () => {
+  it("refuses sha256 with upstream's exact message text and creates no row", async () => {
+    await seedStubRow();
+    const res = await apiCreate({ name: "sha256-refused", object_format_name: "sha256" });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      message: "unsupported object format: sha256",
+      url: "https://example.com/api/swagger",
+    });
+    const rows = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+    expect(rows).toHaveLength(0);
+  });
+
+  it("admits sha1 explicitly and omits-without-error (the create default)", async () => {
+    await seedStubRow();
+    const explicit = await apiCreate({ name: "sha1-explicit", object_format_name: "sha1" });
+    expect(explicit.status).toBe(201);
+    const row = await drizzle(env.DB)
+      .select({ objectFormatName: repositories.objectFormatName })
+      .from(repositories)
+      .all();
+    expect(row).toHaveLength(1);
+    expect(row[0]?.objectFormatName).toBe("sha1");
+    const omitted = await apiCreate({ name: "sha1-omitted" });
+    expect(omitted.status).toBe(201);
+  });
+});

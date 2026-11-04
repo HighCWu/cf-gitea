@@ -209,7 +209,11 @@ export type SearchResults = z.infer<typeof searchResultsSchema>;
  * initial commit with the template scaffolding (`readme` 400-validated,
  * `gitignores`/`license` rendered from the inlined options/ catalogs —
  * services/user-repos.ts + services/repo-init-templates.ts), leaving
- * `issue_labels` the one accepted-and-ignored option.
+ * `issue_labels` the one accepted-and-ignored option. `object_format_name`
+ * is contract-honest since B-24: the enum's `sha256` member is REFUSED at
+ * the create service with upstream's exact text (the engine is sha1-only,
+ * SPEC-0001 §5 — the enum mirrors the frozen contract, not an engine
+ * capability).
  */
 export const createRepoOptionSchema = z.object({
   auto_init: z.boolean().optional().openapi({ description: "Whether the repository should be auto-initialized?" }),
@@ -262,11 +266,15 @@ export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;
  *    PullRequestsConfig, upstream updateRepoUnits repo.go:855-966) and
  *    `projects_mode` (the 'projects' row's ProjectsConfig, repo.go:968-989);
  *  - accepted-and-ignored (no store yet — SPEC-0005 sweep): `has_code`
- *    (needs the creation-seeded code unit row — see services/repo-settings.ts)
- *    and the mirror fields (`mirror_interval`, `enable_prune`,
- *    `mirror_username`/`mirror_password`/`mirror_token`);
- *  - the `external_tracker`/`external_wiki`/`internal_tracker` objects are
- *    accepted per shape and ignored the same way.
+ *    (needs the creation-seeded code unit row — see services/repo-settings.ts;
+ *    census B-32) and the `external_tracker`/`external_wiki`/
+ *    `internal_tracker` objects (upstream applies them WITH validation,
+ *    repo.go:761-835 — census B-33);
+ *  - applied since the mirror-settings wave (routes/repo.ts
+ *    updateMirrorSettings, repo.go:1023-1135): the five mirror fields
+ *    (`mirror_interval`, `enable_prune`, `mirror_username`/
+ *    `mirror_password`/`mirror_token`) — silently skipped for non-mirrors,
+ *    which is upstream's own posture (repo.go:1029-1033).
  */
 export const editRepoOptionSchema = z.object({
   allow_fast_forward_only_merge: z

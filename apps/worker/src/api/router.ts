@@ -6,6 +6,7 @@ import {
   createTokenAuthMiddleware,
   type AuthResolver,
 } from "./auth";
+import { requireSignInViewApiGate } from "./config";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
 import { apiScopeGate } from "./scope-gate";
@@ -117,6 +118,13 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // route's own reqToken / assignment gates own them), and the gate is a
   // no-op in standalone stub-resolver usage where resolveAuth never ran.
   app.use("*", apiScopeGate());
+
+  // The require-sign-in-view instance flag's API arm (SPEC-0003 §2.4 row 6,
+  // census B-34 — upstream mounts verifyAuthWithOptionsAPI's SignInRequired
+  // over the whole group, api.go:961 + :905-910): anonymous calls answer
+  // upstream's exact raw 403 {message} body. Off by default; a no-op when
+  // resolveAuth never ran (the scope-gate's standalone posture).
+  app.use("*", requireSignInViewApiGate());
 
   const requireAuth = createTokenAuthMiddleware(options.auth ?? createStubAuthResolver());
   const optionalAuth = createOptionalTokenAuthMiddleware(options.auth ?? createStubAuthResolver());

@@ -77,9 +77,13 @@ import { tombstoneRepoDO } from "../../repos/purge";
  *     exactly this flag, repo.go:349). Stored on the row beside
  *     `default_branch` (the same-request follow-up update — upstream sets
  *     it on the insert; RepoService.create seeds the default false).
- *   - `object_format_name` is accepted per contract and ignored (sha1 is the
- *     only engine object format — the create seed stores 'sha1'
- *     unconditionally).
+ *   - `object_format_name` is validated at the create service (B-24): sha1
+ *     is the only engine object format (SPEC-0001 §5), so `sha256` — which
+ *     upstream would create on a git ≥ 2.42 host (create.go:221-226) — is
+ *     REFUSED with upstream's exact Error() text, `unsupported object
+ *     format: sha256` (create.go:225), mapped to the contract-declared 422;
+ *     it is never accepted-and-silently-built-as-sha1. Junk values are
+ *     rejected at bind time by the contract enum.
  */
 
 /** Upstream `repo_module.Readmes` — the contents of options/readme/. */
@@ -254,6 +258,11 @@ export async function createUserRepository(
     // FN-4: `TrustModel: opts.TrustModel` (create.go:248 — ToTrustModel of
     // the form string). NULL stores the default model, upstream's 0.
     trustModel: form.trust_model === undefined || form.trust_model === "default" ? undefined : form.trust_model,
+    // FN-4/B-24: `ObjectFormatName: opts.ObjectFormatName` (create.go:224-226
+    // — the service validates against the supported set; sha1 is the only
+    // engine format, so `sha256` throws RepoObjectFormatUnsupportedError and
+    // the routes answer 422 instead of silently building sha1).
+    objectFormatName: form.object_format_name,
   });
 
   // Metadata the create call carries: default branch (upstream

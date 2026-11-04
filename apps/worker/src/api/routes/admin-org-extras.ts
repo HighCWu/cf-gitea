@@ -7,7 +7,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
 import { repositories } from "../../db/schema";
-import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
+import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError, RepoService } from "../../repos/service";
 import { tombstoneRepoDO } from "../../repos/purge";
 import { OrgService } from "../../services/orgs/orgs";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
@@ -194,12 +194,19 @@ export function registerAdminOrgExtrasRoutes(
         owner: { id: org.id, usernameLower: org.usernameLower },
         name: form.name,
         isPrivate: form.private === true,
+        objectFormatName: form.object_format_name,
       });
     } catch (error) {
       if (error instanceof RepoNameCollisionError) {
         throw new ApiError(409, "The repository with the same name already exists.");
       }
       if (error instanceof RepoNameInvalidError) {
+        throw new ApiError(422, error.message);
+      }
+      if (error instanceof RepoObjectFormatUnsupportedError) {
+        // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused
+        // with upstream's exact Error() text (create.go:225) under the
+        // contract-declared 422 (see user-repos.ts's mapping note).
         throw new ApiError(422, error.message);
       }
       throw error;

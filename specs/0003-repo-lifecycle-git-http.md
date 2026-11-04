@@ -152,7 +152,19 @@ private repo with public-only token → `404` at `:132`).
 
 Anonymous pull precondition (upstream `:130-146`): owner visibility must be **public**
 and repo **not private**, unless the instance sets require-sign-in-view, or the repo
-grants anonymous read on its code unit. Visibility model: repo is `is_private` bool;
+grants anonymous read on its code unit. LANDED (census B-34, 2026-11-04): the
+`REQUIRE_SIGNIN_VIEW` var (wrangler.jsonc(.example), strict polarity — only the exact
+string `"true"` arms; default off = upstream's app.ini default) gates BOTH anonymous
+arms inside `!requireSignInView` exactly like upstream's `!RequireSignInViewStrict`
+(githttp.go:132) — the git-http gate (`src/git-http/acl.ts`, the `decide`/`decideDeployKey`
+arms + the Basic-password arm's canAnonymousPull fold) answers the row-2 challenge for
+every anonymous pull under the flag; the API group answers upstream's raw 403
+`{"message": "Only signed in user is allowed to call APIs."}` (api.go:905-910, mounted
+api.go:961 — `requireSignInViewApiGate` in `src/api/router.ts`); the repo pages read the
+anonymous viewer as invisible via the shared gate (`src/ui/repo-view.ts` — the 404-shell
+posture, the recorded shape delta against upstream's RedirectForLogin login redirect).
+The packages arm (package.go:120, container) stays with the packages owner (census B-34
+disposition); no /explore surface is served, so that arm is N/A. Visibility model: repo is `is_private` bool;
 owner is public/limited/private (§2.5.6) — "internal" is owner-limited, not a separate
 repo state (upstream `modules/structs/visible_type.go:9-18`, `models/repo/repo.go:186`).
 
@@ -166,7 +178,7 @@ P = push `receive-pack`):
 | 3 | anonymous | any | P | `401` + challenge (push always needs identity) | `:149-160` |
 | 4 | anonymous unit-read granted | private repo | F | 200 | `:138-145`, test `:163-189` |
 | 5 | anonymous unit-read granted | private repo | P | `401` (unit read never grants write) | test `:184` |
-| 6 | any | require-sign-in-view instance | F | `401` (overrides #1/#4) | `:132`, test `:186-188` |
+| 6 | any | require-sign-in-view instance | F | `401` (overrides #1/#4) | `:132`, test `:186-188` — LANDED (B-34, 2026-11-04): the `REQUIRE_SIGNIN_VIEW` var + the `!requireSignInView` fold over both anonymous arms (`src/git-http/acl.ts`; gate.test.ts "row 6" suite, the flag-off controls pin rows 1/4 beside it) |
 | 7 | authenticated, token lacks `read:repository` / `write:repository` scope for the op | any | F/P | `403` | `:163-166` (CheckRepoScopedToken), test `:110-128` |
 | 8 | authenticated, valid scope, repo visible to them, **no write grant** (non-collaborator on public repo, read-only collaborator) | existing | P | `404` "Repository not found" (existence known, write capability hidden) | `:197-199` |
 | 9 | authenticated, valid scope, **no read grant** (private repo, not collaborator) | existing | F/P | `404` "Repository not found" | `:197-199`, test `:130-133` |

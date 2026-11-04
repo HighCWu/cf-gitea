@@ -3,7 +3,7 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
-import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
+import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
 import { assertDemoRepoQuota, DemoRepoQuotaError } from "../../services/demo-quota";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -218,6 +218,13 @@ export function registerUserReposRoutes(
       if (error instanceof RepoNameInvalidError) {
         // upstream 422s err.Error() for reserved/pattern violations; our
         // ported message text differs from Go's error strings
+        throw new ApiError(422, error.message);
+      }
+      if (error instanceof RepoObjectFormatUnsupportedError) {
+        // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused
+        // with upstream's exact Error() text (create.go:225) under the
+        // contract-declared 422 (upstream's own runtime arm for this class
+        // is the 500-internal family — the recorded B-24 divergence note).
         throw new ApiError(422, error.message);
       }
       throw error;

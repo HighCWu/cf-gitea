@@ -30,6 +30,7 @@
  */
 
 import { readGrant, resolveRepository } from "../git-http/acl";
+import { requireSignInViewEnabled } from "../api/config";
 import { viewerTeamAccessMode } from "../api/services/repository";
 import type { Viewer } from "./viewer";
 import type { RepoRow } from "./ui-context";
@@ -53,6 +54,14 @@ export async function resolveRepositoryForViewer(
   // viewer (§4.8; the gate answers its 403 shape on the git-HTTP side).
   if (resolved.owner === null || resolved.owner.status !== "active") return null;
   const doer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : null;
+  // require-sign-in-view (SPEC-0003 §2.4 row 6, census B-34): upstream's web
+  // group carries the flag through optSignIn → RedirectForLogin
+  // (web.go:354 + web.go:217-220); this tier's documented refusal posture is
+  // the 404 shell ("invisible repos 404, never a 401", §2.6), so the
+  // anonymous viewer reads the flagged instance as invisible — the recorded
+  // shape delta against upstream's login redirect. Signed-in viewers are
+  // untouched (upstream's SignInRequired arm never consults a doer).
+  if (doer === null && requireSignInViewEnabled(env)) return null;
   const grant = readGrant({
     repoVisibility: resolved.repo.visibility,
     owner: { id: resolved.owner.id, status: resolved.owner.status },

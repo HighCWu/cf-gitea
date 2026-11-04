@@ -30,6 +30,8 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
+import { labels, protectedBranches, repoTopics, repositories, webhooks } from "../../db/schema";
+import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { settleCreatingRepo } from "../../git-http/gate";
 import { replicateRepoCopy } from "../../repos/fork-task";
 import { RepoService } from "../../repos/service";
@@ -761,5 +763,266 @@ describe("generateRepo content copy (the shared fork machinery)", () => {
     if (carriedTag === undefined) throw new Error("unreachable");
     expect(carriedTag.peeled).toBe(commitOid);
     expect((await env.REPO.getByName("alice/fork-tag").readCommit(carriedTag.target))?.oid).toBe(commitOid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The six non-git_content copy arms (B-29, census 2026-11-04): every
+// GenerateRepoOption boolean now copies its unit — upstream order
+// template.go:131-178, each gated on its own boolean (template.go gates ONLY
+// the git-content arm on git_content × emptiness, :133). The units seed via
+// their landed stores directly (the join/rows/R2 objects); the generate call
+// rides the same standalone router the guard matrix uses. git_content stays
+// FALSE in this block, so the assertions also pin upstream's birth flag
+// (`IsEmpty: !opts.GitContent || templateRepo.IsEmpty` — a copy-armed,
+// content-less generate lands EMPTY).
+// ---------------------------------------------------------------------------
+
+/** Seed the unit rows + R2 objects on `templateId` and return the expectation
+ *  table the assertions compare against (verbatim copies, upstream's field
+ *  lists: labels WITHOUT the archived flag, webhooks WITHOUT name/status). */
+async function seedAllUnits(templateId: string): Promise<{ avatarSourceKey: string }> {
+  const avatarSourceKey = `r_${templateId}`;
+  // topics — the join rows + the render column (the FN-4 shape the writer
+  // maintains; the copy reads the JOIN — repo-topics.ts's source of truth).
+  await env.DB.prepare("INSERT INTO repo_topics (repo_id, topic) VALUES (?, 'alpha'), (?, 'beta')")
+    .bind(templateId, templateId)
+    .run();
+  await drizzle(env.DB)
+    .update(repositories)
+    .set({ topics: JSON.stringify(["alpha", "beta"]) })
+    .where(eq(repositories.id, templateId));
+  // labels — one archived (the flag must NOT carry: upstream's field list,
+  // template.go:35-42) and one plain scoped pair.
+  await drizzle(env.DB).insert(labels).values([
+    { repoId: templateId, name: "archived-one", exclusive: false, exclusiveOrder: 0, description: "d1", color: "#aa0000", archivedAt: new Date() },
+    { repoId: templateId, name: "scope/one", exclusive: true, exclusiveOrder: 3, description: "d2", color: "#00bb00" },
+  ]);
+  // protected branches — one rule, priority 4, the canonical config JSON.
+  await drizzle(env.DB).insert(protectedBranches).values({
+    repoId: templateId,
+    ruleName: "release/*",
+    priority: 4,
+    rules: serializeRuleConfig(emptyRuleConfig()),
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+  // webhooks — the events blob + secret copied verbatim.
+  await drizzle(env.DB).insert(webhooks).values({
+    repoId: templateId,
+    ownerId: 42,
+    url: "https://hooks.example.com/gen",
+    httpMethod: "POST",
+    contentType: 1,
+    secret: "s3cret",
+    events: JSON.stringify({ push: { active: true } }),
+    isActive: true,
+    type: "gitea",
+    meta: "",
+  });
+  // git hook — the route's persisted-edit layout (routes/git-hooks.ts).
+  await env.REPO_PACKS.put(`githooks/${templateId}/pre-receive`, "#!/bin/sh\necho generated-copy-probe\n");
+  // repo avatar — the services/avatars.ts key layout.
+  await env.REPO_PACKS.put(`avatars/${avatarSourceKey}`, new Uint8Array([1, 2, 3]));
+  return { avatarSourceKey };
+}
+
+describe("generateRepo copy arms (B-29 — the six non-git_content units)", () => {
+  const CLEANUP_TABLES = ["labels", "protected_branches", "webhooks", "repo_topics"];
+
+  beforeEach(async () => {
+    for (const table of CLEANUP_TABLES) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+  });
+
+  it("copies every selected unit (topics, git hooks, webhooks, avatar, labels, protected branches)", async () => {
+    const { aliceId } = await seedIdentities();
+    await createTemplate("arm-all");
+    const template = await new RepoService(env.DB).getBySlug("alice", "arm-all");
+    if (template === null) throw new Error("template seed missing");
+    await seedAllUnits(template.id);
+
+    const response = await router()(
+      "/api/v1/repos/alice/arm-all/generate",
+      aliceAuth({
+        method: "POST",
+        body: JSON.stringify({
+          owner: "alice",
+          name: "arm-all-copy",
+          topics: true,
+          git_hooks: true,
+          webhooks: true,
+          avatar: true,
+          labels: true,
+          protected_branch: true,
+        }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    const generated = await new RepoService(env.DB).getBySlug("alice", "arm-all-copy");
+    if (generated === null) throw new Error("generated row missing");
+    // Upstream's birth flag: git_content=false → the generated repo lands
+    // EMPTY even though the template had content classes seeded elsewhere.
+    expect(generated.isEmpty).toBe(true);
+    expect(generated.status).toBe("ready");
+
+    // topics — the join rows AND the render column (upstream's
+    // GenerateTopics + syncTopicsInRepository tail). The template's own rows
+    // live in the same tables, so every store assertion scopes the
+    // generated repo's id.
+    const topics = await drizzle(env.DB)
+      .select({ topic: repoTopics.topic })
+      .from(repoTopics)
+      .where(eq(repoTopics.repoId, generated.id))
+      .all();
+    expect(topics.map((t) => t.topic).sort()).toEqual(["alpha", "beta"]);
+    const renderRow = await drizzle(env.DB)
+      .select({ topics: repositories.topics })
+      .from(repositories)
+      .where(eq(repositories.id, generated.id))
+      .get();
+    // The render column carries the writer's ASC-sorted JSON (upstream's
+    // syncTopicsInRepository Find-order) — assert the literal bytes.
+    expect(renderRow?.topics).toBe('["alpha","beta"]');
+
+    // labels — the five upstream columns; the archived flag did NOT carry.
+    const copied = await drizzle(env.DB)
+      .select({
+        name: labels.name,
+        exclusive: labels.exclusive,
+        exclusiveOrder: labels.exclusiveOrder,
+        description: labels.description,
+        color: labels.color,
+        archivedAt: labels.archivedAt,
+      })
+      .from(labels)
+      .where(eq(labels.repoId, generated.id))
+      .all();
+    const byName = Object.fromEntries(copied.map((l) => [l.name, l]));
+    expect(byName["scope/one"]).toMatchObject({ exclusive: true, exclusiveOrder: 3, description: "d2", color: "#00bb00", archivedAt: null });
+    expect(byName["archived-one"]).toMatchObject({ archivedAt: null });
+    // The TEMPLATE's archived row keeps its flag (the copy never mutates the
+    // template).
+    const templateLabel = await drizzle(env.DB)
+      .select({ archivedAt: labels.archivedAt })
+      .from(labels)
+      .where(eq(labels.repoId, template.id))
+      .all();
+    expect(templateLabel).toHaveLength(2);
+    expect(templateLabel.filter((l) => l.archivedAt !== null)).toHaveLength(1);
+
+    // protected branches — name, priority and the config JSON verbatim.
+    const rules = await drizzle(env.DB)
+      .select({ ruleName: protectedBranches.ruleName, priority: protectedBranches.priority, rules: protectedBranches.rules })
+      .from(protectedBranches)
+      .where(eq(protectedBranches.repoId, generated.id))
+      .all();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ ruleName: "release/*", priority: 4 });
+
+    // webhooks — upstream's exact field list.
+    const hooks = await drizzle(env.DB)
+      .select({ url: webhooks.url, secret: webhooks.secret, events: webhooks.events, isActive: webhooks.isActive, ownerId: webhooks.ownerId })
+      .from(webhooks)
+      .where(eq(webhooks.repoId, generated.id))
+      .all();
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0]).toMatchObject({
+      url: "https://hooks.example.com/gen",
+      secret: "s3cret",
+      events: JSON.stringify({ push: { active: true } }),
+      isActive: true,
+      ownerId: 42,
+    });
+
+    // git hooks — the persisted edit moved to the generated repo's key.
+    const hook = await env.REPO_PACKS.get(`githooks/${generated.id}/pre-receive`);
+    expect(hook).not.toBeNull();
+    expect(await hook!.text()).toBe("#!/bin/sh\necho generated-copy-probe\n");
+
+    // avatar — the copy landed under the generated repo's own storage key.
+    const avatar = await env.REPO_PACKS.get(`avatars/${generated.storageKey}`);
+    expect(avatar).not.toBeNull();
+
+    void aliceId;
+  });
+
+  it("gates each unit on its OWN boolean (topics=true copies topics and nothing else)", async () => {
+    await seedIdentities();
+    await createTemplate("arm-solo");
+    const template = await new RepoService(env.DB).getBySlug("alice", "arm-solo");
+    if (template === null) throw new Error("template seed missing");
+    await seedAllUnits(template.id);
+
+    const response = await router()(
+      "/api/v1/repos/alice/arm-solo/generate",
+      aliceAuth({
+        method: "POST",
+        body: JSON.stringify({ owner: "alice", name: "arm-solo-copy", topics: true }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    const generated = await new RepoService(env.DB).getBySlug("alice", "arm-solo-copy");
+    if (generated === null) throw new Error("generated row missing");
+
+    const topics = await drizzle(env.DB)
+      .select({ topic: repoTopics.topic })
+      .from(repoTopics)
+      .where(eq(repoTopics.repoId, generated.id))
+      .all();
+    expect(topics.map((t) => t.topic).sort()).toEqual(["alpha", "beta"]);
+    const forGenerated = (table: typeof labels | typeof protectedBranches | typeof webhooks) =>
+      drizzle(env.DB)
+        .select({ id: table.id })
+        .from(table)
+        .where(eq(table.repoId, generated.id))
+        .all();
+    expect(await forGenerated(labels)).toHaveLength(0);
+    expect(await forGenerated(protectedBranches)).toHaveLength(0);
+    expect(await forGenerated(webhooks)).toHaveLength(0);
+    // The template's own seeded rows are untouched (2 labels, 1 rule, 1 hook).
+    expect(
+      await drizzle(env.DB).select({ id: labels.id }).from(labels).where(eq(labels.repoId, template.id)).all(),
+    ).toHaveLength(2);
+    expect(
+      await drizzle(env.DB)
+        .select({ id: protectedBranches.id })
+        .from(protectedBranches)
+        .where(eq(protectedBranches.repoId, template.id))
+        .all(),
+    ).toHaveLength(1);
+    expect(await env.REPO_PACKS.get(`githooks/${generated.id}/pre-receive`)).toBeNull();
+    expect(await env.REPO_PACKS.get(`avatars/${generated.storageKey}`)).toBeNull();
+  });
+
+  it("avatar=true on a template WITHOUT an avatar is a silent no-op (upstream's len(Avatar) > 0 gate)", async () => {
+    await seedIdentities();
+    await createTemplate("arm-noavatar");
+    const response = await router()(
+      "/api/v1/repos/alice/arm-noavatar/generate",
+      aliceAuth({
+        method: "POST",
+        body: JSON.stringify({ owner: "alice", name: "arm-noavatar-copy", avatar: true }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    const generated = await new RepoService(env.DB).getBySlug("alice", "arm-noavatar-copy");
+    if (generated === null) throw new Error("generated row missing");
+    expect(await env.REPO_PACKS.get(`avatars/${generated.storageKey}`)).toBeNull();
+  });
+
+  it("labels=true with an EMPTY template label set inserts nothing (upstream's empty-slice guard)", async () => {
+    await seedIdentities();
+    await createTemplate("arm-nolabels");
+    const response = await router()(
+      "/api/v1/repos/alice/arm-nolabels/generate",
+      aliceAuth({
+        method: "POST",
+        body: JSON.stringify({ owner: "alice", name: "arm-nolabels-copy", labels: true }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    expect(await drizzle(env.DB).select({ id: labels.id }).from(labels).all()).toHaveLength(0);
   });
 });

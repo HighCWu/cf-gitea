@@ -15,7 +15,7 @@ import {
   userRedirects,
   users,
 } from "../../db/schema";
-import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
+import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
 import { enqueueRegisterNotifyMail } from "../../services/mail/register-notify";
@@ -1159,6 +1159,12 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
         throw new ApiError(409, "The repository with the same name already exists.");
       }
       if (error instanceof RepoNameInvalidError) {
+        throw new ApiError(422, error.message);
+      }
+      if (error instanceof RepoObjectFormatUnsupportedError) {
+        // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused
+        // with upstream's exact Error() text (create.go:225) under the
+        // contract-declared 422 (see user-repos.ts's mapping note).
         throw new ApiError(422, error.message);
       }
       throw error;

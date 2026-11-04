@@ -58,6 +58,19 @@
     // actor IRIs that answer 501 "Not implemented" — discovery-only, by
     // upstream's own posture.
     "FEDERATION_ENABLED": "false",
+    // SPEC-0003 §2.4 row 6 (census B-34) — the require-sign-in-view instance
+    // flag ([service] REQUIRE_SIGNIN_VIEW → Service.RequireSignInViewStrict,
+    // modules/setting/service.go:43,170). Strict polarity, the DEMO_MODE
+    // class: ONLY the exact string "true" arms it; absent/anything else
+    // stays anonymous-readable (upstream's own default: the app.ini setting
+    // is false). Armed, it refuses EVERY anonymous read: git-HTTP pulls 401
+    // even on public repos and unit-grants (routers/web/repo/githttp.go:132,
+    // test git_smart_http_test.go:186-188), API calls 403 {"message": "Only
+    // signed in user is allowed to call APIs."} (api.go:905-910 mounted at
+    // :961), and repo pages read as invisible to anonymous viewers (upstream
+    // redirects to login at web.go:354; ours answers the 404-shell posture —
+    // the recorded shape delta). Signed-in callers are never consulted.
+    "REQUIRE_SIGNIN_VIEW": "false",
     // SPEC-0014 §2 — the demo-operations gate. ONLY the exact string "true"
     // arms the demo sweep (hourly cron producer → {kind:"demo-sweep"} → the
     // existing delete cascade); absent/anything else stays OFF (fail-closed,

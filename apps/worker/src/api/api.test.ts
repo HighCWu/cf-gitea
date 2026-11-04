@@ -6,7 +6,7 @@ import {
   extractTokenHeader,
   STUB_USER,
 } from "./auth";
-import { SERVER_VERSION } from "./config";
+import { requireSignInViewApiGate, SERVER_VERSION } from "./config";
 import type { ApiEnv } from "./env";
 import { userSchema } from "./models/user";
 import {
@@ -155,5 +155,62 @@ describe("setPaginationHeaders", () => {
 
     expect(res.headers.get("X-Total-Count")).toBe("0");
     expect(res.headers.get("Link")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The require-sign-in-view instance flag's API arm (SPEC-0003 §2.4 row 6,
+// census B-34): upstream mounts verifyAuthWithOptionsAPI's SignInRequired
+// over the whole API group (routers/api/v1/api.go:961 + :905-910) — anonymous
+// calls answer the RAW {"message": "Only signed in user is allowed to call
+// APIs."} 403 (a map literal, NO url member). The middleware is driven here
+// on a probe app with the auth context the worker-level resolveAuth sets,
+// so the armed/off × anonymous/signed × standalone matrix is deterministic
+// without flipping the deployed var (wrangler.jsonc default "false").
+// ---------------------------------------------------------------------------
+
+describe("require-sign-in-view API gate (upstream api.go:905-910)", () => {
+  const ANONYMOUS_AUTH = { user: null, token: null, scope: null, isBasicAuth: false };
+  const SIGNED_AUTH = { user: { id: 7, username: "alice" }, token: null, scope: null, isBasicAuth: false };
+
+  /** A minimal app that mirrors the production chain shape: an auth-context
+   *  writer (resolveAuth's stand-in), then the gate, then a probe route. */
+  function probeApp(auth: unknown): Hono<ApiEnv> {
+    const app = new Hono<ApiEnv>();
+    app.use("*", async (c, next) => {
+      if (auth !== undefined) c.set("auth", auth as ApiEnv["Variables"]["auth"]);
+      await next();
+    });
+    app.use("*", requireSignInViewApiGate());
+    app.get("/probe", (c) => c.json({ ok: true }));
+    return app;
+  }
+
+  const request = (app: Hono<ApiEnv>, env: Record<string, string>) =>
+    app.request("https://example.com/probe", undefined, env);
+
+  it("flag off: anonymous passes (upstream's default posture, the deployed var default)", async () => {
+    const res = await request(probeApp(ANONYMOUS_AUTH), { REQUIRE_SIGNIN_VIEW: "false" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
+  it("flag on: an anonymous call answers upstream's exact RAW 403 body — no url member", async () => {
+    const res = await request(probeApp(ANONYMOUS_AUTH), { REQUIRE_SIGNIN_VIEW: "true" });
+    expect(res.status).toBe(403);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body).toEqual({ message: "Only signed in user is allowed to call APIs." });
+    expect("url" in body).toBe(false);
+  });
+
+  it("flag on: a resolved doer passes untouched (SignInRequired never consults a signed-in ctx)", async () => {
+    const res = await request(probeApp(SIGNED_AUTH), { REQUIRE_SIGNIN_VIEW: "true" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
+  it("no auth context (standalone router usage): the gate is the scope-gate's no-op", async () => {
+    const res = await request(probeApp(undefined), { REQUIRE_SIGNIN_VIEW: "true" });
+    expect(res.status).toBe(200);
   });
 });

@@ -227,6 +227,22 @@ export class OwnerNotAssignableError extends Error {
   }
 }
 
+/**
+ * The create asked for an object format the storage engine cannot serve
+ * (upstream: create.go:221-226 admits {sha1, sha256} and the failure class
+ * is a plain `unsupported object format: %s` error; the engine here is
+ * sha1-only — SPEC-0001 §5 — so `sha256`, which upstream WOULD create on a
+ * git ≥ 2.42 host, is refused instead of silently built as sha1). The
+ * message text is upstream's Error() string verbatim (create.go:225); the
+ * API layer maps it to the contract-declared 422 validationError.
+ */
+export class RepoObjectFormatUnsupportedError extends Error {
+  constructor(public readonly objectFormatName: string) {
+    super(`unsupported object format: ${objectFormatName}`);
+    this.name = "RepoObjectFormatUnsupportedError";
+  }
+}
+
 export class NotAuthorizedError extends Error {
   constructor(messageText = "not authorized") {
     super(messageText);
@@ -338,6 +354,14 @@ export interface CreateRepoInput {
    *  "api" (every current call site is an API route or the git push-create
    *  settle); the downstream audit wave threads the real per-request origin. */
   origin?: AuditOrigin;
+  /** Upstream `opts.ObjectFormatName` (create.go:221-226): empty/absent
+   *  defaults to sha1; anything but sha1 throws
+   *  RepoObjectFormatUnsupportedError. Upstream admits sha256 too (and
+   *  creates real sha256 repos on a git ≥ 2.42 host); our engine is
+   *  sha1-only (SPEC-0001 §5), so the request is REFUSED — never silently
+   *  built as sha1. Callers that don't surface the field (forks, generate —
+   *  which inherits the template's row, always sha1 — migrate) omit it. */
+  objectFormatName?: string;
 }
 
 /** The creation kinds that select a default-units posture (see
@@ -404,6 +428,14 @@ export class RepoService {
    */
   async create(input: CreateRepoInput): Promise<RepoRow> {
     if (!isUsableRepoName(input.name)) throw new RepoNameInvalidError(input.name);
+    // Upstream's object-format validation (create.go:221-226) at the same
+    // service seam: empty defaults to sha1 (create.go:221-223), a named
+    // format must be sha1 (the engine's only format — SPEC-0001 §5; upstream
+    // additionally admits sha256 and errors with the SAME message text for
+    // anything else).
+    if (input.objectFormatName !== undefined && input.objectFormatName !== "" && input.objectFormatName !== "sha1") {
+      throw new RepoObjectFormatUnsupportedError(input.objectFormatName);
+    }
     const lower = input.name.toLowerCase();
     const id = crypto.randomUUID();
     const createdAt = new Date();
@@ -433,7 +465,9 @@ export class RepoService {
           refsVersion: 0,
           // FN-4: the engine is sha1-only (SPEC-0001 §5) — the upstream
           // create validates ObjectFormatName against the supported set
-          // (create.go:224-226) and ours admits exactly 'sha1'.
+          // (create.go:224-226) and ours admits exactly 'sha1' (the guard
+          // above refuses any named non-sha1 format; a sha256 request never
+          // silently lands as sha1).
           objectFormatName: "sha1",
           // FN-4: `IsFsckEnabled: !opts.IsMirror` (create.go:242) — mirrors
           // (creationKind "mirror", the SPEC-0009 migrate arm) are created
