@@ -53,10 +53,13 @@ import type { User } from "./models/user";
 // 26.64s of the 30s default IN a green 8-worker full run (the fork-head merge
 // arms — and it fired the stochastic one-file-per-run timeout class under load,
 // 2026-10-26). The suite's 260-isolate spawn storm spikes closures up to ~12x
-// their solo time; these file-local 90s budgets restore headroom while
+// their solo time; these file-local budgets restore headroom while
 // vitest.config.ts keeps 30s for every other file. Membership: the measured
-// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
-vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27). Widened
+// 90s -> 180s on 2026-11-04: the fork-head delete_branch arms blew 90s in
+// BOTH gate rounds under desktop load (load avg ~9 on the 32-core box) while
+// passing solo — the budget's job is hang detection, not speed enforcement.
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 180_000 });
 
 const ORIGIN = "https://apisuite.test";
 const TOKEN = "pull-engine-token";
