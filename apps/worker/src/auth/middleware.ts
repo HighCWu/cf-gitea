@@ -24,8 +24,12 @@ import { users } from "../db/schema";
 import type { AuthEnv, AuthInfo, AuthToken, AuthUser } from "./auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "./httpauth";
 import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./failure-limiter";
-import { requiredScopeNames, type ScopeCategory, ScopeSet, type ScopeLevel } from "./scopes";
+import { requiredScopeNames, type ScopeCategory, ScopeSet, type ScopeLevel, SCOPE_ALL } from "./scopes";
 import { TokenService } from "./token-service";
+import { authUserFromRow, userSignInPassword } from "./password-auth";
+import { getTwoFactorByUid, validateAndConsumeTotp } from "./two-factor";
+import { hasCredentialsForUser } from "../web/webauthn-store";
+import { AuditActions, emitAudit } from "../services/audit";
 import { oauth2FeatureEnabled, resolveOAuth2AccessTokenCredential, type ResolvedOAuth2Credential } from "../services/oauth2/token";
 
 /** Message used for every bad/expired/revoked credential (api.go:862–875). */
@@ -189,6 +193,80 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
     const verified: { token: AuthToken; user: AuthUser } | null =
       oauth2Resolved !== null ? oauth2CredentialAuth(oauth2Resolved) : await service.verify(credential, { now });
     if (verified === null) {
+      // THE BASIC PASSWORD ARM (SPEC-0002 §6.2 API-Basic row; upstream
+      // services/auth/basic.go:135-146): the token arms missed, the
+      // credential arrived via HTTP Basic, and EnableBasicAuth holds
+      // (default TRUE, service.go:179 — no knob until Phase C) → the full
+      // password sign-in with the raw (username, password) pair. The arm
+      // fails CLOSED into the same generic 401 (basic.go:142-146 →
+      // api.go:862-869's "invalid username, password or token") except the
+      // WebAuthn hard-reject, whose message IS the wire body
+      // (ErrUserAuthMessage → api.go:866-868).
+      if (parsed?.basicAuth !== undefined && parsed?.basicAuth !== null) {
+        const outcome = await basicPasswordArm(
+          c.env.DB,
+          parsed.basicAuth,
+          c.req.header("X-Gitea-OTP") ?? "",
+          now,
+        );
+        if (outcome.kind === "webauthn-enrolled") {
+          // Upstream logs nothing extra here; the message is ErrUserAuthMessage's.
+          await limiterRecordFailureFailOpen(limiter, ip, now);
+          return apiErrorResponse(c, 401, "basic authorization is not allowed while WebAuthn enrolled");
+        }
+        if (outcome.kind === "ok") {
+          const auth: AuthInfo = {
+            user: authUserFromRow(outcome.user),
+            // A password-Basic doer holds NO token row (upstream
+            // GetDoerTokenScope misses the ExtDoerData arm and
+            // GetAccessScope answers AccessTokenScopeAll via the
+            // LoginMethod check, basic.go:189-197) — the synthetic row
+            // carries `all` so the scope gate renders it identically.
+            token: {
+              id: -1,
+              userId: outcome.user.id,
+              name: "basic-password",
+              prefix: "",
+              scopes: SCOPE_ALL,
+              expiresAt: null,
+              lastUsedAt: null,
+              createdAt: now,
+            },
+            scope: ScopeSet.parseLenient(SCOPE_ALL),
+            isBasicAuth: true,
+          };
+          c.set("auth", auth);
+          // No last_used touch (the PAT path only, as below) + the limiter
+          // reset (the house semantics on every verified-credential arm).
+          await runBackground(c, limiterResetFailOpen(limiter, ip));
+          await next();
+          return;
+        }
+        // The generic failure class (password wrong/unset, user unknown,
+        // unsupported-hash — the controlled cause logged, SPEC §6.3-3).
+        if (outcome.kind === "unsupported-hash") {
+          console.error(`basic-auth: ${outcome.message}`);
+        }
+        if (outcome.kind === "totp-fail") {
+          // basic.go:182's audit row rides the generic 401 (the
+          // "invalid provided OTP" text stays OFF the wire — api.go:867's
+          // generic fallback swallows every non-ErrUserAuthMessage error).
+          void emitAudit(drizzle(c.env.DB), {
+            action: AuditActions.UserAuthenticationFailTwoFactor,
+            actorId: outcome.userId,
+            actorName: outcome.username,
+            actorCredential: null,
+            scopeType: "user",
+            scopeId: outcome.userId,
+            scopeName: outcome.username,
+            origin: "api",
+            ipAddress: ip,
+            vars: { scope: outcome.username },
+          }).catch((error: unknown) => {
+            console.error(`basic-auth: audit row failed: ${String(error)}`);
+          });
+        }
+      }
       // The 401 must not depend on the limiter backend's health.
       await limiterRecordFailureFailOpen(limiter, ip, now);
       return apiErrorResponse(c, 401, INVALID_CREDENTIAL_MESSAGE);
@@ -282,6 +360,64 @@ function runBackground(c: Context<AuthEnv>, promise: Promise<void>): Promise<voi
   } catch {
     return promise;
   }
+}
+
+// --- the Basic password arm ---------------------------------------------------
+
+/**
+ * The outcome taxonomy of the API Basic password attempt. `failed` and
+ * `unsupported-hash` (whose message goes to the log, never the wire) render
+ * the generic 401; `webauthn-enrolled` carries the wire message;
+ * `totp-fail` carries the audit-row coordinates (basic.go:182) and renders
+ * the generic 401.
+ */
+export type BasicPasswordOutcome =
+  | { kind: "ok"; user: typeof users.$inferSelect }
+  | { kind: "webauthn-enrolled" }
+  | { kind: "totp-fail"; userId: number; username: string }
+  | { kind: "unsupported-hash"; message: string }
+  | { kind: "failed" };
+
+/**
+ * basic.go:139-161 — UserSignIn(uname, passwd) then the 2FA ladder:
+ * WebAuthn-enrolled hard-rejects (the ErrUserAuthMessage body), a
+ * TOTP-enrolled user must present `X-Gitea-OTP` and the passcode is
+ * ATOMICALLY CONSUMED (a captured OTP cannot replay within its window).
+ * Failures here are upstream's generic auth-error class, except the
+ * WebAuthn reject. Context-free (db + the OTP passcode as parameters) so
+ * the git-HTTP arm reuses it outside a Hono context (git-http/acl.ts).
+ */
+export async function basicPasswordArm(
+  db: D1Database,
+  basic: { username: string; password: string },
+  otpPasscode: string,
+  now: Date,
+): Promise<BasicPasswordOutcome> {
+  const signIn = await userSignInPassword(db, basic.username, basic.password);
+  if (!signIn.ok) {
+    if (signIn.failure.kind === "unsupported-hash") {
+      return { kind: "unsupported-hash", message: signIn.failure.error.message };
+    }
+    return { kind: "failed" };
+  }
+  const user = signIn.user;
+
+  // basic.go:148-156 — WebAuthn-enrolled → hard reject.
+  if (await hasCredentialsForUser(db, user.id)) {
+    return { kind: "webauthn-enrolled" };
+  }
+
+  // basic.go:158-160 + validateTOTP (:169-187) — TOTP-enrolled → the
+  // X-Gitea-OTP passcode, consumed atomically.
+  const twofa = await getTwoFactorByUid(db, user.id);
+  if (twofa !== null) {
+    const ok = await validateAndConsumeTotp(db, twofa, otpPasscode, { now });
+    if (!ok) {
+      return { kind: "totp-fail", userId: user.id, username: user.username };
+    }
+  }
+
+  return { kind: "ok", user };
 }
 
 // --- post-auth route middlewares ---------------------------------------------
