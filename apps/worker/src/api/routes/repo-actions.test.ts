@@ -213,6 +213,47 @@ const EMPTY_COMMIT: SeedCommit = {
   files: [{ path: "README.md", content: "# empty\n" }],
 };
 
+/**
+ * The seeds' DETERMINISTIC trigger-run census (the D-8 count-exact drain —
+ * the recorded fix for the flake class the settle-moat barrier only out-
+ * waited, commit 5c2bd1f). The seeds' REAL pushes ride the engine's onPush
+ * seam (6cdc698): each receive fires one `handleActionsPushEvent` in
+ * waitUntil AFTER the receive answers, over its applied updates; every
+ * created branch/tag update fires a "create" AND a "push" event, and the
+ * create events match nothing (no fixture declares `on: create`). The rows
+ * below are the full, empirically-verified census of the runs those events
+ * insert (verified row-by-row stable across repeated solo runs):
+ *
+ *   - actions-suite's ONE receive carries two updates (refs/heads/main +
+ *     refs/tags/v1): the branch update matches ci.yml + notify.yml (`on:
+ *     push`, no filters), the tag update re-matches both at the tag's tree —
+ *     4 rows.
+ *   - actions-fallback's branch update matches deploy.yml (.github/workflows
+ *     fallback) — 1 row.
+ *   - actions-empty has no workflow files — 0 rows.
+ *   - scoped-source's `.gitea/scoped_workflows` is not a WORKFLOW_DIR
+ *     (.gitea/workflows / .github/workflows) — 0 rows.
+ *
+ * broken.yml is the parse-fail arm (logged and skipped, never a run); the
+ * invalid-workflow failed-run arm inserts 0 (its static-violation map is
+ * empty for these fixtures). Each run carries exactly one attempt and one
+ * job (single-job fixtures, no matrix), so attempts and jobs carry the same
+ * bound as runs — and the jobs insert is the last write the trigger makes
+ * into the run-family tables, so all three bounds together certify the
+ * inserts are complete before the single wipe.
+ *
+ * A fixture change that adds/removes a trigger workflow MUST update this
+ * table — an over-count fails the barrier loudly on purpose (a divergent
+ * trigger is a product change worth knowing about, not a race to absorb).
+ */
+const SEED_TRIGGER_RUNS: Array<{ repo: string; workflow: string; ref: string; n: number }> = [
+  { repo: "actions-suite", workflow: "ci.yml", ref: "refs/heads/main", n: 1 },
+  { repo: "actions-suite", workflow: "notify.yml", ref: "refs/heads/main", n: 1 },
+  { repo: "actions-suite", workflow: "ci.yml", ref: "refs/tags/v1", n: 1 },
+  { repo: "actions-suite", workflow: "notify.yml", ref: "refs/tags/v1", n: 1 },
+  { repo: "actions-fallback", workflow: "deploy.yml", ref: "refs/heads/main", n: 1 },
+];
+
 const OWNER = "alice";
 
 let ALICE_ID = 0;
@@ -234,6 +275,20 @@ beforeAll(async () => {
   }
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
   await applyAuthD1Migrations();
+
+  // The pre-push census (SEED_TRIGGER_RUNS's runtime half): a repo
+  // contributes its trigger rows only when its engine cell is fresh — HEAD
+  // absent is exactly ensureSeededRepo's own push condition, so evaluating
+  // it BEFORE any seed predicts which receives (and their waitUntil trigger
+  // inserts) this execution produces. A re-execution against a seeded D1
+  // (the D-8 double-execution posture) pushes nothing, expects nothing, and
+  // rides straight to the defensive wipe.
+  const pushingSlugs = new Set<string>();
+  for (const slug of ["actions-suite", "actions-fallback", "actions-empty", "scoped-source"]) {
+    if ((await env.REPO.getByName(`${OWNER}/${slug}`).listRefs()).head === null) {
+      pushingSlugs.add(slug);
+    }
+  }
 
   const seeded = await ensureSeededRepo({ owner: OWNER, slug: "actions-suite", commits: SUITE_COMMITS, tags: [{ name: "v1", commitIndex: 1 }] });
   TIP_MAIN = seeded.tips[1] as string;
@@ -285,13 +340,11 @@ beforeAll(async () => {
   await scopedWorkflowSourcesStore(env.DB).addSource(0, SOURCE_REPO_ID);
 
   // The M3 trigger wiring (6cdc698) rides the engine's onPush seam — fired
-  // in waitUntil AFTER the receive answers — so the seeds' REAL pushes above
-  // insert trigger runs of their own (ci.yml / notify.yml / deploy.yml all
-  // declare `on: push`), possibly a beat AFTER the push returns. The run
-  // family and the run_index counters wipe so the suites below start from
-  // the empty-run posture their fixtures were written against (they seed
-  // their own runs); the wipe loops until a pass stays empty across a settle
-  // window, so a late waitUntil insert cannot survive it.
+  // in waitUntil AFTER each receive answers — so the seeds' REAL pushes above
+  // insert trigger runs of their own (the SEED_TRIGGER_RUNS census), a beat
+  // AFTER the push returns. The run family and the run_index counters wipe
+  // so the suites below start from the empty-run posture their fixtures were
+  // written against (they seed their own runs).
   const wipeRunFamily = async (): Promise<number> => {
     for (const table of ["action_run_job_summaries", "action_run_attempts", "action_run_jobs", "action_runs", "repo_counters"]) {
       await env.DB.prepare(`DELETE FROM ${table}`).run();
@@ -299,24 +352,88 @@ beforeAll(async () => {
     const left = await env.DB.prepare("SELECT count(*) AS n FROM action_runs").first<{ n: number }>();
     return left?.n ?? 0;
   };
-  // The settle barrier (the v1.5.3 gate rounds' hardening, widened
-  // 2026-11-04): the tight 20-attempt loop raced a consumer insert that
-  // landed between its last wipe and the first describe (observed R2/R3
-  // under full-suite load — total_count 1 in the zero-run test), and the
-  // two-consecutive-clean window was itself beaten under desktop load
-  // (2026-11-04's gate rounds: a straggler onPush insert landed >500ms
-  // after the pushes returned, cascading UNIQUE collisions through the
-  // runs-listing describe). SIX consecutive clean passes at 300ms space a
-  // ~1.8s stable moat; the count-exact drain (await the deterministic
-  // trigger-run count, then wipe once) is the recorded proper fix.
-  let consecutiveClean = 0;
-  for (let attempt = 0; attempt < 20 && consecutiveClean < 6; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const left = await wipeRunFamily();
-    consecutiveClean = left === 0 ? consecutiveClean + 1 : 0;
+  // The count-exact drain (the D-8 flake class's recorded fix, replacing the
+  // settle-moat race of commit 5c2bd1f): WAIT for the seeds' trigger inserts
+  // to complete — the waitUntil chains cannot insert a row past their
+  // accounted bound — then wipe ONCE. The old barrier instead wiped in a
+  // loop and hoped no insert landed after the last pass; under load a
+  // straggler landed between the barrier and the first describe (the
+  // 2026-11-04 gate rounds) and cascaded UNIQUE collisions through the
+  // runs-listing describe. Load-immunity here is BY CONSTRUCTION: the
+  // census table above fixes exactly what the triggers produce, the drain
+  // never proceeds until every accounted insert has landed (plus one
+  // tripwire sample so a count that GREW past the bound between polls fails
+  // loudly instead of skipping over equality), and the census SHAPE is
+  // asserted too — a compensating divergence (one workflow dropped, another
+  // doubled) carries the same total but not the same rows.
+  const expectedRuns = SEED_TRIGGER_RUNS.filter((row) => pushingSlugs.has(row.repo)).reduce((sum, row) => sum + row.n, 0);
+  // Single attempt and single job per census row (attempt 1, no matrix).
+  const expectedAttempts = expectedRuns;
+  const expectedJobs = expectedRuns;
+  if (expectedRuns > 0) {
+    const countOf = async (table: string): Promise<number> =>
+      (await env.DB.prepare(`SELECT count(*) AS n FROM ${table}`).first<{ n: number }>())?.n ?? 0;
+    const DRAIN_ATTEMPTS = 40; // 40 × 250ms = 10s arrival budget (hookTimeout is 30s)
+    const DRAIN_INTERVAL_MS = 250;
+    let lastRuns = -1;
+    let lastAttempts = -1;
+    let lastJobs = -1;
+    let settled = false;
+    for (let attempt = 0; attempt < DRAIN_ATTEMPTS && !settled; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, DRAIN_INTERVAL_MS));
+      lastRuns = await countOf("action_runs");
+      lastAttempts = await countOf("action_run_attempts");
+      lastJobs = await countOf("action_run_jobs");
+      if (lastRuns !== expectedRuns || lastAttempts !== expectedAttempts || lastJobs !== expectedJobs) continue;
+      // The tripwire: the counts are monotonic during arrival (nothing
+      // deletes mid-drain), so equality here means every accounted insert
+      // landed — one sample later they must STILL equal the bound, else the
+      // trigger produced more than the census accounts for.
+      await new Promise((resolve) => setTimeout(resolve, DRAIN_INTERVAL_MS));
+      lastRuns = await countOf("action_runs");
+      lastAttempts = await countOf("action_run_attempts");
+      lastJobs = await countOf("action_run_jobs");
+      settled = lastRuns === expectedRuns && lastAttempts === expectedAttempts && lastJobs === expectedJobs;
+    }
+    if (!settled) {
+      throw new Error(
+        `the seeds' trigger runs never settled to the deterministic bound: expected ` +
+          `runs=${expectedRuns} attempts=${expectedAttempts} jobs=${expectedJobs}, last saw ` +
+          `runs=${lastRuns} attempts=${lastAttempts} jobs=${lastJobs} — an over-count is a trigger ` +
+          `divergence (a fixture/workflow change must update SEED_TRIGGER_RUNS), an under-count ` +
+          `means a trigger insert never landed`,
+      );
+    }
+    // The census SHAPE: repo × workflow × ref equality with the expected
+    // rows (the failure message carries both sides verbatim).
+    const observed = await env.DB
+      .prepare(
+        "SELECT e2.slug AS repo, r.workflow_id AS workflow, r.ref AS ref, count(*) AS n " +
+          "FROM action_runs r JOIN repositories e2 ON e2.id = r.repo_id " +
+          "GROUP BY r.repo_id, r.workflow_id, r.ref ORDER BY repo, workflow, ref",
+      )
+      .all<{ repo: string; workflow: string; ref: string; n: number }>();
+    const renderCensus = (rows: Array<{ repo: string; workflow: string; ref: string; n: number }>): string =>
+      rows
+        .map((row) => `${row.repo}/${row.workflow}@${row.ref}×${row.n}`)
+        .sort()
+        .join(", ");
+    const expectedCensus = renderCensus(SEED_TRIGGER_RUNS.filter((row) => pushingSlugs.has(row.repo)));
+    const observedCensus = renderCensus(observed.results);
+    if (observedCensus !== expectedCensus) {
+      throw new Error(
+        `the seeds' trigger census diverged from the recorded bound — expected [${expectedCensus}], observed [${observedCensus}]`,
+      );
+    }
   }
-  if (consecutiveClean < 6) {
-    throw new Error("the seeds' trigger runs never settled — the run-family wipe did not converge");
+  // Every accounted insert has landed (or none was expected): the single
+  // wipe hands the describes their empty-run posture, and it must hold.
+  const wipedRuns = await wipeRunFamily();
+  if (wipedRuns !== 0) {
+    throw new Error(
+      `the run-family wipe left ${wipedRuns} action_runs behind — ` +
+        `the describes' empty-run posture is not guaranteed`,
+    );
   }
 });
 
