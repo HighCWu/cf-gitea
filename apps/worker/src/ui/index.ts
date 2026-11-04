@@ -722,7 +722,15 @@ import { renderServerErrorShellResponse } from "./not-found-response";
 import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
-import { clearSessionSetCookie, lookupValidSession, sameOriginGuard, sessionCookieValue } from "./session";
+import {
+  clearSessionSetCookie,
+  lookupValidSession,
+  MUST_CHANGE_PASSWORD_PATH,
+  mustChangePasswordArm,
+  sameOriginGuard,
+  sessionCookieValue,
+  userMustChangePassword,
+} from "./session";
 import { blobRedirectResponse, fetchActionRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
 import {
   loadReleaseDownload,
@@ -1333,7 +1341,8 @@ import {
   parseUserSettingsAccountPasswordForm,
   renderUserSettingsAccountPage,
 } from "./pages/user-settings-account";
-import { changeOwnPassword } from "../services/user-accounts";
+import { applyPasswordReset, changeOwnPassword } from "../services/user-accounts";
+import { renderMustChangePasswordPage } from "./pages/change-password";
 import {
   applyUserSettingsNotificationsActionsForm,
   applyUserSettingsNotificationsEmailForm,
@@ -3862,6 +3871,10 @@ export interface UserSettingsTabRoute {
     | "user-settings-oauth2-delete"
     | "user-settings-oauth2-revoke"
     | "user-settings-account"
+    // GET+POST /user/settings/change_password (web.go:637-638 — the
+    // MUST-CHANGE password page, password.go:267-327; the PWD-4 enforcement
+    // half's web arm — pages/change-password.tsx).
+    | "user-settings-change-password"
     | "user-settings-account-email"
     | "user-settings-account-email-delete"
     | "user-settings-account-delete"
@@ -4533,6 +4546,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // The account tab (navbar.tmpl:7-11; upstream EmailPost/DeleteEmail/
     // DeleteAccount over the landed email + PAT stores).
     if (tail.length === 1 && tail[0] === "account") return { family: "user-settings-account", id: null };
+    // The MUST-CHANGE password page (web.go:637-638's literal pair —
+    // password.go:267-327; GET renders, POST applies).
+    if (tail.length === 1 && tail[0] === "change_password") {
+      return { family: "user-settings-change-password", id: null };
+    }
     if (tail.length === 2 && tail[0] === "account" && tail[1] === "email") {
       return { family: "user-settings-account-email", id: null };
     }
@@ -7177,6 +7195,28 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
     // (the dashboard matrix's RED).
     setCookie = resolution.setCookie;
     viewer = resolution.viewer;
+    // THE MUST-CHANGE GATE (web.go:197-206 — the PWD-4 enforcement half):
+    // upstream's verifyAuthWithOptionsWeb runs tree-wide BEFORE any page
+    // handler, so a flagged session's EVERY page answers the gate — the
+    // 303 onto /user/settings/change_password (or the git-UA 401,
+    // web.go:199-201) — with the carved-out change page passing through to
+    // its own handlers. Impersonated sessions never gate
+    // (routers/common/auth.go:71's isImpersonated carve-out — the admin
+    // behind the session browses freely). The flag read is one PK probe
+    // (userMustChangePassword — session.ts's ownership-shape note: the
+    // Viewer projection cannot carry it without touching viewer.ts); the
+    // §2.4 rotation directive (a FULL §2.7 string here) rides the gate
+    // response so a pending rotation is never lost to the redirect — the
+    // loginPage comment's forced-logout rule.
+    if (
+      viewer.kind === "user" &&
+      url.pathname !== MUST_CHANGE_PASSWORD_PATH &&
+      (viewer.impersonatorUserId ?? null) === null
+    ) {
+      const flagged = await userMustChangePassword(c.env.DB, viewer.id);
+      const arm = mustChangePasswordArm(c.req.raw, flagged, setCookie ?? undefined);
+      if (arm !== null) return { ok: false, response: arm };
+    }
     // The wave-10 navbar bell's unread count (head_navbar_icons.tmpl's
     // `.notification_count`): the derived-thread COUNT per signed-in request
     // — the same one-query cost upstream's PageGlobalData carries
@@ -11583,6 +11623,62 @@ async function userSettingsAccountPasswordSubmit(c: Context<{ Bindings: Env }>):
   const data = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
   if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
   return p.respond(c.html(renderUserSettingsAccountPage(p.ctx, data, outcome.message)));
+}
+
+// --- the MUST-CHANGE password page (pages/change-password.tsx — upstream
+// MustChangePassword/MustChangePasswordPost, routers/web/auth/password.go:
+// 267-327 over web.go:637-638; SPEC-0002 §6.3, the PWD-4 enforcement half's
+// web arm) ---------------------------------------------------------------
+
+/**
+ * GET /user/settings/change_password — the forced-change form. The gate
+ * itself lives in resolveUiSession (this exact path is the carve-out, so
+ * the request reaches HERE); the page's own arms are web.go:206-210's
+ * else-if: a signed-in user who does NOT need the change is redirected to
+ * "/" ("make sure that the form cannot be accessed by users who don't need
+ * this"), anonymous falls to the prologue's login round-trip (the
+ * reqSignIn group's RedirectForLogin).
+ */
+async function userSettingsChangePasswordPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  if (!(await userMustChangePassword(c.env.DB, p.viewer.id))) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
+  }
+  return p.respond(c.html(renderMustChangePasswordPage({ ctx: p.ctx, error: null }), 200));
+}
+
+/**
+ * POST /user/settings/change_password — MustChangePasswordPost
+ * (password.go:277-327): the NeedChangePassword guard, the retype check,
+ * then the SHARED UpdateAuth arm (applyPasswordReset — password.go:298-301's
+ * `MustChangePassword: optional.Some(false)`; NO old-password field — the
+ * live session is the credential). Success lands on "/" (redirectAfterAuth's
+ * default target — the template carries no redirect_to field); failures
+ * re-render the form at 200 with the message (the RenderWithErrDeprecated
+ * arms). A user whose flag cleared between render and submit re-answers
+ * through the middleware-equivalent layer and gets web.go:206-210's 303 "/"
+ * — upstream's handler-level NotFound arm (password.go:286-290) sits BEHIND
+ * its own middleware there, unreachable in normal routing; the observable
+ * answer at this layer is the redirect.
+ */
+async function userSettingsChangePasswordSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  if (!(await userMustChangePassword(c.env.DB, p.viewer.id))) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
+  }
+  const params = await readUrlEncodedForm(c.req.raw);
+  const outcome = await applyPasswordReset(
+    c.env.DB,
+    p.viewer.id,
+    params.get("password") ?? "",
+    params.get("retype") ?? "",
+  );
+  if (outcome.outcome === "changed") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
+  }
+  return p.respond(c.html(renderMustChangePasswordPage({ ctx: p.ctx, error: outcome.message }), 200));
 }
 
 /** POST /user/settings/account/email (upstream EmailPost's arms): the write
@@ -17774,7 +17870,12 @@ async function ownerPackageSettingsSubmit(c: Context<{ Bindings: Env }>): Promis
     return respond(new Response(null, { status: 303, headers: { location: packageSettingsLink(ownerNameOf(owner), pkg.type, pkg.name) } }));
   }
   if (form.action === "delete") {
-    const outcome = await applyPackageSettingsDelete(c.env.DB, pkg, form.packageName);
+    // The deleted arm rides the settings POST (user/package.go:487 —
+    // RemovePackage, one event per version descriptor; anonymous is gated
+    // above, so viewer is the signed-in doer).
+    const emit =
+      viewer.kind === "user" ? { webhookEnv: c.env, doerId: viewer.id } : undefined;
+    const outcome = await applyPackageSettingsDelete(c.env.DB, pkg, form.packageName, emit);
     if (outcome === "ok") {
       return respond(new Response(null, { status: 303, headers: { location: `/${ownerNameOf(owner)}/-/packages` } }));
     }
@@ -17809,7 +17910,14 @@ async function ownerPackageVersionDelete(c: Context<{ Bindings: Env }>): Promise
   if (pkg === null) return respond(c.html(renderNotFound(ctx), 404));
   const versionRow = await getVersionByNameAndVersion(c.env.DB, packagesOwnerIdOf(owner), pkg.type, pkg.name, route.version ?? "");
   if (versionRow === null) return respond(c.html(renderNotFound(ctx), 404));
-  await deletePackageVersionGuarded(c.env.DB, pkg, versionRow);
+  // The deleted arm rides the version-delete POST (user/package.go:510 —
+  // RemovePackageVersion notifies ALWAYS).
+  await deletePackageVersionGuarded(
+    c.env.DB,
+    pkg,
+    versionRow,
+    viewer.kind === "user" ? { webhookEnv: c.env, doerId: viewer.id } : undefined,
+  );
   const location = await resolveVersionDeleteRedirect(c.env.DB, ownerNameOf(owner), pkg);
   return respond(new Response(null, { status: 303, headers: { location } }));
 }
@@ -19287,6 +19395,11 @@ uiRouter.post("/user/settings/account", (c) => userSettingsAccountPasswordSubmit
 uiRouter.post("/user/settings/account/email", (c) => userSettingsAccountEmailSubmit(c));
 uiRouter.post("/user/settings/account/email/delete", (c) => userSettingsAccountEmailDelete(c));
 uiRouter.post("/user/settings/account/delete", (c) => userSettingsAccountDelete(c));
+// The MUST-CHANGE password pair (web.go:637-638's literal GET+POST group —
+// pages/change-password.tsx; the resolveUiSession gate carves THIS path out
+// of the tree-wide redirect so both arms are reachable).
+uiRouter.get("/user/settings/change_password", (c) => userSettingsChangePasswordPage(c));
+uiRouter.post("/user/settings/change_password", (c) => userSettingsChangePasswordSubmit(c));
 // The notifications tab (navbar.tmpl:12-16 — the GET page + the two
 // preference POSTs).
 uiRouter.get("/user/settings/notifications", (c) => userSettingsNotificationsPage(c));

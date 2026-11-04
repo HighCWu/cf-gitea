@@ -46,6 +46,7 @@ import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../../auth/ht
 import { userRedirectDoesNotExist } from "../../auth/middleware";
 import { ScopeSet } from "../../auth/scopes";
 import { TokenService } from "../../auth/token-service";
+import { requireSignInViewEnabled } from "../config";
 import { findUserByName, type UserRow } from "../services/repository";
 import { pathEscape } from "../services/releases";
 import {
@@ -62,6 +63,7 @@ import {
   searchVersions,
   PropertyType,
   deletePackageVersionAndReferences,
+  type PackageRow,
 } from "../../services/packages/model";
 import {
   buildDebianRepositoryKey,
@@ -118,6 +120,11 @@ import {
 import { getPackageProperties } from "../../services/packages/protocol-common";
 import { PackageSizeMismatchError, PackageBlobTooLargeError, packageBlobContentKey } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
+import {
+  emitPackageDeleted,
+  resolvePackageEventAllVersions,
+  resolvePackageEventDescriptor,
+} from "../../services/packages/webhooks";
 import { serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
 import {
   PypiFormError,
@@ -557,8 +564,14 @@ function packagesDisabled(env: Env): boolean {
   return !packagesQuotaFromEnv(env).packagesEnabled;
 }
 
+/** `env` carries the require-sign-in-view flag into
+ *  determinePackageAccessMode's strict arm (package.go:120 — upstream's
+ *  check lives in the same determineAccessMode the gate consumes). The
+ *  `required: "none"` callers (the nuget service-index trio, the swift
+ *  login pair) never reach the gate — upstream's carve-outs keep their
+ *  anonymous access under the flag too. */
 async function protocolAccessGate(
-  d1: D1Database,
+  env: Env,
   required: "read" | "write",
   owner: UserRow,
   cred: ResolvedCredential,
@@ -566,8 +579,9 @@ async function protocolAccessGate(
   if (cred.scope !== null && !cred.scope.has(`${required}:package`)) {
     packageAccessChallenge();
   }
-  const mode: PackageAccessMode = await determinePackageAccessMode(d1, owner, cred.doer, {
+  const mode: PackageAccessMode = await determinePackageAccessMode(env.DB, owner, cred.doer, {
     ownerVisibleToDoer: ownerVisibleToDoer(owner, cred),
+    strictSignInView: requireSignInViewEnabled(env),
   });
   if (!accessModeAtLeast(mode, required)) {
     packageAccessChallenge();
@@ -599,7 +613,7 @@ async function protocolContext(
     if (ownerBlindToPublicOnly(owner, cred)) {
       throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(owner.username)) });
     }
-    await protocolAccessGate(c.env.DB, required, owner, cred);
+    await protocolAccessGate(c.env, required, owner, cred);
   }
   return { owner, cred };
 }
@@ -1191,7 +1205,17 @@ quota: packagesQuotaFromEnv(c.env),
   // DeletePackage (nuget.go:675-698) — the group-level /{id}/{version} shape.
   app.delete("/:username/nuget/:id/:version", async (c) => {
     try {
-      const { owner } = await protocolContext(c, "write", { apiKeyHeader: true });
+      const { owner, cred } = await protocolContext(c, "write", { apiKeyHeader: true });
+      // The deleted arm (nuget.go:679 → RemovePackageVersionByNameAndVersion →
+      // RemovePackageVersion, packages.go:532 — notifies ALWAYS): the
+      // descriptor resolves BEFORE the version row dies.
+      const descriptor = await resolvePackageEventDescriptor(
+        c.env.DB,
+        owner.id,
+        "nuget",
+        c.req.param("id") ?? "",
+        c.req.param("version") ?? "",
+      );
       const removed = await removeNugetVersion(
         c.env.DB,
         owner,
@@ -1199,6 +1223,9 @@ quota: packagesQuotaFromEnv(c.env),
         c.req.param("version") ?? "",
       );
       if (!removed) return nugetApiError(404, "package does not exist");
+      if (descriptor !== null) {
+        await emitPackageDeleted(c.env, [descriptor], cred.doer?.id ?? 0);
+      }
       return new Response(null, { status: 204 });
     } catch (error) {
       return nugetErrorResponse(error);
@@ -1640,6 +1667,8 @@ quota: packagesQuotaFromEnv(c.env),
       if (doer === null) {
         return debianPlain(401, "user should have specific permission or be a site admin");
       }
+      // The deleted arm rides the service fold (debian.go:297's pd != nil
+      // gate — the emission is cascade-gated INSIDE the service).
       const deleted = await deleteDebianPackageFile(
         c.env.DB,
         c.env.REPO_PACKS,
@@ -1649,6 +1678,8 @@ quota: packagesQuotaFromEnv(c.env),
         c.req.param("name") ?? "",
         c.req.param("version") ?? "",
         c.req.param("architecture") ?? "",
+        undefined,
+        { webhookEnv: c.env, doerId: doer.id },
       );
       if (!deleted) return debianPlain(404, "package file does not exist");
       return new Response(null, { status: 204 });
@@ -1761,6 +1792,9 @@ quota: packagesQuotaFromEnv(c.env),
       if (doer === null) {
         return debianPlain(401, "user should have specific permission or be a site admin");
       }
+      // The deleted arm rides the service fold (alpine.go:269 →
+      // RemovePackageFileAndVersionIfUnreferenced's pd != nil gate — the
+      // emission is cascade-gated INSIDE the service).
       const deleted = await deleteAlpinePackageFile(
         c.env.DB,
         c.env.REPO_PACKS,
@@ -1769,6 +1803,8 @@ quota: packagesQuotaFromEnv(c.env),
         c.req.param("repository") ?? "",
         c.req.param("architecture") ?? "",
         c.req.param("filename") ?? "",
+        undefined,
+        { webhookEnv: c.env, doerId: doer.id },
       );
       if (!deleted) return debianPlain(404, "package file does not exist");
       return new Response(null, { status: 204 });
@@ -1920,6 +1956,8 @@ quota: packagesQuotaFromEnv(c.env),
           if (doer === null) {
             return rpmPlain(401, "user should have specific permission or be a site admin");
           }
+          // The deleted arm rides the service fold (rpm.go:319's pd != nil
+          // gate — the emission is cascade-gated INSIDE the service).
           const deleted = await deleteRpmPackageFile(
             c.env.DB,
             c.env.REPO_PACKS,
@@ -1928,6 +1966,8 @@ quota: packagesQuotaFromEnv(c.env),
             target.name ?? "",
             target.version ?? "",
             target.architecture ?? "",
+            undefined,
+            { webhookEnv: c.env, doerId: doer.id },
           );
           if (!deleted) return rpmPlain(404, "package file does not exist");
           return new Response(null, { status: 204 });
@@ -2067,6 +2107,9 @@ quota: packagesQuotaFromEnv(c.env),
       if (doer === null) {
         return debianPlain(401, "user should have specific permission or be a site admin");
       }
+      // The deleted arm rides the service fold (arch.go:290 →
+      // RemovePackageFileAndVersionIfUnreferenced's pd != nil gate — the
+      // emission is cascade-gated INSIDE the service).
       const deleted = await deleteArchPackageVersion(
         c.env.DB,
         c.env.REPO_PACKS,
@@ -2075,6 +2118,8 @@ quota: packagesQuotaFromEnv(c.env),
         target.architecture,
         target.name,
         target.version,
+        undefined,
+        { webhookEnv: c.env, doerId: doer.id },
       );
       if (!deleted.ok) {
         // The version miss carries upstream's not-exist sentinel body; the
@@ -2175,10 +2220,17 @@ quota: packagesQuotaFromEnv(c.env),
     try {
       const { owner } = await protocolContext(c, "read");
       const origin = new URL(c.req.url).origin;
-      return new Response(JSON.stringify(buildCargoRegistryConfig(owner, origin)), {
-        status: 200,
-        headers: { "content-type": "application/json;charset=utf-8" },
-      });
+      // RepositoryConfig (cargo.go:53) — the auth-required fold is
+      // `RequireSignInViewStrict || !public`, evaluated per request (the
+      // mirror FILE bakes the flag in at initialize/rebuild time,
+      // index.go:250 — the write-side callers thread it separately).
+      return new Response(
+        JSON.stringify(buildCargoRegistryConfig(owner, origin, { strictSignInView: requireSignInViewEnabled(c.env) })),
+        {
+          status: 200,
+          headers: { "content-type": "application/json;charset=utf-8" },
+        },
+      );
     } catch (error) {
       return cargoErrorResponse(error);
     }
@@ -3488,13 +3540,32 @@ async function npmDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
         // (a filename-only search, NO download-counter bump) + RemovePackageVersion.
         const found = await findNpmVersionForFilename(c.env.DB, owner, target.name, target.filename ?? "");
         if (found === null) return npmErrorResponse(404, "");
+        // The deleted arm (npm.go:344 — RemovePackageVersion notifies
+        // ALWAYS, packages.go:532): the descriptor resolves BEFORE the
+        // version row dies, the emission rides after the delete.
+        const descriptor = await resolvePackageEventDescriptor(
+          c.env.DB,
+          owner.id,
+          "npm",
+          target.name,
+          found.version,
+        );
         await removeNpmVersion(c.env.DB, found.id);
+        if (descriptor !== null) {
+          await emitPackageDeleted(c.env, [descriptor], cred.doer?.id ?? 0);
+        }
         return new Response(null, { status: 200 });
       }
       case "delete-package": {
-        // npm unpublish of the whole package (npm.go:352-375).
+        // npm unpublish of the whole package (npm.go:352-375): RemovePackageVersion
+        // PER VERSION (the :368 loop) — one event per version, all rendered
+        // from the pre-delete state.
+        const descriptors = await resolvePackageEventAllVersions(c.env.DB, owner.id, "npm", target.name);
         const removed = await removeNpmPackage(c.env.DB, owner, target.name);
         if (!removed) return npmErrorResponse(404, "");
+        if (descriptors.length > 0) {
+          await emitPackageDeleted(c.env, descriptors, cred.doer?.id ?? 0);
+        }
         return new Response(null, { status: 200 });
       }
       case "delete-preview":
@@ -3619,11 +3690,21 @@ function ociErrorResponse(error: OciNamedError, wwwAuthenticate?: string[]): Res
 
 /** APIUnauthorizedError (container.go:116-130): the Bearer realm (the origin
  *  root — no sub-path to strip) + the Basic twin when the owner exists and is
- *  non-public. */
-function containerUnauthorizedResponse(origin: string, owner: UserRow | null): Response {
+ *  non-public OR the require-sign-in-view flag is armed — upstream's fold is
+ *  `requireSignIn := owner != nil && owner.Visibility != public;
+ *  requireSignIn = requireSignIn || RequireSignInViewStrict` (container.go:
+ *  122-127: the twin rides the flag even with no path owner to resolve, the
+ *  /v2 root and /token posture). */
+function containerUnauthorizedResponse(
+  origin: string,
+  owner: UserRow | null,
+  strictSignInView = false,
+): Response {
   const challenges = [
     `Bearer realm="${origin}/v2/token",service="container_registry",scope="*"`,
-    ...(owner !== null && owner.visibility !== "public" ? ['Basic realm="Gitea Container Registry"'] : []),
+    ...(strictSignInView || (owner !== null && owner.visibility !== "public")
+      ? ['Basic realm="Gitea Container Registry"']
+      : []),
   ];
   return ociErrorResponse(OCI_UNAUTHORIZED, challenges);
 }
@@ -3722,7 +3803,22 @@ async function containerOwnerContext(
     // for the challenge (container.go:121-128) — a private owner's path
     // adds the Basic realm twin even on an auth-layer failure.
     const challengeOwner = await resolveOwnerRow(c.env.DB, containerUsername(c));
-    throw new ContainerGateResponse(containerUnauthorizedResponse(origin, challengeOwner));
+    throw new ContainerGateResponse(
+      containerUnauthorizedResponse(origin, challengeOwner, requireSignInViewEnabled(c.env)),
+    );
+  }
+  // ReqContainerAccess (container.go:133-137) — upstream's group middleware
+  // runs BEFORE the owner assignment (api.go:537), refusing `doer == nil`
+  // always and `strict && doer.IsGhost()` under the require-sign-in-view
+  // flag with the OCI envelope. Flag-off, the token-less anonymous caller
+  // keeps the LANDED posture (the anonymous ladder through
+  // protocolAccessGate below — the private-owner arm answers the shared
+  // Gitea-Package-API challenge, pinned by the container battery); under
+  // the flag both anonymous and ghost classes answer the OCI envelope +
+  // Basic twin here, upstream's exact shape for the flag-on instance.
+  if (requireSignInViewEnabled(c.env) && (cred.kind === "anonymous" || cred.kind === "ghost")) {
+    const challengeOwner = await resolveOwnerRow(c.env.DB, containerUsername(c));
+    throw new ContainerGateResponse(containerUnauthorizedResponse(origin, challengeOwner, true));
   }
   const username = containerUsername(c);
   const owner = await resolveOwnerRow(c.env.DB, username);
@@ -3736,7 +3832,7 @@ async function containerOwnerContext(
     throw new ContainerGateResponse(plainResponse(404, userRedirectDoesNotExist(owner.username)));
   }
   try {
-    await protocolAccessGate(c.env.DB, required, owner, resolved);
+    await protocolAccessGate(c.env, required, owner, resolved);
   } catch (error) {
     // The shared gate throws the families' HTTPException challenge — carry
     // its prepared response (upstream reqPackageAccess's 401, api.go:51-61).
@@ -3889,12 +3985,14 @@ async function containerDispatch(c: Context<{ Bindings: Env }>): Promise<Respons
 // The individual arms — thin over services/packages/container.ts.
 
 /** DetermineSupport (container.go:148-150) behind ReqContainerAccess
- *  (:133-137). */
+ *  (:133-137) — the refusal is `doer == nil || (RequireSignInViewStrict &&
+ *  doer.IsGhost())` (:135): anonymous always, a ghost bearer too when the
+ *  require-sign-in-view flag is armed. */
 async function containerPing(c: Context<{ Bindings: Env }>): Promise<Response> {
   const origin = new URL(c.req.url).origin;
   const cred = await resolveContainerCredential(c.env.DB, c.req.raw);
-  if (cred === null || cred.kind === "anonymous") {
-    return containerUnauthorizedResponse(origin, null);
+  if (cred === null || cred.kind === "anonymous" || (requireSignInViewEnabled(c.env) && cred.kind === "ghost")) {
+    return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
   }
   return containerResponse(200, null);
 }
@@ -3906,25 +4004,30 @@ async function containerToken(c: Context<{ Bindings: Env }>): Promise<Response> 
   const d1 = c.env.DB;
   const cred = await resolveContainerCredential(d1, c.req.raw);
   if (cred === null) {
-    return containerUnauthorizedResponse(origin, null);
+    return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
   }
   if (cred.kind === "user") {
     const scope = cred.scope;
     // container.go:165-176 — HasAnyScope(read:package, write:package, all).
     if (scope === null || !scope.hasAny("read:package", "write:package", "all")) {
-      return containerUnauthorizedResponse(origin, null);
+      return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
     }
     const token = await mintContainerToken(d1, cred.doer.id, verifiedScopeString(cred));
     return containerResponse(200, JSON.stringify({ token }), { contentType: "application/json" });
   }
   if (cred.kind === "anonymous") {
-    // container.go:157-163 — the ghost token (no RequireSignInViewStrict).
+    // container.go:156-159 — anonymous + RequireSignInViewStrict refuses
+    // BEFORE the ghost mint (the flag arm); only the flag-off posture mints
+    // the ghost token (:157-163).
+    if (requireSignInViewEnabled(c.env)) {
+      return containerUnauthorizedResponse(origin, null, true);
+    }
     const token = await mintContainerToken(d1, CONTAINER_GHOST_USER_ID, "");
     return containerResponse(200, JSON.stringify({ token }), { contentType: "application/json" });
   }
   // A ghost/invalid bearer at /token: upstream's ghost doer carries no
   // scope → the HasAnyScope gate 401s (container.go:165-176).
-  return containerUnauthorizedResponse(origin, null);
+  return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
 }
 
 /** The mint-time scope string (the PAT's normalized scope — upstream's
@@ -3938,12 +4041,14 @@ function containerTokenPost(): Response {
   return containerResponse(404, null);
 }
 
-/** GetRepositoryList (container.go:201-231) — the catalog. */
+/** GetRepositoryList (container.go:201-231) — the catalog, behind
+ *  ReqContainerAccess (:133-137): anonymous always refused; a ghost bearer
+ *  too when the require-sign-in-view flag is armed. */
 async function containerCatalog(c: Context<{ Bindings: Env }>): Promise<Response> {
   const origin = new URL(c.req.url).origin;
   const cred = await resolveContainerCredential(c.env.DB, c.req.raw);
-  if (cred === null || cred.kind === "anonymous") {
-    return containerUnauthorizedResponse(origin, null);
+  if (cred === null || cred.kind === "anonymous" || (requireSignInViewEnabled(c.env) && cred.kind === "ghost")) {
+    return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
   }
   let n = 100;
   const rawN = c.req.query("n");
@@ -4280,7 +4385,7 @@ async function containerGetOrHeadManifest(c: Context<{ Bindings: Env }>, method:
 
 /** DeleteManifest (container.go:678-704). */
 async function containerDeleteManifest(c: Context<{ Bindings: Env }>, image: string, reference: string): Promise<Response> {
-  const { owner } = await containerOwnerContext(c, "write");
+  const { owner, doer } = await containerOwnerContext(c, "write");
   const search = containerManifestSearchReference(reference);
   if (search === null) {
     return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
@@ -4296,8 +4401,23 @@ async function containerDeleteManifest(c: Context<{ Bindings: Env }>, image: str
   if (versions.length === 0) {
     return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
   }
+  // The deleted arm (container.go:697 — RemovePackageVersion PER VERSION,
+  // the DeleteManifest loop over GetManifestVersions): one event per
+  // version, all rendered from the pre-delete state. A token-authed delete
+  // without a user principal has no upstream doer either — the fan-out's
+  // missing-doer skip arm covers it.
+  let descriptors: { pkg: PackageRow; version: (typeof versions)[number] }[] = [];
+  if (doer !== null) {
+    const pkg = await getPackageByName(c.env.DB, owner.id, "container", image);
+    if (pkg !== null) {
+      descriptors = versions.map((version) => ({ pkg, version }));
+    }
+  }
   for (const version of versions) {
     await deletePackageVersionAndReferences(c.env.DB, version.id);
+  }
+  if (descriptors.length > 0) {
+    await emitPackageDeleted(c.env, descriptors, doer?.id ?? 0);
   }
   return containerResponse(202, null);
 }
@@ -4618,6 +4738,17 @@ async function rubygemsYank(c: Context<{ Bindings: Env }>): Promise<Response> {
     for (const [key, value] of form.entries()) {
       if (typeof value === "string") params.append(key, value);
     }
+    // The deleted arm (rubygems.go:281 → RemovePackageVersionByNameAndVersion
+    // → RemovePackageVersion, packages.go:532 — notifies ALWAYS; the yank
+    // endpoint IS the hard delete): the descriptor resolves BEFORE the
+    // version row dies.
+    const descriptor = await resolvePackageEventDescriptor(
+      c.env.DB,
+      owner.id,
+      "rubygems",
+      params.get("gem_name") ?? "",
+      params.get("version") ?? "",
+    );
     const removed = await removeRubyGemVersion(
       c.env.DB,
       owner.id,
@@ -4626,6 +4757,9 @@ async function rubygemsYank(c: Context<{ Bindings: Env }>): Promise<Response> {
     );
     if (removed === null) {
       return rubygemsPlain(404, new RubyPackageNotExistError().message);
+    }
+    if (descriptor !== null) {
+      await emitPackageDeleted(c.env, [descriptor], doer.id);
     }
     return new Response(null, { status: 200 });
   } catch (error) {
@@ -4898,10 +5032,18 @@ function terraformUploadError(error: unknown): Response {
  *  cascade → 200 (no body). */
 async function terraformDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner } = await protocolContext(c, "write");
-    const outcome = await deleteTerraformState(c.env.DB, owner.id, c.req.param("name") ?? "");
+    const { owner, cred } = await protocolContext(c, "write");
+    const name = c.req.param("name") ?? "";
+    // The deleted arm (terraform.go:285 — RemovePackageVersion PER VERSION,
+    // the DeleteState loop before the silent model-level DeletePackageByID):
+    // one event per version, all rendered from the pre-delete state.
+    const descriptors = await resolvePackageEventAllVersions(c.env.DB, owner.id, "terraform", name);
+    const outcome = await deleteTerraformState(c.env.DB, owner.id, name);
     if (outcome.kind === "not-found") return terraformPlainText(404, "package does not exist");
     if (outcome.kind === "locked") return terraformPlainText(423, "terraform state is locked");
+    if (descriptors.length > 0) {
+      await emitPackageDeleted(c.env, descriptors, cred.doer?.id ?? 0);
+    }
     return new Response(null, { status: 200 });
   } catch (error) {
     if (error instanceof HTTPException) return error.getResponse();
@@ -4923,6 +5065,9 @@ async function terraformDeleteBySerial(c: Context<{ Bindings: Env }>): Promise<R
     );
     if (outcome.kind === "not-found") return terraformPlainText(404, "package does not exist");
     if (outcome.kind === "latest") return terraformPlainText(403, "cannot delete the latest version");
+    // SILENT by upstream derivation: DeleteStateBySerial cascades through the
+    // model-level DeletePackageVersionAndReferences directly
+    // (terraform.go:233), never RemovePackageVersion — no PackageDelete.
     return new Response(null, { status: 204 });
   } catch (error) {
     if (error instanceof HTTPException) return error.getResponse();
@@ -5591,7 +5736,7 @@ async function chefProtocolContext(
   if (ownerBlindToPublicOnly(owner, cred)) {
     throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(owner.username)) });
   }
-  await protocolAccessGate(c.env.DB, required, owner, cred);
+  await protocolAccessGate(c.env, required, owner, cred);
   return { owner, cred };
 }
 
@@ -5754,8 +5899,21 @@ async function chefDeleteVersion(c: Context<{ Bindings: Env }>): Promise<Respons
     if (doer === null) {
       return chefErrorResponse(401, "user should have specific permission or be a site admin");
     }
+    // The deleted arm (chef.go:359 → RemovePackageVersionByNameAndVersion →
+    // RemovePackageVersion, packages.go:532 — notifies ALWAYS): the
+    // descriptor resolves BEFORE the version row dies.
+    const descriptor = await resolvePackageEventDescriptor(
+      c.env.DB,
+      owner.id,
+      "chef",
+      c.req.param("name") ?? "",
+      c.req.param("version") ?? "",
+    );
     const deleted = await deleteChefPackageVersion(c.env.DB, owner, c.req.param("name") ?? "", c.req.param("version") ?? "");
     if (!deleted) return chefErrorResponse(404, "");
+    if (descriptor !== null) {
+      await emitPackageDeleted(c.env, [descriptor], doer.id);
+    }
     return new Response(null, { status: 200 });
   } catch (error) {
     if (error instanceof HTTPException) return error.getResponse();
@@ -5771,8 +5929,14 @@ async function chefDeleteCookbook(c: Context<{ Bindings: Env }>): Promise<Respon
     if (doer === null) {
       return chefErrorResponse(401, "user should have specific permission or be a site admin");
     }
+    // The deleted arm (chef.go:395 — RemovePackageVersion PER VERSION, the
+    // DeletePackage loop): one event per version, pre-delete render.
+    const descriptors = await resolvePackageEventAllVersions(c.env.DB, owner.id, "chef", c.req.param("name") ?? "");
     const deleted = await deleteChefPackage(c.env.DB, owner, c.req.param("name") ?? "");
     if (!deleted) return chefErrorResponse(404, "");
+    if (descriptors.length > 0) {
+      await emitPackageDeleted(c.env, descriptors, doer.id);
+    }
     return new Response(null, { status: 200 });
   } catch (error) {
     if (error instanceof HTTPException) return error.getResponse();
@@ -6013,7 +6177,10 @@ async function conanMintedGate(c: Context<{ Bindings: Env }>, required: "read" |
   const row = (await drizzle(c.env.DB).select().from(users).where(eq(users.id, claims.userId)).get()) ?? null;
   if (row === null) return null;
   const doer = rowToAuthUser(row);
-  await protocolAccessGate(c.env.DB, required, owner, { doer, scope: ScopeSet.parseLenient("write:package") });
+  // The doer is a resolved user row here (the ghost claims bailed above), so
+  // determinePackageAccessMode's strict anonymous arm cannot fire — env is
+  // threaded anyway so the gate's flag posture stays uniform.
+  await protocolAccessGate(c.env, required, owner, { doer, scope: ScopeSet.parseLenient("write:package") });
   return { owner, cred: { doer, scope: ScopeSet.parseLenient("write:package") } };
 }
 
@@ -6414,17 +6581,20 @@ quota: packagesQuotaFromEnv(c.env),
       return conanJsonResponse(200, result);
     }
     if (target.arm === "delete-recipe") {
-      const { owner } = await conanGate(c, "write");
+      const { owner, cred } = await conanGate(c, "write");
+      // The deleted arm rides the service (conan.go:691-692 fires from
+      // INSIDE deleteRecipeOrPackage, versionDeleted-gated).
+      const emit = { webhookEnv: c.env, doerId: cred.doer?.id ?? 0 };
       const outcome =
         target.version === "v1"
-          ? await deleteConanRecipeV1(c.env.DB, owner.id, target.recipe)
-          : await deleteConanRecipeV2(c.env.DB, owner.id, target.recipe);
+          ? await deleteConanRecipeV1(c.env.DB, owner.id, target.recipe, emit)
+          : await deleteConanRecipeV2(c.env.DB, owner.id, target.recipe, emit);
       if (outcome.kind === "not-found") return conanErrorResponseRaw(404, "");
       if (outcome.kind === "reference-not-exist") return conanErrorResponseRaw(404, "");
       return new Response(null, { status: 200 });
     }
     if (target.arm === "delete-packages-v1") {
-      const { owner } = await conanGate(c, "write");
+      const { owner, cred } = await conanGate(c, "write");
       let body: { package_ids?: string[] } = {};
       try {
         const parsed = (await c.req.json()) as unknown;
@@ -6434,13 +6604,19 @@ quota: packagesQuotaFromEnv(c.env),
       } catch {
         return conanErrorResponseRaw(500, "internal server error");
       }
-      const outcome = await deleteConanPackageV1(c.env.DB, owner.id, target.recipe, body.package_ids ?? []);
+      const outcome = await deleteConanPackageV1(c.env.DB, owner.id, target.recipe, body.package_ids ?? [], {
+        webhookEnv: c.env,
+        doerId: cred.doer?.id ?? 0,
+      });
       if (outcome.kind !== "deleted") return conanErrorResponseRaw(404, "");
       return new Response(null, { status: 200 });
     }
     if (target.arm === "delete-package") {
-      const { owner } = await conanGate(c, "write");
-      const outcome = await deleteConanPackageV2(c.env.DB, owner.id, target.recipe, target.pref);
+      const { owner, cred } = await conanGate(c, "write");
+      const outcome = await deleteConanPackageV2(c.env.DB, owner.id, target.recipe, target.pref, {
+        webhookEnv: c.env,
+        doerId: cred.doer?.id ?? 0,
+      });
       if (outcome.kind === "not-found") return conanErrorResponseRaw(404, "");
       if (outcome.kind === "reference-not-exist") return conanErrorResponseRaw(404, "");
       return new Response(null, { status: 200 });

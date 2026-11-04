@@ -14,6 +14,7 @@ import { userRedirectDoesNotExist } from "../../auth/middleware";
 import { ScopeSet } from "../../auth/scopes";
 import { TokenService } from "../../auth/token-service";
 import { toApiUser as authToApiUser } from "../auth";
+import { requireSignInViewEnabled } from "../config";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { repositorySchema } from "../models/repository";
@@ -283,6 +284,13 @@ async function requirePackageContext(
   }
   const mode = await determinePackageAccessMode(c.env.DB, owner, cred.doer, {
     ownerVisibleToDoer: ownerVisibleToDoer(owner, cred),
+    // The strict arm (package.go:120). Production's anonymous caller is
+    // pre-empted by requireSignInViewApiGate's group 403 (mounted on
+    // createApiRouter, upstream api.go:961) — this threading models the
+    // same flag inside the assignment, the way upstream's PackageAssignment
+    // API does, and covers the standalone-router posture where the group
+    // gate no-ops on the unresolved auth context.
+    strictSignInView: requireSignInViewEnabled(c.env),
   });
   // reqPackageAccess — the token-scope half (skipped without a token,
   // upstream GetDoerTokenScope's ok-check), then the access-mode half.
@@ -419,7 +427,10 @@ async function findOwnerRepository(d1: D1Database, ownerId: number, repoName: st
  * Upstream canDoerManagePackage (package_update.go:46-68) reduced to the
  * landed model: admin/self always manage; the org fold's admin/owner modes
  * (owner-role bridge, admin/owner teams) manage; an admin-armed grant on the
- * LINKED repo manages (upstream's old-behavior repo-admin arm).
+ * LINKED repo manages (upstream's old-behavior repo-admin arm). No strict
+ * sign-in-view threading: the doer is non-null here (the callers resolved an
+ * authenticated identity), so package.go:120's anonymous-only arm can never
+ * fire.
  */
 async function canDoerManagePackage(
   d1: D1Database,
@@ -928,9 +939,11 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
 
 /** reqPackageAccess for the protocol family: the token-scope half (skipped
  *  without a token), then the access-mode half; both answer the 401
- *  challenge. */
+ *  challenge. `env` carries the require-sign-in-view flag into
+ *  determinePackageAccessMode's strict arm (package.go:120 — upstream's
+ *  check lives in the same determineAccessMode the gate consumes). */
 async function protocolAccessGate(
-  d1: D1Database,
+  env: Env,
   required: "read" | "write",
   owner: UserRow,
   cred: ResolvedCredential,
@@ -938,8 +951,9 @@ async function protocolAccessGate(
   if (cred.scope !== null && !cred.scope.has(`${required}:package`)) {
     packageAccessChallenge();
   }
-  const mode = await determinePackageAccessMode(d1, owner, cred.doer, {
+  const mode = await determinePackageAccessMode(env.DB, owner, cred.doer, {
     ownerVisibleToDoer: ownerVisibleToDoer(owner, cred),
+    strictSignInView: requireSignInViewEnabled(env),
   });
   if (!accessModeAtLeast(mode, required)) {
     packageAccessChallenge();
@@ -964,7 +978,7 @@ async function protocolContext(
   if (ownerBlindToPublicOnly(owner, cred)) {
     throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(owner.username)) });
   }
-  await protocolAccessGate(c.env.DB, required, owner, cred);
+  await protocolAccessGate(c.env, required, owner, cred);
   return { owner, cred };
 }
 
