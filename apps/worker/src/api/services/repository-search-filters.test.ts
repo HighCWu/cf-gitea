@@ -592,13 +592,20 @@ describe("search uid x exclusive x mode=collaborative (repo_list.go:405-449)", (
     });
     expect(hiddenView.total).toBe(0);
 
-    // The public member's collaboration survives the exclusion.
+    // The PUBLIC member's collaboration is excluded TOO — since the
+    // owner-visibility arm (repo_list.go:380-384) landed, the public-only
+    // BASE conjunct (`owner_id NOT IN (… visibility IN limited/private)`)
+    // ANDs ahead of the member arms (upstream's own composition), so a
+    // private-visibility org's public repo is unreachable in a public-only
+    // search regardless of membership. The member arms only ever ADD rows in
+    // includePrivate searches, where the hidden-membership exclusion is
+    // upstream-absent as well (:433-435 rides the `!opts.Private` guard).
     const publicView = await searchRepositories(env.DB, anonymous, {
       ...searchOpts,
       uid: publicMember.id,
       mode: "collaborative",
     });
-    expect(publicView.items.map((p) => p.repo.slug)).toEqual(["shyrepo"]);
+    expect(publicView.total).toBe(0);
   });
 
   it("refuses cross-visibility: a stranger asking for carol's collaborative edges gets nothing private", async () => {
@@ -622,6 +629,125 @@ describe("search uid x exclusive x mode=collaborative (repo_list.go:405-449)", (
   it("an unknown uid still matches nothing", async () => {
     const miss = await searchRepositories(env.DB, anonymous, { ...searchOpts, uid: 999999 });
     expect(miss.total).toBe(0);
+  });
+
+  it("mode=collaborative WINS over exclusive (repo.go:166-174 — the mode switch overwrites Collaborate)", async () => {
+    // Upstream binds `exclusive` first (Collaborate = Some(false)) and the
+    // mode switch runs after it — `mode=collaborative&exclusive=true` lands
+    // Collaborate = Some(true): the collaborate arm ONLY, owned repos
+    // excluded (the arm's own Neq(owner_id) predicate). Carol owns own1 and
+    // collaborates on alice's priv1 — the exclusive-wins shape would answer
+    // own1; the upstream shape answers priv1.
+    const { carol } = await seedCollaborateFixture();
+    const modeWins = await searchRepositories(env.DB, viewerFor(carol), {
+      ...searchOpts,
+      uid: carol.id,
+      mode: "collaborative",
+      exclusive: true,
+      includePrivate: true,
+    });
+    expect(modeWins.items.map((p) => p.repo.slug)).toEqual(["priv1"]);
+
+    // Without the mode, exclusive keeps its owned-only arm.
+    const exclusiveAlone = await searchRepositories(env.DB, viewerFor(carol), {
+      ...searchOpts,
+      uid: carol.id,
+      exclusive: true,
+      includePrivate: true,
+    });
+    expect(exclusiveAlone.items.map((p) => p.repo.slug)).toEqual(["own1"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The !Private base arm's owner-visibility exclusion (repo_list.go:380-384)
+// ---------------------------------------------------------------------------
+
+describe("search owner-visibility exclusion (repo_list.go:380-384)", () => {
+  it("a public-only search hides limited- and private-profile owners' PUBLIC repos; public owners answer", async () => {
+    const publicOwner = await seedVerifiedUser({ username: "OpenOwner" });
+    const limitedOwner = await seedVerifiedUser({ username: "LimitedOwner" });
+    const privateOwner = await seedVerifiedUser({ username: "SecretOwner" });
+    await drizzle(env.DB).update(users).set({ visibility: "limited" }).where(eq(users.id, limitedOwner.id));
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, privateOwner.id));
+    await seedRepo(publicOwner.id, "openowner", "visible", "public");
+    await seedRepo(limitedOwner.id, "limitedowner", "limpub", "public");
+    await seedRepo(privateOwner.id, "secretowner", "secpub", "public");
+
+    // Anonymous (and any `private=false` search): only the public-profile
+    // owner's repo passes — the base conjunct ANDs
+    // `owner_id NOT IN (… visibility IN (limited, private))`.
+    const anon = await searchRepositories(env.DB, anonymous, { ...searchOpts });
+    expect(anon.items.map((p) => p.repo.slug)).toEqual(["visible"]);
+
+    // Explicit `private=false` on a signed viewer is the same arm.
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const forced = await searchRepositories(env.DB, viewerFor(carol), {
+      ...searchOpts,
+      includePrivate: false,
+    });
+    expect(forced.items.map((p) => p.repo.slug)).toEqual(["visible"]);
+  });
+
+  it("the exclusion is the !Private arm only — includePrivate searches surface the same repos", async () => {
+    const limitedOwner = await seedVerifiedUser({ username: "LimitedOwner" });
+    const viewer = await seedVerifiedUser({ username: "Viewer" });
+    await seedRepo(limitedOwner.id, "limitedowner", "limpub", "public");
+
+    const signed = await searchRepositories(env.DB, viewerFor(viewer), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(signed.items.map((p) => p.repo.slug)).toEqual(["limpub"]);
+
+    // The listing-shaped !includePrivate on /users/{username}/repos has NO
+    // such exclusion upstream (GetUserRepositories, repo_list.go:823-825 —
+    // bare is_private=false), which is why the arm rides the SEARCH builder
+    // and not the shared visibilityConditions helper.
+  });
+
+  it("the exclusion keys on the REPO owner, never the searcher or starer profile", async () => {
+    // A private-profile STARER's stars over a public-owner repo still answer
+    // (the starer-profile independence pin above); likewise a private-profile
+    // uid's OWN public repo is excluded from a public-only search only
+    // through the owner arm — the uid block cannot resurrect it.
+    const starer = await seedVerifiedUser({ username: "ShyStarer" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const pubId = await seedRepo(bob.id, "bob", "pub", "public");
+    await seedStar(starer.id, pubId);
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, starer.id));
+
+    const hit = await searchRepositories(env.DB, anonymous, { ...searchOpts, starredBy: starer.id });
+    expect(hit.items.map((p) => p.repo.slug)).toEqual(["pub"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The priority_owner_id CASE's ELSE arm (repo_list.go:612 — ELSE owner_id)
+// ---------------------------------------------------------------------------
+
+describe("search priority CASE ELSE (repo_list.go:612)", () => {
+  it("non-priority rows order by OWNER ID before the explicit sort, not a constant tie", async () => {
+    // alice seeds first (lower id). sort=alpha desc alone would put zeta
+    // first; the upstream ELSE (owner_id) groups non-priority rows by owner
+    // id ASC — alice's row leads regardless of name. (A constant-ELSE
+    // mis-port would tie both at 1 and hand the order to the alpha sort.)
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const prio = await seedVerifiedUser({ username: "Prio" });
+    await seedRepo(alice.id, "alice", "alpha-name", "public");
+    await seedRepo(bob.id, "bob", "zeta-name", "public");
+    await seedRepo(prio.id, "prio", "mid", "public");
+    expect(alice.id).toBeLessThan(bob.id);
+
+    const ordered = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "name,mid", // both slugs match `name`; mid rides its own needle
+      priorityOwnerId: prio.id,
+      sort: "alpha",
+      order: "desc",
+    });
+    expect(ordered.items.map((p) => p.repo.slug)).toEqual(["mid", "alpha-name", "zeta-name"]);
   });
 });
 
@@ -772,5 +898,59 @@ describe("search keyword owner-prefix CASE (repo_list.go:614-618)", () => {
     });
     expect(floated.total).toBe(2);
     expect(floated.items.map((p) => p.repo.slug)).toEqual(["az", "aa"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The tier-1 repoSearch fixture pin — comma needles vs the whole-keyword
+// one-slash pair gate (repo_list.go:477-483).
+//
+// The compat scenario's original needle set (`<owner>/shared,<owner>/second`)
+// rode OUR pre-SEARCH per-segment pair arm — a divergence: upstream gates the
+// owner/repo arm on `strings.Count(opts.Keyword, "/") == 1` over the WHOLE
+// keyword, so two owner-qualified needles (two slashes) skip it, and
+// owner-qualified needles never match the bare-name arms (plain lower_name
+// substrings). Real Gitea answers 0 hits + no Link for that form; 3197fee's
+// faithful rewrite exposed it (the compat suite went red) and REDFIX
+// corrected the scenario onto bare needles. Both forms are pinned here so
+// neither direction of drift (a per-segment "restoration", or an accidental
+// whole-keyword over-match) can land silently.
+// ---------------------------------------------------------------------------
+
+describe("comma needles vs the whole-keyword pair gate (repo_list.go:477-483)", () => {
+  it("owner-qualified comma needles (two slashes) match NOTHING — upstream's 0-hit answer", async () => {
+    const owner = await seedVerifiedUser({ username: "PinOwner" });
+    await seedRepo(owner.id, "pinowner", "shared", "public");
+    await seedRepo(owner.id, "pinowner", "second", "public");
+
+    // The exact pre-REDFIX fixture needle set: both repos exist and are
+    // public, yet the pair arm is skipped (whole keyword carries two
+    // slashes) and `instr(slug, "pinowner/shared")` is 0 for a repo NAMED
+    // "shared" — upstream's needles name repos, never owner/repo pairs.
+    const hits = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "pinowner/shared,pinowner/second",
+    });
+    expect(hits.total).toBe(0);
+    expect(hits.items).toEqual([]);
+  });
+
+  it("bare comma needles OR per repo name — the corrected tier-1 fixture form (two hits)", async () => {
+    const owner = await seedVerifiedUser({ username: "PinOwner2" });
+    const org = await seedOrg("PinOrg", owner.id);
+    await seedRepo(owner.id, "pinowner2", "shared", "public");
+    await seedRepo(owner.id, "pinowner2", "second", "public");
+    await seedRepo(org.id, "pinorg", "org-shared", "public");
+
+    // Each needle is an independent lower_name substring ORed in (:474):
+    // `second` matches only the second repo, `org-shared` only the org
+    // repo — exactly two hits, the compat scenario's "two keyword hits,
+    // first page" without touching `shared` (which neither needle names).
+    const hits = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      keyword: "second,org-shared",
+    });
+    expect(hits.total).toBe(2);
+    expect(hits.items.map((p) => p.repo.slug).sort()).toEqual(["org-shared", "second"]);
   });
 });

@@ -1022,12 +1022,20 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoSearch: [
     {
+      // Upstream keyword arms (models/repo/repo_list.go:455-491 at the pin):
+      // comma needles are plain `lower_name` substrings (:474) and the
+      // "owner/repo" pair arm needs the WHOLE keyword to carry exactly one
+      // slash (:477) — owner-qualified needles (`compatowner/shared,
+      // compatowner/second`, two slashes) match NOTHING upstream; real
+      // Gitea answers 0 hits + no Link for that form. The pre-SEARCH
+      // per-segment pair arm that matched both repos was OUR divergence
+      // (removed by 3197fee), and this scenario had recorded it. The
+      // two-hit first page therefore rides bare name needles over the
+      // seeded set: exactly `second` (9002) and `org-shared` (9003) match.
       name: "two keyword hits, first page",
       status: 200,
       linkRels: ["next", "last"],
-      request: (ctx) => ({
-        path: `/repos/search?q=${String(ctx.seeds.repoOwner)}/shared,${String(ctx.seeds.repoOwner)}/second&limit=1`,
-      }),
+      request: () => ({ path: "/repos/search?q=second,org-shared&limit=1" }),
     },
     {
       name: "invalid mode",
