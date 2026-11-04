@@ -54,7 +54,13 @@ import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 import { replaceRepoTopics } from "./repo-topics";
 import { searchExploreRepos } from "./search";
-import { GO_ZERO_TIME, searchRepositories, type Viewer } from "./repository";
+import {
+  GO_ZERO_TIME,
+  listOwnedRepositories,
+  listUserRepositories,
+  searchRepositories,
+  type Viewer,
+} from "./repository";
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -128,6 +134,18 @@ const viewerFor = (user: { id: number; username: string }, isAdmin = false): Vie
     visibility: "public",
   },
 });
+
+/** The same identity presenting a PUBLIC-ONLY token (`Viewer.publicOnlyToken`
+ *  — the service-level twin of upstream `IsPublicOnlyDoer`; the route-level
+ *  twin rides repositories.test.ts's real-scope SELF fetches). */
+const publicOnlyViewerFor = (user: { id: number; username: string }, isAdmin = false): Viewer => ({
+  ...viewerFor(user, isAdmin),
+  publicOnlyToken: true,
+});
+
+/** The plain `{page, limit}` the list services take (the clamped values
+ *  parseListOptions produces for an unparameterized request). */
+const listOpts = { page: 1, limit: 50 };
 
 async function seedRepo(
   ownerId: number,
@@ -719,6 +737,142 @@ describe("search owner-visibility exclusion (repo_list.go:380-384)", () => {
 
     const hit = await searchRepositories(env.DB, anonymous, { ...searchOpts, starredBy: starer.id });
     expect(hit.items.map((p) => p.repo.slug)).toEqual(["pub"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The signed-in public arm's owner-visibility conjunct (repo_list.go:651-658
+// userAllPublicRepoCond with the SIGNED-IN limit [Private] at :667-673) and
+// the DoerTokenRepoCond floors on the LIST paths (repo_list.go:757-765
+// PublicRepoUnderPublicOwnerCond, :774-779 DoerTokenRepoCond, :822 its
+// GetUserRepositories AND, :366-368 the ListMyRepos force-Private-false).
+// ---------------------------------------------------------------------------
+
+describe("signed-in public-arm owner exclusion (repo_list.go:667-673, limit [Private])", () => {
+  it("an includePrivate search hides a private-profile owner's public repo; LIMITED owners stay visible", async () => {
+    // The signed-in arm's limit is [Private] ONLY (upstream appends Limited
+    // for the anonymous arm alone, :669-671): a public repo under a
+    // limited-profile owner stays list-visible to a signed-in viewer, while
+    // the private-profile owner's public repo drops. The anonymous control
+    // (the S2 arm, limit [Limited, Private]) keeps only the open row.
+    const openOwner = await seedVerifiedUser({ username: "OpenOwner" });
+    const limitedOwner = await seedVerifiedUser({ username: "LimitedOwner" });
+    const secretOwner = await seedVerifiedUser({ username: "SecretOwner" });
+    await drizzle(env.DB).update(users).set({ visibility: "limited" }).where(eq(users.id, limitedOwner.id));
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, secretOwner.id));
+    await seedRepo(openOwner.id, "openowner", "visible", "public");
+    await seedRepo(limitedOwner.id, "limitedowner", "limpub", "public");
+    await seedRepo(secretOwner.id, "secretowner", "secpub", "public");
+
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const signed = await searchRepositories(env.DB, viewerFor(carol), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(signed.items.map((p) => p.repo.slug).sort()).toEqual(["limpub", "visible"]);
+
+    const anon = await searchRepositories(env.DB, anonymous, { ...searchOpts });
+    expect(anon.items.map((p) => p.repo.slug)).toEqual(["visible"]);
+  });
+
+  it("the conjunct rides the PUBLIC arm only — owner and grantee arms resurrect the row", async () => {
+    // Upstream composes the owner half INSIDE the public arm of the OR
+    // (:651-657); the own/collaborator/team arms are untouched, so a
+    // private-profile owner's rows stay reachable through a real edge.
+    const secretOwner = await seedVerifiedUser({ username: "SecretOwner" });
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, secretOwner.id));
+    const secpubId = await seedRepo(secretOwner.id, "secretowner", "secpub", "public");
+    await seedRepo(secretOwner.id, "secretowner", "vault", "private");
+    const carol = await seedVerifiedUser({ username: "Carol" });
+
+    // The owner themself: the own-arm (ownership OR) admits their rows —
+    // the public row despite the narrowed public arm, the private one too
+    // (the conjunct never rides the owner arm).
+    const own = await searchRepositories(env.DB, viewerFor(secretOwner), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(own.items.map((p) => p.repo.slug).sort()).toEqual(["secpub", "vault"]);
+
+    // A collaborator on the public row: the grant arm admits it; the vault
+    // (no grant) stays out.
+    await seedCollaborator(carol.id, secpubId);
+    const granted = await searchRepositories(env.DB, viewerFor(carol), {
+      ...searchOpts,
+      includePrivate: true,
+    });
+    expect(granted.items.map((p) => p.repo.slug)).toEqual(["secpub"]);
+  });
+});
+
+describe("DoerTokenRepoCond list floors (repo_list.go:757-765, :774-779, :822/:366-368)", () => {
+  /** shy = private-profile owner with a public + a private repo; open =
+   *  public-profile owner with a public repo — the genuinely-public pair the
+   *  floor admits. */
+  async function seedFloorFixture() {
+    const shy = await seedVerifiedUser({ username: "ShyOwner" });
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, shy.id));
+    await seedRepo(shy.id, "shyowner", "shyrepo", "public");
+    await seedRepo(shy.id, "shyowner", "vault", "private");
+    const open = await seedVerifiedUser({ username: "OpenOwner" });
+    await seedRepo(open.id, "openowner", "openpub", "public");
+    return { shy, open };
+  }
+
+  it("listUserRepositories floors a public-only token to genuinely-public pairs — even the owner themself", async () => {
+    const { shy } = await seedFloorFixture();
+
+    // The public-only token listing its OWN repos: the token floor ANDs
+    // public + public-owner (repo_list.go:822) — their public repo drops on
+    // the owner-visibility half (their profile is private) and the vault on
+    // the is_private half. Upstream: DoerTokenRepoCond →
+    // PublicRepoUnderPublicOwnerCond, no self/admin exemption.
+    const floored = await listUserRepositories(env.DB, "shyowner", publicOnlyViewerFor(shy), listOpts);
+    expect(floored.total).toBe(0);
+    expect(floored.items).toEqual([]);
+
+    // The same identity with a FULL-scope viewer keeps both rows (the self
+    // arm; GetUserRepositories's Private=true self reading).
+    const full = await listUserRepositories(env.DB, "shyowner", viewerFor(shy), listOpts);
+    expect(full.items.map((p) => p.repo.slug).sort()).toEqual(["shyrepo", "vault"]);
+
+    // A genuinely-public owner's row passes the floor.
+    const openList = await listUserRepositories(env.DB, "openowner", publicOnlyViewerFor(shy), listOpts);
+    expect(openList.items.map((p) => p.repo.slug)).toEqual(["openpub"]);
+  });
+
+  it("listOwnedRepositories floors a public-only token (ListMyRepos forces Private=false, repo_list.go:366-368)", async () => {
+    const { shy, open } = await seedFloorFixture();
+
+    // The token's own list: the vault is hidden despite ownership (the
+    // forced-public reading), and shyrepo is hidden by the owner half.
+    const floored = await listOwnedRepositories(env.DB, publicOnlyViewerFor(shy), listOpts);
+    expect(floored.total).toBe(0);
+    expect(floored.items).toEqual([]);
+
+    // Full-scope control: everything owned.
+    const full = await listOwnedRepositories(env.DB, viewerFor(shy), listOpts);
+    expect(full.items.map((p) => p.repo.slug).sort()).toEqual(["shyrepo", "vault"]);
+
+    // A public-profile owner's public repo passes under the same token.
+    const openFloored = await listOwnedRepositories(env.DB, publicOnlyViewerFor(open), listOpts);
+    expect(openFloored.items.map((p) => p.repo.slug)).toEqual(["openpub"]);
+  });
+
+  it("the floor narrows ADMIN listers too (IsPublicOnlyDoer has no admin exemption)", async () => {
+    await seedFloorFixture();
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+
+    // Full-scope admin: the unfiltered [] arm — both rows.
+    const adminFull = await listUserRepositories(env.DB, "shyowner", viewerFor(admin, true), listOpts);
+    expect(adminFull.items.map((p) => p.repo.slug).sort()).toEqual(["shyrepo", "vault"]);
+
+    // The same admin with a public-only token: the floor applies anyway
+    // (upstream ANDs DoerTokenRepoCond unconditionally, :822; ARC's
+    // public-only early return :662-664 checks IsPublicOnlyDoer, not
+    // IsAdmin) — nothing of the private-profile owner survives.
+    const adminFloored = await listUserRepositories(env.DB, "shyowner", publicOnlyViewerFor(admin, true), listOpts);
+    expect(adminFloored.total).toBe(0);
   });
 });
 

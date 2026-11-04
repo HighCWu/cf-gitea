@@ -9,6 +9,7 @@
 
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
@@ -106,6 +107,10 @@ async function seedRepo(
     createdAt?: string;
     numIssues?: number;
     numPulls?: number;
+    /** The owner's users-row id — nullable in the schema (0003 added it
+     *  bare); the owner-visibility conjoins key on it, so the fixtures that
+     *  flip owner visibility seed it like the real create flows do. */
+    ownerId?: number;
   } = {},
 ): Promise<string> {
   const id = opts.id ?? String(repoSeq++);
@@ -113,6 +118,7 @@ async function seedRepo(
     id,
     storageKey: `r_${id}`,
     ownerNamespace,
+    ownerId: opts.ownerId ?? null,
     slug,
     visibility: opts.visibility ?? "public",
     refsVersion: opts.refsVersion ?? 0,
@@ -375,6 +381,37 @@ describe("GET /repos/search (repoSearch)", () => {
     expect(signed.headers.get("X-Total-Count")).toBe("2");
   });
 
+  it("a signed private=true search hides private-profile owners' public repos; LIMITED owners stay (repo_list.go:667-673)", async () => {
+    // The signed-in arm of AccessibleRepositoryCondition (arm 1 through
+    // userAllPublicRepoCond, repo_list.go:651-658/:667-673): the PUBLIC arm
+    // of the signed OR carries `owner_id NOT IN (private-visibility owners)`.
+    // The limit is [Private] ONLY for signed-in viewers — a LIMITED-profile
+    // owner's public repo stays visible (upstream appends Limited to the
+    // anonymous arm alone, :669-671) — the discriminating half vs the S2
+    // anonymous arm. ownerId is seeded on every row: the conjunct keys on it
+    // (NULL would drop the row once any private-profile user exists).
+    const open = await seedVerifiedUser({ username: "OpenOwner" });
+    const limitedOwner = await seedVerifiedUser({ username: "LimitedOwner" });
+    const secretOwner = await seedVerifiedUser({ username: "SecretOwner" });
+    await db().update(users).set({ visibility: "limited" }).where(eq(users.id, limitedOwner.id));
+    await db().update(users).set({ visibility: "private" }).where(eq(users.id, secretOwner.id));
+    await seedRepo("openowner", "visible", { ownerId: open.id });
+    await seedRepo("limitedowner", "limpub", { ownerId: limitedOwner.id });
+    await seedRepo("secretowner", "secpub", { ownerId: secretOwner.id });
+    await seedUser(STUB_LOGIN); // the stub resolver authenticates as this unrelated viewer
+
+    const res = await router()("/repos/search?private=true", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("2");
+    const body = await res.json<{ data: Array<{ full_name: string }> }>();
+    expect(body.data.map((r) => r.full_name).sort()).toEqual(["limitedowner/limpub", "openowner/visible"]);
+
+    // Anonymous control (the S2 arm — limit [Limited, Private]): only the
+    // open row survives.
+    const anon = await router()("/repos/search");
+    expect(anon.headers.get("X-Total-Count")).toBe("1");
+  });
+
   it("sorts by created desc / alpha desc and paginates with clamps and headers", async () => {
     const alice = await seedUser("Alice");
     await seedRepo(alice.usernameLower, "aaa", { id: "101", createdAt: "2026-01-01T00:00:00Z" });
@@ -598,6 +635,117 @@ describe("GET /user/repos (userCurrentListRepos)", () => {
     const first = await router()("/user/repos?limit=2", { headers: authHeaders });
     expect(first.headers.get("Link")).toContain('rel="next"');
     expect(first.headers.get("Link")).toContain('rel="last"');
+  });
+});
+
+describe("the public-only token floor on the repo lists (DoerTokenRepoCond, repo_list.go:757-765/:774-779)", () => {
+  it("floors /users/{username}/repos and /user/repos to genuinely-public pairs — the owner's own lists included", async () => {
+    // The LIST paths carry upstream's DoerTokenRepoCond: GetUserRepositories
+    // ANDs it into the owner-scoped cond (repo_list.go:822) and ListMyRepos
+    // forces Private=false for a public-only doer (:366-368) — a public-only
+    // token never sees rows a full-scope doer would, its OWN private repos
+    // included. The scope rides the SPEC-0002 resolveAuth middleware
+    // (`viewerOf` → `Viewer.publicOnlyToken`), so this pins through the REAL
+    // worker (SELF), not the standalone stub router whose injected resolver
+    // never attaches a scope.
+    const owner = await seedVerifiedUser({ username: "FloorOwner" });
+    await seedRepo("floorowner", "pub", { ownerId: owner.id });
+    await seedRepo("floorowner", "vault", { visibility: "private", ownerId: owner.id });
+
+    // `public-only,all` — the restriction flag is not a permission drop, so
+    // /user proves the identity (otherwise a total of 1 would be
+    // indistinguishable from the anonymous posture).
+    const forcedToken = (await mintFor(owner.id, "floor-pub-only", "public-only,all")).plaintext;
+    const who = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(who.status).toBe(200);
+    expect((await who.json<{ login?: string }>()).login).toBe("FloorOwner");
+
+    // The owner's OWN /users/{username}/repos through the public-only token:
+    // the private vault drops on the floor's is_private half.
+    const userRepos = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/FloorOwner/repos`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(userRepos.headers.get("X-Total-Count")).toBe("1");
+    expect((await userRepos.json<Array<{ full_name: string }>>()).map((r) => r.full_name)).toEqual([
+      "floorowner/pub",
+    ]);
+
+    // /user/repos: the forced-public reading hides the vault here too.
+    const ownRepos = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user/repos`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(ownRepos.headers.get("X-Total-Count")).toBe("1");
+
+    // Flipping the doer's profile to private: the /users/{username} resolve
+    // path answers upstream's masked userAssignment 404 BEFORE any list runs
+    // (services/context/user.go:71-74 — `DoerTokenAllowsOwner` fails for a
+    // public-only doer on a private-visibility target, THEMSELVES included;
+    // user_extdata.go:122-124) — the floor's owner-visibility half
+    // (PublicRepoUnderPublicOwnerCond, :757-765) is pinned service-side
+    // (repository-search-filters.test.ts); here the layered composition is.
+    await db().update(users).set({ visibility: "private" }).where(eq(users.id, owner.id));
+    const afterFlip = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/FloorOwner/repos`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(afterFlip.status).toBe(404);
+    expect(await afterFlip.json()).toEqual({
+      message: "user redirect does not exist [name: FloorOwner]",
+      url: ERROR_URL,
+    });
+
+    // /user/repos resolves NO username target (no userAssignment arm), so the
+    // list runs and the floor's owner-visibility half drops the public repo:
+    // nothing of the private-profile owner survives the token.
+    const ownAfterFlip = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user/repos`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(ownAfterFlip.headers.get("X-Total-Count")).toBe("0");
+
+    // The control: the same user's all-scope token keeps the full lists.
+    const allToken = (await mintFor(owner.id, "floor-all-scope", "all")).plaintext;
+    const fullSelf = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/FloorOwner/repos`, {
+      headers: { authorization: basicTokenHeader(allToken) },
+    });
+    expect(fullSelf.headers.get("X-Total-Count")).toBe("2");
+    const fullOwned = await SELF.fetch(`${SELF_ORIGIN}/api/v1/user/repos`, {
+      headers: { authorization: basicTokenHeader(allToken) },
+    });
+    expect(fullOwned.headers.get("X-Total-Count")).toBe("2");
+  });
+
+  it("narrows an admin's listing too — IsPublicOnlyDoer has no admin exemption (repo_list.go:662-664, :822)", async () => {
+    const target = await seedVerifiedUser({ username: "ShyTarget" });
+    await db().update(users).set({ visibility: "private" }).where(eq(users.id, target.id));
+    await seedRepo("shytarget", "shyrepo", { ownerId: target.id });
+    await seedRepo("shytarget", "vault", { visibility: "private", ownerId: target.id });
+    const admin = await seedVerifiedUser({ username: "RootAdmin", isAdmin: true });
+
+    // A full-scope admin token sees both rows of the private-profile owner.
+    const adminToken = (await mintFor(admin.id, "root-all", "all")).plaintext;
+    const full = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/ShyTarget/repos`, {
+      headers: { authorization: basicTokenHeader(adminToken) },
+    });
+    expect(full.headers.get("X-Total-Count")).toBe("2");
+
+    // The same admin with a public-only token: the /users/{username} resolve
+    // path answers the masked userAssignment 404 — `DoerTokenAllowsOwner`
+    // (user_extdata.go:122-124) has no admin exemption and upstream's
+    // userAssignment arm (services/context/user.go:71-74) runs for admins
+    // too. The LIST-level floor for an admin (upstream ANDs DoerTokenRepoCond
+    // unconditionally, repo_list.go:822; the public-only ARC early return
+    // :662-664 keys on IsPublicOnlyDoer, not IsAdmin) is pinned service-side
+    // (repository-search-filters.test.ts) without the assignment gate.
+    const forcedToken = (await mintFor(admin.id, "root-pub-only", "public-only,all")).plaintext;
+    const floored = await SELF.fetch(`${SELF_ORIGIN}/api/v1/users/ShyTarget/repos`, {
+      headers: { authorization: basicTokenHeader(forcedToken) },
+    });
+    expect(floored.status).toBe(404);
+    expect(await floored.json()).toEqual({
+      message: "user redirect does not exist [name: ShyTarget]",
+      url: ERROR_URL,
+    });
   });
 });
 

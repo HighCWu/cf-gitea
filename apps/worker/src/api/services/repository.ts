@@ -94,16 +94,28 @@ export interface RepositoryWithOwner {
  * The requesting identity for a conversion: the resolved `User` when a token
  * middleware ran, `null` for anonymous callers, plus the instance origin the
  * URLs are built against.
+ *
+ * `publicOnlyToken` mirrors upstream `IsPublicOnlyDoer` (models/user/
+ * user_extdata.go:105-108 — the presented token's scope is public-only): the
+ * flag rides the SPEC-0002 `resolveAuth` scope (`auth.scope.publicOnly`), the
+ * same read route-side `authScopePublicOnly` makes. Optional so hand-built
+ * viewers (the explore/session seams — cookie doers have no token scope,
+ * upstream `IsPublicOnlyDoer` false for them) keep the full-scope reading.
  */
 export interface Viewer {
   origin: string;
   requester: User | null;
+  publicOnlyToken?: boolean;
 }
 
 /** Requester accessor for optional-auth routes (middleware absent → null). */
 export function viewerOf(c: Context<ApiEnv>): Viewer {
   const requester: User | undefined = c.get("authUser");
-  return { origin: new URL(c.req.url).origin, requester: requester ?? null };
+  return {
+    origin: new URL(c.req.url).origin,
+    requester: requester ?? null,
+    publicOnlyToken: c.get("auth")?.scope?.publicOnly === true,
+  };
 }
 
 /**
@@ -1313,6 +1325,34 @@ function updatedSortKey(): SQL {
  * requester collaborates on (`collaboratorGrantCondition` — upstream
  * `AccessibleRepositoryCondition`'s access-table arm,
  * repo_list.go:661-700). Admins see all.
+ *
+ * The signed-in OR's public arm carries the owner-visibility conjunct
+ * (upstream arm 1, `userAllPublicRepoCond` repo_list.go:651-658 with the
+ * signed-in limit — `orgVisibilityLimit = [Private]`, :667-673): a PUBLIC
+ * repo is list-visible to a signed-in non-admin only when its OWNER is not a
+ * private-visibility profile. LIMITED-profile owners stay reachable for
+ * signed-in viewers (upstream appends `Limited` to the limit ONLY for the
+ * anonymous arm, :669-671 — the anonymous-style `IN ('limited', 'private')`
+ * exclusion rides the search's `!includePrivate` base instead, the S2
+ * condition). The conjunct rides INSIDE the public arm of the OR — the
+ * owner/collaborator/team arms are unaffected (a private-profile owner sees
+ * their own rows through the owner arm; a grantee through the grant arms) —
+ * upstream's own composition.
+ *
+ * The OR also carries upstream arm 5 (`userOrgPublicRepoCond`, :330-339 via
+ * :694-696 — public repos of orgs the viewer BELONGS to, no grant needed):
+ * with the narrowed public arm it is load-bearing — upstream composes
+ * `AccessibleRepositoryCondition` in one OR, and its `uid == actor` search
+ * shape skips the base entirely (repo_list.go:372 `Actor.ID != OwnerID`), so
+ * the member arms stand alone there; ours ANDs the base with the uid block,
+ * which only stays row-equivalent because the base carries the member arm.
+ * For our 3-value owner enum the landed `publicInPrivateOrgCondition` IS
+ * arm 5's equivalent: public- and limited-visibility orgs' public repos ride
+ * the (limited-keeping) public arm, so the private-org join is the only row
+ * class arm 5 adds. The `!includePrivate` branch stays the bare
+ * `visibility = 'public'`: `/users/{username}/repos`'s `!Private` arm is bare
+ * `is_private = false` upstream (GetUserRepositories, repo_list.go:823-825),
+ * and it shares this helper.
  */
 function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
   if (!includePrivate || viewer.requester === null) {
@@ -1322,12 +1362,50 @@ function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
     return [];
   }
   const userId = viewer.requester.id;
-  const grantArms = userId === undefined ? [] : [teamGrantCondition(userId), collaboratorGrantCondition(userId)];
+  const grantArms =
+    userId === undefined
+      ? []
+      : [teamGrantCondition(userId), collaboratorGrantCondition(userId), publicInPrivateOrgCondition(userId)];
   return [
     or(
-      eq(repositories.visibility, "public"),
+      // The public arm's owner half (userAllPublicRepoCond, repo_list.go
+      // :651-658, signed-in limit [Private]): the owner subquery rides the
+      // PUBLIC arm only.
+      and(
+        eq(repositories.visibility, "public"),
+        sql`${repositories.ownerId} NOT IN (SELECT id FROM users WHERE users.visibility IN ('private'))`,
+      ),
       eq(repositories.ownerNamespace, requesterLoginLower(viewer) ?? ""),
       ...grantArms,
+    ) as SQL,
+  ];
+}
+
+/**
+ * The doer-token visibility floor on the list paths — upstream
+ * `DoerTokenRepoCond` (repo_list.go:774-779): a PUBLIC-ONLY token's viewer is
+ * narrowed to `PublicRepoUnderPublicOwnerCond` (:757-765) — public repos
+ * under PUBLIC-visibility owners, nothing else, even when the doer otherwise
+ * qualifies (their own private repos, an admin's blanket access — upstream
+ * ANDs the cond unconditionally in `GetUserRepositories`, repo_list.go:822,
+ * and `AccessibleRepositoryCondition` early-returns to the same narrowing for
+ * a public-only doer, :662-664; `IsPublicOnlyDoer` has no admin exemption).
+ * Empty for every other viewer (`builder.NewCond()` upstream). The SEARCH
+ * path needs no extra arm here: a public-only token's `includePrivate` is
+ * forced false route-side (repo.ts resolveIncludePrivate — upstream
+ * `SearchRepositoryCondition` :366-368), so the anonymous-style base
+ * (`visibility = 'public'` + the owner `NOT IN ('limited', 'private')`
+ * conjunct, ≡ the IN ('public') owner half on our 3-value enum) already
+ * carries the exact narrowing.
+ */
+function doerTokenRepoCondition(viewer: Viewer): SQL[] {
+  if (viewer.publicOnlyToken !== true) {
+    return [];
+  }
+  return [
+    and(
+      eq(repositories.visibility, "public"),
+      sql`${repositories.ownerId} IN (SELECT id FROM users WHERE users.visibility = 'public')`,
     ) as SQL,
   ];
 }
@@ -1770,7 +1848,10 @@ export async function searchRepositories(
 /**
  * `/users/{username}/repos` (`GetUserRepositories`, "id ASC"): public
  * repositories of the user, or all of them when the viewer is the user
- * themself or a site admin.
+ * themself or a site admin — narrowed by `DoerTokenRepoCond` for a
+ * public-only token (repo_list.go:822 ANDs it ahead of the `!Private` arm;
+ * `doerTokenRepoCondition`): even the owner themself — or an admin — holding
+ * a public-only token sees only the genuinely-public pairs.
  */
 export async function listUserRepositories(
   d1: D1Database,
@@ -1784,6 +1865,7 @@ export async function listUserRepositories(
   const where = and(
     eq(repositories.ownerNamespace, ownerLower),
     ...visibilityConditions(viewer, includePrivate),
+    ...doerTokenRepoCondition(viewer),
   );
   const db = drizzle(d1);
   const totalRows = await db.select({ value: sql<number>`count(*)` }).from(repositories).where(where);
@@ -1816,8 +1898,12 @@ export async function listUserRepositories(
 /**
  * `/user/repos` (`ListMyRepos`): everything the authenticated user owns,
  * including private (`SearchRepoOptions{OwnerID: doer, Private: true}`,
- * default "name ASC" ordering). The identity comes from the auth middleware;
- * a token user without a D1 row owns nothing (empty list).
+ * default "name ASC" ordering) — narrowed by `DoerTokenRepoCond` for a
+ * public-only token: upstream forces `Private = false` for a public-only
+ * doer (repo_list.go:366-368), which ANDs the anonymous-style base
+ * (public + public-owner) ahead of the owned rows — the token cannot read
+ * its own private repos here either. The identity comes from the auth
+ * middleware; a token user without a D1 row owns nothing (empty list).
  */
 export async function listOwnedRepositories(
   d1: D1Database,
@@ -1827,7 +1913,10 @@ export async function listOwnedRepositories(
   if (viewer.requester === null) {
     return { items: [], total: 0 };
   }
-  const where = eq(repositories.ownerNamespace, requesterLoginLower(viewer) ?? "");
+  const where = and(
+    eq(repositories.ownerNamespace, requesterLoginLower(viewer) ?? ""),
+    ...doerTokenRepoCondition(viewer),
+  );
   const db = drizzle(d1);
   const totalRows = await db.select({ value: sql<number>`count(*)` }).from(repositories).where(where);
   const items = await db

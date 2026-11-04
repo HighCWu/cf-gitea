@@ -174,7 +174,12 @@ describe("loadAdminReposData — the viewer scope", () => {
     await seedBaseFixtures();
     const data = await load(plainViewer, "");
     const slugs = data.items.map((item) => item.repo.slug).sort();
-    expect(slugs).toEqual(["arch", "forked", "mirrored", "pub", "pub", "starry", "tmpl"]); // the publics; alice's two privates hidden
+    // S-FIX2's signed-in port (repo_list.go:651-673): the second "pub"
+    // (bob/pub — a public repo under bob, a PRIVATE-visibility owner per
+    // this fixture's own comment) drops for the signed-in non-admin — the
+    // [Private]-only owner-visibility limit. The ae88762 REDFIX class: the
+    // pin had recorded the pre-port bare-public ladder.
+    expect(slugs).toEqual(["arch", "forked", "mirrored", "pub", "starry", "tmpl"]); // the publics; alice's privates + bob's hidden
     expect(data.total).toBe(slugs.length);
   });
 });
