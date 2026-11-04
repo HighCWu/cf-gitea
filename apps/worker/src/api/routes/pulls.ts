@@ -23,8 +23,10 @@
  * service owns the composition). POST …/merge requires the mergeable state
  * (405 otherwise — the not-mergeable semantics of the contract's 405), refuses
  * WIP titles and already-merged rows with 405, and refuses the auto-merge
- * schedule with the declared 409. POST /merge-upstream answers 404: forks
- * cannot exist yet (SPEC-0003 primitives pending).
+ * schedule with the declared 409. POST /merge-upstream syncs a FORK's branch
+ * with its base (the fork machinery landed — services/pull-engine.ts
+ * mergeUpstream: the write/fork/read gates, "up-to-date"/"fast-forward"/
+ * "merge" outcomes, the divergence walk in the fork cell).
  *
  * `GET …/pulls/{index}.{diffType}` is a DOT-SUFFIX path (SPEC-0004 §4): the
  * contract path is declared doc-only via the registry (hono's `:a.:b` two-
@@ -65,7 +67,8 @@ import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import { z } from "zod";
 
-import { issues, milestones, PRStatus, pullRequests, users } from "../../db/schema";
+import { issues, milestones, PRStatus, pullRequests, teams, users } from "../../db/schema";
+import { emitIssueEvent } from "../../services/issue-events";
 import { IssueError, MilestoneNotExistError } from "../../issues/errors";
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
@@ -77,6 +80,7 @@ import {
   editPullRequestOptionSchema,
   mergePullRequestOptionSchema,
   mergeUpstreamRequestSchema,
+  mergeUpstreamResponseSchema,
   pullRequestListSchema,
   pullRequestSchema,
   type PullRequest,
@@ -85,7 +89,8 @@ import { changedFileListSchema, commitListSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { ActionType, recordAction, type ActionDraft } from "../services/activity-feeds";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
-import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, hasWorkInProgressPrefix, issueErrorToApiError, issueNoDependenciesLeft } from "../services/issues";
+import { collaboratorModeOf } from "../services/repo-collaborators";
+import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, hasWorkInProgressPrefix, issueErrorToApiError, issueNoDependenciesLeft, addIssueAssignees, resolveCreateAssigneeUsers } from "../services/issues";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { parseMilestoneDeadline } from "../services/milestones";
 import {
@@ -101,6 +106,7 @@ import {
   toApiPullRequest,
 } from "../services/pulls";
 import {
+  changePullRequestTargetBranch,
   composeMergeMessage,
   createPullHeadRef,
   carryForkHeadIntoBase,
@@ -115,17 +121,23 @@ import {
 import { branchRef, engineReads, isFullObjectId, refTipMap, tagRef } from "../services/engine";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
 import {
+  apiUserFromRow,
+  canViewRepository,
   canViewRepositoryWithTeams,
+  doerRepoAccessMode,
   findRepositoryById,
   findRepositoryByPath,
   repositoryPermissions,
   toApiRepository,
   viewerOf,
   type RepositoryWithOwner,
+  type UserRow,
+  type Viewer,
 } from "../services/repository";
 import { toApiUser } from "../services/user";
 import { canWriteRepository } from "../services/repo-access";
 import { loadRepoSettings } from "../services/repo-settings";
+import { PullReviewsService } from "../services/pull-reviews";
 import { canBypassBranchProtection, checkPullBranchProtections, findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import { createScheduledAutoMergeComment, insertScheduledAutoMergeRow } from "../../services/pull-automerge";
 import { emitMilestoneEvent } from "./issues";
@@ -156,7 +168,15 @@ import { requestedReviewersOf } from "./pull-reviews";
  * extended by this batch — same treatment as the issues block):
  *   - POST pulls: 400 (invalid due_date format — upstream
  *     ApplyAPIDeadlineTimestamp "invalid date format: X"; undeclared in the
- *     contract). The other 400/409/412/422 codes on PATCH are DECLARED.
+ *     contract), 500 (an INVALID REVIEWER on the create arms —
+ *     ErrNotValidReviewRequest is unmapped in repoCreatePullRequest's
+ *     :547-555 error ladder, so the failure answers APIErrorInternal with
+ *     the exact error text AFTER the PR row committed, upstream's
+ *     committed-prefix wart; the standalone requested_reviewers route maps
+ *     the same family to 422 — the two upstream mappings differ). The other
+ *     400/409/412/422 codes on PATCH are DECLARED. The PATCH retarget adds
+ *     500 (ErrBranchesEqual is likewise unmapped at pull.go:764-769 —
+ *     "branches are equal [head: %sm base: %s]", the upstream typo verbatim).
  *
  * Engine boundary (documented, this wave): POST accepts the create per
  * upstream shape WITHOUT the base/head branch-existence check (an engine
@@ -164,8 +184,11 @@ import { requestedReviewersOf } from "./pull-reviews";
  * (pull-engine.ts mergeableOfRow — a still-checking row renders FALSE, the
  * pin's non-nullable bool: structs/pull.go:65, models/issues/pull.go:751-756),
  * `base.sha: ""` and `head.sha` from the pull_requests cache. The PATCH
- * `base` retarget is likewise
- * engine-gated upstream and is ignored this wave. The PATCH assignee fields
+ * `base` retarget is LIVE: the gate (skip on merged/empty/same-base,
+ * pull.go:748), the branch-existence 404, ChangeTargetBranch's mapped
+ * errors (pull.go:757-770) and the PullRequestChangeTargetBranch webhook
+ * ride the engine's landed retarget (changePullRequestTargetBranch).
+ * The PATCH assignee fields
  * are LIVE: upstream REPLACES the assignee set (UpdateAssignees,
  * pull.go:674-694) and the machinery rides the landed issue_assignees table
  * (replacePullAssignees below; the blocks-enforcement sweep wired
@@ -178,7 +201,11 @@ import { requestedReviewersOf } from "./pull-reviews";
  * (PATCH state), through emitWebhookDeliveries — see emitPullWebhook. The
  * label/-milestone sub-events ride their tier-2 surfaces;
  * pull_request_assign is emitted HERE since the PATCH assignee replace went
- * live (emitPullAssignWebhook, one event per changed assignee).
+ * live (emitPullAssignWebhook, one event per changed assignee) and the
+ * create arms emit it too (the create-carried assignees, NewPullRequest's
+ * :191-193 notify); pull_request_review_request rides the create's
+ * reviewer/team arms (the :169-181 loops) — review_request events land
+ * BEFORE the opened webhook, upstream's NewPullRequest order.
  *
  * Activity feeds (specs/activity-feeds.md §3.3 tail): the PR-lifecycle
  * `action` rows (create/close/reopen/merge_pull_request) ride the same
@@ -956,19 +983,73 @@ export function registerPullRoutes(
         deadlineAt = parseMilestoneDeadline(form.due_date);
       }
 
+      // loadAssigneeUserIDs (pull.go:527 — the shared create resolver, the
+      // issues-create arm's twin): the pre-write resolution of
+      // form.assignee/assignees — NOT writer-gated on this route (unlike
+      // the issues create, issue.go:606-622; any PR creator's assignees
+      // resolve, pull.go:526-528 is unconditional). The create wrapper's
+      // 422s fire BEFORE any row is written (services/issues.ts
+      // resolveCreateAssigneeUsers — orgs never resolve,
+      // GetDoerUsersByNames' type filter). The ARG order mirrors upstream's
+      // call — loadAssigneeUserIDs(ctx, form.Assignee, form.Assignees):
+      // the singular rides FIRST (upstream's Set then randomizes, so this
+      // is the deterministic analogue of its input order).
+      const createAssignees = await resolveCreateAssigneeUsers(c.env.DB, found, [
+        ...(form.assignee !== undefined && form.assignee !== null && form.assignee !== "" ? [form.assignee] : []),
+        ...(form.assignees ?? []),
+      ]);
+
+      // parseReviewersByNames (pull.go:539 → pull_review.go:826-865): names
+      // or emails resolved BEFORE NewPullRequest — the first miss 404s
+      // ("user doesn't exist: X") with NO row written. The team loop runs
+      // ONLY on an org-owned repo (`ctx.Repo.Repository.Owner.
+      // IsOrganization()`, :857): a user-owned repo's team_reviewers are
+      // silently ignored (upstream skips the loop entirely).
+      const createReviewers: UserRow[] = [];
+      for (const name of form.reviewers ?? []) {
+        const row = name.includes("@")
+          ? (await drizzle(c.env.DB).select().from(users).where(eq(users.email, name)).limit(1).all())[0]
+          : (await drizzle(c.env.DB).select().from(users).where(eq(users.usernameLower, name.toLowerCase())).limit(1).all())[0];
+        if (row === undefined) {
+          throw new ApiError(404, `user doesn't exist: ${name}`);
+        }
+        createReviewers.push(row);
+      }
+      const createTeamReviewers: Array<typeof teams.$inferSelect> = [];
+      if (found.owner.type === "org") {
+        for (const name of form.team_reviewers ?? []) {
+          const team = (
+            await drizzle(c.env.DB)
+              .select()
+              .from(teams)
+              .where(and(eq(teams.orgId, found.owner.id), eq(teams.lowerName, name.toLowerCase())))
+              .limit(1)
+              .all()
+          )[0];
+          if (team === undefined) {
+            throw new ApiError(404, `team doesn't exist: ${name}`);
+          }
+          createTeamReviewers.push(team);
+        }
+      }
+
       let issue: IssueRow;
       let pr: PullRequestRow;
       // NewPullRequest's blocked arm (services/pull/pull.go:64-65 via
       // repoCreatePullRequest's `errors.Is(err, user_model.ErrBlockedUser)`
       // → 403 `err.Error()`, pull.go:547): the POSTER blocked by the repo
-      // owner refuses before any row is written. Upstream's second probe
-      // half — the poster blocked by any REQUESTED ASSIGNEE — rides the
-      // create-request assignee resolution (pull.go:526), which the landed
-      // create drops (the issues.ts create-request deviation); it becomes
-      // reachable when that support lands. The isUserBlockedBy site-admin
+      // owner — OR by any REQUESTED ASSIGNEE (the condition's second half,
+      // upstream `||` order: owner first) — refuses before any row is
+      // written. The assignee half is REACHABLE now the create resolves
+      // form.assignee(s) above. The isUserBlockedBy site-admin
       // short-circuit is upstream's `blockee.IsAdmin`.
       if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, found.repo.ownerId ?? -1)) {
         throw new ApiError(403, BLOCKED_USER_MESSAGE);
+      }
+      for (const user of createAssignees) {
+        if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, user.id)) {
+          throw new ApiError(403, BLOCKED_USER_MESSAGE);
+        }
       }
 
       // The cross-repo create compare (GetCompareInfo, upstream pull.go:520
@@ -1034,6 +1115,95 @@ export function registerPullRoutes(
         issue = updated[0] ?? issue;
       }
 
+      // NewPullRequest's assignee half (services/pull/pull.go:71-82, inside
+      // the tx): the rows + type-9 comments land through the /assignees
+      // trio's AddAssignees core — the fresh PR issue has no pre-assignment
+      // (the skip is unreachable) and the blocked/assignable arms are
+      // pre-checked above. Upstream writes the assignees INSIDE the tx
+      // BEFORE PushToBaseRepo; this landed create is not one transaction,
+      // so the rows land after the committed row + head-ref prefix (the
+      // same documented posture).
+      const addedAssignees = await addIssueAssignees(c.env.DB, found, issue, createAssignees, {
+        id: requester.id ?? 0,
+        isAdmin: requester.is_admin === true,
+      });
+
+      // NewPullRequest's reviewer arms (services/pull/pull.go:169-181):
+      // `issue_service.ReviewRequest` / `TeamReviewRequest` run AFTER the tx
+      // committed — BEFORE the opened webhook (:187). The landed standalone
+      // ladder's validation gates ride the SAME service arms; on the create
+      // path upstream maps NONE of the ErrNotValidReviewRequest family
+      // (repoCreatePullRequest's :547-555 arm list has no entry) — the
+      // failure answers the APIErrorInternal 500 with the exact error text,
+      // the PR row ALREADY COMMITTED (upstream's committed-prefix wart:
+      // the 500 races a created PR, both upstream's and ours).
+      const reviews = new PullReviewsService(c.env.DB, c.env);
+      const doerId = requester.id ?? 0;
+      // The review_request payloads share ONE ToPayloadPullRequest render
+      // (upstream re-converts per notifier call, notifier.go:793-815 — the
+      // shared render is the cheaper adapter; the payload mode carries the
+      // head repo past the doer's visibility, convert/pull.go:33-37).
+      let reviewPayloadRender: Awaited<ReturnType<typeof toApiPullRequest>> | null = null;
+      let reviewRepositoryRender: ReturnType<typeof toApiRepository> | null = null;
+      if (createReviewers.length > 0 || createTeamReviewers.length > 0) {
+        const reviewDiffStats = await pullRequestDiffShortStat(c, found, pr);
+        reviewPayloadRender = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "payload", reviewDiffStats === null ? undefined : { diffStats: reviewDiffStats });
+        reviewRepositoryRender = toApiRepository(viewerOf(c), found);
+      }
+      const reviewRequestEvent = (requestedReviewer: unknown): void | Promise<void> =>
+        emitIssueEvent(c, {
+          repoId: found.repo.id,
+          ownerId: found.repo.ownerId,
+          eventType: "pull_request_review_request",
+          payload: {
+            action: "review_requested",
+            number: issue.index,
+            pull_request: reviewPayloadRender,
+            ...(requestedReviewer === null ? {} : { requested_reviewer: requestedReviewer }),
+            repository: reviewRepositoryRender,
+            sender: c.get("authUser"),
+            commit_id: "",
+          },
+        });
+      for (const reviewer of createReviewers) {
+        if (reviewer.type === "org") {
+          throw new ApiError(500, `Organization can't be added as reviewer [user_id: ${doerId}, repo_id: ${found.repo.id}]`);
+        }
+        // permReviewer.CanAccessAny(read, TypePullRequests) (review_request.
+        // go:82-86) — the reviewer's read arm rides the same team-aware
+        // predicate the standalone route ladder uses (SPEC-0007 §3.5): the
+        // SYNC visibility matrix first, then the grant reads. (The ladder's
+        // exact shape — canViewRepository, NOT the async
+        // canViewRepositoryWithTeams: an un-awaited promise is truthy and
+        // would admit every reviewer.)
+        const reviewerViewer: Viewer = { origin: viewer.origin, requester: apiUserFromRow(reviewer, viewer) };
+        const canRead =
+          canViewRepository(reviewerViewer, found.repo) ||
+          (await doerRepoAccessMode(c.env.DB, found.repo, reviewer.id)) !== "none" ||
+          (await collaboratorModeOf(c.env.DB, found.repo.id, reviewer.id)) !== "none";
+        if (!canRead) {
+          throw new ApiError(500, `Reviewer can't read [user_id: ${doerId}, repo_id: ${found.repo.id}]`);
+        }
+        if (issue.posterId !== null && reviewer.id === issue.posterId) {
+          throw new ApiError(500, `poster of pr can't be reviewer [user_id: ${doerId}, repo_id: ${found.repo.id}]`);
+        }
+        // canDoerChangeReviewRequests is poster-true on the create path
+        // (review_request.go:97 → the Doer-can't-choose arm is unreachable;
+        // lastReview is null on a fresh PR).
+        const requested = await reviews.addReviewRequest(found, issue, pr, reviewer, doerId);
+        if (requested !== null) {
+          await reviewRequestEvent(apiUserFromRow(reviewer, viewer));
+        }
+      }
+      for (const team of createTeamReviewers) {
+        const requested = await reviews.addTeamReviewRequest(issue, pr, team, doerId);
+        if (requested !== null) {
+          // requested_reviewer omitted on the team arm (the module-header
+          // deviation the standalone lane documents).
+          await reviewRequestEvent(null);
+        }
+      }
+
       // Upstream converts TWICE at the create route: the 201 body serializes
       // convert.ToAPIPullRequest (pull.go:558) while pull_service.NewPullRequest
       // (pull.go:544) already fired webhookNotifier.NewPullRequest, whose opened
@@ -1061,7 +1231,17 @@ export function registerPullRoutes(
         eventType: "pull_request",
         payload: pullRequestPayload("opened", payloadRendered, issue.index, toApiRepository(viewerOf(c), found), c.get("authUser")),
       });
-      return c.json(rendered, 201);
+      // NewPullRequest's post-tx assignee notify (services/pull/pull.go:
+      // 191-193 → IssueChangeAssignee): ONE assign webhook per actually-
+      // added assignee, AFTER opened (upstream order :187/:191; the landed
+      // create carries no labels/milestone notify arm — unchanged).
+      for (const user of addedAssignees) {
+        await emitPullAssignWebhook(c, found, issue, "assigned", { added_assignees: [toApiUser(viewerOf(c), user)] });
+      }
+      // Upstream's create 201 renders the converter's LoadRequestedReviewers
+      // (pull.go:558 → convert/pull.go:124) — the review requests created
+      // above render in the response, the same consult the GET rides.
+      return c.json({ ...rendered, requested_reviewers: await requestedReviewersOf(c.env.DB, issue.id, viewer) }, 201);
     },
     bindValidationHook,
   );
@@ -1229,8 +1409,51 @@ export function registerPullRoutes(
         await replacePullAssignees(c, found, issue, [...(form.assignees ?? []), ...(form.assignee ? [form.assignee] : [])]);
       }
 
-      // form.base: the retarget is engine-gated upstream (branch existence +
-      // ChangeTargetBranch); deferred with the engine wave (file header).
+      // form.base: the retarget (pull.go:748-772) — the GATE skips silently
+      // on a merged PR, an empty/absent base, and base == the current base
+      // (all three PATCH-succeed with the field ignored, upstream-true);
+      // then the branch-existence probe answers 404 `new base '%s' not
+      // exist` BEFORE ChangeTargetBranch, whose mapped errors ride the
+      // engine's landed retarget (changePullRequestTargetBranch — the same
+      // service the web merge-box calls) re-pointed at the API's error
+      // texts via errorFlavor. Upstream then fires the
+      // PullRequestChangeTargetBranch webhook (:772 — action "edited" +
+      // changes.ref.from = the OLD base).
+      const retarget = patchField(form.base);
+      if (!pullRequest.hasMerged && retarget !== undefined && retarget !== null && retarget !== "" && retarget !== pullRequest.baseBranch) {
+        const branchExists = refTipMap(await engineReads(c.env, found.repo).listRefs()).get(branchRef(retarget)) !== undefined;
+        if (!branchExists) {
+          throw new ApiError(404, `new base '${retarget}' not exist`);
+        }
+        const oldRetargetBase = pullRequest.baseBranch;
+        // The service carries the whole upstream tail (pull.go:226-358): the
+        // CAS + RecalculateReviewsOfficial + the type-25 ChangeTargetBranch
+        // comment (oldRef/newRef — no num_comments bump) + the push-comments
+        // delete/recreate — all keyed on the doer (the tail's CreateComment
+        // attribution; the doer-less web caller predates the tail).
+        await changePullRequestTargetBranch(c, found, issue, pullRequest, {
+          targetBranch: retarget,
+          now,
+          errorFlavor: "api",
+          doerId: actorId,
+        });
+        pullRequest = { ...pullRequest, baseBranch: retarget };
+        // PullRequestChangeTargetBranch (webhook/notifier.go:726-748):
+        // action "edited" with changes.ref.from = the old base.
+        await emitPullWebhook(c, {
+          repoId: found.repo.id,
+          ownerId: found.repo.ownerId,
+          eventType: "pull_request",
+          payload: pullRequestPayload(
+            "edited",
+            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", await diffStatsExtras()),
+            issue.index,
+            toApiRepository(viewerOf(c), found),
+            c.get("authUser"),
+            { changes: { ref: { from: oldRetargetBase } } },
+          ),
+        });
+      }
 
       // Milestone: only on actual change (upstream guards with != and writer).
       const milestone = patchField(form.milestone);
@@ -1809,9 +2032,14 @@ export function registerPullRoutes(
   );
 
   // -------------------------------------------------------------------------
-  // POST /repos/{owner}/{repo}/merge-upstream (repoMergeUpstream) — 404:
-  // forks cannot exist yet (SPEC-0003 fork primitives pending); the write
-  // gate still runs so private-repo enumeration stays the 404 it already is.
+  // POST /repos/{owner}/{repo}/merge-upstream (repoMergeUpstream) — the fork
+  // sync (api.go:1314 reqToken + mustNotBeArchived + reqRepoWriter(TypeCode)
+  // → repo/branch.go:1301-1354 → services/repository/merge_upstream.go).
+  // The stale "forks cannot exist yet" 404-everywhere stub is superseded —
+  // forks landed (census R20, services/forks.ts) and the service rides the
+  // fork machinery (services/pull-engine.ts mergeUpstream: the write gate,
+  // the fork/base/read gates, the divergence walk in the fork cell, and the
+  // fast-forward / reverse-PR-merge arms).
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({
@@ -1826,20 +2054,31 @@ export function registerPullRoutes(
         body: { content: { "application/json": { schema: mergeUpstreamRequestSchema } } },
       },
       responses: {
-        // the MergeUpstreamResponse shape is declared in models/pull.ts and
-        // carried for the fork wave; forks cannot exist yet, so this handler
-        // never reaches 200 (the declared empty family)
-        200: { description: "MergeUpstreamResponse" },
+        200: { description: "MergeUpstreamResponse", content: { "application/json": { schema: mergeUpstreamResponseSchema } } },
         400: errorResponse,
         404: notFoundResponse,
         409: errorResponse,
       },
     }),
     async (c) => {
-      const { found } = await requireVisibleRepo(c, c.req.valid("param"));
-      c.req.valid("json"); // bind (fast-forward_only accepted per upstream shape)
-      await mergeUpstreamEngine(c, found);
-      return c.body(null, 200); // unreachable — mergeUpstreamEngine throws
+      // NOT requireVisibleRepo: upstream mounts merge-upstream OUTSIDE the
+      // pulls group (api.go:1314 — reqToken + mustNotBeArchived +
+      // reqRepoWriter, no mustAllowPulls), so an ARCHIVED repo answers the
+      // pinned 423 here, not the pulls-subtree 404 (requireVisibleRepo's
+      // assertPullsUnit hides archived on the /pulls subtree — the group
+      // gate this route does not ride). The visibility 404 keeps the
+      // anti-enumeration posture.
+      const viewer = viewerOf(c);
+      const found = await findRepositoryByPath(c.env.DB, c.req.valid("param").owner, c.req.valid("param").repo);
+      if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
+        throw new ApiError(404, "not found");
+      }
+      // mustNotBeArchived (api.go:816-821) — 423 "repo is archived", the
+      // middleware family ahead of the write gate (upstream order).
+      assertNotArchived(found);
+      const form = c.req.valid("json");
+      const result = await mergeUpstreamEngine(c, found, { branch: form.branch, ffOnly: form.ff_only === true });
+      return c.json({ merge_type: result.mergeStyle }, 200);
     },
     bindValidationHook,
   );

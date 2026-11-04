@@ -426,8 +426,10 @@ describe("merge gating — conflict, WIP, schedule", () => {
     expect((await jsonBody(await get(`${AMS_REPO}/pulls/${index}`))).merged).toBe(true);
   });
 
-  it("merge-upstream answers 404 while forks cannot exist", async () => {
-    expect((await send(`${REPO}/merge-upstream`, jsonInit("POST", { branch: "main" }))).status).toBe(404);
+  it("merge-upstream answers the fork gate's 400 on a non-fork (B-51 — merge_upstream.go's InvalidArgument arm supersedes the stale forks-cannot-exist 404)", async () => {
+    const res = await send(`${REPO}/merge-upstream`, jsonInit("POST", { branch: "main" }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ message: "repo is not a fork", url: "https://apisuite.test/api/swagger" });
   });
 });
 
@@ -2287,5 +2289,111 @@ describe("the PR-head sync round-trip — a second push moves refs/pull/N/head a
     expect(carried?.message).toContain("fork-sync-second");
     const prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, seeded.index)).get();
     expect(prRow?.headSha).toBe(secondTip);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /merge-upstream — the fork sync (B-51; repo_service.MergeUpstream,
+// services/repository/merge_upstream.go:22-100). Base = apisuite/pulls, fork
+// = apisuite/fork-up (forkParent pinned over the seeded row); the
+// deterministic oids keep a re-run a no-op like every fork seed here. The
+// branch pairs share NAMES so the base-side resolution takes the fork's own
+// branch (merge_upstream.go:120-124's GitHub-following probe), except the
+// fast-forward arm, which rides main (base main grows monotonically through
+// this suite's merges — always a descendant of the fork's seeded TIP2, so
+// the arm answers fast-forward deterministically whatever ran before).
+// ---------------------------------------------------------------------------
+
+describe("POST /merge-upstream — the fork sync (merge_upstream.go:22-100)", () => {
+  const FORK_UP_SLUG = "fork-up";
+
+  async function forkUpRowId(): Promise<string> {
+    return repoIdOf(OWNER, FORK_UP_SLUG);
+  }
+
+  async function ensureForkUp(): Promise<void> {
+    await ensureSeededRepo({ owner: OWNER, slug: FORK_UP_SLUG, commits: SEED_COMMITS });
+    const baseRepoId = await repoIdOf(OWNER, SLUG);
+    await drizzle(env.DB).update(repositories).set({ forkParent: baseRepoId }).where(eq(repositories.id, await forkUpRowId()));
+    // The deterministic branch pairs (created only when absent — the re-run
+    // no-op): mu-topic equal tips in both cells; mu-diverge diverged tips.
+    const seedPack = await buildHistoryPack(SEED_COMMITS);
+    const baseChild = await buildHistoryPack([...SEED_COMMITS, forkFeatureCommit("mu-base.txt", "from the base\n", T0 + 200)]);
+    const forkChild = await buildHistoryPack([...SEED_COMMITS, forkFeatureCommit("mu-fork.txt", "from the fork\n", T0 + 300)]);
+    const token = await mintPushToken(OWNER_ID, "pull-engine-fork-up");
+    // Each ref rides the pack that CONTAINS its closure (the receive pack
+    // check is per-ref: TIP2-side refs ride the seed pack, the children
+    // their own packs). mu-behind keeps the fork side STRICTLY behind a
+    // never-growing base branch — the ff arm stays re-run-stable (unlike
+    // main, which this suite's merges grow).
+    await pushRefsIfAbsent(`${OWNER}/${SLUG}`, token, [
+      { ref: "refs/heads/mu-topic", oid: seedPack.tips[1] as string },
+      { ref: "refs/heads/mu-behind", oid: baseChild.tips[2] as string },
+    ], baseChild.pack);
+    await pushRefsIfAbsent(`${OWNER}/${SLUG}`, token, [
+      { ref: "refs/heads/mu-diverge", oid: baseChild.tips[2] as string },
+    ], baseChild.pack);
+    await pushRefsIfAbsent(`${OWNER}/${FORK_UP_SLUG}`, token, [
+      { ref: "refs/heads/mu-topic", oid: seedPack.tips[1] as string },
+      { ref: "refs/heads/mu-behind", oid: seedPack.tips[1] as string },
+    ], seedPack.pack);
+    await pushRefsIfAbsent(`${OWNER}/${FORK_UP_SLUG}`, token, [
+      { ref: "refs/heads/mu-diverge", oid: forkChild.tips[2] as string },
+    ], forkChild.pack);
+  }
+
+  async function forkTipOf(branch: string): Promise<string | undefined> {
+    return refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: FORK_UP_SLUG }).listRefs()).get(`refs/heads/${branch}`)?.target;
+  }
+
+  it("up-to-date: equal tips answer merge_type 'up-to-date' and move nothing", async () => {
+    await ensureForkUp();
+    const before = await forkTipOf("mu-topic");
+    const res = await send(`/repos/${OWNER}/${FORK_UP_SLUG}/merge-upstream`, jsonInit("POST", { branch: "mu-topic" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ merge_type: "up-to-date" });
+    expect(await forkTipOf("mu-topic")).toBe(before);
+  });
+
+  it("unknown fork branch: 404 with ErrBranchNotExist's render (upstream's missing comma verbatim)", async () => {
+    await ensureForkUp();
+    const res = await send(`/repos/${OWNER}/${FORK_UP_SLUG}/merge-upstream`, jsonInit("POST", { branch: "ghost" }));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ message: `branch does not exist [repo_id: ${await forkUpRowId()} name: ghost]`, url: "https://apisuite.test/api/swagger" });
+  });
+
+  it("fast-forward: the fork side strictly behind a base branch — the ff move lands the base tip", async () => {
+    await ensureForkUp();
+    const baseTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/mu-behind")?.target as string;
+    const res = await send(`/repos/${OWNER}/${FORK_UP_SLUG}/merge-upstream`, jsonInit("POST", { branch: "mu-behind" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ merge_type: "fast-forward" });
+    expect(await forkTipOf("mu-behind")).toBe(baseTip);
+  });
+
+  it("diverged + ff_only: 400 'fast-forward merge not possible: branch has diverged' and no landing", async () => {
+    await ensureForkUp();
+    const before = await forkTipOf("mu-diverge");
+    const res = await send(`/repos/${OWNER}/${FORK_UP_SLUG}/merge-upstream`, jsonInit("POST", { branch: "mu-diverge", ff_only: true }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ message: "fast-forward merge not possible: branch has diverged", url: "https://apisuite.test/api/swagger" });
+    expect(await forkTipOf("mu-diverge")).toBe(before);
+  });
+
+  it("diverged: the reverse-PR merge lands a two-parent commit with the verbatim 'merge upstream' message (pull.Update's fake-PR swap)", async () => {
+    await ensureForkUp();
+    const baseChildTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/mu-diverge")?.target as string;
+    const forkChildTip = (await forkTipOf("mu-diverge")) as string;
+    const res = await send(`/repos/${OWNER}/${FORK_UP_SLUG}/merge-upstream`, jsonInit("POST", { branch: "mu-diverge" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ merge_type: "merge" });
+    const landed = await forkTipOf("mu-diverge");
+    expect(landed).toBeDefined();
+    expect(landed).not.toBe(forkChildTip);
+    const commit = await env.REPO.getByName(`${OWNER}/${FORK_UP_SLUG}`).readCommit(landed);
+    expect(commit?.message).toContain("merge upstream");
+    expect(commit?.parents).toHaveLength(2);
+    expect(commit?.parents).toContain(forkChildTip);
+    expect(commit?.parents).toContain(baseChildTip);
   });
 });

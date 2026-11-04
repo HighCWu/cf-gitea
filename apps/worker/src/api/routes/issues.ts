@@ -30,9 +30,10 @@ import {
 } from "../models/issue";
 import { issueLabelSchema } from "../models/issue";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
-import { assertNotBlockedForIssueContent, assertNotBlockedForIssueCreate } from "../services/blocks";
+import { assertNotBlockedForIssueContent, assertNotBlockedForIssueCreate, BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { toApiLabel } from "../services/labels";
 import {
+  addIssueAssignees,
   assignOrRemoveIssueProjects,
   changeIssueBody,
   changeIssueDeadline,
@@ -64,6 +65,7 @@ import {
   prefetchCommentRenderPreload,
   prefetchIssueRenderContext,
   prefetchTimelineContext,
+  resolveCreateAssigneeUsers,
   searchIssuesGlobally,
   toApiComment,
   toApiIssue,
@@ -1211,18 +1213,43 @@ export function registerIssueRoutes(
         deadlineAt = parseMilestoneDeadline(rawDueDate);
       }
 
+      // loadAssigneeUserIDs (issue.go:614 → :524-553): the writer-gated
+      // pre-write resolution of form.assignee/assignees — lowercase, dedupe,
+      // empty-drop, then resolve + CanBeAssigned; the first miss 422s BEFORE
+      // any row is written ("Assignee does not exist: user does not exist
+      // [uid: 0, name: X]" — orgs never resolve, GetDoerUsersByNames' type
+      // filter; a resolved but non-assignable login 422s "User X cannot be
+      // assigned to this issue" — the create arm's own not-a-collaborator
+      // outcome). A non-writer's fields are bound-and-dropped (upstream's
+      // writer branch never reads them, issue.go:606-622). The ARG order
+      // mirrors upstream's call — loadAssigneeUserIDs(ctx, form.Assignee,
+      // form.Assignees): the singular rides FIRST (upstream's Set then
+      // randomizes, so this is the deterministic analogue of its input
+      // order).
+      const createAssignees = canWrite
+        ? await resolveCreateAssigneeUsers(c.env.DB, found, [
+            ...(form.assignee !== undefined && form.assignee !== null && form.assignee !== "" ? [form.assignee] : []),
+            ...(form.assignees ?? []),
+          ])
+        : [];
+
       let issue: IssueRow;
       // NewIssue's blocked arm (services/issue/issue.go:33-34 via
       // routers/api/v1/repo/issue.go:625): the poster must not be blocked
-      // by the repo owner — 403 "user is blocked". The assignee half of
-      // upstream's condition is unreachable: this route drops
-      // form.assignee(s) (the file-header deviation), so the sub-arm rides
-      // the create-assignee support when it lands.
+      // by the repo owner — 403 "user is blocked" — NOR by any requested
+      // assignee (the condition's second half, upstream `|| ` order:
+      // owner first, then the assignees). The assignee half is REACHABLE
+      // now the create resolves form.assignee(s) above.
       await assertNotBlockedForIssueCreate(
         c.env.DB,
         { id: requester.id ?? 0, isAdmin: requester.is_admin === true },
         found.repo.ownerId,
       );
+      for (const user of createAssignees) {
+        if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, user.id)) {
+          throw new ApiError(403, BLOCKED_USER_MESSAGE);
+        }
+      }
       try {
         issue = await service.createIssue({
           repoId: found.repo.id,
@@ -1270,16 +1297,28 @@ export function registerIssueRoutes(
           throw error;
         }
       }
+      // NewIssue's assignee half (services/issue/issue.go:47-58): the rows +
+      // type-9 comments land through the /assignees trio's AddAssignees core
+      // — the fresh issue has no pre-assignment, so every requested assignee
+      // is added (AddAssigneeIfNotAssigned's already-assigned skip is
+      // unreachable) and its internal blocked/assignable arms are
+      // pre-checked above (they 403/422 before any row existed). Upstream
+      // writes the assignees INSIDE NewIssue's tx before the projects; this
+      // landed create is not one transaction, so the rows land after the
+      // committed projects prefix (the same documented posture) and a
+      // failure here leaves the earlier arms committed.
+      const addedAssignees = await addIssueAssignees(c.env.DB, found, issue, createAssignees, {
+        id: requester.id ?? 0,
+        isAdmin: requester.is_admin === true,
+      });
       // The opened webhook fires BEFORE the close attempt — upstream's
       // opened notification rides INSIDE issue_service.NewIssue
       // (services/issue/issue.go), so the upstream NewIssue → CloseIssue
       // notify order emits opened even when the close arm below aborts with
-      // the dependencies-left 412. This route drops form.assignee(s) (the
-      // file-header deviation), so a fresh issue's assignee set is ALWAYS
-      // empty and the wire render's null/null is exactly what upstream's
-      // ToAPIIssue (NewIssue:305) would emit for the same fresh issue — the
-      // identities coincide by construction. A future create-assignee wave
-      // must split the paths.
+      // the dependencies-left 412. The wire render below carries the
+      // assignees through toApiIssue's issue_assignees fold — upstream's
+      // post-create refetch (GetIssueByID, issue.go:633) renders the same
+      // rows (ToAPIIssue → LoadAssignees).
       await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
@@ -1306,6 +1345,13 @@ export function registerIssueRoutes(
       }
       if (issue.milestoneId !== null) {
         await emitMilestoneEvent(c, found, issue, "milestoned");
+      }
+      // NewIssue's post-tx assignee notify loop (services/issue/issue.go:
+      // 96-99 → IssueChangeAssignee): ONE assign webhook per actually-added
+      // assignee, AFTER opened/labels/milestone — the same emitAssignEvent
+      // arm the PATCH replace rides.
+      for (const user of addedAssignees) {
+        await emitAssignEvent(c, found, issue, user, false);
       }
       if (form.closed === true) {
         try {

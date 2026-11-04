@@ -2528,6 +2528,51 @@ async function resolveAssigneeNames(d1: D1Database, names: string[]): Promise<Us
   return resolved;
 }
 
+/**
+ * loadAssigneeUserIDs (routers/api/v1/repo/issue.go:524-553) — the CREATE
+ * arms' pre-write resolution (issue create issue.go:614, PR create
+ * pull.go:527): names are lowercased, deduped and empty-dropped (the
+ * container.Set), then resolved through the doer-user lookup —
+ * GetDoerUsersByNames (user.go:1191-1210) filters `type IN (individual,
+ * bot)`, so an ORG login misses exactly like an unknown login: 422
+ * `Assignee does not exist: user does not exist [uid: 0, name: X]`
+ * (issue.go:539 — the create wrapper has NO bracket pair; the pulls-PATCH
+ * wrapper above brackets the ErrUserNotExist render). Each resolved user
+ * then rides CanBeAssigned (repo_permission.go:588-598 — the canBeAssigned
+ * collapse below): a non-assignable user aborts with 422 `User %s cannot
+ * be assigned to this issue` (issue.go:543-547) — the CREATE arms' own
+ * not-a-collaborator outcome, answered BEFORE any row is written (the
+ * PATCH arms' post-write 400/403 family is a different mapping, and the
+ * org arm of CanBeAssigned's InvalidArgument is unreachable here: orgs
+ * never resolve). Input order is preserved; the first failure wins.
+ */
+export async function resolveCreateAssigneeUsers(
+  d1: D1Database,
+  found: RepositoryWithOwner,
+  names: string[],
+): Promise<UserRow[]> {
+  const requested: string[] = [];
+  const seen = new Set<string>();
+  for (const name of names) {
+    const lower = name.toLowerCase();
+    if (lower === "" || seen.has(lower)) continue;
+    seen.add(lower);
+    requested.push(lower);
+  }
+  const resolved: UserRow[] = [];
+  for (const name of requested) {
+    const user = await findUserByName(d1, name);
+    if (user === null || user.type === "org") {
+      throw new ApiError(422, `Assignee does not exist: user does not exist [uid: 0, name: ${name}]`);
+    }
+    if (!(await canBeAssigned(d1, found, user))) {
+      throw new ApiError(422, `User ${user.username} cannot be assigned to this issue`);
+    }
+    resolved.push(user);
+  }
+  return resolved;
+}
+
 /** validateAssignee (services/issue/assignee.go:168-183): the blocked arm
  *  FIRST (the blocks-enforcement wiring), then CanBeAssigned collapsed onto
  *  the landed ACL (the issue-tables-t2 port: a public repo grants every real

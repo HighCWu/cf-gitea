@@ -1670,9 +1670,11 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoMergeUpstream: [
     {
-      // forks cannot exist yet (SPEC-0003 primitives pending) — the declared 404
-      name: "no upstream → declared 404",
-      status: 404,
+      // the fixture repo is not a fork — the fork gate's declared 400
+      // ("repo is not a fork", merge_upstream.go's InvalidArgument arm; the
+      // stale forks-cannot-exist 404 is superseded by B-51's landing)
+      name: "not a fork → declared 400",
+      status: 400,
       request: (ctx) => ({
         path: `${repoPath(ctx)}/merge-upstream`,
         init: ctx.withAuth({

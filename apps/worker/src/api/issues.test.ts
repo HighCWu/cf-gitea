@@ -643,6 +643,121 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(archived.status).toBe(423);
     expect(await archived.json()).toEqual({ message: "repo is archived", url: ERROR_URL });
   });
+
+  // -------------------------------------------------------------------------
+  // form.assignee/assignees — the create arm's writer-gated resolution
+  // (issue.go:614 → loadAssigneeUserIDs :524-553 → NewIssue's assignee
+  // insert, services/issue/issue.go:47-58). The 422/403 arms fire BEFORE
+  // any row is written; the rows + type-9 comments ride the landed
+  // issue_assignees machinery; ONE issue_assign webhook per added assignee
+  // fires AFTER opened/labels/milestone (NewIssue's notify order).
+  // -------------------------------------------------------------------------
+
+  it("applies writer-supplied assignee/assignees: rows + type-9 comments, issue_assign webhooks after opened, the 201 carries them", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const bob = await seedUser("Bob");
+    const hookId = await seedHook(repoId, ["issues", "issue_assign"]);
+
+    const res = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "assigned at birth", assignees: ["Bob"], assignee: "Alice" }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ assignee: { login: string } | null; assignees: Array<{ login: string }> }>();
+    expect(body.assignees.map((u) => u.login).sort()).toEqual(["Alice", "Bob"]);
+    expect(body.assignee?.login).toBe("Alice"); // the deprecated field duplicates the first
+
+    const issueRow = await db().select().from(issues).where(eq(issues.repoId, repoId)).all();
+    const assigneeRows = await db().select().from(issueAssignees).where(eq(issueAssignees.issueId, issueRow[0]!.id)).all();
+    expect(assigneeRows.map((r) => r.assigneeId).sort()).toEqual([bob.id, owner.id].sort());
+    const comments9 = await db().select().from(comments).where(eq(comments.issueId, issueRow[0]!.id)).all();
+    expect(comments9.map((c) => c.type)).toEqual([CommentType.Assignees, CommentType.Assignees]);
+    expect(comments9.map((c) => c.assigneeId).sort()).toEqual([bob.id, owner.id].sort());
+
+    // Webhook order: opened FIRST, then ONE issue_assign per added assignee
+    // (NewIssue :76 → :96-99).
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string });
+    expect(payloads[0]?.action).toBe("opened");
+    expect(payloads.slice(1).map((p) => p.action)).toEqual(["assigned", "assigned"]);
+  });
+
+  it("422s unknown / org / non-assignable assignees BEFORE any row (issue.go:539/:543-547 — the create wrapper has NO bracket pair; orgs never resolve)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    await db().insert(users).values({ username: "teamorg", usernameLower: "teamorg", isAdmin: false, status: "active", type: "org", visibility: "public", createdAt: new Date("2026-01-01T00:00:00Z") });
+
+    const unknown = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x", assignees: ["ghost"] }),
+    });
+    expect(unknown.status).toBe(422);
+    expect(await unknown.json()).toEqual({ message: "Assignee does not exist: user does not exist [uid: 0, name: ghost]", url: ERROR_URL });
+
+    const org = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x", assignees: ["teamorg"] }),
+    });
+    expect(org.status).toBe(422);
+    expect(await org.json()).toEqual({ message: "Assignee does not exist: user does not exist [uid: 0, name: teamorg]", url: ERROR_URL });
+
+    // CanBeAssigned miss on a private repo → 422 "User %s cannot be
+    // assigned to this issue" — the CREATE arm's own not-a-collaborator
+    // outcome (a different mapping from the PATCH family's 400/403).
+    await db().update(repositories).set({ visibility: "private" }).where(eq(repositories.id, repoId));
+    await seedUser("Recluse");
+    const notAssignable = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x", assignees: ["Recluse"] }),
+    });
+    expect(notAssignable.status).toBe(422);
+    expect(await notAssignable.json()).toEqual({ message: "User Recluse cannot be assigned to this issue", url: ERROR_URL });
+
+    // No arm wrote a row.
+    expect(await db().select().from(issues).where(eq(issues.repoId, repoId)).all()).toHaveLength(0);
+  });
+
+  it("403s the poster blocked by a requested assignee BEFORE the row (NewIssue issue.go:33-34's second half — owner first, then the assignees)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const blocker = await seedUser("Blocker");
+    await db().insert(userBlocking).values({ blockerId: blocker.id, blockeeId: 1, note: "", createdAt: new Date() });
+
+    // The owner-half still wins when both fire (upstream's `||` order).
+    const both = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x", assignees: ["Blocker"] }),
+    });
+    expect(both.status).toBe(403);
+    expect(await both.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await db().select().from(issues).where(eq(issues.repoId, repoId)).all()).toHaveLength(0);
+  });
+
+  it("silently drops a NON-WRITER's assignee/assignees — 201, no rows (the fields ride the writer branch, issue.go:606-622)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible"); // no stubWriter
+    await seedUser("Bob");
+
+    const res = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "reader's issue", assignees: ["Bob"], assignee: "Bob" }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ assignees: unknown[] | null }>();
+    // Upstream's converter leaves `Assignees` NIL for zero rows (services/
+    // convert/issue.go:110-119 — the append-only-if-nonempty pattern; unlike
+    // Labels there is no SliceNilAsEmpty) → JSON null, the same render every
+    // no-assignee create answers.
+    expect(body.assignees).toBeNull();
+    const issueRow = await db().select().from(issues).where(eq(issues.repoId, repoId)).all();
+    expect(await db().select().from(issueAssignees).where(eq(issueAssignees.issueId, issueRow[0]!.id)).all()).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------

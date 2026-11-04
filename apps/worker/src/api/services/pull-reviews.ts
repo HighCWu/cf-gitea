@@ -46,7 +46,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 
-import { ReviewType, comments, issues, pullReviews, teamMembers, users } from "../../db/schema";
+import { ReviewType, comments, issues, pullReviews, teamMembers, teams, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOfRow } from "../../services/branch-protection";
@@ -515,6 +515,137 @@ export class PullReviewsService {
     await this.emitReviewRequestMail(issue, doerId, reviewer, requestComment, true);
 
     return review;
+  }
+
+  /**
+   * AddTeamReviewRequest (models/issues/review.go:822-876) — the team
+   * reviewer-request write core. The already-requested skip, the
+   * closed/merged 403 (the ErrReviewRequestOnClosedPR family the user arm
+   * answers), the REQUEST row with `reviewerTeamId` (no user), the type-27
+   * comment carrying `assigneeTeamId` (upstream AssigneeTeamID, review.go:
+   * 865), then teamReviewRequestNotify (services/issue/review_request.go:
+   * 233-252): the team's members expand per GetTeamMembers (ORDER BY
+   * full_name, name), the POSTER member is skipped (:241-243), and each
+   * survivor rides the SAME PullRequestReviewRequest receiver the user arm
+   * uses — best-effort, never fails the request. Returns the created row or
+   * null (already requested — silent skip); the caller emits the
+   * review_request webhook (the route's emission stays with its lane).
+   */
+  async addTeamReviewRequest(
+    issue: IssueRow,
+    pullRequest: PullRequestRow,
+    team: typeof teams.$inferSelect,
+    doerId: number,
+  ): Promise<typeof pullReviews.$inferSelect | null> {
+    const db = this.db;
+    const now = new Date();
+
+    const existing = await db
+      .select({ id: pullReviews.id })
+      .from(pullReviews)
+      .where(and(eq(pullReviews.issueId, issue.id), eq(pullReviews.type, ReviewType.Request), eq(pullReviews.reviewerTeamId, team.id)))
+      .limit(1)
+      .get();
+    if (existing !== undefined) {
+      return null; // already requested — silent skip
+    }
+    if (issue.isClosed || pullRequest.hasMerged) {
+      throw new ApiError(403, "cannot request a re-review on a closed or merged PR");
+    }
+
+    const inserted = await db
+      .insert(pullReviews)
+      .values({ type: ReviewType.Request, reviewerTeamId: team.id, issueId: issue.id, content: "", createdAt: now, updatedAt: now })
+      .returning()
+      .all();
+    const review = inserted[0]!;
+
+    // The type-27 comment RETURNS its row — teamReviewRequestNotify composes
+    // the per-member mail over the SAME comment (review_request.go:235-247;
+    // upstream's per-member AssigneeID mutation is inert for the compose —
+    // the mail keys on the comment id, never the field).
+    const [teamCommentRows] = await db.batch([
+      db.insert(comments).values({
+        type: CommentType.ReviewRequest,
+        posterId: doerId,
+        issueId: issue.id,
+        reviewId: review.id,
+        assigneeTeamId: team.id, // upstream AssigneeTeamID (review.go:865)
+        createdAt: now,
+        updatedAt: now,
+      }).returning(),
+      db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
+    ]);
+    const teamComment = teamCommentRows[0]!;
+
+    // The team-members expansion + per-member mail (teamReviewRequestNotify,
+    // review_request.go:233-252) — best-effort, never fails the request.
+    try {
+      const doerRow = (await db.select().from(users).where(eq(users.id, doerId)).limit(1).all())[0] ?? null;
+      if (doerRow === null) {
+        console.error(`[pull-reviews] team review-request mail skipped: doer row missing [id: ${doerId}]`);
+      } else {
+        const members = await db
+          .select({ user: users })
+          .from(teamMembers)
+          .innerJoin(users, eq(users.id, teamMembers.userId))
+          .where(eq(teamMembers.teamId, team.id))
+          .orderBy(users.fullName, users.username);
+        for (const { user: member } of members) {
+          if (issue.posterId !== null && member.id === issue.posterId) {
+            continue; // the poster member is skipped (review_request.go:241-243)
+          }
+          await this.emitReviewRequestMail(issue, doerId, member, teamComment, true);
+        }
+      }
+    } catch (mailError) {
+      console.error(
+        `[pull-reviews] team review-request mail failed (team ${team.id}, issue ${issue.id}): ${mailError instanceof Error ? mailError.message : String(mailError)}`,
+      );
+    }
+    return review;
+  }
+
+  /**
+   * RecalculateReviewsOfficial (models/issues/review.go:332-368) — the
+   * retarget's official-flag refresh: the flags were computed against the
+   * OLD base branch's protection rules, so after ChangeTargetBranch moves
+   * `base_branch` they must be re-evaluated against the NEW one ("Otherwise
+   * a stale official approval could bypass the new branch's protection",
+   * services/pull/pull.go:327-330). Upstream shape, kept verbatim: clear
+   * `official` on EVERY approve/reject review of the issue, then restore it
+   * on the LATEST approve/reject review per reviewer whose reviewer is
+   * official under the new base (FindLatestReviews' per-reviewer latest —
+   * older decision rows stay cleared). Not transactional here (the landed
+   * engine composes its tail post-CAS; the same documented posture as the
+   * retarget's comment write).
+   */
+  async recalculateReviewsOfficial(found: RepositoryWithOwner, issueId: number, baseBranch: string): Promise<void> {
+    const db = this.db;
+    await db
+      .update(pullReviews)
+      .set({ official: false })
+      .where(and(eq(pullReviews.issueId, issueId), inArray(pullReviews.type, [ReviewType.Approve, ReviewType.Reject])))
+      .run();
+    const decisions = await db
+      .select({ id: pullReviews.id, reviewerId: pullReviews.reviewerId })
+      .from(pullReviews)
+      .where(and(eq(pullReviews.issueId, issueId), inArray(pullReviews.type, [ReviewType.Approve, ReviewType.Reject])))
+      .all();
+    // reviewerId → the LATEST decision row's id (FindLatestReviews' shape).
+    const latestByReviewer = new Map<number, number>();
+    for (const row of decisions) {
+      if (row.reviewerId === null) continue;
+      const current = latestByReviewer.get(row.reviewerId);
+      if (current === undefined || row.id > current) {
+        latestByReviewer.set(row.reviewerId, row.id);
+      }
+    }
+    for (const [reviewerId, reviewRowId] of latestByReviewer) {
+      const reviewer = (await db.select().from(users).where(eq(users.id, reviewerId)).limit(1).all())[0] ?? null;
+      if (!(await isOfficialReviewer(this.d1, found, baseBranch, reviewer))) continue;
+      await db.update(pullReviews).set({ official: true }).where(eq(pullReviews.id, reviewRowId)).run();
+    }
   }
 
   /**

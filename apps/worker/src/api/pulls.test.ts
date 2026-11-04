@@ -20,11 +20,11 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, pullRequests, pullReviews, repoCounters, repoSettings, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, PRStatus, pullRequests, pullReviews, repoCounters, repoSettings, repositories, ReviewType, teamMembers, teamRepoAccess, teams, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
@@ -306,6 +306,17 @@ async function seedPull(
     await service().closeIssue(issue.id, { actorId: options.posterId ?? null });
   }
   return { id: issue.id, index: issue.index, prId: pullRequest.id };
+}
+
+/** The PR row of a repo's Nth (0-based) issue — pull_requests links via issueId. */
+async function prRowByRepo(repoId: string): Promise<Array<typeof pullRequests.$inferSelect>> {
+  const issueRows = await db().select().from(issues).where(eq(issues.repoId, repoId)).all();
+  const rows: Array<typeof pullRequests.$inferSelect> = [];
+  for (const issue of issueRows) {
+    const pr = await db().select().from(pullRequests).where(eq(pullRequests.issueId, issue.id)).all();
+    rows.push(...pr);
+  }
+  return rows;
 }
 
 type DeliveryRow = typeof webhookDeliveries.$inferSelect;
@@ -655,8 +666,236 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     const payload = JSON.parse(all[0]!.payloadContent) as { pull_request: Record<string, unknown> };
     expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
   });
+
+  // -------------------------------------------------------------------------
+  // The create-carried people arms (pull.go:526-539): assignees resolve
+  // through loadAssigneeUserIDs, reviewers/team_reviewers through
+  // parseReviewersByNames — all BEFORE NewPullRequest writes a row (the
+  // first miss aborts clean), the assignee rows riding the landed
+  // issue_assignees machinery and the reviewer requests the landed
+  // review-request machinery (B-48/B-49's census class).
+  // -------------------------------------------------------------------------
+
+  it("applies create-carried assignees: rows + type-9 comments, one assign webhook AFTER opened, the 201 carries them", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "people-a");
+    await seedEngineBranches(owner.usernameLower, "people-a", ["feature"]);
+    const bob = await seedUser("Bob");
+    const hookId = await seedHook(repoId, ["pull_request", "pull_request_assign"]);
+
+    const res = await createPull("/repos/Alice/people-a/pulls", {
+      title: "assigned at birth",
+      head: "feature",
+      base: "main",
+      assignees: ["Bob"],
+      assignee: "Alice",
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ assignee: { login: string } | null; assignees: Array<{ login: string }> }>();
+    expect(body.assignees.map((u) => u.login).sort()).toEqual(["Alice", "Bob"]);
+    // The deprecated field duplicates the FIRST resolved assignee — upstream's
+    // arg order puts the singular FIRST (loadAssigneeUserIDs(ctx,
+    // form.Assignee, form.Assignees)), the deterministic analogue of its
+    // Set-randomized insertion order (the issues-create twin pins the same).
+    expect(body.assignee?.login).toBe("Alice");
+
+    const pr = await prRowByRepo(repoId);
+    const assigneeRows = await db().select().from(issueAssignees).where(eq(issueAssignees.issueId, pr[0]!.issueId)).all();
+    expect(assigneeRows.map((r) => r.assigneeId).sort()).toEqual([bob.id, owner.id].sort());
+    // One type-9 comment per added assignee (AddAssigneeIfNotAssigned →
+    // ToggleIssueAssignee, the landed trio core).
+    const comments9 = await db().select().from(comments).where(and(eq(comments.issueId, pr[0]!.issueId), eq(comments.type, CommentType.Assignees))).all();
+    expect(comments9.map((c) => c.assigneeId).sort()).toEqual([bob.id, owner.id].sort());
+
+    // Webhook order: the review of the deliveries — opened FIRST, then ONE
+    // pull_request_assign per added assignee (NewPullRequest :187 → :191-193).
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string; changes?: Record<string, unknown> });
+    expect(payloads[0]?.action).toBe("opened");
+    const assignPayloads = payloads.filter((p) => p.action === "assigned");
+    expect(assignPayloads).toHaveLength(2);
+    for (const p of assignPayloads) {
+      expect(Object.keys(p.changes ?? {})).toEqual(["added_assignees"]);
+    }
+  });
+
+  it("422s the create's unknown / org / non-assignable assignees BEFORE any row is written (loadAssigneeUserIDs, issue.go:539/:543-547 — the create wrapper has NO bracket pair, and orgs never resolve)", async () => {
+    await seedUser("Alice");
+    // The stub OWNS people-b: the private-repo arms below need the stub past
+    // the anti-enumeration 404 (the resolution itself is NOT writer-gated on
+    // this route — pull.go:526-528 is unconditional).
+    const repoId = await seedRepo("cf-gitea-stub", "people-b");
+    await db().update(repositories).set({ ownerId: 1 }).where(eq(repositories.id, repoId));
+    await seedEngineBranches("cf-gitea-stub", "people-b", ["feature", "f2", "f3", "f4"]);
+    // An org row in the users table — GetDoerUsersByNames filters
+    // type IN (individual, bot), so the org login misses like a ghost.
+    await db().insert(users).values({ username: "teamorg", usernameLower: "teamorg", isAdmin: false, status: "active", type: "org", visibility: "public", createdAt: new Date("2026-01-01T00:00:00Z") });
+
+    const unknown = await createPull("/repos/cf-gitea-stub/people-b/pulls", { title: "x", head: "feature", base: "main", assignees: ["ghost"] });
+    expect(unknown.status).toBe(422);
+    expect(await unknown.json()).toEqual({ message: "Assignee does not exist: user does not exist [uid: 0, name: ghost]", url: ERROR_URL });
+
+    const org = await createPull("/repos/cf-gitea-stub/people-b/pulls", { title: "x", head: "f2", base: "main", assignees: ["teamorg"] });
+    expect(org.status).toBe(422);
+    expect(await org.json()).toEqual({ message: "Assignee does not exist: user does not exist [uid: 0, name: teamorg]", url: ERROR_URL });
+
+    // CanBeAssigned misses → 422 "User %s cannot be assigned to this issue"
+    // — the create arm's own not-a-collaborator outcome, pre-write.
+    await db().update(repositories).set({ visibility: "private" }).where(eq(repositories.id, repoId));
+    await seedUser("Recluse");
+    const notAssignable = await createPull("/repos/cf-gitea-stub/people-b/pulls", { title: "x", head: "f3", base: "main", assignees: ["Recluse"] });
+    expect(notAssignable.status).toBe(422);
+    expect(await notAssignable.json()).toEqual({ message: "User Recluse cannot be assigned to this issue", url: ERROR_URL });
+    await db().update(repositories).set({ visibility: "public" }).where(eq(repositories.id, repoId));
+
+    // The blocked-assignee half of NewPullRequest's arm (pull.go:64-65): the
+    // poster blocked by a REQUESTED assignee answers 403 pre-write.
+    const blocker = await seedUser("Blocker");
+    await db().insert(userBlocking).values({ blockerId: blocker.id, blockeeId: 1, note: "", createdAt: new Date() });
+    const blocked = await createPull("/repos/cf-gitea-stub/people-b/pulls", { title: "x", head: "f4", base: "main", assignees: ["Blocker"] });
+    expect(blocked.status).toBe(403);
+    expect(await blocked.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+
+    // No arm above wrote a row.
+    const rows = await prRowByRepo(repoId);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("applies create-carried reviewers: REQUEST rows + review_request webhooks BEFORE the opened webhook (NewPullRequest :169-181 → :187)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "people-c");
+    await seedEngineBranches(owner.usernameLower, "people-c", ["feature"]);
+    const bob = await seedUser("Bob");
+    // The email form resolves through GetUserByEmail (parseReviewersByNames
+    // :835): seed the address the request uses.
+    await db().update(users).set({ email: "bob@people.invalid" }).where(eq(users.id, bob.id));
+    const hookId = await seedHook(repoId, ["pull_request", "pull_request_review_request"]);
+
+    const res = await createPull("/repos/Alice/people-c/pulls", {
+      title: "review me",
+      head: "feature",
+      base: "main",
+      reviewers: ["Bob", "bob@people.invalid"],
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ requested_reviewers: Array<{ login: string }> }>();
+    expect(body.requested_reviewers.map((u) => u.login).sort()).toEqual(["Bob"]);
+
+    const pr = await prRowByRepo(repoId);
+    const requests = await db().select().from(pullReviews).where(eq(pullReviews.issueId, pr[0]!.issueId)).all();
+    // The name and the email resolve to the SAME user; the loop's second arm
+    // rides AddReviewRequest's already-requested skip — (nil, nil), no row,
+    // no comment, no webhook (models/issues/review.go:709-714).
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.type).toBe(ReviewType.Request);
+    expect(requests[0]!.reviewerId).toBe(bob.id); // the email form resolves to the same row
+    // ONE type-27 comment for the ONE created request (AddReviewRequest :759-771).
+    const comments27 = await db().select().from(comments).where(and(eq(comments.issueId, pr[0]!.issueId), eq(comments.type, CommentType.ReviewRequest))).all();
+    expect(comments27).toHaveLength(1);
+
+    // Webhook order: the review_requested event lands BEFORE the opened
+    // webhook (upstream's loops precede notify_service.NewPullRequest).
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string });
+    expect(payloads[0]?.action).toBe("review_requested");
+    expect(payloads[1]?.action).toBe("opened");
+  });
+
+  it("applies team_reviewers on an ORG-owned repo; a user-owned repo silently ignores them (parseReviewersByNames' org gate, pull_review.go:857)", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "people-d");
+    await seedEngineBranches(owner.usernameLower, "people-d", ["feature", "f2"]);
+    await db().insert(users).values({ username: "teamorg", usernameLower: "teamorg", isAdmin: false, status: "active", type: "org", visibility: "public", createdAt: new Date("2026-01-01T00:00:00Z") });
+    const orgRows = await db().select().from(users).where(eq(users.usernameLower, "teamorg")).all();
+    const teamOrg = orgRows[0]!;
+    const orgRepoId = await seedRepo("teamorg", "orgpeople");
+    await db().update(repositories).set({ ownerId: teamOrg.id }).where(eq(repositories.id, orgRepoId));
+    await seedEngineBranches("teamorg", "orgpeople", ["feature", "f2"]);
+    const teamRows = await db().insert(teams).values({ orgId: teamOrg.id, lowerName: "devs", name: "devs", authorize: "write" }).returning({ id: teams.id }).all();
+    const teamId = teamRows[0]!.id;
+
+    // User-owned repo: team_reviewers silently ignored — no team rows, 201.
+    const userOwned = await createPull("/repos/Alice/people-d/pulls", { title: "x", head: "feature", base: "main", team_reviewers: ["devs", "ghost-team"] });
+    expect(userOwned.status).toBe(201);
+    expect((await userOwned.json<{ requested_reviewers_teams: unknown[] }>()).requested_reviewers_teams).toEqual([]);
+
+    // Org-owned repo: the team REQUEST row + the type-27 comment carrying
+    // assigneeTeamId (AddTeamReviewRequest, review.go:822-876).
+    const orgOwned = await createPull("/repos/teamorg/orgpeople/pulls", { title: "x", head: "feature", base: "main", team_reviewers: ["devs"] });
+    expect(orgOwned.status).toBe(201);
+    const pr = await prRowByRepo(orgRepoId);
+    const requests = await db().select().from(pullReviews).where(eq(pullReviews.issueId, pr[0]!.issueId)).all();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.reviewerTeamId).toBe(teamId);
+    const comments27 = await db().select().from(comments).where(and(eq(comments.issueId, pr[0]!.issueId), eq(comments.type, CommentType.ReviewRequest))).all();
+    expect(comments27[0]!.assigneeTeamId).toBe(teamId);
+
+    // Unknown team on the org-owned repo → 404 BEFORE the row (parseReviewersByNames :866-877).
+    const unknownTeam = await createPull("/repos/teamorg/orgpeople/pulls", { title: "y", head: "f2", base: "main", team_reviewers: ["ghost-team"] });
+    expect(unknownTeam.status).toBe(404);
+    expect(await unknownTeam.json()).toEqual({ message: "team doesn't exist: ghost-team", url: ERROR_URL });
+    const prCount = await prRowByRepo(orgRepoId);
+    expect(prCount).toHaveLength(1);
+  });
+
+  it("404s an unknown reviewer BEFORE any row; an INVALID reviewer answers the create route's unmapped 500 AFTER the PR committed (pull.go:547-555's ladder has no ErrNotValidReviewRequest arm)", async () => {
+    await seedUser("Alice");
+    const repoId = await seedRepo("cf-gitea-stub", "people-e");
+    await db().update(repositories).set({ ownerId: 1 }).where(eq(repositories.id, repoId));
+    await seedEngineBranches("cf-gitea-stub", "people-e", ["feature", "f2"]);
+    await seedUser("Recluse");
+
+    const unknownReviewer = await createPull("/repos/cf-gitea-stub/people-e/pulls", { title: "x", head: "feature", base: "main", reviewers: ["ghost"] });
+    expect(unknownReviewer.status).toBe(404);
+    expect(await unknownReviewer.json()).toEqual({ message: "user doesn't exist: ghost", url: ERROR_URL });
+    expect(await prRowByRepo(repoId)).toHaveLength(0);
+
+    // A private repo's outsider can't read → Reviewer can't read — the
+    // APIErrorInternal 500 with the exact ErrNotValidReviewRequest text,
+    // the PR row ALREADY COMMITTED (upstream's committed-prefix wart).
+    await db().update(repositories).set({ visibility: "private" }).where(eq(repositories.id, repoId));
+    const invalid = await createPull("/repos/cf-gitea-stub/people-e/pulls", { title: "x", head: "f2", base: "main", reviewers: ["Recluse"] });
+    expect(invalid.status).toBe(500);
+    expect(await invalid.json()).toEqual({
+      message: `Reviewer can't read [user_id: 1, repo_id: ${repoId}]`,
+      url: ERROR_URL,
+    });
+    expect(await prRowByRepo(repoId)).toHaveLength(1);
+  });
 });
 
+// ---------------------------------------------------------------------------
+// POST /repos/{owner}/{repo}/merge-upstream (repoMergeUpstream, B-51) — the
+// middleware family. The full service matrix (fork gate, the three styles,
+// the verbatim texts) rides the real cells in pull-engine.test.ts; here the
+// stub harness pins the arms upstream answers BEFORE the service body.
+// ---------------------------------------------------------------------------
+
+describe("POST /repos/{owner}/{repo}/merge-upstream (repoMergeUpstream)", () => {
+  it("403s a non-writer with reqRepoWriter's text, 423s an archived repo before the gate (api.go:1314's middleware order)", async () => {
+    await seedUser("Alice");
+    await seedRepo("alice", "mu-gates");
+    // The stub doer (id 1) holds no grant on Alice's public repo — the write
+    // gate answers upstream's reqRepoWriter 403 (api.go:392-400).
+    const writeGate = await router()("/repos/alice/mu-gates/merge-upstream", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ branch: "main" }),
+    });
+    expect(writeGate.status).toBe(403);
+    expect(await writeGate.json()).toEqual({ message: "user should have a permission to write to a repo", url: ERROR_URL });
+
+    // The archived arm answers BEFORE the write gate (mustNotBeArchived is
+    // middleware #2, reqRepoWriter #3) — a stub-OWNED repo the stub cannot
+    // write would still 423 first.
+    await seedRepo("cf-gitea-stub", "mu-frozen", { archived: true });
+    const archived = await router()("/repos/cf-gitea-stub/mu-frozen/merge-upstream", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ branch: "main" }),
+    });
+    expect(archived.status).toBe(423);
+    expect(await archived.json()).toEqual({ message: "repo is archived", url: ERROR_URL });
+  });
+});
 // ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/pulls (repoListPullRequests)
 // ---------------------------------------------------------------------------
@@ -859,6 +1098,7 @@ describe("GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest)", () => {
     expect(body.changed_files).toBeUndefined();
   });
 
+
   it("omits the trio for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:247-250)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "diffstat-c");
@@ -1029,8 +1269,108 @@ describe("PATCH /repos/{owner}/{repo}/pulls/{index} (repoEditPullRequest)", () =
     const bind = await patchPull("/repos/alice/visible/pulls/1", { content_version: "not a number" });
     expect(bind.status).toBe(422);
   });
-});
 
+  // -------------------------------------------------------------------------
+  // form.base — the retarget arm (pull.go:748-772, B-50): the gate skips
+  // silently on merged/empty/same-base, the branch probe 404s, the mapped
+  // model errors ride their upstream statuses/texts, success lands the CAS +
+  // the type-25 comment + the edited webhook with changes.ref.from.
+  // -------------------------------------------------------------------------
+
+  it("retargets base: CAS reset to checking, the type-25 comment, the edited webhook with changes.ref.from (pull.go:748-772)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "retarget-a");
+    const tip = await seedEngineBranches(owner.usernameLower, "retarget-a", ["feature", "release"]);
+    await landChildCommit(owner.usernameLower, "retarget-a", "release", tip, [
+      { name: "README.md", content: "# retarget-a release\n" },
+    ], "release ahead\n");
+    await createPull("/repos/Alice/retarget-a/pulls", { title: "move me", head: "feature", base: "main" });
+    const hookId = await seedHook(repoId, ["pull_request"]);
+
+    const res = await patchPull("/repos/alice/retarget-a/pulls/1", { base: "release" });
+    expect(res.status).toBe(201);
+    expect((await res.json<{ base: { ref: string } }>()).base.ref).toBe("release");
+
+    const pr = await prRowByRepo(repoId);
+    expect(pr[0]!.baseBranch).toBe("release");
+    expect(pr[0]!.status).toBe(PRStatus.Checking); // the lazy-check reset
+    expect(pr[0]!.mergeBase).toBeNull();
+    expect(pr[0]!.conflictedFiles).toBeNull();
+
+    // The type-25 comment with oldRef/newRef — NO num_comments bump
+    // (updateCommentInfos' switch, comment.go:927-955).
+    const rows = await db().select().from(comments).where(eq(comments.issueId, pr[0]!.issueId)).all();
+    expect(rows.map((r) => r.type)).toEqual([CommentType.ChangeTargetBranch]);
+    expect(rows[0]!.oldRef).toBe("main");
+    expect(rows[0]!.newRef).toBe("release");
+
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string; changes?: Record<string, { ref?: { from: string } }> });
+    expect(payloads.map((p) => p.action)).toEqual(["edited"]);
+    expect(payloads[0]?.changes).toEqual({ ref: { from: "main" } });
+  });
+
+  it("maps the retarget refusals: unknown branch 404, same-base/merged silent skips, closed 422, branches-equal 500 (the upstream typo verbatim), duplicate 409", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "retarget-b");
+    await seedEngineBranches(owner.usernameLower, "retarget-b", ["feature", "release", "f2", "f3"]);
+    await createPull("/repos/Alice/retarget-b/pulls", { title: "pr one", head: "feature", base: "main" });
+
+    // Branch probe FIRST (pull.go:751-756): 404 with the exact render.
+    const unknown = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "ghost" });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toEqual({ message: "new base 'ghost' not exist", url: ERROR_URL });
+
+    // Same base → the gate's silent skip (pull.go:748): 201, no comment.
+    const same = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "main" });
+    expect(same.status).toBe(201);
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+
+    // Merged PR → skipped silently too (the gate's !pr.HasMerged).
+    const prRow = await prRowByRepo(repoId);
+    await db().update(pullRequests).set({ hasMerged: true }).where(eq(pullRequests.id, prRow[0]!.id));
+    const merged = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "release" });
+    expect(merged.status).toBe(201);
+    expect((await merged.json<{ base: { ref: string } }>()).base.ref).toBe("main");
+    await db().update(pullRequests).set({ hasMerged: false }).where(eq(pullRequests.id, prRow[0]!.id));
+
+    // seedEngineBranches points every branch at the SAME tip, so a retarget
+    // to `release` hits IsHeadEqualWithBranch → ErrBranchesEqual → the
+    // route's UNMAPPED arm → APIErrorInternal 500 with the exact text —
+    // upstream's own `%sm` typo verbatim (models/git/branch.go:95-97).
+    const equal = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "release" });
+    expect(equal.status).toBe(500);
+    expect(await equal.json()).toEqual({ message: "branches are equal [head: featurem base: release]", url: ERROR_URL });
+
+    // Closed PR + an existing branch → ErrIssueIsClosed → 422.
+    const service = new IssuesService(env.DB);
+    await service.closeIssue(prRow[0]!.issueId, { actorId: 1 });
+    const closed = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "release" });
+    expect(closed.status).toBe(422);
+    expect(await closed.json()).toEqual({
+      message: `Pull Request [id: ${prRow[0]!.issueId}, repo_id: ${repoId}, index: 1] is already closed`,
+      url: ERROR_URL,
+    });
+    await service.reopenIssue(prRow[0]!.issueId, { actorId: 1 });
+
+    // Duplicate open PR spanning feature → release (pull.go:757-760 → 409):
+    // move release ahead first — equal tips would answer the branches-equal
+    // 500 before the duplicate probe (upstream's check order :261-282).
+    const relTip = refTipMap(await engineReads(env, { ownerNamespace: owner.usernameLower, slug: "retarget-b" }).listRefs()).get("refs/heads/release")?.target;
+    await landChildCommit(owner.usernameLower, "retarget-b", "release", relTip ?? "", [
+      { name: "README.md", content: "# retarget-b release\n" },
+    ], "release ahead\n");
+    await createPull("/repos/Alice/retarget-b/pulls", { title: "pr two", head: "feature", base: "release" });
+    const duplicate = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "release" });
+    expect(duplicate.status).toBe(409);
+    const releaseIssue = await db().select().from(issues).where(and(eq(issues.repoId, repoId), eq(issues.index, 2))).all();
+    const releasePr = await db().select().from(pullRequests).where(eq(pullRequests.issueId, releaseIssue[0]!.id)).all();
+    expect(await duplicate.json()).toEqual({
+      message: "pull request already exists for these targets [id: " + releasePr[0]!.id +
+        ", issue_id: 2, head_repo_id: " + String(repoId) + ", base_repo_id: " + String(repoId) + ", head_branch: feature, base_branch: release]",
+      url: ERROR_URL,
+    });
+  });
+});
 // ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBaseHead)
 // ---------------------------------------------------------------------------
@@ -1135,6 +1475,7 @@ describe("the pull webhook payloads' diff-stat trio (merge + assign)", () => {
     expect(payload.action).toBe("assigned");
     expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
   });
+
 });
 
 // ---------------------------------------------------------------------------

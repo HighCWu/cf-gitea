@@ -47,8 +47,13 @@ import {
 } from "./engine";
 import type { EngineMergeBaseResult, EngineReads } from "./engine";
 import { engineRepoName } from "./engine";
-import { findRepositoryById, type RepositoryWithOwner } from "./repository";
+import { canViewRepository, doerRepoAccessMode, findRepositoryById, viewerOf, type RepositoryWithOwner } from "./repository";
 import { loadRepoSettings } from "./repo-settings";
+// Cycle disclosure: ./pull-reviews imports nothing from THIS module; the
+// edge exists so the retarget's tail rides the same official-flag predicate
+// the review arms use (one isOfficialReviewer, RecalculateReviewsOfficial's
+// re-evaluation included).
+import { PullReviewsService } from "./pull-reviews";
 // The squash default-body builders (the compose arm's GetSquashMergeCommitMessages
 // + Reviewed-on half) — the api→page seam; pull-merge-box imports THIS module's
 // merge entry points back, so the edge is a lazy cycle (function-body bindings
@@ -808,15 +813,179 @@ async function notifyMailMergePullRequest(
 }
 
 /**
- * POST /merge-upstream permission gate + the fork gate: forks cannot exist
- * yet (SPEC-0003 fork primitives pending), so every repo answers 404 — the
- * endpoint is wired for the day a `repositories.base_repo_id` column lands.
+ * POST /merge-upstream's service (repo_service.MergeUpstream,
+ * services/repository/merge_upstream.go:22-100): sync a FORK's branch with
+ * its base. The gate ladder in upstream order — the write gate (the route's
+ * reqRepoWriter(TypeCode) middleware, 403 "user should have a permission to
+ * write to a repo"), the base-code read gate (:32-41 — a fork created while
+ * the base was public must not keep pulling after it turned private; 403
+ * "permission denied to read base repo %d"), the fork gate (400 "repo is not
+ * a fork"), the branch resolution (GetUpstreamDivergingInfo :102-133: the
+ * fork branch must exist — 404 ErrBranchNotExist's render with the upstream
+ * MISSING-COMMA verbatim, models/git/branch.go:50 "branch does not exist
+ * [repo_id: %d name: %s]"; the base-side name is the fork's own branch when
+ * the base has it, else the base's default branch), then the three styles:
+ * "up-to-date" (the base tip is already an ancestor), "fast-forward" (the
+ * base→fork push lands — upstream PushManaged's ff move), and "merge" (the
+ * diverged fall-through: upstream fakes a REVERSE PR — pull.Update's
+ * reversePR swap, services/pull/update.go:96-107 — and merges the base INTO
+ * the fork branch with the verbatim message "merge upstream"; ff_only
+ * refuses the fall-through with 400 "fast-forward merge not possible:
+ * branch has diverged"). Conflict/unrelated answers 409 (the route's
+ * IsErrMergeConflicts / IsErrMergeUnrelatedHistories arms).
+ *
+ * Adaptations (documented, the platform's shape): upstream pushes FROM the
+ * base repo INTO the fork (PushManaged); our fork cells are full object
+ * copies (SPEC-0001b §5.2) so the base history is already in the fork's
+ * cell and the FF move / reverse merge execute THERE — executeMerge with
+ * the fork branch as the CAS'd base ref and the base tip as the head oid
+ * (fast-forward-only for the ff arm, merge for the reverse-PR arm). The
+ * ancestry probe (BaseBranchHasNewCommits, GetBranchDivergingInfo's
+ * has-previous-commit arm) computes the same way — mergeBase in the fork
+ * cell. Upstream's push webhooks for the moved fork branch ride the push
+ * pipeline (notifier fan-out on the receive path); the API write here moves
+ * the ref through the engine's CAS landing, which carries none — the same
+ * posture as every engine-driven merge.
  */
-export async function mergeUpstream(c: Context<ApiEnv>, pair: RepositoryWithOwner): Promise<never> {
+export async function mergeUpstream(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  input: { branch: string; ffOnly: boolean },
+): Promise<{ mergeStyle: "up-to-date" | "fast-forward" | "merge" }> {
+  // reqRepoWriter(TypeCode) (api.go:1314 → :392-400): the write gate —
+  // "user should have a permission to write to a repo".
   if (!(await canWriteRepository(c, pair))) {
-    throw new ApiError(403, "Must have write access");
+    throw new ApiError(403, "user should have a permission to write to a repo");
   }
-  throw new ApiError(404, "repository has no upstream (forks cannot exist yet)");
+  if (pair.repo.forkParent === null) {
+    // GetUpstreamDivergingInfo's fork gate (:107-109): InvalidArgument —
+    // "repo is not a fork" — the route maps to 400.
+    throw new ApiError(400, "repo is not a fork");
+  }
+  const basePair = await findRepositoryById(c.env.DB, pair.repo.forkParent);
+  if (basePair === null) {
+    // The fork edge dangles (the source was deleted): upstream's GetBaseRepo
+    // fails ErrRepoNotExist — the route's unmapped arm answers 500.
+    throw new ApiError(500, `base repository does not exist [id: ${pair.repo.forkParent}]`);
+  }
+
+  // The base-code read gate (:32-41): GetDoerRepoPermission(baseRepo,
+  // doer).CanRead(TypeCode) — a PUBLIC base reads for any doer (the
+  // visibility matrix), a private one needs the grant.
+  const doer = c.get("authUser");
+  const doerId = doer?.id ?? null;
+  const canReadBase = doerId !== null && (canViewRepository(viewerOf(c), basePair.repo) || (await doerRepoAccessMode(c.env.DB, basePair.repo, doerId)) !== "none");
+  if (!canReadBase) {
+    throw new ApiError(403, `permission denied to read base repo ${basePair.repo.id}`);
+  }
+
+  const forkCell = engineCell(c.env, pair.repo);
+  const baseCellReads = engineReads(c.env, basePair.repo);
+  const forkReads = engineReads(c.env, pair.repo);
+
+  // The branch resolution (:111-133): the FORK branch must exist (the head
+  // side resolves FIRST — GetBranchDivergingInfo :763-765 — so its miss is
+  // the 404 the route answers).
+  const forkTip = refTipMap(await forkReads.listRefs()).get(branchRef(input.branch))?.target;
+  if (forkTip === undefined) {
+    throw new ApiError(404, `branch does not exist [repo_id: ${pair.repo.id} name: ${input.branch}]`);
+  }
+  // The BASE-side name: the fork's own branch when the base has it ("Do the
+  // best to follow the GitHub's behavior", :120-124), else the base's
+  // default branch; a default-branch miss is the second GetBranchExisting's
+  // ErrBranchNotExist — 404 with the base repo's id + name.
+  const baseTipMap = refTipMap(await baseCellReads.listRefs());
+  let baseBranchName = input.branch;
+  let baseTip = baseTipMap.get(branchRef(input.branch))?.target;
+  if (baseTip === undefined) {
+    baseBranchName = basePair.repo.defaultBranch;
+    baseTip = baseTipMap.get(branchRef(baseBranchName))?.target;
+    if (baseTip === undefined) {
+      throw new ApiError(404, `branch does not exist [repo_id: ${basePair.repo.id} name: ${baseBranchName}]`);
+    }
+  }
+
+  // The base fetch (the pr-create arm's FetchRemoteTempCommit posture,
+  // compare.go:73-80): when the base advanced past the fork point its tip
+  // (and the commits beyond the fork point) are absent from the fork cell —
+  // carry the closure in, OBJECTS ONLY no ref, so the ancestry walk and the
+  // merges below resolve. Idempotent (putApiObjects no-ops on known oids).
+  if ((await forkCell.readCommit(baseTip)) === null) {
+    await carryLooseRefs(
+      carrySource(c.env, basePair.repo),
+      carryTarget(c.env, pair.repo),
+      [{ name: branchRef(baseBranchName), target: baseTip }],
+      null,
+      await packedCatalogOids(carrySource(c.env, pair.repo)),
+      `${basePair.repo.ownerNamespace}/${basePair.repo.slug} -> ${pair.repo.ownerNamespace}/${pair.repo.slug} (merge-upstream base fetch)`,
+    );
+  }
+
+  // BaseBranchHasNewCommits (GetBranchDivergingInfo :767-814's
+  // has-previous-commit tail): the base tip is NOT an ancestor of the fork
+  // tip. Equal tips and a behind fork answer "up-to-date" (:44-46). An
+  // unresolvable merge base (unrelated histories) counts as new base
+  // commits — the diverged walk below answers its own 409.
+  const ancestry = await forkCell.mergeBase(baseTip, forkTip);
+  const baseHasNewCommits = !(ancestry.tag === "ok" && ancestry.base === baseTip);
+  if (!baseHasNewCommits) {
+    return { mergeStyle: "up-to-date" };
+  }
+
+  const person = mergePerson(c, new Date());
+
+  // The ff attempt (:48-56): the base→fork push with normal (non-forced)
+  // semantics — a non-descendant base tip is the PushOutOfDate rejection.
+  // Our CAS landing: fast-forward-only moves the fork branch onto the base
+  // tip; not_fast_forward / ref_conflict / unrelated all fall through to
+  // the reverse-merge arm, upstream's out-of-date/rejected fall-through
+  // (:58-70).
+  const ff = await forkCell.executeMerge({
+    style: "fast-forward-only",
+    base: branchRef(input.branch),
+    head: baseTip,
+    expectedBaseOid: forkTip,
+    message: "",
+    author: person,
+    committer: person,
+    extraRefUpdates: [],
+  });
+  if (ff.tag === "committed") {
+    return { mergeStyle: "fast-forward" };
+  }
+
+  // The ff_only refusal (:62-65): InvalidArgument — "fast-forward merge not
+  // possible: branch has diverged" — 400.
+  if (input.ffOnly) {
+    throw new ApiError(400, "fast-forward merge not possible: branch has diverged");
+  }
+
+  // The reverse-PR merge (:67-97): pull.Update's fake-PR swap (update.go:
+  // 96-107) merges the BASE branch INTO the fork branch with the verbatim
+  // message "merge upstream". Conflicts and unrelated histories are the
+  // route's 409 family (IsErrMergeConflicts / IsErrMergeUnrelatedHistories);
+  // the upstream renders embed raw git output our engine doesn't capture,
+  // so the texts carry the condition prefix with our engine's detail.
+  const merged = await forkCell.executeMerge({
+    style: "merge",
+    base: branchRef(input.branch),
+    head: baseTip,
+    expectedBaseOid: forkTip,
+    message: "merge upstream",
+    author: person,
+    committer: person,
+    extraRefUpdates: [],
+  });
+  if (merged.tag === "committed") {
+    return { mergeStyle: "merge" };
+  }
+  if (merged.tag === "conflict") {
+    throw new ApiError(409, `Merge Conflict Error: ${merged.conflictedFiles.join(", ")}`);
+  }
+  if (merged.tag === "nothing_to_merge" && merged.status === "unrelated") {
+    throw new ApiError(409, "Merge UnrelatedHistories Error: unrelated histories");
+  }
+  throw executeMergeError(merged);
 }
 
 /** The refs/pull/N/head write at PR creation (§3.4 creation flow step 4). */
@@ -1218,52 +1387,105 @@ export async function deleteBranchAfterMerge(
 
 /**
  * Change a pull request's target branch (services/pull/pull.go
- * ChangeTargetBranch, :226-320): the five refusals in upstream order (the
- * no-op same-branch return, the closed 409, the merged 409, the missing
- * target 400, the branches-equal 400), the duplicate-open-PR 409, then the
- * CAS landing over UpdateColsIfNotMerged's columns. The mergeability
- * re-check upstream runs inline (checkPullRequestBranchMergeable) delegates
- * here to the lazy check: the row CAS-resets to `checking` with
- * mergeBase/conflicts cleared and the next GET rewrites
- * status/conflicts/divergence/mergeBase (§3.4 — the PR is CREATED as
- * `checking`; a retarget is the same re-derivation). The branches-equal
- * comparison rides the BASE cell (the pull ref is the landed projection of
- * the fork head — carryForkHeadIntoBase), so the cross-repo compare stays
- * same-cell like every PR read (§10.8).
+ * ChangeTargetBranch, :226-358): the five refusals in upstream order (the
+ * no-op same-branch return, the closed arm, the merged arm, the missing
+ * target, the branches-equal arm), the duplicate-open-PR arm, then the CAS
+ * landing over UpdateColsIfNotMerged's columns followed by the in-transaction
+ * tail (RecalculateReviewsOfficial → the type-25 ChangeTargetBranch comment →
+ * the push-comments delete/recreate). The mergeability re-check upstream runs
+ * inline (checkPullRequestBranchMergeable) delegates here to the lazy check:
+ * the row CAS-resets to `checking` with mergeBase/conflicts cleared and the
+ * next GET rewrites status/conflicts/divergence/mergeBase (§3.4 — the PR is
+ * CREATED as `checking`; a retarget is the same re-derivation). The
+ * branches-equal comparison rides the BASE cell (the pull ref is the landed
+ * projection of the fork head — carryForkHeadIntoBase), so the cross-repo
+ * compare stays same-cell like every PR read (§10.8).
+ *
+ * Error flavors (`errorFlavor`): the SAME upstream refusals render through
+ * two mappers — the WEB merge-box flash texts (the landed `web` default,
+ * pull-merge-box.tsx's error-message relay) and the API route's ladder
+ * (pull.go:757-770: ErrPullRequestAlreadyExists→409, ErrIssueIsClosed→422,
+ * ErrPullRequestHasMerged→409, everything else — ErrBranchesEqual, the
+ * ErrBranchNotExist re-check, the CAS `pull request status has changed` —
+ * unmapped → APIErrorInternal 500 with err.Error(), the model renders
+ * verbatim including the `%sm` branches-equal typo,
+ * models/git/branch.go:95-97).
+ *
+ * The doer-carrying tail (`doerId`): upstream's tail runs INSIDE the service
+ * unconditionally (CreateComment needs the Doer). The landed web caller
+ * predates the tail (pull-merge-box.tsx passes no doer — its posture keeps
+ * the HEAD behavior until the web wave picks the doer up); the API route
+ * passes the doer and gets the full upstream tail. Non-transactional here —
+ * the same documented posture as the create arms.
  */
 export async function changePullRequestTargetBranch(
   c: Context<ApiEnv>,
   pair: RepositoryWithOwner,
   issue: IssueRow,
   pr: PullRequestRow,
-  input: { targetBranch: string; now: Date },
+  input: { targetBranch: string; now: Date; errorFlavor?: "web" | "api"; doerId?: number },
 ): Promise<{ baseBranch: string }> {
+  const flavor = input.errorFlavor ?? "web";
   // "Current target branch is already the same" (:234-236) — the no-op.
   if (pr.baseBranch === input.targetBranch) {
     return { baseBranch: pr.baseBranch };
   }
   if (issue.isClosed) {
-    throw new ApiError(409, "The pull request has been closed.");
+    // ErrIssueIsClosed (:240-247; the render is ErrIssueIsClosed.Error —
+    // "Pull Request [id, repo_id, index] is already closed"): web 409 flash
+    // / API ladder 422 err.Error().
+    throw flavor === "api"
+      ? new ApiError(422, `Pull Request [id: ${issue.id}, repo_id: ${issue.repoId}, index: ${issue.index}] is already closed`)
+      : new ApiError(409, "The pull request has been closed.");
   }
   if (pr.hasMerged) {
-    throw new ApiError(409, "Failed: The pull request has been merged. You cannot merge again or change the target branch.");
+    // ErrPullRequestHasMerged (:249-256; services/pull/pull.go:204-223's
+    // render — unreachable through the API route, whose gate skips merged
+    // silently, kept for the service's own parity).
+    const mergedRender = `pull request has merged [id: ${pr.id}, issue_id: ${pr.index}, head_repo_id: ${pr.headRepoId}, base_repo_id: ${pr.baseRepoId}, head_branch: ${pr.headBranch}, base_branch: ${pr.baseBranch}]`;
+    throw flavor === "api"
+      ? new ApiError(409, mergedRender)
+      : new ApiError(409, "Failed: The pull request has been merged. You cannot merge again or change the target branch.");
   }
-  const tips = refTipMap(await engineReads(c.env, pair.repo).listRefs());
+  const reads = engineReads(c.env, pair.repo);
+  const tips = refTipMap(await reads.listRefs());
   const targetTip = tips.get(branchRef(input.targetBranch))?.target;
   if (targetTip === undefined) {
-    throw new ApiError(400, "Target branch does not exist.");
+    // ErrBranchNotExist (:258-263) — the API route's probe answers 404
+    // before the service, so this arm is the web box's own render plus the
+    // API ladder's unmapped 500 (err.Error(), models/git/branch.go's
+    // "branch does not exist [repo_id: %d name: %s]" — upstream's missing
+    // comma verbatim).
+    throw flavor === "api"
+      ? new ApiError(500, `branch does not exist [repo_id: ${pair.repo.id} name: ${input.targetBranch}]`)
+      : new ApiError(400, "Target branch does not exist.");
   }
   // IsHeadEqualWithBranch → ErrBranchesEqual (:261-268): the head tip (the
   // pull ref) equals the target tip — the retarget changes nothing.
   const headTip = tips.get(pullHeadRef(pr.index))?.target;
   if (headTip !== undefined && headTip === targetTip) {
-    throw new ApiError(400, "There are no differences to show. There is no need to create a pull request.");
+    // The API ladder has NO ErrBranchesEqual arm → APIErrorInternal 500 with
+    // err.Error() — models/git/branch.go:95-97's `%sm` typo verbatim (the
+    // literal "m" rides the head branch name). The web box answers the
+    // compare-view no-differences flash.
+    throw flavor === "api"
+      ? new ApiError(500, `branches are equal [head: ${pr.headBranch}m base: ${input.targetBranch}]`)
+      : new ApiError(400, "There are no differences to show. There is no need to create a pull request.");
   }
   // GetUnmergedPullRequest duplicate (:270-282): an open unmerged Github-flow
-  // PR already spans head → target. The user_error is has_pull_request's
-  // sentence with the link stripped to text (the flash is plain text).
+  // PR already spans head → target. The API ladder maps
+  // ErrPullRequestAlreadyExists → 409 err.Error() (models/issues/pull.go's
+  // "pull request already exists for these targets [...]" render); the web
+  // flash strips the link to text.
   const duplicate = await drizzle(c.env.DB)
-    .select({ index: pullRequests.index })
+    .select({
+      id: pullRequests.id,
+      index: pullRequests.index,
+      headRepoId: pullRequests.headRepoId,
+      baseRepoId: pullRequests.baseRepoId,
+      headBranch: pullRequests.headBranch,
+      baseBranch: pullRequests.baseBranch,
+    })
     .from(pullRequests)
     .innerJoin(issues, eq(issues.id, pullRequests.issueId))
     .where(
@@ -1281,10 +1503,16 @@ export async function changePullRequestTargetBranch(
     .limit(1)
     .all();
   if (duplicate.length > 0) {
-    throw new ApiError(
-      409,
-      `A pull request between these branches already exists: ${pair.repo.ownerNamespace}/${pair.repo.slug}#${duplicate[0]!.index}`,
-    );
+    const dup = duplicate[0]!;
+    throw flavor === "api"
+      ? new ApiError(
+          409,
+          `pull request already exists for these targets [id: ${dup.id}, issue_id: ${dup.index}, head_repo_id: ${dup.headRepoId}, base_repo_id: ${dup.baseRepoId}, head_branch: ${dup.headBranch}, base_branch: ${dup.baseBranch}]`,
+        )
+      : new ApiError(
+          409,
+          `A pull request between these branches already exists: ${pair.repo.ownerNamespace}/${pair.repo.slug}#${dup.index}`,
+        );
   }
   const updated = await drizzle(c.env.DB)
     .update(pullRequests)
@@ -1293,7 +1521,80 @@ export async function changePullRequestTargetBranch(
     .returning({ id: pullRequests.id });
   if (updated.length === 0) {
     // Lost the UpdateColsIfNotMerged race — the PR merged in between.
-    throw new ApiError(409, "Failed: The pull request has been merged. You cannot merge again or change the target branch.");
+    // Upstream answers `util.ErrorWrap(util.ErrInvalidArgument, "pull
+    // request status has changed")` (:296-299) — the API ladder's unmapped
+    // 500 err.Error(); the web flash reuses its merged refusal.
+    throw flavor === "api"
+      ? new ApiError(500, "pull request status has changed")
+      : new ApiError(409, "Failed: The pull request has been merged. You cannot merge again or change the target branch.");
+  }
+
+  // The doer-carrying tail — upstream's post-CAS in-tx order (:331-358):
+  // syncCommitDivergence (ours is the lazy `checking` reset above) →
+  // RecalculateReviewsOfficial → the type-25 ChangeTargetBranch comment →
+  // the push-comments delete/recreate.
+  if (input.doerId !== undefined) {
+    // RecalculateReviewsOfficial (models/issues/review.go:332-368): the
+    // official flags were computed against the OLD base's protection rules —
+    // "Otherwise a stale official approval could bypass the new branch's
+    // protection" (:327-330).
+    const reviews = new PullReviewsService(c.env.DB, c.env);
+    await reviews.recalculateReviewsOfficial(pair, issue.id, input.targetBranch);
+
+    // The type-25 ChangeTargetBranch comment (CreateComment, :332-351) with
+    // oldRef/newRef — NO num_comments bump (updateCommentInfos counts only
+    // ConversationCountedCommentType = comment/review, comment.go:209-211)
+    // but the issue's updated_unix rides.
+    await drizzle(c.env.DB).batch([
+      drizzle(c.env.DB).insert(comments).values({
+        type: CommentType.ChangeTargetBranch,
+        posterId: input.doerId,
+        issueId: issue.id,
+        oldRef: pr.baseBranch,
+        newRef: input.targetBranch,
+        content: "",
+        createdAt: input.now,
+        updatedAt: input.now,
+      }),
+      drizzle(c.env.DB).update(issues).set({ updatedAt: input.now }).where(eq(issues.id, issue.id)),
+    ] as const);
+
+    // The push-comments refresh (:353-358): delete every type-29
+    // PullRequestPush comment of the issue (they describe the OLD base's
+    // ranges), then recreate the NEW range's first-push comment —
+    // CreatePushPullComment(doer, pr, refs/heads/<newBase>,
+    // refs/pull/N/head, false), comment.go:95+ — whose normal-push arm
+    // walks baseTip..headTip newest-capped and stays SILENT on an empty
+    // range (comment.go:43-45's shouldCreate=false). The walk rides the
+    // BASE cell (the pull ref is its landed projection, §10.8).
+    await drizzle(c.env.DB)
+      .delete(comments)
+      .where(and(eq(comments.issueId, issue.id), eq(comments.type, CommentType.PullRequestPush)))
+      .run();
+    const range = await reads.listCommitsRange(targetTip, pullHeadRef(pr.index), RETARGET_PUSH_COMMITS_CAP, 0);
+    if (range !== null && range.commits.length > 0) {
+      const commitIds = range.commits.map((commit) => commit.oid);
+      await drizzle(c.env.DB).insert(comments).values({
+        type: CommentType.PullRequestPush,
+        posterId: input.doerId,
+        issueId: issue.id,
+        content: JSON.stringify({ is_force_push: false, commit_ids: commitIds } satisfies RetargetPushActionContent),
+        createdAt: input.now,
+        updatedAt: input.now,
+      });
+    }
   }
   return { baseBranch: input.targetBranch };
+}
+
+/** `maxPushCommitsInCommentCount` (services/pull/comment.go:19) — the type-29
+ *  recreate's commit cap. Kept local (webhooks-push exports the same 1000 but
+ *  imports THIS module — the back-edge would cycle). */
+const RETARGET_PUSH_COMMITS_CAP = 1000;
+
+/** Upstream `PushActionContent` (models/issues/comment.go:375-381) — the
+ *  type-29 comment's content JSON (the webhooks-push writer's shape). */
+interface RetargetPushActionContent {
+  is_force_push: boolean;
+  commit_ids: string[];
 }
