@@ -179,15 +179,18 @@ async function seed(): Promise<Seeded> {
 }
 
 /** The w109 viewer's issue-level subscription row (upsert — `false` is the
- *  explicit-unsubscribe arm). */
+ *  explicit-unsubscribe arm). Mirrors setIssueSubscription's writer shape:
+ *  both stamps on the insert arm, updated_unix re-stamped on the conflict
+ *  arm (the columns went NOT NULL — migration 0073). */
 async function subscribe(issueId: number, watching: boolean): Promise<void> {
   const state = expectData(seeded, "seed");
+  const now = new Date();
   await drizzle(env.DB)
     .insert(issueSubscriptions)
-    .values({ userId: state.viewer.id, issueId, isWatching: watching })
+    .values({ userId: state.viewer.id, issueId, isWatching: watching, createdAt: now, updatedAt: now })
     .onConflictDoUpdate({
       target: [issueSubscriptions.userId, issueSubscriptions.issueId],
-      set: { isWatching: watching },
+      set: { isWatching: watching, updatedAt: now },
     });
 }
 

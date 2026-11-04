@@ -26,12 +26,16 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { createCommitStatus, hashCommitStatusContext, latestCommitStatuses } from "../api/services/commit-status";
+import { insertIssuePin, setIssueSubscription } from "../api/services/issue-extras";
 import { mergeableOfRow, statusFromMergeability } from "../api/services/pull-engine";
 import { HAS_CHANGED, parseUpdatedFiles, UNVIEWED, updateReviewStateAtHead, VIEWED } from "../ui/pages/pull-files";
 import {
   comments,
   commitStatuses,
   follows,
+  issuePins,
+  issues,
+  issueSubscriptions,
   lfsObjects,
   orgMembers,
   PRStatus,
@@ -2022,5 +2026,82 @@ describe("commit_statuses context_hash + index parity (ADR-0007 FN-8, migration 
       await sha1Hex("CI / build (push)\x00.github/workflows/ci.yml"),
     );
     expect(await hashCommitStatusContext("ci/test")).toMatch(/^[0-9a-f]{40}$/);
+  });
+});
+
+describe("issue_pins / issue_subscriptions strictness parity (ADR-0007 FN-10/FN-12, migration 0073)", () => {
+  type IssueRow = typeof issues.$inferSelect;
+
+  /** One carrier issue per probe — its repo_id is the pin writer's copy source
+   *  (the NULL-path derivation: IssueRow.repoId is NOT NULL, schema.ts). */
+  async function seedCarrierIssue(repoId: string): Promise<IssueRow> {
+    const rows = await drizzle(env.DB)
+      .insert(issues)
+      .values({ repoId, index: 1, title: "fn10-12 carrier" })
+      .returning()
+      .all();
+    return rows[0]!;
+  }
+
+  it("0073's DDL: repo_id + created_unix + updated_unix read NOT NULL, the single-column issue_id PK survives the rebuild (the §7.1 shape erratum — the composite-PK option is DEAD), and both rebuilt tables carry their full index sets", async () => {
+    const pins = await tableColumns("issue_pins");
+    expect(pins).toEqual([
+      { cid: 0, name: "issue_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "pin_order", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    const subs = await tableColumns("issue_subscriptions");
+    expect(subs).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "user_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "issue_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "is_watching", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 4, name: "created_unix", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 5, name: "updated_unix", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    expect(await indexNames("issue_pins")).toEqual(["issue_pins_repo_order_idx"]);
+    expect(await indexNames("issue_subscriptions")).toEqual(["issue_subscriptions_user_issue_uq", "issue_subscriptions_issue_idx"]);
+  });
+
+  it("the flips bite at the storage layer: a repo-less pin insert and a stamp-less subscription insert (the pre-0073 fixture shapes) both violate NOT NULL", async () => {
+    let pinViolated = false;
+    try {
+      await env.DB.prepare("INSERT INTO issue_pins (issue_id, pin_order) VALUES (1, 1)").run();
+    } catch {
+      pinViolated = true;
+    }
+    expect(pinViolated).toBe(true);
+
+    let subViolated = false;
+    try {
+      await env.DB.prepare("INSERT INTO issue_subscriptions (user_id, issue_id, is_watching) VALUES (1, 1, 1)").run();
+    } catch {
+      subViolated = true;
+    }
+    expect(subViolated).toBe(true);
+  });
+
+  it("the single writers stamp: setIssueSubscription's insert arm writes both stamps, its conflict arm re-stamps updated_unix and preserves created_unix; insertIssuePin copies issues.repo_id (the NULL-path derivation, proven)", async () => {
+    const db = drizzle(env.DB);
+    // Whole seconds — the timestamp mode's storage precision.
+    const now = new Date(1_700_000_000_000);
+    const issue = await seedCarrierIssue("fn10-12-writers");
+
+    await setIssueSubscription(env.DB, { userId: 501, issueId: issue.id, watching: true }, now);
+    const [first] = await db.select().from(issueSubscriptions).all();
+    expect(first).toMatchObject({ userId: 501, issueId: issue.id, isWatching: true, createdAt: now, updatedAt: now });
+
+    // The conflict arm: the explicit-unsubscribe flip re-stamps updated_unix,
+    // created_unix is preserved (issue-extras.ts setIssueSubscription).
+    const later = new Date(1_700_000_005_000);
+    await setIssueSubscription(env.DB, { userId: 501, issueId: issue.id, watching: false }, later);
+    const [second] = await db.select().from(issueSubscriptions).all();
+    expect(second).toMatchObject({ isWatching: false, createdAt: now, updatedAt: later });
+
+    // The pin writer copies the carrier issue's NOT NULL repo_id; the PK is
+    // the single-column issue_id and the row lands at max(pin_order) + 1.
+    await insertIssuePin(env.DB, issue, 900, now);
+    const pins = await db.select().from(issuePins).all();
+    expect(pins).toEqual([{ issueId: issue.id, repoId: "fn10-12-writers", pinOrder: 1 }]);
   });
 });

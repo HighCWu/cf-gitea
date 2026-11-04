@@ -568,7 +568,7 @@ async function seedFixtures(db: DrizzleD1Database): Promise<Fixtures> {
   ]);
   const subscriptionValues = insertedIssues
     .filter((_, i) => i % 4 === 0)
-    .map((issue) => ({ userId: memberId, issueId: issue.id, isWatching: true }));
+    .map((issue) => ({ userId: memberId, issueId: issue.id, isWatching: true, createdAt: now, updatedAt: now }));
   for (const part of chunks(subscriptionValues, 30)) {
     await db.insert(issueSubscriptions).values(part);
   }
@@ -1255,7 +1255,12 @@ describe("index witness (migration 0036 — the audit's P0+P1 wave)", () => {
     for (const part of chunks(commentValues, 3)) await db.insert(comments).values(part);
     const subscriptionValues = targetIssueIds
       .slice(0, 100)
-      .flatMap((issueId) => watchers.slice(0, 2).map((userId) => ({ userId, issueId, isWatching: true })));
+      .flatMap((issueId) =>
+        watchers.slice(0, 2).map((userId) => {
+          const stamped = new Date();
+          return { userId, issueId, isWatching: true, createdAt: stamped, updatedAt: stamped };
+        }),
+      );
     for (const part of chunks(subscriptionValues, 18)) await db.insert(issueSubscriptions).values(part);
     const targetActionValues = Array.from({ length: 120 }, (_, i) => ({
       userId: watcherAt(i),

@@ -492,7 +492,9 @@ describe("applyUserSettingsAccountDeleteForm (DeleteAccount over the PAT-as-pass
     await drizzle(env.DB).insert(repoWatchers).values({ repoId: "r9", userId: 1 });
     await drizzle(env.DB).insert(repoCollaborators).values({ repoId: "r9", userId: 1 });
     await drizzle(env.DB).insert(reactions).values({ userId: 1, issueId: 5, type: "+1" });
-    await drizzle(env.DB).insert(issueSubscriptions).values({ userId: 1, issueId: 5, isWatching: true });
+    await drizzle(env.DB)
+      .insert(issueSubscriptions)
+      .values({ userId: 1, issueId: 5, isWatching: true, createdAt: new Date(), updatedAt: new Date() });
     // A live session row (deleted only through the users FK cascade).
     await drizzle(env.DB).insert(sessions).values({
       id: "sess000001",

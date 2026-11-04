@@ -793,7 +793,9 @@ describe("PUT/DELETE /teams/{id}/members/{username} (orgAddTeamMember/orgRemoveT
       await db().insert(issues).values({ repoId: "t_vault", index: 1, title: "held" }).returning({ id: issues.id }).all()
     )[0]!;
     await db().insert(issueAssignees).values({ issueId: issue.id, assigneeId: s.member.id });
-    await db().insert(issueSubscriptions).values({ userId: s.member.id, issueId: issue.id, isWatching: true });
+    await db()
+      .insert(issueSubscriptions)
+      .values({ userId: s.member.id, issueId: issue.id, isWatching: true, createdAt: NOW, updatedAt: NOW });
     await db().insert(issueStopwatches).values({ issueId: issue.id, userId: s.member.id, createdAt: NOW });
 
     const res = await send(`/teams/${docs.id}/members/${s.member.username}`, {

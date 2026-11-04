@@ -1186,8 +1186,12 @@ export const issueSubscriptions = sqliteTable(
     userId: integer("user_id").notNull(),
     issueId: integer("issue_id").notNull(),
     isWatching: integer("is_watching", { mode: "boolean" }).notNull(),
-    createdAt: integer("created_unix", { mode: "timestamp" }),
-    updatedAt: integer("updated_unix", { mode: "timestamp" }),
+    // NOT NULL per upstream `created NOT NULL` / `updated NOT NULL`
+    // (models/issues/issue_watch.go:22-23) — the FN-12 strictness flip
+    // (audit §7.1 ours-looser arm, migration 0073): the single writer
+    // (setIssueSubscription) stamps both arms, so no NULL path exists.
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
   },
   (t) => [
     uniqueIndex("issue_subscriptions_user_issue_uq").on(t.userId, t.issueId),
@@ -1334,7 +1338,14 @@ export const issuePins = sqliteTable(
   "issue_pins",
   {
     issueId: integer("issue_id").primaryKey(),
-    repoId: text("repo_id"),
+    // NOT NULL per upstream `RepoID int64 UNIQUE(s) NOT NULL`
+    // (models/issues/issue_pin.go:19) — the FN-10 strictness flip (audit
+    // §7.1 ours-looser arm, migration 0073): the single writer
+    // (insertIssuePin) copies issues.repo_id (itself NOT NULL), so no NULL
+    // path exists. The PK stays the single-column issue_id (the audit
+    // §7.1 shape erratum; upstream's UNIQUE(s) rides the
+    // issue_pins_repo_order_idx lead below as the documented divergence).
+    repoId: text("repo_id").notNull(),
     pinOrder: integer("pin_order").notNull(),
   },
   (t) => [
