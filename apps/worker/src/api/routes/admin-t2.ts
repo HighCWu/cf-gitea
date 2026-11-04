@@ -11,10 +11,13 @@ import {
   packageVersions,
   packages,
   repositories,
+  sessions,
   twoFactor,
   userRedirects,
   users,
 } from "../../db/schema";
+import { newSalt, newPasswordRecord } from "../../auth/password";
+import { isComplexEnough, MIN_PASSWORD_LENGTH } from "../../auth/password-policy";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
@@ -74,18 +77,19 @@ import { toApiUser } from "../services/user";
  * ---------------------------------------------------------------------------
  * Documented deviations from upstream (PAT-only auth model + landed columns):
  * ---------------------------------------------------------------------------
- *   1. **No password store (SPEC-0002 §4.6.7)** — upstream adminCreateUser
- *      takes a plain-text `password` and enforces length/complexity/pwned
- *      400s (admin/user.go:102–120), and adminEditUser re-hashes `password`
- *      (admin/user.go:203–226). cf-gitea users authenticate exclusively with
- *      personal access tokens: both fields are ACCEPTED AND IGNORED, the
- *      password-arms (400 `PasswordIsRequired`/`PasswordComplexity`/
- *      `PasswordPwned`, `must_change_password`) are unreachable, and the
- *      response is still the contract's `User` shape. `source_id` and
- *      `login_name` (external-auth concepts) are equally accepted and
- *      ignored; `send_notify` left the deviation when the mailer landed
- *      (specs/email-outbound.md §2.5 — it fires the register-notify mail,
- *      upstream admin/user.go:153-156).
+ *   1. **External-auth fields accepted and ignored** — `source_id` and
+ *      `login_name` (external-auth concepts) are accepted and ignored on
+ *      both arms: every cf-gitea user is LOCAL (LoginType Plain), so
+ *      upstream's parseAuthSource arm (admin/user.go:99) and its
+ *      `LoginType == Plain` ladder gate (admin/user.go:102) always resolve
+ *      to the local ladder. The PASSWORD fields left this deviation when
+ *      the password store landed (SPEC-0002 §6, PWD-2/PWD-4): create
+ *      enforces the length/complexity 400s (admin/user.go:102–120 — the
+ *      pwned arm stays dormant, default-off config, pwn.go:37-39), edit
+ *      re-hashes `password` (admin/user.go:203–226 → UpdateAuth), and
+ *      `must_change_password` persists (see 7). `send_notify` left the
+ *      deviation when the mailer landed (specs/email-outbound.md §2.5 — it
+ *      fires the register-notify mail, upstream admin/user.go:153-156).
  *   2. **`purge` distinguished through the real cascade** (adminDeleteUser):
  *      upstream purge disables the account, deletes every owned repository
  *      through the repo-deletion service (services/user/user.go:172-182 →
@@ -129,8 +133,18 @@ import { toApiUser } from "../services/user";
  *      the landed `users.status` enum ('active'|'prohibited') folds them —
  *      active=false or prohibit_login=true both land 'prohibited' (the same
  *      correlation convert.ToUser already renders, services/user.ts).
- *   7. Upstream-created users carry MustChangePassword=true — a concept we do
- *      not store; the created row is plain active.
+ *   7. **`must_change_password` stores but does not enforce (yet)** — the
+ *      column landed (migration 0075, upstream user.go:107-109
+ *      `NOT NULL DEFAULT false`): create defaults it TRUE (admin/user.go:
+ *      89-95), edit sets/clears it (admin/user.go:207 → UpdateAuth
+ *      update.go:265-267), and the change-password posts upstream pair with
+ *      `optional.Some(false)` clears. The ENFORCEMENT surface — the web
+ *      redirect to /user/settings/change_password (web.go:197-206), the
+ *      /user/change_password flow (password.go:267+) and the API 403 arm
+ *      (`verifyAuthWithOptionsAPI`, api.go:886-893, "You must change your
+ *      password. Change it at: …") — is recorded as SPEC-0002 §6.3's open
+ *      B-row: an admin-created user with the default flag can currently
+ *      sign in without being routed through the change-password flow.
  *   8. **Render subset**: the response converter (`toApiUser`,
  *      services/user.ts) renders description/location/website as "" and
  *      visibility as the public TODO — the same render the landed
@@ -436,14 +450,15 @@ const adminSearchUsersRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
 
 /**
  * Mirror of the contract's `CreateUserOption` (required: username, email).
- * `password` / `must_change_password` / `source_id` / `login_name` are
- * carried per contract and IGNORED — deviation 1 (PAT-only auth; no
- * password or mail store). `send_notify` LEFT deviation 1 when the mailer
- * landed (specs/email-outbound.md §2.5): it fires the register-notify mail
- * via services/mail/register-notify.ts, upstream admin/user.go:153-156
- * parity. Out-of-enum `visibility` dies in the request validator
- * (runtime-only 400 where upstream binding 422s — the documented orgs.ts
- * divergence class).
+ * `password` and `must_change_password` are LIVE (SPEC-0002 §6): the ladder
+ * enforces upstream's 400s (admin/user.go:102–120) and the flag stores with
+ * the default-true semantics (admin/user.go:89–95). `source_id` /
+ * `login_name` remain accepted-and-ignored — deviation 1 (every user is
+ * local). `send_notify` LEFT deviation 1 when the mailer landed
+ * (specs/email-outbound.md §2.5): it fires the register-notify mail via
+ * services/mail/register-notify.ts, upstream admin/user.go:153-156 parity.
+ * Out-of-enum `visibility` dies in the request validator (runtime-only 400
+ * where upstream binding 422s — the documented orgs.ts divergence class).
  */
 const createUserOptionSchema = z.object({
   created_at: z.string().optional().openapi({
@@ -490,9 +505,17 @@ function invalidEmailMessage(email: string): string | null {
   return `email address is invalid: ${email}`;
 }
 
-/** D1 row insert behind `user_model.createUser` (models/user/user.go:700–812). */
+/**
+ * D1 row insert behind `user_model.createUser` (models/user/user.go:700–812).
+ * `password` has already cleared the route's ladder (the 400s fire before
+ * AdminCreateUser upstream), so the row always stores a hashed record here —
+ * upstream's SetPassword arm (user.go:788–791: new salt, the CONFIGURED
+ * algorithm) plus the Rands salt every create writes (user.go:785–786) and
+ * the MustChangePassword default-true flag (admin/user.go:89–95).
+ */
 async function insertCreatedUser(d1: D1Database, form: CreateUserOption, now: Date): Promise<TargetRow> {
   const lower = form.username.toLowerCase();
+  const record = await newPasswordRecord(form.password ?? "");
   const db = drizzle(d1);
   try {
     const inserted = await db
@@ -511,6 +534,11 @@ async function insertCreatedUser(d1: D1Database, form: CreateUserOption, now: Da
         fullName: form.full_name ?? null,
         type: "user",
         createdAt: form.created_at !== undefined ? new Date(form.created_at) : now,
+        passwd: record.passwd,
+        salt: record.salt,
+        passwdHashAlgo: record.passwdHashAlgo,
+        rands: newSalt(),
+        mustChangePassword: form.must_change_password ?? true,
       })
       .returning();
     return inserted[0]!;
@@ -601,11 +629,16 @@ const adminCreateUserRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
 /**
  * Mirror of the contract's `EditUserOption` (required: source_id — a binding
  * artifact; the field is accepted-and-ignored like the rest of the
- * external-auth set, deviation 1). `active`, `admin`, `description`, `email`,
- * `full_name`, `location`, `prohibit_login`, `visibility`, `website` map onto
- * landed columns; the account-flag set without columns
- * (`allow_create_organization`, `allow_git_hook`, `allow_import_local`,
- * `max_repo_creation`, `restricted`) is accepted and ignored.
+ * external-auth set, deviation 1). `password` and `must_change_password` are
+ * LIVE (SPEC-0002 §6): a non-empty password runs upstream's UpdateAuth
+ * ladder (update.go:247–262) and the flag persists whenever present
+ * (update.go:265–267) — an empty/absent password leaves the stored record
+ * untouched (optional.FromNonDefault semantics). `active`, `admin`,
+ * `description`, `email`, `full_name`, `location`, `prohibit_login`,
+ * `visibility`, `website` map onto landed columns; the account-flag set
+ * without columns (`allow_create_organization`, `allow_git_hook`,
+ * `allow_import_local`, `max_repo_creation`, `restricted`) is accepted and
+ * ignored.
  */
 const editUserOptionSchema = z.object({
   active: z.boolean().optional().openapi({ description: "Whether the user account is active" }),
@@ -869,17 +902,35 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     return c.json(items.map((row) => toApiUser(viewer, row)), 200);
   });
 
-  // POST /admin/users — the createUser ladder (user.go:700–812): usable name
+  // POST /admin/users — the createUser ladder (user.go:700–812): the
+  // password 400s FIRST (admin/user.go:102-120 — upstream order: the ladder
+  // runs before AdminCreateUser's user-model validation), then usable name
   // (400 arms via APIErrorAuto — deviation-free messages from the org errors
   // module), email format (400), namespace collision (409), email-in-use
-  // (409), redirect consumption, insert. Deviation 1: the password/
-  // must_change_password/source_id/login_name fields die here as
-  // accepted-and-ignored — no 400 password arms exist to hit. `send_notify`
-  // no longer rides deviation 1: it fires the register-notify mailer
+  // (409), redirect consumption, insert with the hashed password record and
+  // the default-true must_change_password flag (deviation 7: stored, not
+  // enforced). `send_notify` fires the register-notify mailer
   // (specs/email-outbound.md §2.5, upstream admin/user.go:153-156) —
   // caught-and-logged, never load-bearing for the 201.
   app.openapi(adminCreateUserRoute(requireAuth), async (c) => {
     const form = c.req.valid("json");
+
+    // The password ladder (admin/user.go:102–120), unconditioned because
+    // every cf-gitea user is local (LoginType Plain — deviation 1). An
+    // absent/empty password fails the min-length arm upstream too
+    // (len("") < MinPasswordLength → `PasswordIsRequired`), so the field is
+    // effectively REQUIRED on create. The complexity arm answers upstream's
+    // bare code `PasswordComplexity`. The pwned arm (`PasswordPwned`) is
+    // dormant: PASSWORD_CHECK_PWNED is default-OFF and Phase A ships no HIBP
+    // client (password-policy.ts header — IsPwned returns nil with the knob
+    // off, pwn.go:37-39).
+    const password = form.password ?? "";
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      throw new ApiError(400, "PasswordIsRequired");
+    }
+    if (!isComplexEnough(password)) {
+      throw new ApiError(400, "PasswordComplexity");
+    }
 
     const nameError = usableUsernameError(form.username);
     if (nameError !== null) {
@@ -924,28 +975,83 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
 
   // PATCH /admin/users/{username} — the EditUser ladder (admin/user.go:161–263
   // over services/user/update.go): type arms first (the parse rejects
-  // "Organization"; the convert check rejects admin→Bot), then the email
-  // replace (400 invalid / 409 in use), then the column patches with the
-  // last-admin guard on `admin`. Password/auth-source fields ride the
-  // accepted-and-ignored deviation 1.
+  // "Organization"; the convert check rejects admin→Bot), then the auth arm —
+  // the optional password (empty/absent = unchanged, non-empty = upstream's
+  // UpdateAuth ladder) plus the must_change_password write, committed BEFORE
+  // the email replace (400 invalid / 409 in use) exactly like upstream's
+  // separate UpdateAuth → ReplacePrimaryEmailAddress sequence, then the
+  // column patches with the last-admin guard on `admin`.
   app.openapi(adminEditUserRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
     const target = await resolveTargetRow(c, username);
     const form = c.req.valid("json");
 
     // --- type conversion arm (user.go:193–201 → convert.UserTypeFromString)
+    const password = form.password ?? "";
     const currentType = target.type === "org" ? "Organization" : "User";
     if (form.type !== undefined && form.type !== currentType) {
       if (form.type === "Organization") {
         throw new ApiError(400, 'invalid user type "Organization" (expected User, Bot)');
       }
-      // form.type === "Bot"
+      // form.type === "Bot" — upstream's route-level auth-material guard
+      // (admin/user.go:200–204) fires BEFORE the conversion checks: with any
+      // password/auth-source material attached, the dedicated bot 400
+      // answers regardless of admin status. (UpdateAuth's own IsTypeBot fold
+      // for an ALREADY-bot target, update.go:233–235, is unreachable —
+      // deviation 3 stores no bot rows.)
+      if (password !== "" || (form.source_id ?? 0) !== 0 || (form.login_name ?? "") !== "") {
+        throw new ApiError(400, "a bot account cannot have a password or authentication source");
+      }
       if (target.isAdmin) {
         throw new ApiError(400, "bot user can not be a site administrator");
       }
       // Deviation 3: no bot storage variant — upstream would convert; ours
       // answers CheckConvertUserType's message instead.
       throw new ApiError(400, "user type can not be converted");
+    }
+
+    // --- the auth arm (admin/user.go:200–226 → UpdateAuth, update.go:
+    // 231–267), applied and COMMITTED before the email/profile steps —
+    // upstream runs UpdateAuth to completion (UpdateUserCols) before
+    // ReplacePrimaryEmailAddress; no transaction spans them, so a later 409
+    // never rolls the password write back here either.
+    const authPatch: Partial<typeof users.$inferInsert> = {};
+    if (password !== "") {
+      // optional.FromNonDefault semantics (update.go:249): empty/absent =
+      // unchanged. The ladder texts DIFFER from create's bare codes — the
+      // route maps ErrMinLength to its own fmt string (admin/user.go:212–214)
+      // and ErrComplexity to err.Error() (admin/user.go:215–216, "password
+      // not complex enough"). The pwned arm is dormant (default-off config,
+      // pwn.go:37-39 — SPEC-0002 §6.2).
+      if (password.length < MIN_PASSWORD_LENGTH) {
+        throw new ApiError(400, `password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      }
+      if (!isComplexEnough(password)) {
+        throw new ApiError(400, "password not complex enough");
+      }
+      // SetPassword (user.go:407–414): new salt + the CONFIGURED algorithm.
+      const record = await newPasswordRecord(password);
+      authPatch.passwd = record.passwd;
+      authPatch.salt = record.salt;
+      authPatch.passwdHashAlgo = record.passwdHashAlgo;
+    }
+    if (form.must_change_password !== undefined) {
+      // optional.FromPtr (update.go:265–267): present = write, absent =
+      // untouched — an explicit false clears the create-defaulted flag.
+      authPatch.mustChangePassword = form.must_change_password;
+    }
+    if (Object.keys(authPatch).length > 0) {
+      await drizzle(c.env.DB).update(users).set(authPatch).where(eq(users.id, target.id));
+      if (authPatch.passwd !== undefined) {
+        // UpdateAuth's token invalidation (update.go:278–284 →
+        // DeleteAuthTokensByUserID): our remember-session rows play the
+        // auth_token role (the changeOwnPassword interpretation,
+        // services/user-accounts.ts) — live non-remember sessions and PATs
+        // are untouched.
+        await drizzle(c.env.DB)
+          .delete(sessions)
+          .where(and(eq(sessions.userId, target.id), eq(sessions.remember, true)));
+      }
     }
 
     // --- email replace arm (user.go:228–233 → ReplacePrimaryEmailAddress,

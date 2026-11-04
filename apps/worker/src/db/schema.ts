@@ -729,6 +729,18 @@ export const users = sqliteTable(
      *  time-limit-code hash data `purpose|uid|lowerEmail|lowerName|passwd|
      *  rands` (user.go:948-950 — the reset flow, SPEC-0002 §6.2). */
     rands: text("rands", { length: 32 }).notNull().default(""),
+    /** Upstream `User.MustChangePassword` (user.go:107-109, `NOT NULL DEFAULT
+     *  false`) — the admin-create flag that defaults TRUE (admin/user.go:
+     *  89-95: `MustChangePassword: true` unless the body's *bool overrides),
+     *  forcing upstream's change-password flow on the next sign-in (the web
+     *  redirect web.go:197-206, the API 403 verify arm api.go:886-893 — the
+     *  enforcement surface is SPEC-0002 §6.3's B-row). Set and cleared
+     *  through the admin API arms (admin/user.go:207 → UpdateAuth
+     *  update.go:265-267, the UpdateUserCols column list) and by upstream's
+     *  change-password posts (`optional.Some(false)` — password.go:206/300,
+     *  account.go:79). NOT NULL DEFAULT false mirrors the xorm DDL verbatim;
+     *  the ALTER backfills existing rows to false. */
+    mustChangePassword: integer("must_change_password", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [
     uniqueIndex("users_username_lower_uq").on(t.usernameLower),

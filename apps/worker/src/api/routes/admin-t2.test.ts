@@ -39,11 +39,13 @@ import {
   protectedBranches,
   repositories,
   repoCounters,
+  sessions,
   twoFactor,
   userBadges,
   userRedirects,
   users,
 } from "../../db/schema";
+import { verifyPassword } from "../../auth/password";
 import { starRepo } from "../services/stars";
 import { watchRepo } from "../services/repo-watchers";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
@@ -225,6 +227,21 @@ async function seedPackage(ownerId: number, name: string): Promise<void> {
   });
 }
 
+/** One sessions row for the edit-arm's token-invalidation assertion (the
+ *  remember rows are upstream's auth_token twin — UpdateAuth sweeps them on
+ *  a password change, update.go:278-284; live rows are untouched). */
+async function seedSession(userId: number, id: string, remember: boolean): Promise<void> {
+  await drizzle(env.DB).insert(sessions).values({
+    id,
+    userId,
+    sha256Digest: "a".repeat(64),
+    rotatedAt: NOW,
+    expiresAt: new Date(NOW.getTime() + 60_000),
+    lastSeenAt: NOW,
+    remember,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // The admin gate (reqToken + reqSiteAdmin, api.go:1867)
 // ---------------------------------------------------------------------------
@@ -269,6 +286,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
       jsonAdmin({
         username: "newbie",
         email: "newbie@example.com",
+        password: "Sup3r-Secret!",
         full_name: "New Bie",
         visibility: "limited",
         created_at: "2025-06-01T10:00:00Z",
@@ -293,14 +311,55 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(row[0]?.visibility).toBe("limited");
   });
 
-  it("accepts and ignores the PAT-only deviation fields (password, source_id, send_notify…)", async () => {
+  it("stores the hashed password record and the rands salt (user.go:788-794); must_change_password DEFAULTS TRUE (admin/user.go:89-95)", async () => {
+    const res = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "hashed", email: "hashed@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(res.status).toBe(201);
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "hashed")).limit(1))[0]!;
+    // The admin-user-edit.test.tsx stored-record pattern: SetPassword under
+    // the CONFIGURED spec (new salt, pbkdf2$50000$50) plus the Rands salt
+    // every upstream create writes (user.go:785-786).
+    expect(row.passwd).toMatch(/^[0-9a-f]{100}$/);
+    expect(row.salt).toMatch(/^[0-9a-f]{32}$/);
+    expect(row.passwdHashAlgo).toBe("pbkdf2$50000$50");
+    expect(row.rands).toMatch(/^[0-9a-f]{32}$/);
+    expect(row.mustChangePassword).toBe(true);
+    expect(await verifyPassword("Sup3r-Secret!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+    expect(await verifyPassword("wrong-password", row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
+  });
+
+  it("400 PasswordIsRequired when the password is absent or below MinPasswordLength (admin/user.go:102-106)", async () => {
+    const absent = await adminSend("/admin/users", jsonAdmin({ username: "nopass", email: "nopass@example.com" }));
+    expect(absent.status).toBe(400);
+    expect(((await absent.json<Record<string, unknown>>())).message).toBe("PasswordIsRequired");
+
+    const short = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "shortpass", email: "short@example.com", password: "Aa1!Aa1" }),
+    );
+    expect(short.status).toBe(400);
+    expect(((await short.json<Record<string, unknown>>())).message).toBe("PasswordIsRequired");
+  });
+
+  it("400 PasswordComplexity on a long single-class password (admin/user.go:107-112)", async () => {
+    const res = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "weakpass", email: "weak@example.com", password: "alllowercase" }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json<Record<string, unknown>>())).message).toBe("PasswordComplexity");
+  });
+
+  it("persists must_change_password=false from the body; source_id/login_name/restricted stay accepted-and-ignored (deviation 1)", async () => {
     const res = await adminSend(
       "/admin/users",
       jsonAdmin({
         username: "tokenonly",
         email: "tokenonly@example.com",
-        password: "super-secret-123",
-        must_change_password: true,
+        password: "Sup3r-Secret!",
+        must_change_password: false,
         send_notify: true,
         source_id: 7,
         login_name: "ext-id",
@@ -309,41 +368,56 @@ describe("POST /admin/users (adminCreateUser)", () => {
     );
     expect(res.status).toBe(201);
     const body: Record<string, unknown> = await res.json();
-    expect(body.active).toBe(true); // no must-change-password concept lands
+    expect(body.active).toBe(true);
+    // The explicit *bool override of the default-true (admin/user.go:93-95).
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "tokenonly")).limit(1))[0]!;
+    expect(row.mustChangePassword).toBe(false);
   });
 
   it("409s on the shared-namespace collision and the duplicate email", async () => {
     const dupName = await adminSend(
       "/admin/users",
-      jsonAdmin({ username: "NEIGHBOR", email: "fresh@example.com" }),
+      jsonAdmin({ username: "NEIGHBOR", email: "fresh@example.com", password: "Sup3r-Secret!" }),
     );
     expect(dupName.status).toBe(409);
     const nameBody: Record<string, unknown> = await dupName.json();
     expect(nameBody.message).toBe("user already exists [name: NEIGHBOR]");
 
-    const first = await adminSend("/admin/users", jsonAdmin({ username: "fresh", email: "fresh@example.com" }));
+    const first = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "fresh", email: "fresh@example.com", password: "Sup3r-Secret!" }),
+    );
     expect(first.status).toBe(201);
     const dupEmail = await adminSend(
       "/admin/users",
-      jsonAdmin({ username: "fresh2", email: "FRESH@example.com" }),
+      jsonAdmin({ username: "fresh2", email: "FRESH@example.com", password: "Sup3r-Secret!" }),
     );
     expect(dupEmail.status).toBe(409);
     const emailBody: Record<string, unknown> = await dupEmail.json();
     expect(emailBody.message).toBe("e-mail already in use [email: FRESH@example.com]");
   });
 
-  it("400s on unusable names and invalid emails (APIErrorAuto arms)", async () => {
-    const reserved = await adminSend("/admin/users", jsonAdmin({ username: "org", email: "a@example.com" }));
+  it("400s on unusable names and invalid emails AFTER the password ladder (upstream order, admin/user.go:102-142)", async () => {
+    const reserved = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "org", email: "a@example.com", password: "Sup3r-Secret!" }),
+    );
     expect(reserved.status).toBe(400);
     expect(((await reserved.json<Record<string, unknown>>())).message).toBe("name is reserved [name: org]");
 
-    const chars = await adminSend("/admin/users", jsonAdmin({ username: "bad name", email: "a@example.com" }));
+    const chars = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "bad name", email: "a@example.com", password: "Sup3r-Secret!" }),
+    );
     expect(chars.status).toBe(400);
     expect(((await chars.json<Record<string, unknown>>())).message).toBe(
       "name is invalid [bad name]: must be valid alpha or numeric or dash(-_) or dot characters",
     );
 
-    const email = await adminSend("/admin/users", jsonAdmin({ username: "okname", email: "not-an-email" }));
+    const email = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "okname", email: "not-an-email", password: "Sup3r-Secret!" }),
+    );
     expect(email.status).toBe(400);
     expect(((await email.json<Record<string, unknown>>())).message).toBe("email address is invalid: not-an-email");
   });
@@ -352,7 +426,10 @@ describe("POST /admin/users (adminCreateUser)", () => {
     await adminSend("/admin/users/neighbor/rename", jsonAdmin({ new_username: "renamed" }));
     expect(await new OrgService(env.DB).lookupUserRedirect("neighbor")).toBe(neighborId);
 
-    const res = await adminSend("/admin/users", jsonAdmin({ username: "neighbor", email: "n2@example.com" }));
+    const res = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "neighbor", email: "n2@example.com", password: "Sup3r-Secret!" }),
+    );
     expect(res.status).toBe(201);
     expect(await new OrgService(env.DB).lookupUserRedirect("neighbor")).toBeNull();
   });
@@ -748,7 +825,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(((await grant.json<Record<string, unknown>>())).is_admin).toBe(true);
   });
 
-  it("409s a duplicate email; the same address is a case-insensitive no-op; password ignored", async () => {
+  it("409s a duplicate email; the same address is a case-insensitive no-op", async () => {
     await drizzle(env.DB).update(users).set({ email: "root@example.com" }).where(eq(users.id, adminId));
 
     const conflict = await adminSend("/admin/users/neighbor", jsonPatch({ email: "root@example.com" }));
@@ -759,9 +836,91 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
 
     const same = await adminSend("/admin/users/root", jsonPatch({ email: "ROOT@example.com" }));
     expect(same.status).toBe(200);
+  });
 
-    const ignored = await adminSend("/admin/users/neighbor", jsonPatch({ password: "whatever-123" }));
-    expect(ignored.status).toBe(200);
+  it("sets the password through the UpdateAuth ladder: hash stored, remember sessions swept, live rows kept (admin/user.go:203-226)", async () => {
+    await seedSession(neighborId, "sess-remember", true);
+    await seedSession(neighborId, "sess-live", false);
+    const before = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+
+    const res = await adminSend("/admin/users/neighbor", jsonPatch({ password: "Br4vo-Fourte" }));
+    expect(res.status).toBe(200);
+
+    const after = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(after.passwd).not.toBe(before.passwd);
+    expect(after.salt).not.toBe(before.salt);
+    expect(after.passwdHashAlgo).toBe("pbkdf2$50000$50");
+    expect(await verifyPassword("Br4vo-Fourte", after.passwd, after.salt, after.passwdHashAlgo)).toBe(true);
+    // The old record is REPLACED, not verified-against: a seeded row carries
+    // the dead "argon2" DDL default that Phase A refuses to parse (the
+    // controlled unsupported-hash arm), so the honest before/after assertion
+    // is the algorithm column itself — asserted above ("argon2" gone).
+
+    // update.go:278-284 — the token invalidation: the remember rows (our
+    // auth_token twin) die, live non-remember sessions are untouched.
+    const remaining = await drizzle(env.DB).select().from(sessions).where(eq(sessions.userId, neighborId)).all();
+    expect(remaining.map((s) => s.id).sort()).toEqual(["sess-live"]);
+  });
+
+  it("absent and empty password leave the stored record untouched (optional.FromNonDefault, update.go:249)", async () => {
+    const before = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+
+    const absent = await adminSend("/admin/users/neighbor", jsonPatch({ full_name: "Renamed" }));
+    expect(absent.status).toBe(200);
+    const empty = await adminSend("/admin/users/neighbor", jsonPatch({ password: "" }));
+    expect(empty.status).toBe(200);
+
+    const after = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(after.passwd).toBe(before.passwd);
+    expect(after.salt).toBe(before.salt);
+    expect(after.passwdHashAlgo).toBe(before.passwdHashAlgo);
+  });
+
+  it("walks the edit password ladder with the UpdateAuth texts — DIFFERENT from create's bare codes (admin/user.go:212-216)", async () => {
+    const short = await adminSend("/admin/users/neighbor", jsonPatch({ password: "Aa1!Aa1" }));
+    expect(short.status).toBe(400);
+    expect(((await short.json<Record<string, unknown>>())).message).toBe("password must be at least 8 characters");
+
+    const complex = await adminSend("/admin/users/neighbor", jsonPatch({ password: "alllowercase-long" }));
+    expect(complex.status).toBe(400);
+    expect(((await complex.json<Record<string, unknown>>())).message).toBe("password not complex enough");
+  });
+
+  it("must_change_password: create defaults TRUE, the edit arm sets and clears it (update.go:265-267)", async () => {
+    const created = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "mcpuser", email: "mcp@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(created.status).toBe(201);
+    const createdRow = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "mcpuser")).limit(1))[0]!;
+    expect(createdRow.mustChangePassword).toBe(true);
+
+    const cleared = await adminSend("/admin/users/mcpuser", jsonPatch({ must_change_password: false }));
+    expect(cleared.status).toBe(200);
+    const clearedRow = (await drizzle(env.DB).select().from(users).where(eq(users.id, createdRow.id)).limit(1))[0]!;
+    expect(clearedRow.mustChangePassword).toBe(false);
+
+    const set = await adminSend("/admin/users/mcpuser", jsonPatch({ must_change_password: true }));
+    expect(set.status).toBe(200);
+    const setRow = (await drizzle(env.DB).select().from(users).where(eq(users.id, createdRow.id)).limit(1))[0]!;
+    expect(setRow.mustChangePassword).toBe(true);
+  });
+
+  it("the bot auth-material guard 400s before the conversion arms (admin/user.go:200-204)", async () => {
+    const withPassword = await adminSend(
+      "/admin/users/neighbor",
+      jsonPatch({ type: "Bot", password: "Sup3r-Secret!" }),
+    );
+    expect(withPassword.status).toBe(400);
+    expect(((await withPassword.json<Record<string, unknown>>())).message).toBe(
+      "a bot account cannot have a password or authentication source",
+    );
+
+    const withSource = await adminSend("/admin/users/neighbor", jsonPatch({ type: "Bot", login_name: "ext-id" }));
+    expect(withSource.status).toBe(400);
+    expect(((await withSource.json<Record<string, unknown>>())).message).toBe(
+      "a bot account cannot have a password or authentication source",
+    );
   });
 
   it("walks the type arms: Organization 400 parse, admin→Bot 400, plain→Bot the deviation 400", async () => {
