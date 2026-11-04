@@ -11,11 +11,12 @@
 
 import { env } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { TWOFA_COOKIE_NAME } from "../auth/two-factor";
-import { TokenService } from "../auth/token-service";
+import { newPasswordRecord } from "../auth/password";
 import { users, webauthnCredentials } from "../db/schema";
 import { mintSession, SESSION_COOKIE_NAME, sessionRouter } from "../ui/session";
 import {
@@ -85,6 +86,19 @@ async function seedUser(username = "alice"): Promise<{ id: number; username: str
 async function sessionCookieFor(userId: number): Promise<string> {
   const value = await mintSession(env.DB, userId, { remember: false });
   return `${SESSION_COOKIE_NAME}=${value}`;
+}
+
+/** The web login verifies a REAL password (PWD-2 — the PAT-as-password arm
+ * is retired, auth.go:292-369): seed the configured pbkdf2 record and return
+ * the plaintext the login form posts. */
+async function seedPassword(userId: number, password = "correct horse battery staple"): Promise<string> {
+  const record = await newPasswordRecord(password);
+  await drizzle(env.DB)
+    .update(users)
+    .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+    .where(eq(users.id, userId))
+    .run();
+  return password;
 }
 
 /** Insert an enrolled credential row directly (the login-family fixtures). */
@@ -393,14 +407,14 @@ describe("the login family", () => {
   it("POST /login parks the pre-auth identity and 303s the prompt (the gate)", async () => {
     const user = await seedUser();
     await enrollCredential(user.id);
-    const pat = (await new TokenService(env.DB).mint({ userId: user.id, name: "web", scopes: "read:repository" })).plaintext;
+    const pw = await seedPassword(user.id);
 
     const res = await sessionRouter.request(
       "/login",
       {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN },
-        body: `password=${encodeURIComponent(pat)}`,
+        body: `user_name=${encodeURIComponent(user.username)}&password=${encodeURIComponent(pw)}`,
       },
       env,
     );
@@ -415,13 +429,13 @@ describe("the login family", () => {
 
     // A user WITHOUT keys mints immediately (the composition point).
     const plain = await seedUser("bob");
-    const pat2 = (await new TokenService(env.DB).mint({ userId: plain.id, name: "web", scopes: "read:repository" })).plaintext;
+    const pw2 = await seedPassword(plain.id);
     const direct = await sessionRouter.request(
       "/login",
       {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN },
-        body: `password=${encodeURIComponent(pat2)}`,
+        body: `user_name=${encodeURIComponent(plain.username)}&password=${encodeURIComponent(pw2)}`,
       },
       env,
     );

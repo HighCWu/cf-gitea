@@ -1,9 +1,10 @@
 /**
- * The login page (SPEC-0010 §2.1/§2.2): the sign-in form in the anonymous
- * shell. The credential is a PAT posted as `password` (`token` accepted as a
- * field alias) — token-as-password mirrors the Basic convention SPEC-0002
- * §2.2 already accepts, so one mental model covers both surfaces. Plain HTML
- * form — no client script; the page must work with JS disabled.
+ * The login page (SPEC-0010 §2.1/§2.2, credential superseded by SPEC-0002
+ * §6.2): the sign-in form in the anonymous shell. The credential is the
+ * account PASSWORD (PWD-2, 2026-11-04 — upstream parity restored; the
+ * interim PAT-as-password arm is RETIRED, and with it the B-1 "Access
+ * Token" label divergence below). Plain HTML form — no client script; the
+ * page must work with JS disabled.
  *
  * Shape mirrors gitea/templates/user/auth/signin.tmpl + signin_inner.tmpl at
  * the pin (page-content `user signin`, the attached header/segment pair, the
@@ -11,22 +12,20 @@
  * `user_name` (owner cross-check), `password`, `remember`, and a hidden
  * `redirect_to` carried through to the POST.
  *
- * ## The credential-label divergence (the B-1 usability fix, 2026-10-30)
+ * ## Historical note — the credential-label divergence (2026-10-30 →
+ * ## 2026-11-04, SUPERSEDED)
  *
- * The credential field's VISIBLE label reads "Access Token", not
- * "Password": upstream labels it with locale key `password` because
- * upstream HAS a password store, while our credential is a PAT
- * (SPEC-0002 §4.6.7 divergence 7 — no password store; SPEC-0010 §2.2
- * token-as-password) and a "Password" label on a PAT field is the decoy
- * the first-run audit flagged (docs/usability/findings-first-run.md
- * blocker 1 — a just-registered "password" can never sign in). A short
- * helper under the field names the token's source (Settings →
- * Applications). DOCUMENTED DIVERGENCE required by the platform posture —
- * upstream's own strings cannot be copied here truthfully. Only the label
- * text diverges: the input keeps `name="password"`/`id="password"`,
- * `type="password"` (secret masking) and `autocomplete="current-password"`
- * (so password managers can retain the PAT — the wire shape is SPEC-0010
- * §2.2 verbatim).
+ * Between the B-1 usability fix and PWD-2's password store, the field's
+ * VISIBLE label read "Access Token" (the credential was a PAT,
+ * SPEC-0002 §4.6.7 divergence 7 — then no password store existed; the
+ * label kept a "Password" label from lying, docs/usability/
+ * findings-first-run.md blocker 1). The password store landed with
+ * migration 0074: the label is upstream's "Password" again, and the
+ * label-row slot carries upstream's "Forgot password?" link (signin_inner
+ * .tmpl) targeting the no-mailer disabled-posture page. The input keeps
+ * `name="password"`/`id="password"`, `type="password"` (secret masking)
+ * and `autocomplete="current-password"` — the wire shape is SPEC-0010
+ * §2.2 verbatim.
  *
  * ## First-run amendment (SPEC-0010 §6, 2026-10-28)
  *
@@ -90,23 +89,19 @@ export const loginFirstRunLocale = {
   init_admin_name: "Administrator Username",
   /** "install.admin_email" */
   init_admin_email: "Email Address",
-  /** "install.admin_password" — accepted-and-ignored (PAT-only auth,
-   *  SPEC-0002 §4.6.7); the note keeps the field honest. */
+  /** "install.admin_password" — SPEC-0002 §6.2 install-init row: the
+   *  bootstrap admin's real password (hashed by the create path). */
   init_admin_password: "Password",
-  init_password_note:
-    "Sign-in uses personal access tokens (PATs) — create one under your account settings after signing in. This field is kept for the upstream install form's shape and is not stored.",
+  init_password_note: "",
   /** "install.submit" */
   init_submit: "Initialize This Instance",
   /** The one-shot race loser's verdict (cf-gitea addition; upstream's
    *  install.admin_user_recreation_disallowed posture). */
   init_already_initialized: "This instance is already initialized — sign in instead.",
-  /** The sign-in credential helper (cf-gitea addition — the B-1 fix): the
-   *  field label itself diverges in locale.ts ("Access Token"); this helper
-   *  occupies the slot upstream fills with the "Forgot password?" link
-   *  (signin_inner.tmpl's tw-flex label row) — meaningless without a
-   *  password store (SPEC-0002 §4.6.7). */
-  credential_note:
-    "Sign in with a personal access token (PAT), not a password — accounts on this instance have no passwords. Create a token under Settings → Applications.",
+  /** "auth.forgot_password" — the forgot-password link occupies the slot
+   *  upstream's signin_inner.tmpl label row reserves for it (SPEC-0002
+   *  §6.2; the interim PAT credential note is retired with the PAT arm). */
+  forgot_password: "Forgot password?",
   /** "register" (navbar-less pages use the form-footer link) */
   sign_up_now: "Register now.", // "auth.sign_up_now"
 } as const;
@@ -298,8 +293,8 @@ function AdminInitSection(props: { panel: AdminInitPanel }) {
                 name="admin_passwd"
                 type="password"
                 autocomplete="new-password"
+                required
               />
-              <p class="tw-text-sm tw-text-grey">{loginFirstRunLocale.init_password_note}</p>
             </div>
             <div class="field">
               <button type="submit" class="ui primary button tw-w-full">
@@ -348,7 +343,6 @@ export function LoginPage(props: {
                   autocomplete="current-password"
                   required
                 />
-                <p class="tw-text-sm tw-text-grey">{loginFirstRunLocale.credential_note}</p>
               </div>
               <div class="inline field">
                 <div class="ui checkbox">
@@ -367,6 +361,12 @@ export function LoginPage(props: {
                 navigator sit AFTER the form inside the same segment, only
                 when external methods exist (the non-empty list). */}
             {props.oauth2Sources !== undefined ? <ExternalAuthMethods sources={props.oauth2Sources} /> : null}
+            {/* the "Forgot password?" link — signin_inner.tmpl's label-row
+                slot (SPEC-0002 §6.2; the target is the no-mailer-disabled
+                page, upstream-faithful). */}
+            <p class="tw-mt-4">
+              <a href="/user/forgot_password">{loginFirstRunLocale.forgot_password}</a>
+            </p>
             {props.signUpLink === true ? (
               <p class="tw-mt-4">
                 <a href="/user/sign_up">{loginFirstRunLocale.sign_up_now}</a>

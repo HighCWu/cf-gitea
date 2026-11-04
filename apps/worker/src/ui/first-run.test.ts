@@ -406,17 +406,17 @@ describe("GET/POST /user/sign_up — the ALLOW_SIGNUP gate", () => {
 // ---------------------------------------------------------------------------------
 
 describe("session integration — the init-created admin", () => {
-  it("logs in with a PAT (POST /login shape) and holds is_admin in the viewer", async () => {
-    const init = await request("/install", form({ admin_name: "Root", email: "root@example.com", admin_passwd: "x", retype: "x" }));
+  it("logs in with the install password (POST /login shape) and holds is_admin in the viewer", async () => {
+    const init = await request("/install", form({ admin_name: "Root", email: "root@example.com", admin_passwd: "Bootstrap-1a", retype: "Bootstrap-1a" }));
     const initCookie = cookieHeader(init).split(";")[0] ?? "";
     const admin = (await adminRows())[0]!;
 
-    // The admin mints a PAT (settings surface path) and signs in with it.
-    const pat = (await new TokenService(env.DB).mint({ userId: admin.id, name: "web", scopes: "all" })).plaintext;
+    // SPEC-0002 §6.2 (PWD-2): the install password is a REAL credential —
+    // the admin signs in with it directly.
     const login = await request("/login", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ password: pat }).toString(),
+      body: new URLSearchParams({ user_name: "Root", password: "Bootstrap-1a" }).toString(),
     });
     expect(login.status).toBe(303);
     const cookie = cookieHeader(login).split(";")[0] ?? "";
@@ -455,17 +455,15 @@ describe("login page extension", () => {
     }
   });
 
-  it("labels the credential field Access Token with the PAT helper (the B-1 divergence)", () => {
+  it("labels the credential field Password with the forgot-password link (SPEC-0002 §6.2, PWD-2)", () => {
     const html = renderLoginPage({ ctx, redirectTo: null, error: null });
-    // The label diverges from upstream's locale `password` ("Password") —
-    // our credential is a PAT (SPEC-0002 §4.6.7), and the field's helper
-    // names the token source in the slot upstream fills with the
-    // "Forgot password?" link. The wire shape is unchanged (`password`).
-    expect(html).toContain(">Access Token</label>");
-    expect(html).not.toContain(">Password</label>");
-    expect(html).toContain("personal access token (PAT), not a password");
-    expect(html).toContain("Settings → Applications");
-    expect(html).not.toContain("Forgot password");
+    // The B-1 interim "Access Token" label is superseded: the password
+    // store landed, the label reads Password, and the forgot-password link
+    // occupies the slot upstream's signin_inner.tmpl reserves for it.
+    expect(html).toContain(">Password</label>");
+    expect(html).not.toContain(">Access Token</label>");
+    expect(html).toContain("Forgot password?");
+    expect(html).toContain('href="/user/forgot_password"');
     expect(html).toContain('name="password"');
   });
 

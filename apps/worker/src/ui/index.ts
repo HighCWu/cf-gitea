@@ -1330,8 +1330,10 @@ import {
   parseUserSettingsAccountDeleteForm,
   parseUserSettingsAccountEmailDeleteForm,
   parseUserSettingsAccountEmailForm,
+  parseUserSettingsAccountPasswordForm,
   renderUserSettingsAccountPage,
 } from "./pages/user-settings-account";
+import { changeOwnPassword } from "../services/user-accounts";
 import {
   applyUserSettingsNotificationsActionsForm,
   applyUserSettingsNotificationsEmailForm,
@@ -11564,6 +11566,25 @@ async function userSettingsAccountPage(c: Context<{ Bindings: Env }>): Promise<R
   return p.respond(c.html(renderUserSettingsAccountPage(p.ctx, data), 200));
 }
 
+/** POST /user/settings/account (upstream AccountPost, routers/web/user/
+ *  setting/account.go:60-96 — SPEC-0002 §6.2 change-password row, PWD-2):
+ *  the old-password check + the UpdateAuth ladder via changeOwnPassword;
+ *  "changed" → 303 back (the success flash is upstream's; the house
+ *  settings convention 303s silently), "invalid" → reload + re-render 200
+ *  with the inline message. The invalidation is remember-me rows ONLY. */
+async function userSettingsAccountPasswordSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsAccountPasswordForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await changeOwnPassword(c.env.DB, p.viewer.id, form);
+  if (outcome.outcome === "changed") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/account" } }));
+  }
+  const data = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsAccountPage(p.ctx, data, outcome.message)));
+}
+
 /** POST /user/settings/account/email (upstream EmailPost's arms): the write
  *  apply takes the users ROW (the loader's), so the handler resolves it
  *  first; "added"/"primary"/"redirect" → 303 back, "invalid" → reload +
@@ -19262,6 +19283,7 @@ uiRouter.post("/user/settings/applications/oauth2/:id{\\d+}/revoke/:grantId{\\d+
 uiRouter.get("/user/settings/applications/oauth2/:id{\\d+}/revoke/:grantId{\\d+}", () => methodNotAllowed("POST"));
 // The account tab (navbar.tmpl:7-11 — the GET page + the three POST arms).
 uiRouter.get("/user/settings/account", (c) => userSettingsAccountPage(c));
+uiRouter.post("/user/settings/account", (c) => userSettingsAccountPasswordSubmit(c));
 uiRouter.post("/user/settings/account/email", (c) => userSettingsAccountEmailSubmit(c));
 uiRouter.post("/user/settings/account/email/delete", (c) => userSettingsAccountEmailDelete(c));
 uiRouter.post("/user/settings/account/delete", (c) => userSettingsAccountDelete(c));

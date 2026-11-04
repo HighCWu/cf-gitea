@@ -320,7 +320,7 @@ async function linkAccountSignInSubmit(c: RouteContext): Promise<Response> {
     await limiterRecordFailureFailOpen(limiter, ip, now);
     return reRender(c, hints, {
       allowSignup: allowSignup(c.env),
-      error: locale.login_error_scope,
+      error: linkAccountLocale.token_scope,
       errorTab: "signin",
     });
   }

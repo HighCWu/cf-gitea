@@ -54,7 +54,8 @@ import {
 } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
 import { TokenService } from "../auth/token-service";
-import { auditEvents, authFailures, repositories, sessions, users } from "../db/schema";
+import { newPasswordRecord } from "../auth/password";
+import { auditEvents, authFailures, emailAddresses, repositories, sessions, users } from "../db/schema";
 import {
   WEBAUTHN_CHALLENGE_COOKIE_NAME,
   WEBAUTHN_COOKIE_NAME,
@@ -223,6 +224,24 @@ async function seedToken(user: SeedUser, name: string, scopes = "all"): Promise<
   return (await new TokenService(env.DB).mint({ userId: user.id, name, scopes })).plaintext;
 }
 
+/** A login-able PASSWORD for `user` (SPEC-0002 §6.2 — the row gains the
+ *  hashed password columns under the configured pbkdf2 arm). Returns the
+ *  plaintext the login form posts. */
+async function seedPassword(
+  user: SeedUser,
+  password = "correct horse battery staple",
+): Promise<string> {
+  const record = await newPasswordRecord(password);
+  const updated = await drizzle(env.DB)
+    .update(users)
+    .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+    .where(eq(users.id, user.id))
+    .returning({ id: users.id })
+    .all();
+  if (updated.length === 0) throw new Error("password seed failed");
+  return password;
+}
+
 const failureCount = async (ip: string): Promise<number> =>
   (await drizzle(env.DB).select().from(authFailures).where(eq(authFailures.ip, ip)).get())?.count ?? 0;
 
@@ -254,10 +273,10 @@ beforeEach(async () => {
 describe("POST /login — the happy path (§2.2)", () => {
   it("mints a row and sets the gitea_session cookie with the exact flag set (no remember)", async () => {
     const alice = await seedUser({ username: "Alice" });
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
 
     const before = Date.now();
-    const res = await request("/login", form({ password: pat }));
+    const res = await request("/login", form({ user_name: alice.username, password: pw }));
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/");
 
@@ -287,8 +306,8 @@ describe("POST /login — the happy path (§2.2)", () => {
 
   it("remember toggles ONLY the cookie persistence: Max-Age=2678400 (31 days)", async () => {
     const alice = await seedUser();
-    const pat = await seedToken(alice, "web");
-    const res = await request("/login", form({ password: pat, remember: "on" }));
+    const pw = await seedPassword(alice);
+    const res = await request("/login", form({ user_name: alice.username, password: pw, remember: "on" }));
     expect(res.status).toBe(303);
     expect(cookieParts(cookieHeader(res)).get("Max-Age")).toBe(String(REMEMBER_MAX_AGE_SECONDS));
     expect(sessionSetCookie("a:b", true)).toContain(`Max-Age=${REMEMBER_MAX_AGE_SECONDS}`);
@@ -298,15 +317,15 @@ describe("POST /login — the happy path (§2.2)", () => {
     expect(row?.remember).toBe(true);
   });
 
-  it("accepts `token` as the field alias and an optional case-insensitive matching user_name", async () => {
+  it("signs in case-insensitively and via a display-case username (the lower_name lookup)", async () => {
     const alice = await seedUser({ username: "Alice" });
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
 
-    const alias = await request("/login", form({ token: pat }));
-    expect(alias.status).toBe(303);
-
-    const named = await request("/login", form({ password: pat, user_name: "ALICE" }));
+    const named = await request("/login", form({ user_name: "ALICE", password: pw }));
     expect(named.status).toBe(303);
+
+    const display = await request("/login", form({ user_name: "Alice", password: pw }));
+    expect(display.status).toBe(303);
   });
 
   it("parses `remember` by presence: empty value stays a session cookie, any non-empty value persists", async () => {
@@ -314,26 +333,26 @@ describe("POST /login — the happy path (§2.2)", () => {
     // checkbox's canonical "on" is covered above; here the parse rule's two
     // edges: an explicitly empty field is absence, ANY other value persists.
     const alice = await seedUser();
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
 
-    const empty = await request("/login", form({ password: pat, remember: "" }));
+    const empty = await request("/login", form({ user_name: alice.username, password: pw, remember: "" }));
     expect(empty.status).toBe(303);
     expect(cookieParts(cookieHeader(empty)).has("Max-Age")).toBe(false);
 
-    const anyValue = await request("/login", form({ password: pat, remember: "yes" }));
+    const anyValue = await request("/login", form({ user_name: alice.username, password: pw, remember: "yes" }));
     expect(anyValue.status).toBe(303);
     expect(cookieParts(cookieHeader(anyValue)).get("Max-Age")).toBe(String(REMEMBER_MAX_AGE_SECONDS));
   });
 
   it("honors a path-absolute ?redirect_to and rejects scheme-relative/scheme/control-char targets (§4.6)", async () => {
     const alice = await seedUser();
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
 
-    const ok = await request("/login", form({ password: pat, redirect_to: "/alice/repo" }));
+    const ok = await request("/login", form({ user_name: alice.username, password: pw, redirect_to: "/alice/repo" }));
     expect(ok.headers.get("location")).toBe("/alice/repo");
 
     for (const hostile of ["//evil.example/x", "https://evil.example/x", "/\tmeta", "relative/path", ""]) {
-      const res = await request("/login", form({ password: pat, redirect_to: hostile }));
+      const res = await request("/login", form({ user_name: alice.username, password: pw, redirect_to: hostile }));
       expect(res.status).toBe(303);
       expect(res.headers.get("location")).toBe("/");
     }
@@ -341,14 +360,14 @@ describe("POST /login — the happy path (§2.2)", () => {
 
   it("resets the per-IP limiter on success (§2.2 step 5)", async () => {
     const alice = await seedUser();
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
     const ip = "10.9.9.9";
     for (let i = 0; i < 19; i++) {
       await request("/login", form({ password: "nope" }, { "x-forwarded-for": ip }));
     }
     expect(await failureCount(ip)).toBe(19);
 
-    const res = await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
+    const res = await request("/login", form({ user_name: alice.username, password: pw }, { "x-forwarded-for": ip }));
     expect(res.status).toBe(303);
     expect(await failureCount(ip)).toBe(0); // limiter.reset ran via waitUntil
   });
@@ -359,11 +378,11 @@ describe("POST /login — the happy path (§2.2)", () => {
     const staleCookie = await mintSession(env.DB, alice.id); // a live ALICE row presented at Bob's login
     expect(await lookupValidSession(env.DB, staleCookie)).not.toBeNull();
 
-    const bobPat = await seedToken(bob, "web");
+    const pw = await seedPassword(bob);
     const res = await request("/login", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${SESSION_COOKIE_NAME}=${staleCookie}` },
-      body: new URLSearchParams({ password: bobPat }).toString(),
+      body: new URLSearchParams({ user_name: "Bob", password: pw }).toString(),
     });
     expect(res.status).toBe(303);
     // Bob minted…
@@ -380,13 +399,13 @@ describe("POST /login — the happy path (§2.2)", () => {
 
   it("a SAME-user re-login KEEPS the prior row alive (the documented choice — it already authenticates the minted principal)", async () => {
     const alice = await seedUser({ username: "Alice" });
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
     const priorCookie = await mintSession(env.DB, alice.id);
 
     const res = await request("/login", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${SESSION_COOKIE_NAME}=${priorCookie}` },
-      body: new URLSearchParams({ password: pat }).toString(),
+      body: new URLSearchParams({ user_name: alice.username, password: pw }).toString(),
     });
     expect(res.status).toBe(303);
     // both rows alive: the prior (same principal) AND the fresh mint
@@ -401,10 +420,10 @@ describe("POST /login — the happy path (§2.2)", () => {
 
   it("stamps users.last_login_at at the mint (P3-7 — upstream's SetLastLogin sign-in family, auth.go:427-430)", async () => {
     const alice = await seedUser({ username: "Alice" });
-    const pat = await seedToken(alice, "web");
+    const pw = await seedPassword(alice);
     const before = Date.now();
 
-    const res = await request("/login", form({ password: pat }));
+    const res = await request("/login", form({ user_name: alice.username, password: pw }));
     expect(res.status).toBe(303);
 
     const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).all())[0];
@@ -421,91 +440,87 @@ describe("POST /login — failure paths re-render at 200 and count one limiter f
   const ip = "10.1.1.1";
   const post = async (fields: Record<string, string>): Promise<Response> => request("/login", form(fields, { "x-forwarded-for": ip }));
 
-  it("unknown / malformed / missing PAT → the non-committal invalid-token error", async () => {
-    const res = await post({ password: "cfg_00000000_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+  it("unknown / malformed / missing credential → the generic username-or-password-incorrect error", async () => {
+    const res = await post({ user_name: "Alice", password: "not-her-password" });
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("The token is not valid.");
+    expect(html).toContain("Username or password is incorrect.");
     expect(html).toContain("ui negative message");
     expect(html).toContain('action="/login"');
     expect(await failureCount(ip)).toBe(1);
 
     expect((await post({})).status).toBe(200); // no fields at all
     expect(await failureCount(ip)).toBe(2);
+
+    // a password-less row never reaches a hash call — the same generic arm
+    const nobody = await seedUser({ username: "Passwordless" });
+    void nobody;
+    const res2 = await post({ user_name: "Passwordless", password: "anything" });
+    expect(res2.status).toBe(200);
+    expect(await res2.text()).toContain("Username or password is incorrect.");
+    expect(await failureCount(ip)).toBe(3);
   });
 
-  it("bad PAT shapes — sub-gate short, wrong-shape cfg_, and the imported 40-hex look-alike — fail like unknown credentials", async () => {
-    // tokenLookupPrefix's gates (token-format.ts): a value under the 8-char
-    // upstream gate never reaches a lookup; a `cfg_`-prefixed but malformed
-    // value and a 40-hex imported-shape value take the 12-char prefix lookup
-    // and miss the index — all render the same non-committal failure and
-    // count exactly one limiter failure each (§4.11's indistinguishability).
-    const short = await post({ password: "abc" });
-    expect(short.status).toBe(200);
-    expect(await short.text()).toContain("The token is not valid.");
+  it("wrong password / unknown user / wrong-shape credentials are indistinguishable (§4.11)", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    await seedPassword(alice);
+
+    const wrong = await post({ user_name: "Alice", password: "wrong-password" });
+    expect(wrong.status).toBe(200);
+    expect(await wrong.text()).toContain("Username or password is incorrect.");
     expect(await failureCount(ip)).toBe(1);
 
-    const wrongShape = await post({ password: "cfg_zzzz_not-quite-a-token" });
-    expect(wrongShape.status).toBe(200);
-    expect(await wrongShape.text()).toContain("The token is not valid.");
+    const unknown = await post({ user_name: "Nobody", password: "whatever" });
+    expect(unknown.status).toBe(200);
+    expect(await unknown.text()).toContain("Username or password is incorrect.");
     expect(await failureCount(ip)).toBe(2);
 
-    const importedHex = await post({ password: "0123456789abcdef0123456789abcdef01234567" });
-    expect(importedHex.status).toBe(200);
-    expect(await importedHex.text()).toContain("The token is not valid.");
+    // the EMAIL arm's miss renders the same message (signin.go:30-44)
+    const emailMiss = await post({ user_name: "alice@nowhere.example", password: "whatever" });
+    expect(emailMiss.status).toBe(200);
+    expect(await emailMiss.text()).toContain("Username or password is incorrect.");
     expect(await failureCount(ip)).toBe(3);
   });
 
   it("carries redirect_to through the failure re-render (the round-trip survives a bad credential)", async () => {
     // The POST → failure → resubmit loop keeps the hidden field filled, so
-    // a user who mistypes their token does not lose their deep link (§2.2).
-    const res = await post({ password: "nope", redirect_to: "/alice/repo" });
+    // a user who mistypes their password does not lose their deep link (§2.2).
+    const res = await post({ user_name: "Alice", password: "nope", redirect_to: "/alice/repo" });
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('name="redirect_to" value="/alice/repo"');
     expect(await failureCount(ip)).toBe(1);
   });
 
-  it("a wrong user_name is a login failure that reveals nothing", async () => {
+  it("a PAT in the password field is NOT accepted (the interim token-as-password arm is REMOVED, SPEC-0002 §6.2)", async () => {
     const alice = await seedUser({ username: "Alice" });
     const pat = await seedToken(alice, "web");
-    const res = await post({ password: pat, user_name: "not-alice" });
+    // even a VALID, all-scoped PAT renders the generic failure and counts
+    // one limiter failure — upstream never accepted a token here
+    const res = await post({ user_name: alice.username, password: pat });
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain("The token is not valid.");
+    expect(await res.text()).toContain("Username or password is incorrect.");
     expect(await failureCount(ip)).toBe(1);
+    expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
   });
 
-  it("an expired PAT verifies as unknown", async () => {
-    const alice = await seedUser();
-    const minted = await new TokenService(env.DB).mint({
+  it("the email arm signs in when the address is activated (signin.go:30-44)", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const pw = await seedPassword(alice);
+    await drizzle(env.DB).insert(emailAddresses).values({
       userId: alice.id,
-      name: "expired",
-      scopes: "all",
-      expiresAt: new Date(Date.now() - 1000),
+      email: "alice@example.com",
+      lowerEmail: "alice@example.com",
+      isActivated: true,
+      isPrimary: true,
     });
-    const res = await post({ password: minted.plaintext });
-    expect(res.status).toBe(200);
-    expect(await failureCount(ip)).toBe(1);
-  });
-
-  it("public-only, no-token-scope, and missing-repository-scope PATs cannot mint (§2.2 step 3)", async () => {
-    const alice = await seedUser();
-    for (const [name, scopes] of [
-      ["po", "public-only"],
-      ["ns", "no-token-scope"],
-      ["ru", "read:user"],
-    ] as const) {
-      const pat = await seedToken(alice, name, scopes);
-      const res = await post({ password: pat });
-      expect(res.status).toBe(200);
-      expect(await res.text()).toContain("does not grant repository read access");
-    }
-    expect(await failureCount(ip)).toBe(3);
+    const res = await post({ user_name: "Alice@Example.com", password: pw });
+    expect(res.status).toBe(303);
   });
 
   it("a prohibited account gets the form, no row, no cookie (§2.2 step 4)", async () => {
     const mallory = await seedUser({ username: "Mallory", status: "prohibited" });
-    const pat = await seedToken(mallory, "web");
-    const res = await post({ password: pat });
+    const pw = await seedPassword(mallory);
+    const res = await post({ user_name: "Mallory", password: pw });
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("prohibited from signing in");
     expect(await failureCount(ip)).toBe(1);
@@ -523,7 +538,7 @@ describe("POST /login — the shared per-IP limiter blocks (§2.2 step 1, §4.7)
     for (let attempt = 0; attempt < threshold + 1; attempt++) {
       const res = await request(
         "/login",
-        form({ password: "cfg_00000000_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, { "x-forwarded-for": ip }),
+        form({ user_name: "Alice", password: "nope" }, { "x-forwarded-for": ip }),
       );
       if (res.status === 429) {
         blocked = res;
@@ -537,8 +552,8 @@ describe("POST /login — the shared per-IP limiter blocks (§2.2 step 1, §4.7)
 
     // The check runs FIRST: even a valid credential stays blocked.
     const alice = await seedUser();
-    const pat = await seedToken(alice, "web");
-    const valid = await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
+    const pw = await seedPassword(alice);
+    const valid = await request("/login", form({ user_name: alice.username, password: pw }, { "x-forwarded-for": ip }));
     expect(valid.status).toBe(429);
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
   });
@@ -711,7 +726,7 @@ describe("GET /login — the rotation round-trip", () => {
 
   it("a remembered session's rotation keeps Max-Age=2678400 (upstream re-sets the remember cookie, auth.go:127)", async () => {
     const alice = await seedUser();
-    const login = await request("/login", form({ password: await seedToken(alice, "web"), remember: "on" }));
+    const login = await request("/login", form({ user_name: alice.username, password: await seedPassword(alice), remember: "on" }));
     expect(login.status).toBe(303);
     const remembered = cookieParts(cookieHeader(login)).get(SESSION_COOKIE_NAME) ?? "";
     await backdateRotation(remembered, new Date(Date.now() - 25 * 60 * 60 * 1000));
@@ -1612,10 +1627,10 @@ function setCookieMaps(response: Response): Map<string, Map<string, string>> {
 }
 
 describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () => {
-  /** A login-able PAT for `user` + a live TOTP enrollment through the REAL
-   *  enrollment seam (the secret never touches a test constant). */
-  async function seedEnrolled(user: SeedUser, name = "web"): Promise<{ pat: string; secret: string; scratchToken: string }> {
-    const pat = await seedToken(user, name);
+  /** A login-able PASSWORD for `user` + a live TOTP enrollment through the
+   *  REAL enrollment seam (the secret never touches a test constant). */
+  async function seedEnrolled(user: SeedUser, _name = "web"): Promise<{ pat: string; secret: string; scratchToken: string }> {
+    const pat = await seedPassword(user);
     const secret = generateTotpSecret();
     const ticket = await mintPendingTicket(env.DB, { kind: "enroll", secret });
     const outcome = await applyTwofaEnrollment(env.DB, user.id, await totpCode(secret, Date.now() / 1000), ticket);
@@ -1644,7 +1659,7 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
 
   /** Drive the gate to the twofa page: login POST → the 303 + ticket cookie. */
   async function gateTicket(user: SeedUser, pat: string, extra: Record<string, string> = {}): Promise<string> {
-    const res = await request("/login", form({ password: pat, ...extra }));
+    const res = await request("/login", form({ user_name: user.username, password: pat, ...extra }));
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/user/two_factor");
     const value = setCookieMaps(res).get(TWOFA_COOKIE_NAME);
@@ -1657,8 +1672,8 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
 
   it("a NOT-enrolled user's login is byte-unchanged: direct mint, no twofa cookie", async () => {
     const alice = await seedUser();
-    const pat = await seedToken(alice, "web");
-    const res = await request("/login", form({ password: pat }));
+    const pat = await seedPassword(alice);
+    const res = await request("/login", form({ user_name: alice.username, password: pat }));
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/");
     const cookies = setCookieMaps(res);
@@ -1669,7 +1684,7 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
   it("an enrolled user's login does NOT mint — 303 /user/two_factor with the sealed ticket (auth.go:330-349)", async () => {
     const alice = await seedUser();
     const { pat } = await seedEnrolled(alice);
-    const res = await request("/login", form({ password: pat, redirect_to: "/alice/repo" }));
+    const res = await request("/login", form({ user_name: alice.username, password: pat, redirect_to: "/alice/repo" }));
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/user/two_factor");
     const cookies = setCookieMaps(res);
@@ -1679,9 +1694,9 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     // the credential proof SUCCEEDED: the limiter reset still ran (the gate
     // login itself, same IP bucket, clears the counter)
     const ip = "10.5.5.5";
-    for (let i = 0; i < 3; i++) await request("/login", form({ password: "nope" }, { "x-forwarded-for": ip }));
+    for (let i = 0; i < 3; i++) await request("/login", form({ user_name: "nobody", password: "nope" }, { "x-forwarded-for": ip }));
     expect(await failureCount(ip)).toBe(3);
-    await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
+    await request("/login", form({ user_name: alice.username, password: pat }, { "x-forwarded-for": ip }));
     expect(await failureCount(ip)).toBe(0);
   });
 
@@ -1695,7 +1710,7 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     const { pat, secret } = await seedEnrolled(alice);
     await seedWebAuthnCredential(alice);
 
-    const res = await request("/login", form({ password: pat, redirect_to: "/alice/repo" }));
+    const res = await request("/login", form({ user_name: alice.username, password: pat, redirect_to: "/alice/repo" }));
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/user/webauthn"); // the webauthn prompt wins (hasWebAuthn first)
     const cookies = setCookieMaps(res);
@@ -1708,9 +1723,9 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     // limiter to inherit a park-vs-complete split from, so the house rule
     // "verified password ⇒ reset" covers every park alike).
     const ip = "10.6.6.6";
-    for (let i = 0; i < 3; i++) await request("/login", form({ password: "nope" }, { "x-forwarded-for": ip }));
+    for (let i = 0; i < 3; i++) await request("/login", form({ user_name: "nobody", password: "nope" }, { "x-forwarded-for": ip }));
     expect(await failureCount(ip)).toBe(3);
-    await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
+    await request("/login", form({ user_name: alice.username, password: pat }, { "x-forwarded-for": ip }));
     expect(await failureCount(ip)).toBe(0);
 
     // THE DEAD-500 FIX: from the webauthn prompt, the TOTP fallback link

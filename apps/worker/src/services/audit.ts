@@ -236,6 +236,17 @@ export const AuditActions = {
   // (auth.go:476's RecordAs — actor the ADMIN, scope the target).
   UserImpersonation: defineAction("user:impersonation:start", "User {actor} started impersonating user {scope}."),
   UserImpersonationExit: defineAction("user:impersonation:exit", "User {actor} stopped impersonating user {scope}."),
+  // SPEC-0002 §6 (PWD-2) — the password-family emits (action.go:69/76,
+  // ids AND templates verbatim):
+  //   - UserAuthenticationFailTwoFactor — the API Basic password arm's
+  //     failed-OTP consume (basic.go:182's RecordAs; the generic 401 rides).
+  //   - UserPassword — the change-password arm's UpdateAuth success
+  //     (update.go:283, the deleteAuthTokens tail).
+  UserAuthenticationFailTwoFactor: defineAction(
+    "user:authentication:fail:twofactor",
+    "Failed two-factor authentication for user {scope}.",
+  ),
+  UserPassword: defineAction("user:password", "Changed password of user {scope}."),
   // The external-login link pair (action.go:89-90 — ids AND templates
   // verbatim): the add row emits at the dance callback's link completion
   // (web/oauth2-login.ts's linkIdentityToUser arms — upstream

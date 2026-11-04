@@ -634,11 +634,10 @@ describe("the submit — the password arm (SPEC-0002 §6.2 admin-set, PWD-2)", (
       field: "password",
     });
     const complex = await submit(seeded, aliceForm({ password: "alllowercase123" }));
-    expect(complex).toEqual({
-      outcome: "invalid",
-      message: expect.stringContaining("Password does not pass complexity requirements:"),
-      field: "password",
-    });
+    expect(complex).toMatchObject({ outcome: "invalid", field: "password" });
+    expect(complex.outcome === "invalid" && complex.message).toEqual(
+      expect.stringContaining("Password does not pass complexity requirements:"),
+    );
   });
 
   it("a valid password stores the hashed record + clears remember sessions", async () => {
@@ -650,7 +649,7 @@ describe("the submit — the password arm (SPEC-0002 §6.2 admin-set, PWD-2)", (
     expect(row.salt).toMatch(/^[0-9a-f]{32}$/);
     expect(row.passwdHashAlgo).toBe("pbkdf2$50000$50");
     const { sessions } = await import("../../db/schema");
-    const rows = await drizzle(env.DB).select().from(await sessions).all();
+    const rows = await drizzle(env.DB).select().from(sessions).all();
     expect(rows.every((r) => !(r.userId === seeded.aliceId && r.remember))).toBe(true);
   });
 });

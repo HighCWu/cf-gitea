@@ -68,7 +68,6 @@ import { drizzle } from "drizzle-orm/d1";
 import { users } from "../../db/schema";
 import { ScopeSet } from "../../auth/scopes";
 import { TokenService } from "../../auth/token-service";
-import { loginFirstRunLocale } from "./login";
 import { signUpLocale } from "./first-run";
 import { locale } from "../locale";
 import { sanitizeSuggestedUsername } from "../../services/auth-sources/identity";
@@ -94,6 +93,15 @@ export const linkAccountLocale = {
   /** The signin arm's failure re-render (linkaccount.go:101's
    *  form.username_password_incorrect — non-committal by design). */
   username_password_incorrect: "Username or password is incorrect.", // "form.username_password_incorrect"
+  /** The link-account sign-in tab's own scope gate (SPEC-0010 §5's PAT
+   *  verification surface — NOT the web-login password arm; the old shared
+   *  locale.login_error_scope key moved here with PWD-2's login swap). */
+  token_scope: "The token cannot sign in: it does not grant repository read access.",
+  /** The token credential note (the B-1 fix's copy — truthful for THIS
+   *  surface, which verifies a PAT; login.tsx's copy retired with its PAT
+   *  arm). */
+  credential_note:
+    "Sign in with a personal access token (PAT), not a password — accounts on this instance have no passwords. Create a token under Settings → Applications.",
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -379,7 +387,7 @@ export function LinkAccountPage(props: {
                         required
                         tabindex={2}
                       />
-                      <p class="tw-text-sm tw-text-grey">{loginFirstRunLocale.credential_note}</p>
+                      <p class="tw-text-sm tw-text-grey">{linkAccountLocale.credential_note}</p>
                     </div>
                     <div class="field">
                       <button type="submit" class="ui primary button tw-w-full" tabindex={3}>

@@ -202,8 +202,15 @@ import type { UiContext } from "../ui-context";
 export const userSettingsAccountLocale = {
   account: "Account", // "settings.account" (the title — ctx.Data["Title"], account.go:38 — + the navbar item)
   password: "Password", // "settings.password" (the section header, account.tmpl:4)
+  /** account.tmpl:8-29's form labels (SPEC-0002 §6.2 — the change-password
+   *  arm is MOUNTED with the password store; the disabled notice above is
+   *  retired). */
+  old_password: "Current Password", // "settings.old_password"
+  new_password: "New Password", // "settings.new_password"
+  retype_new_password: "Confirm New Password", // "settings.retype_new_password"
+  change_password: "Update Password", // "settings.change_password"
   password_change_disabled:
-    "Non-local users cannot update their password through the Gitea web interface.", // "settings.password_change_disabled" (the else arm, account.tmpl:32)
+    "Non-local users cannot update their password through the Gitea web interface.", // "settings.password_change_disabled" (the else arm, account.tmpl:32 — UNRENDERED since PWD-2)
   manage_emails: "Manage Email Addresses", // "settings.manage_emails" (account.tmpl:39)
   primary: "Primary", // "settings.primary"
   activated: "Activated", // "settings.activated"
@@ -302,6 +309,22 @@ export function parseUserSettingsAccountEmailForm(params: URLSearchParams): User
     method: params.get("_method") ?? "",
     id: /^\d+$/.test(rawId) ? Number.parseInt(rawId, 10) : null,
     email: params.get("email") ?? "",
+  };
+}
+
+/** The POST /user/settings/account password body (account.tmpl:8-29's
+ *  ChangePasswordForm — old_password/password/retype). */
+export interface UserSettingsAccountPasswordForm {
+  oldPassword: string;
+  newPassword: string;
+  retype: string;
+}
+
+export function parseUserSettingsAccountPasswordForm(params: URLSearchParams): UserSettingsAccountPasswordForm {
+  return {
+    oldPassword: params.get("old_password") ?? "",
+    newPassword: params.get("password") ?? "",
+    retype: params.get("retype") ?? "",
   };
 }
 
@@ -573,14 +596,33 @@ export function UserSettingsAccountPage(props: { ctx: UiContext; data: UserSetti
         <UserSettingsNavbar active="account" />
         <div class="flex-container-main">
           <div class="user-setting-content">
-            {/* account.tmpl:3-35 — the password section's disabled arm (the
-                module header: no password model, the security module's
-                "no password form renders anywhere" rule). */}
+            {/* account.tmpl:3-35 — the change-password form, MOUNTED with the
+                password store (SPEC-0002 §6.2 change-password row; the
+                interim disabled notice is superseded). The POST is
+                AccountPost's port: the old-password check (required only
+                when a password is set), the retype match, the UpdateAuth
+                ladder, remember-me-only invalidation. `error` renders the
+                inline flash (the failure re-render convention). */}
             <h4 class="ui top attached header">{userSettingsAccountLocale.password}</h4>
             <div class="ui attached segment">
-              <div class="ui info message">
-                <p class="text left">{userSettingsAccountLocale.password_change_disabled}</p>
-              </div>
+              {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
+              <form class="ui form" action="/user/settings/account" method="post">
+                <div class="required field">
+                  <label for="old_password">{userSettingsAccountLocale.old_password}</label>
+                  <input id="old_password" name="old_password" type="password" autocomplete="current-password" />
+                </div>
+                <div class="required field">
+                  <label for="password">{userSettingsAccountLocale.new_password}</label>
+                  <input id="password" name="password" type="password" autocomplete="new-password" required />
+                </div>
+                <div class="required field">
+                  <label for="retype">{userSettingsAccountLocale.retype_new_password}</label>
+                  <input id="retype" name="retype" type="password" autocomplete="new-password" required />
+                </div>
+                <div class="field">
+                  <button type="submit" class="ui primary button">{userSettingsAccountLocale.change_password}</button>
+                </div>
+              </form>
             </div>
 
             {/* account.tmpl:37-105 — the emails section. The disabled add

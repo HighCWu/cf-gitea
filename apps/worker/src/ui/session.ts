@@ -145,8 +145,14 @@ import {
   limiterRecordFailureFailOpen,
   limiterResetFailOpen,
 } from "../auth/middleware";
-import { ScopeSet } from "../auth/scopes";
-import { TokenService } from "../auth/token-service";
+import { userSignInPassword } from "../auth/password-auth";
+import { verifyUserTimeLimitCode } from "../auth/reset-code";
+import { applyPasswordReset } from "../services/user-accounts";
+import {
+  passwordResetLocale,
+  renderForgotPasswordPage,
+  renderResetPasswordPage,
+} from "./pages/password-reset";
 import {
   clearTwofaSetCookie,
   getTwoFactorByUid,
@@ -943,9 +949,10 @@ export function safeRedirectTarget(raw: string | null | undefined): string {
 }
 
 interface LoginForm {
-  /** The PAT (`password` field; `token` accepted as an alias, §2.2). */
+  /** The password (`password` field — SPEC-0002 §6.2; the interim `token`
+   *  alias is REMOVED with the PAT-as-password behavior). */
   password: string | null;
-  /** Optional owner cross-check, case-insensitive (§2.2). */
+  /** The username (or email) — upstream SignInForm's required field. */
   userName: string | null;
   remember: boolean;
   /** The form's hidden `redirect_to` (validated only at use time). */
@@ -972,7 +979,7 @@ async function parseLoginForm(req: Request): Promise<LoginForm> {
     return { password: null, userName: null, remember: false, redirectTo: null };
   }
   return {
-    password: params.get("password") ?? params.get("token"),
+    password: params.get("password"),
     userName: params.get("user_name"),
     remember: (params.get("remember") ?? "") !== "",
     redirectTo: params.get("redirect_to"),
@@ -1151,48 +1158,46 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
     renderLoginFailure(
       c,
       form.redirectTo,
-      locale.login_error_invalid_token,
+      locale.login_error_incorrect,
       limiterRecordFailureFailOpen(limiter, ip, now),
     );
 
-  // Step 2: verify the PAT unchanged (prefix lookup + sha256 + timing-safe
-  // compare + expiry, src/auth/token-service.ts:165-188). Unknown,
-  // malformed, and expired credentials are indistinguishable (§4.11).
-  if (form.password === null || form.password === "") return invalid();
-  const verified = await new TokenService(c.env.DB).verify(form.password, { now });
-  if (verified === null) return invalid();
-  // The optional `user_name` must match the token owner case-insensitively;
-  // a mismatch is a login failure that reveals nothing (§2.2).
-  if (form.userName !== null && form.userName.trim().toLowerCase() !== verified.user.usernameLower) {
+  // Step 2: THE PASSWORD ARM (SPEC-0002 §6.2 web row — upstream SignInPost
+  // routers/web/auth/auth.go:292-330 → UserSignIn → the DB Authenticate
+  // ladder in src/auth/password-auth.ts). Both fields are REQUIRED
+  // (upstream SignInForm binding:"Required"); every failure — unknown
+  // user/email, wrong password, unset password, the controlled
+  // unsupported-hash row (logged; SPEC §6.3-3) — re-renders the SAME
+  // generic message (upstream "form.username_password_incorrect"), and
+  // counts one limiter failure. The PAT-as-password behavior is REMOVED:
+  // upstream never accepted a token in the password field (SPEC-0010
+  // §2.2's interim posture is superseded). The EnablePasswordSignInForm
+  // gate (default TRUE, service.go:180) has no knob until Phase C.
+  if (form.userName === null || form.userName.trim() === "" || form.password === null || form.password === "") {
     return invalid();
   }
-
-  // Step 3: capability gate on the minting PAT — the session carries the
-  // USER's web identity (scope-less, §2.2 step 3), so the PAT must itself
-  // pass the gate's authenticated read path; a `no-token-scope` or
-  // public-only PAT must not mint a session that reads more than the token
-  // could (the gate masks limited-owner repos from public-only tokens,
-  // acl.ts decide + SPEC-0002 §4.1).
-  const scope = ScopeSet.parseLenient(verified.token.scopes);
-  if (!scope.has("read:repository") || scope.publicOnly) {
-    return renderLoginFailure(
-      c,
-      form.redirectTo,
-      locale.login_error_scope,
-      limiterRecordFailureFailOpen(limiter, ip, now),
-    );
+  const signIn = await userSignInPassword(c.env.DB, form.userName, form.password);
+  if (!signIn.ok) {
+    if (signIn.failure.kind === "prohibited") {
+      // Upstream renders the dedicated prohibit-login PAGE (auth.go:316-320);
+      // the inline banner is the house posture every prohibited arm shares
+      // (the documented divergence at oauth2ErrorMessage).
+      return renderLoginFailure(
+        c,
+        form.redirectTo,
+        locale.login_error_prohibited,
+        limiterRecordFailureFailOpen(limiter, ip, now),
+      );
+    }
+    if (signIn.failure.kind === "unsupported-hash") {
+      console.error(`login: ${signIn.failure.error.message}`);
+    }
+    return invalid();
   }
+  const user = signIn.user;
 
-  // Step 4: prohibited account → no session, no row, no cookie (upstream
-  // refusing login for prohibit-login users, githttp.go:194-197 semantics).
-  if (verified.user.status !== "active") {
-    return renderLoginFailure(
-      c,
-      form.redirectTo,
-      locale.login_error_prohibited,
-      limiterRecordFailureFailOpen(limiter, ip, now),
-    );
-  }
+  // Step 3 is GONE with the PAT arm: a password session carries the USER's
+  // web identity, no token scope (upstream's password sign-in holds no PAT).
 
   // Step 4.5a (THE WEBAUTHN 2FA GATE — the disclosed hunk, the WebAuthn
   // unit): a user with enrolled security keys does not get the session yet.
@@ -1217,10 +1222,10 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // BOTH carriers here — the pending carrier AND the `gitea_twofa` gate
   // ticket — and whichever flow completes first clears both (the TOTP
   // arms below; the webauthn mint arm is web/webauthn.ts's).
-  if (await hasCredentialsForUser(c.env.DB, verified.user.id)) {
+  if (await hasCredentialsForUser(c.env.DB, user.id)) {
     const pending = await signCeremonyState(c.env.DB, {
       k: "pending",
-      uid: verified.user.id,
+      uid: user.id,
       ch: "",
       rem: form.remember,
       to: safeRedirectTarget(form.redirectTo),
@@ -1235,12 +1240,12 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
     // reset on every verified-password arm alike.
     sink(limiterResetFailOpen(limiter, ip));
     sink(sweepExpiredSessions(c.env.DB, now));
-    if (await hasTwoFactorByUid(c.env.DB, verified.user.id)) {
+    if (await hasTwoFactorByUid(c.env.DB, user.id)) {
       const ticket = await mintPendingTicket(
         c.env.DB,
         {
           kind: "gate",
-          userId: verified.user.id,
+          userId: user.id,
           remember: form.remember,
           redirectTo: safeRedirectTarget(form.redirectTo),
         },
@@ -1258,12 +1263,12 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // redirect_to cookie — one carrier here), and the flow continues at
   // GET /user/two_factor. The limiter reset + the GC sweep still run (the
   // credential proof SUCCEEDED — this is not a failure arm).
-  if (await hasTwoFactorByUid(c.env.DB, verified.user.id)) {
+  if (await hasTwoFactorByUid(c.env.DB, user.id)) {
     const ticket = await mintPendingTicket(
       c.env.DB,
       {
         kind: "gate",
-        userId: verified.user.id,
+        userId: user.id,
         remember: form.remember,
         redirectTo: safeRedirectTarget(form.redirectTo),
       },
@@ -1281,8 +1286,8 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // the mint lands (upstream's Regenerate — retirePresentedSession's
   // header; mint-first so a failed retirement can never leave the presenter
   // sessionless).
-  const cookieValue = await mintSession(c.env.DB, verified.user.id, { now, remember: form.remember });
-  await retirePresentedSession(c.env.DB, c.req.raw, verified.user.id);
+  const cookieValue = await mintSession(c.env.DB, user.id, { now, remember: form.remember });
+  await retirePresentedSession(c.env.DB, c.req.raw, user.id);
   sink(limiterResetFailOpen(limiter, ip));
   sink(sweepExpiredSessions(c.env.DB, now));
 
@@ -1545,7 +1550,121 @@ sessionRouter.get("/login", (c) => loginPage(c));
 sessionRouter.post("/login", (c) => loginSubmit(c));
 sessionRouter.post("/logout", (c) => logout(c));
 // The 2FA gate (web.go:600-604's group — statics, no uiRouter overlap).
+sessionRouter.get("/user/forgot_password", (c) => forgotPasswordPage(c));
+sessionRouter.post("/user/forgot_password", (c) => forgotPasswordSubmit(c));
+sessionRouter.get("/user/reset_password", (c) => resetPasswordPage(c));
+sessionRouter.post("/user/reset_password", (c) => resetPasswordSubmit(c));
 sessionRouter.get("/user/two_factor", (c) => twofaPage(c));
 sessionRouter.post("/user/two_factor", (c) => twofaSubmit(c));
 sessionRouter.get("/user/two_factor/scratch", (c) => twofaScratchPage(c));
 sessionRouter.post("/user/two_factor/scratch", (c) => twofaScratchSubmit(c));
+
+// ---------------------------------------------------------------------------
+// The forgot/reset password arms (upstream routers/web/auth/password.go —
+// SPEC-0002 §6.2 reset row, PWD-2). The forgot-REQUEST arm stays gated off
+// upstream-faithfully (no Workers mailer: the GET renders the
+// reset-disabled state — password.go:40-45's IsResetDisable — and the POST
+// is the :53-57 NotFound). The reset-COMPLETE arm is live: the HMAC
+// time-limit code (auth/reset-code.ts) verifies, the 2FA arms run
+// (password.go:170-204's order — TOTP passcode/scratch BEFORE the apply,
+// the WebAuthn-only park AFTER it), then the UpdateAuth ladder
+// (services/user-accounts.ts applyPasswordReset) and the auto sign-in
+// (handleSignIn — mint + cookie + the "/" redirect).
+// ---------------------------------------------------------------------------
+
+/** GET /user/forgot_password — the reset-disabled page. */
+async function forgotPasswordPage(c: RouteContext): Promise<Response> {
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+  return c.html(renderForgotPasswordPage(assembled.ctx), 200);
+}
+
+/** POST /user/forgot_password — upstream NotFound without a mailer
+ *  (password.go:53-57; the form never renders, so this is the
+ *  non-browser-client arm). */
+async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
+  return renderServerErrorShellResponse(c.env, c.req.raw);
+}
+
+/** GET /user/reset_password?code=… — the code verifies BEFORE the form
+ *  renders (commonResetPassword, password.go:110-160): a valid code renders
+ *  the password form (with the passcode field when TOTP-enrolled), an
+ *  invalid/expired one renders the invalid-code message
+ *  ("auth.invalid_code"). */
+async function resetPasswordPage(c: RouteContext): Promise<Response> {
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+  const url = new URL(c.req.url);
+  const code = url.searchParams.get("code") ?? "";
+  if (code !== "") {
+    const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
+    if (user !== null) {
+      const twoFactor = await hasTwoFactorByUid(c.env.DB, user.id);
+      return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: null, twoFactor }), 200);
+    }
+  }
+  return c.html(
+    renderResetPasswordPage({ ctx: assembled.ctx, code, error: passwordResetLocale.invalid_code, twoFactor: false }),
+    200,
+  );
+}
+
+/** POST /user/reset_password — the reset-complete arm (ResetPasswdPost,
+ *  password.go:164-265). */
+async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
+  // §2.8 layer 2 — a non-GET UI write.
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+  const invalid = (code: string, message: string): Response =>
+    c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: message, twoFactor: false }), 200);
+
+  const params = await readUrlEncodedForm(c.req.raw);
+  const code = params.get("code") ?? "";
+  const password = params.get("password") ?? "";
+  const retype = params.get("retype") ?? "";
+  const remember = (params.get("remember") ?? "") !== "";
+  if (code === "") return invalid(code, passwordResetLocale.invalid_code);
+
+  const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
+  if (user === null) return invalid(code, passwordResetLocale.invalid_code);
+
+  // password.go:170-204 — the TOTP arms (the form carries the passcode
+  // field only when the account is enrolled): a scratch code OR a live
+  // passcode, consumed atomically.
+  const twofa = await getTwoFactorByUid(c.env.DB, user.id);
+  if (twofa !== null) {
+    const scratch = params.get("scratch_code") ?? "";
+    const passcode = params.get("passcode") ?? "";
+    const ok =
+      scratch !== ""
+        ? await verifyScratchToken(twofa, scratch)
+        : await validateAndConsumeTotp(c.env.DB, twofa, passcode);
+    if (!ok) {
+      return invalid(code, passwordResetLocale.invalid_code);
+    }
+  }
+
+  const outcome = await applyPasswordReset(c.env.DB, user.id, password, retype);
+  if (outcome.outcome !== "changed") return invalid(code, outcome.message);
+
+  // password.go:246-258 — the WebAuthn-only user finishes on its own page:
+  // the reset APPLIED first (UpdateAuth precedes handleTwoFactorRequired),
+  // then the park — the same pending carrier the login park arms.
+  if (twofa === null && (await hasCredentialsForUser(c.env.DB, user.id))) {
+    const pending = await signCeremonyState(c.env.DB, {
+      k: "pending",
+      uid: user.id,
+      ch: "",
+      rem: remember,
+      to: "/",
+    });
+    return seeOther("/user/webauthn", webAuthnPendingSetCookie(pending));
+  }
+
+  // handleSignIn (auth.go:632): mint + Set-Cookie + the "/" redirect.
+  const cookieValue = await mintSession(c.env.DB, user.id, { remember });
+  return seeOther("/", sessionSetCookie(cookieValue, remember));
+}

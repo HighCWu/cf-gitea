@@ -54,20 +54,15 @@ export const locale = {
   sign_in: "Sign In", // "sign_in" (navbar link, form title, submit button)
   sign_out: "Sign Out", // "sign_out" (navbar POST button)
   uname_holder: "Username or Email Address", // "home.uname_holder" (optional owner check)
-  /** DIVERGENCE (the B-1 usability fix, 2026-10-30): upstream's "password"
-   *  key renders "Password" because upstream HAS a password store; our
-   *  login credential is a PAT (SPEC-0002 §4.6.7 divergence 7 — no password
-   *  store; SPEC-0010 §2.2 token-as-password), so the label must be
-   *  truthful. Upstream key cited for the slot; the POST field name stays
-   *  `password` (the wire shape is unchanged). */
-  password: "Access Token",
+  /** SPEC-0002 §6.2 (PWD-2): upstream's "password" key renders "Password" —
+   *  the interim "Access Token" label (the B-1 fix) is superseded now that
+   *  the password store landed. */
+  password: "Password",
   remember_me: "Remember This Device", // "auth.remember_me"
-  /** cf-gitea additions — upstream has no PAT login form at the pin; the
-   *  invalid wording deliberately mirrors "form.user_not_exist"'s
-   *  non-committal shape (unknown/expired/malformed are indistinguishable,
-   *  §4.11). */
-  login_error_invalid_token: "The token is not valid.",
-  login_error_scope: "The token cannot sign in: it does not grant repository read access.",
+  /** SPEC-0002 §6.2 — upstream "form.username_password_incorrect": every
+   *  password-arm failure (unknown user/email, wrong/unset password, the
+   *  logged unsupported-hash row) renders this one generic message. */
+  login_error_incorrect: "Username or password is incorrect.",
   login_error_prohibited: "This account is prohibited from signing in.",
 
   // --- pages wave 9 — the signed-in experience (navbar surface) --------------

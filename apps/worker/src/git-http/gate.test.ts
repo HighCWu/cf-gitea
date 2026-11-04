@@ -68,6 +68,8 @@ import { addDeployKeyToken } from "../api/services/deploy-keys";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { settleCreatingRepo, applyPushTail, type PushTailCommands } from "./gate";
+import { authorizeGitHttp } from "./acl";
+import type { AuthUser } from "../auth/auth-context";
 import { createWikiPage } from "../services/wiki";
 import { ensureCargoIndexMirror } from "../services/packages/cargo-index";
 import type { AutoMergeCheckMessage } from "../services/pull-automerge";
@@ -2266,5 +2268,153 @@ describe("the _cargo-index git family (S-2 — the wiki family's contract over t
     expect(refs).toContain("refs/heads/notes");
     expect(refs).toContain("refs/heads/main");
     expect(ownerId).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Row 6 — the require-sign-in-view instance flag (SPEC-0003 §2.4 row 6,
+// census B-34). Upstream folds EVERY anonymous-pull arm inside
+// `!setting.Service.RequireSignInViewStrict` (routers/web/repo/githttp.go:132,
+// pinned by tests/integration/git_smart_http_test.go:186-188: the anonymous
+// unit-read grant flips to 401 under the flag). These tests drive
+// `authorizeGitHttp` DIRECTLY with an env slice override (the vitest plugin
+// injects the deployed wrangler vars into SELF's env, so SELF cannot flip the
+// var per test); the flag default in wrangler.jsonc(.example) is "false" —
+// the anonymous-readable self-host posture.
+// ---------------------------------------------------------------------------
+
+describe("row 6: require-sign-in-view kills every anonymous pull (SPEC-0003 §2.4)", () => {
+  /** The AuthUser projection resolveRepository hands the gate (acl.ts:87-102)
+   *  — the direct call needs the same shape for the owner-active grant lines. */
+  function authUserOf(id: number, username: string): AuthUser {
+    return {
+      id,
+      username,
+      usernameLower: username.toLowerCase(),
+      email: null,
+      displayName: null,
+      location: null,
+      website: null,
+      description: null,
+      isAdmin: false,
+      status: "active",
+      createdAt: new Date(),
+    };
+  }
+
+  /** Seed `alice/<slug>` (owner PUBLIC, repo visibility per arg) with a real
+   *  users row; the D1 row + the owner projection are all the direct gate
+   *  call needs. */
+  async function seedRepo(slug: string, visibility: "public" | "private") {
+    // One owner per slug — the direct call never parses the URL, so the
+    // namespace string is cosmetic and per-test usernames dodge the UNIQUE
+    // collision the shared "alice" would hit across this describe's tests.
+    const username = `alice_${slug.replace(/-/g, "_")}`;
+    const alice = await seedVerifiedUser({ username });
+    const created = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: username.toLowerCase() },
+      name: slug,
+      isPrivate: visibility === "private",
+    });
+    const row = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, created.id)).get())!;
+    return { repo: row, owner: authUserOf(alice.id, alice.username), ownerVisibility: "public" as const };
+  }
+
+  /** The anonymous read decision through the real gate (the flag rides the
+   *  env-slice override). */
+  async function anonRead(
+    fx: { repo: typeof repositories.$inferSelect; owner: AuthUser; ownerVisibility: "public" },
+    envOverride: Record<string, string>,
+    unitAnonymousRead = false,
+  ): Promise<Response | true> {
+    return authorizeGitHttp({
+      req: new Request(`https://example.com/alice/${fx.repo.slug}.git/info/refs?service=git-upload-pack`),
+      env: Object.assign({}, env, envOverride),
+      waitUntil: () => {},
+      op: "read",
+      repo: fx.repo,
+      owner: fx.owner,
+      ownerVisibility: fx.ownerVisibility,
+      unitAnonymousRead,
+    });
+  }
+
+  it("overrides row 1: anonymous read of a public repo 401-challenges under the flag", async () => {
+    const fx = await seedRepo("r6public", "public");
+    // Control: flag OFF (the deployed default) — row 1 stays open.
+    expect(await anonRead(fx, {})).toBe(true);
+    // The flag: the same request challenges.
+    const denied = await anonRead(fx, { REQUIRE_SIGNIN_VIEW: "true" });
+    expect(denied).toBeInstanceOf(Response);
+    expect((denied as Response).status).toBe(401);
+    expect((denied as Response).headers.get("www-authenticate")).toBe(CHALLENGE);
+  });
+
+  it("overrides row 4: the anonymous unit-read grant flips to 401 under the flag (upstream test :186-188)", async () => {
+    const fx = await seedRepo("r6unit", "private");
+    await env.DB
+      .prepare("INSERT INTO repo_units (repo_id, type, anonymous_access_mode) VALUES (?, 'code', 'read')")
+      .bind(fx.repo.id)
+      .run();
+    // Control: flag OFF — the grant admits the read (row 4).
+    expect(await anonRead(fx, {}, true)).toBe(true);
+    // The flag: the grant no longer reaches the decision.
+    const denied = await anonRead(fx, { REQUIRE_SIGNIN_VIEW: "true" }, true);
+    expect(denied).toBeInstanceOf(Response);
+    expect((denied as Response).status).toBe(401);
+    expect((denied as Response).headers.get("www-authenticate")).toBe(CHALLENGE);
+  });
+
+  it("never consults a signed-in doer: the owner's token pull still passes under the flag", async () => {
+    const fx = await seedRepo("r6authed", "public");
+    const token = (await mintFor(fx.owner.id, "w", "write:repository")).plaintext;
+    const outcome = await authorizeGitHttp({
+      req: new Request(`https://example.com/alice/${fx.repo.slug}.git/info/refs?service=git-upload-pack`, {
+        headers: { authorization: basicTokenHeader(token) },
+      }),
+      env: Object.assign({}, env, { REQUIRE_SIGNIN_VIEW: "true" }),
+      waitUntil: () => {},
+      op: "read",
+      repo: fx.repo,
+      owner: fx.owner,
+      ownerVisibility: fx.ownerVisibility,
+      unitAnonymousRead: false,
+    });
+    expect(outcome).toBe(true);
+  });
+
+  it("kills the deploy-key public-read line: a foreign key on a public repo 404s under the flag, its own repo still reads", async () => {
+    const fx = await seedRepo("r6key", "public");
+    const other = await seedRepo("r6other", "public");
+    const key = await addDeployKeyToken(env.DB, fx.repo.id, "r6-key", true);
+    if (key.token === undefined) throw new Error("deploy key seed returned no plaintext");
+    const deployAuth = { authorization: basicHeader("git", key.token) };
+
+    const call = (target: typeof fx.repo, flag: string) =>
+      authorizeGitHttp({
+        req: new Request(`https://example.com/alice/${target.slug}.git/info/refs?service=git-upload-pack`, {
+          headers: deployAuth,
+        }),
+        env: Object.assign({}, env, flag === "" ? {} : { REQUIRE_SIGNIN_VIEW: flag }),
+        waitUntil: () => {},
+        op: "read",
+        repo: target,
+        owner: fx.owner,
+        ownerVisibility: "public",
+        unitAnonymousRead: false,
+      });
+
+    // Control (flag OFF): the foreign key reads the public repo through the
+    // canAnonymousPull arm (the decideDeployKey public line).
+    const flagOff = await call(other.repo, "");
+    expect(flagOff).toBe(true);
+    // Under the flag: the public line dies (falls to the key permission —
+    // own repo only), 404-masked like any zero-perm read.
+    const foreign = await call(other.repo, "true");
+    expect(foreign).toBeInstanceOf(Response);
+    expect((foreign as Response).status).toBe(404);
+    // The key's OWN repo reads on (the key permission is a signed-in arm —
+    // the flag never consults it).
+    expect(await call(fx.repo, "true")).toBe(true);
   });
 });

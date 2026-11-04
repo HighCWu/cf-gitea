@@ -585,15 +585,16 @@ describe("the account page DOM (user/settings/account.tmpl at the pin)", () => {
     expect(html).toContain('href="/user/settings/security"');
   });
 
-  it("renders the password section's disabled arm and NO password-change form (the no-password-model rule)", async () => {
+  it("renders the MOUNTED change-password form (SPEC-0002 §6.2 — PWD-2 supersedes the disabled arm)", async () => {
     const html = await pageHtml();
     expect(html).toContain(userSettingsAccountLocale.password);
-    expect(html).toContain(userSettingsAccountLocale.password_change_disabled);
-    expect(html).toContain('class="ui info message"');
-    expect(html).not.toContain('name="old_password"'); // account.tmpl:13 — unmounted
-    expect(html).not.toContain('name="new_password"');
-    expect(html).not.toContain("change_password"); // the form arm's action+button vocabulary
-    expect(html).not.toContain("forgot_password"); // rides the form arm only
+    expect(html).toContain('name="old_password"'); // account.tmpl:13 — the arm is real
+    expect(html).toContain('name="password" type="password" autocomplete="new-password"');
+    expect(html).toContain('name="retype"');
+    expect(html).toContain('action="/user/settings/account"');
+    expect(html).toContain(userSettingsAccountLocale.change_password);
+    // the retired disabled notice never renders
+    expect(html).not.toContain(userSettingsAccountLocale.password_change_disabled);
   });
 
   it("renders the email rows: the synthesized primary labeled and button-less, secondaries with Remove + Make Primary", async () => {
@@ -717,6 +718,6 @@ describe("the account page DOM (user/settings/account.tmpl at the pin)", () => {
     expect(data).not.toBeNull();
     const html = renderUserSettingsAccountPage(ctx, data!, null, "");
     expect(html).toContain("user settings account");
-    expect(html).toContain(userSettingsAccountLocale.password_change_disabled);
+    expect(html).toContain('name="old_password"');
   });
 });

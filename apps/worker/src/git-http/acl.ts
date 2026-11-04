@@ -41,7 +41,11 @@ import {
 } from "../auth/middleware";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import { oauth2FeatureEnabled } from "../services/oauth2/token";
-import { ScopeSet } from "../auth/scopes";
+import { ScopeSet, SCOPE_ALL } from "../auth/scopes";
+import { authUserFromRow } from "../auth/password-auth";
+import { basicPasswordArm } from "../auth/middleware";
+import { hasTwoFactorByUid } from "../auth/two-factor";
+import { AuditActions, emitAudit } from "../services/audit";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import {
   DEPLOY_TOKEN_PREFIX,
@@ -57,8 +61,18 @@ import { repoUnits, repositories, users } from "../db/schema";
 // visibility layer (SPEC-0007 §3.5 + SPEC-0005): one grant resolution
 // (org/team arms + the collaborator row), no drift.
 import { doerRepoAccessMode } from "../api/services/repository";
+import { requireSignInViewEnabled } from "../api/config";
 
 type RepositoryRow = typeof repositories.$inferSelect;
+
+/**
+ * The repo-layer TOTP gate's plain-text 401 body — upstream's own message
+ * VERBATIM (githttp.go:157; its TODO admits the body should become
+ * "invalid credentials" once the token expectation is documented — we carry
+ * the pinned text as-is).
+ */
+export const GIT_TOTP_PLAINTEXT_401 =
+  "Users with two-factor authentication enabled cannot perform HTTP/HTTPS operations via plain username and password. Please create and use a personal access token on the user settings page";
 
 /** repositories ⋈ users on the owner namespace, both sides case-folded
  *  (§2.1 item 4: `(owner, lower_name)` lookup; §4.5 case-insensitivity).
@@ -227,7 +241,7 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
             ? touchDeployKeyLastUsed(env.DB, key.id, now)
             : Promise.resolve(),
         );
-        return decideDeployKey(op, repo, owner, input.ownerVisibility, input.engineAdmin === true, key);
+        return decideDeployKey(op, repo, owner, input.ownerVisibility, input.engineAdmin === true, key, requireSignInViewEnabled(env));
       }
     }
 
@@ -242,6 +256,79 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
       });
     }
     if (verified === null) {
+      // THE BASIC PASSWORD ARM (SPEC-0002 §6.2 git-HTTPS row; upstream
+      // services/auth/basic.go:135-161 runs in the git routes' auth chain):
+      // the token arms missed + HTTP Basic carried (username, password) +
+      // EnableBasicAuth (default TRUE, no knob until Phase C) → the full
+      // password sign-in, WebAuthn-enrolled hard-reject folded into the
+      // generic failure (identity never establishes → the challenge,
+      // githttp.go:146-159's !IsSigned arm), TOTP passcode consumed
+      // atomically from X-Gitea-OTP. Every miss → the same 401 challenge.
+      if (parsed?.basicAuth !== undefined && parsed?.basicAuth !== null) {
+        const outcome = await basicPasswordArm(
+          env.DB,
+          parsed.basicAuth,
+          req.headers.get("X-Gitea-OTP") ?? "",
+          now,
+        );
+        if (outcome.kind === "ok") {
+          input.waitUntil(limiterResetFailOpen(limiter, ip));
+          // THE REPO GATE (githttp.go:152-158, inside its !canAnonymousPull
+          // branch): a password-Basic INDIVIDUAL doer with a TOTP enrollment
+          // is refused EVEN WITH a valid OTP (the OTP satisfied Basic; the
+          // gate fires on enrollment alone — upstream's TODO admits the
+          // body should become "invalid credentials"). Reads that anonymous
+          // callers can make skip the branch upstream, so they skip it here.
+          // Row 6 folds in here too: upstream's canAnonymousPull is computed
+          // UNDER the !RequireSignInViewStrict gate (githttp.go:132), so a
+          // flagged instance answers "no anonymous pull" and this branch
+          // fires for reads as well.
+          const canAnonymousPull =
+            !requireSignInViewEnabled(env) && (repo.visibility === "public" || input.unitAnonymousRead);
+          if (!(op === "read" && canAnonymousPull)) {
+            if (await hasTwoFactorByUid(env.DB, outcome.user.id)) {
+              return new Response(GIT_TOTP_PLAINTEXT_401, {
+                status: 401,
+                headers: { "content-type": "text/plain;charset=utf-8" },
+              });
+            }
+          }
+          const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, outcome.user.id);
+          return decide(
+            op,
+            repo,
+            owner,
+            input.ownerVisibility,
+            input.unitAnonymousRead,
+            authUserFromRow(outcome.user),
+            ScopeSet.parseLenient(SCOPE_ALL), // basic.go:189-197 — password Basic holds AccessTokenScopeAll
+            teamMode,
+            oauth2FeatureEnabled(env),
+            requireSignInViewEnabled(env),
+          );
+        }
+        if (outcome.kind === "unsupported-hash") {
+          console.error(`git-http basic-auth: ${outcome.message}`);
+        }
+        if (outcome.kind === "totp-fail") {
+          // basic.go:182's audit row (shared validateTOTP — the git chain
+          // records it the same as the API chain).
+          void emitAudit(drizzle(env.DB), {
+            action: AuditActions.UserAuthenticationFailTwoFactor,
+            actorId: outcome.userId,
+            actorName: outcome.username,
+            actorCredential: null,
+            scopeType: "user",
+            scopeId: outcome.userId,
+            scopeName: outcome.username,
+            origin: "api",
+            ipAddress: ip,
+            vars: { scope: outcome.username },
+          }).catch((error: unknown) => {
+            console.error(`git-http basic-auth: audit row failed: ${String(error)}`);
+          });
+        }
+      }
       // Unknown/revoked/expired/malformed credential → 401 challenge
       // (identity not established; §2.4 edge 4.14). Upstream answers the
       // failed-credential arm at the SAME challenge site (githttp.go:146-159
@@ -263,10 +350,10 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
     // predicate the API visibility layer resolves; 'none' when the doer
     // holds no grant).
     const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, verified.user.id);
-    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope, teamMode, oauth2FeatureEnabled(env));
+    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope, teamMode, oauth2FeatureEnabled(env), requireSignInViewEnabled(env));
   }
 
-  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null, "none", oauth2FeatureEnabled(env));
+  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null, "none", oauth2FeatureEnabled(env), requireSignInViewEnabled(env));
 }
 
 /**
@@ -325,6 +412,7 @@ function decide(
   scope: ScopeSet | null,
   teamMode: TeamAccessMode,
   oauth2Enabled: boolean,
+  requireSignInView: boolean,
 ): Response | true {
   // PRE-AUTH refusals — upstream httpBase runs both BEFORE the auth ladder,
   // so they answer their plain 403 bodies to ANONYMOUS callers too (never
@@ -351,12 +439,22 @@ function decide(
   });
   // Rows 4/5: an explicit anonymous-read grant on the private repo's code
   // unit (upstream git_smart_http_test.go:163-189) — read only, and still
-  // requires a public, active owner.
+  // requires a public, active owner. Row 6 (require-sign-in-view): upstream
+  // folds BOTH anonymous arms inside `isPull && repoExist &&
+  // !RequireSignInViewStrict` (githttp.go:132) — the flag kills every
+  // anonymous read, the public row and the unit-grant row alike (the
+  // upstream test pins the unit-grant refusal,
+  // git_smart_http_test.go:186-188).
   const anonymousUnitRead =
-    op === "read" && unitAnonymousRead && owner !== null && owner.status === "active" && ownerVisibility === "public";
+    op === "read" &&
+    !requireSignInView &&
+    unitAnonymousRead &&
+    owner !== null &&
+    owner.status === "active" &&
+    ownerVisibility === "public";
 
   if (doer === null) {
-    if (anonymousUnitRead || (op === "read" && publiclyVisible)) return true;
+    if ((op === "read" && publiclyVisible && !requireSignInView) || anonymousUnitRead) return true;
     // Rows 2/3/5: every other anonymous request challenges — pushes always
     // need identity, and unit read never grants write (test :184). The
     // realm follows the pin's OAuth2 switch (githttp.go:146-159).
@@ -435,8 +533,10 @@ function decide(
  *   `!isPull` gate);
  * - READ: publicly visible (upstream's canAnonymousPull arm admits ANY
  *   signed-in doer's pull on a public repo with a public owner,
- *   :132-135 — the key user included) OR the key's own repo (mode 1 and 2
- *   both satisfy read). The key user deliberately does NOT take the
+ *   :132-135 — the key user included; require-sign-in-view kills this
+ *   line with the rest of canAnonymousPull, :132 — a foreign key then
+ *   falls to the key permission, own repo only) OR the key's own repo
+ *   (mode 1 and 2 both satisfy read). The key user deliberately does NOT take the
  *   authenticated-limited-owner read line the user matrix grants: upstream's
  *   key permission model has no such arm — a limited owner's public repo
  *   stays beyond a foreign key.
@@ -455,6 +555,7 @@ function decideDeployKey(
   ownerVisibility: "public" | "limited" | "private",
   engineAdmin: boolean,
   key: VerifiedDeployKey,
+  requireSignInView: boolean,
 ): Response | true {
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
   if (engineAdmin || owner === null) return repositoryNotFound();
@@ -474,7 +575,10 @@ function decideDeployKey(
     // mode >= read (both stored modes) covers everything else. A foreign
     // key on a private/limited-visible repo grants nothing → the 404.
     const publiclyVisible =
-      repo.visibility === "public" && owner.status === "active" && ownerVisibility === "public";
+      !requireSignInView &&
+      repo.visibility === "public" &&
+      owner.status === "active" &&
+      ownerVisibility === "public";
     if (publiclyVisible || key.repoId === repo.id) return true;
     return repositoryNotFound();
   }

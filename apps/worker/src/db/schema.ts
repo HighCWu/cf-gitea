@@ -693,6 +693,42 @@ export const users = sqliteTable(
      *  user-list `LastLoginSince` filter (user.go:897) which has no landed
      *  surface — no index here. */
     lastLoginAt: integer("last_login_at", { mode: "timestamp" }),
+    // -------------------------------------------------------------------------
+    // Password authentication (SPEC-0002 §6.1, PWD-2/M8) — kept LAST for the
+    // same reason as `num_stars`: ALTER TABLE ADD COLUMN physically appends.
+    // The pin's DDL is mirrored verbatim (ADR-0007); cf-gitea adds DEFAULT ''
+    // backfills (SQLite ALTER requires one for NOT NULL) that reproduce
+    // exactly the row shape upstream's create path sets for password-less
+    // users (user.go:783-794: Passwd='', Salt='') — the deliberate
+    // divergence from the nullable xorm tags of Salt/Rands is recorded in
+    // SPEC-0002 §6.3.
+    // -------------------------------------------------------------------------
+    /** Upstream `User.Passwd` (user.go:104, `NOT NULL`) — the hex PBKDF2
+     *  digest (100 hex chars for the keyLen-50 family) or the full crypt
+     *  string (bcrypt). NEVER a plaintext password. Empty = no password set
+     *  (user.go:427-430 `IsPasswordSet`) — such rows are rejected before any
+     *  hash comparison (services/auth/source/db/authenticate.go:51-53).
+     *  Hashed/verified by src/auth/password.ts (the hash.go:42-60 both-eras
+     *  salt rule; the two pbkdf2 arms DO NOT COALESCE, hash.go:108-135). */
+    passwd: text("passwd").notNull().default(""),
+    /** Upstream `User.PasswdHashAlgo` (user.go:105, `NOT NULL DEFAULT
+     *  'argon2'`) — the algorithm NAME or full spec, never inline in the
+     *  hash. The 'argon2' DDL default mirrors the pin verbatim but is dead
+     *  in practice: code always writes the column explicitly (SetPassword
+     *  stores the dealiased CONFIGURED spec "pbkdf2$50000$50",
+     *  setting/security.go:175; password-less create stores ''). A bare
+     *  stored "pbkdf2" is the legacy iter-10000 arm (hash.go:116). */
+    passwdHashAlgo: text("passwd_hash_algo").notNull().default("argon2"),
+    /** Upstream `User.Salt` (user.go:118, `VARCHAR(32)`) — 32 lowercase hex
+     *  chars (hex(16 crypto-random bytes), `GetUserSalt` user.go:555-565)
+     *  or '' on password-less rows; consumed per the hash.go:42-60 both-eras
+     *  decode rule (10-char raw binary era vs hex-decoded). */
+    salt: text("salt", { length: 32 }).notNull().default(""),
+    /** Upstream `User.Rands` (user.go:117, `VARCHAR(32)`) — GetUserSalt-
+     *  generated at every upstream create (user.go:786), consumed by the
+     *  time-limit-code hash data `purpose|uid|lowerEmail|lowerName|passwd|
+     *  rands` (user.go:948-950 — the reset flow, SPEC-0002 §6.2). */
+    rands: text("rands", { length: 32 }).notNull().default(""),
   },
   (t) => [
     uniqueIndex("users_username_lower_uq").on(t.usernameLower),
