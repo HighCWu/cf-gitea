@@ -192,10 +192,13 @@ import { deleteRunner, getOrCreateActiveRunnerToken } from "../../services/actio
  *     CreateVariable's ValidateName, so the pre-check arm mirrors that
  *     order).
  *
- * THE AT-REST DIVERGENCE (services/secrets-variables.ts module header):
- * secret `data` stores plaintext — upstream encrypts with the instance
- * SecretKey, and the API never renders secret data, so the divergence is
- * invisible to the contract and gated on the settings-module seam.
+ * THE AT-REST ENVELOPE (services/secrets-variables.ts module header, the
+ * B-57 flip): secret `data` stores the instance-key AEAD envelope
+ * (services/instance-key.ts — `v1:` versioned, AES-256-GCM under HKDF of the
+ * shared keystore row; legacy-plaintext rows read transparently through the
+ * prefix dispatch) — upstream encrypts with the instance SecretKey, and the
+ * API never renders secret data, so the at-rest format is invisible to the
+ * contract (this file's handlers are untouched by the envelope).
  */
 
 // ---------------------------------------------------------------------------

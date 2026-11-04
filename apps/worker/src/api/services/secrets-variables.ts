@@ -47,6 +47,7 @@ import {
   type Viewer,
 } from "./repository";
 import { toApiUser } from "./user";
+import { encryptInstanceSecretData } from "../../services/instance-key";
 
 /**
  * The actions secrets/variables/runners service — the upstream `secret` +
@@ -110,15 +111,27 @@ import { toApiUser } from "./user";
  * `{ownerId, repoId: ""}` (upstream's 0 sentinel, adapted to the landed TEXT
  * repositories.id). Never both non-empty; never both empty.
  *
- * THE AT-REST DIVERGENCE — upstream stores secret `data` encrypted with the
- * instance SecretKey (EncryptSecret → AesEncrypt CFB,
- * models/secret/secret.go:20-55, 57-66). cf-gitea has no instance-key model
- * yet (the settings-module seam, services/hooks.ts:488-491's
- * headerAuthorizationEncrypted precedent), so the column stores plaintext.
- * The API NEVER returns secret data — the `Secret` wire shape
+ * THE AT-REST ENVELOPE (census B-57, LANDED) — upstream stores secret `data`
+ * encrypted with the instance SecretKey (EncryptSecret → sha256(SecretKey) →
+ * AES-256-CFB over base64(plaintext), a random 16-byte IV prepended,
+ * modules/secret/secret.go:20-55, 57-66). This store now encrypts too: the
+ * instance-key AEAD envelope (services/instance-key.ts — AES-256-GCM under
+ * HKDF of the shared `general_token_signing_secret` keystore row; CFB is not
+ * in WebCrypto, the documented adaptation) — every write below stores
+ * `v1:<base64url(iv||ct||tag)>` in the SAME data column (format swap, no
+ * migration), and the reader (services/actions/dispatch.ts getSecretsOfTask)
+ * dispatches on the prefix, with a transparent legacy-plaintext arm for
+ * pre-change rows (upgrade-on-write converts them on their next edit). The
+ * API NEVER returns secret data — the `Secret` wire shape
  * (modules/structs/secret.go:10-17) carries name/description/created_at only
- * — so the divergence is invisible to the contract and gated on the same
- * future settings SPEC.
+ * — so the format is invisible to the contract (the 60-test routes battery
+ * is unchanged across the flip). Rotation is operator-only (swap the
+ * keystore row + restart); stale envelopes then fail open and the reader
+ * skips them — upstream's "maybe SECRET_KEY is wrong" arm
+ * (models/secret/secret.go:180-185). The old in-file note (plaintext at
+ * rest, the hooks.ts:488-491 seam, "gated on a future settings SPEC") is
+ * retired by this change; hooks.headerAuthorizationEncrypted keeps its own
+ * parked-column note and is untouched.
  *
  * LENGTH UNITS — secrets count `data` in BYTES (Go len,
  * models/secret/secret.go:69, 133); variables count it in RUNES
@@ -248,7 +261,13 @@ function dataTooLong(): ApiError {
  * CreateOrUpdateSecret (services/secrets/secrets.go:14-41): validate the
  * name, find by (scope, UPPER(name)); a miss inserts (201 arm), a hit
  * updates data + description (204 arm). `data` counts BYTES against
- * SecretDataMaxLength in both arms; the description truncates at 4096 runes.
+ * SecretDataMaxLength in both arms (the BYTE count is upstream's plaintext
+ * check, models/secret/secret.go:69, 133 — it gates the input, not the
+ * stored form); the description truncates at 4096 runes. Both arms store the
+ * instance-key envelope (see the module header) — the INSERTED/UPDATED
+ * ENCRYPT (InsertEncryptedSecret / UpdateSecret's EncryptSecret call,
+ * models/secret/secret.go:79, 139); the returned row's `.data` carries that
+ * envelope (callers render the wire Secret, which never includes data).
  */
 export async function createOrUpdateSecret(
   d1: D1Database,
@@ -264,6 +283,7 @@ export async function createOrUpdateSecret(
   }
   const truncatedDescription = truncateRunes(description, DESCRIPTION_MAX_RUNES);
   const now = new Date();
+  const encrypted = await encryptInstanceSecretData(d1, data);
   const existing = await drizzle(d1)
     .select()
     .from(secrets)
@@ -271,10 +291,11 @@ export async function createOrUpdateSecret(
     .limit(1);
   if (existing.length > 0) {
     const row = existing[0]!;
-    // UpdateSecret (secret.go:132-152) — data + description only.
+    // UpdateSecret (secret.go:132-152) — data + description only. The
+    // envelope write is also the legacy row's transparent upgrade-on-write.
     const updated = await drizzle(d1)
       .update(secrets)
-      .set({ data, description: truncatedDescription })
+      .set({ data: encrypted, description: truncatedDescription })
       .where(eq(secrets.id, row.id))
       .returning();
     return { row: updated[0]!, created: false };
@@ -285,7 +306,7 @@ export async function createOrUpdateSecret(
       ownerId: scope.ownerId,
       repoId: scope.repoId,
       name: normalized,
-      data,
+      data: encrypted,
       description: truncatedDescription,
       createdAt: now,
     })

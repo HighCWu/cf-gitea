@@ -2939,10 +2939,12 @@ export const deployKeys = sqliteTable(
  * UPPERCASE-normalized (InsertEncryptedSecret / InsertVariable).
  *
  * `data` is upstream's LONGTEXT encrypted-data column (SecretDataMaxLength
- * 65536); cf-gitea stores plaintext with the divergence documented in
- * services/secrets-variables.ts — upstream encrypts with the instance
- * SecretKey (EncryptSecret), an instance key model does not exist yet (same
- * seam as webhooks.header_authorization_encrypted, services/hooks.ts:488-491).
+ * 65536); cf-gitea stores the versioned AEAD envelope of
+ * services/instance-key.ts (B-57 LANDED 2026-11-04: v1:<base64url(iv‖ct‖tag)>
+ * AES-256-GCM over the shared signing-secret row's HKDF key — upstream's
+ * EncryptSecret posture, the GCM adaptation; legacy plaintext rows serve
+ * transparently and upgrade on write; same seam as
+ * webhooks.header_authorization_encrypted, services/hooks.ts:488-491, B-64).
  * `description` truncates at 4096 runes (SecretDescriptionMaxLength).
  */
 export const secrets = sqliteTable(
@@ -2957,7 +2959,7 @@ export const secrets = sqliteTable(
     repoId: text("repo_id").notNull().default(""),
     /** Uppercase-normalized at insert and lookup (strings.ToUpper). */
     name: text("name").notNull(),
-    /** Secret value; plaintext in cf-gitea (see the table comment). */
+    /** Secret value; the versioned AEAD envelope (see the table comment). */
     data: text("data").notNull(),
     description: text("description").notNull().default(""),
     /** Row creation (upstream `CreatedUnix xorm:"created"`). */
@@ -4917,9 +4919,10 @@ export const actionScheduleSpecs = sqliteTable(
  *     PEM/PKCS8 spelling replaced by JWK JSON — the same material in Web
  *     Crypto's native format).
  *
- * At rest the values are plaintext JSON — the repo's ratified actions-secrets
- * posture (the `secrets` table comment above: "an instance key model does not
- * exist yet"; upstream itself stores the PEM unencrypted on the AppData disk).
+ * At rest the values are plaintext JSON (upstream itself stores the PEM
+ * unencrypted on the AppData disk) — the `secrets`-table envelope (B-57,
+ * instance-key.ts) covers the secret DATA column; these rows carry key
+ * material the runtime must load directly.
  * `name` is the PRIMARY KEY: two rows, point reads, no further indexes. The
  * insert race (two isolates cold-generating concurrently) resolves by
  * on-conflict-do-nothing + read-back — strictly stronger than upstream's

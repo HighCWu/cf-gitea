@@ -842,11 +842,12 @@ re-opening). **Surprises of the sweep**, in order of severity:
     actions approve-all-checks arm all engine-404 while their API-side (or
     service-side) machinery is landed and test-pinned — the same shape as
     surprise 12, one store over.
-21. **Actions secrets sit in D1 as plaintext (B-57).** Upstream encrypts
-    secret data with the instance key; ours stores the raw bytes and the
-    in-file note names the portable seam itself — wire-invisible, but the
-    at-rest posture is upstream-standard behavior with no platform force
-    (the S25 contrast is recorded on the board row).
+21. **Actions secrets sat in D1 as plaintext (B-57 — LANDED 2026-11-04).**
+    Upstream encrypts secret data with the instance key; ours stored the raw
+    bytes until the versioned AEAD envelope landed (the board row carries
+    the as-built; the wire was never affected). The S25 contrast and the
+    B-64 twin (the webhook Authorization header, same class) are on the
+    board.
 22. **The packages codec/digest tails were economics notes, not platform
     forces (B-58).** Upstream renders `Packages.xz` beside the .gz baseline
     and MD5 digest lines/sections across the distro index builders; ours

@@ -57,6 +57,7 @@ import {
   type TaskWithToken,
 } from "./model";
 import { refreshRunStatus } from "./update";
+import { decryptInstanceSecretData } from "../instance-key";
 import { emitWorkflowJobStatus, emitWorkflowRunStatus } from "./webhook-events";
 import { taskAllowsOidcToken } from "./oidc";
 import { createAuthorizationToken, oidcIssuer, signActionsClaims } from "./secrets";
@@ -620,9 +621,12 @@ async function generateTaskContext(env: Env, d1: D1, appUrl: string, ctx: ClaimC
 /**
  * GetSecretsOfTask (models/secret/secret.go:155-190): GITHUB_TOKEN /
  * GITEA_TOKEN always; fork-PR runs (except pull_request_target) get nothing
- * else; then owner secrets overlaid by repo secrets (repo wins). Our
- * `secrets` table stores plaintext (the documented at-rest divergence,
- * schema.ts) — the read serves the stored value.
+ * else; then owner secrets overlaid by repo secrets (repo wins). Each row's
+ * `data` goes through the instance-key envelope read (services/
+ * instance-key.ts — the v1 AEAD envelope with a transparent legacy-plaintext
+ * arm, the B-57 at-rest flip), upstream's DecryptSecret call
+ * (models/secret/secret.go:180); an envelope that fails to open is logged
+ * and SKIPPED — upstream's "maybe SECRET_KEY is wrong" arm (secret.go:181-184).
  */
 export async function getSecretsOfTask(d1: D1, ctx: ClaimContext): Promise<Record<string, string>> {
   const base: Record<string, string> = {
@@ -645,7 +649,14 @@ export async function getSecretsOfTask(d1: D1, ctx: ClaimContext): Promise<Recor
     .where(and(eq(actionSecrets.ownerId, 0), eq(actionSecrets.repoId, ctx.run.repoId)));
 
   for (const secret of [...ownerSecrets, ...repoSecrets]) {
-    base[secret.name] = secret.data;
+    let value: string;
+    try {
+      value = await decryptInstanceSecretData(d1, secret.data);
+    } catch (error) {
+      console.error(`[actions-dispatch] unable to decrypt Actions secret ${secret.id} ${secret.name}`, error);
+      continue;
+    }
+    base[secret.name] = value;
   }
   return base;
 }
