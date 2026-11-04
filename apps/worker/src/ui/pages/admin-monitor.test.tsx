@@ -930,7 +930,7 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     expect(html).not.toContain("cancel/");
   });
 
-  it("nav: the shared family navbar with the monitor items active/open, audit_logs omitted (the F7 fold)", () => {
+  it("nav: the shared family navbar with the monitor items active/open, the B-70 audit_logs item leading (navbar.tmpl:110-112)", () => {
     const html = renderToString(<AdminFamilyNav active="stats" />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('<details class="item" open="">'); // the group containing the active page
@@ -939,8 +939,11 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     expect(html).toContain('href="/-/admin/monitor/cron"');
     expect(html).toContain('href="/-/admin/monitor/queue"');
     expect(html).toContain('href="/-/admin/monitor/stacktrace"');
-    // The unported audit_logs page is a dead link — never rendered.
-    expect(html).not.toContain("/-/admin/monitor/audit_logs");
+    // The B-70 landing flipped the old dead-link pin: the audit item renders
+    // FIRST (unlit on the stats page — navbar.tmpl:110-112's position).
+    expect(html).toContain('href="/-/admin/monitor/audit_logs"');
+    expect(html.indexOf('href="/-/admin/monitor/audit_logs"')).toBeLessThan(html.indexOf('href="/-/admin/monitor/stats"'));
+    expect(html).not.toContain('class="active item" href="/-/admin/monitor/audit_logs"');
   });
 });
 

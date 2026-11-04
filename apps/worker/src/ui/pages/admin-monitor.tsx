@@ -33,8 +33,11 @@
  *         the trace page: "%d Goroutines, %d Processes" header over the
  *         process-manager stack list (+ the dev-only perftrace tab and the
  *         diagnosis-report download form, trace_tabs.tmpl).
- *   GET /-/admin/monitor/audit_logs  ViewAuditLogs — NOT ported (no landed
- *         audit-log store; the nav item is omitted — the dead-link rule).
+ *   GET /-/admin/monitor/audit_logs  ViewAuditLogs — LANDED since this
+ *         module (census B-70, pages/admin-audit-logs.tsx over the
+ *         settings-audit-logs shared renderer): the "no landed audit-log
+ *         store" omission below rode a stale premise — the audit_event
+ *         store (SPEC-0015) and the user twin viewer landed after.
  *
  * The whole group sits behind `verifyAuthWithOptionsWeb(&VerifyOptions{
  * SignInRequired: true, AdminRequired: true})` (web.go:779) — anonymous
@@ -106,9 +109,10 @@
  * ## DOM contract (templates/admin/*.tmpl at the pin)
  *
  * layout_head's pageClass is the literal `admin monitor` on every page. The
- * four pages render the layout verbatim: BaseLayout → the admin navbar
+ * pages render the layout verbatim: BaseLayout → the admin navbar
  * reduced to the monitor `<details class="item" open>` submenu
- * (navbar.tmpl:106-124, audit_logs omitted) → `.flex-container-main` →
+ * (navbar.tmpl:106-124 — the B-70 audit_logs item leads it since the
+ * admin-audit-logs landing) → `.flex-container-main` →
  * `.admin-setting-content` with the template's `h4.ui.top.attached.header` +
  * `.ui.attached.table.segment` tables. stats.tmpl: two-column rows
  * (`<td width="200">{key}</td><td>{count}</td>`), header
@@ -135,9 +139,11 @@
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
- * - audit_logs: omitted from the submenu AND the family — no landed audit
- *   store (the survey row's config/notices/auths/emails siblings are equally
- *   out of this module's scope).
+ * - audit_logs: omitted from the submenu AND the family at this module's
+ *   landing ("no landed audit store") — the reason DIED (B-70): the
+ *   audit_event store (SPEC-0015) and the shared viewer landed afterwards,
+ *   and the page now lives at pages/admin-audit-logs.tsx (the shared nav
+ *   carries the item).
  * - The cron run button POSTs the PAGE URL (`/-/admin/monitor/cron`), not
  *   upstream's dashboard target (`AppSubUrl + "/-/admin"`, cron.tmpl:7) — the
  *   dashboard route landed since (the 2f7afe9 mount window) and this page-URL
@@ -649,9 +655,10 @@ export type AdminMonitorPage = "stats" | "cron" | "queue" | "trace";
 // shared navbar, pages/admin-users.tsx AdminFamilyNav; the module-local
 // AdminMonitorNav copy was deleted). Upstream keeps the Monitoring details
 // `open` only on monitor pages — which the `active` prop always is for this
-// module's four pages, so the shared nav's derived-open arm reproduces the
-// template here. The audit_logs item is OMITTED (no landed store — the
-// dead-link rule).
+// module's pages, so the shared nav's derived-open arm reproduces the
+// template here. The audit_logs item RENDERED since B-70
+// (pages/admin-audit-logs.tsx; the shared nav's `monitor-audit` active
+// value lights it — it leads the menu at navbar.tmpl:110-112).
 // ---------------------------------------------------------------------------
 
 /** The layout shell (layout_head.tmpl verbatim around the content block):

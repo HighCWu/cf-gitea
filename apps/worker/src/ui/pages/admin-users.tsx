@@ -193,8 +193,9 @@
  * (Repositories + Packages — the tick-18 arm, gated on the global packages
  * flag), Integrations (Applications + Webhooks), the Configuration
  * group (SPEC-0018 §3.2's Summary item), the top-level System Notices item
- * (SPEC-0018 §3.1), Monitoring (the four live monitor items; audit_logs
- * omitted) — with the details-open + active-item arms derived from the
+ * (SPEC-0018 §3.1), Monitoring (the five live monitor items — the B-70
+ * audit_logs arm landed first in the menu, navbar.tmpl:110-112) — with the
+ * details-open + active-item arms derived from the
  * `active` prop (upstream's per-group PageIs* conditions), and OMITS every
  * group whose items are all unlanded (self_check, actions — auths retired
  * from the omission list at the EXTERNAL AUTH W4 landing: the /-/admin/auths
@@ -325,6 +326,10 @@ export type AdminFamilyNavActive =
   | "cron"
   | "queue"
   | "trace"
+  // The B-70 admin audit-logs page (pages/admin-audit-logs.tsx —
+  // navbar.tmpl:106-124's audit_logs item; the label rides audit.title, so
+  // the id is the AdminMonitorPage sibling naming, not a locale key).
+  | "monitor-audit"
   // The census C6 arm: the admin actions JOB QUEUE page (pages/
   // repo-actions-queue.tsx — navbar.tmpl:87-89's item).
   | "actions-job-queue"
@@ -364,6 +369,9 @@ export const adminFamilyLocale = {
   variables: "Variables", // "actions.variables" (navbar.tmpl:81 — the actions-wave Variables item)
   scopedWorkflows: "Scoped Workflows", // "actions.scoped_workflows" (navbar.tmpl:84 — the store wave's scoped-workflows item)
   monitoring: "Monitoring", // "admin.monitor"
+  // The B-70 arm's item label — navbar.tmpl:110-112 keys the SHARED
+  // audit.title ("Audit Log"), not an admin.monitor.* key.
+  auditLogs: "Audit Log", // "audit.title" (navbar.tmpl:110-112)
   stats: "Stats", // "admin.monitor.stats"
   cron: "Cron Tasks", // "admin.monitor.cron"
   queues: "Queues", // "admin.monitor.queues"
@@ -381,16 +389,20 @@ export const adminFamilyLocale = {
  *  SPEC-0018 §3.2 arm's Summary item, navbar.tmpl:93-102 — the
  *  settings-editor item omitted by the dead-link rule), the TOP-LEVEL
  *  System Notices item (the SPEC-0018 §3.1 arm, navbar.tmpl:104-106's
- *  position), and Monitoring (the monitor family's four live items), and
+ *  position), and Monitoring (the monitor family's five live items — the
+ *  B-70 audit_logs arm leads the menu, navbar.tmpl:110-112), and
  *  the Actions group (the C6 arm's Job-queue item, the actions wave's
  *  Runners/Variables items, and the store wave's Scoped-workflows item —
  *  navbar.tmpl:73-89's landed set). Upstream's
  *  per-group `PageIs*` conditions reduce to:
  *  the group containing the active page renders `open`, the active item
- *  gets the `active item` class. audit_logs, self_check are
- *  omitted — their upstream items are unlanded pages (the dead-link
+ *  gets the `active item` class. self_check is
+ *  omitted — its upstream item is an unlanded page (the dead-link
  *  rule; the census's (b)/(c) classes); auths LEFT that list at the W4
- *  landing (specs/external-auth-sources.md §6.4). The Integrations group
+ *  landing (specs/external-auth-sources.md §6.4) and audit_logs LEFT it at
+ *  the B-70 landing (pages/admin-audit-logs.tsx — the store and the user
+ *  twin had landed after the omission; the census's stale-reason record).
+ *  The Integrations group
  *  carries upstream's navbar.tmpl:50-77 dual gate: the template's own
  *  comment ("Webhooks and OAuth can be both disabled here, so add this if
  *  statement to display different ui") wraps the group in
@@ -423,7 +435,13 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
   const assetsOpen = props.active === "repos" || (props.packagesEnabled !== false && props.active === "packages");
   const integrationsOpen = props.active === "applications" || props.active === "hooks";
   const configOpen = props.active === "config";
-  const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
+  const monitorOpen =
+    props.active === "stats" ||
+    props.active === "cron" ||
+    props.active === "queue" ||
+    props.active === "trace" ||
+    // The B-70 arm — navbar.tmpl:107's PageIsAdminMonitorAudit open arm.
+    props.active === "monitor-audit";
   // The census C6 arm — navbar.tmpl:73-89's Actions group opens with its
   // landed items (the job queue, the actions wave's Runners/Variables, and
   // the store wave's Scoped-workflows — the AdminFamilyNavActive note).
@@ -518,6 +536,9 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
         <details class="item" open={openAttr(monitorOpen)}>
           <summary>{adminFamilyLocale.monitoring}</summary>
           <div class="menu">
+            {/* navbar.tmpl:110-112 — the audit_logs item is the menu's FIRST
+                entry (the B-70 landing; the label is audit.title). */}
+            {item("/-/admin/monitor/audit_logs", adminFamilyLocale.auditLogs, props.active === "monitor-audit")}
             {item("/-/admin/monitor/stats", adminFamilyLocale.stats, props.active === "stats")}
             {item("/-/admin/monitor/cron", adminFamilyLocale.cron, props.active === "cron")}
             {item("/-/admin/monitor/queue", adminFamilyLocale.queues, props.active === "queue")}

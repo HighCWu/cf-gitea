@@ -27,6 +27,16 @@
  * A repository event therefore NEVER renders on an org page and vice versa —
  * the scope pair is the loader's base where-clause, not a post-filter.
  *
+ * ## The admin arm (B-70 — pages/admin-audit-logs.tsx)
+ *
+ * The loader is scope-OPTIONAL: `scope === undefined` is the ADMIN page's
+ * instance-wide stream — no scope pair in the base where-clause, every event
+ * lists (upstream ViewOptions' own contract: "The admin view leaves ScopeType
+ * empty to list every event", shared/audit/audit.go:21-30; the admin handler
+ * calls SearchOptionsFromRequest(ctx, "", 0), audit.go:30). The page DOM,
+ * filter parse, keyset walk and list rendering are THIS module's shared
+ * renderer reused verbatim; `hasActions` is false there (no repo row read).
+ *
  * ## The query (SearchOptionsFromRequest port, shared/audit/audit.go:37-77)
  *
  *   - sort: only the exact value "timestamp_asc" upgrades the default DESC
@@ -267,7 +277,10 @@ export const AUDIT_PAGE_WALK_MAX = 50;
 
 /** The scope pair the two mounts key (the module header's encoding section —
  *  repository: the repositories.id UUID; organization: the decimal users.id
- *  string). */
+ *  string). OPTIONAL at the loader: `undefined` is the ADMIN arm — upstream
+ *  ViewOptions' own posture ("The admin view leaves ScopeType empty to list
+ *  every event", shared/audit/audit.go:21-30) — the instance-wide stream the
+ *  admin audit page renders (pages/admin-audit-logs.tsx). */
 export interface AuditScopePair {
   type: Extract<AuditScopeType, "repository" | "organization">;
   id: string;
@@ -286,6 +299,8 @@ export interface AuditLogsPageData {
   hasNext: boolean;
   filters: AuditFilters;
   filterAction: string;
+  /** False on the admin arm (the family nav carries no Actions block — the
+   *  loader reads no repo row when the scope is undefined). */
   hasActions: boolean;
   /** The ORG twin's navbar Applications gate (org navbar.tmpl:15-19's
    *  `.EnableOAuth2` wrap — the repo twin's navbar has no such item and
@@ -305,7 +320,7 @@ export interface AuditLogsPageData {
  */
 export async function loadSettingsAuditLogs(
   d1: D1Database,
-  scope: AuditScopePair,
+  scope: AuditScopePair | undefined,
   query: URLSearchParams,
   oauth2Enabled = true,
 ): Promise<AuditLogsPageData> {
@@ -314,13 +329,14 @@ export async function loadSettingsAuditLogs(
   // Raw binding in, drizzle wrapped here (the tag-module page-loader
   // convention) — the service's findAuditEvents takes the wrapped type.
   const db = drizzle(d1);
-  // The base where-clause: the scope pair is UNCONDITIONAL (the scope pair
-  // is the page's identity — a repository event never renders on an org page
-  // and vice versa), the filters ride only when set (the service's own
-  // exact-wins action precedence mirrors the parse).
+  // The base where-clause: the scope pair is UNCONDITIONAL on the repo/org
+  // arms (the scope pair is the page's identity — a repository event never
+  // renders on an org page and vice versa) and ABSENT on the admin arm
+  // (scope undefined — every event lists, shared/audit/audit.go:21-30's
+  // empty-ScopeType posture); the filters ride only when set (the service's
+  // own exact-wins action precedence mirrors the parse).
   const baseQuery = {
-    scopeType: scope.type,
-    scopeId: scope.id,
+    ...(scope !== undefined ? { scopeType: scope.type, scopeId: scope.id } : {}),
     ...(filters.action !== "" ? { action: filters.action } : {}),
     ...(filters.actionPrefix !== "" ? { actionPrefix: filters.actionPrefix } : {}),
     ...(actorId !== null ? { actorId } : {}),
@@ -388,9 +404,12 @@ export async function loadSettingsAuditLogs(
   // The nav's Actions block flag (navbar.tmpl:47's unit conditional): the
   // REPOSITORY scope's id IS the repo id, so the loader reads the unit flags
   // directly (the options page's hasActions threading); the org scope has no
-  // repo row and its navbar carries no Actions block — false.
+  // repo row and its navbar carries no Actions block — false; the admin arm
+  // (scope undefined) reads no repo row either — false.
   const hasActions =
-    scope.type === "repository" ? (await loadRepoSettings(d1, scope.id)).hasActions : false;
+    scope !== undefined && scope.type === "repository"
+      ? (await loadRepoSettings(d1, scope.id)).hasActions
+      : false;
   return {
     events,
     page,
