@@ -99,19 +99,29 @@
  *     (mail_issue_common.go:133) — no alias table ported.
  */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
+  actionRunAttempts,
+  actionRunJobs,
+  actionRuns,
   comments,
   issueAssignees,
   issues,
   issueSubscriptions,
+  orgMembers,
+  releaseAssets,
+  releases,
+  repoTransfer,
   repoWatchers,
   ReviewType,
+  teamMembers,
+  teams,
   userSettings,
   users,
 } from "../../db/schema";
+import { ACTION_STATUS_CANCELLED, ACTION_STATUS_FAILURE, ACTION_STATUS_SKIPPED, ACTION_STATUS_SUCCESS } from "../actions/model";
 import { hasWorkInProgressPrefix } from "../../api/services/issues";
 import { renderMarkdownToHtml } from "../../api/services/markdown";
 import {
@@ -134,6 +144,7 @@ import { appDomainFromAppUrl, parseMailFrom, sanitizeSubject } from "./message";
 import { enqueueMailOutbox, type EnqueueOutcome, type MailOutboxEnv } from "./outbox";
 import { appUrlWithSlash, GITEA_APP_NAME, isMailable } from "./register-notify";
 import {
+  actionStatusLocaleString,
   displayNameWithFullName,
   issueActionApproveLine,
   issueActionCloseLine,
@@ -147,10 +158,19 @@ import {
   issueActionReviewLine,
   issueMailFallbackSubject,
   issuePushCommitListHtml,
+  pathEscapeSegments,
+  releaseNewSubject,
   renderIssueActionMail,
   renderIssueAssignedMail,
   renderIssueCommentMail,
+  renderReleaseMail,
+  renderRepoTransferMail,
+  renderWorkflowRunMail,
+  repoTransferSubjectTo,
+  repoTransferSubjectToYou,
+  shortSha,
   type ReviewCommentExcerptData,
+  type WorkflowRunMailJob,
 } from "./templates";
 
 /** The issue row the arm composes over (schema-derived; no issues/service
@@ -2057,4 +2077,576 @@ export async function notifyPullReviewDismiss(
     },
     options,
   );
+}
+
+// ---------------------------------------------------------------------------
+// The B-65 receivers (behavioral-census NF10 → board B-65): the three
+// mailNotifier arms the 13-receiver landing deferred, over the same
+// outbox + funnel machinery. Upstream they ride ONE dispatch each
+// (services/notify/notify.go: the mailNotifier + the uinotification
+// notifier both fire from the registered-notifier loop), and the whole
+// mailNotifier registers only behind `[service] ENABLE_NOTIFY_MAIL`
+// (mailer.go:33-35) — so all three gate MAIL_ENABLED + ENABLE_NOTIFY_MAIL
+// exactly like the participant fan-out arms above.
+// ---------------------------------------------------------------------------
+
+/** The `NewRelease` arm's input (notify.go:191: `rel *repo_model.Release` —
+ *  the release row the write service just landed, plus its publisher the
+ *  emit site already holds). */
+export interface NotifyNewReleaseInput {
+  /** The release row (upstream `rel`; `rel.RepoID`/`rel.ID`/`TagName`/
+   *  `Title`/`Note`/`PublisherID` + the draft/prerelease flags are the used
+   *  slice). */
+  release: typeof releases.$inferSelect;
+  /** The publisher (upstream `rel.Publisher` via LoadAttributes). */
+  publisher: UserRow;
+}
+
+/**
+ * The `NewRelease` arm's mail (notify.go:191-203 → MailNewRelease,
+ * mail_release.go:33-119): mail the RELEASE-watch watchers of the repo.
+ * Receiver-side skips, upstream's order: draft/prerelease (:194-197), then
+ * the watcher pool, the mailable prefilter, the three-way DeleteFunc
+ * (publisher | on-mention preference without a custom watch | the releases
+ * unit gate). One outbox row per recipient — upstream composes ONE body per
+ * language group and a Message per member (`msgs` loop, mail_release.go:
+ * 108-117); our single-recipient rows are the same split at finer grain
+ * (the to_addr leak rule, SPEC §4.1). Message-ID
+ * `<path/releases/<id>@AppDomain>` (generateMessageIDForRelease,
+ * mail_release.go:25-27); from = the publisher's display name; msg.Info =
+ * the subject; NO metadata/sender headers upstream sets none here.
+ * Dedupe `new-release:<releaseId>:<recipientId>`.
+ *
+ * EMIT SITES (upstream release.go:198 create arm + :361-368 publish/convert
+ * arm — both `!rel.IsDraft` after the row + assets land): the release
+ * service's owners wire
+ * `notifyNewRelease(env, { release: <row>, publisher: <row> })` after the
+ * INSERT, catching nothing (the receiver never throws for its skips —
+ * upstream logs at the receiver, notify.go:201-202, and the write stays
+ * committed). A D1 failure inside the outbox INSERT propagates to the emit
+ * site's catch-and-log seam (the register-notify posture).
+ */
+export async function notifyNewRelease(
+  env: MailNotifyEnv,
+  input: NotifyNewReleaseInput,
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  // The receiver's own skips (notify.go:194-197) — before any query.
+  if (input.release.isDraft || input.release.isPrerelease) {
+    return { outcome: "no-recipients" };
+  }
+
+  const pre = await mailArmPrelude(env, "release mail", `release mail for release ${input.release.id}`, input.release.repoId);
+  if (!pre.ok) return pre.outcome;
+  const { from, pair } = pre;
+
+  // The watch pool (mail_release.go:40-56): GetRepoWatchersIDs(WatchReleases)
+  // = mode <> Dont AND include_releases (watch.go:266-282); the custom set
+  // (GetRepoCustomWatchersIDs :260-264, customOnly arm watch.go:283-289)
+  // = the same base restricted to `mode = Custom OR any include false` —
+  // it feeds ONLY the on-mention allowance of the DeleteFunc.
+  const watchRows = await drizzle(env.DB)
+    .select({
+      userId: repoWatchers.userId,
+      mode: repoWatchers.mode,
+      includePullRequests: repoWatchers.includePullRequests,
+      includeIssues: repoWatchers.includeIssues,
+      includeReleases: repoWatchers.includeReleases,
+    })
+    .from(repoWatchers)
+    .where(eq(repoWatchers.repoId, input.release.repoId))
+    .all();
+  const watcherIds: number[] = [];
+  const customWatcherIds = new Set<number>();
+  for (const watch of watchRows) {
+    if (watch.mode === WatchMode.Dont || !watch.includeReleases) continue;
+    watcherIds.push(watch.userId);
+    if (watch.mode === WatchMode.Custom || !watch.includePullRequests || !watch.includeIssues) {
+      customWatcherIds.add(watch.userId);
+    }
+  }
+  if (watcherIds.length === 0) return { outcome: "no-recipients" };
+
+  // GetMailableUsersByIDs(ids, len(customWatchers) > 0) (mail_release.go:
+  // 57-65; user.go:1157-1179) through the typed side store: type user,
+  // active, address; the preference pool admits enabled/andyourown — plus
+  // onmention when ANY custom watcher exists — with the per-recipient
+  // onmention arm resolved at the DeleteFunc below.
+  const candidates = await drizzle(env.DB)
+    .select({ user: users, pref: userSettings.emailNotificationsPreference })
+    .from(users)
+    .leftJoin(userSettings, eq(userSettings.userId, users.id))
+    .where(inArray(users.id, watcherIds))
+    .all();
+  const pool: Array<{ user: UserRow; onMentionAllowed: boolean }> = [];
+  for (const row of candidates) {
+    if (!isMailable(row.user)) continue;
+    const pref = row.pref ?? "enabled";
+    if (pref === "disabled") continue;
+    const mentionArm = customWatcherIds.size > 0;
+    if (pref === "onmention" && !mentionArm) continue;
+    pool.push({ user: row.user, onMentionAllowed: pref === "onmention" });
+  }
+
+  // The releases unit flag (CheckRepoUnitUser's unit half, TypeReleases).
+  const settings = await loadRepoSettings(env.DB, input.release.repoId);
+
+  // The DeleteFunc (mail_release.go:75-79): publisher | on-mention without a
+  // custom watch | the unit gate (admin short-circuit inside the fold, A3).
+  const recipients = pool.filter(({ user, onMentionAllowed }) => {
+    if (user.id === input.publisher.id) return false;
+    if (onMentionAllowed && !customWatcherIds.has(user.id)) return false;
+    return true; // unit gate checked per survivor below (async)
+  });
+  const finalRecipients: UserRow[] = [];
+  for (const { user } of recipients) {
+    if (await checkRepoUnitUserForMail(env.DB, pair.repo, user, settings.hasReleases)) {
+      finalRecipients.push(user);
+    }
+  }
+  if (finalRecipients.length === 0) return { outcome: "no-recipients" };
+
+  // ---- compose (mailNewRelease, mail_release.go:76-119) ----
+  const origin = appUrlWithSlash(env.APP_URL);
+  const appDomain = appDomainFromAppUrl(env.APP_URL);
+  const repoPath = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
+  const repoHtmlUrl = `${origin}${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
+  const subject = releaseNewSubject(input.release.tagName, repoPath);
+  const messageId = `<${repoPath}/releases/${input.release.id}@${appDomain}>`;
+  const noteHtml =
+    (input.release.note ?? "") === ""
+      ? ""
+      : renderMarkdownToHtml({
+          text: input.release.note ?? "",
+          // The repo-comment context with absolute links
+          // (renderhelper.NewRenderContextRepoComment + WithUseAbsoluteLink(true),
+          // mail_release.go:79-84).
+          mode: "comment",
+          context: repoPath,
+          wiki: false,
+          origin,
+        });
+  const attachments = await drizzle(env.DB)
+    .select({ uuid: releaseAssets.uuid, name: releaseAssets.name, size: releaseAssets.size })
+    .from(releaseAssets)
+    .where(eq(releaseAssets.releaseId, input.release.id))
+    .all();
+  const bodyHtml = renderReleaseMail({
+    subject,
+    publisherName: input.publisher.username,
+    releaseHtmlUrl: `${repoHtmlUrl}/releases/tag/${pathEscapeSegments(input.release.tagName)}`,
+    tagName: input.release.tagName,
+    repoHtmlUrl,
+    repoPath,
+    title: input.release.title,
+    renderedNoteHtml: noteHtml,
+    attachments: attachments.map((asset) => ({
+      downloadUrl: `${origin}attachments/${encodeURIComponent(asset.uuid)}`,
+      name: asset.name,
+      size: asset.size,
+    })),
+    appName: GITEA_APP_NAME,
+    appUrl: origin,
+  });
+
+  const enqueue: EnqueueOutcome[] = [];
+  const recipientIds: number[] = [];
+  for (const recipient of finalRecipients) {
+    enqueue.push(
+      await enqueueMailOutbox(
+        env,
+        {
+          info: subject,
+          fromAddress: from.address,
+          fromDisplayName: mailFromDisplayName(input.publisher),
+          toAddr: recipient.email!,
+          replyTo: null,
+          subject,
+          bodyHtml,
+          headers: JSON.stringify({ "Message-ID": messageId }),
+          dedupeKey: `new-release:${input.release.id}:${recipient.id}`,
+        },
+        options,
+      ),
+    );
+    recipientIds.push(recipient.id);
+  }
+  return { outcome: "enqueued", recipientIds, enqueue };
+}
+
+/** The `RepoPendingTransfer` arm's input (notify.go:204:
+ *  `doer, newOwner *user_model.User, repo *repo_model.Repository`). */
+export interface NotifyRepoPendingTransferInput {
+  /** The repo id whose pending transfer just landed. */
+  repoId: string;
+  /** Who filed the request (upstream `doer`). */
+  doer: UserRow;
+  /** The target owner row — a USER or an ORG (upstream `newOwner`). */
+  newOwner: UserRow;
+}
+
+
+/**
+ * The `RepoPendingTransfer` arm's mail (notify.go:204-209 →
+ * SendRepoTransferNotifyMail, mail_repo.go:27-103): tell the pending
+ * recipient they can accept/reject.
+ *
+ * The notification-row half of the pair (CreateRepoTransferNotification,
+ * models/activities/notification.go:119-155 — the repository-source row for
+ * every recipient) is DERIVED on this tree, not written: the recipient's
+ * thread materializes at READ time from the `repo_transfer` pending row
+ * itself (UNIQUE(repo_id) — the row IS the transfer's existence, its
+ * insert-stamped `updated_at` the thread's updated_at, and the org/user
+ * recipient predicate the read-time recipient union), with the read/pin
+ * state riding the per-user `user_settings_kv` rows the API's mark paths
+ * write. That is the derived-thread model's own posture (NF2 deviations
+ * 1-2, api/routes/notifications.ts module doc) extended to the
+ * repository-source class: the source row upstream materializes is the
+ * pending-transfer row here, and the repository subject filter now MATCHES
+ * (the deviation-5 record retires for `repository`; `commit` stays
+ * match-nothing — no producer). Upstream also never deletes those rows on
+ * accept/reject; ours derive while the pending row lives — the recorded
+ * delta of the same fold.
+ *
+ * Recipients (mail_repo.go:31-54): the ORG arm fans to every
+ * GetUsersWhoCanCreateOrgRepo member who is mailable (per language upstream;
+ * this tree serves English — the family posture), the USER arm to the owner
+ * alone unless a bot (our users.type enum carries no bot rows — the
+ * documented vacuous skip). Subject per arm: to_you vs to (the org's
+ * display name as destination). From = the doer's display name; msg.Info =
+ * `UID: <newOwnerId>, repository pending transfer notification`; NO
+ * Message-ID. Dedupe `repo-transfer-notify:<transferRowId>:<recipientId>`
+ * — the pending row's own id, so a re-request after reject/cancel (a NEW
+ * row) notifies again like upstream's second dispatch.
+ *
+ * EMIT SITE (upstream services/repository/transfer.go:506, the pending arm
+ * after the tx commits): the transfer route's owner wires
+ * `notifyRepoPendingTransfer(env, { repoId, doer, newOwner })` after
+ * `RepoService.requestTransfer` succeeds, catch-and-log (a mailer outage
+ * must never fail the 201).
+ */
+export async function notifyRepoPendingTransfer(
+  env: MailNotifyEnv,
+  input: NotifyRepoPendingTransferInput,
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  const pre = await mailArmPrelude(env, "repo-transfer mail", `repo-transfer mail for repo ${input.repoId}`, input.repoId);
+  if (!pre.ok) return pre.outcome;
+  const { from, pair } = pre;
+
+  // The pending row just filed — the dedupe identity (and the derived
+  // thread's carrier). A missing row means the caller fired off-path; log
+  // and skip (the push-wave degradation rule).
+  const transfer = await drizzle(env.DB)
+    .select({ id: repoTransfer.id })
+    .from(repoTransfer)
+    .where(eq(repoTransfer.repoId, input.repoId))
+    .get();
+  if (transfer === undefined) {
+    console.error(`[mail] repo-transfer mail skipped: pending row missing [repo: ${input.repoId}]`);
+    return { outcome: "no-recipients" };
+  }
+
+  // The recipient set (mail_repo.go:31-54).
+  const isOrg = input.newOwner.type === "org";
+  const mailableRecipients: UserRow[] = [];
+  if (isOrg) {
+    // GetUsersWhoCanCreateOrgRepo (organization/org.go): users joined
+    // through teams that grant repo creation — our bridge keeps org OWNERS
+    // on `org_members.role='owner'` (no owners-team row exists, the SPEC-0007
+    // §3.3 collapse) and team grants on
+    // `team_members × teams(can_create_org_repo OR authorize='owner')` —
+    // the same disjunction OrgService.canCreateOrgRepo serves per user
+    // (services/orgs/orgs.ts:687-698). Mailable filter at the fold
+    // (mail_repo.go:39-41 `!user.IsMailable() continue`).
+    const granted = await drizzle(env.DB)
+      .selectDistinct({ user: users })
+      .from(users)
+      .leftJoin(orgMembers, and(eq(orgMembers.orgId, input.newOwner.id), eq(orgMembers.userId, users.id)))
+      .leftJoin(teamMembers, eq(teamMembers.userId, users.id))
+      .leftJoin(
+        teams,
+        and(
+          eq(teams.id, teamMembers.teamId),
+          eq(teams.orgId, input.newOwner.id),
+          or(eq(teams.canCreateOrgRepo, true), eq(teams.authorize, "owner")),
+        ),
+      )
+      .where(
+        // The grant disjunction: the owner bridge (org_members.role='owner',
+        // the matched join arm) OR a qualifying team row (teams.id survives
+        // only when the join's org + grant conjuncts held). A user with no
+        // membership rows in THIS org fails both arms (NULL <> IS NOT NULL).
+        and(eq(users.type, "user"), or(eq(orgMembers.role, "owner"), sql`${teams.id} is not null`)),
+      )
+      .all();
+    for (const { user } of granted) {
+      if (isMailable(user)) mailableRecipients.push(user);
+    }
+  } else {
+    // The user arm (mail_repo.go:56-59): bots skip (vacuous here — no bot
+    // rows), then the owner alone, mailable.
+    if (isMailable(input.newOwner)) mailableRecipients.push(input.newOwner);
+  }
+  if (mailableRecipients.length === 0) return { outcome: "no-recipients" };
+
+  // ---- compose (sendRepoTransferNotifyMailPerLang, mail_repo.go:61-103) ----
+  const origin = appUrlWithSlash(env.APP_URL);
+  const repoPath = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
+  const repoHtmlUrl = `${origin}${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
+  const doerDisplay = displayNameOfRow(input.doer);
+  const destination = isOrg ? displayNameOfRow(input.newOwner) : "you";
+  const subject = isOrg
+    ? repoTransferSubjectTo(doerDisplay, repoPath, destination)
+    : repoTransferSubjectToYou(doerDisplay, repoPath);
+  const bodyHtml = renderRepoTransferMail({
+    subject,
+    link: repoHtmlUrl,
+    repoPath,
+    appName: GITEA_APP_NAME,
+    appUrl: origin,
+  });
+
+  const enqueue: EnqueueOutcome[] = [];
+  const recipientIds: number[] = [];
+  for (const recipient of mailableRecipients) {
+    enqueue.push(
+      await enqueueMailOutbox(
+        env,
+        {
+          info: `UID: ${input.newOwner.id}, repository pending transfer notification`,
+          fromAddress: from.address,
+          fromDisplayName: mailFromDisplayName(input.doer),
+          toAddr: recipient.email!,
+          replyTo: null,
+          subject,
+          bodyHtml,
+          headers: null,
+          dedupeKey: `repo-transfer-notify:${transfer.id}:${recipient.id}`,
+        },
+        options,
+      ),
+    );
+    recipientIds.push(recipient.id);
+  }
+  return { outcome: "enqueued", recipientIds, enqueue };
+}
+
+/** Upstream `User.DisplayName()` (FullName when set, else the username) —
+ *  the transfer subjects' arg (the mail From header uses the different
+ *  `fromDisplayName` "FullName (username)" form). */
+function displayNameOfRow(user: UserRow): string {
+  const full = (user.displayName ?? user.fullName ?? "").trim();
+  return full === "" ? user.username : full;
+}
+
+/** The `WorkflowRunStatusUpdate` arm's input (notify.go:210:
+ *  `repo, sender *user_model.User, run *actions_model.ActionRun` — the run
+ *  row carries the repo + trigger ids; the sender resolves from the run's
+ *  latest attempt below, exactly the notify wrapper's rule). */
+export interface NotifyWorkflowRunStatusUpdateInput {
+  /** The settled run row (upstream `run` — status, index, workflow id, ref,
+   *  commit sha, trigger ids). */
+  run: typeof actionRuns.$inferSelect;
+}
+
+/** Upstream `PrettyRef` (models/actions/run.go): `refs/pull/<N>/*` → "#N";
+ *  `refs/heads|tags/<name>` → the short name; anything else raw. */
+function prettyRef(ref: string): string {
+  const pull = /^refs\/pull\/(\d+)\//.exec(ref);
+  if (pull !== null) return `#${pull[1]}`;
+  const heads = /^refs\/(heads|tags)\/(.+)$/.exec(ref);
+  if (heads !== null) return heads[2]!;
+  return ref;
+}
+
+/**
+ * The `WorkflowRunStatusUpdate` arm's mail (notify.go:210-215 →
+ * MailActionsTrigger, mail_workflow_run.go:152-177): mail the run's TRIGGER
+ * USER the outcome, per their actions email preference — the reader half of
+ * the `actionsEmailNotificationsPreference` column the settings tab has
+ * written since migration 0034. Gates, upstream's order:
+ *   1. run status: `!IsDone || IsSkipped` never mails (:159 — the four
+ *      terminal statuses minus skipped);
+ *   2. the recipient must be mailable (:162);
+ *   3. the per-recipient KV preference (:164-175, default failure-only):
+ *      "disabled" never sends; anything but "all" skips non-FAILURE runs.
+ * The recipient = the latest attempt's trigger user when one exists, else
+ * the run's (services/actions/notify.go:68-87's wrapper rule — resolved
+ * HERE because our fire point is the run-status chokepoint, which holds
+ * rows not users). The compose (:66-151): the latest attempt's jobs, ALL
+ * must be done or nothing mails at all (:67-71); failures sort first
+ * (:77-82); subject `[<path>] <Status>: <workflowId> (<prettyRef> -
+ * <shortSha>)`; Message-ID `<path/actions/runs/<run.Index>@AppDomain>`;
+ * from = the RECIPIENT's display name (upstream's own arg, :145); the
+ * sender/recipient headers carry the recipient on BOTH sides (:147-149 —
+ * generateSenderRecipientHeaders(recipient, recipient)); the metadata
+ * headers (:150-152) ride generateMetadataHeaders(repo).
+ * PLATFORM reduction: the per-job status icons (LoadMailIcon's embedded
+ * PNGs, mail_workflow_run.go:97-110) have no embed carrier in the outbox
+ * draft — the icon cell is dropped (renderWorkflowRunMail's record).
+ * Dedupe `workflow-run-status:<runId>:<latestAttemptId>:<recipientId>` —
+ * the settle identity, so the chokepoint's re-drives idempotently dedupe
+ * and a rerun (new attempt) mails again.
+ *
+ * EMIT SITE (upstream fires from NotifyWorkflowRunStatusUpdate's callers —
+ * the run-finish settle services/actions/notify.go:63, the invalid-workflow
+ * run :75 of invalid_workflow.go, the cancel arm cancel.go:54 — every one
+ * flows through the run-status chokepoint on this tree):
+ * `notifyWorkflowRunStatusUpdate(env, { run: <settled row> })` after
+ * refreshRunStatus's final run-row UPDATE (services/actions/update.ts) —
+ * an unconditional call is upstream-faithful (the receiver filters the
+ * non-done/skipped statuses itself); catch-and-log.
+ */
+export async function notifyWorkflowRunStatusUpdate(
+  env: MailNotifyEnv,
+  input: NotifyWorkflowRunStatusUpdateInput,
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  const run = input.run;
+
+  // Gate 1 — the run status (mail_workflow_run.go:159).
+  const done = new Set([ACTION_STATUS_SUCCESS, ACTION_STATUS_FAILURE, ACTION_STATUS_CANCELLED, ACTION_STATUS_SKIPPED]);
+  if (!done.has(run.status) || run.status === ACTION_STATUS_SKIPPED) {
+    return { outcome: "no-recipients" };
+  }
+
+  // The recipient (services/actions/notify.go:71-85): the latest attempt's
+  // trigger user when the run carries one, else the run's.
+  let triggerUserId = run.triggerUserId;
+  if (run.latestAttemptId > 0) {
+    const attempt = await drizzle(env.DB)
+      .select({ triggerUserId: actionRunAttempts.triggerUserId })
+      .from(actionRunAttempts)
+      .where(eq(actionRunAttempts.id, run.latestAttemptId))
+      .get();
+    if (attempt !== undefined && attempt.triggerUserId !== 0) triggerUserId = attempt.triggerUserId;
+  }
+  const recipient = await drizzle(env.DB).select().from(users).where(eq(users.id, triggerUserId)).get();
+  if (recipient === undefined) return { outcome: "no-recipients" };
+
+  // Gate 2 — mailable (:162).
+  if (!isMailable(recipient)) return { outcome: "no-recipients" };
+
+  // Gate 3 — the actions email preference (:164-175): the reader half of
+  // the settings tab's column (migration 0034; default failure-only,
+  // setting_options.go:23).
+  const pref = (await drizzle(env.DB).select().from(userSettings).where(eq(userSettings.userId, recipient.id)).get())
+    ?.actionsEmailNotificationsPreference ?? "failure-only";
+  if (pref === "disabled") return { outcome: "no-recipients" };
+  if (pref !== "all" && run.status !== ACTION_STATUS_FAILURE) return { outcome: "no-recipients" };
+
+  // The compose prelude — the master gate + MAIL_FROM + the repo pair
+  // (MailActionsTrigger's `setting.MailService == nil` arm, :155-158).
+  const pre = await mailArmPrelude(env, "actions mail", `actions mail for run ${run.id}`, run.repoId);
+  if (!pre.ok) return pre.outcome;
+  const { from, pair } = pre;
+
+  // The latest attempt's jobs (:66-71): any not done → no mail at all.
+  const jobRows = await drizzle(env.DB)
+    .select({
+      id: actionRunJobs.id,
+      name: actionRunJobs.name,
+      status: actionRunJobs.status,
+      attempt: actionRunJobs.attempt,
+      started: actionRunJobs.started,
+      stopped: actionRunJobs.stopped,
+    })
+    .from(actionRunJobs)
+    .where(
+      run.latestAttemptId > 0
+        ? and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, run.latestAttemptId))
+        : eq(actionRunJobs.runId, run.id),
+    )
+    .all();
+  const jobDone = new Set([ACTION_STATUS_SUCCESS, ACTION_STATUS_FAILURE, ACTION_STATUS_CANCELLED, ACTION_STATUS_SKIPPED]);
+  if (jobRows.some((job) => !jobDone.has(job.status))) {
+    return { outcome: "no-recipients" };
+  }
+
+  // Failures sort first (:77-82): success flag ascending, then by status
+  // value (cmp.Compare on the raw enum).
+  const sorted = [...jobRows].sort((a, b) => {
+    const aSuccess = a.status === ACTION_STATUS_SUCCESS;
+    const bSuccess = b.status === ACTION_STATUS_SUCCESS;
+    if (aSuccess !== bSuccess) return aSuccess ? 1 : -1;
+    return a.status - b.status;
+  });
+  const origin = appUrlWithSlash(env.APP_URL);
+  const appDomain = appDomainFromAppUrl(env.APP_URL);
+  const repoPath = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
+  const repoHtmlUrl = `${origin}${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
+  const runHtmlUrl = `${repoHtmlUrl}/actions/runs/${run.index}`;
+  const mailJobs: WorkflowRunMailJob[] = sorted.map((job) => ({
+    htmlUrl: `${repoHtmlUrl}/actions/runs/${run.id}/jobs/${job.id}`,
+    name: job.name,
+    status: job.status,
+    attempt: job.attempt,
+    durationSeconds:
+      job.started === null || job.stopped === null ? 0 : Math.max(0, Math.round((job.stopped.getTime() - job.started.getTime()) / 1000)),
+  }));
+
+  // The run status text (:112-124): success → all_succeeded; cancelled →
+  // all_cancelled; failure → all_failed unless any job is not a failure.
+  // Upstream computes this into the template data map (mail_workflow_run.go
+  // :126-133 "RunStatusText") but workflow_run.tmpl never PRINTS it — dead
+  // data upstream too — so the derivation is kept (pinned for the trace)
+  // without threading it into the render.
+  const _runStatusText =
+    run.status === ACTION_STATUS_SUCCESS
+      ? "All jobs have succeeded"
+      : run.status === ACTION_STATUS_CANCELLED
+        ? "All jobs have been cancelled"
+        : sorted.every((job) => job.status === ACTION_STATUS_FAILURE)
+          ? "All jobs have failed"
+          : "Some jobs were not successful";
+  // The subject (:125) — note the run status is the `actions.status.*`
+  // word (LocaleString), the body line the jobs verdict.
+  const subject = `[${repoPath}] ${actionStatusLocaleString(run.status)}: ${run.workflowId} (${prettyRef(run.ref)} - ${shortSha(run.commitSha)})`;
+  const bodyHtml = renderWorkflowRunMail({
+    subject,
+    jobs: mailJobs,
+    runHtmlUrl,
+    workflowId: run.workflowId,
+    appName: GITEA_APP_NAME,
+    appUrl: origin,
+  });
+
+  // The headers (:146-152): Message-ID over the run INDEX;
+  // generateSenderRecipientHeaders(recipient, recipient) — the recipient on
+  // BOTH sides (upstream's own call) — and generateMetadataHeaders(repo).
+  const headers: Record<string, string> = {
+    "Message-ID": `<${repoPath}/actions/runs/${run.index}@${appDomain}>`,
+    "List-ID": `${repoPath} <${pair.repo.slug}.${pair.repo.ownerNamespace}.${appDomain}>`,
+    "List-Archive": `<${repoHtmlUrl}>`,
+    "X-Mailer": "Gitea",
+    "X-Gitea-Repository": pair.repo.slug,
+    "X-Gitea-Repository-Path": repoPath,
+    "X-Gitea-Repository-Link": repoHtmlUrl,
+    "X-GitLab-Project": pair.repo.slug,
+    "X-GitLab-Project-Path": repoPath,
+    "X-Gitea-Sender": recipient.username,
+    "X-Gitea-Recipient": recipient.username,
+    "X-Gitea-Recipient-Address": recipient.email ?? "",
+    "X-GitHub-Sender": recipient.username,
+    "X-GitHub-Recipient": recipient.username,
+    "X-GitHub-Recipient-Address": recipient.email ?? "",
+  };
+
+  const enqueue = await enqueueMailOutbox(
+    env,
+    {
+      info: subject,
+      fromAddress: from.address,
+      fromDisplayName: mailFromDisplayName(recipient),
+      toAddr: recipient.email!,
+      replyTo: null,
+      subject,
+      bodyHtml,
+      headers: JSON.stringify(headers),
+      dedupeKey: `workflow-run-status:${run.id}:${run.latestAttemptId}:${recipient.id}`,
+    },
+    options,
+  );
+  return { outcome: "enqueued", recipientIds: [recipient.id], enqueue: [enqueue] };
 }

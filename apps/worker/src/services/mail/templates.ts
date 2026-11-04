@@ -58,7 +58,7 @@ export function registerNotifySubject(displayName: string, appName: string): str
  * format-detection, color-scheme pair, title, the style block) with the
  * title slot filled by the caller.
  */
-function baseHead(titleHtmlEscaped: string): string {
+function baseHead(titleHtmlEscaped: string, extraHead = ""): string {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -78,8 +78,7 @@ function baseHead(titleHtmlEscaped: string): string {
 			a, a:visited {color: #58a6ff}
 			.mail-footer td {border-top-color: #3f4248 !important; color: #8c959f !important}
 		}
-	</style>
-</head>
+	</style>${extraHead}</head>
 `;
 }
 
@@ -606,6 +605,327 @@ export function renderIssueAssignedMail(data: IssueAssignedMailData): string {
 \t</p>
 \t
 \t${baseFooter(data.appUrl, data.appName)}
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// The B-65 receiver families (specs/behavioral-census NF10 -> board B-65):
+// the three unported mailNotifier receivers' landing templates —
+//   - `renderReleaseMail`          — templates/mail/repo/release.tmpl
+//   - `renderRepoTransferMail`     — templates/mail/repo/transfer.tmpl
+//   - `renderWorkflowRunMail`      — templates/mail/repo/actions/workflow_run.tmpl
+// traced byte-for-byte like the families above, with the locale strings
+// pinned verbatim from options/locale/locale_en-US.json (our tree serves
+// English only).
+// ---------------------------------------------------------------------------
+
+/** Go `util.PathEscapeSegments` (modules/util/pathescape.go:14-23): escape
+ *  every "/"-separated segment with Go url.PathEscape's rule — RFC 3986
+ *  unreserved + the sub-delims and ":@" a path segment may carry stay
+ *  literal; everything else percent-encodes (space → %20, never "+"). */
+export function pathEscapeSegments(raw: string): string {
+  const segmentSafe = /[A-Za-z0-9\-._~!$&'()*+,;=:@]/;
+  let out = "";
+  for (const ch of raw) {
+    if (segmentSafe.test(ch)) {
+      out += ch;
+    } else {
+      out += [...Buffer.from(ch, "utf8")].map((byte) => `%${byte.toString(16).toUpperCase().padStart(2, "0")}`).join("");
+    }
+  }
+  return out.replaceAll("/", "%2F");
+}
+
+/** `FormatByteSize` (modules/util/bytesize.go:9-11) = humanize.IBytes —
+ *  1024-based units (KiB/MiB/GiB...), one decimal below 10, none at/above
+ *  (humanize's default format `%.1f` rounds, `0` renders as `0`):
+ *  0→"0", 1023→"1023", 1024→"1.0 KiB", 1536→"1.5 KiB", 1048576→"1.0 MiB". */
+export function formatByteSize(size: number): string {
+  if (size < 1024) {
+    return `${size}`;
+  }
+  const units = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+  let value = size;
+  let unit = -1;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/** Go `time.Duration.String()` over whole seconds (the mail jobs' duration
+ *  cell — `Stopped.Sub(Started)` rendered by the template verbatim):
+ *  "0s", "45s", "1m30s", "2h5m0s", "25h0m0s" — hours never roll into days. */
+export function goDurationString(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.trunc(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  if (hours > 0) return `${hours}h${minutes}m${secs}s`;
+  if (minutes > 0) return `${minutes}m${secs}s`;
+  return `${secs}s`;
+}
+
+/** `mail.release.new.subject` (locale_en-US.json): `%s in %s released`. */
+export function releaseNewSubject(tagName: string, repoPath: string): string {
+  return `${tagName} in ${repoPath} released`;
+}
+
+/** Data for `renderReleaseMail` (the release.tmpl data map's used slice —
+ *  the compose mailNewRelease, mail_release.go:76-119). */
+export interface ReleaseMailData {
+  /** Upstream `.Subject` — releaseNewSubject(tagName, repoPath). */
+  subject: string;
+  /** Upstream `.Release.Publisher.Name` — the RAW username the text line's
+   *  locale arg carries (mail.release.new.text's %[1]s). */
+  publisherName: string;
+  /** Upstream `.Release.HTMLURL` — Repo.HTMLURL() + "/releases/tag/" +
+   *  PathEscapeSegments(TagName) (models/repo/release.go:145-147). */
+  releaseHtmlUrl: string;
+  /** Upstream `.Release.TagName`. */
+  tagName: string;
+  /** Upstream `.Release.Repo.HTMLURL` — the absolute repo URL. */
+  repoHtmlUrl: string;
+  /** Upstream `.Release.Repo.FullName` — "owner/repo". */
+  repoPath: string;
+  /** Upstream `.Release.Title`. */
+  title: string;
+  /** Upstream `.Release.RenderedNote` — the markdown rendered to HTML with
+   *  absolute links (renderhelper's WithUseAbsoluteLink(true) arm); RAW in
+   *  the div. "" takes the template's dropped-if line. */
+  renderedNoteHtml: string;
+  /** Upstream `.Release.Attachments` — DownloadURL + Name + Size per row. */
+  attachments: Array<{ downloadUrl: string; name: string; size: number }>;
+  /** Upstream `AppName` (the head footer's link text). */
+  appName: string;
+  /** Upstream `AppUrl` — trailing-slash form. */
+  appUrl: string;
+}
+
+/**
+ * `templates/mail/repo/release.tmpl` — byte-faithful trace. The source
+ * archive rows render unconditionally (upstream `.DisableDownloadSourceArchives`
+ * is a mail-template-level flag wired from the repo units; no producer on
+ * this tree sets it — the template's `{{if not}}` default arm). Empty
+ * RenderedNote renders the dropped-if bare-tab line. Attachment URLs are
+ * interpolated RAW (`{{.DownloadURL}}` attribute context — the value is our
+ * canonical `/attachments/{uuid}` absolute, MakeAbsoluteURL's shape).
+ */
+export function renderReleaseMail(data: ReleaseMailData): string {
+  const subject = escapeHtml(data.subject);
+  const publisher = escapeHtml(data.publisherName);
+  const tag = escapeHtml(data.tagName);
+  const releaseUrl = escapeHtml(data.releaseHtmlUrl);
+  const repoUrl = escapeHtml(data.repoHtmlUrl);
+  const repoPath = escapeHtml(data.repoPath);
+  const title = escapeHtml(data.title);
+  const textLine = `<b>${publisher}</b> released <a href='${releaseUrl}'>${tag}</a> in <a href='${repoUrl}'>${repoPath}</a>`;
+  const noteLine = data.renderedNoteHtml === "" ? "" : `<div>${data.renderedNoteHtml}</div>`;
+  const zipUrl = `${data.repoHtmlUrl}/archive/${pathEscapeSegments(data.tagName)}.zip`;
+  const targzUrl = `${data.repoHtmlUrl}/archive/${pathEscapeSegments(data.tagName)}.tar.gz`;
+  const attachmentItems = data.attachments
+    .map(
+      (attachment) =>
+        `\t\t\t<li>\n\t\t\t\t<a target="_blank" href="${escapeHtml(attachment.downloadUrl)}"><strong>${escapeHtml(attachment.name)} (${escapeHtml(formatByteSize(attachment.size))})</strong></a>\n\t\t\t</li>`,
+    )
+    .join("\n");
+  return `${baseHead(subject)}
+
+<body>
+	<p>
+		${textLine}
+	</p>
+	<h4>Title: ${title}</h4>
+	<p>Note:</p>
+	${noteLine}
+	<p>Downloads:</p>
+	<ul>
+		<li>
+			<a href="${escapeHtml(zipUrl)}" rel="nofollow"><strong>Source Code (ZIP)</strong></a>
+		</li>
+		<li>
+			<a href="${escapeHtml(targzUrl)}" rel="nofollow"><strong>Source Code (TAR.GZ)</strong></a>
+		</li>${attachmentItems === "" ? "" : `\n${attachmentItems}`}
+	</ul>
+	${baseFooter(data.appUrl, data.appName)}
+</body>
+</html>`;
+}
+
+/** `mail.repo.transfer.subject_to_you` (locale_en-US.json): `%s would like
+ *  to transfer "%s" to you` — the USER-target arm's subject (doer display
+ *  name + repo full name). */
+export function repoTransferSubjectToYou(doerDisplayName: string, repoPath: string): string {
+  return `${doerDisplayName} would like to transfer "${repoPath}" to you`;
+}
+
+/** `mail.repo.transfer.subject_to`: `%s would like to transfer "%s" to %s` —
+ *  the ORG-target arm's subject (destination = the org's display name). */
+export function repoTransferSubjectTo(doerDisplayName: string, repoPath: string, destination: string): string {
+  return `${doerDisplayName} would like to transfer "${repoPath}" to ${destination}`;
+}
+
+/** Data for `renderRepoTransferMail` (transfer.tmpl's data map). */
+export interface RepoTransferMailData {
+  /** Upstream `.Subject` — the arm's composed subject (to_you / to). */
+  subject: string;
+  /** Upstream `.Link` — Repo.HTMLURL (the transfer landing URL). */
+  link: string;
+  /** Upstream `.Repo` — the repo full name (the anchor's text). */
+  repoPath: string;
+  /** Upstream `AppName` (the head footer's link text). */
+  appName: string;
+  /** Upstream `AppUrl` — trailing-slash form. */
+  appUrl: string;
+}
+
+/**
+ * `templates/mail/repo/transfer.tmpl` — byte-faithful trace. The subject is
+ * interpolated TWICE (the head title arg AND the body's first line — the
+ * template's own shape, `{{.Subject}}.` with the trailing period literal);
+ * the body line is `mail.repo.transfer.body` = "To accept or reject it,
+ * visit %s or just ignore it." with the HTMLFormat-built anchor raw.
+ */
+export function renderRepoTransferMail(data: RepoTransferMailData): string {
+  const subject = escapeHtml(data.subject);
+  const link = escapeHtml(data.link);
+  const repoPath = escapeHtml(data.repoPath);
+  return `${baseHead(subject)}
+
+<body>
+	<p>${subject}.
+		To accept or reject it, visit <a href='${link}'>${repoPath}</a> or just ignore it.
+	</p>
+	${baseFooter(data.appUrl, data.appName)}
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// The actions workflow-run family (templates/mail/repo/actions/workflow_run.tmpl)
+// ---------------------------------------------------------------------------
+
+/** Upstream `Status.LocaleString` (models/actions/status.go:48-50 → the
+ *  `actions.status.*` locale strings) over the run/job status enum — the
+ *  subject's status word and the job icons' alt text. Our numeric enum is
+ *  models/actions/status.go's (ACTION_STATUS_* in services/actions/model.ts):
+ *  0 unknown 1 success 2 failure 3 cancelled 4 skipped. */
+export function actionStatusLocaleString(status: number): string {
+  switch (status) {
+    case 0:
+      return "Unknown";
+    case 1:
+      return "Success";
+    case 2:
+      return "Failure";
+    case 3:
+      return "Canceled";
+    case 4:
+      return "Skipped";
+    default:
+      return "Unknown";
+  }
+}
+
+/** Upstream `workflowRunJobStatusPresentation` (mail_workflow_run.go:49-59):
+ *  success → status-success, cancelled/skipped → status-neutral, everything
+ *  else → status-failure. */
+export function workflowRunJobStatusClass(status: number): "status-success" | "status-neutral" | "status-failure" {
+  if (status === 1) return "status-success";
+  if (status === 3 || status === 4) return "status-neutral";
+  return "status-failure";
+}
+
+/** One mail job row (upstream `workflowRunMailJob`, mail_workflow_run.go:34-43,
+ *  minus the embedded-icon fields — see the PLATFORM note on
+ *  `renderWorkflowRunMail`). */
+export interface WorkflowRunMailJob {
+  htmlUrl: string;
+  name: string;
+  status: number;
+  attempt: number;
+  /** Whole seconds (Go time.Duration rendered by String()). */
+  durationSeconds: number;
+}
+
+/** Data for `renderWorkflowRunMail` (workflow_run.tmpl's data map). */
+export interface WorkflowRunMailData {
+  /** Upstream `.Subject` — the composed subject (workflowRunSubject). */
+  subject: string;
+  /** Upstream `.Jobs` — the latest-attempt jobs, failures-first sorted by
+   *  the compose; empty renders the else arm. */
+  jobs: WorkflowRunMailJob[];
+  /** Upstream `.Run.HTMLURL` — the else arm's link (run landing URL). */
+  runHtmlUrl: string;
+  /** Upstream `.Run.WorkflowID` — the else arm's text. */
+  workflowId: string;
+  /** Upstream `AppName` (the head footer's link text). */
+  appName: string;
+  /** Upstream `AppUrl` — trailing-slash form. */
+  appUrl: string;
+}
+
+/** The workflow_run.tmpl `<head>`'s own style block (verbatim — it sits
+ *  AFTER the base head include, INSIDE the same `<head>`). */
+const WORKFLOW_RUN_HEAD_STYLE = `
+	<style>
+		.job-row td {border-top: 1px solid #d0d7de}
+		a.status-success {color: #2da44e !important}
+		a.status-failure {color: #e5534b !important}
+		a.status-neutral, .job-duration {color: #697077 !important}
+		img.status-neutral {filter: brightness(75%)}
+		@media (prefers-color-scheme: dark) {
+			.job-row td {border-top-color: #3f4248}
+			a.status-neutral, .job-duration {color: #afbac7 !important}
+			img.status-neutral {filter: brightness(125%)}
+		}
+	</style>`;
+
+/**
+ * `templates/mail/repo/actions/workflow_run.tmpl` — byte-faithful trace with
+ * ONE recorded PLATFORM reduction: the status-icon `<td>` (an embedded PNG
+ * served by `cid:` content-id — mail_workflow_run.go:98-110 LoadMailIcon +
+ * the iconsFS embed) has no carrier in the outbox draft shape (no
+ * multipart/related embeds), so the icon cell is DROPPED per row and the
+ * status word rides the hidden `<span>` the alt text fed (visually the
+ * status stays conveyed by the colored link class + the subject's status
+ * word; the `img.*` style rules stay in the block — dead bytes, kept for
+ * the trace). The `{{if gt $job.Attempt 1}}` line renders its "(Attempt
+ * #N)" parens or its bare tab+newline; the duration cell keeps the hidden
+ * `<br>` spacer byte.
+ */
+export function renderWorkflowRunMail(data: WorkflowRunMailData): string {
+  const subject = escapeHtml(data.subject);
+  const rows: string[] = [];
+  for (const [index, job] of data.jobs.entries()) {
+    const cls = workflowRunJobStatusClass(job.status);
+    const statusWord = escapeHtml(actionStatusLocaleString(job.status));
+    const attemptLine = job.attempt > 1 ? `(Attempt #${job.attempt})` : "";
+    rows.push(
+      `\t\t<tr${index === 0 ? "" : ` class="job-row"`}>\n` +
+        // PLATFORM: the icon <td> dropped (the cid embed reduction above).
+        `\t\t\t<td align="left" style="padding: 6px 0; text-align: left; vertical-align: middle; word-break: break-word;">\n` +
+        `\t\t\t\t<a class="${cls}" href="${escapeHtml(job.htmlUrl)}" style="font-weight: bold;"><span style="display: none;">${statusWord}: </span>${escapeHtml(job.name)}</a>\n` +
+        `\t\t\t\t${attemptLine}\n` +
+        `\t\t\t</td>\n` +
+        `\t\t\t<td class="job-duration" width="1%" align="right" style="width: 1%; padding: 6px 0 6px 8px; text-align: right; vertical-align: middle; white-space: nowrap;">${escapeHtml(goDurationString(job.durationSeconds))}<span style="display: none;"><br></span></td>\n` +
+        `\t\t</tr>`,
+    );
+  }
+  const jobsBlock =
+    data.jobs.length > 0
+      ? `\t\n\t<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width: 100%; border-collapse: collapse;">\n\t\n${rows.join("\n")}\n\t\n\t</table>\n\t\n`
+      : `\t\n\t<p><a href="${escapeHtml(data.runHtmlUrl)}">${escapeHtml(data.workflowId)}</a></p>\n\t\n`;
+  return `${baseHead(subject, WORKFLOW_RUN_HEAD_STYLE)}
+<body>
+
+	<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width: 100%; border-collapse: collapse;"><tr><td style="padding: 0 8px;">
+${jobsBlock}	</td></tr></table>
+
+	${baseFooter(data.appUrl, data.appName)}
+
 </body>
 </html>`;
 }

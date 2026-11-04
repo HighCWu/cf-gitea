@@ -80,7 +80,10 @@
  * - `mark_page_as_read` (purge-page) is not rendered: it needs the
  *   CurUnreadNotificationIDs id-list channel for a page-wide mark the
  *   mark-all button already covers at this scale (dead surface avoided);
- *   the POST tail stays unclaimed (notifications.test pins the 404).
+ *   the ROUTE itself is LANDED (the POST /notifications/purge-page mount —
+ *   ui/index.ts's purge-page handler over the caller's-threads filter,
+ *   pinned at notifications.test.tsx's mount block; the stale "POST tail
+ *   stays unclaimed" note predates that mount and is retired, census NF12).
  *   w129 batch-14 sweep: the subscriptions/watching pages themselves
  *   LANDED since this note was written (window-2e C3b — pages/
  *   notification-subscriptions.tsx, both GET tails mounted); what stays

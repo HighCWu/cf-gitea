@@ -122,9 +122,11 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  * by this batch — the landed route-module convention): 401 anonymous
  * (upstream reqToken), 400 bad last_read_at (user.go:137), 422 bad
  * since/before (GetQueryBeforeSince). Auth: every operation requires a token
- * (requireAuth); the upstream `notification` scope category and the
- * public-only-token rejection land with the SPEC-0002 scope work — no scope
- * model exists yet.
+ * (requireAuth) plus the `notification` token-scope category
+ * (api/scope-gate.ts:95-97,162 — the category is registered on both the
+ * global /notifications and the repo-scoped notifications subtrees) and the
+ * public-only-token rejection (auth/middleware.ts rejectPublicOnly) — both
+ * LANDED (the census NF12 defect that called them pending is retired).
  */
 
 // ---------------------------------------------------------------------------
