@@ -21,6 +21,9 @@
  * setting.OAuth2.Enabled false ⇒ 403 on every endpoint). WIRED in W4: the
  * router export below carries the group 403 wrap over the OAUTH2_ENABLED
  * var (SPEC §6/§2.11), the outermost middleware before any session read.
+ * The MUST-CHANGE gate rides requireSignIn itself (web.go:197-206 over
+ * reqSignIn — a flagged session mid-dance 303s onto the change page before
+ * the dance validation; census B-82's closure).
  *
  * ## The session-state seam (the one adaptation upstream forces)
  *
@@ -82,8 +85,10 @@ import { demoModeEnabled } from "../services/demo-sweep";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import {
   clearSessionSetCookie,
+  mustChangePasswordArm,
   sameOriginGuard,
   sessionCookieValue,
+  sessionSetCookie,
   verifySession,
   type SessionUser,
 } from "./session";
@@ -281,6 +286,29 @@ async function requireSignIn(c: RouteContext): Promise<SignedIn | Response> {
     const sink = backgroundSink(c);
     for (const work of verification.background) sink(work);
     if (verification.outcome === "authenticated") {
+      // THE MUST-CHANGE GATE (web.go:197-206 riding reqSignIn — web.go:350 IS
+      // verifyAuthWithOptionsWeb(SignInRequired:true) and the /login/oauth
+      // authorize+grant group mounts on it, web.go:617-624): a flagged
+      // session mid-dance answers the 303 onto /user/settings/change_password
+      // BEFORE any dance validation — no consent renders, no dance-state
+      // stashes, no code mints (the census B-82 closure; SPEC-0002 §6.3.1's
+      // recorded edge). Upstream's ordering is preserved: the gate branch
+      // runs ahead of the SignInRequired redirect, so an anonymous request
+      // still gets the login round-trip and a signed-in flagged doer the
+      // change-page redirect. Impersonated sessions never gate
+      // (common/auth.go:71's isImpersonated carve — the admin's impersonated
+      // consent flow keeps working). The §2.4 rotation directive rides the
+      // gate response (the loginPage forced-logout rule — a rotation that
+      // silently never reaches the client would strand the flagged user
+      // mid-dance past the grace).
+      if (verification.user.mustChangePassword && verification.impersonatorUserId === null) {
+        const directive =
+          verification.setCookie === null
+            ? undefined
+            : sessionSetCookie(verification.setCookie, verification.remember);
+        const arm = mustChangePasswordArm(c.req.raw, true, directive);
+        if (arm !== null) return arm;
+      }
       const colon = value.indexOf(":");
       return {
         user: verification.user,

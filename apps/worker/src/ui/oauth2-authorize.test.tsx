@@ -43,7 +43,7 @@ import { auditEvents, oauth2Applications, oauth2AuthorizationCodes, oauth2Grants
 import { demoModeEnabled } from "../services/demo-sweep";
 import type { UiAssetsFetcher } from "./index";
 import type { UiManifest } from "./manifest";
-import { impersonateSessionUser, mintSession } from "./session";
+import { impersonateSessionUser, mintSession, MUST_CHANGE_PASSWORD_PATH } from "./session";
 // The scope family's ONE home is the service module (the v1.5.2 F9 absorb —
 // the authorize module re-imports from there too).
 import { grantAdditionalScopes, normalizeGrantScope } from "../services/oauth2/token";
@@ -723,6 +723,88 @@ describe("POST /login/oauth/grant — the audit record (W4)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.impersonatorId).toBe(0);
     expect(rows[0]!.impersonatorName).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// The MUST-CHANGE gate at the dance (web.go:197-206 riding reqSignIn — census
+// B-82's closure; SPEC-0002 §6.3.1's recorded edge). Upstream mounts the
+// /login/oauth authorize+grant group on reqSignIn (web.go:350 IS
+// verifyAuthWithOptionsWeb(SignInRequired), group web.go:617-624), so a
+// flagged session mid-dance answers the change-page 303 (or the git-UA 401)
+// BEFORE any dance validation — no consent renders, no dance-state stashes,
+// no code mints. Impersonated sessions never gate (common/auth.go:71). The
+// unflagged arms are the whole suite above.
+// ---------------------------------------------------------------------------------
+
+describe("the MUST-CHANGE gate at the dance (web.go:197-206 over reqSignIn)", () => {
+  /** Flip the flag directly (session.test.ts's shape — the admin-set arm). */
+  const flagMustChange = async (userId: number): Promise<void> => {
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, userId)).run();
+  };
+
+  const codeRowCount = async (): Promise<number> =>
+    (await drizzle(env.DB).select().from(oauth2AuthorizationCodes).all()).length;
+
+  it("a flagged session's GET /authorize 303s onto the change page BEFORE the auto-consent — no code mints", async () => {
+    const user = await seedUser("FlaggedDancer");
+    const app = await seedApp({ clientId: "client-a", confidential: true });
+    await seedGrant(user.id, app.id, "read:repository"); // the auto-consent fixture — without the gate this mints
+    await flagMustChange(user.id);
+    const res = await request(AUTH_URL, { headers: { cookie: `gitea_session=${user.cookie}` } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    // Nothing danced: no authorization code, no dance-state stash.
+    expect(await codeRowCount()).toBe(0);
+    expect(await oauthStateOf(user.cookie)).toBeNull();
+  });
+
+  it("the git-UA arm answers upstream's HTTPError(401) plain text at the dance too (web.go:199-201)", async () => {
+    const user = await seedUser("FlaggedGitClient");
+    const app = await seedApp({ clientId: "client-a", confidential: true });
+    await seedGrant(user.id, app.id, "read:repository");
+    await flagMustChange(user.id);
+    const res = await request(AUTH_URL, {
+      headers: { cookie: `gitea_session=${user.cookie}`, "user-agent": "git/2.45.2" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await res.text()).toBe("Update your password\n");
+    expect(await codeRowCount()).toBe(0);
+  });
+
+  it("a flagged session's POST /grant 303s BEFORE the state verification — the stashed dance state is NOT consumed", async () => {
+    const user = await seedUser("FlaggedConsenter");
+    await seedConsentFixture({ clientId: "gate-client" });
+    const fields = await harvestConsentForm(user, { clientId: "gate-client" }); // stashes the dance state (unflagged yet)
+    await flagMustChange(user.id);
+    const res = await request("/login/oauth/grant", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, cookie: `gitea_session=${user.cookie}` },
+      body: formBody({ ...fields, granted: "true" }),
+    });
+    // The gate — not the code mint, and not the 400-mismatch arm: the stash
+    // survives untouched (upstream's middleware precedes GrantApplicationOAuth
+    // and its Session-state read).
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    expect(await oauthStateOf(user.cookie)).not.toBeNull();
+    expect(await codeRowCount()).toBe(0);
+  });
+
+  it("an IMPERSONATED flagged session's dance PROCEEDS (common/auth.go:71 — impersonated sessions never gate)", async () => {
+    const admin = await seedUser("GateAdmin");
+    const target = await seedUser("FlaggedTarget");
+    await flagMustChange(target.id);
+    const app = await seedApp({ clientId: "client-a", confidential: true });
+    await seedGrant(target.id, app.id, "read:repository");
+    expect(await impersonateSessionUser(env.DB, target.cookie.split(":")[0] ?? "", admin.id, target.id)).toBe("impersonating");
+    const res = await request(AUTH_URL, { headers: { cookie: `gitea_session=${target.cookie}` } });
+    // The auto-consent runs — the impersonated session is not the flagged
+    // doer's own credential (CheckSignedInUser's isImpersonated carve).
+    expect(res.status).toBe(303);
+    expect((res.headers.get("location") ?? "").startsWith("https://app.example/cb?code=gta_")).toBe(true);
   });
 });
 

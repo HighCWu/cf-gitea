@@ -42,11 +42,10 @@ import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { TokenService } from "../auth/token-service";
 import { sessions, userRedirects, users } from "../db/schema";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { firstRunRouter } from "./first-run";
-import { sessionRouter, SESSION_COOKIE_NAME } from "./session";
+import { sessionRouter, SESSION_COOKIE_NAME, mintSession } from "./session";
 import { renderLoginPage } from "./pages/login";
 import { resolveViewer } from "./viewer";
 import { type UiAssetsFetcher } from "./index";
@@ -429,6 +428,74 @@ describe("session integration — the init-created admin", () => {
     // The signed-in browser never sees the first-run surfaces again.
     expect((await request("/install", { headers: { cookie } })).status).toBe(303);
     expect(initCookie).toContain(SESSION_COOKIE_NAME); // the init session was real
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// The must-change gate derivation (census B-82 — SPEC-0002 §6.3.1's disclosure
+// resolved): upstream has NO verifyAuthWithOptionsWeb instance on the first-run
+// surfaces — the install router mounts only MustInitSessioner +
+// installContexter (routers/install/routes.go:28) and /user/sign_up is a bare
+// mount (web.go:597-598) — so a flagged session needs no gate arm HERE. The
+// signed-in short-circuit (redirectIfSignedIn → 303 "/") funnels the flagged
+// browser onto the uiRouter, where the resolveUiSession gate redirects onto
+// /user/settings/change_password one hop later. The pin: the first-run answers
+// stay "/" — never the change page (that would be an arm upstream doesn't
+// carry), never a usable form for the flagged session.
+// ---------------------------------------------------------------------------------
+
+describe("the must-change gate derivation — NO first-run arm (census B-82)", () => {
+  /** A seeded, flagged user with a live session (the session.test.ts shape). */
+  async function seedFlaggedUser(username: string): Promise<string> {
+    const rows = await drizzle(env.DB)
+      .insert(users)
+      .values({
+        username,
+        usernameLower: username.toLowerCase(),
+        isAdmin: false,
+        status: "active",
+        visibility: "public",
+        createdAt: new Date(),
+      })
+      .returning()
+      .all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("user seed failed");
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, row.id)).run();
+    return mintSession(env.DB, row.id);
+  }
+
+  it("a flagged session's GET /install answers 303 '/' — NOT the change page (upstream gates no install route)", async () => {
+    const cookie = await seedFlaggedUser("FlaggedInstaller");
+    const res = await request("/install", { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+  });
+
+  it("a flagged session's GET /user/sign_up answers 303 '/' — NOT the change page (web.go:597's bare mount)", async () => {
+    const cookie = await seedFlaggedUser("FlaggedSignuper");
+    const res = await request("/user/sign_up", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    }, { allowSignup: "true" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+  });
+
+  it("a flagged session's POST /install cannot act — 303 '/' and no second admin row", async () => {
+    const cookie = await seedFlaggedUser("FlaggedPoster");
+    const before = await userCount();
+    const res = await request("/install", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://test.local",
+        cookie: `${SESSION_COOKIE_NAME}=${cookie}`,
+      },
+      body: new URLSearchParams({ admin_name: "Sneak", email: "sneak@example.com", admin_passwd: "x", retype: "x" }).toString(),
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    expect(await userCount()).toBe(before);
   });
 });
 
