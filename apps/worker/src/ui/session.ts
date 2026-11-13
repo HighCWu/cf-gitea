@@ -152,6 +152,7 @@ import {
   passwordResetLocale,
   renderForgotPasswordPage,
   renderResetPasswordPage,
+  resetWrongUserMessage,
 } from "./pages/password-reset";
 import { changePasswordLocale } from "./pages/change-password";
 import {
@@ -1762,6 +1763,38 @@ async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
   return answer instanceof Response ? answer : await answer;
 }
 
+/**
+ * password.go:144-146 — the reset wrong-user refusal (B-83): a signed-in
+ * viewer opening ANOTHER account's reset link gets upstream's
+ * reset_password_wrong_user flash and the reset does NOT apply
+ * (commonResetPassword's `ctx.Doer != nil && u.ID != ctx.Doer.ID` guard).
+ * The presented session is the doer probe (upstream ctx.Doer — an
+ * impersonation session's id is the impersonated principal, upstream's
+ * Override posture); anonymous viewers keep the code as the sole authority
+ * (upstream-true). Returns the flash text for the page's error slot, or
+ * null when the arm does not apply (no/doa session, or the viewer IS the
+ * target). The doer's email is a refusal-path-only point read
+ * (lookupValidSession carries no email); the flash text composes in the
+ * page module (resetWrongUserMessage — this module must not be imported
+ * from there, the cycle must not close).
+ */
+async function resetWrongUserRefusal(
+  d1: D1Database,
+  req: Request,
+  target: typeof users.$inferSelect,
+): Promise<string | null> {
+  const presented = sessionCookieValue(req);
+  if (presented === null) return null;
+  const doer = await lookupValidSession(d1, presented);
+  if (doer === null || doer.id === target.id) return null;
+  const doerRow = await drizzle(d1)
+    .select({ email: users.email })
+    .from(users)
+    .where(eq(users.id, doer.id))
+    .get();
+  return resetWrongUserMessage(doerRow?.email ?? "", target.email ?? "");
+}
+
 /** GET /user/reset_password?code=… — the code verifies BEFORE the form
  *  renders (commonResetPassword, password.go:110-160): a valid code renders
  *  the password form (with the passcode field when TOTP-enrolled), an
@@ -1777,7 +1810,15 @@ async function resetPasswordPage(c: RouteContext): Promise<Response> {
   if (code !== "") {
     const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
     if (user !== null) {
+      // password.go:131-146's order — the enrollment read precedes the
+      // wrong-user refusal (has_two_factor stays in the refusal render's
+      // Data); the GET refusal renders the page WITH the flash (ResetPasswd
+      // continues past the guard), reset obviously not applied.
       const twoFactor = await hasTwoFactorByUid(c.env.DB, user.id);
+      const refusal = await resetWrongUserRefusal(c.env.DB, c.req.raw, user);
+      if (refusal !== null) {
+        return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: refusal, twoFactor }), 200);
+      }
       return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: null, twoFactor }), 200);
     }
   }
@@ -1812,10 +1853,23 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
   if (user === null) return invalid(code, passwordResetLocale.invalid_code);
 
+  // password.go:131-146's order — the enrollment READ precedes the
+  // wrong-user refusal (has_two_factor stays in the refusal render's Data);
+  // a refused POST stops here, so the CONSUME below never runs
+  // (commonResetPassword returns before ResetPasswdPost's twofa arms) and
+  // the reset does NOT apply.
+  const twofa = await getTwoFactorByUid(c.env.DB, user.id);
+  const refusal = await resetWrongUserRefusal(c.env.DB, c.req.raw, user);
+  if (refusal !== null) {
+    return c.html(
+      renderResetPasswordPage({ ctx: assembled.ctx, code, error: refusal, twoFactor: twofa !== null }),
+      200,
+    );
+  }
+
   // password.go:170-204 — the TOTP arms (the form carries the passcode
   // field only when the account is enrolled): a scratch code OR a live
   // passcode, consumed atomically.
-  const twofa = await getTwoFactorByUid(c.env.DB, user.id);
   if (twofa !== null) {
     const scratch = params.get("scratch_code") ?? "";
     const passcode = params.get("passcode") ?? "";

@@ -15,6 +15,7 @@ import fixtures from "./password-fixtures.json";
 import {
   CONFIGURED_HASH_ALGO,
   CONFIGURED_HASH_SPEC,
+  PRODUCTION_PBKDF2_ITERATION_CAP,
   PasswordHashSaltError,
   PasswordHashUnsupportedError,
   bytesToHex,
@@ -43,6 +44,18 @@ interface PwdVector {
 
 const vectors: PwdVector[] = fixtures.vectors;
 
+/**
+ * The EXECUTABLE vectors — everything except `pbkdf2_hi`: its spec
+ * `pbkdf2$320000$50` sits above the production Workers PBKDF2 iteration cap
+ * (B-85, workerd#1346), so the parser routes it to the controlled
+ * PasswordHashUnsupportedError and no hash/verify call may run it (it is the
+ * guard's own pin row, in the describe below). Keeping the vector in the
+ * fixture is deliberate: a configured upstream instance CAN store such a
+ * row (setting.go:33), and the fixture records its exact digest for the day
+ * the cap question is revisited.
+ */
+const HASHABLE_VECTORS = vectors.filter((v) => v.name !== "pbkdf2_hi");
+
 /** The 8 named vectors, in file order — guards the fixture copy. */
 const EXPECTED_NAMES = [
   "pbkdf2_v2_default_ascii",
@@ -69,28 +82,32 @@ function storedSpecOf(vector: PwdVector): string {
 }
 
 describe("known-answer vectors (8, Go+Python cross-checked)", () => {
-  it("carries exactly the 8 named vectors", () => {
+  it("carries exactly the 8 named vectors, of which 7 are executable", () => {
     expect(vectors.map((v) => v.name)).toEqual(EXPECTED_NAMES);
+    // pbkdf2_hi is the production-cap refused row (B-85) — the loops below
+    // must never quietly re-include it.
+    expect(HASHABLE_VECTORS.map((v) => v.name)).toEqual(EXPECTED_NAMES.filter((n) => n !== "pbkdf2_hi"));
+    expect(vectors.find((v) => v.name === "pbkdf2_hi")?.algo).toBe("pbkdf2$320000$50");
   });
 
-  it("every vector hashPasswordWithAlgo reproduces the stored hash byte-exact", async () => {
-    for (const v of vectors) {
+  it("every EXECUTABLE vector hashPasswordWithAlgo reproduces the stored hash byte-exact", async () => {
+    for (const v of HASHABLE_VECTORS) {
       await expect(hashPasswordWithAlgo(v.password, v.salt, storedSpecOf(v)), v.name).resolves.toBe(
         v.stored_hash,
       );
     }
   });
 
-  it("every vector verifies", async () => {
-    for (const v of vectors) {
+  it("every EXECUTABLE vector verifies", async () => {
+    for (const v of HASHABLE_VECTORS) {
       await expect(verifyPassword(v.password, v.stored_hash, v.salt, storedSpecOf(v)), v.name).resolves.toBe(
         true,
       );
     }
   });
 
-  it("every wrong-password fails", async () => {
-    for (const v of vectors) {
+  it("every EXECUTABLE wrong-password fails", async () => {
+    for (const v of HASHABLE_VECTORS) {
       await expect(
         verifyPassword(`${v.password}-wrong`, v.stored_hash, v.salt, storedSpecOf(v)),
         v.name,
@@ -151,14 +168,15 @@ describe("parseStoredHashAlgo (hash.go:134-189)", () => {
     expect(parseStoredHashAlgo(CONFIGURED_HASH_SPEC).iter).toBe(50000);
   });
 
-  it('parses the "pbkdf2$<iter>$<keyLen>" family', () => {
+  it('parses the "pbkdf2$<iter>$<keyLen>" family up to the production cap', () => {
     expect(parseStoredHashAlgo("pbkdf2$50000$50")).toEqual({
       hasher: "pbkdf2",
       iter: 50000,
       keyLen: 50,
       specification: "pbkdf2$50000$50",
     });
-    expect(parseStoredHashAlgo("pbkdf2$320000$50").iter).toBe(320000);
+    // 320000 sits ABOVE the cap — refused, the B-85 describe below.
+    expect(() => parseStoredHashAlgo("pbkdf2$320000$50")).toThrow(PasswordHashUnsupportedError);
     expect(parseStoredHashAlgo("pbkdf2$10000$64").keyLen).toBe(64);
   });
 
@@ -197,6 +215,81 @@ describe("parseStoredHashAlgo (hash.go:134-189)", () => {
       expect((error as PasswordHashUnsupportedError).specification).toBe("argon2$2$65536$8$50");
       expect((error as PasswordHashUnsupportedError).message).toContain("argon2");
     }
+  });
+});
+
+describe("the production PBKDF2 iteration cap (B-85 — PW4's rule-4 class)", () => {
+  /** The fixture's pbkdf2_hi row: what a configured upstream instance
+   *  (setting.go:33) can legitimately store. */
+  const hiVector = vectors.find((v) => v.name === "pbkdf2_hi");
+  if (hiVector === undefined) throw new Error("pbkdf2_hi fixture missing — the cap pin needs its row");
+
+  const LEGACY_SALT = "0123456789abcdef0123456789abcdef"; // 32-hex, both decode eras happy
+
+  it("the boundary: exactly-at-cap parses, above-cap refuses", () => {
+    expect(parseStoredHashAlgo(`pbkdf2$${PRODUCTION_PBKDF2_ITERATION_CAP}$50`)).toEqual({
+      hasher: "pbkdf2",
+      iter: 100000,
+      keyLen: 50,
+      specification: "pbkdf2$100000$50",
+    });
+    expect(() => parseStoredHashAlgo(`pbkdf2$${PRODUCTION_PBKDF2_ITERATION_CAP + 1}$50`)).toThrow(
+      PasswordHashUnsupportedError,
+    );
+  });
+
+  it("a stored 320k-spec row (the pbkdf2_hi dealias) verifies FAILS-CONTROLLED, never a raw platform throw", async () => {
+    // The row's digest is the real Go-generated one — but no verify may
+    // reach deriveBits: parse routes first, identically in local workerd
+    // and production (the environments otherwise disagree, workerd#1346).
+    expect(hiVector.algo).toBe("pbkdf2$320000$50");
+    await expect(verifyPassword(hiVector.password, hiVector.stored_hash, hiVector.salt, hiVector.algo)).rejects.toBeInstanceOf(
+      PasswordHashUnsupportedError,
+    );
+    await expect(verifyPassword(hiVector.password + "-wrong", hiVector.stored_hash, hiVector.salt, hiVector.algo)).rejects.toBeInstanceOf(
+      PasswordHashUnsupportedError,
+    );
+    await expect(hashPasswordWithAlgo(hiVector.password, hiVector.salt, hiVector.algo)).rejects.toBeInstanceOf(
+      PasswordHashUnsupportedError,
+    );
+  });
+
+  it("the controlled error carries the spec and a loggable cause naming the cap", async () => {
+    try {
+      await verifyPassword("pw", "ab".repeat(50), LEGACY_SALT, "pbkdf2$320000$50");
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(PasswordHashUnsupportedError);
+      const unsupported = error as PasswordHashUnsupportedError;
+      expect(unsupported.specification).toBe("pbkdf2$320000$50");
+      expect(unsupported.message).toContain("320000");
+      expect(unsupported.message).toContain(String(PRODUCTION_PBKDF2_ITERATION_CAP));
+    }
+  });
+
+  it("the 50k configured default and the legacy 10k arms are UNCHANGED below the cap", async () => {
+    const record = await newPasswordRecord("cap-unaffected-Pw0rd!");
+    expect(await verifyPassword("cap-unaffected-Pw0rd!", record.passwd, record.salt, record.passwdHashAlgo)).toBe(true);
+    await expect(verifyPassword("pw", "ab".repeat(50), LEGACY_SALT, "pbkdf2$10000$50")).resolves.toBe(false);
+    await expect(verifyPassword("pw", "ab".repeat(50), LEGACY_SALT, "pbkdf2")).resolves.toBe(false);
+  });
+
+  it("ASYMMETRY DOCUMENTED: local workerd EXECUTES above-cap deriveBits (production refuses it, workerd#1346) — the guard must live at parse time", async () => {
+    // The live probe proves the local-vs-production split the benchmark
+    // (§5.4 iterationCapProbe) measured: the LOCAL workerd vitest runs in
+    // happily derives above the cap. Production derives NOTHING here — it
+    // throws mid-call. If a future workerd starts enforcing locally, this
+    // assertion's premise lapses; the parse-time guard stays correct in
+    // either world, which is exactly why the route went through
+    // PasswordHashUnsupportedError instead of relying on the platform.
+    const above = PRODUCTION_PBKDF2_ITERATION_CAP + 1;
+    const localDigest = await pbkdf2Sha256Hex("asymmetry-probe", new TextEncoder().encode(LEGACY_SALT), above, 50);
+    expect(localDigest).toMatch(/^[0-9a-f]{100}$/);
+    // …so a verify with an above-cap spec must be refused by the PARSER
+    // (before any WebCrypto call), never by an environment-dependent throw.
+    await expect(
+      verifyPassword("asymmetry-probe", localDigest, LEGACY_SALT, `pbkdf2$${above}$50`),
+    ).rejects.toBeInstanceOf(PasswordHashUnsupportedError);
   });
 });
 

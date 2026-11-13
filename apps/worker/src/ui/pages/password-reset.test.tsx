@@ -23,7 +23,13 @@
  *     one-time invalidation (user.go:948-950 — the hash data no longer
  *     recomputes after SetPassword), then the sign-in state (handleSignIn,
  *     auth.go:632 — mint + cookie + "/") or the WebAuthn-only park
- *     (password.go:246-258).
+ *     (password.go:246-258);
+ *   - the wrong-user refusal (B-83, commonResetPassword password.go:144-146):
+ *     a signed-in viewer on ANOTHER account's link gets the
+ *     reset_password_wrong_user flash and the reset does NOT apply — the GET
+ *     renders the page WITH the flash, the POST stops BEFORE the TOTP
+ *     consume (GetTwoFactorByUID precedes the guard upstream), no session is
+ *     minted, nothing is consumed.
  */
 
 import { env } from "cloudflare:test";
@@ -47,11 +53,18 @@ import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
 import {
+  mintSession,
   REMEMBER_MAX_AGE_SECONDS,
   SESSION_COOKIE_NAME,
   sessionRouter,
 } from "../session";
-import { ForgotPasswordPage, passwordResetLocale, renderForgotPasswordPage, ResetPasswordPage } from "./password-reset";
+import {
+  ForgotPasswordPage,
+  passwordResetLocale,
+  renderForgotPasswordPage,
+  resetWrongUserMessage,
+  ResetPasswordPage,
+} from "./password-reset";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -575,5 +588,142 @@ describe("POST /user/reset_password — the WebAuthn-only park", () => {
     expect(cookieHeader(res)).toContain(WEBAUTHN_COOKIE_NAME);
     // The park does NOT mint the session — the ceremony owns the sign-in.
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The wrong-user refusal (B-83 — commonResetPassword, password.go:144-146):
+// a signed-in viewer opening ANOTHER account's reset link gets upstream's
+// reset_password_wrong_user flash (auth.reset_password_wrong_user) and the
+// reset does NOT apply. Both arms render tplResetPassword at 200 — the GET
+// continues past the guard (ResetPasswd), the POST takes the `u == nil`
+// arm (password.go:167-171) — and the POST stops BEFORE the TOTP consume
+// (GetTwoFactorByUID precedes the guard upstream; the consume is
+// ResetPasswdPost's business). The presented session is the doer probe;
+// anonymous viewers keep the code as the sole authority (upstream-true).
+// -----------------------------------------------------------------------------
+
+/** A POST body with the signed-in viewer's session cookie riding along. */
+const formAs = (cookieValue: string, fields: Record<string, string>): RequestInit => ({
+  method: "POST",
+  headers: {
+    "content-type": "application/x-www-form-urlencoded",
+    cookie: `${SESSION_COOKIE_NAME}=${cookieValue}`,
+  },
+  body: new URLSearchParams(fields).toString(),
+});
+
+const asViewer = (cookieValue: string): RequestInit => ({
+  headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+});
+
+const WRONG_USER_FLASH_FRAGMENT = "but the account recovery link is meant for";
+
+describe("the wrong-user refusal (password.go:144-146, B-83)", () => {
+  it("the flash text composes upstream's %s pair, safe against $ replacement patterns", () => {
+    expect(resetWrongUserMessage("bob@example.com", "alice@example.com")).toBe(
+      "You are signed in as bob@example.com, but the account recovery link is meant for alice@example.com",
+    );
+    expect(resetWrongUserMessage("$&x@evil.test", "a$1b@ok.test")).toBe(
+      "You are signed in as $&x@evil.test, but the account recovery link is meant for a$1b@ok.test",
+    );
+  });
+
+  it("GET: a signed-in viewer on ANOTHER account's link renders the reset page WITH the flash (ResetPasswd continues past the guard)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const bob = await seedUser("Bob", "bob@example.com");
+    const code = await mintCode(alice);
+    const bobCookie = await mintSession(env.DB, bob.id, { remember: false });
+
+    const res = await request(`/user/reset_password?code=${code}`, asViewer(bobCookie));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(resetWrongUserMessage("bob@example.com", "alice@example.com"));
+    // The form still renders (upstream keeps Code in Data past the guard).
+    expect(html).toContain(`name="code" value="${code}"`);
+  });
+
+  it("GET: the RIGHT-user viewer and the anonymous viewer render WITHOUT the flash (the guard does not apply)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const code = await mintCode(alice);
+    const aliceCookie = await mintSession(env.DB, alice.id, { remember: false });
+
+    const own = await request(`/user/reset_password?code=${code}`, asViewer(aliceCookie));
+    expect(own.status).toBe(200);
+    expect(await own.text()).not.toContain(WRONG_USER_FLASH_FRAGMENT);
+
+    const anonymous = await request(`/user/reset_password?code=${code}`);
+    expect(anonymous.status).toBe(200);
+    expect(await anonymous.text()).not.toContain(WRONG_USER_FLASH_FRAGMENT);
+  });
+
+  it("POST: the refusal applies to the submit — 200 + flash, password UNTOUCHED, NO session minted, code unconsumed", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const bob = await seedUser("Bob", "bob@example.com");
+    await seedPassword(alice, "previous horse battery staple");
+    const code = await mintCode(alice);
+    const before = await userRow(alice.id);
+    const bobCookie = await mintSession(env.DB, bob.id, { remember: false });
+
+    const res = await request(
+      "/user/reset_password",
+      formAs(bobCookie, { code, password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(resetWrongUserMessage("bob@example.com", "alice@example.com"));
+
+    // NOTHING happened: the row is byte-identical (no apply), the passwd-bound
+    // code still verifies (nothing consumed it — user.go:948-950's data hash
+    // recomputes), and the only session row is Bob's own presented one (no
+    // handleSignIn mint for anyone).
+    const after = await userRow(alice.id);
+    expect(after.passwd).toBe(before.passwd);
+    expect(after.salt).toBe(before.salt);
+    expect(await verifyUserTimeLimitCode(env.DB, "reset_password", code)).not.toBeNull();
+    const sessionRows = await drizzle(env.DB).select().from(sessions).all();
+    expect(sessionRows).toHaveLength(1);
+    expect(sessionRows[0]?.userId).toBe(bob.id);
+  });
+
+  it("a TOTP-enrolled target: the refusal renders WITH the passcode field and the enrollment is never consumed", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const bob = await seedUser("Bob", "bob@example.com");
+    const { scratchToken } = await seedTotp(alice);
+    const code = await mintCode(alice);
+    const bobCookie = await mintSession(env.DB, bob.id, { remember: false });
+
+    const res = await request(
+      "/user/reset_password",
+      formAs(bobCookie, { code, password: NEW_PASSWORD, retype: NEW_PASSWORD, scratch_code: scratchToken }),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(resetWrongUserMessage("bob@example.com", "alice@example.com"));
+    // has_two_factor precedes the guard upstream (password.go:131-143) — the
+    // refusal render keeps the passcode field.
+    expect(html).toContain('name="passcode"');
+
+    // The VALID scratch token was NOT consumed by the refused POST: the same
+    // link resets fine anonymously right after (scratch verify is read-only;
+    // the burn lives past the apply).
+    const replay = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, scratch_code: scratchToken }),
+    );
+    expect(replay.status).toBe(303);
+    expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
+  });
+
+  it("the RIGHT-user POST still applies and signs in (the guard's doer==target early-out)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const code = await mintCode(alice);
+    const aliceCookie = await mintSession(env.DB, alice.id, { remember: false });
+
+    const res = await request(
+      "/user/reset_password",
+      formAs(aliceCookie, { code, password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+    );
+    expect(res.status).toBe(303);
+    expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
   });
 });

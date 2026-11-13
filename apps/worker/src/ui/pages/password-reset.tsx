@@ -31,6 +31,8 @@ export const passwordResetLocale = {
   remember_me: "Remember This Device", // "auth.remember_me"
   submit: "Recover Account", // "auth.reset_password_helper"
   invalid_code: "Your confirmation code is invalid or has expired.", // "auth.invalid_code"
+  reset_password_wrong_user:
+    "You are signed in as %s, but the account recovery link is meant for %s", // "auth.reset_password_wrong_user" (B-83)
 } as const;
 
 /** GET /user/forgot_password — the reset-disabled state (no mailer). */
@@ -99,6 +101,18 @@ export function ResetPasswordPage(props: {
       </div>
     </BaseLayout>
   );
+}
+
+/**
+ * password.go:144-146's flash text (B-83, auth.reset_password_wrong_user,
+ * locale_en-US): the Go `%s` pair filled with (doer.Email, target.Email).
+ * Function replacers, so email content can never trip the `$` replacement
+ * patterns. The wrong-user refusal renders this as the page's error flash;
+ * the reset does NOT apply (the probe lives with the session arms — this
+ * module stays session-free, the import cycle must not close).
+ */
+export function resetWrongUserMessage(doerEmail: string, targetEmail: string): string {
+  return passwordResetLocale.reset_password_wrong_user.replace("%s", () => doerEmail).replace("%s", () => targetEmail);
 }
 
 /** The router-facing render helpers (the hono/jsx split — session.ts stays

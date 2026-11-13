@@ -23,13 +23,29 @@
  * are unverifiable until Phase B: parsing raises the controlled
  * PasswordHashUnsupportedError (SPEC §6.3-3, ADR-0008 rule 4) — callers
  * translate it into upstream's generic auth failure on the wire while the
- * server log carries the cause; NEVER a silent mismatch.
+ * server log carries the cause; NEVER a silent mismatch. The same controlled
+ * arm answers pbkdf2 specs ABOVE the production iteration cap (B-85 — PW4's
+ * rule-4 class, the accepted-but-unexecutable parse; see the constant below).
  */
 
 import { timingSafeDigestEqual } from "./digest";
 
 /** The hardwired PASSWORD_HASH_ALGO config name (setting.go:13). */
 export const CONFIGURED_HASH_ALGO = "pbkdf2";
+
+/**
+ * The PRODUCTION Workers PBKDF2 iteration cap (B-85): production deriveBits
+ * refuses iterations above 100,000 (workerd#1346; SPEC-0002 §5.4's
+ * iterationCapProbe) while the LOCAL workerd this repo tests in does NOT
+ * enforce it — the test-asymmetry hazard the benchmark flagged. A stored
+ * spec above the cap (e.g. `pbkdf2$320000$50`, the pbkdf2_hi dealias,
+ * setting.go:33) verifies in every local test and would throw MID-VERIFY in
+ * production; parseStoredHashAlgo routes such specs to the controlled
+ * PasswordHashUnsupportedError at PARSE time, so both runtimes fail CLOSED
+ * with the same controlled error (the same arm as the other unexecutable
+ * parses) instead of a verify that diverges by environment.
+ */
+export const PRODUCTION_PBKDF2_ITERATION_CAP = 100_000;
 
 /**
  * The dealiased configured specification stored in `passwd_hash_algo` on
@@ -147,6 +163,17 @@ export function parseStoredHashAlgo(algorithmSpec: string): ParsedHashSpec {
     // Upstream would run pbkdf2.Key with the raw (signed) ints; a corrupted
     // row lands here, and the controlled error is the honest arm (§6.3-3).
     throw new PasswordHashUnsupportedError(spec, `pbkdf2 params out of range: iter=${iter} keyLen=${keyLen}`);
+  }
+  if (iter > PRODUCTION_PBKDF2_ITERATION_CAP) {
+    // B-85 (PW4's rule-4 class): production Workers refuse deriveBits above
+    // the cap (workerd#1346) — a stored pbkdf2_hi-era spec would verify in
+    // local tests and throw MID-VERIFY in production. The controlled
+    // unsupported error here fails CLOSED identically in both runtimes;
+    // never a verify whose outcome depends on the environment.
+    throw new PasswordHashUnsupportedError(
+      spec,
+      `pbkdf2 iteration count ${iter} exceeds the production Workers cap ${PRODUCTION_PBKDF2_ITERATION_CAP} (workerd#1346)`,
+    );
   }
   return { hasher: hasherType, iter, keyLen, specification: spec };
 }
