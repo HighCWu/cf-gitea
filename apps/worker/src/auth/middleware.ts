@@ -21,6 +21,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../db/schema";
+import { enableBasicAuthentication, type PasswordConfigEnv } from "../api/config";
 import type { AuthEnv, AuthInfo, AuthToken, AuthUser } from "./auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "./httpauth";
 import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./failure-limiter";
@@ -225,13 +226,26 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
       // THE BASIC PASSWORD ARM (SPEC-0002 §6.2 API-Basic row; upstream
       // services/auth/basic.go:135-146): the token arms missed, the
       // credential arrived via HTTP Basic, and EnableBasicAuth holds
-      // (default TRUE, service.go:179 — no knob until Phase C) → the full
-      // password sign-in with the raw (username, password) pair. The arm
-      // fails CLOSED into the same generic 401 (basic.go:142-146 →
-      // api.go:862-869's "invalid username, password or token") except the
-      // WebAuthn hard-reject, whose message IS the wire body
-      // (ErrUserAuthMessage → api.go:866-868).
+      // (census B-87: the ENABLE_BASIC_AUTHENTICATION var, default TRUE —
+      // service.go:179 MustBool(true)) → the full password sign-in with the
+      // raw (username, password) pair. The arm fails CLOSED into the same
+      // generic 401 (basic.go:142-146 → api.go:862-869's "invalid username,
+      // password or token") except the WebAuthn hard-reject, whose message
+      // IS the wire body (ErrUserAuthMessage → api.go:866-868).
       if (parsed?.basicAuth !== undefined && parsed?.basicAuth !== null) {
+        // THE KNOB (basic.go:139-141): with EnableBasicAuth OFF the password
+        // method is NOT APPLICABLE — `return nil, nil`, the request proceeds
+        // ANONYMOUS exactly like no credentials at all (the endpoint's own
+        // auth requirement answers; public routes serve). NEVER the generic
+        // 401 here: upstream never tests the pair, so the failure limiter is
+        // not touched either. Basic-carried TOKENS verified above and stay
+        // unaffected (the gate sits AFTER the VerifyAuthToken arm).
+        const basicAuthEnv: PasswordConfigEnv = c.env;
+        if (!enableBasicAuthentication(basicAuthEnv)) {
+          c.set("auth", { user: null, token: null, scope: null, isBasicAuth: false });
+          await next();
+          return;
+        }
         const outcome = await basicPasswordArm(
           c.env.DB,
           parsed.basicAuth,

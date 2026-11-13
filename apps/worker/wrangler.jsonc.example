@@ -71,6 +71,53 @@
     // redirects to login at web.go:354; ours answers the 404-shell posture —
     // the recorded shape delta). Signed-in callers are never consulted.
     "REQUIRE_SIGNIN_VIEW": "false",
+    // Census B-87 (PW16, SPEC-0002 §6.5 Phase C) — the password system's six
+    // config knobs, upstream's [service]/[security] keys over wrangler vars.
+    // Defaults here ARE upstream's defaults (ADR-0008: behavioral equivalence
+    // at the default config).
+    // ENABLE_PASSWORD_SIGNIN_FORM ([service] ENABLE_PASSWORD_SIGNIN_FORM →
+    // Service.EnablePasswordSignInForm, modules/setting/service.go:180,
+    // MustBool(true)) — the web login form's arm. "false" (or "0"/"f", the
+    // go-ini bool parse) hides the WHOLE sign-in form (signin_inner.tmpl:
+    // 13-49 wraps the <form>: user_name, password, remember, submit and the
+    // forgot-password link) while external-auth buttons still render without
+    // the "or" divider (:51); the POST /login arm answers upstream's
+    // 403 (auth.go:293-295).
+    "ENABLE_PASSWORD_SIGNIN_FORM": "true",
+    // ENABLE_BASIC_AUTHENTICATION ([service] ENABLE_BASIC_AUTHENTICATION →
+    // Service.EnableBasicAuth, service.go:179, MustBool(true)) — the git/API
+    // Basic PASSWORD arm. "false" makes the Basic password method NOT
+    // APPLICABLE (services/auth/basic.go:139-141): the request proceeds
+    // ANONYMOUS (each endpoint's own auth requirement answers) — never the
+    // generic 401; Basic-carried TOKENS keep working (the token arm runs
+    // before the gate).
+    "ENABLE_BASIC_AUTHENTICATION": "true",
+    // PASSWORD_HASH_ALGO ([security] PASSWORD_HASH_ALGO →
+    // setting.PasswordHashAlgo, security.go:175, MustString("")) — the
+    // algorithm NEW passwords hash with (SetPassword) and the rehash target.
+    // Names dealias to full specs (hash/setting.go:22-34): argon2, bcrypt,
+    // scrypt, pbkdf2 (→ pbkdf2$50000$50), pbkdf2_v1, pbkdf2_v2, pbkdf2_hi;
+    // "" = upstream's pbkdf2 default. A spec the runtime cannot execute
+    // (scrypt, above-cap pbkdf2 params — workerd#1346) answers the recorded
+    // controlled-refusal posture instead of upstream's boot-time log.Fatal.
+    "PASSWORD_HASH_ALGO": "",
+    // MIN_PASSWORD_LENGTH ([security] MIN_PASSWORD_LENGTH, security.go:167,
+    // MustInt(8)) — the shared UpdateAuth ladder's floor (update.go:257);
+    // non-numeric falls back to 8 (MustInt semantics).
+    "MIN_PASSWORD_LENGTH": "8",
+    // PASSWORD_COMPLEXITY ([security] PASSWORD_COMPLEXITY, security.go:
+    // 209-218, Strings(",")) — comma-separated classes lower,upper,digit,spec.
+    // UNSET/empty/"off" = NO complexity checking (upstream's default —
+    // app.example.ini:503); a set with at least one valid class requires
+    // those classes only; a set with NO valid class falls back to ALL four
+    // (password.go:77-96's own fallback).
+    "PASSWORD_COMPLEXITY": "",
+    // PASSWORD_CHECK_PWN ([security] PASSWORD_CHECK_PWN, security.go:179,
+    // MustBool(false) — pwn.go:37-39) — "true" checks new passwords against
+    // the Have-I-Been-Pwned range API at every password-set arm (an outbound
+    // fetch to api.pwnedpasswords.com; failures answer upstream's
+    // password_pwned_err posture, never a silent pass).
+    "PASSWORD_CHECK_PWN": "false",
     // SPEC-0014 §2 — the demo-operations gate. ONLY the exact string "true"
     // arms the demo sweep (hourly cron producer → {kind:"demo-sweep"} → the
     // existing delete cascade); absent/anything else stays OFF (fail-closed,

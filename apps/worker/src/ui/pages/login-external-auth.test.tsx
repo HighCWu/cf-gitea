@@ -178,3 +178,96 @@ describe("the signup page's social block (signup_inner.tmpl:50-56)", () => {
     expect(noSources).not.toContain("divider divider-text");
   });
 });
+
+// -----------------------------------------------------------------------------
+// Census B-87 — the ENABLE_PASSWORD_SIGNIN_FORM form gate
+// (signin_inner.tmpl:13-49's `{{if .EnablePasswordSignInForm}}`: the WHOLE
+// <form> hides — user_name, password, remember, submit — and the
+// forgot-password link with it (upstream renders it inside the form's
+// password-field block). The external-auth block keeps rendering WITHOUT
+// the "or" divider (:51's `and $showExternalAuthMethods
+// .EnablePasswordSignInForm`). The register/admin-init panels stay
+// (upstream keeps them form-independent). Absent = ON — the golden-stable
+// default every other describe here pins.
+// -----------------------------------------------------------------------------
+
+describe("ENABLE_PASSWORD_SIGNIN_FORM=off — the login form gate (signin_inner.tmpl:13-49)", () => {
+  const htmlOff = renderLoginPage({ ctx: ANON_CTX, redirectTo: null, error: null, enablePasswordSignInForm: false });
+  const htmlOn = renderLoginPage({ ctx: ANON_CTX, redirectTo: null, error: null });
+
+  it("the whole <form> disappears (no user_name/password/remember/submit)", () => {
+    expect(htmlOff).not.toContain('<form class="ui form" action="/login" method="post">');
+    expect(htmlOff).not.toContain('name="user_name"');
+    expect(htmlOff).not.toContain('name="password"');
+    expect(htmlOff).not.toContain('name="remember"');
+    expect(htmlOff).not.toContain('name="redirect_to"');
+    // The page itself still renders (the header + segment survive, like
+    // upstream's header-over-empty-segment shape).
+    expect(htmlOff).toContain("Sign In");
+  });
+
+  it("the forgot-password link hides with the form (it sits inside the form upstream)", () => {
+    expect(htmlOff).not.toContain("/user/forgot_password");
+    expect(htmlOn).toContain("/user/forgot_password");
+  });
+
+  it("a server-side error message renders OUTSIDE the form arm? No — the error lives in the form, so it hides too", () => {
+    // The inline failure banner is the form's first child; with the form
+    // gone there is nothing to render it in (upstream's template nests it
+    // the same way — base/alert sits inside the {{if}} block).
+    const htmlErr = renderLoginPage({
+      ctx: ANON_CTX,
+      redirectTo: null,
+      error: "username or password is incorrect",
+      enablePasswordSignInForm: false,
+    });
+    expect(htmlErr).not.toContain("username or password is incorrect");
+  });
+
+  it("external-auth buttons keep rendering WITHOUT the or-divider (signin_inner.tmpl:51's and)", () => {
+    const sources = [{ name: "corp-oidc", provider: "openidConnect", iconUrl: null }] as const;
+    const withBoth = renderLoginPage({
+      ctx: ANON_CTX,
+      redirectTo: null,
+      error: null,
+      oauth2Sources: [...sources],
+      enablePasswordSignInForm: false,
+    });
+    expect(withBoth).toContain("external-login-navigator");
+    expect(withBoth).toContain("/user/oauth2/corp-oidc");
+    expect(withBoth).not.toContain("divider-text");
+    // The ON twin keeps the divider (the pre-existing social-block pin's shape).
+    const withForm = renderLoginPage({
+      ctx: ANON_CTX,
+      redirectTo: null,
+      error: null,
+      oauth2Sources: [...sources],
+    });
+    expect(withForm).toContain("divider-text");
+  });
+
+  it("the admin-init panel and the register link stay (form-independent, upstream's own posture)", () => {
+    const adminInit = renderLoginPage({
+      ctx: ANON_CTX,
+      redirectTo: null,
+      error: null,
+      adminInit: { open: true, error: null },
+      signUpLink: true,
+      enablePasswordSignInForm: false,
+    });
+    expect(adminInit).toContain('action="/install"');
+    expect(adminInit).toContain('href="/user/sign_up"');
+    expect(adminInit).not.toContain('action="/login"');
+  });
+
+  it("the absent prop keeps the golden-stable ON render (byte-identical to the explicit true)", () => {
+    const explicitTrue = renderLoginPage({
+      ctx: ANON_CTX,
+      redirectTo: null,
+      error: null,
+      enablePasswordSignInForm: true,
+    });
+    expect(htmlOn).toBe(explicitTrue);
+    expect(htmlOn).toContain('<form class="ui form" action="/login" method="post">');
+  });
+});

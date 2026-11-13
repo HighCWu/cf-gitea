@@ -461,3 +461,75 @@ describe("the must-change-password 403 arm (api.go:886-893)", () => {
     expect(res.status).toBe(200);
   });
 });
+
+// -----------------------------------------------------------------------------
+// Census B-87 — the ENABLE_BASIC_AUTHENTICATION knob (service.go:179 +
+// basic.go:139-141). OFF: the Basic PASSWORD method is NOT APPLICABLE —
+// `return nil, nil` — the request proceeds ANONYMOUS (the endpoint's own
+// auth requirement answers), never the generic 401, and the failure limiter
+// is never touched (upstream never calls UserSignIn). Basic-carried TOKENS
+// verify BEFORE the gate (basic.go:134-137's VerifyAuthToken arm) and stay
+// unaffected. The ON posture is every describe above (the default var is
+// "true" — the generated Env literal).
+// -----------------------------------------------------------------------------
+
+describe("ENABLE_BASIC_AUTHENTICATION=off — the method is not applicable (basic.go:139-141)", () => {
+  /** The rig with the knob forced OFF (the var rides the request env — the
+   *  same per-request override the vitest plugin's var injection admits). */
+  const callKnobOff = async (path: string, init?: RequestInit): Promise<Response> =>
+    await app.request(`${ORIGIN}${path}`, init, { ...env, ENABLE_BASIC_AUTHENTICATION: "false" });
+
+  it("a VALID password pair proceeds ANONYMOUS — the arm never runs, no doer, no 401", async () => {
+    const alice = await seedUser("KnobOffValid");
+    const pw = await seedPassword(alice);
+
+    const res = await callKnobOff("/_whoami", { headers: { Authorization: basicHeader("KnobOffValid", pw) } });
+    expect(res.status).toBe(200);
+    const body = await res.json<{ user: string | null; userId: number | null; isBasicAuth: boolean; token: unknown }>();
+    expect(body.user).toBeNull();
+    expect(body.userId).toBeNull();
+    expect(body.isBasicAuth).toBe(false);
+    expect(body.token).toBeNull();
+  });
+
+  it("a WRONG password pair also proceeds anonymous — no generic 401, no failure row", async () => {
+    const alice = await seedUser("KnobOffWrong");
+    await seedPassword(alice);
+
+    const res = await callKnobOff("/_whoami", {
+      headers: { Authorization: basicHeader("KnobOffWrong", "wrong-password"), "CF-Connecting-IP": "203.0.113.77" },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json<{ user: string | null }>()).user).toBeNull();
+    // basic.go:141 returns before UserSignIn — no credential test happened,
+    // so the limiter never records (the ip param matches the header above).
+    expect(await failureCountFor("203.0.113.77")).toBe(0);
+  });
+
+  it("a token-REQUIRED route answers its own 401 shape, not the invalid-credential envelope", async () => {
+    const alice = await seedUser("KnobOffRepo");
+    const pw = await seedPassword(alice);
+
+    const res = await callKnobOff("/_repo", { headers: { Authorization: basicHeader("KnobOffRepo", pw) } });
+    expect(res.status).toBe(401);
+    const body = await res.json<{ message: string; url?: string }>();
+    // requireToken's own refusal ("token is required") — NOT the Basic arm's
+    // generic "invalid username, password or token".
+    expect(body.message).toBe("token is required");
+  });
+
+  it("a Basic-carried TOKEN still authenticates (the token arm precedes the gate, basic.go:134-137)", async () => {
+    const alice = await seedUser("KnobOffToken");
+    const token = await new TokenService(env.DB)
+      .mint({ userId: alice.id, name: "t", scopes: "all" })
+      .then((m) => m.plaintext);
+
+    const res = await callKnobOff("/_whoami", { headers: { Authorization: basicHeader(token, "") } });
+    expect(res.status).toBe(200);
+    const body = await res.json<{ user: string | null; isBasicAuth: boolean }>();
+    expect(body.user).toBe("KnobOffToken");
+    // The Basic carrier keeps isBasicAuth=true for the reqBasicAuth routes —
+    // the gate only removes the PASSWORD arm.
+    expect(body.isBasicAuth).toBe(true);
+  });
+});

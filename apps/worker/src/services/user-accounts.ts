@@ -95,7 +95,14 @@ import { LastOrgOwnerError } from "./orgs/errors";
 import { scrubUserFromAllRules } from "./branch-protection";
 import { deletePackageAndReferences } from "./packages/model";
 import { usableUsernameError } from "./orgs/orgs";
-import { isComplexEnough, buildComplexityError, MIN_PASSWORD_LENGTH } from "../auth/password-policy";
+import {
+  buildComplexityError,
+  DEFAULT_PASSWORD_POLICY,
+  isComplexEnough,
+  isPwned,
+  type PasswordPolicy,
+  type PwnedResult,
+} from "../auth/password-policy";
 import { newPasswordRecord, newSalt, verifyPassword } from "../auth/password";
 
 // ---------------------------------------------------------------------------
@@ -346,18 +353,56 @@ export async function initializeAdminUser(
 // ---------------------------------------------------------------------------
 
 /**
- * The shared UpdateAuth password-validation ladder (upstream
- * services/user/update.go:247-265): minimum length, complexity, pwned
- * (default-OFF upstream — PASSWORD_CHECK_PWNED MustBool(false), pwn.go:37;
- * Phase A keeps it off, the config surface is Phase C). Returns the inline
- * message for the caller's re-render, or null when clean.
+ * The shared UpdateAuth password-validation ladder's SYNC half (upstream
+ * services/user/update.go:256-262): minimum length over
+ * `policy.minLength`, complexity over `policy.complexityClasses`. The pwned
+ * arm (update.go:263-265) is ASYNC + networked, so it lives in the caller
+ * (`isPwned` + the knob's `checkPwned` — the change/reset arms' options and
+ * the admin-t2 routes). `policy` defaults to DEFAULT_PASSWORD_POLICY =
+ * upstream's DEFAULT config (floor 8, NO complexity — security.go:209-218
+ * seeds "off" when the key is unset; the B-87 correction, cited in
+ * password-policy.ts's header). Callers with an env thread
+ * `resolvePasswordPolicy(env)` so an ARMED config gates them too. Returns
+ * the inline message for the caller's re-render, or null when clean.
  */
-export function validateNewPassword(password: string): string | null {
-  if (password.length < MIN_PASSWORD_LENGTH) {
-    return `Password length cannot be less than ${MIN_PASSWORD_LENGTH} characters.`;
+export function validateNewPassword(password: string, policy: PasswordPolicy = DEFAULT_PASSWORD_POLICY): string | null {
+  if (password.length < policy.minLength) {
+    return `Password length cannot be less than ${policy.minLength} characters.`;
   }
-  if (!isComplexEnough(password)) return buildComplexityError();
+  if (!isComplexEnough(password, policy.complexityClasses)) return buildComplexityError(policy.complexityClasses);
   return null;
+}
+
+/**
+ * The pwned arm's WEB messages (upstream account.go:88-90 / password.go:
+ * 216-219 / auth.go:590-600 flash the locale rows):
+ * `auth.password_pwned` (locale_en-US.json:442) with the in-text anchor
+ * reduced to the bare URL — the house plain-text flash convention (the
+ * BuildComplexityError `<ul>` precedent, census PW15) — and
+ * `auth.password_pwned_err` (:443). The API edit arm keeps the RAW error
+ * texts instead (admin/user.go:220's `err.Error()`) —
+ * password-policy.ts PASSWORD_PWNED_ERROR_TEXT + PwnedResult.message.
+ */
+export const PASSWORD_PWNED_MESSAGE =
+  "The password you chose is on a list of stolen passwords (https://haveibeenpwned.com/Passwords) previously exposed in public data breaches. Please try again with a different password and consider changing this password elsewhere too.";
+export const PASSWORD_PWNED_REQUEST_FAILED_MESSAGE = "Could not complete request to HaveIBeenPwned";
+
+/** The pwned arm's message for a resolved check: null = clean (the ladder
+ *  continues), else the caller's re-render text. The arm runs ONLY when the
+ *  knob is armed (`policy.checkPwned`) — the callers gate it there. */
+export function pwnedArmMessage(result: PwnedResult): string | null {
+  if (result.kind === "clean") return null;
+  return result.kind === "pwned" ? PASSWORD_PWNED_MESSAGE : PASSWORD_PWNED_REQUEST_FAILED_MESSAGE;
+}
+
+/** The shared options the async password arms take — the policy (resolved
+ *  from env by callers that have it; omitted = upstream's default config)
+ *  and the pwned check's injectable fetch (tests; production rides the
+ *  runtime global fetch). */
+export interface PasswordArmOptions {
+  now?: Date;
+  policy?: PasswordPolicy;
+  fetchImpl?: typeof fetch;
 }
 
 export interface ChangePasswordForm {
@@ -384,7 +429,7 @@ export async function changeOwnPassword(
   d1: D1Database,
   userId: number,
   form: ChangePasswordForm,
-  _options?: { now?: Date },
+  options?: PasswordArmOptions,
 ): Promise<ChangePasswordOutcome> {
   const db = drizzle(d1);
   const user =
@@ -400,8 +445,15 @@ export async function changeOwnPassword(
   if (form.newPassword !== form.retype) {
     return { outcome: "invalid", message: "The passwords do not match." };
   }
-  const policy = validateNewPassword(form.newPassword);
+  const policy = validateNewPassword(form.newPassword, options?.policy);
   if (policy !== null) return { outcome: "invalid", message: policy };
+  // The pwned arm (update.go:263-265) — ONLY when the knob is armed
+  // (PASSWORD_CHECK_PWN, default off = upstream's default posture).
+  if (options?.policy?.checkPwned === true) {
+    const pwned = await isPwned(form.newPassword, { fetchImpl: options?.fetchImpl });
+    const message = pwnedArmMessage(pwned);
+    if (message !== null) return { outcome: "invalid", message };
+  }
 
   const record = await newPasswordRecord(form.newPassword);
   const updated = await db
@@ -730,13 +782,20 @@ export async function applyPasswordReset(
   userId: number,
   newPassword: string,
   retype: string,
-  _options?: { now?: Date },
+  options?: PasswordArmOptions,
 ): Promise<ChangePasswordOutcome> {
   if (newPassword !== retype) {
     return { outcome: "invalid", message: "The passwords do not match." };
   }
-  const policy = validateNewPassword(newPassword);
+  const policy = validateNewPassword(newPassword, options?.policy);
   if (policy !== null) return { outcome: "invalid", message: policy };
+  // The pwned arm (password.go:213-221's UpdateAuth error switch, the same
+  // ladder) — ONLY when the knob is armed (PASSWORD_CHECK_PWN).
+  if (options?.policy?.checkPwned === true) {
+    const pwned = await isPwned(newPassword, { fetchImpl: options?.fetchImpl });
+    const message = pwnedArmMessage(pwned);
+    if (message !== null) return { outcome: "invalid", message };
+  }
 
   const db = drizzle(d1);
   const record = await newPasswordRecord(newPassword);

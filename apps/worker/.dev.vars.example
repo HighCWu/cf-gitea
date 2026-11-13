@@ -54,3 +54,15 @@ OAUTH2_ENABLED=true
 OAUTH2_SIGNING_ALGORITHM=RS256
 OAUTH2_JWT_CLAIM_ISSUER=
 OAUTH2_INVALIDATE_REFRESH_TOKENS=false
+# Census B-87 (PW16, SPEC-0002 §6.5 Phase C) — the password system's six
+# config knobs (upstream defaults; semantics documented in
+# wrangler.jsonc.example's vars block). Local flips: set
+# PASSWORD_COMPLEXITY=lower,upper,digit,spec to re-arm the all-classes
+# ladder the pre-B-87 hardwire shipped, or ENABLE_BASIC_AUTHENTICATION /
+# ENABLE_PASSWORD_SIGNIN_FORM to "false" to exercise the refusal shapes.
+ENABLE_PASSWORD_SIGNIN_FORM=true
+ENABLE_BASIC_AUTHENTICATION=true
+PASSWORD_HASH_ALGO=
+MIN_PASSWORD_LENGTH=8
+PASSWORD_COMPLEXITY=
+PASSWORD_CHECK_PWN=false

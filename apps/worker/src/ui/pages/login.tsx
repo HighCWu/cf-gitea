@@ -320,53 +320,78 @@ export function LoginPage(props: {
   /** The external-auth buttons (§5.6): absent/empty = no block at all —
    *  the golden-stable default render. */
   oauth2Sources?: OAuth2LoginSourceButton[];
+  /**
+   * Census B-87 (PW16): `[service] ENABLE_PASSWORD_SIGNIN_FORM`
+   * (Service.EnablePasswordSignInForm, service.go:180 MustBool(true)) — the
+   * knob the router resolves (api/config.ts enablePasswordSignInForm).
+   * Absent = ON (the golden-stable default). `false` renders upstream's
+   * signin_inner.tmpl:13-49 shape: the WHOLE `<form>` disappears (user_name,
+   * password, remember, submit — and the forgot-password link, which sits
+   * inside the form's password-field block upstream), external-auth buttons
+   * keep rendering WITHOUT the "or" divider (:51's `and`), and the
+   * register/admin-init panels stay (upstream keeps them
+   * form-independent). The POST arm's 403 rides the session router
+   * (auth.go:293-295 — the B-84 handoff).
+   */
+  enablePasswordSignInForm?: boolean;
 }) {
   const { ctx } = props;
+  const passwordFormShown = props.enablePasswordSignInForm !== false;
   return (
     <BaseLayout ctx={ctx} title={locale.sign_in} pageClass="user signin">
       <div class="ui middle very relaxed page grid">
         <div class="column tw-flex tw-flex-col tw-gap-4 tw-max-w-2xl tw-m-auto">
           <h4 class="ui top attached header center">{locale.sign_in}</h4>
           <div class="ui attached segment">
-            <form class="ui form" action="/login" method="post">
-              {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
-              <div class="field">
-                <label for="user_name">{locale.uname_holder}</label>
-                <input id="user_name" name="user_name" type="text" autocomplete="username" autofocus />
-              </div>
-              <div class="field">
-                <label for="password">{locale.password}</label>
-                <input
-                  id="password"
-                  name="password"
-                  type="password"
-                  autocomplete="current-password"
-                  required
-                />
-              </div>
-              <div class="inline field">
-                <div class="ui checkbox">
-                  <label for="remember">{locale.remember_me}</label>
-                  <input id="remember" name="remember" type="checkbox" />
+            {passwordFormShown ? (
+              <form class="ui form" action="/login" method="post">
+                {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
+                <div class="field">
+                  <label for="user_name">{locale.uname_holder}</label>
+                  <input id="user_name" name="user_name" type="text" autocomplete="username" autofocus />
                 </div>
-              </div>
-              <input type="hidden" name="redirect_to" value={props.redirectTo ?? ""} />
-              <div class="field">
-                <button type="submit" class="ui primary button tw-w-full">
-                  {locale.sign_in}
-                </button>
-              </div>
-            </form>
+                <div class="field">
+                  <label for="password">{locale.password}</label>
+                  <input
+                    id="password"
+                    name="password"
+                    type="password"
+                    autocomplete="current-password"
+                    required
+                  />
+                </div>
+                <div class="inline field">
+                  <div class="ui checkbox">
+                    <label for="remember">{locale.remember_me}</label>
+                    <input id="remember" name="remember" type="checkbox" />
+                  </div>
+                </div>
+                <input type="hidden" name="redirect_to" value={props.redirectTo ?? ""} />
+                <div class="field">
+                  <button type="submit" class="ui primary button tw-w-full">
+                    {locale.sign_in}
+                  </button>
+                </div>
+              </form>
+            ) : null}
             {/* signin_inner.tmpl:50-56 — the divider + the external-login
                 navigator sit AFTER the form inside the same segment, only
-                when external methods exist (the non-empty list). */}
-            {props.oauth2Sources !== undefined ? <ExternalAuthMethods sources={props.oauth2Sources} /> : null}
+                when external methods exist (the non-empty list). The
+                divider shows only when the form AND the methods both exist
+                (:51's `and $showExternalAuthMethods
+                .EnablePasswordSignInForm`). */}
+            {props.oauth2Sources !== undefined ? (
+              <ExternalAuthMethods sources={props.oauth2Sources} withDivider={passwordFormShown} />
+            ) : null}
             {/* the "Forgot password?" link — signin_inner.tmpl's label-row
                 slot (SPEC-0002 §6.2; the target is the no-mailer-disabled
-                page, upstream-faithful). */}
-            <p class="tw-mt-4">
-              <a href="/user/forgot_password">{loginFirstRunLocale.forgot_password}</a>
-            </p>
+                page, upstream-faithful). Upstream renders it inside the
+                form's password-field block, so it hides with the form. */}
+            {passwordFormShown ? (
+              <p class="tw-mt-4">
+                <a href="/user/forgot_password">{loginFirstRunLocale.forgot_password}</a>
+              </p>
+            ) : null}
             {props.signUpLink === true ? (
               <p class="tw-mt-4">
                 <a href="/user/sign_up">{loginFirstRunLocale.sign_up_now}</a>
@@ -404,6 +429,11 @@ export function renderLoginPage(options: {
   adminInit?: AdminInitPanel;
   signUpLink?: boolean;
   oauth2Sources?: OAuth2LoginSourceButton[];
+  /** Census B-87: the router resolves ENABLE_PASSWORD_SIGNIN_FORM
+   *  (api/config.ts enablePasswordSignInForm) and passes it here; absent =
+   *  ON. The session-router call sites thread it in B-84's file — recorded
+   *  handoff (the GET arm; the POST /login 403 arm too, auth.go:293-295). */
+  enablePasswordSignInForm?: boolean;
 }): string {
   return renderPage(
     <LoginPage
@@ -413,6 +443,7 @@ export function renderLoginPage(options: {
       adminInit={options.adminInit}
       signUpLink={options.signUpLink}
       oauth2Sources={options.oauth2Sources}
+      enablePasswordSignInForm={options.enablePasswordSignInForm}
     />,
   );
 }

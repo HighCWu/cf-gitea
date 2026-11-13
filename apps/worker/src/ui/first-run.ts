@@ -61,6 +61,7 @@ import {
   signUpLocale,
 } from "./pages/first-run";
 import { loginFirstRunLocale, oauth2LoginSourceButtons } from "./pages/login";
+import { enablePasswordSignInForm } from "../api/config";
 import { listActiveOAuth2Sources } from "../services/auth-sources/store";
 import { demoModeEnabled } from "../services/demo-sweep";
 import {
@@ -182,7 +183,17 @@ async function renderInstall(
 ): Promise<Response> {
   const assembled = await pageContext(c);
   if ("response" in assembled) return assembled.response;
-  return c.html(renderInstallPage({ ctx: assembled.ctx, adminInit: panel }), 200);
+  // Census B-87: the ENABLE_PASSWORD_SIGNIN_FORM knob gates the sign-in
+  // form on the install render too (the same template upstream hides,
+  // signin_inner.tmpl:13-49).
+  return c.html(
+    renderInstallPage({
+      ctx: assembled.ctx,
+      adminInit: panel,
+      enablePasswordSignInForm: enablePasswordSignInForm(c.env),
+    }),
+    200,
+  );
 }
 
 // ---------------------------------------------------------------------------

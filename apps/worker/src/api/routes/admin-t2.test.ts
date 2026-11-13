@@ -18,7 +18,7 @@
  */
 
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -81,12 +81,13 @@ function resolver(): AuthResolver {
   };
 }
 
-function familyApp(register: (app: OpenAPIHono<ApiEnv>) => void) {
+function familyApp(register: (app: OpenAPIHono<ApiEnv>) => void, envPatch?: Record<string, string>) {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
   register(app);
+  const requestEnv = envPatch === undefined ? env : { ...env, ...envPatch };
   return async (path: string, init?: RequestInit): Promise<Response> =>
-    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), requestEnv));
 }
 
 const authed = (init?: RequestInit, token = TOKEN_ADMIN): RequestInit => {
@@ -101,6 +102,12 @@ const jsonAdmin = (body: unknown, method = "POST", token = TOKEN_ADMIN): Request
 const jsonPatch = (body: unknown, token = TOKEN_ADMIN): RequestInit => jsonAdmin(body, "PATCH", token);
 
 const adminSend = familyApp((app) => registerAdminT2Routes(app, createTokenAuthMiddleware(resolver())));
+
+/** Census B-87: a sender whose request env carries knob overrides — the
+ *  password config rides the structural PasswordConfigEnv slice, so the
+ *  armed shapes pin without touching the shared rig env. */
+const adminSendKnobs = (knobs: Record<string, string>): ReturnType<typeof familyApp> =>
+  familyApp((app) => registerAdminT2Routes(app, createTokenAuthMiddleware(resolver())), knobs);
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -345,13 +352,40 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(((await short.json<Record<string, unknown>>())).message).toBe("PasswordIsRequired");
   });
 
-  it("400 PasswordComplexity on a long single-class password (admin/user.go:107-112)", async () => {
+  it("a long single-class password CREATES at the default config — upstream's unset PASSWORD_COMPLEXITY is checking OFF (security.go:209-218; census B-87's correction of the PW15 all-classes mis-derivation)", async () => {
     const res = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "weakpass", email: "weak@example.com", password: "alllowercase" }),
+    );
+    expect(res.status).toBe(201);
+    const row = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "weakpass")).limit(1);
+    expect(row[0]?.username).toBe("weakpass");
+  });
+
+  it("400 PasswordComplexity on a long single-class password when the knob is ARMED (admin/user.go:107-112 over PASSWORD_COMPLEXITY=lower,upper,digit,spec)", async () => {
+    const send = adminSendKnobs({ PASSWORD_COMPLEXITY: "lower,upper,digit,spec" });
+    const res = await send(
       "/admin/users",
       jsonAdmin({ username: "weakpass", email: "weak@example.com", password: "alllowercase" }),
     );
     expect(res.status).toBe(400);
     expect(((await res.json<Record<string, unknown>>())).message).toBe("PasswordComplexity");
+  });
+
+  it("the armed min-length floor rides MIN_PASSWORD_LENGTH (MustInt(8) default; admin/user.go:103)", async () => {
+    const send = adminSendKnobs({ MIN_PASSWORD_LENGTH: "16" });
+    const short = await send(
+      "/admin/users",
+      jsonAdmin({ username: "floortest", email: "floor@example.com", password: "Sup3r-Short!" }),
+    );
+    expect(short.status).toBe(400);
+    expect(((await short.json<Record<string, unknown>>())).message).toBe("PasswordIsRequired");
+    // The same password clears the raised floor.
+    const ok = await send(
+      "/admin/users",
+      jsonAdmin({ username: "floortest", email: "floor@example.com", password: "A-Longer-Password-Value!" }),
+    );
+    expect(ok.status).toBe(201);
   });
 
   it("persists must_change_password=false from the body; source_id/login_name/restricted stay accepted-and-ignored (deviation 1)", async () => {
@@ -892,10 +926,11 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(after.salt).not.toBe(before.salt);
     expect(after.passwdHashAlgo).toBe("pbkdf2$50000$50");
     expect(await verifyPassword("Br4vo-Fourte", after.passwd, after.salt, after.passwdHashAlgo)).toBe(true);
-    // The old record is REPLACED, not verified-against: a seeded row carries
-    // the dead "argon2" DDL default that Phase A refuses to parse (the
-    // controlled unsupported-hash arm), so the honest before/after assertion
-    // is the algorithm column itself — asserted above ("argon2" gone).
+    // The old record is REPLACED, not verified-against: the honest
+    // before/after assertion is the algorithm column itself (asserted above
+    // — SetPassword writes the CONFIGURED spec; B-86's landed argon2/bcrypt
+    // verify arms would verify a seeded old row, which is exactly why the
+    // replacement, not the verify, is the assertion).
 
     // update.go:278-284 — the token invalidation: the remember rows (our
     // auth_token twin) die, live non-remember sessions are untouched.
@@ -922,9 +957,25 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(short.status).toBe(400);
     expect(((await short.json<Record<string, unknown>>())).message).toBe("password must be at least 8 characters");
 
-    const complex = await adminSend("/admin/users/neighbor", jsonPatch({ password: "alllowercase-long" }));
+    // The complexity arm at the DEFAULT config does not fire (upstream's
+    // unset PASSWORD_COMPLEXITY is checking OFF — census B-87's correction):
+    // the weak long password EDITS cleanly.
+    const weakOk = await adminSend("/admin/users/neighbor", jsonPatch({ password: "alllowercase-long" }));
+    expect(weakOk.status).toBe(200);
+
+    // The ARMED knob gates the edit arm with the same UpdateAuth text.
+    const send = adminSendKnobs({ PASSWORD_COMPLEXITY: "lower,upper,digit,spec" });
+    const complex = await send("/admin/users/neighbor", jsonPatch({ password: "alllowercase-long" }));
     expect(complex.status).toBe(400);
     expect(((await complex.json<Record<string, unknown>>())).message).toBe("password not complex enough");
+
+    // MIN_PASSWORD_LENGTH moves the edit arm's fmt string too (admin/user.go:213).
+    const raised = adminSendKnobs({ MIN_PASSWORD_LENGTH: "16" });
+    const floorText = await raised("/admin/users/neighbor", jsonPatch({ password: "Aa1!Aa1" }));
+    expect(floorText.status).toBe(400);
+    expect(((await floorText.json<Record<string, unknown>>())).message).toBe(
+      "password must be at least 16 characters",
+    );
   });
 
   it("must_change_password: create defaults TRUE, the edit arm sets and clears it (update.go:265-267)", async () => {
@@ -1415,5 +1466,106 @@ describe("POST /admin/users/{username}/repos (adminCreateRepo)", () => {
   it("404s a missing target", async () => {
     const res = await adminSend("/admin/users/ghost/repos", jsonAdmin({ name: "proj" }));
     expect(res.status).toBe(404);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Census B-87 — the PASSWORD_CHECK_PWN arm (admin/user.go:113-119 create,
+// :220-221 edit; pwn.go:37-51 IsPwned over the HIBP range API). Default OFF
+// = no outbound call; armed = the real check with BOTH failure shapes
+// mapped (create: PasswordPwned with the request-error logged; edit: the
+// raw err.Error() texts).
+// -----------------------------------------------------------------------------
+
+describe("the PASSWORD_CHECK_PWN arm (admin/user.go:113-119 / :220-221)", () => {
+  /** The HIBP range body for a password whose suffix the stub serves. */
+  const pwnedRangeBody = async (password: string, count = 42): Promise<string> => {
+    const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(password));
+    const hex = [...new Uint8Array(digest)]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+      .toUpperCase();
+    return `${hex.slice(5)}:${count}`;
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("default OFF: no outbound call happens even when fetch would fail (pwn.go:37-39's nil short-circuit)", async () => {
+    vi.stubGlobal("fetch", () => {
+      throw new Error("network must not be touched with the knob off");
+    });
+    const res = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "pwnoff", email: "pwnoff@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(res.status).toBe(201);
+  });
+
+  it("armed + pwned password → 400 PasswordPwned on create (admin/user.go:118)", async () => {
+    const send = adminSendKnobs({ PASSWORD_CHECK_PWN: "true" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => pwnedRangeBody("Pwned-Secret-1").then((body) => new Response(body, { status: 200 }))),
+    );
+    const res = await send(
+      "/admin/users",
+      jsonAdmin({ username: "pwneduser", email: "pwned@example.com", password: "Pwned-Secret-1" }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json<Record<string, unknown>>())).message).toBe("PasswordPwned");
+  });
+
+  it("armed + clean password → 201 (the range miss passes)", async () => {
+    const send = adminSendKnobs({ PASSWORD_CHECK_PWN: "true" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("ABCDEF0123456789ABCDEF0123456789ABCDEF01:5\n", { status: 200 }))),
+    );
+    const res = await send(
+      "/admin/users",
+      jsonAdmin({ username: "cleanpwn", email: "cleanpwn@example.com", password: "Fresh-And-Clean-1" }),
+    );
+    expect(res.status).toBe(201);
+  });
+
+  it("armed + HIBP request failure → create still answers PasswordPwned with the failure logged (admin/user.go:115-117's log.Error + the same 400)", async () => {
+    const send = adminSendKnobs({ PASSWORD_CHECK_PWN: "true" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("upstream exploded", { status: 503 }))),
+    );
+    const res = await send(
+      "/admin/users",
+      jsonAdmin({ username: "pwnfail", email: "pwnfail@example.com", password: "Fresh-And-Clean-2" }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json<Record<string, unknown>>())).message).toBe("PasswordPwned");
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("using Have-I-Been-Pwned service failed"));
+    errSpy.mockRestore();
+  });
+
+  it("armed on the EDIT arm → the raw err.Error() texts at 400 (admin/user.go:220-221)", async () => {
+    const send = adminSendKnobs({ PASSWORD_CHECK_PWN: "true" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => pwnedRangeBody("Edited-Pwned-Pass").then((body) => new Response(body, { status: 200 }))),
+    );
+    const hit = await send("/admin/users/neighbor", jsonPatch({ password: "Edited-Pwned-Pass" }));
+    expect(hit.status).toBe(400);
+    expect(((await hit.json<Record<string, unknown>>())).message).toBe("password has been pwned");
+
+    const failing = adminSendKnobs({ PASSWORD_CHECK_PWN: "true" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new Error("dns timeout"))),
+    );
+    const miss = await failing("/admin/users/neighbor", jsonPatch({ password: "Edited-Clean-Pass-1" }));
+    expect(miss.status).toBe(400);
+    expect(((await miss.json<Record<string, unknown>>())).message).toBe(
+      "using Have-I-Been-Pwned service failed: dns timeout",
+    );
   });
 });

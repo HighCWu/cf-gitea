@@ -17,7 +17,8 @@ import {
   users,
 } from "../../db/schema";
 import { newSalt, newPasswordRecord } from "../../auth/password";
-import { isComplexEnough, MIN_PASSWORD_LENGTH } from "../../auth/password-policy";
+import { isComplexEnough, isPwned, PASSWORD_PWNED_ERROR_TEXT, type PwnedResult } from "../../auth/password-policy";
+import { resolvePasswordPolicy } from "../config";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
 import { AuditActions, auditEventInsert } from "../../services/audit";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
@@ -953,16 +954,27 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     // absent/empty password fails the min-length arm upstream too
     // (len("") < MinPasswordLength → `PasswordIsRequired`), so the field is
     // effectively REQUIRED on create. The complexity arm answers upstream's
-    // bare code `PasswordComplexity`. The pwned arm (`PasswordPwned`) is
-    // dormant: PASSWORD_CHECK_PWNED is default-OFF and Phase A ships no HIBP
-    // client (password-policy.ts header — IsPwned returns nil with the knob
-    // off, pwn.go:37-39).
+    // bare code `PasswordComplexity`. The pwned arm (`PasswordPwned`,
+    // admin/user.go:113-119) runs ONLY when the knob is armed (census
+    // B-87: PASSWORD_CHECK_PWN, default off = upstream's default posture);
+    // BOTH pwned failure shapes answer PasswordPwned, with the
+    // request-failure logged (admin/user.go:115-117's log.Error).
+    const policy = resolvePasswordPolicy(c.env);
     const password = form.password ?? "";
-    if (password.length < MIN_PASSWORD_LENGTH) {
+    if (password.length < policy.minLength) {
       throw new ApiError(400, "PasswordIsRequired");
     }
-    if (!isComplexEnough(password)) {
+    if (!isComplexEnough(password, policy.complexityClasses)) {
       throw new ApiError(400, "PasswordComplexity");
+    }
+    if (policy.checkPwned) {
+      const pwned = await isPwned(password);
+      if (pwned.kind !== "clean") {
+        if (pwned.kind === "request-failed") {
+          console.error(`pwned-check: ${pwned.message}`);
+        }
+        throw new ApiError(400, "PasswordPwned");
+      }
     }
 
     const nameError = usableUsernameError(form.username);
@@ -1065,13 +1077,25 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       // unchanged. The ladder texts DIFFER from create's bare codes — the
       // route maps ErrMinLength to its own fmt string (admin/user.go:212–214)
       // and ErrComplexity to err.Error() (admin/user.go:215–216, "password
-      // not complex enough"). The pwned arm is dormant (default-off config,
-      // pwn.go:37-39 — SPEC-0002 §6.2).
-      if (password.length < MIN_PASSWORD_LENGTH) {
-        throw new ApiError(400, `password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      // not complex enough"). The pwned arm (admin/user.go:220-221) maps
+      // BOTH failure shapes to the raw err.Error() text at 400 — and runs
+      // ONLY when the knob is armed (census B-87: PASSWORD_CHECK_PWN,
+      // default off = upstream's default posture).
+      const policy = resolvePasswordPolicy(c.env);
+      if (password.length < policy.minLength) {
+        throw new ApiError(400, `password must be at least ${policy.minLength} characters`);
       }
-      if (!isComplexEnough(password)) {
+      if (!isComplexEnough(password, policy.complexityClasses)) {
         throw new ApiError(400, "password not complex enough");
+      }
+      if (policy.checkPwned) {
+        const pwned: PwnedResult = await isPwned(password);
+        if (pwned.kind === "pwned") {
+          throw new ApiError(400, PASSWORD_PWNED_ERROR_TEXT);
+        }
+        if (pwned.kind === "request-failed") {
+          throw new ApiError(400, pwned.message);
+        }
       }
       // SetPassword (user.go:407–414): new salt + the CONFIGURED algorithm.
       const record = await newPasswordRecord(password);

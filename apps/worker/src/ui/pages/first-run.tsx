@@ -156,7 +156,19 @@ export function renderSignUpPage(options: {
  * Settings" under the sign-in form; an initialized instance never renders
  * it (the router 303s to `/` before any render). signUpLink stays off
  * here: while the init window is open there is nothing to register into.
+ * Census B-87: the ENABLE_PASSWORD_SIGNIN_FORM knob rides through to the
+ * sign-in form (the router resolves it; absent = ON).
  */
-export function renderInstallPage(options: { ctx: UiContext; adminInit: AdminInitPanel }): string {
-  return renderLoginPage({ ctx: options.ctx, redirectTo: null, error: null, adminInit: options.adminInit });
+export function renderInstallPage(options: {
+  ctx: UiContext;
+  adminInit: AdminInitPanel;
+  enablePasswordSignInForm?: boolean;
+}): string {
+  return renderLoginPage({
+    ctx: options.ctx,
+    redirectTo: null,
+    error: null,
+    adminInit: options.adminInit,
+    enablePasswordSignInForm: options.enablePasswordSignInForm,
+  });
 }
