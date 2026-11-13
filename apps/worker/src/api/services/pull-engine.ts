@@ -35,7 +35,8 @@ import { ApiError } from "../errors";
 import { notifyAutoMergePullRequest, notifyMergePullRequest } from "../../services/mail/notify";
 import { setIssueReadBy } from "../../services/mentions/carrier";
 import { carryLooseRefs, type CarrySource, type CarryTarget } from "../../repos/carry";
-import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
+import { canUserDelete, findRule, parseRuleConfig, principalAccessOf, type PullBranchProtectionGit } from "../../services/branch-protection";
+import { discoverCodeOwnerRules, type CodeOwnerRule } from "../../services/codeowners";
 import {
   branchRef,
   engineCell,
@@ -231,6 +232,63 @@ export async function pullRequestDiff(
   truncated: boolean;
 }> {
   return pullRequestDiffForEnv(c.env, pair, pr);
+}
+
+// ---------------------------------------------------------------------------
+// The B-53 merge-gate git collection (census B-53 — the codeowner +
+// protected-file arms' merge-time view). checkPullBranchProtections
+// (services/branch-protection.ts) consumes this through its input.
+// ---------------------------------------------------------------------------
+
+/**
+ * The merge-time git view the branch-protection gate's B-53 arms read —
+ * `pullGateGitInputs` threads into `PullBranchProtectionInput.git`. Both
+ * pieces come from ONE base repo (the PR's base; upstream's gate reads
+ * `pr.BaseRepo` throughout, services/issue/pull.go:148-251):
+ *
+ * - `changedFiles` — `GetFilesChangedBetween(mergeBase, headRef)`
+ *   (modules/git/repo_compare.go:84: `diff-tree --name-only --root -r`,
+ *   a two-commit walk) over `pr.GetGitHeadRefName()` (refs/pull/N/head,
+ *   services/issue/pull.go:148). Ours is the PR diff range's path list
+ *   (pullRequestDiffForEnv — the same mergeBase..head walk); `complete` is
+ *   false on the engine's file budget (`truncated`) AND on a null merge
+ *   base (the unrelated-histories Empty state, where upstream's
+ *   git.MergeBase errors and the codeowner gate fails closed, :161-165).
+ *   A failed walk answers null — the gate's fail-closed carrier.
+ * - `codeownerRules` — the CODEOWNERS parse (services/issue/pull.go:53-110,
+ *   ported in services/codeowners.ts): a FORK base repo short-circuits to
+ *   no rules BEFORE any read (:62-64); otherwise the candidate paths are
+ *   probed at the LIVE base-branch tip (GetBranchCommit, :69-70 — not the
+ *   stored merge base) with the first found file winning; a missing tip or
+ *   an over-size file answers null (fail closed, :70-79).
+ *
+ * Callers thread this lazily — only when a rule arms one of the arms
+ * (upstream returns before any walk when the arms are disarmed), so a
+ * plain-protected merge pays nothing.
+ */
+export async function pullGateGitInputs(env: ApiEnv["Bindings"], pair: RepositoryWithOwner, pr: PullRequestRow, d1: D1Database): Promise<PullBranchProtectionGit> {
+  const isFork = pair.repo.forkParent !== null;
+  const changedFiles = await pullRequestDiffForEnv(env, pair, pr)
+    .then((range): PullBranchProtectionGit["changedFiles"] => ({
+      paths: range.files.map((file) => file.path),
+      // A null merge base (unrelated histories → the Empty state) leaves the
+      // walk incomplete: upstream's git.MergeBase errors there and the
+      // codeowner gate fails closed (services/issue/pull.go:161-165 →
+      // :171-175).
+      complete: range.mergeBase !== null && !range.truncated,
+    }))
+    .catch((): null => null);
+
+  const codeownerRules = isFork
+    ? [] // :62-64 — a fork base repo has no codeowner rules, before any read
+    : await (async (): Promise<CodeOwnerRule[] | null> => {
+        const reads = engineReads(env, pair.repo);
+        const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
+        if (baseTip === null) return null; // GetBranchCommit error — fail closed
+        return discoverCodeOwnerRules(d1, (path) => reads.readBlob(baseTip.oid, path));
+      })();
+
+  return { changedFiles, codeownerRules };
 }
 
 /**

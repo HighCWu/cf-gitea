@@ -46,8 +46,17 @@
  * status-check arm IS ENFORCED (SPEC-0013 §6 retired: the status consumer
  * landed with SPEC-0012 — commit_statuses has a producer, so the
  * IsPullCommitStatusPass arm merge.go:707–713 reads the head sha the callers
- * thread in); codeowner and protected-file arms stay stored-but-unenforced
- * (§6 — no CODEOWNERS, no file walking).
+ * thread in). The CODEOWNER arm (merge.go:729–731 → HasAllRequiredCodeowner
+ * Reviews, services/issue/pull.go:148–251) and the PROTECTED-FILES arm
+ * (merge.go:737–739 → MergeBlockedByProtectedFiles, protected_branch.go:
+ * 316–324) ENFORCE since census B-53 (the §6 deferrals retired): both read
+ * the merge-time git view (`PullBranchProtectionGit` — the mergeBase..head
+ * changed-file walk and the base-branch CODEOWNERS parse) that the callers
+ * thread via api/services/pull-engine.ts `pullGateGitInputs`; absent inputs
+ * fail the armed arm closed, matching upstream's own error arms (a repo-open
+ * or CODEOWNERS-read error blocks the merge, :152-175). The parser and
+ * matcher live in services/codeowners.ts; the push-side file-pattern family
+ * (hook_pre_receive.go:210–260) is the receive-pack gate's separate surface.
  *
  * SANITIZATION (SPEC-0013 M4) — the save-side whitelist normalization port of
  * UpdateProtectBranch (protected_branch.go:418–527): every user allowlist runs
@@ -100,6 +109,7 @@ import { combineCommitStatusStates, latestCommitStatuses } from "../api/services
 import { repositoryPermissions, type RepositoryRow, type Viewer } from "../api/services/repository";
 import { collaboratorModeOf } from "../api/services/repo-collaborators";
 import { issues, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, type CommitStatusRow } from "../db/schema";
+import { matchCodeOwnerRules, type CodeOwnerRule } from "./codeowners";
 
 // ---------------------------------------------------------------------------
 // The system pseudo-principals (user_system.go:51) — resolvable by name at the
@@ -789,6 +799,156 @@ export function mergeBlockedByOutdatedBranch(config: ProtectedBranchConfig, comm
 }
 
 // ---------------------------------------------------------------------------
+// The B-53 arms (census B-53 — SPEC-0013 §6's deferrals retired): the
+// codeowner gate (HasAllRequiredCodeownerReviews, services/issue/pull.go:
+// 148–251) and the protected-files gate (MergeBlockedByProtectedFiles,
+// protected_branch.go:316–324), wired into checkPullBranchProtections at
+// upstream's gate positions (merge.go:729–731 / :737–739).
+// ---------------------------------------------------------------------------
+
+/**
+ * `FindLatestReviews` (models/issues/review_list.go:132–151) — the latest
+ * review per reviewer id under the condition: types approve/reject/request,
+ * NOT dismissed, OfficialOnly FALSE (the codeowner gate counts a code
+ * owner's approval even when it is not "official" toward RequiredApprovals
+ * — services/issue/pull.go:174-185's explicit comment). The two-step is the
+ * max(id) GROUP BY reviewer_id subquery upstream builds.
+ */
+async function latestReviewsOf(
+  d1: D1Database,
+  issueId: number,
+): Promise<{ reviewerId: number; type: number; stale: boolean }[]> {
+  const cond = and(
+    eq(pullReviews.issueId, issueId),
+    inArray(pullReviews.type, [ReviewType.Approve, ReviewType.Reject, ReviewType.Request]),
+    eq(pullReviews.dismissed, false),
+  );
+  const latest = await drizzle(d1)
+    .select({ maxId: sql<number>`max(${pullReviews.id})` })
+    .from(pullReviews)
+    .where(cond)
+    .groupBy(pullReviews.reviewerId)
+    .all();
+  const ids = latest.map((row) => Number(row.maxId)).filter((id) => Number.isFinite(id));
+  if (ids.length === 0) return [];
+  const rows = await drizzle(d1)
+    .select({ reviewerId: pullReviews.reviewerId, type: pullReviews.type, stale: pullReviews.stale })
+    .from(pullReviews)
+    .where(and(cond, inArray(pullReviews.id, ids)))
+    .all();
+  return rows;
+}
+
+/**
+ * HasAllRequiredCodeownerReviews (services/issue/pull.go:148–251) over the
+ * threaded git view. Disarmed → true (:149-151). The error arms — a missing
+ * walk, a failed/over-size CODEOWNERS read (`null` rules) — FAIL CLOSED
+ * (:152-175: every upstream error in this function logs and returns false;
+ * a budget-truncated match likewise, :171-175). No rules → true (:176-178 —
+ * a fork base, a missing/empty/all-invalid CODEOWNERS). Matching rules with
+ * no reviewer beyond the poster are WAIVED (:213-219 — an author-only rule
+ * can never be satisfied); every surviving rule needs ONE of its owners
+ * (users + team members, poster excluded) whose LATEST review is an
+ * approval; `ignore_stale_approvals` filters stale reviews first
+ * (:187-197). The official-only flag is intentionally FALSE (see
+ * latestReviewsOf).
+ */
+export async function hasAllRequiredCodeownerReviews(d1: D1Database, config: ProtectedBranchConfig, input: PullBranchProtectionInput): Promise<boolean> {
+  if (!config.blockOnCodeownerReviews) return true;
+  const git = input.git;
+  if (git === undefined || git === null) return false;
+  if (git.codeownerRules === null) return false;
+  if (git.codeownerRules.length === 0) return true;
+  if (git.changedFiles === null || !git.changedFiles.complete) return false;
+  const { matching, complete } = matchCodeOwnerRules(git.codeownerRules, git.changedFiles.paths);
+  if (!complete) return false;
+  if (matching.length === 0) return true;
+
+  let approving = await latestReviewsOf(d1, input.issueId);
+  if (config.ignoreStaleApprovals) {
+    approving = approving.filter((review) => !review.stale);
+  }
+
+  // The per-team member cache (:201-209 — teamMembersByID).
+  const teamMembersById = new Map<number, number[]>();
+  const posterId = input.posterId ?? 0;
+
+  for (const rule of matching) {
+    const reviewerIds = new Set<number>();
+    for (const user of rule.users) {
+      if (user.id !== posterId) reviewerIds.add(user.id);
+    }
+    for (const team of rule.teams) {
+      let members = teamMembersById.get(team.id);
+      if (members === undefined) {
+        const rows = await drizzle(d1)
+          .select({ userId: teamMembers.userId })
+          .from(teamMembers)
+          .where(eq(teamMembers.teamId, team.id))
+          .all();
+        members = rows.map((row) => row.userId);
+        teamMembersById.set(team.id, members);
+      }
+      for (const member of members) {
+        if (member !== posterId) reviewerIds.add(member);
+      }
+    }
+    // The author-only rule waiver (:213-219).
+    if (reviewerIds.size === 0) continue;
+    // "and at least 1 approving review from one of them" (:222-228).
+    const satisfied = [...reviewerIds].some((id) => approving.some((review) => review.reviewerId === id && review.type === ReviewType.Approve));
+    if (!satisfied) return false;
+  }
+  return true;
+}
+
+/**
+ * `getFilePatterns` (protected_branch.go:300–314) — the semicolon-separated
+ * column LOWERCASED first, entries trimmed, empties skipped, each compiled
+ * with `.` AND `/` as separators (a `*` crosses neither). An INVALID
+ * expression is logged and EXCLUDED — never a broad match, never the
+ * quoted-literal fallback (that polarity is the rule-name compiler's alone,
+ * :108–111); the exclusion makes the arm inert for that entry.
+ */
+export function protectedFilePatterns(patterns: string): RegExp[] {
+  const out: RegExp[] = [];
+  for (const expr of patterns.toLowerCase().split(";")) {
+    const trimmed = expr.trim();
+    if (trimmed === "") continue;
+    try {
+      out.push(new RegExp(`^${compileGlobPattern([...trimmed], [".", "/"])}$`));
+    } catch (error) {
+      console.error(
+        `[branch-protection] glob.Compile '${trimmed}' (skipped): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return out;
+}
+
+/**
+ * MergeBlockedByProtectedFiles (protected_branch.go:316–324) over the
+ * threaded walk. Zero compiled patterns → not blocked (:318–320). Else the
+ * upstream answer is `len(changedProtectedFiles) > 0` (:323) — upstream's
+ * list is the pipeline's CheckFileProtection output (services/pull/patch.go:
+ * 370–402: lowercase paths, first-match wins, the 10-entry bound is only a
+ * store bound); our walk serves the same predicate with `some`. Missing or
+ * budget-truncated walk data fails CLOSED — upstream's precondition is a
+ * pipeline-computed stored list (the mergeable state implies the pipeline
+ * succeeded), so a missing walk here is the refuse-the-merge posture, never
+ * a silent pass.
+ */
+export function mergeBlockedByProtectedFiles(config: ProtectedBranchConfig, git: PullBranchProtectionGit | null | undefined): boolean {
+  const patterns = protectedFilePatterns(config.protectedFilePatterns);
+  if (patterns.length === 0) return false;
+  if (git === undefined || git === null || git.changedFiles === null || !git.changedFiles.complete) return true;
+  return git.changedFiles.paths.some((path) => {
+    const lpath = path.toLowerCase();
+    return patterns.some((pattern) => pattern.test(lpath));
+  });
+}
+
+// ---------------------------------------------------------------------------
 // The merge gate core (services/pull/merge.go:694–742).
 // ---------------------------------------------------------------------------
 
@@ -811,6 +971,44 @@ export interface PullBranchProtectionInput {
    * a rule that arms status checks answers the 405 (pending), never merges.
    */
   headSha?: string | null;
+  /**
+   * The merge-time git view the B-53 arms read (census B-53 — SPEC-0013 §6's
+   * deferrals retired): the mergeBase..head changed-file walk (upstream's
+   * GetFilesChangedBetween for the codeowner arm, the STORED
+   * `pr.ChangedProtectedFiles` for the protected-files arm — our one walk
+   * serves both, computed at gate time where upstream's pipeline stored it
+   * before the gate; the mergeable-state precondition means the stored value
+   * was always computed by a successful pipeline there, so a failed walk
+   * here maps to that same refuse-the-merge posture) and the base-branch
+   * CODEOWNERS parse. Callers thread it from api/services/pull-engine.ts
+   * `pullGateGitInputs`, lazily — only when an arm is armed (upstream's own
+   * arms return before any walk when not armed). ABSENT/null data fails the
+   * armed arm CLOSED, the same direction upstream's own error arms take
+   * (HasAllRequiredCodeownerReviews blocks on repo-open/read errors,
+   * services/issue/pull.go:152-175; a failed pipeline is never mergeable).
+   */
+  git?: PullBranchProtectionGit | null;
+  /**
+   * The issue poster id — the codeowner arm EXCLUDES the author from every
+   * reviewer set (an author cannot approve their own PR; the author-only
+   * rule is waived outright, services/issue/pull.go:199-219). 0/absent
+   * excludes nobody.
+   */
+  posterId?: number;
+}
+
+/**
+ * The git-derived inputs of the B-53 arms — what `pullGateGitInputs`
+ * (api/services/pull-engine.ts) collects at merge time. `changedFiles`
+ * null/`complete: false` and `codeownerRules` null are the FAIL-CLOSED
+ * carriers (the walk failed / the CODEOWNERS read failed or the file
+ * exceeds MaxDisplayFileSize); `codeownerRules: []` is the pass arm (no
+ * file, empty file, all-invalid lines, or a fork base repo — upstream's
+ * discovery answers no rules in each).
+ */
+export interface PullBranchProtectionGit {
+  changedFiles: { paths: string[]; complete: boolean } | null;
+  codeownerRules: CodeOwnerRule[] | null;
 }
 
 /**
@@ -892,7 +1090,11 @@ export async function mergeRequiredContextsCommitStatus(
  * (:707–713 — IsPullCommitStatusPass, commit_status.go:73–101: the rule's
  * stored statusCheckContexts arm the check; the EffectiveRequiredContexts
  * scoped-workflow half stages with that feature's merge-gate wiring), then
- * approvals, rejected reviews, official review requests, outdated branch.
+ * approvals, rejected reviews, official review requests, outdated branch,
+ * the codeowner reviews arm (:729–731) and the protected-files arm
+ * (:737–739 — upstream's `skipProtectedFilesCheck` bypass is the pre-receive
+ * push arm's alone, hook_pre_receive.go:304; both our callers pass the
+ * merge-side posture, check.go:179 / automerge.go:221).
  */
 export async function checkPullBranchProtections(d1: D1Database, rule: ProtectedBranchRow, input: PullBranchProtectionInput): Promise<string | null> {
   const config = parseRuleConfig(rule.rules);
@@ -920,8 +1122,18 @@ export async function checkPullBranchProtections(d1: D1Database, rule: Protected
   if (mergeBlockedByOutdatedBranch(config, input.commitsBehind)) {
     return "The head branch is behind the base branch";
   }
-  // block_on_codeowner_reviews (:729–731) and MergeBlockedByProtectedFiles
-  // (:737–739) — §6 omissions.
+  // HasAllRequiredCodeownerReviews (:729–731) — B-53. Armed with no threaded
+  // git view it fails closed (the upstream error arms), so a caller that
+  // only threads inputs when an arm is armed can never under-enforce.
+  if (!(await hasAllRequiredCodeownerReviews(d1, config, input))) {
+    return "There are missing code owner reviews";
+  }
+  // MergeBlockedByProtectedFiles (:737–739) — B-53 (upstream's
+  // skipProtectedFilesCheck early-return sits between the two arms; the
+  // merge-side posture never skips).
+  if (mergeBlockedByProtectedFiles(config, input.git)) {
+    return "Changed protected files";
+  }
   return null;
 }
 

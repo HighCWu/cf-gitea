@@ -49,7 +49,9 @@ import {
   serializeRuleConfig,
   type ProtectedBranchConfig,
   type PrincipalAccess,
+  type PullBranchProtectionGit,
 } from "./branch-protection";
+import type { CodeOwnerRule } from "./codeowners";
 import { commitStatuses, protectedBranches, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teamRepoAccess, teams } from "../db/schema";
 import { IssuesService } from "../issues/service";
 
@@ -454,6 +456,248 @@ describe("checkPullBranchProtections (merge.go:694–742) over pull_reviews", ()
     expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0 })).toBeNull();
     expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 3 })).toBe("The head branch is behind the base branch");
   });
+});
+
+// ---------------------------------------------------------------------------
+// The B-53 arms (census B-53 — SPEC-0013 §6's deferrals retired): the
+// codeowner gate (HasAllRequiredCodeownerReviews, services/issue/pull.go:
+// 148-251) and the protected-files gate (MergeBlockedByProtectedFiles,
+// protected_branch.go:316-324) at their gate positions (merge.go:729-731 /
+// :737-739). The git view threads as plain data (pullGateGitInputs' shape,
+// engine-covered in api/pull-engine.test.ts); these pins carry the gate's
+// allow/deny matrix, the official-review interplay and the fail-closed
+// polarities.
+// ---------------------------------------------------------------------------
+
+/** A hand-built rule shaped like parseCodeOwnersLine's output. */
+const coRule = (pattern: string, userIds: number[] = [], teamIds: number[] = []): CodeOwnerRule => ({
+  regexp: new RegExp(`^${pattern}$`),
+  negative: false,
+  pattern,
+  users: userIds.map((id) => ({ id, login: `user-${id}` })),
+  teams: teamIds.map((id) => ({ id, name: `team-${id}` })),
+});
+
+const OK_WALK: PullBranchProtectionGit["changedFiles"] = { paths: ["docs/a.md"], complete: true };
+
+const coGit = (codeownerRules: CodeOwnerRule[] | null, changedFiles: PullBranchProtectionGit["changedFiles"] = OK_WALK): PullBranchProtectionGit => ({
+  codeownerRules,
+  changedFiles,
+});
+
+describe("checkPullBranchProtections codeowner arm (services/issue/pull.go:148-251)", () => {
+  let repoId: string;
+  let pull: { issueId: number; index: number };
+  beforeEach(async () => {
+    repoId = await seedRepo();
+    pull = await seedPull(repoId); // the poster is user 2 (bob)
+  });
+
+  const armedRule = async (config: Partial<ProtectedBranchConfig> = { blockOnCodeownerReviews: true }) => ruleOf(repoId, await seedRule(repoId, "main", config));
+
+  it("disarmed → pass even with blocking-shaped git data (the :149-151 early return)", async () => {
+    const rule = await armedRule({ blockOnCodeownerReviews: false });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])], { paths: ["docs/a.md"], complete: true }) })).toBeNull();
+  });
+
+  it("armed with NO threaded git view fails CLOSED (:152-175's error arms)", async () => {
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0 })).toBe("There are missing code owner reviews");
+  });
+
+  it("armed with a failed/over-size CODEOWNERS read (null rules) fails CLOSED", async () => {
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit(null) })).toBe("There are missing code owner reviews");
+  });
+
+  it("armed with NO rules — a fork base, a missing/empty/all-invalid file → pass (:176-178)", async () => {
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([]) })).toBeNull();
+  });
+
+  it("armed with a missing or budget-truncated walk fails CLOSED (:171-175)", async () => {
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])], null) })).toBe("There are missing code owner reviews");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])], { paths: [], complete: false }) })).toBe(
+      "There are missing code owner reviews",
+    );
+  });
+
+  it("no matching rule (the changed files miss every pattern) → pass", async () => {
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("src/.*", [1])]) })).toBeNull();
+  });
+
+  it("a matching rule with no reviews blocks with the upstream text verbatim (:729-731)", async () => {
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+  });
+
+  it("an UNOFFICIAL codeowner approval satisfies the gate (OfficialOnly intentionally false, :174-185)", async () => {
+    const rule = await armedRule();
+    await seedReview(pull.issueId, ReviewType.Approve, { official: false, reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBeNull();
+  });
+
+  it("a DISMISSED approval never counts; a reject as the LATEST review blocks", async () => {
+    const rule = await armedRule();
+    await seedReview(pull.issueId, ReviewType.Approve, { dismissed: true, reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+    // latest-per-reviewer: an approve then a reject leaves the reject live
+    await seedReview(pull.issueId, ReviewType.Reject, { reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+    // a NEWER approve re-satisfies the rule
+    await seedReview(pull.issueId, ReviewType.Approve, { reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBeNull();
+  });
+
+  it("stale approvals filter only under ignore_stale_approvals (:187-197)", async () => {
+    const rule = await armedRule({ blockOnCodeownerReviews: true, ignoreStaleApprovals: true });
+    await seedReview(pull.issueId, ReviewType.Approve, { stale: true, reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+    // a sibling rule WITHOUT the flag (the UNIQUE repo+name pair forces a
+    // distinct rule name; the gate takes the rule directly) counts the stale
+    // approval
+    const freshRule = await ruleOf(repoId, await seedRule(repoId, "*", { blockOnCodeownerReviews: true }, { priority: 9 }));
+    expect(await checkPullBranchProtections(env.DB, freshRule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [1])]) })).toBeNull();
+  });
+
+  it("the poster is excluded from every reviewer set; an author-only rule is WAIVED (:199-219)", async () => {
+    const rule = await armedRule();
+    // bob (2) is the poster and the sole code owner → the rule can never be
+    // satisfied → waived → merge passes.
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, posterId: 2, git: coGit([coRule("docs/.*", [2])]) })).toBeNull();
+    // a second, non-poster owner re-arms the rule
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, posterId: 2, git: coGit([coRule("docs/.*", [2, 1])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+    await seedReview(pull.issueId, ReviewType.Approve, { reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, posterId: 2, git: coGit([coRule("docs/.*", [2, 1])]) })).toBeNull();
+  });
+
+  it("team arms resolve through team_members (LoadMembers, :201-211); non-members never satisfy", async () => {
+    const teamId = await seedTeam(5, "Backend");
+    await seedTeamMember(5, teamId, 1); // user 1 (doer) is the team member
+    const rule = await armedRule();
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [], [teamId])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+    await seedReview(pull.issueId, ReviewType.Approve, { reviewerId: 1 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [], [teamId])]) })).toBeNull();
+    // a review by a NON-member (user 3, no team row) does not satisfy
+    const freshPull = await seedPull(repoId, "feature2");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: freshPull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [], [teamId])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+    await seedReview(freshPull.issueId, ReviewType.Approve, { reviewerId: 3 });
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: freshPull.issueId, commitsBehind: 0, git: coGit([coRule("docs/.*", [], [teamId])]) })).toBe(
+      "There are missing code owner reviews",
+    );
+  });
+});
+
+describe("checkPullBranchProtections protected-files arm (protected_branch.go:316-324)", () => {
+  let repoId: string;
+  let pull: { issueId: number; index: number };
+  beforeEach(async () => {
+    repoId = await seedRepo();
+    pull = await seedPull(repoId);
+  });
+
+  let patternsSeq = 0;
+  // The UNIQUE (repo_id, branch_name) pair forces distinct rule names — the
+  // gate takes the rule directly, so the name is arbitrary.
+  const patternsRule = async (patterns: string) => ruleOf(repoId, await seedRule(repoId, `main${++patternsSeq}`, { protectedFilePatterns: patterns }));
+
+  it("zero compiled patterns → not blocked even with a matching file (:318-320)", async () => {
+    const rule = await patternsRule("");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/a.md"], complete: true }) })).toBeNull();
+  });
+
+  it("a changed file inside the patterns blocks with the upstream text verbatim (:737-739)", async () => {
+    const rule = await patternsRule("docs/**");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/config.yml"], complete: true }) })).toBe(
+      "Changed protected files",
+    );
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["src/a.go", "readme.md"], complete: true }) })).toBeNull();
+  });
+
+  it("matches are case-insensitive on BOTH sides (getFilePatterns lowercases, CheckFileProtection lowercases paths)", async () => {
+    const rule = await patternsRule("Docs/**.YML");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/Config.Yml"], complete: true }) })).toBe(
+      "Changed protected files",
+    );
+  });
+
+  it("an INVALID pattern is skipped, never a broad match (getFilePatterns :305-309)", async () => {
+    const rule = await patternsRule("(((;docs/**");
+    // `(((` is skipped (invalid glob), docs/** still compiles and gates —
+    // then a patterns value that compiles to NOTHING leaves the arm inert.
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/a.md"], complete: true }) })).toBe(
+      "Changed protected files",
+    );
+    const inert = await patternsRule("(((;)))");
+    expect(await checkPullBranchProtections(env.DB, inert, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/a.md"], complete: true }) })).toBeNull();
+  });
+
+  it("a missing or truncated walk fails CLOSED (the refuse posture, never a silent pass)", async () => {
+    const rule = await patternsRule("docs/**");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], null) })).toBe("Changed protected files");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/a.md"], complete: false }) })).toBe(
+      "Changed protected files",
+    );
+  });
+
+  it("the glob separators hold: `*` crosses neither `.` nor `/` (glob.Compile(expr, '.', '/'))", async () => {
+    // The separator grammar's little-known arm: `docs/*` blocks a DOTLESS
+    // file but NOT "docs/a.md" — the pattern language is the upstream GLOB
+    // (unlike the CODEOWNERS regex language), so recursive arms need `**`.
+    const single = await patternsRule("docs/*");
+    expect(await checkPullBranchProtections(env.DB, single, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/readme"], complete: true }) })).toBe(
+      "Changed protected files",
+    );
+    expect(await checkPullBranchProtections(env.DB, single, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/a.md"], complete: true }) })).toBeNull();
+    expect(await checkPullBranchProtections(env.DB, single, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["docs/sub/a"], complete: true }) })).toBeNull();
+    const dot = await patternsRule("config.*");
+    expect(await checkPullBranchProtections(env.DB, dot, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["config.yml"], complete: true }) })).toBe(
+      "Changed protected files",
+    );
+    expect(await checkPullBranchProtections(env.DB, dot, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["config/x.yml"], complete: true }) })).toBeNull();
+    expect(await checkPullBranchProtections(env.DB, dot, { issueId: pull.issueId, commitsBehind: 0, git: coGit([], { paths: ["config-yml"], complete: true }) })).toBeNull();
+  });
+
+  it("the codeowner arm precedes the protected-files arm (merge.go:729 < :737)", async () => {
+    const rule = await armedProtectedRule();
+    // both arms would block → the CODEOWNER text answers first
+    expect(
+      await checkPullBranchProtections(env.DB, rule, {
+        issueId: pull.issueId,
+        commitsBehind: 0,
+        git: coGit([coRule("docs/.*", [1])], { paths: ["docs/a.md"], complete: true }),
+      }),
+    ).toBe("There are missing code owner reviews");
+    // the codeowner arm satisfied → the protected-files text answers
+    await seedReview(pull.issueId, ReviewType.Approve, { reviewerId: 1 });
+    expect(
+      await checkPullBranchProtections(env.DB, rule, {
+        issueId: pull.issueId,
+        commitsBehind: 0,
+        git: coGit([coRule("docs/.*", [1])], { paths: ["docs/a.md"], complete: true }),
+      }),
+    ).toBe("Changed protected files");
+  });
+
+  async function armedProtectedRule() {
+    return ruleOf(repoId, await seedRule(repoId, "main", { blockOnCodeownerReviews: true, protectedFilePatterns: "docs/**" }));
+  }
 });
 
 // ---------------------------------------------------------------------------

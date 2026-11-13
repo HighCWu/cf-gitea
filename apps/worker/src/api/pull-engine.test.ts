@@ -31,18 +31,19 @@ import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedComm
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { users, protectedBranches, repositories, comments, issueDependencies, issueUsers, issues, notificationStates, PRStatus, pullAutoMerges, pullRequests, repoUnits } from "../db/schema";
+import { users, protectedBranches, repositories, comments, issueDependencies, issueUsers, issues, notificationStates, PRStatus, pullAutoMerges, pullRequests, pullReviews, repoUnits, ReviewType } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { DependenciesLeftError } from "../issues/service";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
+import { findRepositoryById } from "./services/repository";
 import { ApiError, giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerPullRoutes } from "./routes/pulls";
-import { mergePullRequest } from "./services/pull-engine";
+import { mergePullRequest, pullGateGitInputs } from "./services/pull-engine";
 import { engineReads, refTipMap, ZERO_OID } from "./services/engine";
 import { findPullRequestByIndex } from "./services/pulls";
 import type { Context } from "hono";
@@ -146,6 +147,21 @@ async function seedBranchWithCommit(branch: string, path: string, content: strin
   expect(written.status).toBe(201);
   const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
   return tips.get(`refs/heads/${branch}`)?.target ?? "";
+}
+
+/** The suite's base tree (SEED_COMMITS[1]'s full tree) plus variant files —
+ *  SeedCommits carry the COMPLETE tree per commit. */
+function variantCommit(variant: string, files: { path: string; content: string }[]): SeedCommit {
+  return {
+    message: `b53: ${variant}`,
+    time: T0 + 900,
+    files: [
+      { path: "README.md", content: "# pull engine suite\n" },
+      { path: "shared.txt", content: "shared base\n" },
+      { path: "docs/base.txt", content: "base doc\n" },
+      ...files,
+    ],
+  };
 }
 
 /** Worker-side object hash (workerd crypto.subtle; putApiObjects re-verifies). */
@@ -2395,5 +2411,178 @@ describe("POST /merge-upstream — the fork sync (merge_upstream.go:22-100)", ()
     expect(commit?.parents).toHaveLength(2);
     expect(commit?.parents).toContain(forkChildTip);
     expect(commit?.parents).toContain(baseChildTip);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The B-53 merge-gate arms (census B-53 — SPEC-0013 §6's deferrals retired):
+// pullGateGitInputs (the merge-time git view) over REAL engine content, and
+// the route-level allow/deny of the codeowner + protected-file gates through
+// POST …/merge. The armed rules ride DEDICATED base branches (never main) so
+// no sibling describe's merge inherits them.
+// ---------------------------------------------------------------------------
+
+describe("pullGateGitInputs — the merge-time git view (services/issue/pull.go:53-110 over real content)", () => {
+  /** Push a variant branch into the suite repo through the receive flow
+   *  (nested paths land here — the contents POST route is single-segment),
+   *  then open the PR head→base over the API. */
+  async function seedCoPair(
+    variant: string,
+    baseFiles: { path: string; content: string }[],
+  ): Promise<{ pr: NonNullable<Awaited<ReturnType<typeof findPullRequestByIndex>>>["pullRequest"]; pair: NonNullable<Awaited<ReturnType<typeof findRepositoryById>>> }> {
+    const token = await mintPushToken(OWNER_ID, `b53-${variant}`);
+    const { tips, pack } = await buildHistoryPack([...SEED_COMMITS, variantCommit(`${variant}-base`, baseFiles), variantCommit(`${variant}-head`, [{ path: `${variant}.txt`, content: `${variant} content\n` }])]);
+    await pushRefsIfAbsent(`${OWNER}/${SLUG}`, token, [
+      { ref: `refs/heads/${variant}-base`, oid: tips[tips.length - 2]! },
+      { ref: `refs/heads/${variant}-head`, oid: tips[tips.length - 1]! },
+    ], pack);
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: `${variant} PR`, head: `${variant}-head`, base: `${variant}-base` }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+    const repoId = (await repoRowId())!;
+    const found = await findPullRequestByIndex(env.DB, repoId, index);
+    expect(found).not.toBeNull();
+    const pair = await findRepositoryById(env.DB, repoId);
+    expect(pair).not.toBeNull();
+    return { pr: found!.pullRequest, pair: pair! };
+  }
+
+  async function repoRowId(): Promise<string | undefined> {
+    return (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG))).get())?.id;
+  }
+
+  it("walks the mergebase..head paths (complete) and parses NO rules without a CODEOWNERS file", async () => {
+    const { pr, pair } = await seedCoPair("conone", [{ path: "placeholder.txt", content: "no codeowners here\n" }]);
+    const inputs = await pullGateGitInputs(env, pair, pr, env.DB);
+    expect(inputs.changedFiles).not.toBeNull();
+    expect(inputs.changedFiles!.complete).toBe(true);
+    expect(inputs.changedFiles!.paths).toContain("conone.txt");
+    expect(inputs.codeownerRules).toEqual([]);
+  });
+
+  it("parses the base-tip CODEOWNERS with ROOT precedence over docs/ (codeOwnerFiles order)", async () => {
+    const { pr, pair } = await seedCoPair("coroot", [
+      { path: "CODEOWNERS", content: `${String.raw`.*\\.root`} @${OWNER}\n` },
+      { path: "docs/CODEOWNERS", content: `${String.raw`.*\\.docs`} @${OWNER}\n` },
+    ]);
+    const inputs = await pullGateGitInputs(env, pair, pr, env.DB);
+    expect(inputs.codeownerRules).toHaveLength(1);
+    expect(inputs.codeownerRules![0]!.pattern).toBe(String.raw`.*\.root`);
+    expect(inputs.codeownerRules![0]!.users).toEqual([{ id: OWNER_ID, login: OWNER }]);
+    expect(inputs.changedFiles!.paths).toContain("coroot.txt");
+  });
+
+  it("falls through a missing root to docs/CODEOWNERS", async () => {
+    const { pr, pair } = await seedCoPair("codocs", [{ path: "docs/CODEOWNERS", content: `${String.raw`.*\\.docs`} @${OWNER}\n` }]);
+    const inputs = await pullGateGitInputs(env, pair, pr, env.DB);
+    expect(inputs.codeownerRules).toHaveLength(1);
+    expect(inputs.codeownerRules![0]!.pattern).toBe(String.raw`.*\.docs`);
+  });
+
+  it("an EMPTY and an all-invalid CODEOWNERS both answer [] (the :97-106 arms)", async () => {
+    const empty = await seedCoPair("coempty", [{ path: "CODEOWNERS", content: "" }]);
+    expect((await pullGateGitInputs(env, empty.pair, empty.pr, env.DB)).codeownerRules).toEqual([]);
+    const bad = await seedCoPair("cobad", [{ path: "CODEOWNERS", content: "lonetoken\n" }]);
+    expect((await pullGateGitInputs(env, bad.pair, bad.pr, env.DB)).codeownerRules).toEqual([]);
+  });
+
+  it("invalid owner names drop their rules but valid lines survive (best-effort parse)", async () => {
+    const { pr, pair } = await seedCoPair("comixed", [{ path: "CODEOWNERS", content: `ghostonly.txt @ghost-who\n${String.raw`.*\\.txt`} @${OWNER}\n` }]);
+    const inputs = await pullGateGitInputs(env, pair, pr, env.DB);
+    expect(inputs.codeownerRules).toHaveLength(1);
+    expect(inputs.codeownerRules![0]!.pattern).toBe(String.raw`.*\.txt`);
+  });
+});
+
+describe("the B-53 route arms — POST merge under armed rules (merge.go:729-739)", () => {
+  /** A zero-armed rule row on a base branch (branch+commits land FIRST —
+   *  the write paths never see the armed rule, the delete_branch test's
+   *  posture). */
+  async function seedRuleOn(base: string, apply: (config: ReturnType<typeof emptyRuleConfig>) => void): Promise<void> {
+    const repoId = (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG))).get())!.id;
+    const config = emptyRuleConfig();
+    apply(config);
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId,
+      ruleName: base,
+      priority: 0,
+      rules: serializeRuleConfig(config),
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+  }
+
+  it("block_on_codeowner_reviews: a matching rule with no review answers the verbatim 405; an (unofficial) codeowner approval lets it merge", async () => {
+    // a code owner that is NOT the poster (the API token identity is the
+    // repo owner — an author-only rule would be WAIVED, :213-219)
+    await env.DB.prepare(
+      "INSERT INTO users (id, username, username_lower, is_admin, status, type, created_at) VALUES (?, ?, ?, 0, 'active', 'user', 0)",
+    )
+      .bind(9900, "b53owner", "b53owner")
+      .run();
+    // the CODEOWNERS file sits on the BASE branch tip — the discovery read
+    const made = await send(`${REPO}/branches`, jsonInit("POST", { new_branch_name: "cowbase" }));
+    expect(made.status).toBeLessThan(300);
+    const co = await send(`${REPO}/contents/CODEOWNERS`, jsonInit("POST", { content: btoa(`${String.raw`.*\\.txt`} @b53owner\n`), branch: "cowbase", message: "cowbase: CODEOWNERS" }));
+    expect(co.status).toBeLessThan(300);
+    await seedBranchWithCommit("cowhead", "gate.txt", "gated content\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "codeowner gated", head: "cowhead", base: "cowbase" }));
+    expect(created.status).toBe(201);
+    const index = ((await jsonBody(created)) as { number: number }).number;
+    await seedRuleOn("cowbase", (config) => {
+      config.blockOnCodeownerReviews = true;
+    });
+
+    const denied = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
+    expect(denied.status).toBe(405);
+    expect(await denied.json()).toEqual({ message: "There are missing code owner reviews", url: "https://apisuite.test/api/swagger" });
+
+    // an UNOFFICIAL approval from the code owner satisfies the gate
+    // (OfficialOnly intentionally false — services/issue/pull.go:174-185).
+    // The ISSUE id comes from the joined row — the create response's `id` is
+    // the PR row id and the two id spaces diverge once other issues exist.
+    const b53RepoId = (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG))).get())!.id;
+    const found = await findPullRequestByIndex(env.DB, b53RepoId, index);
+    expect(found).not.toBeNull();
+    await drizzle(env.DB).insert(pullReviews).values({
+      type: ReviewType.Approve,
+      reviewerId: 9900,
+      issueId: found!.issue.id,
+      content: "",
+      official: false,
+      dismissed: false,
+      stale: false,
+      commitId: found!.pullRequest.headSha ?? "c".repeat(40),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const merged = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
+    expect(merged.status).toBe(200);
+  });
+
+  it("protected_file_patterns: a change inside the patterns answers the verbatim 405; a change outside merges", async () => {
+    // branch+commits land BEFORE the rule (the write paths never see it).
+    // The nested secret lands through the receive flow (the contents POST
+    // route is single-segment).
+    await seedBranchWithCommit("pfbase", "keep.txt", "pf base\n");
+    const token = await mintPushToken(OWNER_ID, "b53-pfsecret");
+    const { tips, pack } = await buildHistoryPack([...SEED_COMMITS, variantCommit("pfsecret", [{ path: "secret/key.txt", content: "s3cr3t\n" }])]);
+    await pushRefsIfAbsent(`${OWNER}/${SLUG}`, token, [{ ref: "refs/heads/pfsecret", oid: tips[tips.length - 1]! }], pack);
+    const secretPr = await send(`${REPO}/pulls`, jsonInit("POST", { title: "secret change", head: "pfsecret", base: "pfbase" }));
+    expect(secretPr.status).toBe(201);
+    const secretIndex = ((await jsonBody(secretPr)) as { number: number }).number;
+    await seedRuleOn("pfbase", (config) => {
+      config.protectedFilePatterns = "secret/**";
+    });
+    const denied = await send(`${REPO}/pulls/${secretIndex}/merge`, jsonInit("POST", { do: "merge" }));
+    expect(denied.status).toBe(405);
+    expect(await denied.json()).toEqual({ message: "Changed protected files", url: "https://apisuite.test/api/swagger" });
+
+    // the control: the same rule, a change OUTSIDE the patterns → merges
+    await seedBranchWithCommit("pfok", "other.txt", "unprotected\n");
+    const okPr = await send(`${REPO}/pulls`, jsonInit("POST", { title: "unprotected change", head: "pfok", base: "pfbase" }));
+    expect(okPr.status).toBe(201);
+    const okIndex = ((await jsonBody(okPr)) as { number: number }).number;
+    expect((await send(`${REPO}/pulls/${okIndex}/merge`, jsonInit("POST", { do: "merge" }))).status).toBe(200);
   });
 });

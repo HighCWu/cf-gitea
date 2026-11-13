@@ -96,6 +96,7 @@ import {
   deleteBranchAfterMerge,
   ensurePullRequestChecked,
   mergePullRequest,
+  pullGateGitInputs,
   pullRequestDiffShortStat,
 } from "../api/services/pull-engine";
 import { findPullRequestByIndex, toApiPullRequest } from "../api/services/pulls";
@@ -622,9 +623,21 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
   // NOT skip them — approvals etc. must hold when green; the arm lives in
   // check.go:178-215, reached through the consumer's whole-ladder call,
   // automerge.go:221-223). The status-check arm inside now re-reads the SAME
-  // fresh sha the explicit isPullCommitStatusPass gate above used.
+  // fresh sha the explicit isPullCommitStatusPass gate above used. The B-53
+  // arms' git view threads only when an arm is armed (upstream returns
+  // before any walk when disarmed — services/issue/pull.go:149-151).
   if (rule !== null) {
-    const failure = await checkPullBranchProtections(d1, rule, { issueId, commitsBehind: checked.commitsBehind ?? 0, headSha: checked.headSha });
+    const git =
+      config !== null && (config.blockOnCodeownerReviews || config.protectedFilePatterns.trim() !== "")
+        ? await pullGateGitInputs(env, pair, pr, d1)
+        : undefined;
+    const failure = await checkPullBranchProtections(d1, rule, {
+      issueId,
+      commitsBehind: checked.commitsBehind ?? 0,
+      headSha: checked.headSha,
+      git,
+      posterId: issue.posterId ?? 0,
+    });
     if (failure !== null) return "skipped-protections";
   }
 

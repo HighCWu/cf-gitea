@@ -490,9 +490,20 @@ commit (`pull-reviews.ts`, migration 0018).
   merge-gate enforcement side stays with the M3 trigger chain.)
 - **Protected/unprotected file patterns** — pre-receive diff walking
   (`hook_pre_receive.go:210-226`) is real CPU per push for the least-demanded arm;
-  the `unprotected_files_only` allowance (`:248-260`) compounds it.
+  the `unprotected_files_only` allowance (`:248-260`) compounds it. (As-built,
+  census B-53 2026-11-13: the MERGE-side half ENFORCES now —
+  `MergeBlockedByProtectedFiles` over the merge-time walk, `services/branch-protection.ts`
+  `mergeBlockedByProtectedFiles`; the pre-receive PUSH-side family
+  (`hook_pre_receive.go:210-260`, the `unprotected_files_only` allowance included)
+  stays this list's residue.)
 - **`require_signed_commits`** — no commit-signature verification surface exists.
-- **`block_on_codeowner_reviews`** — no CODEOWNERS surface.
+- **`block_on_codeowner_reviews`** — no CODEOWNERS surface. (As-built, census
+  B-53 2026-11-13: LANDED — `services/codeowners.ts` ports the parser, owner
+  resolution, discovery and matcher (models/issues/pull.go:828-981 +
+  services/issue/pull.go:47-251), and the gate arm enforces in
+  `checkPullBranchProtections` (merge.go:729-731); the recorded adaptation is the
+  per-match MatchTimeout's static safety screen; the PR-create auto
+  review-request arm (PullRequestCodeOwnersReview, :253-310) stays unported.)
 - **Merge queue / auto-merge schedule** — the 409 on
   `merge_when_checks_succeed` stands (`pulls.ts:1102-1105`); upstream's
   auto-merge deferral semantics (`check.go:187-190`) land with it, if ever.

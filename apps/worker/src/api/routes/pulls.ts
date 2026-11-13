@@ -115,6 +115,7 @@ import {
   mergePullRequest as mergePullRequestEngine,
   mergeableOfRow,
   mergeUpstream as mergeUpstreamEngine,
+  pullGateGitInputs,
   pullRequestDiff,
   pullRequestDiffShortStat,
 } from "../services/pull-engine";
@@ -1948,17 +1949,27 @@ export function registerPullRoutes(
       // text VERBATIM; `force_merge` clears it only through
       // CanBypassBranchProtection (check.go:192–207).
       if (rule !== null && !manualMark) {
+        const ruleConfig = parseRuleConfig(rule.rules);
+        // The B-53 arms' merge-time git view (census B-53) — threaded only
+        // when an arm is armed, upstream's own laziness (both arms return
+        // before any walk when disarmed, services/issue/pull.go:149-151).
+        const git =
+          ruleConfig.blockOnCodeownerReviews || ruleConfig.protectedFilePatterns.trim() !== ""
+            ? await pullGateGitInputs(c.env, found, pullRequest, c.env.DB)
+            : undefined;
         const failure = await checkPullBranchProtections(c.env.DB, rule, {
           issueId: issue.id,
           commitsBehind: checked.commitsBehind ?? 0,
           headSha: checked.headSha,
+          git,
+          posterId: issue.posterId ?? 0,
         });
         if (failure !== null) {
           const bypass =
             form.force_merge === true &&
             (await canBypassBranchProtection(
               c.env.DB,
-              parseRuleConfig(rule.rules),
+              ruleConfig,
               await principalAccessOf(c.env.DB, found.repo, requester),
             ));
           if (!bypass) {
