@@ -1,0 +1,48 @@
+hash-wasm wasm binaries vendored for the password verify arms — provenance
+==========================================================================
+
+Files:   argon2.wasm   (extracted from hash-wasm@4.12.0 dist/index.esm.js)
+         bcrypt.wasm   (extracted from hash-wasm@4.12.0 dist/index.esm.js)
+         blake2b.wasm  (extracted from hash-wasm@4.12.0 dist/index.esm.js —
+                        hash-wasm's argon2 computes the H0 and the
+                        variable-length expansion H' with its blake2b build)
+
+License: MIT (hash-wasm, upstream). The upstream LICENSE text lives at
+         scripts/hash-bench/vendor/hash-wasm/LICENSE (the bench harness's
+         copy of the same distribution); no license file is duplicated here.
+Source:  npm tarball hash-wasm@4.12.0 (registry.npmjs.org), dist/index.esm.js
+SHA256:  83b5829d20b4312aca1a56819f95eef20492e058c70f282c9ed6929f579b20ed  argon2.wasm
+         6a204dc0bc5d7ebfe386a4969095b5319627397f3c3cc1cb0a16ea0e7fbaf313  bcrypt.wasm
+         b478c0d889d97d7a8db4d10501457ad78dd406d02dcb4c892c0d844805ef05bb  blake2b.wasm
+Obtained: 2026-11-04 for the Phase-B benchmark (scratch-dir npm install; the
+          three binaries extracted from the bundle by
+          scripts/hash-bench/lib/extract-wasm.mjs — a pure decode of the
+          base64 literals the dist embeds, so the bytes are byte-identical to
+          what hash-wasm ships). Copied HERE 2026-11-13 (census B-86) for the
+          product verify arms; the SHA256s above are re-verified identical to
+          the harness copy on copy. The full upstream PROVENANCE record
+          (including the measured workerd platform constraint and the
+          @noble/hashes + python3-bcrypt cross-validations) is
+          scripts/hash-bench/vendor/hash-wasm/PROVENANCE.txt — the harness
+          directory is reference-only, these files are the product copies.
+
+Why these exact bytes:
+  workerd hard-blocks DYNAMIC wasm compilation (WebAssembly.compile(bytes)
+  fails with "Wasm code generation disallowed by embedder", no compat flag —
+  measured, docs/research/hash-bench-phase-b.md §5.1). The only supported
+  wasm shape is a STATICALLY IMPORTED .wasm module (bundled as a CompiledWasm
+  module — wrangler's DEFAULT module rule already maps **/*.wasm), so the
+  binaries must live as real files imported statically by
+  apps/worker/src/auth/password-wasm.ts. hash-wasm's own JS loader (base64
+  embedding + WebAssembly.compile) is NOT vendored into the product; the
+  wrapper logic it carries for these two algorithms was re-shaped into
+  password-wasm.ts (same wasm call contract: memory + Hash_GetBuffer +
+  Hash_SetMemorySize/Hash_Calculate for argon2; memory + Hash_GetBuffer +
+  bcrypt_verify for bcrypt; memory + Hash_Init/Hash_Update/Hash_Final +
+  Hash_Calculate for blake2b) — adapted code, not copied code.
+
+Known-answer validation:
+  Go-generated fixtures at the upstream pin fc4936884584
+  (golang.org/x/crypto v0.58.0: argon2.IDKey + bcrypt.GenerateFromPassword /
+  CompareHashAndPassword) pin every arm in password.test.ts — see
+  ../password-wasm-fixtures.json and its generator notes.
