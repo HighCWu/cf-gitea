@@ -4,6 +4,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { reactions, releaseAssets, releases, users } from "../../db/schema";
 import { ReleaseAlreadyExistError } from "../../issues/errors";
 import { IssuesService, type ReleaseRow } from "../../issues/service";
+import { notifyNewRelease } from "../../services/mail/notify";
 import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
 import { ApiError } from "../errors";
 import type { ApiEnv } from "../env";
@@ -513,6 +514,34 @@ async function readTaggedCommitFill(
  * ctx.APIErrorInternal → 500 (routers/api/v1/repo/release.go:285-287 create,
  * :379-382 edit). Replicated: untyped throw → the house 500.
  */
+
+/**
+ * The NewRelease mail emit seam (services/mail/notify.ts's receiver doc;
+ * upstream release.go:198 create arm + :361-368 publish/convert arm — both
+ * fire `!rel.IsDraft` after the row + assets land). Fire-and-log: the
+ * receiver never throws for its skips (upstream logs at the receiver,
+ * notify.go:201-202) and the release write stays committed; a D1 failure
+ * inside the outbox INSERT lands here, logs, and the 201 still goes out.
+ * The publisher is the ROW's PublisherID (upstream rel.Publisher via
+ * LoadAttributes — the original creator, never the editor on the
+ * publish-from-draft arm).
+ */
+async function emitNewReleaseNotify(env: ApiEnv["Bindings"], d1: D1Database, row: ReleaseRow): Promise<void> {
+  if (row.isDraft) return;
+  try {
+    const publisher = await drizzle(d1).select().from(users).where(eq(users.id, row.publisherId)).get();
+    if (publisher === undefined) {
+      console.error(`[releases] new-release notify skipped: publisher row missing [id: ${row.publisherId}]`);
+      return;
+    }
+    await notifyNewRelease(env, { release: row, publisher });
+  } catch (error) {
+    console.error(
+      `[releases] new-release notify failed (release ${row.id}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInput): Promise<CreateReleaseWithGitTagResult> {
   const { pair } = input;
   const repoId = pair.repo.id;
@@ -638,6 +667,11 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
   });
 
   if (fill === undefined) {
+    // The NewRelease emit (release.go:198 create arm; the tag-record
+    // conversion arm rides the same seam — its isConvertedFromTag fire at
+    // :361-368 lands on this same published row). Drafts skip inside the
+    // seam.
+    await emitNewReleaseNotify(input.env, input.d1, row);
     return { row, tagCreated, tagTip, tagCommitSha };
   }
   // The fill write (the shared-writer residual — see step 4 above): the
@@ -648,7 +682,10 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     .set({ sha1: fill.sha1, numCommits: fill.numCommits, createdAt: fill.createdAt })
     .where(eq(releases.id, row.id))
     .returning();
-  return { row: filled[0] ?? row, tagCreated, tagTip, tagCommitSha };
+  const finalRow = filled[0] ?? row;
+  // The NewRelease emit — see the fill-undefined arm above.
+  await emitNewReleaseNotify(input.env, input.d1, finalRow);
+  return { row: finalRow, tagCreated, tagTip, tagCommitSha };
 }
 
 export interface EditReleasePatch {
@@ -834,7 +871,18 @@ export async function editRelease(input: EditReleaseTagContext & {
     })
     .where(eq(releases.id, row.id))
     .returning();
-  return { row: rows[0] ?? null, tagCreated };
+  const finalRow = rows[0] ?? null;
+  // The NewRelease emit (UpdateRelease's `!rel.IsDraft && (isTagCreated ||
+  // isConvertedFromTag)` arm, release.go:361-367): the conversion half is
+  // unreachable on this surface (tag-only records 404 on every edit —
+  // assertNotTagRecord), so the live arm is publish-from-draft (a draft
+  // never holds a tag, so publishing always lands a FRESH tag) and a
+  // published edit whose tag_name rename landed a NEW tag; an edit that
+  // RODE the existing tag fires nothing, exactly upstream.
+  if (finalRow !== null && !isDraft && tagCreated) {
+    await emitNewReleaseNotify(env, input.d1, finalRow);
+  }
+  return { row: finalRow, tagCreated };
 }
 
 /** The R2 slice the R2-object sweep reads (routes/ui callers pass `env`). */

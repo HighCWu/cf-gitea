@@ -32,10 +32,14 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 import {
   issueAssignees,
   issueUsers,
+  orgMembers,
   pullRequests,
   pullReviews,
   repositories,
   ReviewType,
+  repoTransfer,
+  teamMembers,
+  teams,
   users,
 } from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -53,6 +57,11 @@ const TOKEN_CAROL = "carol-token";
 const TOKEN_ADMIN = "admin-token";
 const TOKEN_WATCHER = "watcher-token";
 const TOKEN_MUTER = "muter-token";
+const TOKEN_ORGOWNER = "orgowner-token";
+const TOKEN_TEAMGRANT = "teamgrant-token";
+const TOKEN_PLAINMEMBER = "plainmember-token";
+
+const T_TRANSFER = new Date("2026-03-03T00:00:00Z"); // the pending transfer's insert stamp
 
 const T1 = new Date("2026-03-01T00:00:00Z"); // issue creations (by neighbor)
 const T2 = new Date("2026-03-05T00:00:00Z"); // owner's comment on A
@@ -115,7 +124,13 @@ function resolver(): AuthResolver {
                 ? "watcher"
                 : token === TOKEN_MUTER
                   ? "muter"
-                  : null;
+                  : token === TOKEN_ORGOWNER
+                    ? "orgowner"
+                    : token === TOKEN_TEAMGRANT
+                      ? "teamgrant"
+                      : token === TOKEN_PLAINMEMBER
+                        ? "plainmember"
+                        : null;
       if (login === null) {
         return null;
       }
@@ -177,6 +192,13 @@ beforeEach(async () => {
     "repo_units",
     "repositories",
     "users",
+    // The repository-source leg (deviation 7): the pending-transfer rows and
+    // the per-user KV state ride the shared reset too.
+    "repo_transfer",
+    "org_members",
+    "team_members",
+    "teams",
+    "user_settings_kv",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
@@ -837,3 +859,211 @@ describe("notifications auth", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// The repository-source leg (module doc deviation 7): pending-transfer
+// threads derived from repo_transfer, read/pin state in user_settings_kv.
+// ---------------------------------------------------------------------------
+
+/** Seed a pending transfer (the derived thread's carrier row). */
+async function seedTransfer(repoId: string, newOwnerId: number): Promise<{ id: number }> {
+  const rows = await drizzle(env.DB)
+    .insert(repoTransfer)
+    .values({ repoId, doerId: 1, newOwnerId, createdAt: T_TRANSFER })
+    .returning({ id: repoTransfer.id })
+    .all();
+  return rows[0]!;
+}
+
+describe("the repository-source leg — pending-transfer threads (deviation 7)", () => {
+  it("the target user's thread: the NEGATIVE id, the Repository subject bytes (relative subject URL, empty comment pair, the \"\" state), merged totals and ordering", async () => {
+    const transfer = await seedTransfer(REPO_ID, neighborId);
+    const response = await send("/notifications", authed(undefined, TOKEN_NEIGHBOR));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Total-Count")).toBe("2"); // issue A + the transfer thread
+    const threads = await response.json<Thread[]>();
+    // Order: A's foreign activity T3 ranks above the transfer's T1 stamp.
+    expect(threads.map((thread) => thread.id)).toEqual([issueA.id, -transfer.id]);
+    const repo = threads[1]!;
+    expect(repo.unread).toBe(true);
+    expect(repo.pinned).toBe(false);
+    expect(repo.updated_at).toBe(T_TRANSFER.toISOString());
+    expect(repo.url).toBe(`https://example.com/api/v1/notifications/threads/-${transfer.id}`);
+    expect(repo.subject).toEqual({
+      title: `${OWNER_NS}/${SLUG}`, // the full name
+      url: `/${OWNER_NS}/${SLUG}`, // upstream's RELATIVE Link() FIXME, kept
+      html_url: `https://example.com/${OWNER_NS}/${SLUG}`,
+      latest_comment_url: "",
+      latest_comment_html_url: "",
+      type: "Repository",
+      state: "", // the zero NotifySubjectStateType — the widened wire enum
+    });
+  });
+
+  it("the org arm mirrors canCreateOrgRepo: the owner bridge and the team grants receive; the plain member and outsiders don't", async () => {
+    const seeded = await drizzle(env.DB)
+      .insert(users)
+      .values([
+        { username: "theorg", usernameLower: "theorg", type: "org", status: "active", createdAt: SEED },
+        { username: "orgowner", usernameLower: "orgowner", status: "active", createdAt: SEED },
+        { username: "teamgrant", usernameLower: "teamgrant", status: "active", createdAt: SEED },
+        { username: "plainmember", usernameLower: "plainmember", status: "active", createdAt: SEED },
+      ])
+      .returning({ id: users.id, username: users.username })
+      .all();
+    const orgId = seeded.find((row) => row.username === "theorg")!.id;
+    const orgOwnerId = seeded.find((row) => row.username === "orgowner")!.id;
+    const teamGrantId = seeded.find((row) => row.username === "teamgrant")!.id;
+    const plainMemberId = seeded.find((row) => row.username === "plainmember")!.id;
+    await drizzle(env.DB).insert(orgMembers).values([
+      { orgId, userId: orgOwnerId, role: "owner", isPublic: false, createdAt: SEED },
+      { orgId, userId: plainMemberId, role: "member", isPublic: false, createdAt: SEED },
+    ]);
+    const teamRows = await drizzle(env.DB)
+      .insert(teams)
+      .values([
+        { orgId, lowerName: "creators", name: "creators", canCreateOrgRepo: true, authorize: "none" },
+        { orgId, lowerName: "plain", name: "plain", canCreateOrgRepo: false, authorize: "none" },
+      ])
+      .returning({ id: teams.id, lowerName: teams.lowerName })
+      .all();
+    const creatorsId = teamRows.find((row) => row.lowerName === "creators")!.id;
+    const plainId = teamRows.find((row) => row.lowerName === "plain")!.id;
+    await drizzle(env.DB).insert(teamMembers).values([
+      { orgId, teamId: creatorsId, userId: teamGrantId },
+      { orgId, teamId: plainId, userId: plainMemberId },
+    ]);
+    const transfer = await seedTransfer(REPO2_ID, orgId); // org-owned thread; the repo-scoped seed keeps REPO_ID clean
+
+    const ownerView = await (await send("/notifications", authed(undefined, TOKEN_ORGOWNER))).json<Thread[]>();
+    expect(ownerView.map((thread) => thread.id)).toContain(-transfer.id); // the org_members.role='owner' bridge
+    const grantView = await (await send("/notifications", authed(undefined, TOKEN_TEAMGRANT))).json<Thread[]>();
+    expect(grantView.map((thread) => thread.id)).toContain(-transfer.id); // teams.can_create_org_repo
+    const plainView = await (await send("/notifications", authed(undefined, TOKEN_PLAINMEMBER))).json<Thread[]>();
+    expect(plainView.map((thread) => thread.id)).not.toContain(-transfer.id); // membership without the grant
+    const carolView = await (await send("/notifications", authed(undefined, TOKEN_CAROL))).json<Thread[]>();
+    expect(carolView.map((thread) => thread.id)).not.toContain(-transfer.id);
+  });
+
+  it("PATCH marks through the KV arm (never notification_states); pin implies non-unread; NewAvailable follows", async () => {
+    const transfer = await seedTransfer(REPO_ID, neighborId);
+    const negId = -transfer.id;
+    expect((await (await send("/notifications/new", authed(undefined, TOKEN_NEIGHBOR))).json<{ new: number }>()).new).toBe(2);
+
+    const marked = await send(`/notifications/threads/${negId}`, authed({ method: "PATCH" }, TOKEN_NEIGHBOR));
+    expect(marked.status).toBe(205);
+    expect((await (await send("/notifications/new", authed(undefined, TOKEN_NEIGHBOR))).json<{ new: number }>()).new).toBe(1);
+    // The marked thread left the default unread+pinned view — all=true sees it.
+    const listed = await (await send("/notifications?all=true", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    expect(listed.find((thread) => thread.id === negId)!.unread).toBe(false);
+
+    // The state landed in the KV namespace (the whole point of the arm) and
+    // NOT in notification_states.
+    const kv = await env.DB
+      .prepare("SELECT setting_value FROM user_settings_kv WHERE user_id = ? AND setting_key = ?")
+      .bind(neighborId, `notifications.repo_state.${REPO_ID}`)
+      .first<{ setting_value: string }>();
+    expect(kv).not.toBeNull();
+    const parsed = JSON.parse(kv!.setting_value) as { readAt: number; pinned: boolean };
+    expect(parsed.pinned).toBe(false);
+    expect(parsed.readAt).toBeGreaterThan(0);
+    const states = await env.DB
+      .prepare("SELECT COUNT(*) AS n FROM notification_states WHERE user_id = ?")
+      .bind(neighborId)
+      .first<{ n: number }>();
+    expect(states!.n).toBe(0);
+
+    // Pinning: implies non-unread, the flag flips in the KV row.
+    const pinned = await send(
+      `/notifications/threads/${negId}?to-status=pinned`,
+      authed({ method: "PATCH" }, TOKEN_NEIGHBOR),
+    );
+    expect(pinned.status).toBe(205);
+    const after = await (await send("/notifications", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    const pinnedThread = after.find((thread) => thread.id === negId)!;
+    expect(pinnedThread.pinned).toBe(true);
+    expect(pinnedThread.unread).toBe(false);
+    const kv2 = await env.DB
+      .prepare("SELECT setting_value FROM user_settings_kv WHERE user_id = ? AND setting_key = ?")
+      .bind(neighborId, `notifications.repo_state.${REPO_ID}`)
+      .first<{ setting_value: string }>();
+    expect((JSON.parse(kv2!.setting_value) as { pinned: boolean }).pinned).toBe(true);
+  });
+
+  it("PUT /notifications (the mark sweep) covers the repo leg too — the mark arms carry no subject-type filter", async () => {
+    await seedTransfer(REPO_ID, neighborId);
+    const swept = await send("/notifications", authed({ method: "PUT" }, TOKEN_NEIGHBOR));
+    expect(swept.status).toBe(205);
+    const listed = await (await send("/notifications", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    expect(listed.every((thread) => thread.unread === false)).toBe(true);
+    const kv = await env.DB
+      .prepare("SELECT setting_value FROM user_settings_kv WHERE setting_key = ?")
+      .bind(`notifications.repo_state.${REPO_ID}`)
+      .all<{ setting_value: string }>();
+    expect(kv.results).toHaveLength(1); // exactly the recipient's row
+  });
+
+  it("subject-type filters split the legs: repository matches the transfer thread, commit still matches nothing", async () => {
+    const transfer = await seedTransfer(REPO_ID, neighborId);
+    const repoOnly = await (await send("/notifications?subject-type=repository", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    expect(repoOnly.map((thread) => thread.id)).toEqual([-transfer.id]);
+    const issueOnly = await (await send("/notifications?subject-type=issue", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    expect(issueOnly.map((thread) => thread.id)).toEqual([issueA.id]);
+    const commit = await (await send("/notifications?subject-type=commit", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    expect(commit).toEqual([]);
+    const mixed = await (
+      await send("/notifications?subject-type=repository&subject-type=commit", authed(undefined, TOKEN_NEIGHBOR))
+    ).json<Thread[]>();
+    expect(mixed.map((thread) => thread.id)).toEqual([-transfer.id]);
+  });
+
+  it("thread guards: an unknown negative id 404s with the upstream message; a non-recipient 403s; the admin bypass serves", async () => {
+    const transfer = await seedTransfer(REPO_ID, neighborId);
+    const negId = -transfer.id;
+    const missing = await send("/notifications/threads/-99999", authed(undefined, TOKEN_NEIGHBOR));
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual(
+      expect.objectContaining({ message: "notification does not exist [id: -99999]" }),
+    );
+    const forbidden = await send(`/notifications/threads/${negId}`, authed(undefined, TOKEN_CAROL));
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual(
+      expect.objectContaining({
+        message: `only user itself and admin are allowed to read/change this thread ${negId}`,
+      }),
+    );
+    const admin = await send(`/notifications/threads/${negId}`, authed(undefined, TOKEN_ADMIN));
+    expect(admin.status).toBe(200);
+    expect((await admin.json<Thread>()).id).toBe(negId);
+    const adminMark = await send(`/notifications/threads/${negId}`, authed({ method: "PATCH" }, TOKEN_ADMIN));
+    expect(adminMark.status).toBe(205); // the admin's OWN kv row, caller-perspective
+  });
+
+  it("updated_at = max(updated_at, created_at): a stamp-less row reads its insert stamp, a stamped update wins (the xorm `updated` fold)", async () => {
+    const pending = await seedTransfer(REPO_ID, neighborId); // updated_at defaults 0 → created_at wins
+    const stamped = await drizzle(env.DB)
+      .insert(repoTransfer)
+      .values({ repoId: REPO2_ID, doerId: 1, newOwnerId: neighborId, createdAt: T1, updatedAt: T3 })
+      .returning({ id: repoTransfer.id })
+      .all();
+    const threads = await (await send("/notifications", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>();
+    expect(threads.find((thread) => thread.id === -pending.id)!.updated_at).toBe(T_TRANSFER.toISOString());
+    expect(threads.find((thread) => thread.id === -stamped[0]!.id)!.updated_at).toBe(T3.toISOString());
+    // T3 outranks issue A's T3-tie? A ties at T3 with the stamped transfer —
+    // the id tie-break decides (asserted loosely: both present).
+    expect(threads).toHaveLength(3);
+  });
+
+  it("the repo-scoped list merges the legs and pagination slices across them", async () => {
+    const transfer = await seedTransfer(REPO_ID, neighborId);
+    const scoped = await send(`/repos/${OWNER_NS}/${SLUG}/notifications`, authed(undefined, TOKEN_NEIGHBOR));
+    expect(scoped.headers.get("X-Total-Count")).toBe("2");
+    expect((await scoped.json<Thread[]>()).map((thread) => thread.id)).toEqual([issueA.id, -transfer.id]);
+    const page2 = await send(`/repos/${OWNER_NS}/${SLUG}/notifications?limit=1&page=2`, authed(undefined, TOKEN_NEIGHBOR));
+    expect(page2.headers.get("X-Total-Count")).toBe("2");
+    expect((await page2.json<Thread[]>()).map((thread) => thread.id)).toEqual([-transfer.id]);
+    // The OTHER repo shows no transfer thread (repo_id scoping).
+    const other = await send(`/repos/${OWNER_NS}/second/notifications`, authed(undefined, TOKEN_NEIGHBOR));
+    expect((await other.json<Thread[]>())).toEqual([]);
+  });
+});

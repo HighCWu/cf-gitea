@@ -39,6 +39,7 @@ import {
   actionTaskSteps,
   actionTasks,
 } from "../../db/schema";
+import { notifyWorkflowRunStatusUpdate, type MailNotifyEnv } from "../mail/notify";
 import { getRepoById, updateRepoRunsNumbers, type RunJobRow, type TaskRow } from "./model";
 import { decodeLogIndexes, encodeLogIndexes, nextChunkSeq, readLogs, renderLogAppend, sealLogsToStorage } from "./logs";
 import {
@@ -148,8 +149,24 @@ export function aggregateJobStatus(jobs: Array<Pick<RunJobRow, "status" | "conti
  * from its jobs; the latest attempt propagates to the run (status + started/
  * stopped mirrors, UpdateRunAttempt's rules). The M1b substitute for the
  * emitter's run-status leg (module header).
+ *
+ * `mailEnv` arms the WorkflowRunStatusUpdate mail receiver
+ * (services/mail/notify.ts — upstream notify.go:210-215, fired from the
+ * run-settle services whose wrapper closes with UpdateRepoRunsNumbers,
+ * notify.go:90 — the same tail this chokepoint holds). Callers that hold the
+ * worker env thread it (updateTask's bindings, stopTask's env); the rest
+ * stay silent — upstream's own callers without a mailer fire nothing. The
+ * call is unconditional once armed (upstream-faithful — the receiver filters
+ * the non-done/skipped statuses itself) and catch-and-log (a mailer outage
+ * never fails the settle write).
  */
-export async function refreshRunStatus(d1: D1, repoId: string, runId: number, runAttemptId: number): Promise<void> {
+export async function refreshRunStatus(
+  d1: D1,
+  repoId: string,
+  runId: number,
+  runAttemptId: number,
+  mailEnv?: MailNotifyEnv,
+): Promise<void> {
   const db = drizzle(d1);
   const now = new Date();
   const jobs = await db
@@ -217,12 +234,27 @@ export async function refreshRunStatus(d1: D1, repoId: string, runId: number, ru
       stopped = now;
     }
   }
+  const settled = { ...run, status: runStatus, started, stopped, updated: now };
   await db.update(actionRuns).set({ status: runStatus, started, stopped, updated: now }).where(eq(actionRuns.id, run.id));
   // FN-4: the run-status chokepoint's tally recount — upstream's
   // WorkflowRunStatusUpdate notify closes with UpdateRepoRunsNumbers
   // (notify.go:90); every job settle flows through here, so the closed
   // counts stay current (never-failing, see updateRepoRunsNumbers).
   await updateRepoRunsNumbers(d1, repoId);
+  // The WorkflowRunStatusUpdate mail receiver (notify.go:210-215) — the
+  // settle tail's mail half, armed only when the caller threaded the env
+  // (see the doc above). Unconditional once armed = upstream-faithful (the
+  // receiver filters its own gates); catch-and-log keeps the settle write
+  // committed (the register-notify posture shared by every mail arm).
+  if (mailEnv !== undefined) {
+    try {
+      await notifyWorkflowRunStatusUpdate(mailEnv, { run: settled });
+    } catch (error) {
+      console.error(
+        `[actions] workflow-run-status notify failed (run ${runId}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 }
 
 /** hasWaitingJobsToPick (run_job.go:449-455) — only bump when waiting work
@@ -583,14 +615,19 @@ export interface UpdateTaskOutcome {
  * WithReload for the settled run (runner.go:274) — fires here when the
  * caller supplies the bindings; the run leg of the emitter pass
  * (checkJobsOfRun's webhook param) rides the same context. Absent (the
- * current routes/fake-runner callers) → no emissions from this path.
+ * current routes/fake-runner callers) → no emissions from this path. The
+ * type is widened with Partial<MailNotifyEnv> so the REAL route caller
+ * (which passes the whole worker env) also arms the WorkflowRunStatusUpdate
+ * mail receiver riding refreshRunStatus's tail — the mail half of the same
+ * upstream notify (services/mail/notify.ts's receiver doc); a bare
+ * {DB, REPO} bindings object stays valid and stays silent.
  */
 export async function updateTask(
   d1: D1,
   runnerId: number,
   req: UpdateTaskRequest,
   appUrl = "",
-  bindings?: ActionsWebhookBindings,
+  bindings?: ActionsWebhookBindings & Partial<MailNotifyEnv>,
 ): Promise<UpdateTaskOutcome> {
   if (req.state === undefined) {
     throw new Error("state is required");
@@ -627,8 +664,10 @@ export async function updateTask(
 
   // The lifecycle writes: the attempt/run aggregate (the completing job's
   // own flip lands here first — the emitter below re-reads DB truth), the
-  // tasks_version wake, ephemeral removal.
-  await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId);
+  // tasks_version wake, ephemeral removal. The bindings carry the mail env
+  // when the caller holds the whole worker env (routes.ts passes c.env) —
+  // the WorkflowRunStatusUpdate receiver arms on them.
+  await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId, bindings);
   if (!preJobWasDone && isDoneStatus(task.status)) {
     // Only bump when waiting work remains (run_job.go:513-527). The emitter
     // below carries its own wake arm for the jobs IT flips (a needs-wake
@@ -853,7 +892,10 @@ export async function stopTask(d1: D1, taskId: number, status: number, env?: Env
     if (await hasWaitingJobsToPick(d1, job.repoId)) {
       await increaseTaskVersion(d1, job.ownerId, job.repoId);
     }
-    await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId);
+    // stopTask's env (when the caller threaded it) arms the settle tail's
+    // mail receiver too — upstream's cancel arm fires the same notify
+    // (services/actions/cancel.go:54).
+    await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId, env);
   }
 
   // Piggyback (task.go:452-464): the task flipped done, so an ephemeral

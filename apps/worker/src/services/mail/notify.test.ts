@@ -28,9 +28,12 @@ import { emptyTree, serializeCommit } from "@cf-gitea/git-engine";
 import { WatchMode } from "../../api/services/repo-watchers";
 import { engineCell, ZERO_OID } from "../../api/services/engine";
 import { mergePullRequest } from "../../api/services/pull-engine";
+import { createReleaseWithGitTag, editRelease } from "../../api/services/releases";
 import type { ApiEnv } from "../../api/env";
 
 import {
+  actionRunJobs,
+  actionRuns,
   comments,
   emailInbound,
   emailOutbox,
@@ -43,6 +46,8 @@ import {
   userSettings,
   users,
 } from "../../db/schema";
+import { ACTION_STATUS_FAILURE, ACTION_STATUS_RUNNING } from "../actions/model";
+import { refreshRunStatus } from "../actions/update";
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import {
@@ -185,6 +190,18 @@ beforeEach(async () => {
     "repositories",
     "user_settings",
     "users",
+    // The B-65 emit-wiring fixtures (the actions settle tail + the transfer
+    // class) — the arms' tables ride the shared reset too.
+    "action_run_attempts",
+    "action_run_jobs",
+    "action_runs",
+    "repo_transfer",
+    "org_members",
+    "team_members",
+    "teams",
+    "user_settings_kv",
+    "release_assets",
+    "releases",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
@@ -2243,5 +2260,238 @@ describe("notifyPullRequestReviewRequest — the PullRequestReviewRequest receiv
     expect((await notifyPullRequestReviewRequest(off, { issue, comment, doer, reviewer, isRequest: true }, {})).outcome).toBe("disabled");
     const malformed = armedEnv({ MAIL_FROM: "no address here" });
     expect((await notifyPullRequestReviewRequest(malformed, { issue, comment, doer, reviewer, isRequest: true }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The B-65 emit wirings — the REAL write paths (census B-65's completion):
+// the release service's publish arms fire notifyNewRelease after the row +
+// assets land, and the actions run-status chokepoint's tail fires
+// notifyWorkflowRunStatusUpdate when the caller threaded the mail env. The
+// repo.ts transfer-route emit rides its own battery
+// (notify-b65-arms.test.ts, which mounts the router).
+// ---------------------------------------------------------------------------
+
+describe("the B-65 emit wirings — releases publish arms + the actions settle tail", () => {
+  /** Distinct repo rows per test — the engine DO namespace survives across
+   *  tests, so a shared cell name would collide on refs/heads/main. */
+  async function seedEngineRepo(repoId: string, slug: string): Promise<{
+    repo: typeof repositories.$inferSelect;
+    owner: typeof users.$inferSelect;
+  }> {
+    await db().insert(repositories).values({
+      id: repoId,
+      storageKey: `r_${repoId}`,
+      ownerNamespace: "repoowner",
+      ownerId: 1,
+      slug,
+      visibility: "public",
+      status: "ready",
+    });
+    const repo = (await db().select().from(repositories).where(eq(repositories.id, repoId)).get())!;
+    const owner = (await db().select().from(users).where(eq(users.id, 1)).get())!;
+    const cell = engineCell(env, repo);
+    const tree = emptyTree();
+    const commit = serializeCommit({
+      tree: tree.oid,
+      parents: [],
+      author: { name: "Seed", email: "seed@example.com", time: 1_700_000_000, tz: "+0000" },
+      committer: { name: "Seed", email: "seed@example.com", time: 1_700_000_000, tz: "+0000" },
+      message: "seed main\n",
+    });
+    const put = await cell.putApiObjects([tree, commit]);
+    if (put.tag !== "ok") throw new Error(`seed put failed: ${put.tag}`);
+    const moved = await cell.commitApiChange({ ref: "refs/heads/main", expectedOldOid: ZERO_OID, newOid: commit.oid });
+    if (moved.tag !== "committed") throw new Error(`seed ref move failed: ${moved.tag}`);
+    return { repo, owner };
+  }
+
+  function emitBindings(): ApiEnv["Bindings"] {
+    return Object.assign({}, env, {
+      APP_URL: "https://mail.example",
+      MAIL_ENABLED: "true",
+      ENABLE_NOTIFY_MAIL: "true",
+      MAIL_PROVIDER: "dummy",
+      MAIL_FROM: "Gitea <noreply@example.com>",
+      REPO_TASKS: spyQueue(),
+    });
+  }
+
+  it("createReleaseWithGitTag: a draft mails nothing; the published create lands new-release rows (the release.go:198 emit after the row + assets)", async () => {
+    const { repo, owner } = await seedEngineRepo("520", "emit-create");
+    await db().insert(repoWatchers).values({ repoId: "520", userId: 20 });
+    const pair = { repo, owner };
+    // The DRAFT arm: no tag, no fill, no mail (the seam's !IsDraft skip —
+    // upstream release.go:198 fires only for published creates). The write
+    // doer (repoowner) deliberately DIFFERS from the publisher row (fixture
+    // 60 = 'doer') so the From pin proves the mail carries the PUBLISHER.
+    await createReleaseWithGitTag({
+      env: emitBindings(),
+      d1: env.DB,
+      pair,
+      publisherId: 60,
+      doer: { id: 1, login: "repoowner", email: "owner@example.com" },
+      requestHost: "mail.example",
+      tagName: "draft-1",
+      targetCommitish: "main",
+      tagMessage: undefined,
+      title: "draft release",
+      note: "",
+      isDraft: true,
+      isPrerelease: false,
+    });
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    // The PUBLISHED arm: the tag lands, the fill lands, the mail lands.
+    const published = await createReleaseWithGitTag({
+      env: emitBindings(),
+      d1: env.DB,
+      pair,
+      publisherId: 60,
+      doer: { id: 1, login: "repoowner", email: "owner@example.com" },
+      requestHost: "mail.example",
+      tagName: "v1.0",
+      targetCommitish: "main",
+      tagMessage: undefined,
+      title: "the release",
+      note: "",
+      isDraft: false,
+      isPrerelease: false,
+    });
+    expect(published.tagCreated).toBe(true);
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.toAddr).toBe("rw@example.com");
+    expect(rows[0]!.subject).toBe("v1.0 in repoowner/emit-create released");
+    expect(rows[0]!.dedupeKey).toBe(`new-release:${published.row.id}:20`);
+    expect(rows[0]!.fromDisplayName).toBe("doer"); // from = the PUBLISHER row, never the write doer
+  });
+
+  it("editRelease: publish-from-draft lands the fresh tag AND the mail; a tag-riding edit mails nothing (the release.go:361-367 isTagCreated arm)", async () => {
+    const { repo, owner } = await seedEngineRepo("521", "emit-edit");
+    await db().insert(repoWatchers).values({ repoId: "521", userId: 20 });
+    const pair = { repo, owner };
+    const draft = await createReleaseWithGitTag({
+      env: emitBindings(),
+      d1: env.DB,
+      pair,
+      publisherId: 60,
+      doer: { id: 60, login: "publisher", email: "pub@example.com" },
+      requestHost: "mail.example",
+      tagName: "v2.0",
+      targetCommitish: "main",
+      tagMessage: undefined,
+      title: "draft first",
+      note: "",
+      isDraft: true,
+      isPrerelease: false,
+    });
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    // The publish edit: isDraft false + a FRESH tag → the mail fires, with
+    // the ROW's publisher (upstream rel.Publisher via LoadAttributes), not
+    // the editor.
+    const published = await editRelease({
+      env: emitBindings(),
+      pair,
+      doer: { id: 1, login: "repoowner", email: "owner@example.com" },
+      requestHost: "mail.example",
+      d1: env.DB,
+      row: draft.row,
+      patch: { isDraft: false, now: new Date(1_700_000_500_000) },
+    });
+    expect(published.tagCreated).toBe(true);
+    expect(published.row?.isDraft).toBe(false);
+    let rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.subject).toBe("v2.0 in repoowner/emit-edit released");
+    expect(rows[0]!.fromDisplayName).toBe("doer"); // the ROW's publisher, not the editor
+    expect(rows[0]!.dedupeKey).toBe(`new-release:${draft.row.id}:20`);
+    // A published edit that RIDES the tag fires nothing (isTagCreated false).
+    await editRelease({
+      env: emitBindings(),
+      pair,
+      doer: { id: 1, login: "repoowner", email: "owner@example.com" },
+      requestHost: "mail.example",
+      d1: env.DB,
+      row: published.row!,
+      patch: { title: "renamed", now: new Date(1_700_000_600_000) },
+    });
+    rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+  });
+
+  it("refreshRunStatus's settle tail: armed → the workflow-run mail to the trigger user; unarmed → silent; a non-done run → the receiver filters (the update.ts emit)", async () => {
+    await seedRepo();
+    const now = new Date();
+    const done = await db()
+      .insert(actionRuns)
+      .values({
+        repoId: REPO_ID,
+        ownerId: 1,
+        index: 1,
+        workflowId: "ci.yml",
+        ref: "refs/heads/main",
+        commitSha: "1234567890abcdef1234567890abcdef12345678",
+        status: ACTION_STATUS_FAILURE,
+        triggerUserId: 20,
+        created: now,
+        updated: now,
+      })
+      .returning()
+      .all();
+    const run = done[0]!;
+    await db().insert(actionRunJobs).values({
+      runId: run.id,
+      repoId: REPO_ID,
+      ownerId: 1,
+      name: "build",
+      status: ACTION_STATUS_FAILURE,
+      workflowPayload: new TextEncoder().encode("{}"),
+      created: now,
+      updated: now,
+    });
+    // Unarmed (every existing caller's shape): the settle lands, no mail.
+    await refreshRunStatus(env.DB, REPO_ID, run.id, 0);
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    // Armed: the receiver runs its own gates and mails the failure.
+    await refreshRunStatus(env.DB, REPO_ID, run.id, 0, armedEnv());
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.toAddr).toBe("rw@example.com");
+    expect(rows[0]!.subject).toBe("[repoowner/repo] Failure: ci.yml (main - 1234567890)");
+    expect(rows[0]!.dedupeKey).toBe(`workflow-run-status:${run.id}:0:20`);
+    // The chokepoint's re-drives dedupe (the settle identity).
+    await refreshRunStatus(env.DB, REPO_ID, run.id, 0, armedEnv());
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(1);
+    // A running run stays silent even armed (the receiver's gate 1): the
+    // aggregate from a RUNNING job keeps the run non-done, so the settle
+    // tail fires the receiver and the receiver filters it.
+    const running = await db()
+      .insert(actionRuns)
+      .values({
+        repoId: REPO_ID,
+        ownerId: 1,
+        index: 2,
+        workflowId: "ci.yml",
+        ref: "refs/heads/main",
+        commitSha: "1234567890abcdef1234567890abcdef12345678",
+        status: ACTION_STATUS_RUNNING,
+        triggerUserId: 20,
+        created: now,
+        updated: now,
+      })
+      .returning()
+      .all();
+    await db().insert(actionRunJobs).values({
+      runId: running[0]!.id,
+      repoId: REPO_ID,
+      ownerId: 1,
+      name: "build",
+      status: ACTION_STATUS_RUNNING,
+      workflowPayload: new TextEncoder().encode("{}"),
+      created: now,
+      updated: now,
+    });
+    await refreshRunStatus(env.DB, REPO_ID, running[0]!.id, 0, armedEnv());
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(1);
   });
 });

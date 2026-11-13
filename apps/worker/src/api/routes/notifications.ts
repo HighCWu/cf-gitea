@@ -14,8 +14,10 @@ import {
   notificationStates,
   pullRequests,
   repositories,
+  repoTransfer,
   repoWatchers,
   ReviewType,
+  userSettingsKv,
   users,
 } from "../../db/schema";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -109,14 +111,51 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  *    users.type enum is "user"/"org" only, no bot rows can exist).
  *    Access-revoked users remain excluded upstream-only (no revocation
  *    model).
- * 5. Subject types are Issue/Pull only. `subject-type=commit/repository`
- *    filters are accepted (upstream maps them to valid sources) but match
- *    nothing here — no commit/repository notification source exists.
+ * 5. Subject sources: Issue/Pull derive from issue activity;
+ *    `repository` matches the pending-transfer thread leg (deviation 7);
+ *    `commit` filters still match nothing — no commit notification source
+ *    exists on this tree.
  * 6. 205 responses carry NO body. Upstream returns the marked
  *    NotificationThreadList JSON with 205; Cloudflare's runtime enforces the
  *    fetch spec's null-body rule ("Response with null body status … cannot
  *    have a body"), so the body is dropped and the marked set is observable
  *    via a follow-up GET. The declared code stays 205 (contract subset).
+ * 7. The repository-source class (B-65's completion, the pending-transfer
+ *    thread) rides the same API by DERIVATION: upstream materializes one
+ *    Notification row per recipient at request time
+ *    (CreateRepoTransferNotification, notification.go:119-155); ours derives
+ *    at read time from the `repo_transfer` pending row itself
+ *    (UNIQUE(repo_id) — the row IS the transfer's existence), so a thread
+ *    lives exactly as long as the pending request (upstream's rows persist
+ *    after accept/reject — the recorded delta of the same fold). Thread id =
+ *    NEGATIVE repo_transfer.id (positive ids would shadow issue ids — the
+ *    disjoint sign convention; the single-thread lookup branches on it).
+ *    Read/pin state materializes in `user_settings_kv` under
+ *    `notifications.repo_state.<repoId>` (JSON `{readAt, pinned}` — an
+ *    absent row is unread), written by the mark paths' KV arm (the
+ *    markThreads twin). Recipients = the transfer's target user OR, for an
+ *    org target, the canCreateOrgRepo grant set (services/orgs/orgs.ts:687's
+ *    exact disjunction over the collapsed owners-team bridge); NO mute arm
+ *    (upstream's mute pass is the issue-source assembly's own post-join,
+ *    notification_list.go:135-141 — this class holds no watcher rows to
+ *    mute) and no bot skip (vacuous, deviation 4's note). The subject
+ *    renders upstream's Repository arm verbatim (convert/notification.go:
+ *    87-94): title = the full name, URL = the RELATIVE repo path (the
+ *    converter's own FIXME kept), absolute html_url, the empty
+ *    latest-comment pair, and the ZERO NotifySubjectStateType "" — hence
+ *    the widened wire enum (the 201-transfer RUNTIME_ONLY precedent). The
+ *    thread's updated_at = max(updated_at, created_at): upstream's xorm
+ *    `updated` tag insert-stamps UpdatedUnix, our pending rows carry the
+ *    insert-time created_at (the column default) while updated_at stays 0
+ *    until a stamping writer lands (the schema's recorded port-when-read
+ *    follow-up). Pagination merges both legs — each fetches
+ *    top-(page*limit), the merge sorts updated_at DESC then SERIALIZED id
+ *    DESC and slices the page window — and X-Total-Count, NewAvailable and
+ *    the mark sweep ride the merged totals (the mark sweep carries no
+ *    subject-type param, so its repo leg always rides). The web purge
+ *    page's derivation copy (ui/pages/notifications.tsx) stays
+ *    issue-source-only this wave — the transfer-pending class rides the API
+ *    totals only (follow-up for the ui owner).
  *
  * Undeclared runtime codes (kept out of the orchestrator RUNTIME_ONLY tables
  * by this batch — the landed route-module convention): 401 anonymous
@@ -147,8 +186,15 @@ const notificationSubjectSchema = z.object({
     .enum(["Issue", "Pull", "Commit", "Repository"])
     .openapi({ description: "Type indicates the type of the notification subject" }),
   state: z
-    .enum(["open", "closed", "merged"])
-    .openapi({ description: "State indicates the current state of the notification subject" }),
+    .enum(["open", "closed", "merged", ""])
+    .openapi({
+      description: "State indicates the current state of the notification subject",
+      // The "" arm is upstream's zero NotifySubjectStateType: the
+      // Repository subject arm (convert/notification.go:87-94) never sets
+      // State, so the serializer emits the zero value — the swagger enum
+      // [open,closed,merged] misses it (the 201-transfer RUNTIME_ONLY
+      // precedent; module doc deviation 7).
+    }),
 });
 
 const notificationThreadSchema = z.object({
@@ -224,14 +270,20 @@ const listQuery = {
       .string()
       .optional()
       .openapi({ type: "boolean", description: "If true, show notifications marked as read. Default value is false" }),
-    "status-types": z.string().optional().openapi({
-      description:
-        "Show notifications with the provided status types (repeated query params). Options are: unread, read and/or pinned. Defaults to unread & pinned.",
-    }),
-    "subject-type": z.string().optional().openapi({
-      description:
-        "filter notifications by subject type (repeated query params). Options are: issue, pull, commit, repository.",
-    }),
+    "status-types": z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .openapi({
+        description:
+          "Show notifications with the provided status types (repeated query params). Options are: unread, read and/or pinned. Defaults to unread & pinned.",
+      }),
+    "subject-type": z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .openapi({
+        description:
+          "filter notifications by subject type (repeated query params). Options are: issue, pull, commit, repository.",
+      }),
     since: rfc3339Query("Only show notifications updated after the given time. This is a timestamp in RFC 3339 format"),
     before: rfc3339Query("Only show notifications updated before the given time. This is a timestamp in RFC 3339 format"),
     page: pageQuery,
@@ -248,10 +300,13 @@ const readQuery = {
       .string()
       .optional()
       .openapi({ description: "If true, mark all notifications on this repo. Default value is false" }),
-    "status-types": z.string().optional().openapi({
-      description:
-        "Mark notifications with the provided status types (repeated query params). Options are: unread, read and/or pinned. Defaults to unread.",
-    }),
+    "status-types": z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .openapi({
+        description:
+          "Mark notifications with the provided status types (repeated query params). Options are: unread, read and/or pinned. Defaults to unread.",
+      }),
     "to-status": z.string().optional().openapi({ description: "Status to mark notifications as, Defaults to read." }),
   }),
 } as const;
@@ -262,10 +317,13 @@ const repoReadQuery = {
       .string()
       .optional()
       .openapi({ description: "If true, mark all notifications on this repo. Default value is false" }),
-    "status-types": z.string().optional().openapi({
-      description:
-        "Mark notifications with the provided status types (repeated query params). Options are: unread, read and/or pinned. Defaults to unread.",
-    }),
+    "status-types": z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .openapi({
+        description:
+          "Mark notifications with the provided status types (repeated query params). Options are: unread, read and/or pinned. Defaults to unread.",
+      }),
     "to-status": z.string().optional().openapi({ description: "Status to mark notifications as. Defaults to read." }),
     last_read_at: rfc3339Query(
       "Describes the last point that notifications were checked. Anything updated since this time will not be updated.",
@@ -762,8 +820,13 @@ async function markThreads(
 // Serialization (services/convert/notification.go ToNotificationThread).
 // ---------------------------------------------------------------------------
 
-/** Resolved {unread, pinned} of a thread (upstream Unread = !(read||pinned)). */
-function resolvedStatus(thread: DerivedThread): { unread: boolean; pinned: boolean } {
+/** Resolved {unread, pinned} of a thread (upstream Unread = !(read||pinned)).
+ *  Structural over both thread kinds: DerivedThread and RepoThread carry the
+ *  same {state, lastActivity} view. */
+function resolvedStatus(thread: {
+  state: { pinned: boolean; readAtUnix: number } | null;
+  lastActivity: number;
+}): { unread: boolean; pinned: boolean } {
   if (thread.state !== null && thread.state.pinned) {
     return { unread: false, pinned: true };
   }
@@ -822,12 +885,325 @@ function toNotificationThread(
 }
 
 // ---------------------------------------------------------------------------
+// The repository-source leg (module doc deviation 7): pending-transfer
+// threads derived from `repo_transfer`, read/pin state in `user_settings_kv`.
+// ---------------------------------------------------------------------------
+
+/** The KV key namespace of the per-user repo-thread state (deviation 7). */
+const REPO_STATE_KEY_PREFIX = "notifications.repo_state.";
+
+interface RepoThreadState {
+  pinned: boolean;
+  readAtUnix: number;
+}
+
+/** One derived repository-source thread (the pending transfer's mailbox). */
+interface RepoThread {
+  transfer: typeof repoTransfer.$inferSelect;
+  repo: typeof repositories.$inferSelect;
+  owner: typeof users.$inferSelect;
+  /** The caller's KV state row (null when never touched — unread). */
+  state: RepoThreadState | null;
+  /** max(updated_at, created_at) unix seconds — the xorm `updated`
+   *  insert-stamp fold (deviation 7's updated_at note). */
+  lastActivity: number;
+}
+
+function repoStateKey(repoId: string): string {
+  return `${REPO_STATE_KEY_PREFIX}${repoId}`;
+}
+
+/** The stored KV value — `{readAt, pinned}` JSON; malformed → null (unread). */
+function parseRepoState(raw: string | null): RepoThreadState | null {
+  if (raw === null) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { readAt?: unknown; pinned?: unknown };
+    if (typeof parsed.readAt !== "number" || !(parsed.pinned === true || parsed.pinned === false || parsed.pinned === 0 || parsed.pinned === 1)) {
+      return null;
+    }
+    return { readAtUnix: parsed.readAt, pinned: parsed.pinned === true || parsed.pinned === 1 };
+  } catch {
+    return null;
+  }
+}
+
+/** The thread's updated_at over the transfer row (unix seconds; the columns
+ *  are raw INTEGERs — see deviation 7 for the max() fold). */
+function repoLastActivityExpr(): SQL {
+  return sql`max(coalesce(${repoTransfer.updatedAt}, 0), coalesce(${repoTransfer.createdAt}, 0))`;
+}
+
+/**
+ * The repository-source recipient predicate (deviation 7): the caller is a
+ * recipient iff they are the transfer's TARGET USER, or — for an org target
+ * — a member who can create repos in that org: OrgService.canCreateOrgRepo
+ * (services/orgs/orgs.ts:687) mirrored as one SQL disjunction over the
+ * collapsed owners-team bridge (`org_members.role='owner'`, SPEC-0007 §3.3)
+ * OR a `team_members × teams` row with `can_create_org_repo` or
+ * `authorize='owner'`, both scoped to the target org id. The org arms only
+ * ever match org-id targets (membership rows exist for orgs alone), so no
+ * type conjunct is needed. NO mute arm and no bot skip (deviation 7).
+ */
+function repoRecipientExpr(userId: number): SQL {
+  return sql`(
+    ${repoTransfer.newOwnerId} = ${userId}
+    or exists (
+      select 1 from org_members om
+      where om.org_id = ${repoTransfer.newOwnerId} and om.user_id = ${userId} and om.role = 'owner'
+    )
+    or exists (
+      select 1 from team_members tm
+      join teams t on t.id = tm.team_id
+      where tm.user_id = ${userId} and t.org_id = ${repoTransfer.newOwnerId}
+        and (t.can_create_org_repo = 1 or t.authorize = 'owner')
+    )
+  )`;
+}
+
+/**
+ * The status predicate over the KV left join (the statusExpr twin; the state
+ * rides a JSON TEXT column, so the fields extract at query time — D1's
+ * SQLite carries JSON1). Same semantics as the issue leg: unread while no
+ * state or unpinned-and-behind the marker; read when the marker covers the
+ * activity; pinned when the flag is set (pinning implies non-unread).
+ */
+function repoStatusExpr(statuses: ThreadStatus[], lastActivity: SQL): SQL {
+  const pinnedExpr = sql`coalesce(json_extract(${userSettingsKv.settingValue}, '$.pinned'), 0)`;
+  const readAtExpr = sql`coalesce(json_extract(${userSettingsKv.settingValue}, '$.readAt'), 0)`;
+  const parts: SQL[] = [];
+  if (statuses.includes("unread")) {
+    parts.push(sql`(${userSettingsKv.settingValue} is null or (${pinnedExpr} = 0 and ${readAtExpr} < (${lastActivity})))`);
+  }
+  if (statuses.includes("read")) {
+    parts.push(
+      sql`(${userSettingsKv.settingValue} is not null and ${pinnedExpr} = 0 and ${readAtExpr} >= (${lastActivity}))`,
+    );
+  }
+  if (statuses.includes("pinned")) {
+    parts.push(sql`${pinnedExpr} = 1`);
+  }
+  return sql`(${sql.join(parts, sql` or `)})`;
+}
+
+/** The repo leg's filters (the ThreadQuery slice the leg consumes, plus the
+ *  page-window bound). */
+interface RepoThreadQuery {
+  userId: number;
+  repoId?: string;
+  updatedAfter?: number;
+  updatedBefore?: number;
+  statuses?: ThreadStatus[];
+  /** page*limit — undefined = unbounded (the mark sweep). */
+  topK?: number;
+}
+
+function repoThreadConditions(query: RepoThreadQuery, lastActivity: SQL): SQL[] {
+  const conditions: SQL[] = [repoRecipientExpr(query.userId)];
+  if (query.repoId !== undefined) {
+    conditions.push(eq(repoTransfer.repoId, query.repoId));
+  }
+  if (query.updatedAfter !== undefined && query.updatedAfter > 0) {
+    conditions.push(sql`(${lastActivity}) >= ${query.updatedAfter}`);
+  }
+  if (query.updatedBefore !== undefined && query.updatedBefore > 0) {
+    conditions.push(sql`(${lastActivity}) <= ${query.updatedBefore}`);
+  }
+  if (query.statuses !== undefined && query.statuses.length > 0) {
+    conditions.push(repoStatusExpr(query.statuses, lastActivity));
+  }
+  return conditions;
+}
+
+/** The KV join arm — `setting_key = 'notifications.repo_state.' || repo_id`.
+ *  (user_id, setting_key) is UNIQUE, so the left join never fans out. */
+function repoStateJoin(userId: number) {
+  return and(
+    eq(userSettingsKv.userId, userId),
+    sql`${userSettingsKv.settingKey} = ${REPO_STATE_KEY_PREFIX} || ${repoTransfer.repoId}`,
+  );
+}
+
+/** Total matching repo threads (the merged totals' second summand). */
+async function countRepoThreads(d1: D1Database, query: RepoThreadQuery): Promise<number> {
+  const lastActivity = repoLastActivityExpr();
+  const rows = await drizzle(d1)
+    .select({ value: sql<number>`count(*)` })
+    .from(repoTransfer)
+    .leftJoin(userSettingsKv, repoStateJoin(query.userId))
+    .where(and(...repoThreadConditions(query, lastActivity)));
+  return rows[0]?.value ?? 0;
+}
+
+async function fetchRepoThreads(d1: D1Database, query: RepoThreadQuery): Promise<{ items: RepoThread[]; total: number }> {
+  const db = drizzle(d1);
+  const lastActivity = repoLastActivityExpr();
+  const conditions = repoThreadConditions(query, lastActivity);
+  const total = await countRepoThreads(d1, query);
+  const rows = await db
+    .select({
+      transfer: repoTransfer,
+      repo: repositories,
+      owner: users,
+      stateValue: userSettingsKv.settingValue,
+      lastActivity: sql<number>`(${lastActivity})`,
+    })
+    .from(repoTransfer)
+    .innerJoin(repositories, eq(repositories.id, repoTransfer.repoId))
+    .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
+    .leftJoin(userSettingsKv, repoStateJoin(query.userId))
+    .where(and(...conditions))
+    // Upstream ToOrders `updated_unix DESC`; the tie-break reads the
+    // SERIALIZED ids (deviation 7's merge note — the negative sign makes
+    // "id desc" the deterministic, client-visible order).
+    .orderBy(desc(sql`(${lastActivity})`), desc(sql`(-${repoTransfer.id})`))
+    .limit(query.topK ?? -1)
+    .offset(0);
+  return {
+    items: rows.map((row) => ({
+      transfer: row.transfer,
+      repo: row.repo,
+      owner: row.owner,
+      state: parseRepoState(row.stateValue),
+      lastActivity: row.lastActivity,
+    })),
+    total,
+  };
+}
+
+/** Single repo thread by NEGATIVE thread id (the threadById branch) — the
+ *  same 404/403 shapes as the issue leg, exact upstream messages. */
+async function repoThreadById(d1: D1Database, doer: { id: number; is_admin: boolean }, id: number): Promise<RepoThread> {
+  const transferId = -id;
+  const db = drizzle(d1);
+  const rows = await db
+    .select({ transfer: repoTransfer, repo: repositories, owner: users })
+    .from(repoTransfer)
+    .innerJoin(repositories, eq(repositories.id, repoTransfer.repoId))
+    .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
+    .where(eq(repoTransfer.id, transferId))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined) {
+    // GetNotificationByID → db.ErrNotExist → 404 (notify/threads.go:105-112).
+    throw new ApiError(404, `notification does not exist [id: ${id}]`);
+  }
+  const isRecipient =
+    (
+      await db
+        .select({ one: sql<number>`1` })
+        .from(repoTransfer)
+        .where(and(eq(repoTransfer.id, transferId), repoRecipientExpr(doer.id)))
+        .limit(1)
+    ).length > 0;
+  if (!isRecipient && !doer.is_admin) {
+    // threads.go:114-117 — exact upstream message (the issue leg's twin).
+    throw new ApiError(403, `only user itself and admin are allowed to read/change this thread ${id}`);
+  }
+  const stateRow = await db
+    .select({ value: userSettingsKv.settingValue })
+    .from(userSettingsKv)
+    .where(and(eq(userSettingsKv.userId, doer.id), eq(userSettingsKv.settingKey, repoStateKey(row.repo.id))))
+    .get();
+  return {
+    transfer: row.transfer,
+    repo: row.repo,
+    owner: row.owner,
+    state: parseRepoState(stateRow?.value ?? null),
+    lastActivity: Math.max(row.transfer.updatedAt.getTime(), row.transfer.createdAt.getTime()) / 1000,
+  };
+}
+
+/**
+ * The KV arm of the mark paths (markThreads' twin): one
+ * `notifications.repo_state.<repoId>` upsert per marked thread in one D1
+ * batch. Same status rules as the issue leg — `read` stamps the wall-clock
+ * marker, `unread` zeroes it, `pinned` only sets the flag (pinning implies
+ * non-unread; the stored marker survives).
+ */
+async function markRepoThreads(
+  d1: D1Database,
+  userId: number,
+  threads: ReadonlyArray<{ repo: { id: string } }>,
+  toStatus: ThreadStatus,
+  now: Date,
+): Promise<void> {
+  if (threads.length === 0) {
+    return;
+  }
+  const db = drizzle(d1);
+  const nowUnix = Math.floor(now.getTime() / 1000);
+  const statements: BatchStatement[] = threads.map((thread) =>
+    db
+      .insert(userSettingsKv)
+      .values({
+        userId,
+        settingKey: repoStateKey(thread.repo.id),
+        settingValue: JSON.stringify({ readAt: toStatus === "read" ? nowUnix : 0, pinned: toStatus === "pinned" }),
+      })
+      .onConflictDoUpdate({
+        target: [userSettingsKv.userId, userSettingsKv.settingKey],
+        set:
+          toStatus === "pinned"
+            ? { settingValue: sql`json_set(${userSettingsKv.settingValue}, '$.pinned', json('true'))` }
+            : {
+                settingValue: sql`json_set(${userSettingsKv.settingValue}, '$.readAt', ${toStatus === "read" ? nowUnix : 0}, '$.pinned', json('false'))`,
+              },
+      }),
+  );
+  await db.batch(statements as BatchStatements);
+}
+
+/** The Repository subject's serialization (convert/notification.go:87-94) —
+ *  byte-for-byte upstream: the relative-path URL (the converter's own FIXME
+ *  kept), the empty latest-comment pair, and the zero state "" (the wire
+ *  enum's widened arm). */
+function toRepoNotificationThread(
+  viewer: Viewer,
+  thread: RepoThread,
+  status: { unread: boolean; pinned: boolean },
+): z.infer<typeof notificationThreadSchema> {
+  const origin = viewer.origin;
+  const pair = { repo: thread.repo, owner: thread.owner };
+  const ownerNamespace = encodeURIComponent(thread.repo.ownerNamespace);
+  const slug = encodeURIComponent(thread.repo.slug);
+  const id = -thread.transfer.id;
+
+  const repository: Repository = toApiRepository(viewer, pair);
+  // Upstream nulls the permissions block on the whole parent chain
+  // (services/convert/notification.go:40-43); there is no parent here.
+  delete repository.permissions;
+
+  return {
+    id,
+    repository,
+    subject: {
+      title: `${thread.repo.ownerNamespace}/${thread.repo.slug}`, // FullName
+      // FIXME carried from upstream: "this is a relative URL, rather useless
+      // and inconsistent, but keeping for backwards compat"
+      // (convert/notification.go:91-92).
+      url: `/${ownerNamespace}/${slug}`,
+      latest_comment_url: "",
+      html_url: `${origin}/${ownerNamespace}/${slug}`,
+      latest_comment_html_url: "",
+      type: "Repository",
+      state: "",
+    },
+    unread: status.unread,
+    pinned: status.pinned,
+    updated_at: new Date(thread.lastActivity * 1000).toISOString(),
+    url: `${origin}/api/v1/notifications/threads/${id}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Handlers (the list/read pair shared by the global and repo-scoped routes).
 // The response constructors stay inline in the route handlers — the
 // hono-zod-openapi Handler type wants the c.json/c.body call in its own body.
 // ---------------------------------------------------------------------------
 
-/** Shared list body: fetch + pagination headers + serialization. */
+/** Shared list body: fetch both legs, merge, pagination headers, serialize. */
 async function listThreadsPayload(
   c: Context<ApiEnv>,
   userId: number,
@@ -835,35 +1211,54 @@ async function listThreadsPayload(
 ): Promise<z.infer<typeof notificationThreadListSchema>> {
   const url = new URL(c.req.url);
   const listOptions = parseListOptions(url);
-  const { items, total } = await fetchThreads(c.env.DB, {
-    userId,
-    repoId,
-    updatedAfter: parseQueryTime(url.searchParams.get("since")) ?? undefined,
-    updatedBefore: parseQueryTime(url.searchParams.get("before")) ?? undefined,
-    statuses: parseFormBool(url.searchParams.get("all"))
-      ? []
-      : parseStatusTypes(url.searchParams.getAll("status-types"), ["unread", "pinned"]),
-    sources: parseSubjectTypes(url.searchParams.getAll("subject-type")),
-    listOptions,
-  });
-  setPaginationHeaders(c, total, listOptions);
+  const updatedAfter = parseQueryTime(url.searchParams.get("since")) ?? undefined;
+  const updatedBefore = parseQueryTime(url.searchParams.get("before")) ?? undefined;
+  const statuses = parseFormBool(url.searchParams.get("all"))
+    ? []
+    : parseStatusTypes(url.searchParams.getAll("status-types"), ["unread", "pinned"]);
+  const sources = parseSubjectTypes(url.searchParams.getAll("subject-type"));
+  // The two-leg top-K merge (module doc deviation 7): each leg fetches
+  // top-(page*limit), the merge sorts updated DESC / serialized-id DESC and
+  // slices the page window. The repository-source leg rides only when the
+  // subject-type filter admits it (commit stays match-nothing).
+  const repoLegAdmitted = sources === null || sources.includes("repository");
+  const topK = listOptions.page * listOptions.limit;
+  const [issuePage, repoPage] = await Promise.all([
+    fetchThreads(c.env.DB, { userId, repoId, updatedAfter, updatedBefore, statuses, sources, listOptions: { page: 1, limit: topK } }),
+    repoLegAdmitted
+      ? fetchRepoThreads(c.env.DB, { userId, repoId, updatedAfter, updatedBefore, statuses, topK })
+      : Promise.resolve({ items: [] as RepoThread[], total: 0 }),
+  ]);
+  setPaginationHeaders(c, issuePage.total + repoPage.total, listOptions);
+  const merged = [
+    ...issuePage.items.map((thread) => ({ id: thread.issue.id, lastActivity: thread.lastActivity, thread })),
+    ...repoPage.items.map((thread) => ({ id: -thread.transfer.id, lastActivity: thread.lastActivity, thread })),
+  ].sort((a, b) => b.lastActivity - a.lastActivity || b.id - a.id);
+  const window = merged.slice((listOptions.page - 1) * listOptions.limit, listOptions.page * listOptions.limit);
   const viewer = viewerOf(c);
-  return items.map((thread) => toNotificationThread(viewer, thread, resolvedStatus(thread)));
+  return window.map((entry) =>
+    "issue" in entry.thread
+      ? toNotificationThread(viewer, entry.thread, resolvedStatus(entry.thread))
+      : toRepoNotificationThread(viewer, entry.thread, resolvedStatus(entry.thread)),
+  );
 }
 
-/** Shared mark body: fetch the in-scope threads and write their state rows. */
+/** Shared mark body: fetch the in-scope threads of BOTH legs and write
+ *  their state (notification_states / the KV arm — deviation 7). */
 async function markThreadsInScope(c: Context<ApiEnv>, userId: number, repoId: string | undefined): Promise<void> {
   const url = new URL(c.req.url);
-  const { items } = await fetchThreads(c.env.DB, {
-    userId,
-    repoId,
-    // No pagination on the mark sweep (upstream Find without ListOptions).
-    updatedBefore: parseLastReadAt(url.searchParams.get("last_read_at")),
-    statuses: parseFormBool(url.searchParams.get("all"))
-      ? []
-      : parseStatusTypes(url.searchParams.getAll("status-types"), ["unread"]),
-  });
-  await markThreads(c.env.DB, userId, items, parseToStatus(url.searchParams.get("to-status")), new Date());
+  // No pagination on the mark sweep (upstream Find without ListOptions).
+  const updatedBefore = parseLastReadAt(url.searchParams.get("last_read_at"));
+  const statuses = parseFormBool(url.searchParams.get("all"))
+    ? []
+    : parseStatusTypes(url.searchParams.getAll("status-types"), ["unread"]);
+  const toStatus = parseToStatus(url.searchParams.get("to-status"));
+  const now = new Date();
+  const { items } = await fetchThreads(c.env.DB, { userId, repoId, updatedBefore, statuses });
+  await markThreads(c.env.DB, userId, items, toStatus, now);
+  // The mark arms carry no subject-type param, so the repo leg always rides.
+  const repoLeg = await fetchRepoThreads(c.env.DB, { userId, repoId, updatedBefore, statuses });
+  await markRepoThreads(c.env.DB, userId, repoLeg.items, toStatus, now);
 }
 
 function requireDoer(c: Context<ApiEnv>): { id: number; is_admin: boolean } {
@@ -880,12 +1275,16 @@ function requireDoer(c: Context<ApiEnv>): { id: number; is_admin: boolean } {
 // Single-thread lookup (notify/threads.go getThread guard, mirrored).
 // ---------------------------------------------------------------------------
 
-/** Resolve one derived thread by id with the upstream ownership guard. */
+/** Resolve one derived thread by id with the upstream ownership guard.
+ *  Negative ids branch to the repository-source leg (deviation 7). */
 async function threadById(
   d1: D1Database,
   doer: { id: number; is_admin: boolean },
   id: number,
-): Promise<DerivedThread> {
+): Promise<DerivedThread | RepoThread> {
+  if (id < 0) {
+    return repoThreadById(d1, doer, id);
+  }
   const db = drizzle(d1);
   const rows = await db
     // pull trimmed to the serializer's only read (the D1 result-set cap).
@@ -1043,7 +1442,12 @@ export function registerNotificationsRoutes(app: OpenAPIHono<ApiEnv>, requireAut
       },
     }),
     async (c) => {
-      const total = await countThreads(c.env.DB, { userId: requireDoer(c).id, statuses: ["unread"] });
+      // The unread count rides the merged totals (deviation 7): the issue
+      // leg plus the repository-source leg.
+      const doer = requireDoer(c);
+      const total =
+        (await countThreads(c.env.DB, { userId: doer.id, statuses: ["unread"] })) +
+        (await countRepoThreads(c.env.DB, { userId: doer.id, statuses: ["unread"] }));
       return c.json({ new: total }, 200);
     },
   );
@@ -1068,7 +1472,15 @@ export function registerNotificationsRoutes(app: OpenAPIHono<ApiEnv>, requireAut
     async (c) => {
       const doer = requireDoer(c);
       const thread = await threadById(c.env.DB, doer, pathId(c.req.valid("param").id));
-      return c.json(toNotificationThread(viewerOf(c), thread, resolvedStatus(thread)), 200);
+      const viewer = viewerOf(c);
+      // The serializer branches on the thread kind (deviation 7): the
+      // Repository subject arm for the pending-transfer leg.
+      return c.json(
+        "issue" in thread
+          ? toNotificationThread(viewer, thread, resolvedStatus(thread))
+          : toRepoNotificationThread(viewer, thread, resolvedStatus(thread)),
+        200,
+      );
     },
   );
 
@@ -1092,7 +1504,14 @@ export function registerNotificationsRoutes(app: OpenAPIHono<ApiEnv>, requireAut
     async (c) => {
       const doer = requireDoer(c);
       const thread = await threadById(c.env.DB, doer, pathId(c.req.valid("param").id));
-      await markThreads(c.env.DB, doer.id, [thread], parseToStatus(c.req.valid("query")["to-status"]), new Date());
+      const toStatus = parseToStatus(c.req.valid("query")["to-status"]);
+      // The mark branches on the thread kind (deviation 7): issue threads
+      // write notification_states, repository-source threads the KV arm.
+      if ("issue" in thread) {
+        await markThreads(c.env.DB, doer.id, [thread], toStatus, new Date());
+      } else {
+        await markRepoThreads(c.env.DB, doer.id, [thread], toStatus, new Date());
+      }
       // Deviation 6: the 205 body upstream sends cannot exist on this runtime.
       return c.body(null, 205);
     },

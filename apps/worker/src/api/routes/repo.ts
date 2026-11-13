@@ -6,7 +6,7 @@ import { z } from "zod";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { orgMembers, repositories, teams } from "../../db/schema";
+import { orgMembers, repositories, teams, users } from "../../db/schema";
 import {
   OwnerNotAssignableError,
   RepoNameCollisionError,
@@ -47,6 +47,7 @@ import {
   MirrorValidationError,
 } from "../services/mirror";
 import { switchSchedulesToDefaultBranch } from "../../services/actions/schedule";
+import { notifyRepoPendingTransfer } from "../../services/mail/notify";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
 import { engineCell, engineReads } from "../services/engine";
@@ -1030,6 +1031,26 @@ export function registerRepoRoutes(
           throw new ApiError(409, error.message);
         }
         throw error;
+      }
+
+      // The RepoPendingTransfer mail arm (services/repository/transfer.go:506,
+      // the pending arm after the tx commits — services/mail/notify.ts's
+      // receiver doc): mail the pending recipient set (the org grant fan or
+      // the target user). Catch-and-log — a mailer outage must never fail the
+      // 201. The notification-row half needs no write here: the recipient's
+      // thread derives at READ time from the pending row itself
+      // (api/routes/notifications.ts, the repository-source leg).
+      try {
+        const doer = await drizzle(c.env.DB).select().from(users).where(eq(users.id, requester.id ?? 0)).get();
+        if (doer === undefined) {
+          console.error(`[repo] repo-transfer notify skipped: doer row missing [id: ${requester.id ?? 0}]`);
+        } else {
+          await notifyRepoPendingTransfer(c.env, { repoId: found.repo.id, doer, newOwner: target });
+        }
+      } catch (error) {
+        console.error(
+          `[repo] repo-transfer notify failed (repo ${found.repo.id}): ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
 
       // 201 + the CURRENT Repository — the transfer is pending, not applied

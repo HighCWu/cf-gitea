@@ -309,15 +309,21 @@ export interface FeedActor {
 }
 
 /** Which feed family the query targets. */
-export type FeedKind = "repo" | "user" | "org";
+export type FeedKind = "repo" | "user" | "org" | "team";
 
 export interface FeedQueryOptions {
   kind: FeedKind;
   /** kind=repo: the TEXT repositories.id. */
   repoId?: string;
-  /** kind=user|org: the requested subject's row (user rows cover orgs —
-   *  only the id feeds the predicates). */
+  /** kind=user|org|team: the requested subject's row (user rows cover orgs —
+   *  only the id feeds the predicates; for kind=team it is the TEAM's org —
+   *  upstream resolves RequestedTeam → RequestedUser = the org,
+   *  action.go:475-479). */
   requested?: { id: number };
+  /** kind=team: the requested team itself (orgListTeamActivityFeeds,
+   *  team.go:834-856) — the repo pin `repo_id IN` the team's covered set
+   *  (action.go:523-530 → AccessibleTeamReposEnv). */
+  team?: { id: number; orgId: number; includesAll: boolean };
   /** The viewer's identity row (null = anonymous). */
   actor: FeedActor | null;
   /** Per-endpoint IncludePrivate (SPEC §2): repo=true; user=self||admin;
@@ -369,9 +375,11 @@ function actUserCond(opts: FeedQueryOptions): SQL | undefined {
     sql`${actions.actUserId} IN (SELECT id FROM ${users} WHERE visibility IN ('public', 'limited'))`,
     sql`${actions.actUserId} = ${opts.actor.id}`,
   ];
-  if (opts.kind === "org" && opts.requested !== undefined) {
+  if ((opts.kind === "org" || opts.kind === "team") && opts.requested !== undefined) {
     // "An organization can always see the activities whose act_user_id is
-    // the same as its id" (action.go:488-490).
+    // the same as its id" (action.go:488-490) — the team feeds arm reaches
+    // the same branch by resolving RequestedTeam to the org first
+    // (action.go:475-479), so kind=team requested = the org.
     branches.push(sql`${actions.actUserId} = ${opts.requested.id}`);
   }
   if (opts.kind === "user" && opts.requested !== undefined) {
@@ -397,10 +405,27 @@ function actUserCond(opts: FeedQueryOptions): SQL | undefined {
 }
 
 /**
+ * The RequestedTeam repo pin (action.go:523-530 → AccessibleTeamReposEnv,
+ * org_repo.go:109-141 — the `team_repo` join): repo_id restricted to the
+ * team's covered set. includes_all coverage rides the read-side union (the
+ * org-teams module's convention — repos created after the last fan-out are
+ * real coverage on reads).
+ */
+function teamRepoCond(team: { id: number; orgId: number; includesAll: boolean }): SQL {
+  const materialized = sql`SELECT tra.repo_id FROM ${teamRepoAccess} tra WHERE tra.team_id = ${team.id}`;
+  const covered = team.includesAll
+    ? sql`(${materialized} UNION SELECT id FROM ${repositories} WHERE owner_id = ${team.orgId})`
+    : sql`(${materialized})`;
+  return sql`${actions.repoId} IN ${covered}`;
+}
+
+/**
  * Repo accessibility (action.go:499-501, AccessibleRepoIDsQuery) over the
  * landed repo model: public repos ∪ actor-owned ∪ collaborator rows ∪
  * team-granted (team_members ⋈ team_repo_access). Admins and the repo-kind
- * endpoint (the repo was already visibility-gated by the route) skip it.
+ * endpoint (the repo was already visibility-gated by the route) skip it —
+ * the team feeds arm KEEPS it for non-admin actors (upstream applies the
+ * accessible-repos filter to every non-site-admin arm, action.go:499-501).
  */
 function repoAccessCond(opts: FeedQueryOptions): SQL | undefined {
   if (opts.actor === null) {
@@ -443,6 +468,12 @@ function feedCondition(opts: FeedQueryOptions): SQL | undefined {
     parts.push(sql`${actions.userId} = ${actions.actUserId}`);
   } else {
     parts.push(eq(actions.userId, opts.requested?.id ?? -1));
+  }
+  if (opts.kind === "team" && opts.team !== undefined) {
+    // B-76 — the RequestedTeam pin (action.go:523-530): the org's receiver
+    // rows (the user_id filter above rides the kind!=repo else branch with
+    // requested = the org) restricted to the team's covered repos.
+    parts.push(teamRepoCond(opts.team));
   }
   if (opts.onlyPerformedBy) {
     parts.push(eq(actions.actUserId, opts.requested?.id ?? -1));
