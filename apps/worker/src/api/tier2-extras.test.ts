@@ -477,10 +477,10 @@ describe("issue subscriptions (issue-t2)", () => {
 
 describe("pinned issues/pulls (issue-t2)", () => {
   it("lists pinned issues and pulls in pin order", async () => {
-    await env.DB.prepare("INSERT INTO issue_pins (issue_id, repo_id, pin_order) VALUES (?1, ?2, 1), (?3, ?2, 2)")
+    await env.DB.prepare("INSERT INTO issue_pins (issue_id, repo_id, is_pull, pin_order) VALUES (?1, ?2, 0, 1), (?3, ?2, 0, 2)")
       .bind(issueB.id, REPO_ID, issueA.id)
       .run();
-    await env.DB.prepare("INSERT INTO issue_pins (issue_id, repo_id, pin_order) VALUES (?1, ?2, 0)")
+    await env.DB.prepare("INSERT INTO issue_pins (issue_id, repo_id, is_pull, pin_order) VALUES (?1, ?2, 1, 0)")
       .bind(await pullRowId(), REPO_ID)
       .run();
 
@@ -665,10 +665,10 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
       });
     const secondPullIssueId = secondPull.issue.id;
     await drizzle(env.DB).insert(issuePins).values([
-      { issueId: issueB.id, repoId: REPO_ID, pinOrder: 1 },
-      { issueId: issueA.id, repoId: REPO_ID, pinOrder: 2 },
-      { issueId: seededPullIssueId, repoId: REPO_ID, pinOrder: 1 },
-      { issueId: secondPullIssueId, repoId: REPO_ID, pinOrder: 2 },
+      { issueId: issueB.id, repoId: REPO_ID, isPull: false, pinOrder: 1 },
+      { issueId: issueA.id, repoId: REPO_ID, isPull: false, pinOrder: 2 },
+      { issueId: seededPullIssueId, repoId: REPO_ID, isPull: true, pinOrder: 1 },
+      { issueId: secondPullIssueId, repoId: REPO_ID, isPull: true, pinOrder: 2 },
     ]);
 
     // The tier-1 issue routes mount beside the family app so the per-row

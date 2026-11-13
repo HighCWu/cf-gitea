@@ -876,6 +876,16 @@ export const PRFlow = {
   AGit: 1,
 } as const;
 
+/** `pull_requests.type` — upstream `PullRequestType` (models/issues/pull.go:
+ *  87-93). Every upstream create path stamps `PullRequestGitea` (0) — the API
+ *  create (routers/api/v1/repo/pull.go:521), the agit port
+ *  (services/agit/agit.go:188) and the web create (routers/web/repo/pull.go:
+ *  1385); `PullRequestGit` (1) has no writer upstream, ours never either. */
+export const PRType = {
+  Gitea: 0,
+  Git: 1,
+} as const;
+
 /**
  * Issues and pull requests (SPEC-0005 §3.2). A PR is an issue row with
  * `is_pull = 1` plus a `pull_requests` row joined on `issue_id`; both draw
@@ -983,6 +993,21 @@ export const pullRequests = sqliteTable(
     mergerId: integer("merger_id"),
     mergedAt: integer("merged_unix", { mode: "timestamp" }),
     flow: integer("flow").notNull().default(PRFlow.Github),
+    /** `PullRequestType` (pull.go:122 — untagged, nullable upstream; FN
+     *  completion, migration 0078). The DEFAULT carries the Go zero-value
+     *  `PullRequestGitea` every upstream create arm stamps (see `PRType`),
+     *  so the value space stays 0 without a per-arm writer leg: drizzle
+     *  inserts bind the VALUE default (the TABLEMISS2 dialect finding),
+     *  raw inserts read the DDL constant, and pre-0078 rows read the
+     *  ALTER default. A drizzle reader would surface `null` only for rows
+     *  written with the column explicitly NULL — no such writer exists. */
+    type: integer("type").default(PRType.Gitea),
+    /** `ChangedProtectedFiles` (pull.go:128, `xorm:"TEXT JSON"`) — the
+     *  protected-file delta snapshot upstream recomputes at merge time.
+     *  Landed nullable, port-when-read: no writer or reader yet (the merge
+     *  arms have no protected-file delta pass), rows stay NULL until one
+     *  lands. */
+    changedProtectedFiles: text("changed_protected_files"),
   },
   (t) => [
     uniqueIndex("pull_requests_issue_id_uq").on(t.issueId),
@@ -1135,24 +1160,30 @@ export const labels = sqliteTable("labels", {
   ],
 );
 
-/** Issue↔label attachment (SPEC-0005 §3.2). */
+/** Issue↔label attachment (SPEC-0005 §3.2). Mirrors `IssueLabel`
+ *  (models/issues/issue_label.go:19-23): the surrogate `id` pk landed with
+ *  migration 0078 (FN-10) — the composite (issue_id, label_id) PK demoted to
+ *  the `issue_labels_issue_label_uq` uniqueIndex (upstream UNIQUE(s)), which
+ *  keeps arbitrating every writer's target-less `onConflictDoNothing`.
+ *  Column order follows the upstream struct (the 0077 rebuild convention).
+ */
 export const issueLabels = sqliteTable(
   "issue_labels",
   {
+    id: integer("id").primaryKey({ autoIncrement: true }),
     issueId: integer("issue_id").notNull(),
     labelId: integer("label_id").notNull(),
   },
   (t) => [
-    primaryKey({ columns: [t.issueId, t.labelId] }),
+    uniqueIndex("issue_labels_issue_label_uq").on(t.issueId, t.labelId),
     // Index audit P2: the label-filtered list pages embed `issue_id IN
     // (SELECT issue_id FROM issue_labels WHERE label_id IN (…))` (the shared
     // WHERE builders, api/services/issues.ts:671 + pulls.ts:227) and the
     // label delete cascade detaches edges by label_id (api/services/labels.ts
-    // :234) — the PK leads with issue_id, so neither could seek. Deliberate
-    // divergence from upstream (models/issues/issue_label.go:19-23: the
-    // UNIQUE(s) composite leads with issue_id; upstream scans the label side
-    // too) — the follows/star reverse-index precedent for the read-heavy
-    // direction.
+    // :234) — neither could seek the UNIQUE(s) composite (it leads with
+    // issue_id). Deliberate divergence from upstream (upstream scans the
+    // label side too) — the follows/star reverse-index precedent for the
+    // read-heavy direction.
     index("issue_labels_label_idx").on(t.labelId),
   ],
 );
@@ -1442,22 +1473,37 @@ export const commitStatusIndexes = sqliteTable(
 export type CommitStatusRow = typeof commitStatuses.$inferSelect;
 export type LabelRow = typeof labels.$inferSelect;
 
-/** Issue pins (tier-2 surface, table now per §3.2). */
+/** Issue pins (tier-2 surface, table now per §3.2). Mirrors `IssuePin`
+ *  (models/issues/issue_pin.go:17-23): the surrogate `id` pk and `is_pull`
+ *  landed with migration 0078 (FN-10 residue) via a REBUILD — column order
+ *  follows the upstream struct (the 0077 rebuild convention). The old
+ *  single-column issue_id PK demoted to the `issue_pins_issue_id_uq`
+ *  uniqueIndex, which keeps arbitrating every writer's target-less
+ *  `onConflictDoNothing`; since an issue belongs to exactly one repo, the
+ *  issue_id domain equals upstream's UNIQUE(s)(repo_id, issue_id) — same
+ *  constraint, the repo lead is functionally dependent.
+ */
 export const issuePins = sqliteTable(
   "issue_pins",
   {
-    issueId: integer("issue_id").primaryKey(),
+    id: integer("id").primaryKey({ autoIncrement: true }),
     // NOT NULL per upstream `RepoID int64 UNIQUE(s) NOT NULL`
     // (models/issues/issue_pin.go:19) — the FN-10 strictness flip (audit
     // §7.1 ours-looser arm, migration 0073): the single writer
     // (insertIssuePin) copies issues.repo_id (itself NOT NULL), so no NULL
-    // path exists. The PK stays the single-column issue_id (the audit
-    // §7.1 shape erratum; upstream's UNIQUE(s) rides the
-    // issue_pins_repo_order_idx lead below as the documented divergence).
+    // path exists.
     repoId: text("repo_id").notNull(),
+    issueId: integer("issue_id").notNull(),
+    /** Upstream `IsPull bool xorm:"NOT NULL"` (issue_pin.go:21) — the issue
+     *  vs PR pin split moved from the readers' issues join into the row.
+     *  NO DDL default (value-drift rule): the one writer stamps
+     *  `issues.is_pull` (issue-extras.ts insertIssuePin), and the 0078 copy
+     *  leg backfilled the pre-existing rows from the same column. */
+    isPull: integer("is_pull", { mode: "boolean" }).notNull(),
     pinOrder: integer("pin_order").notNull(),
   },
   (t) => [
+    uniqueIndex("issue_pins_issue_id_uq").on(t.issueId),
     // Index audit P2: the pinned-issues strips. The pin list per repo joins
     // `WHERE issue_pins.repo_id = ? AND issues.is_pull = ? ORDER BY
     // issue_pins.pin_order` (api/services/issue-extras.ts:218-221 on the
@@ -1469,8 +1515,8 @@ export const issuePins = sqliteTable(
     // issue_pin.go:19-23), whose repo_id lead already indexes these scans;
     // ours extends the lead with pin_order so the ordered strip reads the
     // index in order and the reorder shift gets a range seek (documented
-    // divergence: (repo_id, pin_order), no uniqueness — the PK is the
-    // arbiter).
+    // divergence: (repo_id, pin_order), no uniqueness — the issue_id
+    // uniqueIndex is the arbiter).
     index("issue_pins_repo_order_idx").on(t.repoId, t.pinOrder),
   ],
 );
@@ -4228,14 +4274,17 @@ export const packageCleanupRules = sqliteTable(
  * offset gate) and `chunk_count` (the ordered chunk enumeration — upstream
  * infers the extent from the file).
  *
- * ONE disclosed column reduction: upstream's `HashStateBytes BLOB` (the
- * serialized MultiHasher resume state, blob_uploader.go:48-53) has NO analog —
- * Workers' WebCrypto digest state is unserializable — so the PUT re-streams
- * the chunks through fresh digests to verify the `?digest=` param (the
- * container service module documents the trade). `updated_unix` keeps
- * upstream's INDEX (FindExpiredBlobUploads' sweep scan, :71-76); `created_unix`
- * stays a plain column (upstream `created` is unindexed). No UNIQUEs beyond
- * the PK — the id is the random session handle (upstream
+ * Upstream's `HashStateBytes BLOB` (the serialized MultiHasher resume state,
+ * blob_uploader.go:48-53) LANDED as the nullable `hash_state_bytes` column
+ * (migration 0078, FN-11's port decision — the column is structure parity)
+ * but keeps the writer reduction: Workers' WebCrypto digest state is
+ * unserializable, so the PUT re-streams the chunks through fresh digests to
+ * verify the `?digest=` param (the container service module documents the
+ * trade) and every row writes NULL — port-when-read, the column gains a
+ * writer only when a consumer needs resumable hash state. `updated_unix`
+ * keeps upstream's INDEX (FindExpiredBlobUploads' sweep scan, :71-76);
+ * `created_unix` stays a plain column (upstream `created` is unindexed). No
+ * UNIQUEs beyond the PK — the id is the random session handle (upstream
  * CryptoRandomString(25); ours crypto.randomUUID() per the Workers ID rule).
  */
 export const packageBlobUploads = sqliteTable(
@@ -4250,6 +4299,11 @@ export const packageBlobUploads = sqliteTable(
     createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
     /** Upstream `UpdatedUnix INDEX NOT NULL` — the expiry sweep's scan key. */
     updatedUnix: integer("updated_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `HashStateBytes BLOB` (package_blob_upload.go:27) — landed
+     *  nullable with migration 0078 (FN-11), written never: see the module
+     *  docstring's writer-reduction derivation. Buffer mode = the raw
+     *  serializer state upstream stores. */
+    hashStateBytes: blob("hash_state_bytes", { mode: "buffer" }),
   },
   (t) => [
     index("package_blob_uploads_updated_idx").on(t.updatedUnix),

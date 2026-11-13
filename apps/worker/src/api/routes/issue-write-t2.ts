@@ -83,9 +83,9 @@ import type { RepositoryWithOwner } from "../services/repository";
  * (`setting.Repository.Issue.MaxPinned`, modules/setting/repository.go:223 —
  * no settings module yet); the archived-repo gate is wired on the label
  * detach only (upstream registers mustNotBeArchived there and NOT on the pin
- * group — the asymmetry is mirrored); the pin shift filters the issue/pull
- * split through an issues join because our `issue_pins` carries no is_pull
- * column (the landed listPinnedIssues does the same join).
+ * group — the asymmetry is mirrored); issue_pins carries is_pull since 0078
+ * (TABLEMISS4) — the join here remains the listPinnedIssues-compatible
+ * read shape.
  *
  * Webhook trigger (SPEC-0005 §3.5, the wave that lifted the old
  * "label detach emits nothing" deviation): the detach emits `issue_label` /

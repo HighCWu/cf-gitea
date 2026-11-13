@@ -893,7 +893,7 @@ describe("org column-issues list query-shape witness (query-shape-audit A2/A6, t
     for (const issue of [first, second, privIssue]) {
       await seedMembership(issue.id, project.id, column.id);
     }
-    await db().insert(issuePins).values({ issueId: first.id, repoId: orgRepo, pinOrder: 2 });
+    await db().insert(issuePins).values({ issueId: first.id, repoId: orgRepo, isPull: false, pinOrder: 2 });
 
     // The tier-1 issue routes mount beside the org family so the per-row
     // single GETs (private repo included — the owner bridge reads it) sit

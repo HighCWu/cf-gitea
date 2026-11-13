@@ -664,7 +664,7 @@ describe("POST /{issues|pulls}/{index}/lock + /unlock (upstream LockIssue/Unlock
 // --- the pin writes ---------------------------------------------------------------------------
 
 async function seedPin(issueId: number, repoId: string, order: number): Promise<void> {
-  await drizzle(env.DB).insert(issuePins).values({ issueId, repoId, pinOrder: order }).onConflictDoNothing();
+  await drizzle(env.DB).insert(issuePins).values({ issueId, repoId, isPull: false, pinOrder: order }).onConflictDoNothing();
 }
 
 describe("POST /{issues|pulls}/{index}/pin (upstream IssuePinOrUnpin) + DELETE /unpin/{index} + POST /move_pin", () => {

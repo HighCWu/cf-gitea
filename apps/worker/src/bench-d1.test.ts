@@ -569,7 +569,10 @@ async function seedFixtures(db: DrizzleD1Database): Promise<Fixtures> {
   const subscriptionValues = insertedIssues
     .filter((_, i) => i % 4 === 0)
     .map((issue) => ({ userId: memberId, issueId: issue.id, isWatching: true, createdAt: now, updatedAt: now }));
-  for (const part of chunks(subscriptionValues, 30)) {
+  // 0078's pull_requests.type stamp widened the row: 5 bound cols x 30 = 150
+  // binds > D1's 100-variable cap (the pre-existing runner break TABLEMISS4
+  // root-caused) — 20 keeps every part under the cap.
+  for (const part of chunks(subscriptionValues, 20)) {
     await db.insert(issueSubscriptions).values(part);
   }
   const stateValues = insertedIssues
@@ -1786,12 +1789,14 @@ describe("index witness (migration 0037 — the audit's P2 wave)", () => {
     ];
     for (const part of chunks(edgeValues, 40)) await db.insert(issueLabels).values(part);
 
-    // Pins: 12 in target (ordered), 6 distractors in other.
+    // Pins: 12 in target (ordered), 6 distractors in other. isPull mirrors
+    // the issue seed's `i % 10 === 0` predicate (the pin row carries its
+    // issue's discriminator since migration 0078).
     await db.insert(issuePins).values(
-      targetIssues.slice(0, 12).map((issue, i) => ({ issueId: issue.id, repoId: targetRepo, pinOrder: i + 1 })),
+      targetIssues.slice(0, 12).map((issue, i) => ({ issueId: issue.id, repoId: targetRepo, isPull: i % 10 === 0, pinOrder: i + 1 })),
     );
     await db.insert(issuePins).values(
-      otherIssues.slice(0, 6).map((issue, i) => ({ issueId: issue.id, repoId: otherRepo, pinOrder: i + 1 })),
+      otherIssues.slice(0, 6).map((issue, i) => ({ issueId: issue.id, repoId: otherRepo, isPull: i % 10 === 0, pinOrder: i + 1 })),
     );
 
     // Pull mirrors: due / future / syncing thirds (fake repo keys — the

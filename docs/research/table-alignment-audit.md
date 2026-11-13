@@ -73,6 +73,24 @@ sources and found accurate.
   29; the open migration-target count drops 11 → 6: `issue_labels.id` +
   `issue_pins.id`/`is_pull` (FN-10), `package_blob_uploads.hash_state_bytes`
   (FN-11 port-or-record), `pull_requests.type` + `changed_protected_files`).
+  **Reconciliation 4 (TABLEMISS4 unit, 2026-11-04):** the FN-10/FN-11
+  completion batch LANDED (migration `0078_gifted_lenny_balinger`) — the 6
+  open port columns are consumed (`issue_labels.id`, `issue_pins.id` +
+  `is_pull`, `package_blob_uploads.hash_state_bytes` via the port decision,
+  `pull_requests.type` + `changed_protected_files`), so the residual drops
+  **29 → 23 = 8 MISSING (all 8 the §7.11 recorded-absent pairs — open
+  MISSING port targets: 0) + 4 RENAME (all four §7.2-recorded — NOT port
+  targets; open rename targets: 0) + 4 OURS-EXTRA + 7 TYPE** (arithmetic:
+  63 − 17 − 12 − 5 − 6 = 23; the open migration-target count drops 6 → 0 —
+  the migration backlog for TABLE-SPECIFIC drift columns is EMPTY; what
+  remains is the recorded layers: §7.11's recorded-absent pairs, §7.2's
+  recorded renames, §7.8/§3.4's ours-extras, and the 7 TYPE divergences).
+  Composition erratum, disclosed: Reconciliation 3's headline said
+  "19 MISSING (8 recorded-absent + 6 open)" — the composition there was
+  stale (19 dated from Reconciliation 2's 8 + 11; after FN-12 consumed 5
+  it read 14 = 8 recorded-absent + 6 open); the 29 total was correct and
+  is unchanged by this erratum — this reconciliation states the corrected
+  composition so the arithmetic closes cleanly (14 − 6 = 8).
   The 4-missing-table
   figure undercounts by counting only data tables a reader would touch;
   this census counts every registered upstream table.
@@ -96,10 +114,10 @@ sources and found accurate.
   commit_statuses `context_hash`/`index` + commit_status_indexes — §3.1's
   rows carry the flips), and FN-7 LANDED (migration 0070,
   `merged_commit_id` + the stamp arm — §5's row carries the status).
-  The remaining open arms are FN-10's remainder (`issue_labels.id`,
-  `issue_pins.id`/`is_pull`), FN-11 (port-or-record), and FN-14
-  (port-when-read) — FN-12 LANDED (2026-11-04, migration 0077; see
-  Reconciliation 3) — the 4 residual RENAMEs of the reconciliation above
+  The remaining open arm is FN-14 (port-when-read) — FN-12 LANDED
+  (2026-11-04, migration 0077; see Reconciliation 3) and FN-10's remainder
+  + FN-11 LANDED (2026-11-04, migration 0078; see Reconciliation 4) —
+  the 4 residual RENAMEs of the reconciliation above
   are DISPOSITIONED as FN-13 §7.2-recorded (CENSUS3, 2026-11-04; see
   Reconciliation 2): no FN assignee needed, the RENAME backlog is empty.
 
@@ -262,7 +280,7 @@ classes only.
 | upstream table | upstream cite | our counterpart | verdict | reason (with cite) |
 |---|---|---|---|---|
 | `protected_tag` | models/git/protected_tag.go:21 | schema.ts:3321 `protected_tags` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): both gonic renames resolved upstream-EXACT — the columns are upstream's mapper outputs `allowlist_team_i_ds`/`allowlist_user_i_ds` again (schema.ts:3433/:3430 re-grepped 2026-11-04); the export/property names are kept per §7.10; no other divergence |
-| `package_blob_upload` | models/packages/package_blob_upload.go:24 | schema.ts:4042 `package_blob_uploads` | drift | hash_state_bytes missing (resumable-upload state); chunk_count extra |
+| `package_blob_upload` | models/packages/package_blob_upload.go:24 | schema.ts:4290 `package_blob_uploads` | drift | LANDED 2026-11-04 (FN-11's port decision, migration `0078_gifted_lenny_balinger`): `hash_state_bytes` landed nullable BLOB (schema.ts:4306, package_blob_upload.go:27) — structure parity; the writer reduction STANDS (Workers' WebCrypto digest state is unserializable — the container module's documented trade), rows write NULL, port-when-read; `chunk_count` stays the recorded ours-extra (the temp-file extent analog) |
 | `package_cleanup_rule` | models/packages/package_cleanup_rule.go:25 | schema.ts:3993 `package_cleanup_rules` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `commit_status_summary` | models/git/commit_status_summary.go:17 | — | missing-table | no reader in worker (grep 0) |
 | `commit_status` | models/git/commit_status.go:37 | schema.ts:1256 `commit_statuses` | aligned | LANDED 2026-11-04 (FN-8, migration 0072): `context_hash` VARCHAR→text (schema.ts:1284, the :50 tag's nullable posture) + `index` INTEGER (schema.ts:1269, the :41 tag — the SQLite reserved word backtick-quoted on every raw surface like upstream :315-325, :346, :357) + the three tag indexes in INDEX form incl. UNIQUE(repo_sha_index) (schema.ts:1301 — D1 ADD COLUMN cannot add table constraints, the FN-6/0066 lesson); block cite re-grepped at landing (:1256-1307) |
@@ -318,11 +336,11 @@ classes only.
 | `public_key` | models/asymkey/ssh_key.go:39 | schema.ts:2518 `public_keys` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `gpg_key_import` | models/asymkey/gpg_key_import.go:28 | — | missing-table | recorded unmodeled — raw armor not kept (schema.ts:2463-2464,2557) |
 | `audit_event` | models/audit/audit_event.go:22 | schema.ts:3817 `audit_event` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — ours' SQL column is upstream's `timestamp_unix` again (schema.ts:3854 re-grepped 2026-11-04, was :3757), matching TimestampUnix `xorm:"INDEX NOT NULL"` (audit_event.go:37); the property name (`createdUnix`) is kept per §7.10; the rest is blanket families (the id family — `scope_id` is §2 item 1's explicit member, TEXT per the ADR-0001 D3 record; the TEXT enum convention — §2 item 3's explicit `origin`/`scope_type` members plus `action`'s hierarchical-colon text port) |
-| `issue_pin` | models/issues/issue_pin.go:17 | schema.ts:1283 `issue_pins` | drift | missing id, is_pull (issue_pin.go:18,21); repo_id ours-NULLable TEXT vs upstream NOT NULL int64 (issue_pin.go:19 vs schema.ts:1287 — §7.1); FN-10 carries; §7.1 erratum: pin_order/issue_id are NOT inversions (ours is the stricter side) |
+| `issue_pin` | models/issues/issue_pin.go:17 | schema.ts:1486 `issue_pins` | drift | LANDED 2026-11-04 (FN-10 residue, migration `0078_gifted_lenny_balinger`): `id` + `is_pull` landed via REBUILD at the upstream struct's column order (schema.ts:1486; `is_pull` :1502, NOT NULL with NO DDL default per the value-drift rule — issue_pin.go:18,21; the one writer stamps `IsPull: issue.IsPull`, issue_pin.go:82, and the 0078 copy leg backfilled legacy rows from the joined issues.is_pull, COALESCE 0); the §7.1 repo_id NOT NULL flip rode 0073 (schema.ts:1489); the composite-PK option is DEAD per the §7.1 shape erratum — the surrogate id pk landed instead and the single-column issue_id PK demoted to the `issue_pins_issue_id_uq` uniqueIndex (domain-equivalent to upstream's UNIQUE(s)(repo_id, issue_id): issue→repo is functional); §7.1 erratum: pin_order/issue_id are NOT inversions (ours is the stricter side) |
 | `reaction` | models/issues/reaction.go:62 | schema.ts:1084 `reactions` | intentional-recorded | original_author/original_author_id recorded-absent (§7.11, SPEC-0005 §9; cites :69-70 — the off-by-one :70-71 corrected by the cite-audit) |
 | `review` | models/issues/review.go:123 | schema.ts:2629 `pull_reviews` | intentional-recorded | original_author/original_author_id recorded-absent (§7.11, SPEC-0005 §9; cites :130-131 — the off-by-one :131-132 corrected by the cite-audit) |
 | `issue_assignees` | models/issues/assignees.go:17 | schema.ts:2053 `issue_assignees` | aligned | blanket families only (id / timestamp-name / strictness) |
-| `pull_request` | models/issues/pull.go:120 | schema.ts:849 `pull_requests` | drift | FN-1 status-enum swap IN FLIGHT (migration 0064 + schema.ts:754-762 re-map); still missing type, changed_protected_files; ours-extra head_sha (documented) |
+| `pull_request` | models/issues/pull.go:120 | schema.ts:968 `pull_requests` | drift | LANDED 2026-11-04 (migration `0078_gifted_lenny_balinger`): `type` + `changed_protected_files` landed (schema.ts:1004/:1010 — pull.go:122/:128); `type` is nullable per the untagged upstream field and carries the DDL DEFAULT 0 — the Go zero-value `PullRequestGitea` every upstream create arm stamps (api pull.go:521, agit services/agit/agit.go:188, web pull.go:1385; `PullRequestGit` has no writer anywhere), so the value space stays 0 through both insert paths with no per-arm writer leg; `changed_protected_files` is TEXT JSON port-when-read; ours-extra `head_sha` (documented); the FN-1 status-enum swap LANDED earlier (migration 0064) |
 | `milestone` | models/issues/milestone.go:47 | schema.ts:1056 `milestones` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `stopwatch` | models/issues/stopwatch.go:20 | schema.ts:2131 `stopwatch` | aligned | blanket families only (id / timestamp-name / strictness) |
 | `issue` | models/issues/issue.go:54 | schema.ts:776 `issues` | aligned | LANDED 2026-11-04 (FN-5, 4b9d555, migration 0069): the rename resolved upstream-EXACT — ours' SQL column is upstream's `name` again (schema.ts:828 re-grepped 2026-11-04), matching the explicit column-NAME tag `xorm:"name"` (issue.go:63) that upstream's own SQL binds (issue_update.go:198; issue.go:536); the property name (`title`) is kept per §7.10; the rest is blanket families (id / timestamp-name / strictness) |
@@ -334,7 +352,7 @@ classes only.
 | `issue_watch` | models/issues/issue_watch.go:17 | schema.ts:1182 `issue_subscriptions` | aligned | 0073's strictness flips LANDED the NOT NULL timestamps (the line-1494 record; the old drift cell cited the pre-0073 NULLable columns — CENSUS-M3's flagged debt, folded at the convergence cleanup; blanket families only (id / timestamp-name / strictness)) |
 | `task` | models/admin/task.go:26 | — | missing-table | platform: admin task queue rides Cloudflare Queues/REPO_TASKS (SPEC-0020) |
 | `label` | models/issues/label.go:81 | schema.ts:1002 `labels` | aligned | blanket families only (id / strictness) — timestamp-name arm withdrawn by the §7.2 erratum (2026-11-04): ours' only timestamp column (`archived_unix`, schema.ts:1014) is parity-named, and upstream's `created_unix`/`updated_unix` (label.go:92-93) have no ours counterpart — wire-invisible upstream (structs/issue_label.go:17), an open missing-column finding routed to the census owner |
-| `issue_label` | models/issues/issue_label.go:19 | schema.ts:1030 `issue_labels` | drift | missing id pk (composite PK used) |
+| `issue_label` | models/issues/issue_label.go:19 | schema.ts:1170 `issue_labels` | drift | LANDED 2026-11-04 (FN-10 residue, migration `0078_gifted_lenny_balinger`): the surrogate `id` pk landed via REBUILD (schema.ts:1170, issue_label.go:20); the composite (issue_id, label_id) PK demoted to the `issue_labels_issue_label_uq` uniqueIndex (upstream UNIQUE(s), issue_label.go:21-22) — every writer's target-less `onConflictDoNothing` keeps arbitrating through it; column order follows the upstream struct (the 0077 rebuild convention) |
 | `app_state` | models/system/appstate.go:17 | — | missing-table | no reader; cron bookkeeping lives in ours cron_state (SPEC-0020) |
 | `notice` | models/system/notice.go:29 | schema.ts:4080 `system_notices` | intentional-recorded | system_notices plural + int type recorded; SPEC-0018 §4.1 (schema.ts:4080) |
 | `system_setting` | models/system/setting.go:20 | — | missing-table | platform: no runtime-writable settings store — config = wrangler vars; SPEC-0018 §1-2 |
@@ -798,14 +816,14 @@ is upstream's `name` again — ours upstream-EXACT; the property name
 
 upstream: models/issues/issue_label.go (struct `IssueLabel`)
 
-- MISSING `id` (integer) — upstream models/issues/issue_label.go:20 (`ID`); no ours counterpart
+- ~~MISSING `id` (integer) — upstream models/issues/issue_label.go:20 (`ID`); no ours counterpart~~ — **LANDED** 2026-11-04 (migration `0078_gifted_lenny_balinger`, FN-10 residue): the surrogate pk via a REBUILD — the composite pair demoted to the `issue_labels_issue_label_uq` uniqueIndex (the writers' target-less `onConflictDoNothing` arbiter unchanged); column order follows the upstream struct
 
-### `issue_pin` → `issue_pins` schema.ts:1283
+### `issue_pin` → `issue_pins` schema.ts:1486
 
 upstream: models/issues/issue_pin.go (struct `IssuePin`)
 
-- MISSING `id` (integer) — upstream models/issues/issue_pin.go:18 (`ID`); no ours counterpart
-- MISSING `is_pull` (boolean NOT NULL) — upstream models/issues/issue_pin.go:21 (`IsPull`); no ours counterpart
+- ~~MISSING `id` (integer) — upstream models/issues/issue_pin.go:18 (`ID`); no ours counterpart~~ — **LANDED** 2026-11-04 (migration `0078_gifted_lenny_balinger`, FN-10 residue): the surrogate pk via a REBUILD at the upstream struct's column order; the single-column issue_id PK demoted to the `issue_pins_issue_id_uq` uniqueIndex — domain-equivalent to upstream's UNIQUE(s)(repo_id, issue_id) since issue→repo is functional, and the writers' target-less `onConflictDoNothing` keeps arbitrating through it
+- ~~MISSING `is_pull` (boolean NOT NULL) — upstream models/issues/issue_pin.go:21 (`IsPull`); no ours counterpart~~ — **LANDED** 2026-11-04 (same migration): NOT NULL with NO DDL default (the value-drift rule — a default could silently store the wrong discriminator for PR pins); the one writer stamps `IsPull: issue.IsPull` (issue_pin.go:82, issue-extras `insertIssuePin`), and the 0078 copy leg backfilled legacy rows from the joined `issues.is_pull` (COALESCE 0) instead of a blind constant
 
 ### `issue_dependency` → `issue_dependency` schema.ts:2075
 
@@ -900,11 +918,11 @@ names are kept per the property-kept contract (§7.10)
 - RENAME `allowlist_team_i_ds` → `allowlist_team_ids` (ours `protected_tags`; schema.ts:3336) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `allowlist_team_i_ds`; rename resolved
 - RENAME `allowlist_user_i_ds` → `allowlist_user_ids` (ours `protected_tags`; schema.ts:3333) — **LANDED by FN-5** (4b9d555, migration 0069): ours renamed to upstream's `allowlist_user_i_ds`; rename resolved
 
-### `package_blob_upload` → `package_blob_uploads` schema.ts:4042
+### `package_blob_upload` → `package_blob_uploads` schema.ts:4290
 
 upstream: models/packages/package_blob_upload.go (struct `PackageBlobUpload`)
 
-- MISSING `hash_state_bytes` (blob) — upstream models/packages/package_blob_upload.go:27 (`HashStateBytes`); no ours counterpart
+- ~~MISSING `hash_state_bytes` (blob) — upstream models/packages/package_blob_upload.go:27 (`HashStateBytes`); no ours counterpart~~ — **LANDED** 2026-11-04 (migration `0078_gifted_lenny_balinger`, FN-11's port decision): nullable BLOB (`hash_state_bytes`, schema.ts:4306 re-grepped) — structure parity; the writer reduction STANDS (Workers' WebCrypto digest state is unserializable, so the PUT re-streams chunks through fresh digests — the container module's documented trade), rows write NULL, port-when-read: the column gains a writer only when a consumer needs resumable hash state
 - OURS-EXTRA `chunk_count` — schema.ts:4050 (`package_blob_uploads.chunkCount`)
 
 ### `project_board` → `project_columns` schema.ts:3188
@@ -992,12 +1010,12 @@ property name (`createdUnix`) is kept per the property-kept contract
 - TYPE `origin`: upstream integer (models/audit/audit_event.go:33) vs ours text (schema.ts:3748 (`audit_event`))
 - TYPE `scope_type`: upstream integer (models/audit/audit_event.go:31) vs ours text (schema.ts:3739 (`audit_event`))
 
-### `pull_request` → `pull_requests` schema.ts:849
+### `pull_request` → `pull_requests` schema.ts:968
 
 upstream: models/issues/pull.go (struct `PullRequest`)
 
-- MISSING `changed_protected_files` (text(json)) — upstream models/issues/pull.go:128 (`ChangedProtectedFiles`); no ours counterpart
-- MISSING `type` (integer) — upstream models/issues/pull.go:122 (`Type`); no ours counterpart
+- ~~MISSING `changed_protected_files` (text(json)) — upstream models/issues/pull.go:128 (`ChangedProtectedFiles`); no ours counterpart~~ — **LANDED** 2026-11-04 (migration `0078_gifted_lenny_balinger`): TEXT JSON nullable (schema.ts:1010 re-grepped), port-when-read — the merge arms have no protected-file delta pass yet, rows stay NULL until one lands
+- ~~MISSING `type` (integer) — upstream models/issues/pull.go:122 (`Type`); no ours counterpart~~ — **LANDED** 2026-11-04 (same migration): nullable per the untagged upstream field, with the DDL DEFAULT 0 carrying the Go zero-value `PullRequestGitea` every upstream create arm stamps (api pull.go:521, services/agit/agit.go:188, web pull.go:1385 — `PullRequestGit` has no writer anywhere); the value space stays 0 through both insert paths (drizzle binds the VALUE default, raw inserts and pre-0078 rows read the DDL constant) with no per-arm writer leg — a DEFAULT is only value-drift when it can store a wrong value (the is_pull rejection), and here it cannot
 - OURS-EXTRA `head_sha` — schema.ts:868 (`pull_requests.headSha`)
 
 ### `lfs_lock` → `lfs_locks` schema.ts:1471
@@ -1166,8 +1184,10 @@ applies).
   (`gitea/models/issues/pull.go:100-107`) is Conflict=0, Checking=1,
   Mergeable=2, ManuallyMerged=3, Error=4, Empty=5, Ancestor=6; ours at
   audit-start (schema.ts enum object, comment at :752-753) swapped 2↔3 —
-  `ManuallyMerged: 2, Mergeable: 3`. **STATUS: IN FLIGHT as this audit
-  closed** — the sibling unit's fix is in the worktree: the enum object at
+  `ManuallyMerged: 2, Mergeable: 3`. **STATUS: LANDED** (migration
+  `0064_pr-status-upstream-alignment` — the landing-state paragraph above
+  records it verified; this bullet's in-flight wording is the audit-era
+  snapshot) — the sibling unit's fix landed: the enum object at
   schema.ts:754-762 now carries upstream's order verbatim (comment cites
   :100-107), and the stored-row remap landed as migration
   `0064_pr-status-upstream-alignment.sql` (single-statement
@@ -1399,14 +1419,26 @@ applies).
 - **FN-10: issue_pins + issue_labels pk completion.** `issue_pins`: add
   `id`, `is_pull` (issue_pin.go:18,21); the `repo_id` nullability arm
   **LANDED** 2026-11-04 (migration `0073_fn10-12-strictness` — the
-  single-column issue_id PK untouched, the composite-PK option DEAD per
-  the §7.1 shape erratum: only repo_id's nullability was ever a real
-  inversion on this table); `issue_labels`: add `id`
-  (issue_label.go:20) or record the composite-PK choice.
+  single-column issue_id PK untouched at the time, the composite-PK option
+  DEAD per the §7.1 shape erratum: only repo_id's nullability was ever a
+  real inversion on this table); `issue_labels`: add `id`
+  (issue_label.go:20) or record the composite-PK choice — **LANDED
+  2026-11-04** (migration `0078_gifted_lenny_balinger`, TABLEMISS4): both
+  tables rebuilt onto the upstream surrogate id pk, `is_pull` NOT NULL
+  stamped by the one writer (issue_pin.go:82) with the copy leg
+  backfilling from the joined issues.is_pull; the composite pairs demoted
+  to `issue_labels_issue_label_uq` / `issue_pins_issue_id_uq`
+  uniqueIndexes (the target-less `onConflictDoNothing` arbiters
+  unchanged); the §3.1 rows + §4 sections carry the annotations.
 - **FN-11: package_blob_upload resumable state.** Missing
   `hash_state_bytes` (package_blob_upload.go:27 — the rolling upload
   checksum state); ours `chunk_count` is the recorded replacement —
-  port-or-record.
+  port-or-record — **RESOLVED by the port decision, LANDED 2026-11-04**
+  (migration `0078_gifted_lenny_balinger`, TABLEMISS4): the column landed
+  nullable BLOB, the writer reduction stands (WebCrypto digest state
+  unserializable — rows write NULL, port-when-read), `chunk_count` stays
+  the recorded ours-extra; the §3.1 row + §4 section carry the
+  annotations.
 - **FN-12: small completions.** `gpg_keys.emails` (gpg_key.go:33 — the
   serialized address list), `issue_dependency.updated_unix`
   (dependency.go:107), `repo_transfer.recipient_access_granted` +
@@ -1492,7 +1524,7 @@ record. Verified members:
 | column | ours | upstream | disposition |
 |---|---|---|---|
 | `issue_subscriptions.created_unix` / `.updated_unix` | NULLable (schema.ts:1189-1190) | `NOT NULL` (models/issues/issue_watch.go:22-23) | **LANDED** 2026-11-04 — migration `0073_fn10-12-strictness` (the FN-12 carrier): the strictness flip via the table rebuild; the one writer (setIssueSubscription, issue-extras.ts) stamps both arms, so no NULL path existed; the 0073 battery in schema.test.ts pins the DDL, the violation probes, and the writer shapes |
-| `issue_pins.repo_id` | NULLable TEXT (schema.ts:1287) | `int64 UNIQUE(s) NOT NULL` (models/issues/issue_pin.go:19) | **LANDED** 2026-11-04 — migration `0073_fn10-12-strictness` (the FN-10 carrier): the NOT NULL flip only, the single-column issue_id PK untouched — the earlier "composite PK" option is DEAD per the §7.1 shape erratum (ours' PK is issue_id alone; repo_id's NULLability was the real inversion); upstream's `UNIQUE(s)` rides the `issue_pins_repo_order_idx` lead as the recorded divergence; the one writer (insertIssuePin) copies issues.repo_id (itself NOT NULL), so no NULL path existed |
+| `issue_pins.repo_id` | NULLable TEXT (schema.ts:1287) | `int64 UNIQUE(s) NOT NULL` (models/issues/issue_pin.go:19) | **LANDED** 2026-11-04 — migration `0073_fn10-12-strictness` (the FN-10 carrier): the NOT NULL flip only, the single-column issue_id PK untouched at the time — the earlier "composite PK" option is DEAD per the §7.1 shape erratum (repo_id's NULLability was the real inversion); upstream's `UNIQUE(s)` rides the `issue_pins_repo_order_idx` lead as the recorded divergence; the one writer (insertIssuePin) copies issues.repo_id (itself NOT NULL), so no NULL path existed. Migration `0078_gifted_lenny_balinger` (FN-10 residue, same day) then rebuilt the table onto the upstream surrogate id pk — the issue_id PK demoted to the `issue_pins_issue_id_uq` uniqueIndex (domain-equivalent to upstream's UNIQUE(s)(repo_id, issue_id): issue→repo is functional) and the UNIQUE(s)-rides-the-lead note above is superseded (schema.ts:1489 re-grepped, was :1287) |
 | `users.email` / `users.avatar_email` | NULLable (schema.ts:604, 641) | `NOT NULL` (models/user/user.go:101, 149) | **intentional-recorded** via SPEC-0002 §4.6 item 16 — part of the recorded users reduction: orgs ARE user rows here and the org-create surface writes `email: input.email ?? null`, `avatarEmail: null` (services/orgs/orgs.ts:430-437); upstream's org-as-user-row survives the same NOT NULL only because xorm writes the Go zero `''` for the never-set fields (CreateOrganization, models/organization/org.go:316-337, sets no Email) — ours models "no email" as NULL where upstream stores `''`; same information, different zero convention |
 | `repo_transfer.created_at` | NOT NULL DEFAULT unixepoch (schema.ts:421-423) | `INDEX NOT NULL created` (models/repo/transfer.go:77) | parity-strict — checked because §2.7's itemization hinted at it; no inversion |
 

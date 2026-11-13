@@ -1022,7 +1022,7 @@ describe("GET /repos/{owner}/{repo}/new_pin_allowed (repoNewPinAllowed)", () => 
     const service = new IssuesService(env.DB);
     for (let i = 0; i < 3; i++) {
       const issue = await service.createIssue({ repoId: REPO_ID, title: `pin-${i}`, posterId: 1 });
-      await drizzle(env.DB).insert(issuePins).values({ issueId: issue.id, repoId: REPO_ID, pinOrder: i + 1 });
+      await drizzle(env.DB).insert(issuePins).values({ issueId: issue.id, repoId: REPO_ID, isPull: false, pinOrder: i + 1 });
     }
     const pinPull = async (i: number) => {
       const pull = await service.createPullRequest({
@@ -1033,7 +1033,7 @@ describe("GET /repos/{owner}/{repo}/new_pin_allowed (repoNewPinAllowed)", () => 
         title: `pinned pull ${i}`,
         posterId: 1,
       });
-      await drizzle(env.DB).insert(issuePins).values({ issueId: pull.issue.id, repoId: REPO_ID, pinOrder: i + 1 });
+      await drizzle(env.DB).insert(issuePins).values({ issueId: pull.issue.id, repoId: REPO_ID, isPull: true, pinOrder: i + 1 });
     };
     await pinPull(0);
 

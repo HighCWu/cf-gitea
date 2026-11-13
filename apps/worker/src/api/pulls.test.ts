@@ -1544,7 +1544,7 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
       .update(pullRequests)
       .set({ hasMerged: true, mergerId: forkOwner.id, mergedAt: new Date("2026-03-04T05:06:07Z"), mergedCommitId: "deadbeef" })
       .where(eq(pullRequests.id, merged.prId));
-    await db().insert(issuePins).values({ issueId: merged.id, repoId: baseId, pinOrder: 1 });
+    await db().insert(issuePins).values({ issueId: merged.id, repoId: baseId, isPull: true, pinOrder: 1 });
 
     // (a) Route-level count (anonymous — head grants resolve without D1).
     const app = createApiRouter();

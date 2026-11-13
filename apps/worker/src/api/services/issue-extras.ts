@@ -297,21 +297,24 @@ export async function pinStats(d1: D1Database, repoId: string, isPull: boolean):
   return { count: rows.length, maxOrder: rows.reduce((max, row) => Math.max(max, row.pinOrder), 0) };
 }
 
-/** The `is_pull` half-condition of the upstream pin updates — our issue_pins
- *  has no is_pull column, so the split rides an issues join (listPinnedIssues
- *  above does the same join). */
+/** The `is_pull` half-condition of the upstream pin updates — the split
+ *  rides an issues join (listPinnedIssues above does the same join; it needs
+ *  the issue rows anyway, and these arms predate the issue_pins.is_pull
+ *  column which stores the same fact — migration 0078). */
 function sameTypeIssues(db: DrizzleD1Database, isPull: boolean) {
   return inArray(issuePins.issueId, db.select({ id: issues.id }).from(issues).where(eq(issues.isPull, isPull)));
 }
 
 /** PinIssue (issue_pin.go:61): the pin row at max + 1 plus the pin (36)
- *  comment, one batch. The caller ran the cap and duplicate checks. */
+ *  comment, one batch. The caller ran the cap and duplicate checks. The pin
+ *  row stamps `IsPull: issue.IsPull` (issue_pin.go:82) — the row's own
+ *  issue/PR discriminator (migration 0078's NOT NULL is_pull, no default). */
 export async function insertIssuePin(d1: D1Database, issue: IssueRow, actorId: number, now: Date): Promise<void> {
   const { maxOrder } = await pinStats(d1, issue.repoId, issue.isPull);
   await drizzle(d1).batch([
     drizzle(d1)
       .insert(issuePins)
-      .values({ issueId: issue.id, repoId: issue.repoId, pinOrder: maxOrder + 1 })
+      .values({ issueId: issue.id, repoId: issue.repoId, isPull: issue.isPull, pinOrder: maxOrder + 1 })
       .onConflictDoNothing(),
     drizzle(d1).insert(comments).values({
       type: CommentType.Pin,

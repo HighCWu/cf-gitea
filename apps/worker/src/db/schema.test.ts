@@ -42,6 +42,7 @@ import {
   lfsObjects,
   orgMembers,
   PRStatus,
+  PRType,
   pullRequests,
   repoCollaborators,
   repoMirrors,
@@ -2054,12 +2055,18 @@ describe("issue_pins / issue_subscriptions strictness parity (ADR-0007 FN-10/FN-
     return rows[0]!;
   }
 
-  it("0073's DDL: repo_id + created_unix + updated_unix read NOT NULL, the single-column issue_id PK survives the rebuild (the §7.1 shape erratum — the composite-PK option is DEAD), and both rebuilt tables carry their full index sets", async () => {
+  it("0073's DDL: repo_id + created_unix + updated_unix read NOT NULL, and both rebuilt tables carry their full index sets (the issue_pins shape is migration 0078's rebuild now — see the FN-10/FN-11 describe below)", async () => {
     const pins = await tableColumns("issue_pins");
+    // Migration 0078 (FN-10 residue) rebuilt the table onto the upstream
+    // surrogate id pk — the 0073 single-column issue_id PK demoted to the
+    // issue_pins_issue_id_uq uniqueIndex; column order follows the upstream
+    // struct (issue_pin.go:17-23), is_pull NOT NULL with NO DDL default.
     expect(pins).toEqual([
-      { cid: 0, name: "issue_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
       { cid: 1, name: "repo_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
-      { cid: 2, name: "pin_order", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "issue_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "is_pull", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 4, name: "pin_order", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
     ]);
     const subs = await tableColumns("issue_subscriptions");
     expect(subs).toEqual([
@@ -2070,7 +2077,7 @@ describe("issue_pins / issue_subscriptions strictness parity (ADR-0007 FN-10/FN-
       { cid: 4, name: "created_unix", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
       { cid: 5, name: "updated_unix", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
     ]);
-    expect(await indexNames("issue_pins")).toEqual(["issue_pins_repo_order_idx"]);
+    expect(await indexNames("issue_pins")).toEqual(["issue_pins_issue_id_uq", "issue_pins_repo_order_idx"]);
     expect(await indexNames("issue_subscriptions")).toEqual(["issue_subscriptions_user_issue_uq", "issue_subscriptions_issue_idx"]);
   });
 
@@ -2109,11 +2116,12 @@ describe("issue_pins / issue_subscriptions strictness parity (ADR-0007 FN-10/FN-
     const [second] = await db.select().from(issueSubscriptions).all();
     expect(second).toMatchObject({ isWatching: false, createdAt: now, updatedAt: later });
 
-    // The pin writer copies the carrier issue's NOT NULL repo_id; the PK is
-    // the single-column issue_id and the row lands at max(pin_order) + 1.
+    // The pin writer copies the carrier issue's NOT NULL repo_id AND its
+    // is_pull discriminator (the 0078 leg, issue_pin.go:82); the row lands
+    // at max(pin_order) + 1 under the demoted issue_id uniqueIndex.
     await insertIssuePin(env.DB, issue, 900, now);
     const pins = await db.select().from(issuePins).all();
-    expect(pins).toEqual([{ issueId: issue.id, repoId: "fn10-12-writers", pinOrder: 1 }]);
+    expect(pins).toEqual([{ id: 1, repoId: "fn10-12-writers", issueId: issue.id, isPull: false, pinOrder: 1 }]);
   });
 });
 
@@ -2286,5 +2294,159 @@ describe("FN-12 small completions (ADR-0007 FN-12, migration 0077)", () => {
     const rows = await db.select().from(repoCollaborators).where(eq(repoCollaborators.repoId, "fn12-collab")).all();
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ id: first?.id, userId: 42, mode: "write", createdAt: now, updatedAt: new Date(1_700_000_600_000) });
+  });
+});
+
+/**
+ * ADR-0007 FN-10/FN-11 + the no-FN pair (migration 0078): the table-
+ * alignment completion batch — the six columns the reconciliation still
+ * counted as open MISSING ports. Per table, against the upstream struct:
+ * - `issue_labels` gains the surrogate `id` pk (issue_label.go:20) via a
+ *   REBUILD — the composite (issue_id, label_id) pair demotes to
+ *   `issue_labels_issue_label_uq` (upstream UNIQUE(s), issue_label.go:21-22)
+ *   and stays the arbiter of every target-less `onConflictDoNothing`.
+ * - `issue_pins` gains `id` (issue_pin.go:18) and `is_pull` (issue_pin.go:21,
+ *   `NOT NULL`, NO DDL default — the value-drift rule) via a REBUILD. The
+ *   one writer stamps `IsPull: issue.IsPull` (issue_pin.go:82, issue-extras
+ *   `insertIssuePin`); the 0078 copy leg backfilled legacy rows from the
+ *   joined `issues.is_pull` (COALESCE 0) instead of a blind constant.
+ * - `pull_requests` gains `type` (pull.go:122 — untagged, nullable upstream)
+ *   and `changed_protected_files` (pull.go:128, TEXT JSON, port-when-read).
+ *   `type` carries the DDL DEFAULT 0: the Go zero-value `PullRequestGitea`
+ *   every upstream create arm stamps (api pull.go:521, agit agit.go:188,
+ *   web pull.go:1385; `PullRequestGit` has no writer anywhere), so 0 is the
+ *   universal value space — drizzle inserts bind the VALUE default, raw
+ *   inserts and pre-0078 rows read the DDL constant, no per-arm writer leg
+ *   rides (the DEFAULT can never be wrong here, unlike is_pull's).
+ * - `package_blob_uploads.hash_state_bytes` (package_blob_upload.go:27,
+ *   BLOB, nullable) — FN-11's port decision: the column is structure
+ *   parity, the writer reduction stands (WebCrypto digest state is
+ *   unserializable — the container module's documented trade), rows stay
+ *   NULL until a read arm needs the port.
+ * The one behavioral pin is the EXISTING-writers discipline (the 0073/0077
+ * rule): every landed column has a verified no-NULL-path/no-value-drift
+ * story or an explicit default.
+ */
+describe("FN-10/FN-11 table-alignment completion (migration 0078)", () => {
+  it("0078's DDL: the rebuilt tables land at upstream's column order with their full index sets, the ALTERed tables carry the new tails", async () => {
+    const labels = await tableColumns("issue_labels");
+    expect(labels).toEqual([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 1 },
+      { cid: 1, name: "issue_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "label_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    expect(await indexNames("issue_labels")).toEqual(["issue_labels_issue_label_uq", "issue_labels_label_idx"]);
+
+    const pr = await tableColumns("pull_requests");
+    expect(pr.at(-2)).toEqual({ cid: 19, name: "type", type: "INTEGER", notnull: 0, dflt_value: "0", pk: 0 });
+    expect(pr.at(-1)).toEqual({ cid: 20, name: "changed_protected_files", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 });
+
+    const uploads = await tableColumns("package_blob_uploads");
+    expect(uploads.at(-1)).toEqual({ cid: 5, name: "hash_state_bytes", type: "BLOB", notnull: 0, dflt_value: null, pk: 0 });
+  });
+
+  it("the arbiters bite through the demoted unique indexes, the pin row rejects a stamp-less insert, and the pull type default reads 0 through both insert paths", async () => {
+    const db = drizzle(env.DB);
+
+    // issue_labels: the composite pair survives as a unique INDEX — the
+    // duplicate attachment is a DO NOTHING, not a new row.
+    await env.DB.prepare("INSERT INTO issue_labels (issue_id, label_id) VALUES (8640780, 1)").run();
+    await env.DB.prepare("INSERT INTO issue_labels (issue_id, label_id) VALUES (8640780, 1) ON CONFLICT DO NOTHING").run();
+    const attachCount = await env.DB
+      .prepare("SELECT COUNT(*) AS n FROM issue_labels WHERE issue_id = 8640780")
+      .first<{ n: number }>();
+    expect(attachCount?.n).toBe(1);
+
+    // issue_pins: same for the demoted issue_id uniqueIndex — and the NOT
+    // NULL is_pull rejects the pre-0078 fixture shape outright.
+    await env.DB
+      .prepare("INSERT INTO issue_pins (repo_id, issue_id, is_pull, pin_order) VALUES ('fn78-arb', 8640781, 0, 1)")
+      .run();
+    await env.DB
+      .prepare("INSERT INTO issue_pins (repo_id, issue_id, is_pull, pin_order) VALUES ('fn78-arb', 8640781, 0, 2) ON CONFLICT DO NOTHING")
+      .run();
+    const pinCount = await env.DB.prepare("SELECT COUNT(*) AS n FROM issue_pins WHERE repo_id = 'fn78-arb'").first<{ n: number }>();
+    expect(pinCount?.n).toBe(1);
+
+    let pinViolated = false;
+    try {
+      await env.DB.prepare("INSERT INTO issue_pins (repo_id, issue_id, pin_order) VALUES ('fn78-arb', 8640782, 3)").run();
+    } catch {
+      pinViolated = true;
+    }
+    expect(pinViolated).toBe(true);
+
+    // pull_requests.type: the raw path reads the DDL constant; the drizzle
+    // path binds the VALUE default (the dialect inlines .default() for the
+    // omitted column — the TABLEMISS2 finding). Both read 0, the Go
+    // zero-value PullRequestGitea every upstream create arm stamps.
+    await env.DB
+      .prepare(
+        "INSERT INTO pull_requests (issue_id, `index`, head_repo_id, base_repo_id, head_branch, base_branch) VALUES (8640781, 1, 'fn78', 'fn78', 'a', 'b')",
+      )
+      .run();
+    const raw = await env.DB.prepare("SELECT type, changed_protected_files FROM pull_requests WHERE issue_id = 8640781").first<{
+      type: number;
+      changed_protected_files: string | null;
+    }>();
+    expect(raw?.type).toBe(0);
+    expect(raw?.changed_protected_files).toBeNull();
+
+    await db.insert(pullRequests).values({ issueId: 8640782, index: 2, headRepoId: "fn78", baseRepoId: "fn78", headBranch: "c", baseBranch: "d" });
+    const drizzleRow = await db.select().from(pullRequests).where(eq(pullRequests.issueId, 8640782)).get();
+    expect(drizzleRow?.type).toBe(0);
+
+    // The value space: PullRequestGit round-trips when written (it just has
+    // no writer upstream — pull.go:87-93), and the TEXT JSON port column
+    // stores the protected-file delta shape.
+    await db
+      .update(pullRequests)
+      .set({ type: PRType.Git, changedProtectedFiles: '["a.txt","b.txt"]' })
+      .where(eq(pullRequests.issueId, 8640782));
+    const written = await db.select().from(pullRequests).where(eq(pullRequests.issueId, 8640782)).get();
+    expect(written?.type).toBe(1);
+    expect(written?.changedProtectedFiles).toBe('["a.txt","b.txt"]');
+
+    // package_blob_uploads.hash_state_bytes: nullable BLOB, the raw-bind
+    // round-trip proves the storage type (the writer stays the recorded
+    // reduction — rows written without it read NULL).
+    await env.DB
+      .prepare("INSERT INTO package_blob_uploads (id, created_unix, updated_unix) VALUES ('fn78-upload', unixepoch(), unixepoch())")
+      .run();
+    const unhashed = await env.DB
+      .prepare("SELECT hash_state_bytes FROM package_blob_uploads WHERE id = 'fn78-upload'")
+      .first<{ hash_state_bytes: Uint8Array | null }>();
+    expect(unhashed?.hash_state_bytes).toBeNull();
+    await env.DB
+      .prepare("UPDATE package_blob_uploads SET hash_state_bytes = ? WHERE id = 'fn78-upload'")
+      .bind(new Uint8Array([0x0f, 0x3a, 0x01]))
+      .run();
+    const hashed = await env.DB
+      .prepare("SELECT hash_state_bytes FROM package_blob_uploads WHERE id = 'fn78-upload'")
+      .first<{ hash_state_bytes: Uint8Array | null }>();
+    expect(Array.from(hashed?.hash_state_bytes ?? [])).toEqual([0x0f, 0x3a, 0x01]);
+  });
+
+  it("the pin writer stamps the row's own is_pull: an issue pin and a PR pin land with their carriers' discriminators", async () => {
+    const db = drizzle(env.DB);
+    const now = new Date(1_700_000_700_000);
+    const rows = await db
+      .insert(issues)
+      .values([
+        { repoId: "fn78-writer", index: 1, title: "fn78 issue carrier", isPull: false },
+        { repoId: "fn78-writer", index: 2, title: "fn78 pull carrier", isPull: true },
+      ])
+      .returning()
+      .all();
+    const [issueCarrier, pullCarrier] = rows;
+    if (issueCarrier === undefined || pullCarrier === undefined) throw new Error("fn78 carriers missing");
+
+    await insertIssuePin(env.DB, issueCarrier, 900, now);
+    await insertIssuePin(env.DB, pullCarrier, 901, now);
+    const pins = await db.select().from(issuePins).where(eq(issuePins.repoId, "fn78-writer")).all();
+    expect(pins).toHaveLength(2);
+    const byIssue = new Map(pins.map((p) => [p.issueId, p]));
+    expect(byIssue.get(issueCarrier.id)).toMatchObject({ repoId: "fn78-writer", isPull: false, pinOrder: 1 });
+    expect(byIssue.get(pullCarrier.id)).toMatchObject({ repoId: "fn78-writer", isPull: true, pinOrder: 1 });
   });
 });

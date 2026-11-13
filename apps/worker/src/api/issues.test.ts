@@ -4106,7 +4106,7 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
       baseBranch: "main",
       headBranch: "feature",
     });
-    await db().insert(issuePins).values({ issueId: first.id, repoId, pinOrder: 2 });
+    await db().insert(issuePins).values({ issueId: first.id, repoId, isPull: false, pinOrder: 2 });
 
     const app = createApiRouter();
     const meter = countedD1();

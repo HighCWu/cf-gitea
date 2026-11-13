@@ -741,7 +741,7 @@ describe("user column-issues list query-shape witness (query-shape-audit A2/A6, 
     for (const issue of [first, second, third]) {
       await seedMembership(issue.id, s.project.id, s.column.id);
     }
-    await db().insert(issuePins).values({ issueId: first.id, repoId: repoA, pinOrder: 2 });
+    await db().insert(issuePins).values({ issueId: first.id, repoId: repoA, isPull: false, pinOrder: 2 });
 
     // The tier-1 issue routes mount beside the user family so the per-row
     // single GETs sit next to the batched list render.

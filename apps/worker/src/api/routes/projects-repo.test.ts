@@ -1191,7 +1191,7 @@ describe("column-issues list query-shape witness (query-shape-audit A2, tier-2)"
     for (const issue of [first, second, third, dangling]) {
       await seedMembership(issue.id, project.id, column.id);
     }
-    await db().insert(issuePins).values({ issueId: first.id, repoId: s.repoId, pinOrder: 2 });
+    await db().insert(issuePins).values({ issueId: first.id, repoId: s.repoId, isPull: false, pinOrder: 2 });
 
     // The witness mount adds the tier-1 issue routes so the per-row single
     // GET renders sit next to the batched list render.
