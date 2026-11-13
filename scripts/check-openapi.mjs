@@ -327,13 +327,23 @@ async function loadGeneratedSpec() {
   const stubDir = await mkdtemp(path.join(tmpdir(), "cf-gitea-openapi-stub-"));
   const workersStub = path.join(stubDir, "cloudflare-workers.mjs");
   await writeFile(workersStub, "export class DurableObject {}\n");
+  // B66R's SMTP transport imports cloudflare:sockets at value level — the
+  // same workerd-virtual-module class; the stub's connect() is never called
+  // (getGeneratedSpec walks the registry only), so the bare shape stands in.
+  const socketsStub = path.join(stubDir, "cloudflare-sockets.mjs");
+  await writeFile(socketsStub, 'export const connect = () => { throw new Error("unreachable in the spec build"); };\n');
   try {
     await build({
       root: WORKER_DIR,
       configFile: false,
       logLevel: "warn",
       build: { ssr: SPEC_ENTRY, outDir, emptyOutDir: true, minify: false },
-      resolve: { alias: [{ find: /^cloudflare:workers$/, replacement: workersStub }] },
+      resolve: {
+        alias: [
+          { find: /^cloudflare:workers$/, replacement: workersStub },
+          { find: /^cloudflare:sockets$/, replacement: socketsStub },
+        ],
+      },
       ssr: { noExternal: true },
     });
     const module = await import(pathToFileURL(path.join(outDir, "openapi.js")).href);

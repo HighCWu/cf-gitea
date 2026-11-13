@@ -1,14 +1,16 @@
 /**
  * The API documentation viewer module's tests (findings-links A2 — the
- * settings-applications "API docs" hint's `/api/swagger` target): the
- * standalone openapi-viewer page's DOM contract (the pinned
- * templates/swagger/openapi-viewer.tmpl element set, byte-pinned over a
- * synthetic manifest), the two spec-document arms (upstream
- * swaggerJsonServe's exact `application/json` content-type + a smoke
- * OpenAPI-parse of the runtime-generated registry document), the PUBLIC
- * login-gate posture (upstream web.go:303-305 carries the session
- * middleware but NO reqSignIn — anonymous renders, no Set-Cookie), the
- * manifest-seam failure arms (the assetsNotBuilt 503 shape), and the
+ * settings-applications "API docs" hint's `/api/swagger` target; census
+ * B-80's byte-exact docs arms): the standalone openapi-viewer page's DOM
+ * contract (the pinned templates/swagger/openapi-viewer.tmpl element set,
+ * byte-pinned over a synthetic manifest), the two spec-document arms
+ * byte-exact against the vendored documents (the frozen contract copy and
+ * the pinned templates tree, with swagger_json.go's AppVer/AppSubURL
+ * substitution applied independently in this file), the substitution
+ * helper's probed Go semantics, the exact `application/json` content-type,
+ * the PUBLIC login-gate posture (upstream web.go:303-305 carries the
+ * session middleware but NO reqSignIn — anonymous renders, no Set-Cookie),
+ * the manifest-seam failure arms (the assetsNotBuilt 503 shape), and the
  * upstream-faithful inline icon bodies (octicon-file-code / octicon-reply
  * at the pinned gitea/public/assets/img/svg bodies).
  *
@@ -27,13 +29,19 @@ import { Hono } from "hono";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { SERVER_VERSION } from "../../api/config";
+import contractV1SwaggerRaw from "../../compat/contract/v1-swagger.generated.json?raw";
+import v1Openapi3Raw from "../../../../../gitea/templates/swagger/v1-openapi3.generated.json?raw";
 import { AssetBuildError, resetManifestCache, type UiManifest } from "../manifest";
 import {
   apiSwaggerPage,
   apiSwaggerViewFromManifest,
   assetsNotBuiltResponse,
+  jsEscapeString,
+  openapi3V1Json,
+  openapi3V1JsonBody,
   renderApiSwaggerPage,
   resetSwaggerSpecCache,
+  substituteSwaggerPlaceholders,
   swaggerJsonResponse,
   swaggerV1Json,
   swaggerV1JsonBody,
@@ -72,7 +80,7 @@ const envUnbuiltAssets: SwaggerTestEnv = { ...env, ASSETS: notBuiltAssets };
 const app = new Hono<{ Bindings: Env }>();
 app.get("/api/swagger", (c) => apiSwaggerPage(c));
 app.get("/swagger.v1.json", () => swaggerV1Json());
-app.get("/openapi3.v1.json", () => swaggerV1Json());
+app.get("/openapi3.v1.json", () => openapi3V1Json());
 
 beforeEach(() => {
   // Both isolate caches: the manifest promise and the serialized spec would
@@ -189,55 +197,133 @@ describe("GET /api/swagger (misc.Swagger → openapi-viewer)", () => {
   });
 });
 
-// --- GET /swagger.v1.json + /openapi3.v1.json — the generated document -------
+// --- GET /swagger.v1.json + /openapi3.v1.json — the vendored documents -------
+//
+// The census B-80 arms: byte-exact serves of the vendored generated docs
+// with swagger_json.go's AppVer/AppSubURL substitution. The EXPECTED bytes
+// here are derived INDEPENDENTLY of the module — this file imports the same
+// raw sources and applies the two plain string replaces itself, so body
+// equality proves the module's replacer port + caches didn't perturb the
+// vendored bytes.
 
-interface GeneratedSpecSmoke {
-  openapi: string;
+interface Swagger2DocSmoke {
+  swagger: string;
   info: { title: string; version: string };
+  basePath: string;
   paths: Record<string, unknown>;
 }
 
-describe("GET /swagger.v1.json (SwaggerV1Json over the generated registry)", () => {
-  it("serves the runtime-generated document with the exact upstream content-type", async () => {
+interface Openapi3DocSmoke {
+  openapi: string;
+  info: { title: string; version: string };
+  servers: { url: string }[];
+  paths: Record<string, unknown>;
+}
+
+/** The two string replaces of routers/web/swagger_json.go:27-37, applied
+ *  independently of the module's helper (AppVer = SERVER_VERSION, AppSubURL
+ *  = "" — the escape of both is identity, probed). */
+const expectedV1 = contractV1SwaggerRaw
+  .replaceAll("0.0.0+GITEA-API-APP-VERSION", SERVER_VERSION)
+  .replaceAll("/GITEA-API-APP-SUBURL/", "/");
+const expectedOpenapi3 = v1Openapi3Raw
+  .replaceAll("0.0.0+GITEA-API-APP-VERSION", SERVER_VERSION)
+  .replaceAll("/GITEA-API-APP-SUBURL/", "/");
+
+describe("GET /swagger.v1.json (SwaggerV1Json over the vendored docs)", () => {
+  it("serves the frozen contract copy byte-exact with the substitution applied", async () => {
     const res = await app.fetch(new Request("https://test.local/swagger.v1.json"), envWithAssets);
     expect(res.status).toBe(200);
     // swaggerJsonServe sets Content-Type "application/json" WITHOUT a
     // charset (routers/web/swagger_json.go) — Hono's c.json would append
     // one, so the module sets the header explicitly.
     expect(res.headers.get("content-type")).toBe("application/json");
-    const doc = JSON.parse(await res.text()) as GeneratedSpecSmoke;
-    // Smoke OpenAPI-parse (the A2 acceptance gates): a real parseable
-    // document with a non-empty path registry and the repo surface present.
+    expect(await res.text()).toBe(expectedV1);
+  });
+
+  it("parses as the upstream Swagger-2.0 document with the substituted version and basePath", () => {
+    const doc = JSON.parse(swaggerV1JsonBody()) as Swagger2DocSmoke;
+    expect(doc.swagger).toBe("2.0");
+    expect(doc.info.title).toBe("Gitea API");
+    // The AppVer arm: the version every other instance arm reports.
+    expect(doc.info.version).toBe(SERVER_VERSION);
+    // The AppSubURL arm: "" + "/" folds the placeholder away.
+    expect(doc.basePath).toBe("/api/v1");
+    // The docs describe the upstream surface (a non-empty path registry).
+    expect(Object.keys(doc.paths).length).toBeGreaterThan(0);
+    expect(doc.paths["/repos/{owner}/{repo}"]).toBeDefined();
+    // No placeholder survives either substitution.
+    expect(swaggerV1JsonBody()).not.toContain("GITEA-API-APP");
+  });
+
+  it("serves the twin OpenAPI-3 document byte-exact at /openapi3.v1.json", async () => {
+    const res = await app.fetch(new Request("https://test.local/openapi3.v1.json"), envWithAssets);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.text()).toBe(expectedOpenapi3);
+  });
+
+  it("parses as the upstream OpenAPI-3 twin — a DIFFERENT document from the swagger arm, like upstream", () => {
+    // Upstream serves Swagger-2.0 at the swagger name and OpenAPI-3 at the
+    // openapi3 name (two formats of the same surface); the vendored twins
+    // differ — the page's data-source reads the openapi3 one.
+    const doc = JSON.parse(openapi3V1JsonBody()) as Openapi3DocSmoke;
     expect(doc.openapi).toBe("3.0.3");
     expect(doc.info.title).toBe("Gitea API");
     expect(doc.info.version).toBe(SERVER_VERSION);
+    expect(doc.servers[0]?.url).toBe("/api/v1");
     expect(Object.keys(doc.paths).length).toBeGreaterThan(0);
-    expect(doc.paths["/repos/{owner}/{repo}"]).toBeDefined();
+    // The two arms are the two vendored documents, not one body twice.
+    expect(openapi3V1JsonBody()).not.toBe(swaggerV1JsonBody());
+    expect(openapi3V1JsonBody()).not.toContain("GITEA-API-APP");
   });
 
-  it("serves the identical document at /openapi3.v1.json (the single-doc divergence)", async () => {
-    // Our registry generates ONE OpenAPI 3.0.3 document; upstream serves a
-    // Swagger-2.0 doc at the swagger name and an OpenAPI-3 doc at the
-    // openapi3 name (module doc). Both names answer the same bytes here.
-    const swagger = await app.fetch(new Request("https://test.local/swagger.v1.json"), envWithAssets);
-    const openapi3 = await app.fetch(new Request("https://test.local/openapi3.v1.json"), envWithAssets);
-    expect(openapi3.status).toBe(200);
-    expect(openapi3.headers.get("content-type")).toBe("application/json");
-    expect(await openapi3.text()).toBe(await swagger.text());
-  });
-
-  it("caches the serialized body for the isolate lifetime and resets on demand", () => {
+  it("caches both substituted bodies for the isolate lifetime and resets on demand", () => {
     const first = swaggerV1JsonBody();
-    expect(swaggerV1JsonBody()).toBe(first); // the cache, not a re-generation
+    const first3 = openapi3V1JsonBody();
+    expect(swaggerV1JsonBody()).toBe(first); // the cache, not a re-substitution
+    expect(openapi3V1JsonBody()).toBe(first3);
     resetSwaggerSpecCache();
-    expect(swaggerV1JsonBody()).toBe(first); // deterministic registry → same bytes
-    const reparsed: unknown = JSON.parse(swaggerV1JsonBody());
-    expect(reparsed).toBeInstanceOf(Object);
+    expect(swaggerV1JsonBody()).toBe(first); // deploy-immutable bytes → same
+    expect(openapi3V1JsonBody()).toBe(first3);
+    expect(JSON.parse(swaggerV1JsonBody())).toBeInstanceOf(Object);
+    expect(JSON.parse(openapi3V1JsonBody())).toBeInstanceOf(Object);
   });
 
   it("shapes swaggerJsonResponse with the exact headers and status", () => {
     const res = swaggerJsonResponse('{"openapi":"3.0.3"}');
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
+  });
+});
+
+// --- the substitution helper (swagger_json.go's replacer, probed) ------------
+
+describe("jsEscapeString (text/template JSEscapeString, probed against Go 1.25.1)", () => {
+  it("is identity over the substitution values at this posture", () => {
+    expect(jsEscapeString(SERVER_VERSION)).toBe(SERVER_VERSION);
+    expect(jsEscapeString("")).toBe("");
+    expect(jsEscapeString("/sub/path")).toBe("/sub/path");
+  });
+
+  it("escapes the specials byte-exact (uppercase \\u00XX, per the Go probe)", () => {
+    expect(jsEscapeString(`a<b>c&d"e'f\\g=h`)).toBe(`a\\u003Cb\\u003Ec\\u0026d\\"e\\'f\\\\g\\u003Dh`);
+  });
+
+  it("escapes control chars as \\u00XX", () => {
+    expect(jsEscapeString("\t\n\r\x00\x1f")).toBe("\\u0009\\u000A\\u000D\\u0000\\u001F");
+  });
+});
+
+describe("substituteSwaggerPlaceholders (swagger_json.go's replacer)", () => {
+  it("swaps both placeholders the way the Go replacer does", () => {
+    const raw = '{"version":"0.0.0+GITEA-API-APP-VERSION","basePath":"/GITEA-API-APP-SUBURL/api/v1"}';
+    expect(substituteSwaggerPlaceholders(raw)).toBe(
+      `{"version":"${SERVER_VERSION}","basePath":"/api/v1"}`,
+    );
+  });
+
+  it("leaves placeholder-free bytes untouched (byte-exact serves)", () => {
+    expect(substituteSwaggerPlaceholders('{"swagger":"2.0"}')).toBe('{"swagger":"2.0"}');
   });
 });

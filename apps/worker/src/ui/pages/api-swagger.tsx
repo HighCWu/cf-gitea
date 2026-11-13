@@ -55,28 +55,55 @@
  * the dispatcher's securityHeaders() stamp, upstream's SecurityHeadersHandler
  * posture.
  *
- * ## The spec document — the runtime-generated registry, not the frozen copy
+ * ## The spec documents — the vendored generated docs, byte-exact (census
+ * B-80)
  *
- * Upstream serves its embedded generated swagger (swaggerJsonServe's
- * template-asset read + the AppVer/AppSubURL placeholder substitution). The
- * upstream-faithful adaptation serves OUR generated document:
- * `getGeneratedSpec()` (src/api/openapi.ts) emits the zod-openapi registry's
- * OpenAPI 3.0.3 document — the exact surface `/api/v1` actually answers
- * (500 operations across 306 paths at the time of writing, contract-checked
- * against the vendored swagger by `pnpm check:api`). Serving the FROZEN
- * contract copy instead would advertise upstream's 78 tier-1 paths we have
- * not landed — a spec pointing at 404s, the same dishonesty class as A2
- * itself. Documented divergence: upstream serves a Swagger-2.0 doc at
- * /swagger.v1.json and an OpenAPI-3 doc at /openapi3.v1.json; our registry
- * generates ONE OpenAPI 3.0.3 document and both names serve it verbatim
- * (swagger-ui reads both formats; the page's data-source is the openapi3
- * name exactly like the pinned template). The AppVer substitution needs no
- * analog: the registry bakes SERVER_VERSION into info.version at generation.
+ * Upstream serves its EMBEDDED generated docs: swaggerJsonServe reads
+ * `swagger/v1-swagger.generated.json` / `swagger/v1-openapi3.generated.json`
+ * from templates.AssetFS() — the templates tree's own files, unmodified —
+ * and runs the AppVer/AppSubURL substitution over them (the census's "two
+ * string replaces"). This module mirrors that exactly: the bytes are Vite
+ * `?raw` build-time strings read AS-IS from
  *
- * The document is deploy-immutable (the registry is compiled in), so the
- * serialized body is cached for the isolate lifetime — the manifest-cache
- * posture (manifest.ts's header note: per-deploy data, never per-request
- * state).
+ *   - `src/compat/contract/v1-swagger.generated.json` — the FROZEN ADR-0002
+ *     contract copy, check:contract-guaranteed byte-identical to the pinned
+ *     submodule file (the audited substrate is the stronger source for the
+ *     swagger name), and
+ *   - `gitea/templates/swagger/v1-openapi3.generated.json` — the submodule
+ *     file directly (the pinned templates tree IS upstream's AssetFS source;
+ *     no frozen copy of the twin exists and duplicating it would create a
+ *     new drift surface).
+ *
+ * `swaggerV1JsonBody`/`openapi3V1JsonBody` then apply swagger_json.go's
+ * replacer verbatim: "0.0.0+GITEA-API-APP-VERSION" → jsEscapeString(AppVer)
+ * and "/GITEA-API-APP-SUBURL/" → jsEscapeString(AppSubURL) + "/", with
+ * AppVer = SERVER_VERSION (the version every other arm of this instance
+ * reports — /version, the ServerVersion model) and AppSubURL = "" (the
+ * instance serves at the origin root; the same folded value the page's
+ * hrefs carry). jsEscapeString is the text/template port probed against Go
+ * 1.25.1's html/template.JSEscapeString (the upstream file's import):
+ * identity for both values at this posture, so the served bodies are the
+ * vendored bytes with the two placeholders swapped — pinned byte-exact in
+ * api-swagger.test.
+ *
+ * History: the first landing (findings-links A2, c69f901) served the
+ * runtime-generated registry document instead, reasoning that the vendored
+ * doc advertises upstream paths our instance has not landed. Census B-80
+ * re-opened that as a mere deferral (ADR-0008: upstream's implemented
+ * STANDARD behavior is in scope by default; "usable enough" is not a
+ * justification for optionality) — the docs arms now serve the vendored
+ * docs exactly like upstream, divergence-free: a Swagger-2.0 document at
+ * /swagger.v1.json and an OpenAPI-3 document at /openapi3.v1.json (both
+ * formats swagger-ui reads; the page's data-source stays the openapi3 name
+ * exactly like the pinned template). The served doc's unimplemented paths
+ * answering 404 is upstream's own posture too — upstream's doc describes
+ * the whole upstream surface, and instance-level feature absence is a
+ * deployment property, not a docs property.
+ *
+ * Both documents are deploy-immutable (the bytes are compiled in), so the
+ * substituted bodies are cached for the isolate lifetime — the
+ * manifest-cache posture (manifest.ts's header note: per-deploy data, never
+ * per-request state).
  *
  * ## Posture — public
  *
@@ -103,7 +130,7 @@
  *   import { apiSwaggerPage, swaggerV1Json } from "./pages/api-swagger";
  *   uiRouter.get("/api/swagger", (c) => apiSwaggerPage(c));
  *   uiRouter.get("/swagger.v1.json", () => swaggerV1Json());
- *   uiRouter.get("/openapi3.v1.json", () => swaggerV1Json());
+ *   uiRouter.get("/openapi3.v1.json", () => openapi3V1Json());
  *
  * No parseUiRoute family: neither path is repo-scoped (src/index.ts's
  * dispatcher excludes `segments[0] === "api"` from the gate branch and
@@ -115,7 +142,9 @@
 
 import type { Context } from "hono";
 
-import { getGeneratedSpec } from "../../api/openapi";
+import { SERVER_VERSION } from "../../api/config";
+import contractV1SwaggerRaw from "../../compat/contract/v1-swagger.generated.json?raw";
+import v1Openapi3Raw from "../../../../../gitea/templates/swagger/v1-openapi3.generated.json?raw";
 import { AssetBuildError, assetURI, cssLinks, loadManifest, type UiManifest } from "../manifest";
 import { renderPage } from "../shell";
 
@@ -289,25 +318,101 @@ export async function apiSwaggerPage(c: Context<{ Bindings: Env }>): Promise<Res
 }
 
 // ---------------------------------------------------------------------------
-// The spec documents (swagger_json.go's arms over the generated registry)
+// The spec documents (swagger_json.go's arms over the vendored docs)
 // ---------------------------------------------------------------------------
 
-/** The serialized generated document, cached for the isolate lifetime (the
- *  manifest-cache posture — deploy-immutable data, never request state). */
-let cachedSpecJson: string | null = null;
+/** Upstream `setting.AppVer` (the value `GET /version` reports — the one
+ *  version string this instance carries, api/config.ts). */
+const APP_VER = SERVER_VERSION;
 
-/** Drop the isolate cache (tests / explicit re-pin reload). */
-export function resetSwaggerSpecCache(): void {
-  cachedSpecJson = null;
+/** Upstream `setting.AppSubURL` — the instance serves at the origin root
+ *  (the same folded "" the viewer page's hrefs carry). A constant, not
+ *  config: there is no subpath-mount posture on Workers here. */
+const APP_SUB_URL = "";
+
+/** Go `text/template` JSEscapeString (the function swagger_json.go's
+ *  replacer wraps via its html/template import), probed byte-for-byte
+ *  against Go 1.25.1: specials `\\ \' \"` and `\u003C/\u003E/\u0026/\u003D`,
+ *  every other byte < ' ' as `\u00XX` (uppercase hex). Identity for both
+ *  substitution values at this posture (AppVer has no specials; AppSubURL
+ *  is empty). Non-ASCII input rides the verbatim passthrough (Go writes
+ *  printable runes verbatim); Go's non-printable `\uXXXX` arm is
+ *  unreachable here — both substitution values are ASCII-only instance
+ *  constants, and the vendored bytes themselves are never escaped. */
+export function jsEscapeString(s: string): string {
+  const HEX = "0123456789ABCDEF";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i] ?? "";
+    switch (c) {
+      case "\\":
+        out += "\\\\";
+        break;
+      case "'":
+        out += "\\'";
+        break;
+      case '"':
+        out += '\\"';
+        break;
+      case "<":
+        out += "\\u003C";
+        break;
+      case ">":
+        out += "\\u003E";
+        break;
+      case "&":
+        out += "\\u0026";
+        break;
+      case "=":
+        out += "\\u003D";
+        break;
+      default: {
+        const code = c.charCodeAt(0);
+        out += code < 0x20 ? `\\u00${HEX[code >> 4]}${HEX[code & 0x0f]}` : c;
+      }
+    }
+  }
+  return out;
 }
 
-/** The `/swagger.v1.json` + `/openapi3.v1.json` body — the registry's
- *  OpenAPI document serialized once per isolate (module doc: the single-doc
- *  divergence note). Generation failures propagate to the app onError arm
- *  (upstream swaggerJsonServe's HTTPError posture for an unreadable doc). */
+/** swagger_json.go's replacer, verbatim:
+ *   "0.0.0+GITEA-API-APP-VERSION" → jsEscapeString(AppVer)
+ *   "/GITEA-API-APP-SUBURL/"     → jsEscapeString(AppSubURL) + "/"
+ * (Go's strings.NewReplacer is single-pass; the placeholders share no bytes,
+ * so the sequential replaces are the same function over these inputs.) */
+export function substituteSwaggerPlaceholders(raw: string): string {
+  return raw
+    .replaceAll("0.0.0+GITEA-API-APP-VERSION", jsEscapeString(APP_VER))
+    .replaceAll("/GITEA-API-APP-SUBURL/", `${jsEscapeString(APP_SUB_URL)}/`);
+}
+
+/** The two vendored documents' substituted bodies, cached for the isolate
+ *  lifetime (the manifest-cache posture — deploy-immutable bytes, never
+ *  request state). */
+let cachedV1Json: string | null = null;
+let cachedOpenapi3Json: string | null = null;
+
+/** Drop the isolate caches (tests / explicit re-pin reload). */
+export function resetSwaggerSpecCache(): void {
+  cachedV1Json = null;
+  cachedOpenapi3Json = null;
+}
+
+/** The `/swagger.v1.json` body — the frozen contract copy's bytes with the
+ *  AppVer/AppSubURL substitution (upstream SwaggerV1Json). Unreadable
+ *  vendored bytes are a build-time failure (`?raw` resolves at bundle);
+ *  upstream's HTTPError posture for an unreadable asset has no runtime arm
+ *  here. */
 export function swaggerV1JsonBody(): string {
-  cachedSpecJson ??= JSON.stringify(getGeneratedSpec());
-  return cachedSpecJson;
+  cachedV1Json ??= substituteSwaggerPlaceholders(contractV1SwaggerRaw);
+  return cachedV1Json;
+}
+
+/** The `/openapi3.v1.json` body — the pinned templates tree's twin document
+ *  with the same substitution (upstream OpenAPI3Json). */
+export function openapi3V1JsonBody(): string {
+  cachedOpenapi3Json ??= substituteSwaggerPlaceholders(v1Openapi3Raw);
+  return cachedOpenapi3Json;
 }
 
 /** The spec Response — Content-Type `application/json` EXACTLY (Go's
@@ -321,9 +426,14 @@ export function swaggerJsonResponse(body: string): Response {
   });
 }
 
-/** `GET /swagger.v1.json` + `GET /openapi3.v1.json` (SwaggerV1Json /
- *  OpenAPI3Json): the generated document. Public — upstream registers both
- *  arms bare (web.go:1794-1797). */
+/** `GET /swagger.v1.json` (SwaggerV1Json): the frozen Swagger-2.0 contract
+ *  document. Public — upstream registers the arm bare (web.go:1794-1797). */
 export function swaggerV1Json(): Response {
   return swaggerJsonResponse(swaggerV1JsonBody());
+}
+
+/** `GET /openapi3.v1.json` (OpenAPI3Json): the twin OpenAPI-3 document —
+ *  the page's data-source, exactly like the pinned template. Public. */
+export function openapi3V1Json(): Response {
+  return swaggerJsonResponse(openapi3V1JsonBody());
 }

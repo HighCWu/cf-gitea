@@ -86,6 +86,7 @@ import { registerUserReadT2Routes } from "./routes/user-read-t2";
 import { registerUserRoute } from "./routes/user";
 import { registerUserSettingsRoutes } from "./routes/user-settings";
 import { registerUsersRoutes } from "./routes/users";
+import { registerSwaggerRedirectRoute } from "./routes/swagger-redirect";
 import { registerVersionRoute } from "./routes/version";
 
 export interface ApiRouterOptions {
@@ -129,6 +130,12 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   const requireAuth = createTokenAuthMiddleware(options.auth ?? createStubAuthResolver());
   const optionalAuth = createOptionalTokenAuthMiddleware(options.auth ?? createStubAuthResolver());
   registerVersionRoute(app);
+  // Miscellaneous (no scope required), upstream's misc group: the API-docs
+  // redirect (api.go:1001-1005 — "The route is here but no in API routes
+  // because it renders a web page"). Plain registration outside the
+  // generated OpenAPI document — the vendored swagger carries no such path
+  // (routes/swagger-redirect.ts, census B-80).
+  registerSwaggerRedirectRoute(app);
   registerUserRoute(app, requireAuth);
   // Identity self-service (committed with the bdf8546 batch, registered here):
   // /user/followers, /user/following/{username} writes, and the key-list

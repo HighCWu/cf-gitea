@@ -981,11 +981,19 @@ import {
   renderOrgTeamsPage,
   resolveOrgTeamsOrg,
 } from "./pages/org-teams";
+import { renderOrgTeamInvitePage } from "./pages/team-invite";
 // The O1 membership write arms compose the landed API-layer service half
 // (SPEC-0007 §3.5 — TeamsService's Add/RemoveTeamMember + repo grant pair)
 // and the org membership services (the visibility flip pair + the doer
 // membership read the members page already rides).
-import { TeamsService, type TeamRecord } from "../api/routes/org-teams";
+import {
+  TeamsService,
+  TeamInviteAlreadyExistsError,
+  UserEmailAlreadyAddedError,
+  type TeamInviteRecord,
+  type TeamRecord,
+} from "../api/routes/org-teams";
+import { sendTeamInviteMail } from "../services/mail/team-invite";
 import { LastOrgOwnerError } from "../services/orgs/errors";
 import { isDoerOrgMember, setOrgMembershipPublic } from "../api/services/orgs";
 import {
@@ -2004,7 +2012,7 @@ import {
   parseSitemapIdx,
   sitemapXmlResponse,
 } from "./pages/sitemap";
-import { apiSwaggerPage, swaggerV1Json } from "./pages/api-swagger";
+import { apiSwaggerPage, openapi3V1Json, swaggerV1Json } from "./pages/api-swagger";
 import {
   loadRepoSearchAux,
   loadTopicSearchAux,
@@ -4054,6 +4062,26 @@ export interface OrgTeamActionRoute {
   action: string;
 }
 
+/** The team-invite redeem family (census B-77 — upstream web.go:976-978's
+ *  `m.Group("/invite/{token}")` inside the reqSignIn /org group: GET
+ *  renders the join page (org.TeamInvite, teams.go:583-606), POST joins +
+ *  removes the invite (org.TeamInvitePost, teams.go:608-627)). The literal
+ *  `invite` second segment is a STATIC route level upstream — chi descends
+ *  it before the `/{org}` param node, so an org named "invite" serves NO
+ *  /org/invite/* subpath at all (the static shadow): this parse claims
+ *  exactly the 4-segment shape and answers any deeper /org/invite/** tail
+ *  with null (the engine's 404 — upstream's 404, not the org "invite"'s
+ *  pages). The token carries no shape rule (opaque CryptoRandomString(25);
+ *  an unknown token is the handler's 404 arm, teams.go:587-594's
+ *  ErrTeamInviteNotFound). Both arms require SIGN-IN upstream (the group's
+ *  reqSignIn tail, web.go:1094) — the handler 303s an anonymous bearer to
+ *  login, exactly the mail link's redirect_to flow. */
+export interface OrgTeamInviteRoute {
+  family: "org-team-invite";
+  /** The redemption token (decoded; upstream's PathParam("token")). */
+  token: string;
+}
+
 /** The O1 org members write family (upstream MembersAction,
  *  routers/web/org/members.go:82-136 at web.go:992's
  *  `m.Post("/members/action/{action}")`): the members page's visibility
@@ -4309,6 +4337,7 @@ export type ParsedUiRoute =
   | SearchAuxRoute
   | OrgTeamsRoute
   | OrgTeamActionRoute
+  | OrgTeamInviteRoute
   | OrgMembersActionRoute
   | OrgLabelsRoute
   | OrgSettingsRoute
@@ -4727,6 +4756,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (raw.length === 3 && raw[1] === "org" && raw[2] === "create") {
     return { family: "org-create" };
+  }
+  // Census B-77: the team-invite redeem pair (web.go:976-978 — the
+  // OrgTeamInviteRoute interface's note). Claimed BEFORE the /org/{org}
+  // tail families: the literal `invite` second segment is chi's static
+  // level and shadows an org named "invite" for every /org/invite/* path —
+  // so /org/invite/members (token="members") is the 404 token-miss, never
+  // the members page, and a deeper tail (raw length > 4) 404s outright
+  // (upstream's static-first descent: the {token} group holds only the
+  // bare "" route, teams.go:976-978's m.Get("")/m.Post("")).
+  if (raw.length >= 4 && raw[1] === "org" && raw[2] === "invite") {
+    if (raw.length !== 4) return null;
+    try {
+      return { family: "org-team-invite", token: decodeURIComponent(raw[3] as string) };
+    } catch {
+      return null;
+    }
   }
 
   // Window-2c: the ADMIN literal family (pages/admin-dashboard.tsx +
@@ -12775,6 +12820,130 @@ async function orgTeamNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
 }
 
 // ---------------------------------------------------------------------------
+// The census B-77 team-invite redeem pair (pages/team-invite.tsx — upstream's
+// /org/invite/{token} GET+POST, web.go:976-978)
+// ---------------------------------------------------------------------------
+
+/** Upstream `user_model.ValidateEmail`'s address-syntax half
+ *  (email_address.go:121-129 — `validation.IsEmailAddressValid` plus the
+ *  default-empty domain allow/block lists, which are unmodeled here). The
+ *  module-local twin carries the misc-t3 validateEmailFormat shape (that
+ *  module's port of the same upstream source — its copy is module-private,
+ *  and this file's invite region is the only other consumer). */
+/** The add arm's mailer gate read — the STRUCTURAL view (the generated Env
+ *  pins the deployed var literal, so the comparison rides the widened param,
+ *  sendTestMail's exact pattern). `setting.MailService != nil`'s polarity is
+ *  the SPEC §5.1 strict gate: only the exact "true" arms. */
+function mailerArmed(env: { MAIL_ENABLED?: string }): boolean {
+  return env.MAIL_ENABLED === "true";
+}
+
+function inviteEmailValid(email: string): boolean {
+  if (/[^\x21-\x7e]/.test(email)) return false; // no non-ASCII / controls
+  const at = email.indexOf("@");
+  if (at <= 0 || at !== email.lastIndexOf("@") || at === email.length - 1) return false;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length > 64 || domain.length > 255) return false;
+  if (/^[.-]|[.-]$|\.\./.test(local)) return false;
+  if (domain.startsWith("[")) {
+    return /^\[(\d{1,3}(\.\d{1,3}){3}|IPv6:[0-9a-fA-F:]+)\]$/.test(domain); // address literal
+  }
+  return /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i.test(domain);
+}
+
+/**
+ * The redeem pair's shared prologue — upstream `getTeamInviteFromContext`
+ * (teams.go:629-653): the invite by token (the miss is the 404 arm,
+ * teams.go:587-594's ErrTeamInviteNotFound), then inviter → team → org by
+ * the row's keys. EVERY dangling lookup is upstream's ServerError (the
+ * GetUserByID/GetTeamByID errors are NOT NotFound-mapped) — the 500-plain
+ * posture, so a dangling row never leaks a 404. The group's reqSignIn
+ * (web.go:1094) 303s an anonymous bearer to login — the mail link's
+ * redirect_to flow lands here post-auth.
+ */
+async function resolveOrgTeamInviteRequest(
+  c: Context<{ Bindings: Env }>,
+): Promise<
+  | { ok: false; response: Response }
+  | { ok: true; ctx: UiContext; respond: (r: Response) => Response; viewerId: number; service: TeamsService; invite: TeamInviteRecord; team: TeamRecord; org: OrgRecord; inviter: typeof users.$inferSelect }
+> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-team-invite") return { ok: false, response: respond(await c.notFound()) }; // drift guard
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname + url.search)) };
+  const service = new TeamsService(c.env.DB);
+  const invite = await service.getInviteByToken(route.token);
+  if (invite === null) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  const inviter = await drizzle(c.env.DB).select().from(users).where(eq(users.id, invite.inviterId)).get();
+  if (inviter === undefined) {
+    return { ok: false, response: respond(new Response("Internal Server Error", { status: 500 })) }; // ServerError("getTeamInviteFromContext")
+  }
+  const team = await service.getTeamById(invite.teamId);
+  if (team === null) {
+    return { ok: false, response: respond(new Response("Internal Server Error", { status: 500 })) }; // ServerError(GetTeamByID)
+  }
+  const org = await drizzle(c.env.DB).select().from(users).where(eq(users.id, team.orgId)).get();
+  if (org === undefined) {
+    return { ok: false, response: respond(new Response("Internal Server Error", { status: 500 })) }; // ServerError(org GetUserByID)
+  }
+  return { ok: true, ctx, respond, viewerId: viewer.id, service, invite, team, org, inviter };
+}
+
+/**
+ * GET /org/invite/{token} (upstream org.TeamInvite, teams.go:583-606):
+ * renders the join card (pages/team-invite.tsx — invite.tmpl). The page
+ * title is `org.teams.invite_team_member` ("Invite to %s") over the team's
+ * name; the card's sentences interpolate the RAW team/org names (the
+ * template's Tr call) and the inviter's username.
+ */
+async function orgTeamInvitePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamInviteRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond, invite, team, org, inviter } = resolved;
+  return respond(
+    c.html(
+      renderOrgTeamInvitePage(ctx, {
+        title: `Invite to ${team.name}`,
+        invite: { token: invite.token, email: invite.email },
+        org,
+        team: { name: team.name, lowerName: team.lowerName },
+        inviter: { username: inviter.username },
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /org/invite/{token} (upstream org.TeamInvitePost, teams.go:608-627):
+ * join the team, then remove the invite row. `AddTeamMember`'s ANY error is
+ * upstream's ServerError (no flash ladder here — an accepted invite never
+ * hits the last-owner/blocked arms' path: the bearer ADDS to the team, and
+ * AddTeamMember's org-membership side effect is unconditional); the invite
+ * removal is log-only (teams.go:621-623 — the membership stands even when
+ * the row delete fails). Redirect: `{org}/teams/{LowerName}` — the NAME
+ * form (OrganisationLink + PathEscape(LowerName), teams.go:625; the R19
+ * name carrier resolves it through the landed detail slice).
+ */
+async function orgTeamInviteRedeem(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamInviteRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { respond, viewerId, service, invite, team, org } = resolved;
+  await service.addTeamMember(team, viewerId);
+  try {
+    await service.removeInviteById(invite.id, team.id);
+  } catch (error) {
+    console.error(`RemoveInviteByID: ${error instanceof Error ? error.message : String(error)}`); // teams.go:621-623's log-only arm
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/teams/${team.lowerName}` } }));
+}
+
+// ---------------------------------------------------------------------------
 // The census R06 org dashboard (pages/org-dashboard.tsx — upstream's
 // /org/{org}/dashboard[/{team}] literals, web.go:982-985)
 // ---------------------------------------------------------------------------
@@ -15397,20 +15566,23 @@ function orgTeamSliceLocation(org: OrgRecord, team: TeamRecord): string {
  *     user==nil arm); the last-owner refusal as above; the redirect's
  *     default target is the team page (teams.go:147).
  *   - `add` — OWNER-only (teams.go:163-166): resolves `uname`
- *     (lowercased — teams.go:168), an unknown user answers the
- *     user_not_exist flash reduced to the team-page redirect
- *     (teams.go:171-194 — at this pin there is no MailService, so the
- *     email-invite branch upstream guards on `setting.MailService != nil`
- *     is dead), an ORG row the cannot_add_org_to_team arm (196-202), a
- *     blocked user the shared blocked arm, an already-member the
+ *     (lowercased — teams.go:168). An unknown user forks on the EMAIL
+ *     INVITE BRANCH (census B-77, teams.go:171-194): mailer armed
+ *     (`setting.MailService != nil` — our strict MAIL_ENABLED === "true"
+ *     polarity) AND the name parses as an email (ValidateEmail) →
+ *     CreateTeamInvite lands the tokenized row and the mail rides the
+ *     funnel (the duplicate / already-member refusals flash and STILL
+ *     redirect — messageless 303s here; a mail failure propagates as the
+ *     ServerError); otherwise the user_not_exist flash. BOTH arms 303 onto
+ *     the team page. An ORG row the cannot_add_org_to_team arm (196-202),
+ *     a blocked user the shared blocked arm, an already-member the
  *     duplicate flash — the add itself rides the landed addTeamMember
  *     (AddTeamMember ensures the ORG membership first). `page = "team"`:
  *     the redirect target is the team page (223-226).
- *   - `remove_invite` — OWNER-only (204-207): the invite store does not
- *     exist at this pin (no MailService — invites are never created), so
- *     both of upstream's arms (the iid==0 redirect, teams.go:209-213, and
- *     the RemoveInviteByID write, 215-222) reduce to the team-page
- *     redirect.
+ *   - `remove_invite` — OWNER-only (204-207, census B-77): the `iid`
+ *     form int (209-213 — zero redirects bare), then RemoveInviteByID
+ *     (215-222 — BOTH keys bind, an error is the ServerError/throw);
+ *     the team-page redirect either way.
  *   - anything else — upstream's switch falls through with `page` empty
  *     (the wildcard param claim): the default teams-list redirect.
  */
@@ -15465,9 +15637,39 @@ async function orgTeamActionSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
       if (!isOwner) return respond(c.html(renderNotFound(ctx), 404));
       const uname = (form.get("uname") ?? "").trim().toLowerCase();
       const target = uname === "" ? null : await findUserByName(c.env.DB, uname);
-      if (target === null || target.type === "org") {
-        // user_not_exist (no MailService — no invite branch) /
-        // cannot_add_org_to_team: the flash arms' redirect, messageless.
+      if (target === null) {
+        // Census B-77 — teams.go:171-194's unknown-name fork: when the
+        // mailer is armed (`setting.MailService != nil`; our strict polarity
+        // MAIL_ENABLED === "true", notify.ts:799) AND the name parses as an
+        // email (`ValidateEmail`, email_address.go:121-129 — the module-local
+        // inviteEmailValid twin; the domain allow/block lists are unmodeled),
+        // CreateTeamInvite lands the tokenized row and the mail rides the
+        // funnel (a mail failure propagates = upstream's ServerError; the
+        // duplicate / already-member refusals flash AND still redirect
+        // upstream — the no-session-flash reduction keeps them messageless
+        // 303s). No mailer or not an email: the user_not_exist flash's
+        // redirect. EVERY arm here lands on the team page.
+        if (mailerArmed(c.env) && inviteEmailValid(uname)) {
+          try {
+            const inviter = viewer.kind === "user" ? await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get() : undefined;
+            if (inviter !== undefined) {
+              const invite = await service.createTeamInvite(inviter, team, uname);
+              await sendTeamInviteMail(c.env, {
+                inviter,
+                org: { username: org.username, displayName: null, fullName: org.fullName },
+                team: { name: team.name },
+                invite: { id: invite.id, token: invite.token, email: invite.email },
+              });
+            }
+          } catch (error) {
+            if (!(error instanceof TeamInviteAlreadyExistsError || error instanceof UserEmailAlreadyAddedError)) throw error;
+          }
+        }
+        return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+      }
+      if (target.type === "org") {
+        // cannot_add_org_to_team (teams.go:196-202): the flash's redirect,
+        // messageless.
         return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
       }
       const blocked = await isUserBlockedBy(c.env.DB, { id: target.id, isAdmin: target.isAdmin }, team.orgId);
@@ -15477,8 +15679,12 @@ async function orgTeamActionSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
     case "remove_invite":
     {
       if (!isOwner) return respond(c.html(renderNotFound(ctx), 404));
-      // No invite store at this pin (no MailService — nothing to remove);
-      // both upstream arms reduce to the team-page redirect.
+      // Census B-77 — teams.go:204-222: the iid==0 redirect (209-213), then
+      // RemoveInviteByID (215-222 — BOTH keys bind; an error is the
+      // ServerError, so the delete throws); the team-page redirect either way.
+      const iid = formInt64(form.get("iid"));
+      if (iid === 0) return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+      await service.removeInviteById(iid, team.id);
       return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
     }
     default:
@@ -20012,7 +20218,7 @@ uiRouter.get("/explore/code", (c) => exploreCodePage(c));
 // doc carries the full mount record (findings-links A2's fix).
 uiRouter.get("/api/swagger", (c) => apiSwaggerPage(c));
 uiRouter.get("/swagger.v1.json", () => swaggerV1Json());
-uiRouter.get("/openapi3.v1.json", () => swaggerV1Json());
+uiRouter.get("/openapi3.v1.json", () => openapi3V1Json());
 // The ORG-scoped inbox families (parseUiRoute claims exactly these 4-/5-
 // segment shapes — upstream web.go:986-991's `/org/{org}` group). Registered
 // in the STATIC block, physically before the dynamic /:owner/:repo pairs:
@@ -20220,6 +20426,16 @@ uiRouter.get("/repo/migrate", (c) => repoMigratePage(c));
 uiRouter.post("/repo/create", (c) => repoCreateSubmit(c));
 uiRouter.get("/org/create", (c) => orgCreatePage(c));
 uiRouter.post("/org/create", (c) => orgCreateSubmit(c));
+// Census B-77: the team-invite redeem pair (web.go:976-978 — GET renders the
+// join page, POST redeems; the literal `invite` segment rides the same
+// static-block rule as /org/create, physically before the dynamic
+// /org/:owner/... pairs). The other methods answer chi's 405 (the
+// edit/delete GET-twin convention — upstream registers only m.Get + m.Post
+// inside the {token} group).
+uiRouter.get("/org/invite/:token", (c) => orgTeamInvitePage(c));
+uiRouter.post("/org/invite/:token", (c) => orgTeamInviteRedeem(c));
+uiRouter.put("/org/invite/:token", () => methodNotAllowed("GET, POST"));
+uiRouter.delete("/org/invite/:token", () => methodNotAllowed("GET, POST"));
 uiRouter.get("/org/:owner/teams", (c) => orgTeamsPage(c));
 // The org worktime page (web.go:1015 — owner-only; registered beside the
 // wave-12 statics BEFORE any dynamic pair, the RegExpRouter rule).
