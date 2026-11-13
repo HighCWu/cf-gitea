@@ -257,6 +257,19 @@ export const AuditActions = {
     "Failed two-factor authentication for user {scope}.",
   ),
   UserPassword: defineAction("user:password", "Changed password of user {scope}."),
+  // The forgot-REQUEST arm's row (B-84, action.go:77 — id AND template
+  // verbatim): `audit.RecordAs(ctx, u, UserPasswordResetRequest, u)` at
+  // password.go:97 — the request is unauthenticated, so the affected account
+  // is the ONLY actor we can name (actor = scope = the target; the recorded
+  // IP carries the forensic signal). Emitted on POST /user/forgot_password's
+  // user-exists branch, in upstream's order (send → audit → cache-arm).
+  // OWNERSHIP NOTE: this registry entry rides B-84's wave (the session.ts/
+  // mail-arm unit) as a minimal disclosed append — the action id must be
+  // registered before any emit, and an unregistered id throws by design.
+  UserPasswordResetRequest: defineAction(
+    "user:password:resetrequest",
+    "Requested password reset for user {scope}.",
+  ),
   // The external-login link pair (action.go:89-90 — ids AND templates
   // verbatim): the add row emits at the dance callback's link completion
   // (web/oauth2-login.ts's linkIdentityToUser arms — upstream

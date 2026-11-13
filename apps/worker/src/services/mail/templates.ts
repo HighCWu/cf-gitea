@@ -988,3 +988,94 @@ export function renderTeamInviteMail(data: TeamInviteMailData): string {
 </body>
 </html>`;
 }
+
+// ---------------------------------------------------------------------------
+// The password-reset mail (templates/mail/user/auth/reset_passwd.tmpl —
+// census B-84, the forgot-REQUEST arm's carrier)
+// ---------------------------------------------------------------------------
+
+/** Go `url.QueryEscape` (net/url, the template funcmap's QueryEscape):
+ *  space becomes "+", every byte outside the unreserved set
+ *  (`A-Za-z0-9-._~`) percent-encodes UPPERCASE. The reset code's alphabet is
+ *  digits + hex + the hex(lowerName) tail — all unreserved, so the helper is
+ *  identity on every real value; it exists because the template's printf
+ *  pipeline runs it unconditionally. */
+export function goQueryEscape(raw: string): string {
+  let out = "";
+  for (const ch of raw) {
+    if (/[A-Za-z0-9\-._~]/.test(ch)) {
+      out += ch;
+    } else if (ch === " ") {
+      out += "+";
+    } else {
+      out += [...Buffer.from(ch, "utf8")].map((byte) => `%${byte.toString(16).toUpperCase().padStart(2, "0")}`).join("");
+    }
+  }
+  return out;
+}
+
+/** `mail.reset_password` (locale_en-US.json) — the EMAIL SUBJECT, verbatim
+ *  with no interpolation (mail_user.go:69's `TrString`, unlike the title line
+ *  below it carries no arg). The MAIL_SUBJECT_PREFIX rides at SEND time
+ *  (message.ts), never in the stored draft. */
+export function resetPasswordMailSubject(): string {
+  return "Recover your account";
+}
+
+/** `mail.reset_password.title` (locale_en-US.json): `%s, you have requested
+ *  to recover your account` — the base head's title line. The arg is the
+ *  DotEscape'd display name; TrHTML escapes plain-string args ONCE
+ *  (localestore.go:156-171) and the template.HTML result inserts raw into
+ *  `<title>{{.}}</title>` — so the caller passes the ALREADY-ESCAPED name and
+ *  this composes without a second pass (the register_notify twin composes the
+ *  escaped name then re-escapes the whole line; identical bytes for
+ *  special-char-free names — the divergence is noted in its test). */
+export function resetPasswordMailTitle(escapedDotEscapedDisplayName: string): string {
+  return `${escapedDotEscapedDisplayName}, you have requested to recover your account`;
+}
+
+/** Data for `renderResetPasswordMail` (sendUserMail's data map's used slice,
+ *  mail_user.go:29-37). */
+export interface ResetPasswordMailData {
+  /** Upstream `.DisplayName` — DotEscape'd at BOTH interpolation sites the
+   *  template declares (the head title arg AND mail.hi_user_x's). */
+  displayName: string;
+  /** Upstream `.ResetPwdCodeLives` — the friendly minutes string
+   *  (MinutesToFriendly(180) = "3 hours"). */
+  resetPwdCodeLives: string;
+  /** Upstream `.Code` — the time-limit code (code + the hex tail, verbatim;
+   *  QueryEscape is identity on its alphabet, see goQueryEscape). */
+  code: string;
+  /** Upstream AppUrl — TRAILING-SLASH form (the template's printf
+   *  concatenates `AppUrl + "user/recover_account?code="` directly). */
+  appUrl: string;
+  /** Upstream AppName (template funcmap) — the footer link's label. */
+  appName: string;
+}
+
+/**
+ * The password-reset body — `templates/mail/user/auth/reset_passwd.tmpl`
+ * byte-faithful trace over the base head/footer. The recover URL points at
+ * `user/recover_account` (NOT reset_password — both routes bind the SAME
+ * handlers upstream, web.go:761-762), interpolated RAW into the href AND the
+ * link text (the register_notify/team_invite URL precedent — html/template's
+ * href-context escaping is identity for this scheme+path+single-query form).
+ * The `mail.reset_password.text` line and its link paragraph share ONE
+ * source line (the template's own adjacency, like register_notify's text_2).
+ */
+export function renderResetPasswordMail(data: ResetPasswordMailData): string {
+  const dotEscaped = escapeHtml(dotEscape(data.displayName));
+  const lives = escapeHtml(data.resetPwdCodeLives);
+  const appUrl = escapeHtml(data.appUrl);
+  const appName = escapeHtml(data.appName);
+  const recoverUrl = `${data.appUrl}user/recover_account?code=${goQueryEscape(data.code)}`;
+  return `${baseHead(resetPasswordMailTitle(dotEscaped))}
+<body>
+	<p>Hi <b>${dotEscaped}</b>,</p>
+	<p>Please click the following link to recover your account within <b>${lives}</b>:</p><p style="word-break: break-all;"><a href="${recoverUrl}">${recoverUrl}</a></p>
+	<p>Not working? Try copying and pasting it to your browser.</p>
+
+	${baseFooter(appUrl, appName)}
+</body>
+</html>`;
+}

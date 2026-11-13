@@ -146,8 +146,16 @@ import {
   limiterResetFailOpen,
 } from "../auth/middleware";
 import { userSignInPassword } from "../auth/password-auth";
-import { verifyUserTimeLimitCode } from "../auth/reset-code";
+import { generateUserTimeLimitCode, verifyUserTimeLimitCode } from "../auth/reset-code";
 import { applyPasswordReset } from "../services/user-accounts";
+import {
+  enqueueResetPasswordMail,
+  mailerConfigured,
+  RESET_PWD_CODE_LIVES_FRIENDLY,
+  lookupUserByEmail,
+  resetAccountIsExternalOnly,
+  resetMailResendLimited,
+} from "../services/mail/reset-notify";
 import {
   passwordResetLocale,
   renderForgotPasswordPage,
@@ -735,7 +743,7 @@ export async function lookupImpersonationExitSession(
   value: string,
 ): Promise<{
   admin: { id: number; username: string };
-  target: { id: number; username: string; type: "user" | "org" };
+  target: { id: number; username: string; type: "user" | "org" | "bot" };
 } | null> {
   const parsed = parseCookieValue(value);
   if (parsed === null) return null;
@@ -1699,6 +1707,11 @@ sessionRouter.post("/logout", (c) => logout(c));
 // The 2FA gate (web.go:600-604's group — statics, no uiRouter overlap).
 sessionRouter.get("/user/forgot_password", (c) => forgotPasswordPage(c));
 sessionRouter.post("/user/forgot_password", (c) => forgotPasswordSubmit(c));
+// /user/recover_account binds the SAME handlers as /user/reset_password
+// upstream (web.go:761-762 — the reset MAIL's link carries this path,
+// reset_passwd.tmpl's printf `%suser/recover_account?code=%s`).
+sessionRouter.get("/user/recover_account", (c) => resetPasswordPage(c));
+sessionRouter.post("/user/recover_account", (c) => resetPasswordSubmit(c));
 sessionRouter.get("/user/reset_password", (c) => resetPasswordPage(c));
 sessionRouter.post("/user/reset_password", (c) => resetPasswordSubmit(c));
 sessionRouter.get("/user/two_factor", (c) => twofaPage(c));
@@ -1708,26 +1721,41 @@ sessionRouter.post("/user/two_factor/scratch", (c) => twofaScratchSubmit(c));
 
 // ---------------------------------------------------------------------------
 // The forgot/reset password arms (upstream routers/web/auth/password.go —
-// SPEC-0002 §6.2 reset row, PWD-2). The forgot-REQUEST arm stays gated off
-// upstream-faithfully (no Workers mailer: the GET renders the
-// reset-disabled state — password.go:40-45's IsResetDisable — and the POST
-// is the :53-57 NotFound). The reset-COMPLETE arm is live: the HMAC
-// time-limit code (auth/reset-code.ts) verifies, the 2FA arms run
+// SPEC-0002 §6.2 reset row, PWD-2; B-84 landed the forgot-REQUEST arm).
+// The forgot-REQUEST arm is LIVE when a mailer is configured
+// (MAIL_ENABLED="true" — the MailService!=nil posture): the GET renders the
+// IsResetRequest form, the POST runs ForgotPasswdPost's ladder
+// (password.go:53-106) — the email lookup (non-individuals fold into
+// not-exist, :66-68), the non-local refusal flash (:81-85), the 180 s
+// resend throttle (:87-91), the time-limit code mint + the reset mail over
+// the landed outbox (services/mail/reset-notify.ts — upstream
+// SendResetPasswordMail), the UserPasswordResetRequest audit row (:97), and
+// the ANTI-ENUMERATION render: IsResetSent at 200 for an unknown AND a
+// known account alike (:69-74 vs :103-105 — identical Data, byte-identical
+// response; NO existence oracle, NO redirect). Without a mailer the
+// disabled twins stay upstream-faithful: the GET renders the
+// reset-disabled state (password.go:40-45's IsResetDisable) and the POST is
+// the :53-57 NotFound. The reset-COMPLETE arm is live: the HMAC time-limit
+// code (auth/reset-code.ts) verifies, the 2FA arms run
 // (password.go:170-204's order — TOTP passcode/scratch BEFORE the apply,
 // the WebAuthn-only park AFTER it), then the UpdateAuth ladder
 // (services/user-accounts.ts applyPasswordReset) and the auto sign-in
 // (handleSignIn — mint + cookie + the "/" redirect).
 // ---------------------------------------------------------------------------
 
-/** GET /user/forgot_password — the reset-disabled page. The MUST-CHANGE
- *  gate prologue rides first (the gate section — upstream's middleware
- *  precedes the handler on every webRoute). */
+/** GET /user/forgot_password — the request form when a mailer is configured
+ *  (IsResetRequest, the `?email=` prefill upstream seeds at :46), else the
+ *  reset-disabled page (IsResetDisable). The MUST-CHANGE gate prologue
+ *  rides first (the gate section — upstream's middleware precedes the
+ *  handler on every webRoute). */
 async function forgotPasswordPage(c: RouteContext): Promise<Response> {
   const gate = await sessionMustChangeGate(c.env.DB, c.req.raw);
   if (gate !== null) return gate;
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
-  return c.html(renderForgotPasswordPage(assembled.ctx), 200);
+  if (!mailerConfigured(c.env)) return c.html(renderForgotPasswordPage(assembled.ctx), 200);
+  const email = new URL(c.req.url).searchParams.get("email") ?? "";
+  return c.html(renderForgotPasswordPage(assembled.ctx, { state: "request", email }), 200);
 }
 
 /**
@@ -1751,16 +1779,107 @@ function forgotPasswordNotFound(env: Env, req: Request): Response | Promise<Resp
   return renderNotFoundShellResponse(env, req);
 }
 
-/** POST /user/forgot_password — upstream NotFound without a mailer
- *  (password.go:53-57; the form never renders, so this is the
- *  non-browser-client arm). The MUST-CHANGE gate prologue rides first —
- *  upstream's middleware precedes the handler, so a flagged session's POST
- *  redirects to the change page before this 404 ever applies. */
+/** The IsResetSent render (password.go:69-74's not-exist arm and :103-105's
+ *  success arm carry IDENTICAL Data — Email from the SUBMISSION, the friendly
+ *  lives; the bytes match, which IS the anti-enumeration posture). */
+function forgotPasswordSentResponse(
+  c: RouteContext,
+  ctx: UiContext,
+  email: string,
+): Response {
+  return c.html(
+    renderForgotPasswordPage(ctx, { state: "sent", email, lives: RESET_PWD_CODE_LIVES_FRIENDLY }),
+    200,
+  );
+}
+
+/** POST /user/forgot_password — ForgotPasswdPost (password.go:53-106).
+ *  Without a mailer: upstream NotFound (the disabled twin — the form never
+ *  renders, so this is the non-browser-client arm). With one: the lookup →
+ *  non-local refusal → resend throttle → mint + mail + audit → the sent
+ *  render, with the not-exist arm answering the SAME sent render
+ *  (anti-enumeration). The MUST-CHANGE gate prologue rides after the
+ *  same-origin guard (the sibling reset arm's order — upstream's CSRF
+ *  middleware precedes the gate), so a flagged session's POST still
+ *  redirects to the change page before any of this applies. */
 async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
   const gate = await sessionMustChangeGate(c.env.DB, c.req.raw);
   if (gate !== null) return gate;
-  const answer = forgotPasswordNotFound(c.env, c.req.raw);
-  return answer instanceof Response ? answer : await answer;
+  if (!mailerConfigured(c.env)) {
+    const answer = forgotPasswordNotFound(c.env, c.req.raw);
+    return answer instanceof Response ? answer : await answer;
+  }
+
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+
+  const params = await readUrlEncodedForm(c.req.raw);
+  const email = params.get("email") ?? "";
+
+  // password.go:62-68 — the lookup; ORGS fold into not-exist (the silent
+  // arm), as does an empty submission (GetUserByEmail's len==0 arm).
+  const user = await lookupUserByEmail(c.env.DB, email);
+  if (user === null || user.type !== "user") return forgotPasswordSentResponse(c, assembled.ctx, email);
+
+  // password.go:81-85 — the non-local refusal: Err_Email + the
+  // non_local_account flash, the form re-rendered with the submission
+  // prefilled (RenderWithErrDeprecated re-renders tplForgotPassword).
+  if (await resetAccountIsExternalOnly(c.env.DB, user.id)) {
+    return c.html(
+      renderForgotPasswordPage(assembled.ctx, {
+        state: "request",
+        email,
+        errEmail: true,
+        error: passwordResetLocale.non_local_account,
+      }),
+      200,
+    );
+  }
+
+  // password.go:87-91 — the resend throttle: the limited arm re-renders the
+  // FORM with no message (IsResetRequest stays in Data upstream, so the
+  // template's dead ResendLimited branch never wins the chain).
+  if (await resetMailResendLimited(c.env.DB, user.id, new Date())) {
+    return c.html(renderForgotPasswordPage(assembled.ctx, { state: "request", email }), 200);
+  }
+
+  // password.go:93-97 — the code mint (user.go:952-963, the SAME HMAC
+  // machinery the reset-COMPLETE arm verifies) + the reset mail, then the
+  // audit row. The hash data binds the ROW's passwd|rands (user.go:948-950 —
+  // a successful reset invalidates the code de facto), so the FULL row is
+  // read here; a row vanished since the lookup answers the sent render (the
+  // not-exist arm's bytes). SendAsync is fire-and-forget upstream: an
+  // enqueue failure logs and the sent render still answers (a mailer outage
+  // must never fail the arm — the register-notify seam posture); the audit
+  // row rides the same best-effort catch (user-accounts.ts's emit posture).
+  const row = await drizzle(c.env.DB).select().from(users).where(eq(users.id, user.id)).get();
+  if (row === undefined) return forgotPasswordSentResponse(c, assembled.ctx, email);
+  const code = await generateUserTimeLimitCode(c.env.DB, "reset_password", row);
+  const mail = await enqueueResetPasswordMail(c.env, user, { code }).catch((error: unknown) => {
+    console.error(`forgot-password: reset mail enqueue failed: ${String(error)}`);
+    return { outcome: "disabled" as const };
+  });
+  if (mail.outcome === "misconfigured") console.error(`forgot-password: ${mail.message}`);
+  try {
+    await emitAudit(drizzle(c.env.DB), {
+      action: AuditActions.UserPasswordResetRequest,
+      actorId: user.id,
+      actorName: user.username,
+      actorCredential: null,
+      scopeType: "user",
+      scopeId: user.id,
+      scopeName: user.username,
+      origin: "ui",
+      ipAddress: clientIp(c.req.raw),
+      vars: { scope: user.username },
+    });
+  } catch (error) {
+    console.error(`forgot-password: audit row failed: ${String(error)}`);
+  }
+
+  return forgotPasswordSentResponse(c, assembled.ctx, email);
 }
 
 /**
@@ -1807,6 +1926,7 @@ async function resetPasswordPage(c: RouteContext): Promise<Response> {
   if ("response" in assembled) return assembled.response;
   const url = new URL(c.req.url);
   const code = url.searchParams.get("code") ?? "";
+  const action = url.pathname; // upstream's {{.Link}} — the served path, no query (context.go:59)
   if (code !== "") {
     const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
     if (user !== null) {
@@ -1817,13 +1937,13 @@ async function resetPasswordPage(c: RouteContext): Promise<Response> {
       const twoFactor = await hasTwoFactorByUid(c.env.DB, user.id);
       const refusal = await resetWrongUserRefusal(c.env.DB, c.req.raw, user);
       if (refusal !== null) {
-        return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: refusal, twoFactor }), 200);
+        return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: refusal, twoFactor, action }), 200);
       }
-      return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: null, twoFactor }), 200);
+      return c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: null, twoFactor, action }), 200);
     }
   }
   return c.html(
-    renderResetPasswordPage({ ctx: assembled.ctx, code, error: passwordResetLocale.invalid_code, twoFactor: false }),
+    renderResetPasswordPage({ ctx: assembled.ctx, code, error: passwordResetLocale.invalid_code, twoFactor: false, action }),
     200,
   );
 }
@@ -1840,8 +1960,9 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
 
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
+  const action = new URL(c.req.url).pathname; // upstream's {{.Link}} — the POST's own path
   const invalid = (code: string, message: string): Response =>
-    c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: message, twoFactor: false }), 200);
+    c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: message, twoFactor: false, action }), 200);
 
   const params = await readUrlEncodedForm(c.req.raw);
   const code = params.get("code") ?? "";
@@ -1862,7 +1983,7 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   const refusal = await resetWrongUserRefusal(c.env.DB, c.req.raw, user);
   if (refusal !== null) {
     return c.html(
-      renderResetPasswordPage({ ctx: assembled.ctx, code, error: refusal, twoFactor: twofa !== null }),
+      renderResetPasswordPage({ ctx: assembled.ctx, code, error: refusal, twoFactor: twofa !== null, action }),
       200,
     );
   }

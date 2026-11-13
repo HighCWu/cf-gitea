@@ -7,10 +7,21 @@
  * service calls.
  *
  * Pins (upstream routers/web/auth/password.go at the submodule):
- *   - the forgot-REQUEST arm stays GATED OFF (no Workers mailer): the GET
- *     renders the IsResetDisable state (password.go:40-45) and the POST is
- *     the non-browser arm (password.go:53-57) — the LANDED 404 (the PWD-WIRE
- *     finding cured 2026-11-04; the pin below);
+ *   - the forgot-REQUEST arm's DISABLED twins (no Workers mailer — the
+ *     injected test env carries MAIL_ENABLED="false"): the GET renders the
+ *     IsResetDisable state (password.go:40-45) and the POST is the
+ *     non-browser arm (password.go:53-57) — the LANDED 404 (the PWD-WIRE
+ *     finding cured 2026-11-04);
+ *   - the forgot-REQUEST arm's LIVE ladder (B-84, password.go:53-106, over
+ *     MAIL_ENABLED="true"): the request form, the ANTI-ENUMERATION sent
+ *     render (byte-identical for a known and an unknown submission — no
+ *     existence oracle, no account-derived data beyond the submission echo),
+ *     the outbox row + the minted code's 180-minute TTL on the exists
+ *     branch, the org fold into the silent arm, the secondary-email lookup
+ *     mailing the PRIMARY address (EmailTo parity), the 180 s resend
+ *     throttle, the non-local refusal flash, the UserPasswordResetRequest
+ *     audit row, and the /user/recover_account route alias (web.go:761-762 —
+ *     the mail link's path, the form's {{.Link}} action);
  *   - the reset link verifies BEFORE the form renders (commonResetPassword,
  *     password.go:110-160) over the HMAC time-limit code
  *     (models/user/user.go:920-973 at our auth/reset-code.ts port): bad
@@ -48,12 +59,18 @@ import { generateUserTimeLimitCode, verifyUserTimeLimitCode, TIME_LIMIT_CODE_LEN
 import { createCredential } from "../../web/webauthn-store";
 import { encodeCoseKey, WEBAUTHN_COOKIE_NAME } from "../../web/webauthn-ceremony";
 import { demoModeEnabled } from "../../services/demo-sweep";
-import { sessions, users } from "../../db/schema";
+import { enqueueMailOutbox } from "../../services/mail/outbox";
+import {
+  MAIL_RESEND_LIMIT_SECONDS,
+  RESET_PWD_CODE_LIVES_FRIENDLY,
+} from "../../services/mail/reset-notify";
+import { auditEvents, emailAddresses, emailOutbox, externalLoginUsers, loginSources, sessions, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
 import {
   mintSession,
+  MUST_CHANGE_PASSWORD_PATH,
   REMEMBER_MAX_AGE_SECONDS,
   SESSION_COOKIE_NAME,
   sessionRouter,
@@ -99,13 +116,25 @@ const app = new Hono<{ Bindings: Env }>();
 app.route("/", sessionRouter);
 
 /** Route-level request with a REAL execution context so every waitUntil
- *  side-effect settles before assertions (session.test.ts's helper). */
-async function request(path: string, init?: RequestInit): Promise<Response> {
+ *  side-effect settles before assertions (session.test.ts's helper). An
+ *  explicit `requestEnv` overrides the injected vars (the live-mail pins —
+ *  the generated Env types MAIL_ENABLED as the example's literal, so the
+ *  widened shape is the house cast pattern). */
+async function request(path: string, init?: RequestInit, requestEnv?: Env): Promise<Response> {
   const { createExecutionContext, waitOnExecutionContext } = await import("cloudflare:test");
   const context = createExecutionContext();
-  const response = await app.fetch(new Request(`${ORIGIN}${path}`, init), testEnv, context);
+  const response = await app.fetch(new Request(`${ORIGIN}${path}`, init), requestEnv ?? testEnv, context);
   await waitOnExecutionContext(context);
   return response;
+}
+
+/** The live-mail env slice: MAIL_ENABLED="true" (the MailService!=nil
+ *  posture) with a parseable MAIL_FROM. */
+function liveMailEnv(): Env {
+  const live: Env = { ...env };
+  (live as { MAIL_ENABLED?: string }).MAIL_ENABLED = "true";
+  (live as { MAIL_FROM?: string }).MAIL_FROM = "Gitea <gitea@test.local>";
+  return live;
 }
 
 function form(fields: Record<string, string>): RequestInit {
@@ -128,12 +157,15 @@ beforeEach(async () => {
   for (const table of [
     "user_redirects",
     "email_addresses",
+    "email_outbox",
     "sessions",
     "personal_access_tokens",
     "auth_failures",
     "two_factor",
     "webauthn_credentials",
     "audit_event",
+    "external_login_user",
+    "login_source",
     "users",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
@@ -467,7 +499,7 @@ describe("POST /user/reset_password — the apply ladder", () => {
     expect(await verifyUserTimeLimitCode(env.DB, "reset_password", code)).not.toBeNull();
   });
 
-  it("the policy re-check runs on the POST arm: below-minimum and complexity failures re-render, password untouched (update.go:247-265)", async () => {
+  it("the policy re-check runs on the POST arm: below-minimum re-renders, a WEAK single-class password APPLIES at the default config, password stored (update.go:247-265; B-87's attributed cross-edit — upstream's unset PASSWORD_COMPLEXITY is checking OFF, security.go:209-218 + app.example.ini:503; the pre-B-87 all-classes arm mis-derived the default and the ARMED re-render shape pins in admin-t2.test.ts's knob battery)", async () => {
     const alice = await seedUser("Alice", "alice@example.com");
     const code = await mintCode(alice);
 
@@ -476,13 +508,13 @@ describe("POST /user/reset_password — the apply ladder", () => {
     expect(await short.text()).toContain("Password length cannot be less than 8 characters.");
 
     const weak = await request("/user/reset_password", form({ code, password: "alllowercasepass", retype: "alllowercasepass" }));
-    expect(weak.status).toBe(200);
-    // BuildComplexityError's all-classes default (password.go:86-96): the
-    // upper/digit classes missing.
-    expect(await weak.text()).toContain("Password does not pass complexity requirements:");
-
+    expect(weak.status).toBe(303);
     const after = await userRow(alice.id);
-    expect(after.passwd).toBe("");
+    // The weak-but-long password now APPLIES (the code consumed, the record
+    // stored — the reset arm's normal success shape).
+    expect(after.passwd).not.toBe("");
+    expect(after.passwdHashAlgo).toBe("pbkdf2$50000$50");
+    expect(await verifyUserTimeLimitCode(env.DB, "reset_password", code)).toBeNull();
   });
 
   it("a missing / invalid code on POST → the invalid-code re-render (password.go:171-176's commonResetPassword miss)", async () => {
@@ -725,5 +757,354 @@ describe("the wrong-user refusal (password.go:144-146, B-83)", () => {
     );
     expect(res.status).toBe(303);
     expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The forgot-REQUEST arm's LIVE render states (B-84 — forgot_passwd.tmpl's
+// request/sent arms over the reduced house render)
+// -----------------------------------------------------------------------------
+
+const SENT_PROMPT_FRAGMENT = "A confirmation email has been sent to";
+
+describe("the live forgot page renders (forgot_passwd.tmpl's arms, B-84)", () => {
+  it("the request state renders the email form with the prefill, no disabled message", () => {
+    const html = renderToString(
+      <ForgotPasswordPage ctx={ctx} arm={{ state: "request", email: "alice@example.com" }} />,
+    );
+    expect(html).toContain('action="/user/forgot_password"');
+    expect(html).toContain('name="email"');
+    expect(html).toContain('value="alice@example.com"');
+    expect(html).toContain('type="email"');
+    expect(html).toContain("Email Address");
+    expect(html).toContain(passwordResetLocale.send_reset_mail);
+    expect(html).not.toContain(passwordResetLocale.reset_disabled);
+    expect(html).not.toContain(SENT_PROMPT_FRAGMENT);
+    // The field div carries no error class without Err_Email (password.go:82).
+    expect(html).not.toContain('field error"');
+  });
+
+  it("the non-local refusal: Err_Email's field class + the non_local_account flash (password.go:81-85)", () => {
+    const html = renderToString(
+      <ForgotPasswordPage
+        ctx={ctx}
+        arm={{ state: "request", email: "ldap@x.test", errEmail: true, error: passwordResetLocale.non_local_account }}
+      />,
+    );
+    expect(html).toContain('field error"');
+    expect(html).toContain(passwordResetLocale.non_local_account);
+    expect(html).toContain('name="email"');
+  });
+
+  it("the sent state: the mail-sent prompt with the SUBMITTED email bolded and the 3-hour lives, NO form", () => {
+    const html = renderToString(
+      <ForgotPasswordPage ctx={ctx} arm={{ state: "sent", email: "ghost@x.test", lives: RESET_PWD_CODE_LIVES_FRIENDLY }} />,
+    );
+    expect(html).toContain(SENT_PROMPT_FRAGMENT);
+    expect(html).toContain(`<b>ghost@x.test</b>`);
+    expect(html).toContain("3 hours");
+    expect(html).toContain("to complete the account recovery process");
+    // IsResetSent wins the template chain — no request form, no disabled note.
+    expect(html).not.toContain("<form");
+    expect(html).not.toContain(passwordResetLocale.reset_disabled);
+  });
+
+  it("renderForgotPasswordPage threads the arm state (the wrapper)", () => {
+    expect(renderForgotPasswordPage(ctx, { state: "sent", email: "a@b.test", lives: "3 hours" })).toContain(
+      SENT_PROMPT_FRAGMENT,
+    );
+    expect(renderForgotPasswordPage(ctx)).toContain(passwordResetLocale.reset_disabled);
+  });
+
+  it("ResetPasswordPage's action mirrors {{.Link}} — the served path (context.go:59): /user/recover_account posts back there", () => {
+    const html = renderToString(
+      <ResetPasswordPage ctx={ctx} code="abc" error={null} twoFactor={false} action="/user/recover_account" />,
+    );
+    expect(html).toContain('action="/user/recover_account"');
+    const def = renderToString(<ResetPasswordPage ctx={ctx} code="abc" error={null} twoFactor={false} />);
+    expect(def).toContain('action="/user/reset_password"');
+  });
+});
+
+// -----------------------------------------------------------------------------
+// POST/GET /user/forgot_password — the LIVE ladder (B-84, password.go:53-106
+// over MAIL_ENABLED="true"): lookup → org fold → non-local refusal → 180 s
+// resend throttle → code mint + outbox mail + audit → the anti-enumeration
+// sent render.
+// -----------------------------------------------------------------------------
+
+describe("the live forgot-REQUEST ladder (password.go:53-106, B-84)", () => {
+  it("GET with a mailer renders the REQUEST form (IsResetRequest), honoring the ?email= prefill (password.go:46)", async () => {
+    const res = await request("/user/forgot_password", undefined, liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('name="email"');
+    expect(html).toContain(passwordResetLocale.send_reset_mail);
+    expect(html).not.toContain(passwordResetLocale.reset_disabled);
+    expect(html).not.toContain(SENT_PROMPT_FRAGMENT);
+
+    const prefilled = await request("/user/forgot_password?email=pri%40x.test", undefined, liveMailEnv());
+    expect(await prefilled.text()).toContain('value="pri@x.test"');
+  });
+
+  it("an UNKNOWN account answers the sent render at 200 — the silent arm, NOTHING enqueued, NO audit row (password.go:69-74)", async () => {
+    const res = await request("/user/forgot_password", form({ email: "ghost@x.test" }), liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(SENT_PROMPT_FRAGMENT);
+    expect(html).toContain("<b>ghost@x.test</b>");
+    expect(html).toContain("3 hours");
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("ANTI-ENUMERATION: the SAME submission answers BYTE-IDENTICALLY whether the account exists or not (password.go:69-74 vs :103-105)", async () => {
+    const alice = await seedUser("Alice", "pri@x.test");
+    const known = await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+    expect(known.status).toBe(200);
+    const bodyA = await known.text();
+    expect(bodyA).toContain(SENT_PROMPT_FRAGMENT);
+
+    // The account vanishes; the identical submission must render the identical bytes.
+    await drizzle(env.DB).delete(users).where(eq(users.id, alice.id));
+    const unknown = await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+    expect(unknown.status).toBe(200);
+    expect(await unknown.text()).toBe(bodyA);
+  });
+
+  it("the EXISTS branch mints the code + enqueues the reset mail (the outbox row, upstream Info/To/subject, fresh code per send)", async () => {
+    const alice = await seedUser("Alice", "pri@x.test");
+    await seedPassword(alice);
+
+    const res = await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(SENT_PROMPT_FRAGMENT);
+
+    const rows = await drizzle(env.DB).select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.info).toBe(`UID: ${alice.id}, recover account`); // sendUserMail's fmt, mail_user.go:49
+    expect(row.toAddr).toBe("pri@x.test"); // u.EmailTo() — the PRIMARY address
+    expect(row.subject).toBe("Recover your account"); // mail.reset_password, no prefix in the draft
+    expect(row.fromAddress).toBe("gitea@test.local");
+    expect(row.fromDisplayName).toBe("Gitea");
+    expect(row.dedupeKey).toBeNull(); // every allowed POST sends a FRESH code
+    expect(row.bodyHtml).toContain("/user/recover_account?code=");
+    expect(row.bodyHtml).toContain("Hi <b>Alice</b>,"); // mail.hi_user_x over the display name
+    expect(row.bodyHtml).toContain("within <b>3 hours</b>:");
+    // The link's code VERIFIES against the row (the SAME HMAC machinery the
+    // reset-COMPLETE arm verifies — user.go:965-973).
+    const code = row.bodyHtml.match(/recover_account\?code=([0-9a-f]+)"/)?.[1];
+    expect(code).toBeDefined();
+    expect((await verifyUserTimeLimitCode(env.DB, "reset_password", code!))?.id).toBe(alice.id);
+    // …and the TTL is the 180-minute window (service.go:147's default; the
+    // verify's now < start+minutes arm, tool.go:53).
+    const mintedAt = Date.now();
+    expect(
+      (await verifyUserTimeLimitCode(env.DB, "reset_password", code!, { now: new Date(mintedAt + 179 * 60_000) }))?.id,
+    ).toBe(alice.id);
+    expect(
+      await verifyUserTimeLimitCode(env.DB, "reset_password", code!, { now: new Date(mintedAt + 181 * 60_000) }),
+    ).toBeNull();
+  });
+
+  it("the audit row lands on the exists branch (user:password:resetrequest, actor=scope=the target — password.go:97's RecordAs)", async () => {
+    const alice = await seedUser("Alice", "pri@x.test");
+    await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("user:password:resetrequest"); // action.go:77, verbatim
+    expect(row.actorId).toBe(alice.id);
+    expect(row.scopeId).toBe(String(alice.id));
+    expect(row.scopeName).toBe("Alice");
+    expect(row.origin).toBe("ui");
+    expect(row.ipAddress).toBe("unknown"); // no cf-connecting-ip on the synthetic request
+    expect(row.message).toContain("Requested password reset for user Alice");
+  });
+
+  it("an ORG submission folds into the silent arm (password.go:66-68's !IsIndividual ⇒ not-exist) — sent bytes, no mail, no audit", async () => {
+    await drizzle(env.DB).insert(users).values({
+      username: "TheOrg",
+      usernameLower: "theorg",
+      email: "org@x.test",
+      type: "org",
+      createdAt: new Date(),
+    });
+    const res = await request("/user/forgot_password", form({ email: "org@x.test" }), liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(SENT_PROMPT_FRAGMENT);
+    expect(html).toContain("<b>org@x.test</b>");
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("a SECONDARY address resolves the account but the mail rides the PRIMARY (GetUserByEmail's email_address arm + EmailTo parity)", async () => {
+    const alice = await seedUser("Alice", "pri@x.test");
+    await drizzle(env.DB)
+      .insert(emailAddresses)
+      .values({ userId: alice.id, email: "sec@x.test", lowerEmail: "sec@x.test", isActivated: true, isPrimary: false });
+
+    const res = await request("/user/forgot_password", form({ email: "sec@x.test" }), liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The response echoes ONLY the submission — no primary-address, no
+    // username leak (the anti-enumeration render's data shape).
+    expect(html).toContain("<b>sec@x.test</b>");
+    expect(html).not.toContain("pri@x.test");
+    expect(html).not.toContain("Alice");
+
+    const rows = await drizzle(env.DB).select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.toAddr).toBe("pri@x.test"); // u.EmailTo() — upstream mails the primary
+  });
+
+  it("the RESEND throttle: a second POST inside 180 s re-renders the FORM with no message, no mail, no audit (password.go:87-91)", async () => {
+    await seedUser("Alice", "pri@x.test");
+    await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(1);
+
+    const second = await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+    expect(second.status).toBe(200);
+    const html = await second.text();
+    // IsResetRequest stays in Data — the template's (dead) ResendLimited
+    // branch never wins the chain, the form re-renders silently.
+    expect(html).toContain('name="email"');
+    expect(html).not.toContain(SENT_PROMPT_FRAGMENT);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(1);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(1);
+  });
+
+  it("the throttle EXPIRES after 180 s: the ledger row outside the window arms nothing, the mail sends again (password.go:99's TTL)", async () => {
+    const alice = await seedUser("Alice", "pri@x.test");
+    // A ledger row from 181 s ago (MailResendLimit's Put TTL, password.go:99).
+    await enqueueMailOutbox(
+      { DB: env.DB },
+      {
+        info: `UID: ${alice.id}, recover account`,
+        fromAddress: "gitea@test.local",
+        fromDisplayName: "Gitea",
+        toAddr: "pri@x.test",
+        replyTo: null,
+        subject: "Recover your account",
+        bodyHtml: "stale",
+        headers: null,
+        dedupeKey: null,
+      },
+      { now: new Date(Date.now() - (MAIL_RESEND_LIMIT_SECONDS + 1) * 1000) },
+    );
+
+    const res = await request("/user/forgot_password", form({ email: "pri@x.test" }), liveMailEnv());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(SENT_PROMPT_FRAGMENT);
+    const rows = await drizzle(env.DB).select().from(emailOutbox).all();
+    expect(rows).toHaveLength(2); // the stale row + the fresh mail
+    expect(rows.filter((r) => r.bodyHtml !== "stale")).toHaveLength(1);
+  });
+
+  it("the NON-LOCAL refusal: an external (non-OAuth2) link flashes non_local_account with Err_Email, nothing sent (password.go:81-85)", async () => {
+    const alice = await seedUser("Alice", "ldap@x.test");
+    const src = (
+      await drizzle(env.DB)
+        .insert(loginSources)
+        .values({
+          type: 2, // LDAP — NOT Plain(0)/OAuth2(6): the refused class
+          name: "corp-ldap",
+          isActive: true,
+          cfg: "{}",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning({ id: loginSources.id })
+    )[0]!;
+    await drizzle(env.DB).insert(externalLoginUsers).values({
+      externalId: "u-1",
+      loginSourceId: src.id,
+      userId: alice.id,
+      provider: "ldap",
+    });
+
+    const res = await request("/user/forgot_password", form({ email: "ldap@x.test" }), liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(passwordResetLocale.non_local_account);
+    expect(html).toContain('field error"');
+    expect(html).toContain('value="ldap@x.test"'); // the submission stays prefilled
+    expect(html).not.toContain(SENT_PROMPT_FRAGMENT);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("the MUST-CHANGE gate precedes the live ladder: a flagged session's POST redirects, no mail, no audit (the middleware order)", async () => {
+    const alice = await seedUser("Alice", "pri@x.test");
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, alice.id));
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+
+    const res = await request(
+      "/user/forgot_password",
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+        body: "email=pri@x.test",
+      },
+      liveMailEnv(),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(MUST_CHANGE_PASSWORD_PATH);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("a CROSS-ORIGIN POST is rejected before the ladder (the same-origin guard — upstream's CSRF middleware precedence)", async () => {
+    await seedUser("Alice", "pri@x.test");
+    const res = await request(
+      "/user/forgot_password",
+      { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.test" }, body: "email=pri@x.test" },
+      liveMailEnv(),
+    );
+    expect(res.status).toBe(403);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The /user/recover_account alias (web.go:761-762 — the reset MAIL's link
+// binds the SAME handlers; the form's {{.Link}} posts back to this path).
+// -----------------------------------------------------------------------------
+
+describe("/user/recover_account — the reset handlers' second binding (B-84)", () => {
+  it("GET renders the reset form WITH the code and the recover-path action (the mail link's landing)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const code = await mintCode(alice);
+
+    const res = await request(`/user/recover_account?code=${code}`, undefined, liveMailEnv());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`name="code" value="${code}"`);
+    expect(html).toContain('action="/user/recover_account"'); // {{.Link}} — the served path
+    expect(html).not.toContain(passwordResetLocale.invalid_code);
+  });
+
+  it("POST applies the reset through the SAME ladder (303 /, the new password signs in)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const code = await mintCode(alice);
+
+    const res = await request(
+      "/user/recover_account",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+      liveMailEnv(),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
+  });
+
+  it("GET /user/recover_account without a code answers the SAME invalid-code render (one handler, both paths)", async () => {
+    const res = await request("/user/recover_account", undefined, liveMailEnv());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(passwordResetLocale.invalid_code);
   });
 });
