@@ -29,6 +29,7 @@ import { teamSchema, type Team } from "../models/team";
 import { repositoryListSchema, repositorySchema } from "../models/repository";
 import { userSchema, userListSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { activitySchema, getFeedRows, renderFeedItems } from "../services/activity-feeds";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { orgDoerOf, orgVisibleToDoer, toApiOrganization } from "../services/org-repos";
 import { requireOrgMembership, requireOrgOwnership, resolveOrgForRequest, type OrgProfileDoer } from "../services/orgs";
@@ -67,8 +68,8 @@ import { toApiUser } from "../services/user";
  *                     (repoListTeams/repoCheckTeam), PUT/DELETE …/{team}
  *                     (repoAddTeam/repoDeleteTeam)
  *   feeds             GET /teams/{id}/activities/feeds
- *                     (orgListTeamActivityFeeds — honest-empty, no activity
- *                     model exists; cf. the misc-t3 empty-storage precedent)
+ *                     (orgListTeamActivityFeeds — the landed activity store's
+ *                     team kind, api/services/activity-feeds.ts)
  *
  * Ownership bridge (SPEC-0007 §3.3/§3.5 + open question 6): `org_members.role`
  * REMAINS the Owners-team representation — no owners team row is created for
@@ -188,28 +189,6 @@ const teamListSchema = z.array(teamSchema);
 
 /** teamSearch's inline `ok`/`data` envelope (org/team.go:781–794). */
 const teamSearchResponseSchema = z.object({ ok: z.boolean(), data: teamListSchema });
-
-/**
- * Minimal `Activity` mirror for the feeds response — declared because the
- * contract declares the shape; the handler always answers the EMPTY array
- * (no activity model exists), so the embedding-heavy fields (repo, comment)
- * are never rendered.
- */
-const activityFeedSchema = z.object({
-  act_user_id: z.number().int().optional().openapi({ format: "int64" }),
-  act_user: userSchema.optional(),
-  content: z.string().optional().openapi({ description: "name of tag, branch or commit" }),
-  created: z.string().optional().openapi({ format: "date-time" }),
-  comment_id: z.number().int().optional().openapi({ format: "int64" }),
-  id: z.number().int().optional().openapi({ format: "int64" }),
-  is_private: z.boolean().optional(),
-  op_type: z.string().optional(),
-  ref_name: z.string().optional(),
-  repo_id: z.number().int().optional().openapi({ format: "int64" }),
-  repo: repositorySchema.optional(),
-  user_id: z.number().int().optional().openapi({ format: "int64" }),
-});
-const activityFeedListSchema = z.array(activityFeedSchema);
 
 const notFoundResponse = {
   description: "notFound",
@@ -1389,8 +1368,16 @@ const orgEditTeamRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-/** `GET /teams/{id}/activities/feeds` — reqTeamReadAccess; honest-empty
- *  (no activity model — the misc-t3 empty-storage precedent). */
+/** The feeds `date` query param (`ctx.FormString("date")` — first value or
+ *  absent; the routes/activity-feeds.ts `dateOf` twin, module-local here). */
+function feedsDateParam(c: Context<ApiEnv>): string | undefined {
+  const raw = new URL(c.req.raw.url).searchParams.get("date");
+  return raw === null || raw === "" ? undefined : raw;
+}
+
+/** `GET /teams/{id}/activities/feeds` — reqTeamReadAccess (api.go:1801);
+ *  the real GetFeeds with RequestedTeam (team.go:834-856) over the landed
+ *  activity store's team kind (api/services/activity-feeds.ts). */
 const orgListTeamActivityFeedsRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
@@ -1411,7 +1398,7 @@ const orgListTeamActivityFeedsRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =
       }),
     },
     responses: {
-      200: { description: "ActivityFeedsList", content: { "application/json": { schema: activityFeedListSchema } } },
+      200: { description: "ActivityFeedsList", content: { "application/json": { schema: z.array(activitySchema) } } },
       404: notFoundResponse,
     },
   });
@@ -1955,11 +1942,27 @@ export function registerOrgTeamsRoutes(
     const service = new TeamsService(c.env.DB);
     const { team, org } = await resolveTeamContext(service, intPathParam(c.req.valid("param").id));
     await requireTeamReadAccess(service, org, team, doer);
+    // GetFeedsOptions{RequestedTeam} (team.go:868-873): RequestedUser = the
+    // org (action.go:475-479 — the store's requested field), IncludePrivate
+    // TRUE unconditionally (:870), date/page/limit pass-through. The store's
+    // team pin restricts repo_id to the covered set (action.go:523-530 →
+    // AccessibleTeamReposEnv; includes-all rides the read-side union), and
+    // the act-user/repo-access visibility filters stay on for non-admin
+    // actors (action.go:473-497/499-501).
     const list = parseListOptions(new URL(c.req.url));
-    // Honest-empty: no activity model exists (module header) — the upstream
-    // GetFeeds over an empty set answers `[]` + zero totals.
-    setPaginationHeaders(c, 0, list);
-    return c.json([], 200);
+    const { total, rows } = await getFeedRows(c.env.DB, {
+      kind: "team",
+      requested: { id: org.id },
+      team: { id: team.id, orgId: team.orgId, includesAll: team.includesAllRepositories },
+      actor: { id: doer.id, isAdmin: doer.isAdmin },
+      includePrivate: true,
+      onlyPerformedBy: false,
+      date: feedsDateParam(c),
+      page: list.page,
+      limit: list.limit,
+    });
+    setPaginationHeaders(c, total, list);
+    return c.json(await renderFeedItems(c.env.DB, viewerOf(c), rows), 200);
   });
 
   app.openapi(userListTeamsRoute(requireAuth), async (c) => {

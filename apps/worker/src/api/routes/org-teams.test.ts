@@ -5,7 +5,8 @@
  * orgListTeamMember/orgAddTeamMember/orgRemoveTeamMember/userListTeams),
  * repo access (orgListTeamRepos/orgListTeamRepo/orgAddTeamRepository/
  * orgRemoveTeamRepository/repoListTeams/repoCheckTeam/repoAddTeam/
- * repoDeleteTeam) and the honest-empty feeds (orgListTeamActivityFeeds).
+ * repoDeleteTeam) and the team feeds arm over the landed activity store
+ * (orgListTeamActivityFeeds).
  *
  * Standalone mount (the labels-t2.test.ts convention): the register function
  * takes the requireAuth/optionalAuth pair and is mounted on a fresh
@@ -26,11 +27,12 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueAssignees, issueStopwatches, issueSubscriptions, issues, repoCollaborators, repoWatchers, repositories, teamMembers, teamRepoAccess, teams, userBlocking, users,
+import { actions, issueAssignees, issueStopwatches, issueSubscriptions, issues, repoCollaborators, repoWatchers, repositories, teamMembers, teamRepoAccess, teams, userBlocking, users,
   protectedBranches,
 } from "../../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
+import { ActionType, recordAction } from "../services/activity-feeds";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerOrgTeamsRoutes, TeamsService } from "./org-teams";
@@ -50,6 +52,7 @@ beforeEach(async () => {
     "team_repo_access",
     "team_members",
     "teams",
+    "action",
     "repo_watchers",
     "stopwatch",
     "issue_subscriptions",
@@ -1085,8 +1088,23 @@ describe("GET/PUT/DELETE /repos/{owner}/{repo}/teams (repoListTeams/repoCheckTea
 });
 
 // ---------------------------------------------------------------------------
-// orgListTeamActivityFeeds — honest-empty
+// orgListTeamActivityFeeds — the landed activity store's team kind
+// (api/services/activity-feeds.ts; upstream GetFeeds with RequestedTeam,
+// routers/api/v1/org/team.go:834-856 + models/activities/action.go:475-530).
+// Fixtures seed through recordAction — the real NotifyWatchers fan-out — with
+// the TEXT repositories.id keys and NO numeric coercion (the store's repo_id
+// column is TEXT; only the WIRE repo_id renders through numericRepoId, so
+// slug ids render 0 beside the fully rendered repo object).
 // ---------------------------------------------------------------------------
+
+/** seedActors plus the docs team explicitly covering t_public_repo. */
+async function seedTeamFeed(): Promise<TeamsSeed & { docsId: number; vaultId: number }> {
+  const s = await seedActors();
+  const service = new TeamsService(env.DB);
+  const docs = await mustTeam(service, await teamIdByName("docs"));
+  await service.addTeamRepo(docs, "t_public_repo");
+  return { ...s, docsId: docs.id, vaultId: await teamIdByName("vault-team") };
+}
 
 describe("GET /teams/{id}/activities/feeds (orgListTeamActivityFeeds)", () => {
   it("answers the empty feed with zero totals behind the read guard", async () => {
@@ -1100,6 +1118,152 @@ describe("GET /teams/{id}/activities/feeds (orgListTeamActivityFeeds)", () => {
     // The read guard applies (private team, org non-member → 404).
     const vaultId = await teamIdByName("vault-team");
     expect((await send(`/teams/${vaultId}/activities/feeds`, { headers: authHeaders(s.outsider.id) })).status).toBe(404);
+    // The 401 arm — reqToken (api.go:1802), the route is requireAuth.
+    expect((await send(`/teams/${docsId}/activities/feeds`)).status).toBe(401);
+  });
+
+  it("renders the covered-repo feed — the team pin, the org receiver rows, the Activity shape", async () => {
+    const s = await seedTeamFeed();
+    const send = router();
+    await recordAction(env.DB, {
+      actUserId: s.teammate.id,
+      repoId: "t_public_repo",
+      opType: ActionType.CreateIssue,
+      isPrivate: false,
+      content: "1|hello",
+      createdAt: new Date("2026-01-01T10:00:00Z"),
+    });
+    await recordAction(env.DB, {
+      actUserId: s.member.id,
+      repoId: "t_public_repo",
+      opType: ActionType.CreateRepo,
+      isPrivate: false,
+      createdAt: new Date("2026-01-01T11:00:00Z"),
+    });
+    // Covered by the OTHER team only — the row exists as an org receiver but
+    // must stay outside the docs pin (action.go:523-530).
+    await recordAction(env.DB, {
+      actUserId: s.teammate.id,
+      repoId: "t_vault",
+      opType: ActionType.CreateIssue,
+      isPrivate: true,
+      createdAt: new Date("2026-01-01T12:00:00Z"),
+    });
+    // DB truth: all three org receiver rows exist — the exclusion below is
+    // the query's team pin, not a missing write.
+    const orgRows = await db()
+      .select({ repoId: actions.repoId })
+      .from(actions)
+      .where(eq(actions.userId, s.org.id))
+      .all();
+    expect(orgRows.map((row) => row.repoId).sort()).toEqual(["t_public_repo", "t_public_repo", "t_vault"]);
+
+    const res = await send(`/teams/${s.docsId}/activities/feeds`, { headers: authHeaders(s.owner.id) });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-total-count")).toBe("2");
+    const body = await res.json<Array<Record<string, unknown>>>();
+    expect(body.map((item) => item.op_type)).toEqual(["create_repo", "create_issue"]);
+    for (const item of body) {
+      expect(item.user_id).toBe(s.org.id); // the org receiver row is the feed's subject
+      expect(item.repo_id).toBe(0); // slug TEXT id — the numericRepoId wire render
+      expect((item.repo as Record<string, unknown>).full_name).toBe("acme/public-repo");
+      expect(item.comment_id).toBe(0);
+      expect("comment" in item).toBe(false); // the live-comment gate (activity.go:42-46)
+    }
+    expect((body[0]?.act_user as Record<string, unknown>).id).toBe(s.member.id);
+    expect((body[1]?.act_user as Record<string, unknown>).id).toBe(s.teammate.id);
+    expect(body[1]?.content).toBe("1|hello");
+    // A PUBLIC team is readable by a non-member (reqTeamReadAccess' public
+    // arm — the org is visible); the outsider's repo-access filter still
+    // bounds the page to the same public rows.
+    const outside = await send(`/teams/${s.docsId}/activities/feeds`, { headers: authHeaders(s.outsider.id) });
+    expect(outside.status).toBe(200);
+    expect(await outside.json<unknown[]>()).toHaveLength(2);
+  });
+
+  it("IncludePrivate is TRUE unconditionally (team.go:870) — the admin sees the private covered row; a non-admin is bounded by repo access", async () => {
+    const s = await seedTeamFeed();
+    const send = router();
+    const service = new TeamsService(env.DB);
+    await service.addTeamRepo(await mustTeam(service, s.vaultId), "t_vault");
+    await recordAction(env.DB, {
+      actUserId: s.teammate.id,
+      repoId: "t_vault",
+      opType: ActionType.CreateIssue,
+      isPrivate: true,
+      createdAt: new Date("2026-01-01T10:00:00Z"),
+    });
+    // Site admin = the fast path (action_list.go:215): no visibility filters,
+    // so the is_private row renders.
+    const admin = await send(`/teams/${s.vaultId}/activities/feeds`, { headers: authHeaders(s.admin.id) });
+    expect(admin.status).toBe(200);
+    const adminBody = await admin.json<Array<Record<string, unknown>>>();
+    expect(adminBody).toHaveLength(1);
+    expect(adminBody[0]?.is_private).toBe(true);
+    expect((adminBody[0]?.repo as Record<string, unknown>).full_name).toBe("acme/vault");
+    // Non-admin org owner: the team pin admits the row but the store's
+    // accessible-repos filter stays on for non-admin actors (action.go:499-501
+    // — under the ownership bridge the org owner holds no access row), so the
+    // page is empty. The repo/user feed twins share the property.
+    const owner = await send(`/teams/${s.vaultId}/activities/feeds`, { headers: authHeaders(s.owner.id) });
+    expect(owner.status).toBe(200);
+    expect(await owner.json<unknown[]>()).toEqual([]);
+  });
+
+  it("includes-all coverage rides the READ — a repo created after the fan-out joins the pin", async () => {
+    const s = await seedTeamFeed();
+    const send = router();
+    await seedRepo(s.org.id, s.org.usernameLower, "later", "public"); // t_later — no team_repo_access row
+    await recordAction(env.DB, {
+      actUserId: s.member.id,
+      repoId: "t_later",
+      opType: ActionType.CreateRepo,
+      isPrivate: false,
+      createdAt: new Date("2026-01-01T10:00:00Z"),
+    });
+    const before = await send(`/teams/${s.docsId}/activities/feeds`, { headers: authHeaders(s.teammate.id) });
+    expect(await before.json<unknown[]>()).toEqual([]); // materialized rows only
+
+    await db().update(teams).set({ includesAllRepositories: true }).where(eq(teams.id, s.docsId));
+    const after = await send(`/teams/${s.docsId}/activities/feeds`, { headers: authHeaders(s.teammate.id) });
+    expect(after.status).toBe(200);
+    expect(after.headers.get("x-total-count")).toBe("1");
+    const body = await after.json<Array<Record<string, unknown>>>();
+    expect(body[0]?.op_type).toBe("create_repo");
+    expect((body[0]?.repo as Record<string, unknown>).full_name).toBe("acme/later");
+  });
+
+  it("date/page/limit pass through (team.go:871-873) — the UTC window, the unparsable skip, the pager", async () => {
+    const s = await seedTeamFeed();
+    const send = router();
+    await recordAction(env.DB, {
+      actUserId: s.teammate.id, repoId: "t_public_repo", opType: ActionType.CreateIssue,
+      isPrivate: false, createdAt: new Date("2026-01-01T10:00:00Z"),
+    });
+    await recordAction(env.DB, {
+      actUserId: s.teammate.id, repoId: "t_public_repo", opType: ActionType.CommentIssue,
+      isPrivate: false, content: "1|hi", createdAt: new Date("2026-01-01T11:00:00Z"),
+    });
+    await recordAction(env.DB, {
+      actUserId: s.teammate.id, repoId: "t_public_repo", opType: ActionType.CreatePullRequest,
+      isPrivate: false, createdAt: new Date("2026-02-01T10:00:00Z"),
+    });
+
+    const jan = await send(`/teams/${s.docsId}/activities/feeds?date=2026-01-01`, { headers: authHeaders(s.owner.id) });
+    expect(jan.headers.get("x-total-count")).toBe("2");
+    expect((await jan.json<Array<Record<string, unknown>>>()).map((item) => item.op_type)).toEqual([
+      "comment_issue",
+      "create_issue",
+    ]);
+
+    // Unparsable date skips the filter — upstream's warn-and-continue
+    // (action.go:455-457).
+    const bad = await send(`/teams/${s.docsId}/activities/feeds?date=not-a-date`, { headers: authHeaders(s.owner.id) });
+    expect((await bad.json<unknown[]>())).toHaveLength(3);
+
+    const page = await send(`/teams/${s.docsId}/activities/feeds?limit=1&page=2`, { headers: authHeaders(s.owner.id) });
+    expect(page.headers.get("x-total-count")).toBe("3");
+    expect((await page.json<Array<Record<string, unknown>>>()).map((item) => item.op_type)).toEqual(["comment_issue"]);
   });
 });
 
