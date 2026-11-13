@@ -100,7 +100,7 @@
  *                                  state's colspan follows the column count
  *
  * The header's "Create User Account" button (list.tmpl:6 → /-/admin/users/new)
- * is an UNLANDED page → omitted. The search/filter form and the sorters are
+ * targets B-88's LANDED page — the CTA folded at ADMIN88's landing review. The search/filter form and the sorters are
  * LIVE (below); the pager is the landed Older/Newer reduction (base/paginate's
  * full numbered bar is JS-free upstream but the repo's established reduction —
  * explore/activity/issues all ship the pair).
@@ -917,11 +917,13 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
   };
   return (
     <AdminFamilyShell ctx={props.ctx} title={adminUsersLocale.user_manage_panel} pageClass="admin user" active="users" oauth2Enabled={props.data.oauth2Enabled}>
-      {/* The header (list.tmpl:3-8): panel name + total. The "Create User
-          Account" button is omitted — /-/admin/users/new is unlanded (the
-          module header). */}
-      <h4 class="ui top attached header">
+      {/* The header (list.tmpl:3-8): panel name + total + the "Create User
+          Account" CTA (B-88's page landed 2026-11-13 — the CTA folded at
+          ADMIN88's landing review; the module-header note rides the same). */}
+      <h4 class="ui top attached header flex-text-block">
         {adminUsersLocale.user_manage_panel} ({adminUsersLocale.total.replace("%d", String(props.data.total))})
+        <div class="tw-flex-1"></div>
+        <a class="ui primary tiny button" href="/-/admin/users/new">Create User Account</a>
       </h4>
       {/* The toolbar (list.tmpl:9-81): ONE no-JS GET form wrapping the combo
           + the filter/sort dropdowns, exactly upstream's form shape. */}

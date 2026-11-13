@@ -240,9 +240,12 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     await seedBaseFixtures();
     const html = render(await load(""));
     expect(html).toContain('class="page-content admin user"'); // list.tmpl:1 (§2.4.1)
+    // B-88's CTA fold: the header now carries the flex-text-block + the
+    // Create User Account link after the total.
     expect(html).toContain(
-      `>${adminUsersLocale.user_manage_panel} (${adminUsersLocale.total.replace("%d", "4")})</h4>`,
+      `>${adminUsersLocale.user_manage_panel} (${adminUsersLocale.total.replace("%d", "4")})`,
     );
+    expect(html).toContain('href="/-/admin/users/new"');
     // The row projection: id, name link, the Admin label on root, email, the
     // constant Local source, the created stamp, the never-signed-in arm.
     expect(html).toContain('<a href="/root">root</a>');
@@ -299,7 +302,7 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).not.toContain(">Newer<"); // page 1
   });
 
-  it("renders the per-row details/edit actions against the LIVE targets; the New Account button stays omitted", async () => {
+  it("renders the per-row details/edit actions against the LIVE targets; the New Account button is LIVE (B-88's CTA fold)", async () => {
     await seedBaseFixtures();
     const data = await load("");
     const html = render(data);
@@ -316,8 +319,8 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).toContain("octicon-person");
     expect(html).toContain("octicon-pencil");
     // The unlanded create page stays omitted (list.tmpl:6 — the dead-link rule).
-    expect(html).not.toContain('href="/-/admin/users/new"');
-    expect(html).not.toContain("Create User Account");
+    expect(html).toContain('href="/-/admin/users/new"'); // B-88's page landed — the CTA folded at the landing review
+    expect(html).toContain("Create User Account"); // B-88's CTA fold
   });
 
   it("row links: active rows carry upstream's HomeLink; PROHIBITED rows render the name PLAIN (the D1/D2 fix)", async () => {

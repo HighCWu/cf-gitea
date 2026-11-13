@@ -1254,6 +1254,13 @@ import {
   renderAdminUserEditPage,
   submitAdminUserEdit,
 } from "./pages/admin-user-edit";
+import {
+  adminUserNewDefaults,
+  loadAdminUserNew,
+  parseAdminUserCreateForm,
+  renderAdminUserNewPage,
+  submitAdminUserCreate,
+} from "./pages/admin-user-new";
 import { loadOrgWorktimeData, renderOrgWorktimePage, resolveOrgWorktimePage } from "./pages/org-worktime";
 import {
   applyUserSettingsSecretForm,
@@ -3849,6 +3856,9 @@ export interface AdminRoute {
     | "admin-monitor-audit-logs-export"
     | "admin-user-detail"
     | "admin-user-edit"
+    // The census B-88 create combo (web.go:815 — GET+POST on one static
+    // literal; pages/admin-user-new.tsx, the page U22 cited unlanded).
+    | "admin-user-new"
     | "admin-users-impersonate"
     | "admin-user-avatar"
     | "admin-user-avatar-delete"
@@ -4830,6 +4840,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     const tail = raw.slice(3);
     if (tail.length === 0) return { family: "admin-dashboard" };
     if (tail.length === 1 && tail[0] === "users") return { family: "admin-users" };
+    // The census B-88 create combo (web.go:815 — GET+POST on one static
+    // literal, pages/admin-user-new.tsx): claimed beside the bare users
+    // literal, static-before-dynamic — "new" cannot shadow the digits-only
+    // {userid} claim and vice versa.
+    if (tail.length === 2 && tail[0] === "users" && tail[1] === "new") return { family: "admin-user-new" };
     // The user detail page + the edit combo + the impersonate/avatar writes
     // (web.go:817-821 — digits-only, junk stays engine-404; the detail
     // page's miss 303s to the LIST at the handler per prepareUserInfo).
@@ -14472,6 +14487,57 @@ async function adminUserEditSubmit(c: Context<{ Bindings: Env }>, userId: number
   return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
 }
 
+/** GET /-/admin/users/new (NewUser — the B-88 module's mount): the pristine
+ *  form over the sources pull (the recipe's step 3 in the module header). */
+async function adminUserNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminUserNew(c.env.DB);
+  return p.respond(
+    c.html(
+      renderAdminUserNewPage(p.ctx, {
+        sources: data.sources,
+        form: adminUserNewDefaults(),
+        error: null,
+        errorField: null,
+        oauth2Enabled: oauth2FeatureEnabled(c.env),
+      }),
+      200,
+    ),
+  );
+}
+
+/** POST /-/admin/users/new (NewUserPost — B-88): invalid re-renders at 200
+ *  with the POSTED values (RenderWithErrDeprecated's &form — new.tmpl:88
+ *  echoes the typed password), created 303s onto the new user's detail
+ *  page (upstream's redirect; the flash dropped). */
+async function adminUserNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminUserCreateForm(await readUrlEncodedForm(c.req.raw));
+  // The prologue guarantees a signed admin; the narrow keeps it cast-free.
+  const doerId = p.ctx.viewer.kind === "user" ? p.ctx.viewer.id : 0;
+  const outcome = await submitAdminUserCreate(c.env.DB, doerId, form, c.env);
+  if (outcome.outcome === "invalid") {
+    const data = await loadAdminUserNew(c.env.DB);
+    return p.respond(
+      c.html(
+        renderAdminUserNewPage(p.ctx, {
+          sources: data.sources,
+          form,
+          error: outcome.message,
+          errorField: outcome.field,
+          oauth2Enabled: oauth2FeatureEnabled(c.env),
+        }),
+        200,
+      ),
+    );
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(outcome.userId) } }));
+}
+
 /** POST /-/admin/users/{userid}/impersonate (the 9c929dc chain's mount):
  *  the four-outcome ladder — impersonated 303s to /user/settings,
  *  unknown-user 400s with upstream's JSON body, already-impersonating 500s
@@ -20621,6 +20687,11 @@ uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"))
 // The admin listing pages (top-level static literals — nothing dynamic
 // shadows them; the parse claims carry the same literals).
 uiRouter.get("/-/admin/users", (c) => adminUsersPage(c));
+// The census B-88 create combo (web.go:815 — GET+POST on one static literal
+// beside the bare users literal; both verbs are REAL upstream — no chi-405
+// twins).
+uiRouter.get("/-/admin/users/new", (c) => adminUserNewPage(c));
+uiRouter.post("/-/admin/users/new", (c) => adminUserNewSubmit(c));
 // The user detail page + the impersonate/avatar writes (web.go:817-821).
 uiRouter.get("/-/admin/users/:userid{\\d+}", (c) => adminUserDetailPage(c, Number.parseInt(c.req.param("userid"), 10)));
 // The edit combo (web.go:~819 — GET+POST on one shape).

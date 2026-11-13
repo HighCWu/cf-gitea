@@ -78,15 +78,13 @@
  *     flagged with form.email_been_used. The domain-allowlist flash
  *     warning (users.go:511-513) has no allowlist config landed — dead
  *     arm, not ported.
- *   - `password` — rendered DISABLED with an explicit not-supported notice
- *     (the ADR-0008 rule-4 remedy: accept-and-ignore is a contract defect;
- *     until the real admin-set arm lands — SPEC-0002 §11's PWD-2 unit — the
- *     input cannot carry an operation the backend cannot execute). A
- *     disabled input never posts, so the rendered form no longer offers the
- *     operation at all; the parse keeps the field for wire parity and the
- *     submit keeps ignoring any hand-crafted value (no store exists to
- *     hit — upstream's min-length/complexity/pwned arms, users.go:464-474,
- *     are unreachable until PWD-2). Never echoes.
+ *   - `password` — LIVE (SPEC-0002 §6.2's admin-set arm, PWD-2 — the
+ *     former disabled interim is superseded): rendered ENABLED and empty
+ *     with upstream's password_helper. FromNonDefault semantics — EMPTY =
+ *     unchanged; non-empty → the UpdateAuth ladder (the min-length /
+ *     complexity arms answer the Err_Password re-render, users.go:486-490),
+ *     then SetPassword + the remember-me invalidation + the audit row
+ *     (update.go:279-283). Never echoes.
  *   - `language` — DROPPED: users has no language column (the detail
  *     page's unproducible-language-line posture) and the landed
  *     EditUserOption contract (admin-t2.ts editUserOptionSchema) declares
@@ -161,10 +159,12 @@
  * (required email, the visibility/max_repo_creation/login_type/user_type
  * enum-int binds — misses re-render flagged at 200, no banner, NOTHING
  * else runs) → the rename arm (commits immediately, upstream's own tx
- * boundary) → the auth fold (status; the disabled-fields' hand-crafted
- * values — password/max_repo_creation/allow_create_organization — absorbed;
- * `restricted` is REAL since the is_restricted column landed, stored in the
- * column patch like admin) → the email arm (org / duplicate) → the
+ * boundary) → the auth fold (status; the PASSWORD arm is REAL — PWD-2:
+ * empty = unchanged, non-empty = the ladder + SetPassword + the remember
+ * sweep + audit; the disabled-fields' hand-crafted values —
+ * max_repo_creation/allow_create_organization — absorbed; `restricted` is
+ * REAL since the is_restricted column landed, stored in the column patch
+ * like admin) → the email arm (org / duplicate) → the
  * UpdateUser position
  * (the type arms, the last-admin guard, then ONE column UPDATE) → the
  * reset-2FA arm → the 303 onto `adminUserLink(targetId)` (upstream's
@@ -293,11 +293,10 @@ export const adminUserEditLocale = {
   full_name: "Full Name", // "settings.full_name" (:75)
   email: "Email Address", // "email" (:79)
   password: "Password", // "password" (:84)
-  // NOT upstream's "admin.users.password_helper" (:86, "Leave the password
-  // empty to keep it unchanged.") — that text would promise an operation the
-  // backend cannot execute (ADR-0008 rule 4). The interim disabled-state
-  // notice; flips to upstream's helper when PWD-2 lands the admin-set arm.
-  password_helper: "Leave the password empty to keep it unchanged.", // "admin.users.password_helper" (:86) — the field is LIVE (SPEC-0002 §6.2 admin-set, PWD-2)
+  // Upstream's "admin.users.password_helper" (:86) verbatim — LIVE since
+  // PWD-2 (SPEC-0002 §6.2 admin-set): the "keep it unchanged" promise is a
+  // real operation now (empty = unchanged, FromNonDefault).
+  password_helper: "Leave the password empty to keep it unchanged.", // "admin.users.password_helper" (:86)
   website: "Website", // "settings.website" (:105)
   location: "Location", // "settings.location" (:109)
   max_repo_creation: "Maximum Number of Repositories", // "admin.users.max_repo_creation" (:116)
@@ -433,8 +432,9 @@ export function parseAdminUserEditForm(params: URLSearchParams): AdminUserEditFo
 
 /** The fields the re-render can flag (upstream's Err_UserName /
  *  Err_LoginType / Err_Visibility / Err_Email / Err_MaxRepoCreation class
- *  hooks; Err_Password / Err_LoginName are unreachable — no password store
- *  (the field renders disabled, ADR-0008 rule 4) and no login-name column). */
+ *  hooks; Err_Password is LIVE — the PWD-2 ladder answers it
+ *  (validateNewPassword → the re-render, users.go:486-490); Err_LoginName
+ *  stays unreachable — no login-name column). */
 export type AdminUserEditErrorField = "userName" | "loginType" | "visibility" | "email" | "maxRepoCreation" | "password";
 
 /** The arm's outcome union (the wiring's map, the module header's recipe):
@@ -799,12 +799,12 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
             <label for="email">{adminUserEditLocale.email}</label>
             <input id="email" name="email" type="email" value={user.email ?? ""} required />
           </div>
-          {/* password (:82-88) — the ADR-0008 rule-4 interim posture: the
-              input is DISABLED (it never posts; the rendered form cannot
-              offer an operation the backend cannot execute) with the
-              not-supported notice replacing upstream's password_helper.
-              Never echoes (no value attr upstream). Flips live when PWD-2
-              lands the admin-set arm. */}
+          {/* password (:82-88) — LIVE (SPEC-0002 §6.2 admin-set, PWD-2 —
+              the disabled interim is superseded): rendered ENABLED and
+              empty with upstream's password_helper; empty = unchanged
+              (FromNonDefault), non-empty = the ladder + SetPassword + the
+              remember sweep + the audit row. Never echoes (no value attr
+              upstream). */}
           <div class="js-local js-non-bot field">
             <label for="password">{adminUserEditLocale.password}</label>
             <input id="password" name="password" type="password" autocomplete="new-password" />

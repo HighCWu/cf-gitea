@@ -31,9 +31,9 @@
  *     rewrite; case-only flip; org rows through the landed
  *     OrgService.renameOrg; the collision/reserved/chars error texts), the
  *     flag folds (status deviation-6, admin with the last-admin guard, the
- *     skip-self prohibit guard), the PASSWORD ARM'S VALIDATION SHAPES
- *     (deviation 1: accepted-and-ignored — no length/complexity/pwned arm
- *     exists to hit), THE RULE-4 PAIR's interim posture (max_repo_creation
+ *     skip-self prohibit guard), the password arm's LANDED validation shapes
+ *     (PWD-2's ladder — the pre-PWD-2 accepted-and-ignored era is history),
+ *     THE RULE-4 PAIR's interim posture (max_repo_creation
  *     / allow_create_organization rendered DISABLED with not-supported
  *     notices — upstream's arms are real, users.go:526-527, ADR-0008
  *     re-opens them; hand-crafted POSTs store nothing) beside the
@@ -644,7 +644,7 @@ describe("the submit — the password arm (SPEC-0002 §6.2 admin-set, PWD-2)", (
     expect(after.passwdHashAlgo).toBe(before.passwdHashAlgo);
   });
 
-  it("a policy-violating password re-renders with the Err_Password message, field flagged", async () => {
+  it("a too-short password re-renders with the Err_Password message, field flagged; a WEAK single-class password EDITS at the default config (B-87's correction: upstream's unset PASSWORD_COMPLEXITY is checking OFF, security.go:209-218 + app.example.ini:503 — the pre-B-87 all-classes arm mis-derived the default; the ARMED re-render shape pins in admin-t2.test.ts's knob battery)", async () => {
     const seeded = await seedEdit();
     const short = await submit(seeded, aliceForm({ password: "a" }));
     expect(short).toEqual({
@@ -652,11 +652,10 @@ describe("the submit — the password arm (SPEC-0002 §6.2 admin-set, PWD-2)", (
       message: "Password length cannot be less than 8 characters.",
       field: "password",
     });
-    const complex = await submit(seeded, aliceForm({ password: "alllowercase123" }));
-    expect(complex).toMatchObject({ outcome: "invalid", field: "password" });
-    expect(complex.outcome === "invalid" && complex.message).toEqual(
-      expect.stringContaining("Password does not pass complexity requirements:"),
-    );
+    const weak = await submit(seeded, aliceForm({ password: "alllowercase123" }));
+    expect(weak).toEqual({ outcome: "updated" });
+    const after = await rowOf(seeded.aliceId);
+    expect(after.passwdHashAlgo).toBe("pbkdf2$50000$50");
   });
 
   it("a valid password stores the hashed record + clears remember sessions", async () => {
