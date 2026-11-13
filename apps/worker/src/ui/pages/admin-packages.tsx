@@ -62,13 +62,54 @@
  *   Published   `DateUtils.AbsoluteShort .Version.CreatedUnix` — the en-US
  *               "Jan 02, 2006" form (the R04 view sidebar's absoluteShort,
  *               imported from pages/packages.tsx)
- *   (Op)        OMITTED — the column holds ONLY the delete-modal anchor
- *               targeting POST /-/admin/packages/delete (web.go:856) — an
- *               UNLANDED write; the column collapses to the 9 live columns
- *               and the empty-state colspan follows (the admin-repos Op
- *               omission verbatim). The header's Cleanup button
- *               (list.tmpl:9-13 → POST /-/admin/packages/cleanup,
- *               packages.go:86-96) dies the same death.
+ *   Op          LIVE (B-67) — the red trash opens upstream's
+ *               #admin-package-delete-modal dialog (list.tmpl:70-74 + :86-94,
+ *               a bare Yes/No confirm — NO typed name gate) posting
+ *               `/-/admin/packages/delete?id=N` (packages.go:82-96). The
+ *               no-JS reduction is the admin-repos Op column's inline
+ *               plain-form POST (the same template family's landed shape):
+ *               hidden `id`, the trash submits, the dialog drops.
+ *
+ * ## The write tails (B-67 — web.go:854-858's POST pair, POST-only)
+ *
+ *   - POST /-/admin/packages/delete — admin.DeletePackageVersion
+ *     (packages.go:82-96): the version by `id` (ctx.FormInt64 — form body
+ *     or query; the modal travels in the query), then RemovePackageVersion.
+ *     PORT over the LANDED `deletePackageVersionGuarded`
+ *     (ui/pages/package-settings.tsx — a503a02's WB26 seam: the terraform
+ *     LOCKED/LATEST guards precede the delete cascade, then
+ *     `emitPackageDeleted` fires ONE deleted event, user/package.go:510 /
+ *     packages.go:532's always-notify, the ADMIN doer as sender). Upstream's
+ *     error arms (a missing/stale id, a guard refusal — both ServerError
+ *     500) ride the admin-repos delete's stale-form posture: the seam maps
+ *     them to outcomes and the route answers the SAME silent 303. NOTE the
+ *     pin's admin surface carries NO whole-package delete arm — upstream's
+ *     whole-package delete is the OWNER-scope settings page only
+ *     (applyPackageSettingsDelete stays there; the derivation at the pin).
+ *   - POST /-/admin/packages/cleanup — admin.CleanupExpiredData
+ *     (packages.go:98-110): `CleanupExpiredData(ctx, time.Duration(0))` —
+ *     the expired-data sweep ONLY (upstream's admin button does NOT run
+ *     ExecuteCleanupRules; that half of CleanupTask is the cron's). PORT as
+ *     the module-local sweep `applyAdminPackagesCleanup` over the LANDED
+ *     model exports (findUnreferencedPackages → the package properties +
+ *     rows, then findExpiredUnreferencedBlobs at olderThan=0 → the rows,
+ *     then the R2 content keys — services/packages/cleanup.ts arm 2's exact
+ *     order), mirroring the module-local blob-size aggregates' data-seam
+ *     note. Success answers the plain redirect upstream takes (ctx.Redirect
+ *     — a browser 303 onto /-/admin/packages); a sweep throw propagates
+ *     (upstream's ServerError arm, the cleanup consumer's fail-loud
+ *     posture). Upstream's `container_service.Cleanup` rides the same
+ *     expired-unreferenced-blob state through the container registry's view;
+ *     this tree's single package_blobs store makes the generic sweep THAT
+ *     sweep (the structural reduction, recorded).
+ *
+ * ## Derived no-op: no admin version/files detail view
+ *
+ * Upstream's admin package family registers NO version/files view — the
+ * list's Version anchor targets the OWNER-scope view
+ * (/{owner}/-/packages/{type}/{name}/{version}, the landed
+ * `versionWebLink`); admin/packages.go carries only the three handlers
+ * above. There is no admin-package-detail page to land at this pin.
  *
  * ## The sort headers' degradation (the documented no-backing posture)
  *
@@ -118,14 +159,25 @@
  */
 
 import { drizzle } from "drizzle-orm/d1";
-import { eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 
-import { packageBlobs, packageFiles, repositories, users } from "../../db/schema";
-import { searchVersions, type PackageRow, type PackageVersionRow } from "../../services/packages/model";
+import { packageBlobs, packageFiles, packageProperties, packageVersions, packages as packagesTable, repositories, users } from "../../db/schema";
+import { packageBlobContentKey } from "../../services/packages/blobs";
+import {
+  PropertyType,
+  deleteBlobById,
+  findExpiredUnreferencedBlobs,
+  findUnreferencedPackages,
+  searchVersions,
+  type PackageRow,
+  type PackageVersionRow,
+} from "../../services/packages/model";
+import { deletePackageVersionGuarded } from "./package-settings";
 import { userLink } from "../links";
 import { formatByteSize, parsePageNumber } from "../page-data";
 import { Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import type { PackageDeleteEmitOptions } from "../../services/packages/webhooks";
 import { AdminEmbeddedSvg, AdminFamilyPagination, AdminFamilyShell } from "./admin-users";
 // The R04 module's shared census + formatters (exports only — that file is
 // not this wave's): the type filter's TypeList, the display-name mapping,
@@ -141,7 +193,10 @@ export const adminPackagesLocale = {
   total: "Total: %d", // "admin.total" (list.tmpl:4)
   total_size: "Total Size: %s", // "admin.packages.total_size" (list.tmpl:5)
   unreferenced_size: "Unreferenced Size: %s", // "admin.packages.unreferenced_size" (list.tmpl:6)
-  cleanup: "Cleanup", // "admin.packages.cleanup" (list.tmpl:10 — the button omitted, the module header)
+  cleanup: "Clean up expired data", // "admin.packages.cleanup" (list.tmpl:10, en-US corpus :3174)
+  cleanup_success: "Cleaned up expired data successfully", // "admin.packages.cleanup.success" (:3175 — the flash text the bare 303 drops, the no-session-flash convention)
+  col_op: "Op.", // "admin.notices.op" (list.tmpl:50 — the Op column, locale :3490)
+  op_delete_aria: "Delete version", // "packages.settings.delete.version" (:3728 — the dialog title the trash opens; the admin-repos additive-aria posture)
   title: "Packages", // "packages.title" (the page Title + the nav item, packages.go:75)
   filter_type: "Type", // "packages.filter.type" (list.tmpl:17)
   filter_type_all: "All", // "packages.filter.type.all" (list.tmpl:18)
@@ -190,6 +245,91 @@ async function totalUnreferencedBlobSizeOf(d1: D1Database): Promise<number> {
     .where(isNull(packageFiles.id))
     .all();
   return Number(row[0]?.total ?? 0);
+}
+
+// ---------------------------------------------------------------------------
+// The write seams (B-67 — web.go:854-858's POST pair; the module header's
+// write-tails section carries the upstream cites and the reductions)
+// ---------------------------------------------------------------------------
+
+export type AdminPackageDeleteResult =
+  | { outcome: "deleted" }
+  | { outcome: "missing" }
+  | { outcome: "locked" }
+  | { outcome: "latest" };
+
+/**
+ * The admin version delete — upstream admin.DeletePackageVersion's ladder
+ * (packages.go:82-96) over the LANDED `deletePackageVersionGuarded` (the
+ * package-settings seam: the terraform guards precede the cascade, then the
+ * deleted-event emission): the version by `id` (upstream ctx.FormInt64 —
+ * the form body and the query both bind it; the modal posts it in the
+ * query), the package row off the version's packageId (the descriptor's
+ * Package arm), the guard-then-delete-then-emit walk. `emit` threads the
+ * WB26 options (the ADMIN doer as the sender, packages.go:532's
+ * always-notify); a missing/stale id or an unknown shape answers "missing"
+ * and a guard refusal its outcome — upstream ServerErrors both arms, the
+ * route's stale-form posture folds every outcome onto the same silent 303.
+ */
+export async function deleteAdminPackageVersionFromForm(
+  d1: D1Database,
+  rawId: string,
+  emit?: PackageDeleteEmitOptions,
+): Promise<AdminPackageDeleteResult> {
+  const id = /^\d+$/.test(rawId) ? Number.parseInt(rawId, 10) : 0;
+  if (id <= 0) return { outcome: "missing" }; // FormInt64's junk arm — GetVersionByID(0) errors upstream
+  const version = (await drizzle(d1).select().from(packageVersions).where(eq(packageVersions.id, id)).get()) ?? null;
+  if (version === null) return { outcome: "missing" }; // upstream's GetVersionByID ServerError arm
+  const pkg = (await drizzle(d1).select().from(packagesTable).where(eq(packagesTable.id, version.packageId)).get()) ?? null;
+  if (pkg === null) return { outcome: "missing" }; // the descriptor's Package load arm
+  const guard = await deletePackageVersionGuarded(d1, pkg, version, emit);
+  return guard === "ok" ? { outcome: "deleted" } : { outcome: guard };
+}
+
+/**
+ * The admin cleanup — upstream admin.CleanupExpiredData's sweep
+ * (packages.go:98-110 → cleanup.go:167-214 at `olderThan = 0`), the
+ * expired-data arm ONLY (ExecuteCleanupRules is the cron's half of
+ * CleanupTask — the admin button never runs it). The module-local
+ * data-seam note applies: this walks the LANDED model exports in
+ * services/packages/cleanup.ts arm 2's exact order —
+ *   (a) the unreferenced package rows (zero versions left): the
+ *       package-scoped properties, then the row;
+ *   (b) EVERY unreferenced blob (olderThan 0 expires all): the rows first,
+ *       then the R2 content keys — the SOLE content-key deleter contract.
+ * Upstream's `container_service.Cleanup` walks the same expired-
+ * unreferenced-blob state through the container registry's view; this
+ * tree's single package_blobs store makes step (b) THAT sweep (the
+ * structural reduction, recorded). The orphan-spool sweep stays the
+ * queue consumer's §5.1 arm — the admin button never had it. A throw
+ * propagates (upstream's ServerError arm; the consumer's fail-loud
+ * posture — the sweeps re-derive idempotently on a retry).
+ */
+export async function applyAdminPackagesCleanup(d1: D1Database, bucket: R2Bucket, options: { now?: Date } = {}): Promise<void> {
+  const now = options.now ?? new Date();
+  const db = drizzle(d1);
+
+  // (a) the unreferenced package rows (cleanup.go:181-189's FindUnreferencedPackages
+  // loop — DeleteAllProperties(Package) + DeletePackageByID).
+  const unreferenced = await findUnreferencedPackages(d1);
+  for (const pkg of unreferenced) {
+    await db
+      .delete(packageProperties)
+      .where(and(eq(packageProperties.refType, PropertyType.Package), eq(packageProperties.refId, pkg.id)))
+      .run();
+    await db.delete(packagesTable).where(eq(packagesTable.id, pkg.id)).run();
+  }
+
+  // (b) the expired unreferenced blobs at olderThan = 0 (cleanup.go:188-212):
+  // the rows first, then the content keys — the PACKAGE-DEFER-STORAGE-DELETE
+  // order both implementations share.
+  const expiredBlobs = await findExpiredUnreferencedBlobs(d1, now);
+  for (const blob of expiredBlobs) {
+    await deleteBlobById(d1, blob.id);
+  }
+  for (const blob of expiredBlobs) {
+    await bucket.delete(packageBlobContentKey(blob.hashSha256));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,17 +489,25 @@ export function renderAdminPackagesPage(ctx: UiContext, data: AdminPackagesData)
  *  ctx.Tr "packages.title", packages.go:75). */
 export function AdminPackagesPage(props: { ctx: UiContext; data: AdminPackagesData }) {
   const { data } = props;
-  const colCount = 9; // the live columns (the Op column omitted — the module header)
+  const colCount = 10; // the nine live columns + the Op column (the delete form)
   const base = "/-/admin/packages";
   return (
     <AdminFamilyShell ctx={props.ctx} title={adminPackagesLocale.title} pageClass="admin user" active="packages" oauth2Enabled={props.data.oauth2Enabled}>
-      {/* The header (list.tmpl:3-8): panel name + the total + the two size
-          totals. The Cleanup form (list.tmpl:9-13) is omitted — its POST
-          target is an unlanded write (the module header). */}
+      {/* The header (list.tmpl:3-12): panel name + the total + the two size
+          totals, and the right-floating Cleanup form — the plain POST to
+          /-/admin/packages/cleanup (list.tmpl:8-10; the dialog-less write,
+          the registration's bare-303 answer). */}
       <h4 class="ui top attached header">
         {adminPackagesLocale.panel} ({adminPackagesLocale.total.replace("%d", String(data.total))},{" "}
         {adminPackagesLocale.total_size.replace("%s", data.totalSizeText)},{" "}
         {adminPackagesLocale.unreferenced_size.replace("%s", data.totalUnreferencedSizeText)})
+        <div class="ui right">
+          <form method="post" action="/-/admin/packages/cleanup">
+            <button type="submit" class="ui primary tiny button">
+              {adminPackagesLocale.cleanup}
+            </button>
+          </form>
+        </div>
       </h4>
       {/* The filter form (list.tmpl:14-29): the q input + the type select
           over AvailableTypes — rendered UNCONDITIONALLY (the admin template
@@ -409,6 +557,7 @@ export function AdminPackagesPage(props: { ctx: UiContext; data: AdminPackagesDa
               <th scope="col">{adminPackagesLocale.col_repository}</th>
               <th scope="col">{adminPackagesLocale.col_size}</th>
               <th scope="col">{adminPackagesLocale.col_published}</th>
+              <th scope="col">{adminPackagesLocale.col_op}</th>
             </tr>
           </thead>
           <tbody>
@@ -443,6 +592,20 @@ export function AdminPackagesPage(props: { ctx: UiContext; data: AdminPackagesDa
                   </td>
                   <td>{item.sizeText}</td>
                   <td>{absoluteShort(item.version.createdUnix)}</td>
+                  {/* The Op cell (list.tmpl:69-74): the red trash opening the
+                      delete dialog upstream — the no-JS plain-form POST
+                      reduction (the admin-repos Op column's shape), the
+                      registration live behind it. Upstream travels the id in
+                      the modal's action URL (?id=N); the hidden field posts
+                      it in the body — the route binds both. */}
+                  <td>
+                    <form method="post" action="/-/admin/packages/delete" class="tw-inline">
+                      <input type="hidden" name="id" value={item.version.id} />
+                      <button type="submit" class="tw-text-red link-action negative" aria-label={adminPackagesLocale.op_delete_aria}>
+                        <Icon name="octicon-trash" />
+                      </button>
+                    </form>
+                  </td>
                 </tr>
               ))
             )}
