@@ -19,6 +19,7 @@ import {
 import { newSalt, newPasswordRecord } from "../../auth/password";
 import { isComplexEnough, MIN_PASSWORD_LENGTH } from "../../auth/password-policy";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
+import { AuditActions, auditEventInsert } from "../../services/audit";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
 import { enqueueRegisterNotifyMail } from "../../services/mail/register-notify";
@@ -512,35 +513,67 @@ function invalidEmailMessage(email: string): string | null {
  * upstream's SetPassword arm (user.go:788–791: new salt, the CONFIGURED
  * algorithm) plus the Rands salt every create writes (user.go:785–786) and
  * the MustChangePassword default-true flag (admin/user.go:89–95).
+ *
+ * B-73: the `user:create` audit row rides the SAME batch — the §4.2
+ * transactional form ("a failed write emits nothing"), the org-create twin's
+ * shape (services/orgs/orgs.ts:459-474). Upstream emits
+ * `audit.Record(ctx, audit_model.UserCreate, u)` immediately after
+ * AdminCreateUser (admin/user.go:149): actor the ADMIN (ctx.Doer), scope the
+ * created user, message the registry template. The new user's numeric id is
+ * allocated by the insert of the same batch, so scope_id resolves through the
+ * scalar subquery (cast to text — the schema's scope_id drift note: decimal
+ * string for numeric entities) exactly like the org twin's mid-batch id;
+ * actor_name snapshots upstream's DisplayName (models/user/user.go:476-482 —
+ * FullName when set, else Name).
  */
-async function insertCreatedUser(d1: D1Database, form: CreateUserOption, now: Date): Promise<TargetRow> {
+async function insertCreatedUser(
+  d1: D1Database,
+  form: CreateUserOption,
+  now: Date,
+  audit: { actorId: number; actorName: string },
+): Promise<TargetRow> {
   const lower = form.username.toLowerCase();
   const record = await newPasswordRecord(form.password ?? "");
   const db = drizzle(d1);
   try {
-    const inserted = await db
-      .insert(users)
-      .values({
-        username: form.username,
-        usernameLower: lower,
-        email: form.email,
-        // The user-directory render (toApiUser) reads display_name; the org
-        // render reads full_name — two landed columns for upstream's one
-        // FullName, so a user-typed create fills both.
-        displayName: form.full_name ?? null,
-        isAdmin: false,
-        status: "active",
-        visibility: form.visibility ?? "public",
-        fullName: form.full_name ?? null,
-        type: "user",
-        createdAt: form.created_at !== undefined ? new Date(form.created_at) : now,
-        passwd: record.passwd,
-        salt: record.salt,
-        passwdHashAlgo: record.passwdHashAlgo,
-        rands: newSalt(),
-        mustChangePassword: form.must_change_password ?? true,
-      })
-      .returning();
+    const [inserted] = await db.batch([
+      db
+        .insert(users)
+        .values({
+          username: form.username,
+          usernameLower: lower,
+          email: form.email,
+          // The user-directory render (toApiUser) reads display_name; the org
+          // render reads full_name — two landed columns for upstream's one
+          // FullName, so a user-typed create fills both.
+          displayName: form.full_name ?? null,
+          isAdmin: false,
+          status: "active",
+          visibility: form.visibility ?? "public",
+          fullName: form.full_name ?? null,
+          type: "user",
+          createdAt: form.created_at !== undefined ? new Date(form.created_at) : now,
+          passwd: record.passwd,
+          salt: record.salt,
+          passwdHashAlgo: record.passwdHashAlgo,
+          rands: newSalt(),
+          mustChangePassword: form.must_change_password ?? true,
+        })
+        .returning(),
+      // SPEC-0015 §4.2: the audit row commits (or rolls back) atomically with
+      // the users row it describes.
+      auditEventInsert(db, {
+        action: AuditActions.UserCreate,
+        actorId: audit.actorId,
+        actorName: audit.actorName,
+        scopeType: "user",
+        scopeId: sql`(select cast(id as text) from users where username_lower = ${lower})`,
+        scopeName: form.username,
+        origin: "api",
+        vars: { scope: form.username },
+        timestamp: now,
+      }),
+    ]);
     return inserted[0]!;
   } catch (error) {
     // The UNIQUE(users.username_lower) race arbiter (upstream IsUserExist
@@ -950,7 +983,18 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     const lower = form.username.toLowerCase();
     // DeleteUserRedirect (user.go:798): creating on a live redirect consumes it.
     await drizzle(c.env.DB).delete(userRedirects).where(eq(userRedirects.lowerName, lower));
-    const row = await insertCreatedUser(c.env.DB, form, new Date());
+    // The audit emit rides the insert batch (B-73 — admin/user.go:149):
+    // actor the ADMIN (ctx.Doer), name the DisplayName mapping.
+    const doer = c.get("authUser");
+    // The wire-model User's id/login/full_name are wire-OMITTABLE — the
+    // authed admin row always carries them; guard the optionals for the type.
+    if (doer?.id === undefined || doer.login === undefined) {
+      throw new ApiError(401, "Unauthorized");
+    }
+    const row = await insertCreatedUser(c.env.DB, form, new Date(), {
+      actorId: doer.id,
+      actorName: (doer.full_name ?? "").trim() !== "" ? (doer.full_name as string) : doer.login,
+    });
     // The register-notify mail arm (specs/email-outbound.md §2.5) — upstream
     // `if form.SendNotify { mailer.SendRegisterNotifyMail(u) }`
     // (routers/api/v1/admin/user.go:153-156; the web twin admin/users.go:262).

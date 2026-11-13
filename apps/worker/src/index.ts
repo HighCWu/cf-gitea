@@ -36,6 +36,7 @@ import { wellKnownRouter } from "./api/routes/federation";
 import { oauth2WellKnownRouter } from "./web/oauth2-wellknown";
 import { webWellKnownRouter } from "./web/well-known";
 import { webMiscRouter } from "./web/misc";
+import { healthzHandler } from "./web/healthz";
 import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -164,7 +165,13 @@ app.onError(async (error, c) => {
 // (gitHttpGate / 404 shell / onError) are documented in web/security-headers.ts.
 app.use("*", securityHeaders());
 
+// The health-check family (B-74): the legacy dispatcher probe `/healthz`
+// (`{"ok":true}`) stays as an alias — scripts/deploy-smoke.mjs's checkHealthz
+// asserts `GET /healthz -> 200 {"ok":true}` verbatim — while the upstream
+// path+payload lands at `/api/healthz` (web.go:295 + install routes.go:36;
+// the healthcheck.Check port — web/healthz.ts).
 app.get("/healthz", (c) => c.json({ ok: true }));
+app.get("/api/healthz", healthzHandler());
 
 // /api/v1 (SPEC-0002/0004): resolveAuth parses credentials (anonymous stays
 // anonymous; its D1-verified identity wins inside the api middlewares);

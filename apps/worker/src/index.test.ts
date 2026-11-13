@@ -68,6 +68,38 @@ describe("GET /healthz", () => {
   });
 });
 
+describe("GET /api/healthz (B-74 — the healthcheck.Check port)", () => {
+  it("answers the draft-inadini payload over the D1 ping (check.go:63-84)", async () => {
+    const response = await SELF.fetch("https://example.com/api/healthz");
+
+    expect(response.status).toBe(200); // pass → 200 (status.ToHTTPStatus, check.go:33-36)
+    expect(response.headers.get("content-type")).toBe("application/json"); // check.go:78, upstream's exact type
+    const text = await response.text();
+    // Go MarshalIndent(payload, "", "  ") parity — the two-space form.
+    expect(text.startsWith('{\n  "status": "pass"')).toBe(true);
+    const body = JSON.parse(text) as {
+      status: string;
+      description: string;
+      checks: Record<string, Array<{ status: string; time: string; output?: string }>>;
+    };
+    expect(body.status).toBe("pass");
+    expect(body.description).toBe("Gitea"); // setting.AppName default (no APP_NAME var landed)
+    const pings = body.checks["database:ping"] ?? [];
+    expect(pings).toHaveLength(1);
+    expect(pings[0]?.status).toBe("pass");
+    expect(pings[0]?.time).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/); // RFC3339 UTC
+    expect(pings[0]?.output).toBeUndefined(); // omitted for pass (draft-inadini §3.1.3)
+    // PLATFORM reduction: no cache tier on Workers — no cache:ping arm.
+    expect(Object.keys(body.checks)).toEqual(["database:ping"]);
+  });
+
+  it("keeps the legacy /healthz alias exact for the deploy-smoke probe", async () => {
+    const response = await SELF.fetch("https://example.com/healthz");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+  });
+});
+
 describe("git engine mount (SPEC-0001 M1)", () => {
   const basic = (user: string, pass: string) =>
     `Basic ${btoa(`${user}:${pass}`)}`;

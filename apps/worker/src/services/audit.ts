@@ -236,6 +236,16 @@ export const AuditActions = {
   // (auth.go:476's RecordAs — actor the ADMIN, scope the target).
   UserImpersonation: defineAction("user:impersonation:start", "User {actor} started impersonating user {scope}."),
   UserImpersonationExit: defineAction("user:impersonation:exit", "User {actor} stopped impersonating user {scope}."),
+  // The create row (action.go:67 — id AND template verbatim; upstream order
+  // is impersonation:start, impersonation:exit, create, delete, …). Emitted
+  // on the admin user-create arm (routers/api/v1/admin/user.go:149
+  // `audit.Record(ctx, audit_model.UserCreate, u)` — actor the ADMIN, scope
+  // the created user; B-73). The install-admin twin (install.go:479) and the
+  // admin-web twin (users.go:256) register their own waves; the
+  // external-auth authenticate family (sspi/reverseproxy/smtp/pam/ldap) has
+  // no cf-gitea surface to emit from (every user is LOCAL — deviation 1 of
+  // api/routes/admin-t2.ts).
+  UserCreate: defineAction("user:create", "Created user {scope}."),
   // SPEC-0002 §6 (PWD-2) — the password-family emits (action.go:69/76,
   // ids AND templates verbatim):
   //   - UserAuthenticationFailTwoFactor — the API Basic password arm's

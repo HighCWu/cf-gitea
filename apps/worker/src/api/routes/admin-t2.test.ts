@@ -25,6 +25,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import {
   actions,
+  auditEvents,
   issueAssignees,
   issueStopwatches,
   notificationStates,
@@ -151,6 +152,7 @@ beforeEach(async () => {
     "package_blobs",
     "package_blob_uploads",
     "package_cleanup_rules",
+    "audit_event",
     "two_factor",
     "repositories",
     "users",
@@ -432,6 +434,45 @@ describe("POST /admin/users (adminCreateUser)", () => {
     );
     expect(res.status).toBe(201);
     expect(await new OrgService(env.DB).lookupUserRedirect("neighbor")).toBeNull();
+  });
+
+  it("emits the user:create audit row — actor the ADMIN, scope the created user (B-73, admin/user.go:149)", async () => {
+    const res = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "audited", email: "audited@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(res.status).toBe(201);
+    const created = (await res.json<Record<string, unknown>>()) as { id: number };
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:create",
+      actorId: adminId, // ctx.Doer — the admin, not the created user
+      actorName: "cf-gitea Stub User", // DisplayName (user.go:476-482): FullName set → FullName (the stub resolver's full_name)
+      scopeType: "user",
+      scopeId: String(created.id), // the decimal string (the scope_id drift note)
+      scopeName: "audited",
+      origin: "api",
+      message: "Created user audited.", // the registry template rendered at emit
+    });
+    expect(rows[0]?.actorCredential).toBeNull();
+    expect(rows[0]?.metadata).toBeNull();
+  });
+
+  it("emits NOTHING on a failed create — the audit row rolls back with the write (§4.2)", async () => {
+    const first = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "first", email: "first@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(first.status).toBe(201);
+    const dup = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "FIRST", email: "other@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(dup.status).toBe(409);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.scopeName).toBe("first");
   });
 });
 
