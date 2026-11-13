@@ -1411,8 +1411,15 @@ import { OrgSettingsNavbar, UserSettingsNavbar } from "./components/settings-nav
 import { loadAdminOrgsData, renderAdminOrgsPage } from "./pages/admin-orgs";
 import { deleteAdminRepoFromForm, loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
 // The tick-18 packages arm (pages/admin-packages.tsx — upstream
-// /-/admin/packages, web.go:852-858's /packages group GET).
-import { loadAdminPackagesData, renderAdminPackagesPage } from "./pages/admin-packages";
+// /-/admin/packages, web.go:852-858's /packages group GET) plus the B-67
+// write tails (the delete POST over deletePackageVersionGuarded's WB26 emit
+// seam, the cleanup POST over the expired-data sweep).
+import {
+  applyAdminPackagesCleanup,
+  deleteAdminPackageVersionFromForm,
+  loadAdminPackagesData,
+  renderAdminPackagesPage,
+} from "./pages/admin-packages";
 // The census R18 (a) arms (each module's header carries its mount record):
 // the emails list + the activate/delete writes, the hooks two-list + delete,
 // the badge-catalog family (all seven upstream routes), and the global
@@ -1474,12 +1481,18 @@ import {
 import { adminNoticesLocale, loadAdminNoticesData, renderAdminNoticesPage } from "./pages/admin-notices";
 // The SPEC-0018 §3.2 config arm (the census R18/R20 config summary — the
 // read-only build-posture page; the vars slice keeps secrets unreachable
-// even by accident, the module header's rule-3 guarantee).
+// even by accident, the module header's rule-3 guarantee). The B-69 POST
+// rider's flash texts ride the module too.
 import {
+  adminConfigTestMailFailedText,
+  adminConfigTestMailSentText,
   adminConfigVarsFromEnv,
   loadAdminConfigData,
   renderAdminConfigPage,
 } from "./pages/admin-config";
+// The B-69 arm's send half (the direct test send — upstream's SendTestMail
+// bypasses its mail queue too, mail.go:45).
+import { sendTestMail } from "../services/mail/test-send";
 import {
   loadUserProfileData,
   loadUserProfileOrganizationsData,
@@ -3743,6 +3756,11 @@ export interface AdminRoute {
     // chi's 405.
     | "admin-repos-delete"
     | "admin-packages"
+    // The B-67 write tails (web.go:856-857 — admin.DeletePackageVersion +
+    // admin.CleanupExpiredData; the listing's delete-modal target and the
+    // header's cleanup button, POST-only: the GET twins answer chi's 405).
+    | "admin-packages-delete"
+    | "admin-packages-cleanup"
     | "admin-emails"
     | "admin-emails-activate"
     | "admin-emails-delete"
@@ -3773,6 +3791,9 @@ export interface AdminRoute {
     | "admin-application-app"
     | "admin-application-regenerate"
     | "admin-config"
+    // The B-69 SendTestMail rider (web.go:792's m.Post("/test_mail") inside
+    // the /-/admin/config group — the POST beside the summary GET).
+    | "admin-config-test-mail"
     | "admin-notices"
     | "admin-notices-delete"
     | "admin-notices-empty"
@@ -4785,11 +4806,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // bare list literal. POST-only — the GET twin answers chi's 405.
     if (tail.length === 2 && tail[0] === "repos" && tail[1] === "delete") return { family: "admin-repos-delete" };
     // The tick-18 packages arm (pages/admin-packages.tsx — web.go:852-858's
-    // /packages group): the bare list GET only. The group's delete/cleanup
-    // POSTs stay unclaimed — unlanded writes (the module's dead-link note),
-    // the engine's 404; the group's `packagesEnabled` qualifier rides the
-    // handler's ctx.packagesEnabled arm, not the parse.
+    // /packages group): the bare list GET + the B-67 write tails (the exact
+    // two-segment tails beside the admin-repos-delete literal; POST-only —
+    // the GET twins answer chi's 405). The group's `packagesEnabled`
+    // qualifier rides the handlers' ctx.packagesEnabled arm, not the parse.
     if (tail.length === 1 && tail[0] === "packages") return { family: "admin-packages" };
+    if (tail.length === 2 && tail[0] === "packages" && tail[1] === "delete") return { family: "admin-packages-delete" };
+    if (tail.length === 2 && tail[0] === "packages" && tail[1] === "cleanup") return { family: "admin-packages-cleanup" };
     // The R18 emails arm (web.go:821-824's /emails group): the list GET and
     // the two write POSTs (the module's plain-form arms).
     if (tail.length === 1 && tail[0] === "emails") return { family: "admin-emails" };
@@ -4872,11 +4895,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     // The SPEC-0018 §3.2 config arm (web.go:788-794's /config group): the
     // read-only summary GET beside the notices arm. Upstream's ChangeConfig
-    // POST, the settings editor page and the two test riders are the §3.2
+    // POST, the settings editor page and the test_cache rider are the §3.2
     // §-outs (arming is a var edit + redeploy, never a runtime toggle), so
-    // ONLY the bare literal claims — every other config/* tail stays
-    // unclaimed → the engine's 404.
+    // ONLY the bare literal and the B-69 test-mail rider claim — every
+    // other config/* tail stays unclaimed → the engine's 404.
     if (tail.length === 1 && tail[0] === "config") return { family: "admin-config" };
+    if (tail.length === 2 && tail[0] === "config" && tail[1] === "test_mail") return { family: "admin-config-test-mail" };
     // The SPEC-0018 §3.1 notices arm (web.go:882-886's /notices group): the
     // paged GET and the two plain-form write POSTs (the module's mount
     // record). NO create route — notices are system-generated, upstream
@@ -14352,15 +14376,69 @@ async function adminReposDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Re
  *  /packages group; the group's `packagesEnabled` qualifier rides the
  *  strict-polarity PACKAGES_ENABLED var through ctx.packagesEnabled, the
  *  R04 prologue's 404-shell arm verbatim): the prologue → the paged packages
- *  listing. The group's delete/cleanup POSTs stay UNCLAIMED — unlanded
- *  writes (the module's dead-link note), the engine's 404, the admin-repos
- *  delete-tail posture. */
+ *  listing. The group's delete/cleanup POSTs are the B-67 tails below. */
 async function adminPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
   if (p.ctx.packagesEnabled === false) return p.respond(c.html(renderNotFound(p.ctx), 404));
   const data = await loadAdminPackagesData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminPackagesPage(p.ctx, data)));
+}
+
+/** The /packages group's gate for the POST tails — the same ladder the GET
+ *  runs (the group qualifier wraps BOTH upstream, web.go:858's closure). */
+async function adminPackagesWriteGate(
+  c: Context<{ Bindings: Env }>,
+): Promise<{ ok: true; ctx: UiContext; respond: (r: Response, status?: number) => Response } | { ok: false; response: Response }> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p;
+  if (p.ctx.packagesEnabled === false) return { ok: false, response: c.html(renderNotFound(p.ctx), 404) };
+  return p;
+}
+
+/**
+ * POST /-/admin/packages/delete (web.go:856 — admin.DeletePackageVersion,
+ * packages.go:82-96, over the LANDED deletePackageVersionGuarded seam with
+ * the WB26 emit options: the terraform guards precede the cascade, then the
+ * deleted event fires with the ADMIN doer as sender — packages.go:532's
+ * always-notify): the §2.8 guard + the group's prologue/packagesEnabled
+ * ladder, then the id into deleteAdminPackageVersionFromForm (the form
+ * body's hidden field OR the modal's ?id=N query — upstream FormInt64
+ * binds both). EVERY outcome answers the bare 303 onto the listing (the
+ * admin-repos delete shape: the success flash + JSONRedirect("") reload
+ * reduce to the 303, the no-session-flash convention; the missing-id and
+ * guard-refusal arms — upstream ServerErrors — ride the same silent 303
+ * stale-form posture, nothing deleted on a refusal).
+ */
+async function adminPackagesDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPackagesWriteGate(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const rawId = form.get("id") ?? new URL(c.req.raw.url).searchParams.get("id") ?? "";
+  const viewer = p.ctx.viewer;
+  // The prologue admitted only a signed-in admin — the emit rides their id
+  // (packages.go:532's RemovePackageVersion(ctx, ctx.Doer, pv)).
+  await deleteAdminPackageVersionFromForm(c.env.DB, rawId, viewer.kind === "user" ? { webhookEnv: c.env, doerId: viewer.id } : undefined);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/packages" } }));
+}
+
+/**
+ * POST /-/admin/packages/cleanup (web.go:857 — admin.CleanupExpiredData,
+ * packages.go:98-110): the §2.8 guard + the group's ladder, then the
+ * expired-data sweep (CleanupExpiredData at olderThan=0 — the rules arm is
+ * the cron's, the module header records the reduction). Upstream answers a
+ * plain ctx.Redirect onto the listing — the bare 303 verbatim; a sweep
+ * throw propagates (upstream's ServerError arm, the fail-loud posture).
+ */
+async function adminPackagesCleanupSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPackagesWriteGate(c);
+  if (!p.ok) return p.response;
+  await applyAdminPackagesCleanup(c.env.DB, c.env.REPO_PACKS);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/packages" } }));
 }
 
 // --- the census R18 (a) arms (pages/admin-emails.tsx / admin-hooks.tsx /
@@ -14960,7 +15038,8 @@ async function adminNoticesEmpty(c: Context<{ Bindings: Env }>): Promise<Respons
 
 // --- the SPEC-0018 §3.2 config arm (pages/admin-config.tsx — upstream's
 // /-/admin config group, web.go:788-794; the shared adminPagePrologue;
-// GET-only — the ChangeConfig write is the §3.2 §-out) ----------------------
+// the ChangeConfig write + the settings editor + the test_cache rider stay
+// the §-outs — the test_mail rider LANDED (the census B-69 arm) -----------
 
 /** GET /-/admin/config (pages/admin-config.tsx): the prologue → the
  *  read-only summary over the declared non-secret wrangler vars (the env
@@ -14972,6 +15051,39 @@ async function adminConfigPage(c: Context<{ Bindings: Env }>): Promise<Response>
   if (!p.ok) return p.response;
   const data = await loadAdminConfigData(adminConfigVarsFromEnv(c.env));
   return p.respond(c.html(renderAdminConfigPage(p.ctx, data)));
+}
+
+/**
+ * POST /-/admin/config/test_mail (pages/admin-config.tsx — the census B-69
+ * arm; upstream SendTestMail, config.go:29-41, mounted at web.go:792 as the
+ * /-/admin/config group's `m.Post("/test_mail", …)` rider): the §2.8 guard +
+ * the shared admin prologue, then the form's `email` (ctx.FormString's
+ * body-then-query merge, base_form.go:18) through the DIRECT test send
+ * (services/mail/test-send.ts — upstream bypasses its mail queue too,
+ * mail.go:45's in-handler sender_service.Send; no email_outbox row, no
+ * queue message). The flash IS the outcome surface (config.go:33-37:
+ * Flash.Error(test_mail_failed, email, err) on the error arm,
+ * Flash.Info(test_mail_sent, email) otherwise — and the no-mailer posture is
+ * SILENT SUCCESS, mail.go:44-46's `MailService == nil → return nil`, so a
+ * disarmed deployment flashes the success text verbatim); the ctx.Redirect
+ * onto /-/admin/config folds into this instance's no-session-flash
+ * re-render convention: the FRESH page at 200 carries the banner
+ * (adminDashboardSubmit's posture, swapped to a 303 if a flash queue lands).
+ */
+async function adminConfigTestMail(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const email = form.get("email") ?? new URL(c.req.raw.url).searchParams.get("email") ?? ""; // FormString's merge, body wins
+  const outcome = await sendTestMail(c.env, email);
+  const flash =
+    outcome.outcome === "failed"
+      ? { kind: "negative" as const, text: adminConfigTestMailFailedText(email, outcome.error) }
+      : { kind: "positive" as const, text: adminConfigTestMailSentText(email) }; // "sent" AND "disabled" alike — the silent-success arm
+  const data = await loadAdminConfigData(adminConfigVarsFromEnv(c.env));
+  return p.respond(c.html(renderAdminConfigPage(p.ctx, data, flash)));
 }
 
 /**
@@ -20187,10 +20299,15 @@ uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
 // chi's 405 — the account_link convention).
 uiRouter.get("/-/admin/repos/delete", () => methodNotAllowed("POST"));
 uiRouter.post("/-/admin/repos/delete", (c) => adminReposDeleteSubmit(c));
-// The tick-18 packages arm (parseUiRoute claims exactly the bare literal —
-// web.go:852-858's list GET; the group's delete/cleanup POSTs stay
-// unregistered, the engine's 404).
+// The tick-18 packages arm + the B-67 write tails (parseUiRoute claims
+// exactly these shapes — web.go:852-858's list GET and the group's
+// delete/cleanup POSTs; the writes are POST-only, the GET twins answer
+// chi's 405 — the admin-repos-delete convention).
 uiRouter.get("/-/admin/packages", (c) => adminPackagesPage(c));
+uiRouter.get("/-/admin/packages/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/packages/delete", (c) => adminPackagesDeleteSubmit(c));
+uiRouter.get("/-/admin/packages/cleanup", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/packages/cleanup", (c) => adminPackagesCleanupSubmit(c));
 // The census R18 (a) arms (parseUiRoute claims exactly these shapes — the
 // same static literals; the writes are POST-only, the badge slug families
 // ride the decoded param, the application delete the positive-integer id).
@@ -20246,6 +20363,10 @@ uiRouter.post("/-/admin/notices/empty", (c) => adminNoticesEmpty(c));
 // Upstream's ChangeConfig POST is the §3.2 §-out: no POST twin exists, the
 // unregistered method falls to the sub-app's 404 (never a page render).
 uiRouter.get("/-/admin/config", (c) => adminConfigPage(c));
+// The B-69 test-mail rider (web.go:792's m.Post("/test_mail") inside the
+// /-/admin/config group) + chi's 405 GET twin (the admin-emails convention).
+uiRouter.post("/-/admin/config/test_mail", (c) => adminConfigTestMail(c));
+uiRouter.get("/-/admin/config/test_mail", () => methodNotAllowed("POST"));
 // The census C6 arm: the admin actions job queue (pages/repo-actions-queue.tsx
 // — web.go:904's `GET /actions/job_queue`; the group's bare /actions literal
 // and its runners/variables/scoped-workflows tails stay unregistered — the

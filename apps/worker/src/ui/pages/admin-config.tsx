@@ -32,12 +32,25 @@
  *   - `GET /-/admin/config/settings` — the dynamic editor page (web.go:794
  *     → config.go:108-113). Requires the write path; the nav item stays
  *     omitted with it (the dead-link rule, AdminFamilyNav).
- *   - the two POST riders `test_mail` (web.go:792 → config.go:29-39) and
- *     `test_cache` (web.go:793 → config.go:42-55) — no POST write path
- *     exists (§1); upstream renders the test-mail rider INSIDE the mailer
- *     section only while the mailer is enabled (config.tmpl:220-228) and
- *     ours stays absent with it (SPEC-0018's §-out — arming is a var edit +
- *     redeploy), the test-cache rider absent with the cache adapter.
+ *   - `POST /test_cache` (web.go:793 → config.go:42-55) — absent with the
+ *     cache adapter (no cache service exists on this tree).
+ *
+ * The `POST /test_mail` rider (web.go:792 → config.go:29-41) LANDED (the
+ * census B-69 arm): the form renders INSIDE the mailer section's dl, gated
+ * on the armed mailer exactly as upstream gates it on `.MailerEnabled`
+ * (config.tmpl:192-229's wrap; config.tmpl:220-228's form — `input
+ * type=email name=email` + the "Send" submit, no CSRF token at the pin).
+ * The POST (mounted in `index.ts` beside the GET arm) runs the direct
+ * test send (services/mail/test-send.ts — upstream bypasses its mail queue
+ * too, mail.go:45) and answers with the FLASH: success "A testing email has
+ * been sent to …" (config.go:36) or failure "Failed to send a testing
+ * email to …: %v" (config.go:34), the redirect of ctx.Redirect folded into
+ * this instance's re-render convention (the flash rides the FRESH page
+ * render at 200 — adminDashboardSubmit's no-session-flash posture). The
+ * no-mailer arm is upstream's SILENT SUCCESS: mail.go:44-46 returns nil
+ * with MailService == nil, so the success flash fires even with the mailer
+ * disarmed (the form merely doesn't render, config.tmpl:192) — a
+ * `flash` prop carries the banner (null = the plain GET).
  *
  * ## The THREE row classes (§3.2 — the dashboard's posture-line idiom
  * generalized; admin-dashboard.tsx renders upstream's inapplicable ops "as
@@ -81,19 +94,28 @@
  * writes, config.go:159). POSTURE rows render identically on every
  * deployment (§5.8) — there is no empty state to special-case.
  *
- * ## Mount record (MOUNTED this unit — the route is live)
+ * ## Mount record (MOUNTED this unit — the routes are live)
  *
  * Route table (`index.ts`), beside the landed adminPagePrologue arms:
  *
- *   GET /-/admin/config   adminPagePrologue → adminConfigVarsFromEnv(env) →
- *                         loadAdminConfigData → renderAdminConfigPage at 200
+ *   GET  /-/admin/config            adminPagePrologue → adminConfigVarsFromEnv(env) →
+ *                                   loadAdminConfigData → renderAdminConfigPage at 200
+ *   POST /-/admin/config/test_mail  sameOriginGuard → the prologue → the form's
+ *                                   `email` (FormString's body-then-query merge) →
+ *                                   sendTestMail(env, …) → the flash over the FRESH
+ *                                   re-render at 200 (upstream 303s onto
+ *                                   /-/admin/config; the no-session-flash reduction)
+ *   GET  /-/admin/config/test_mail  chi's 405 twin (the methodNotAllowed convention)
  *
- * GET-only: upstream's POST arms are all §-outs (above). The claim sits in
- * the landed admin literal family block (`raw[1] === "-" && raw[2] ===
- * "admin"`), a static literal beside the notices arm, ahead of any dynamic
- * arm. The family navbar gains the Configuration group between Integrations
- * and the System Notices item (upstream navbar.tmpl:93-102's position), with
- * the Summary item only — the settings-editor item stays omitted.
+ * The remaining write arms are §-outs (above): upstream's POST
+ * /-/admin/config (ChangeConfig) and GET /-/admin/config/settings stay
+ * unclaimed, POST /-/admin/config/test_cache absent with the cache adapter.
+ * The GET claim sits in the landed admin literal family block (`raw[1] ===
+ * "-" && raw[2] === "admin"`), a static literal beside the notices arm,
+ * ahead of any dynamic arm. The family navbar gains the Configuration group
+ * between Integrations and the System Notices item (upstream
+ * navbar.tmpl:93-102's position), with the Summary item only — the
+ * settings-editor item stays omitted.
  */
 
 import { SERVER_VERSION } from "../../api/config";
@@ -242,6 +264,32 @@ export const adminConfigLocale = {
   },
 } as const;
 
+/** The SendTestMail rider's strings + flash texts (config.tmpl:220-228's form
+ *  over config.go:29-41's handler; en-US values at the pin). */
+export const adminConfigTestMailLocale = {
+  /** "admin.config.send_test_mail" (config.tmpl:220's dt). */
+  rowLabel: "Send Testing Email",
+  /** "admin.config.send_test_mail_submit" (config.tmpl:226's button). */
+  submit: "Send",
+  /** "admin.config.test_email_placeholder" (config.tmpl:224). */
+  placeholder: "Email Address (e.g. test@example.com)",
+  /** "admin.config.test_mail_sent" (config.go:36's Flash.Info). */
+  sent: 'A testing email has been sent to "%s".',
+  /** "admin.config.test_mail_failed" (config.go:34's Flash.Error — %s the
+   *  address, %v the error). */
+  failed: 'Failed to send a testing email to "%s": %v',
+} as const;
+
+/** config.go:36 — ctx.Tr("admin.config.test_mail_sent", email). */
+export function adminConfigTestMailSentText(email: string): string {
+  return adminConfigTestMailLocale.sent.replace("%s", email);
+}
+
+/** config.go:34 — ctx.Tr("admin.config.test_mail_failed", email, err). */
+export function adminConfigTestMailFailedText(email: string, error: string): string {
+  return adminConfigTestMailLocale.failed.replace("%s", email).replace("%v", error);
+}
+
 /** The section keys in upstream config.tmpl's fixed order. */
 export type AdminConfigSectionKey =
   | "server"
@@ -298,6 +346,12 @@ export interface AdminConfigData {
    *  it from the vars slice (`vars.oauth2Enabled !== "false"` — the
    *  strict-polarity read, `oauth2FeatureEnabled`'s discipline). */
   oauth2Enabled: boolean;
+  /** The mailer section's SendTestMail rider gate (config.tmpl:192's
+   *  `{{if .MailerEnabled}}` wrap): the test-mail form renders inside the
+   *  section's dl ONLY while the mailer is armed (`vars.mailEnabled ===
+   *  "true"`, the strict-polarity read); disarmed, the section carries the
+   *  posture row instead. */
+  mailerEnabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -569,10 +623,12 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
     {
       // config.tmpl:186-231 — mailer. REAL (the outbound mailer LANDED —
       // specs/email-outbound.md §6): the four declared vars render their
-      // effective values; POSTURE: upstream's send-test-mail rider
-      // (config.tmpl:220-228) — rendered only while the mailer is enabled —
-      // is absent with it: it is a POST /-/admin/config rider and the write
-      // path is §1's §-out (SPEC-0018: arming is a var edit + redeploy).
+      // effective values. The SendTestMail rider (config.tmpl:220-228) is the
+      // B-69 arm: the FORM renders in the section's dl only while the mailer
+      // is armed (the `mailerEnabled` flag — config.tmpl:192's
+      // `{{if .MailerEnabled}}` wrap), so this rows list carries the rider's
+      // POSTURE note only for the DISARMED deployments (armed ones render the
+      // form pair instead — the page render's mailer tail).
       key: "mailer",
       title: adminConfigLocale.sections.mailer,
       rows: [
@@ -622,12 +678,16 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
           value:
             "OVERRIDE_HEADER, FROM_DISPLAY_NAME_FORMAT, EMBED_ATTACHMENT_IMAGES and ENVELOPE_FROM have no row — unported with per-knob reasons (specs/email-outbound.md §2.4); the relay transport derives the envelope from the verified domain",
         },
-        {
-          kind: "posture",
-          label: "Send-test-mail rider", // config.tmpl:220-228 (mailer-enabled-gated)
-          value:
-            "absent — upstream renders the test-mail form inside this section only while the mailer is enabled; it is a POST /-/admin/config rider and this deployment has no config write path (SPEC-0018 §1: arming is a var edit + redeploy, never a runtime toggle)",
-        },
+        ...(vars.mailEnabled === "true"
+          ? []
+          : [
+              {
+                kind: "posture" as const,
+                label: "Send-test-mail rider", // config.tmpl:220-228 (the armed-only form; config.go:29-41's handler)
+                value:
+                  "form not rendered — upstream renders the test-mail form inside this section only while the mailer is enabled (config.tmpl:192's wrap); the POST rider itself still answers upstream's silent success (config.go:29-41 over mail.go:44-46's MailService==nil nil return), so a disarmed deployment flashes success without sending",
+              },
+            ]),
       ],
     },
     {
@@ -701,7 +761,12 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
       ],
     },
   ];
-  return Promise.resolve({ published, sections, oauth2Enabled: vars.oauth2Enabled !== "false" });
+  return Promise.resolve({
+    published,
+    sections,
+    oauth2Enabled: vars.oauth2Enabled !== "false",
+    mailerEnabled: vars.mailEnabled === "true",
+  });
 }
 
 /** A section by key (the tests' lookup helper; the render walks the array). */
@@ -717,9 +782,16 @@ export function adminConfigSection(data: AdminConfigData, key: AdminConfigSectio
 // The render (templates/admin/config.tmpl at the pin)
 // ---------------------------------------------------------------------------
 
-/** The full-document render (the render.tsx pattern). */
-export function renderAdminConfigPage(ctx: UiContext, data: AdminConfigData): string {
-  return renderPage(<AdminConfigPage ctx={ctx} data={data} />);
+/** The POST's flash banner type (adminDashboardSubmit's shape). */
+export interface AdminConfigFlash {
+  kind: "positive" | "negative";
+  text: string;
+}
+
+/** The full-document render (the render.tsx pattern). `flash` carries the
+ *  SendTestMail POST's banner — null (the GET's shape) renders none. */
+export function renderAdminConfigPage(ctx: UiContext, data: AdminConfigData, flash: AdminConfigFlash | null = null): string {
+  return renderPage(<AdminConfigPage ctx={ctx} data={data} flash={flash} />);
 }
 
 /** One dt/dd row pair. REAL rows render upstream's plain pair with the row
@@ -748,10 +820,18 @@ function ConfigRow(props: { row: AdminConfigRow }) {
 
 /** The admin config page (§2.4.1 discriminator: `admin config` — the
  *  template's own dict, config.tmpl:1; upstream Title is "Summary",
- *  config.go:61). Pure GET — no forms, no flash arm, no write path. */
-export function AdminConfigPage(props: { ctx: UiContext; data: AdminConfigData }) {
+ *  config.go:61). The mailer section renders the SendTestMail form pair when
+ *  the data says armed (`mailerEnabled`, config.tmpl:192's
+ *  `{{if .MailerEnabled}}` wrap over config.tmpl:220-228's form — `input
+ *  type=email name=email` with the placeholder + `required`, the "Send"
+ *  submit, the POST target upstream's own test-mail rider; NO CSRF token at
+ *  the pin). `flash` is the POST's banner (the re-render convention —
+ *  upstream 303s onto this page with the session flash; no flash queue
+ *  exists here). */
+export function AdminConfigPage(props: { ctx: UiContext; data: AdminConfigData; flash?: AdminConfigFlash | null }) {
   return (
     <AdminFamilyShell ctx={props.ctx} title={adminConfigLocale.title} pageClass="admin config" active="config" oauth2Enabled={props.data.oauth2Enabled}>
+      {props.flash !== undefined && props.flash !== null ? <div class={`ui ${props.flash.kind} message`}>{props.flash.text}</div> : null}
       {props.data.sections.map((section) => (
         <div key={section.key}>
           <h4 class="ui top attached header">{section.title}</h4>
@@ -760,6 +840,23 @@ export function AdminConfigPage(props: { ctx: UiContext; data: AdminConfigData }
               {section.rows.map((row) => (
                 <ConfigRow key={row.label} row={row} />
               ))}
+              {section.key === "mailer" && props.data.mailerEnabled ? (
+                <>
+                  {/* config.tmpl:219's divider + :220-228's form pair */}
+                  <div class="divider" />
+                  <dt class="flex-text-block tw-py-1">{adminConfigTestMailLocale.rowLabel}</dt>
+                  <dd class="tw-py-0">
+                    <form class="ui form ignore-dirty" action="/-/admin/config/test_mail" method="post">
+                      <div class="ui tiny input">
+                        <input type="email" name="email" placeholder={adminConfigTestMailLocale.placeholder} size={29} required />
+                      </div>
+                      <button type="submit" class="ui tiny primary button">
+                        {adminConfigTestMailLocale.submit}
+                      </button>
+                    </form>
+                  </dd>
+                </>
+              ) : null}
             </dl>
           </div>
         </div>

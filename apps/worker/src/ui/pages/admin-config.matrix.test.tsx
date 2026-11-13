@@ -1,19 +1,26 @@
 /**
  * The ADMIN CONFIG page's matrix (SPEC-0018 §3.2/§6 — the admin-notices
  * harness shape: module seams over renderToString, plus the MOUNTED route
- * arm driven through `uiRouter.fetch()` with minted sessions).
+ * arms driven through `uiRouter.fetch()` with minted sessions).
  *
  * Covered here:
  *   - the SECTION STRUCTURE: upstream config.tmpl's ELEVEN sections in its
  *     fixed order with the upstream headings (config.tmpl:4…304), the
- *     `admin config` pageClass (config.tmpl:1), and the pure-GET posture
- *     (no form anywhere on the page — the write path is §1's §-out);
+ *     `admin config` pageClass (config.tmpl:1), and the FORM-FREE posture
+ *     while the mailer is disarmed (the canonical vars) — armed, exactly one
+ *     form rides the page: the SendTestMail rider (config.tmpl:220-228,
+ *     inside the mailer section's dl, config.tmpl:192's `{{if
+ *     .MailerEnabled}}` wrap);
  *   - the ROW CLASSES (§3.2): REAL rows carrying `data-row-kind="real"`,
  *     POSTURE rows the muted `tw-text-placeholder-text` pairs with
  *     `data-row-kind="posture"` — ssh/cache are POSTURE-only, the mailer
  *     is REAL as-built (the outbound mailer landed; its send-test-mail
- *     rider stays the section's POSTURE row), every
+ *     rider is the FORM when armed, the POSTURE note when disarmed), every
  *     section carries at least one posture or real row per §3.2's mapping;
+ *   - the SENDTESTMAIL RIDER (the census B-69 arm): the upstream form DOM
+ *     byte-shapes, the flash banner arms (the re-render convention's
+ *     `ui positive/negative message`), and the two flash texts verbatim
+ *     (config.go:34/:36) with the silent-success posture documented;
  *   - the VALUES-CROSS-CHECK (§6/§8.2): the page's `published` slice is the
  *     misc-t2 constants BY IDENTITY (a page-local copy fails), and every
  *     published field reaches the DOM byte-for-byte;
@@ -23,14 +30,21 @@
  *     structurally unreadable — adminConfigVarsFromEnv drops everything
  *     outside the declared non-secret slice, so the rendered HTML carries no
  *     GIT_TOKEN value even when the env object carries one;
- *   - the MOUNTED ROUTE ARM: the adminPagePrologue gate matrix (anonymous →
- *     the login 303, signed-in non-admin → the 404 shell, site admin → 200)
- *     and the live nav fold (the Configuration group's Summary item active).
+ *   - the MOUNTED ROUTE ARMS: the adminPagePrologue gate matrix (anonymous →
+ *     the login 303, signed-in non-admin → the 404 shell, site admin → 200),
+ *     the live nav fold (the Configuration group's Summary item active), the
+ *     ChangeConfig POST's unclaimed shape, and the B-69 POST battery — the
+ *     guard/prologue ladder, the silent-success flash on the disarmed
+ *     deployment, the sent flash over the dummy transport (no email_outbox
+ *     row — the direct send bypasses the ledger), the failure flashes
+ *     verbatim (no FROM / no recipient / the provider-less config error),
+ *     the body-then-query merge, and the GET 405 twin.
  */
 
 import { env } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
+import { drizzle } from "drizzle-orm/d1";
 
 import { SERVER_VERSION } from "../../api/config";
 import {
@@ -40,6 +54,7 @@ import {
   GENERAL_UI_SETTINGS,
 } from "../../api/routes/misc-t2";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { emailOutbox } from "../../db/schema";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
@@ -49,6 +64,9 @@ import {
   AdminConfigPage,
   adminConfigLocale,
   adminConfigSection,
+  adminConfigTestMailFailedText,
+  adminConfigTestMailLocale,
+  adminConfigTestMailSentText,
   adminConfigVarsFromEnv,
   formatPublishedGroup,
   loadAdminConfigData,
@@ -131,12 +149,15 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
     expect(html).toContain("<dl class=\"admin-dl-horizontal\">"); // the section body shape
   });
 
-  it("the page is a pure GET — nothing posts to it, no write path anywhere (§1's §-out)", async () => {
+  it("disarmed (the canonical vars), the page keeps the form-free posture — the write §-outs stay unclaimed", async () => {
     const html = render(await load());
     // The document chrome carries the global sign-out form (every page's
-    // BaseLayout); the §-out posture is that NOTHING targets THIS page —
-    // upstream's ChangeConfig POST and the two test riders have no target
-    // here, and no form rides the config content itself.
+    // BaseLayout); the DISARMED posture is that the config content itself
+    // carries no form: upstream's ChangeConfig POST has no target here, the
+    // test_cache rider is absent with the cache adapter, and the test-mail
+    // rider's form is unrendered while the mailer is off (config.tmpl:192's
+    // {{if .MailerEnabled}} wrap) — the section carries the posture note
+    // instead.
     expect(html).not.toContain('action="/-/admin/config"');
     expect(html).not.toContain("test_mail");
     expect(html).not.toContain("test_cache");
@@ -145,6 +166,29 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
     expect(contentStart).toBeGreaterThan(-1);
     expect(html.slice(contentStart, contentEnd)).not.toContain("<form");
     expect(html.slice(contentStart, contentEnd)).not.toContain("<button");
+  });
+
+  it("armed, exactly one form rides the page — the SendTestMail rider's upstream DOM (config.tmpl:220-228)", async () => {
+    const html = render(await load({ ...VARS, mailEnabled: "true" }));
+    const contentStart = html.indexOf('class="admin-setting-content"');
+    const contentEnd = html.indexOf('class="page-footer"');
+    const content = html.slice(contentStart, contentEnd);
+    expect(content.match(/<form/g)?.length).toBe(1); // exactly one form on the whole page
+    // The form pair byte-shapes (config.tmpl:219-227: divider, the
+    // flex-text-block dt, the tw-py-0 dd, the ui form with its tiny input
+    // and primary tiny button; NO CSRF token at the pin).
+    expect(html).toContain(`<dt class="flex-text-block tw-py-1">${adminConfigTestMailLocale.rowLabel}</dt>`);
+    expect(html).toContain('<dd class="tw-py-0"><form class="ui form ignore-dirty" action="/-/admin/config/test_mail" method="post">');
+    expect(html).toContain('<div class="divider"></div>');
+    expect(html).toContain(
+      `<input type="email" name="email" placeholder="${adminConfigTestMailLocale.placeholder}" size="29" required=""/>`,
+    );
+    expect(html).toContain(`<button type="submit" class="ui tiny primary button">${adminConfigTestMailLocale.submit}</button>`);
+    // The form sits INSIDE the mailer section's dl (the section's rows render
+    // first: the From row's dd precedes the rider).
+    expect(html.indexOf("MAIL_FROM")).toBeLessThan(html.indexOf('action="/-/admin/config/test_mail"'));
+    // And the rider's posture note is GONE (the form replaces it).
+    expect(html).not.toContain("form not rendered — upstream renders the test-mail form");
   });
 
   it("every section's rows carry a row class; ssh/cache are POSTURE-only, the mailer is REAL now (§3.2's mapping as-built)", async () => {
@@ -158,11 +202,16 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
     expect(adminConfigSection(data, "ssh").rows.every((row) => row.kind === "posture")).toBe(true);
     expect(adminConfigSection(data, "cache").rows.every((row) => row.kind === "posture")).toBe(true);
     // The mailer LANDED (specs/email-outbound.md): the four var rows are
-    // REAL, the send-test-mail rider stays the section's one POSTURE row.
+    // REAL; DISARMED, the send-test-mail rider is the section's last row —
+    // the posture note standing in for the armed-only form (config.tmpl:192's
+    // wrap). Armed, the note row is GONE (the form renders in its place —
+    // the rider describe pins that DOM).
     const mailer = adminConfigSection(data, "mailer");
     expect(mailer.rows.some((row) => row.kind === "real")).toBe(true);
     expect(mailer.rows.at(-1)?.kind).toBe("posture");
     expect(mailer.rows.at(-1)?.label).toContain("Send-test-mail");
+    const armedMailer = adminConfigSection(await load({ ...VARS, mailEnabled: "true" }), "mailer");
+    expect(armedMailer.rows.some((row) => row.label.includes("Send-test-mail"))).toBe(false);
     // The REAL side of the mapping: these sections carry at least one live row.
     for (const key of ["server", "lfs", "db", "service", "webhook", "mailer", "session", "git", "log"] as const) {
       expect(adminConfigSection(data, key).rows.some((row) => row.kind === "real")).toBe(true);
@@ -193,7 +242,13 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
     expect(mailer.rows.some((row) => row.value.includes('dummy (MAIL_PROVIDER="dummy") — render+log, upstream\'s dummy protocol; any non-"resend" value rides dummy'))).toBe(true);
     expect(mailer.rows.some((row) => row.value.includes('empty (MAIL_FROM="") — an armed mailer with no parseable From skips the send and logs'))).toBe(true);
     expect(mailer.rows.some((row) => row.value.includes('empty (MAIL_SUBJECT_PREFIX="") — subjects render unprefixed'))).toBe(true);
-    expect(html).toContain("SPEC-0018 §1: arming is a var edit + redeploy, never a runtime toggle");
+    // The DISARMED rider's posture note (the armed form replaces it — the
+    // rider describe). Apostrophe-bearing fragments assert separately (JSX
+    // escapes &#39; in text).
+    expect(html).toContain("form not rendered — upstream renders the test-mail form inside this section only while the mailer is enabled");
+    expect(html).toContain("the POST rider itself still answers upstream");
+    expect(html).toContain("silent success (config.go:29-41 over mail.go:44-46");
+    expect(html).toContain("MailService==nil nil return), so a disarmed deployment flashes success without sending");
     // The service posture row no longer claims "no mailer / no external
     // login chain" — both landed; the remaining absences are named.
     expect(html).toContain("no email-confirmation flow and no captcha");
@@ -315,6 +370,39 @@ describe("the env-var matrix (wrangler vars at request time, §5.9)", () => {
   });
 });
 
+// --- the SendTestMail rider (the census B-69 arm: config.tmpl:220-228's form
+// over config.go:29-41's handler — the flash IS the outcome surface) -------
+
+describe("the SendTestMail rider (the census B-69 arm)", () => {
+  it("the flash texts are upstream's locale strings verbatim (config.go:34/:36 over locale_en-US.json)", () => {
+    expect(adminConfigTestMailSentText("root@test.local")).toBe('A testing email has been sent to "root@test.local".');
+    expect(adminConfigTestMailFailedText("root@test.local", "no FROM specified")).toBe(
+      'Failed to send a testing email to "root@test.local": no FROM specified',
+    );
+    expect(adminConfigTestMailLocale.rowLabel).toBe("Send Testing Email"); // "admin.config.send_test_mail"
+    expect(adminConfigTestMailLocale.submit).toBe("Send"); // "admin.config.send_test_mail_submit"
+    expect(adminConfigTestMailLocale.placeholder).toBe("Email Address (e.g. test@example.com)"); // "admin.config.test_email_placeholder"
+  });
+
+  it("the flash banner rides the re-render convention: null (the GET) renders none, the arms render the ui message classes", async () => {
+    const data = await load();
+    expect(renderAdminConfigPage(ctx, data)).not.toContain("ui positive message");
+    expect(renderAdminConfigPage(ctx, data)).not.toContain("ui negative message");
+    expect(renderAdminConfigPage(ctx, data, { kind: "positive", text: 'A testing email has been sent to "root@test.local".' })).toContain(
+      '<div class="ui positive message">A testing email has been sent to &quot;root@test.local&quot;.</div>',
+    );
+    expect(renderAdminConfigPage(ctx, data, { kind: "negative", text: "Failed to send a testing email to \"root@test.local\": no FROM specified" })).toContain(
+      '<div class="ui negative message">Failed to send a testing email to &quot;root@test.local&quot;: no FROM specified</div>',
+    );
+  });
+
+  it("the bare AdminConfigPage component carries the optional flash prop too (the render seam's shape)", async () => {
+    const html = renderToString(<AdminConfigPage ctx={ctx} data={await load()} flash={null} />);
+    expect(html).toContain('class="page-content admin config"');
+    expect(html).not.toContain("ui positive message");
+  });
+});
+
 // --- the secret hygiene (§3.2 rule 3 — SECRET rows never exist) ------------------
 
 describe("the secret hygiene rule (wrangler secret values are never read)", () => {
@@ -375,6 +463,7 @@ describe("the mounted /-/admin/config route arm (SPEC-0018 §3.2)", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM users").run();
     await env.DB.prepare("DELETE FROM sessions").run();
+    await env.DB.prepare("DELETE FROM email_outbox").run();
     await env.DB
       .prepare(
         "INSERT INTO users (id, username, username_lower, display_name, is_admin, created_at) VALUES " +
@@ -436,5 +525,207 @@ describe("the mounted /-/admin/config route arm (SPEC-0018 §3.2)", () => {
     // GET-only listing pages' posture: never a 200 render of this page.
     expect(res.status).not.toBe(200);
     expect(await res.text()).not.toContain('class="page-content admin config"');
+  });
+});
+
+// --- the mounted B-69 POST arm (web.go:792 — the /-/admin/config group's
+// test_mail rider, driven through uiRouter.fetch) --------------------------
+//
+// Every POST pin drives an env with EXPLICIT MAIL_* overrides (the vitest
+// plugin injects the operator-local wrangler VARS into `env`, so the
+// determinism here is asserted, not assumed). All arms run transport-free:
+// the dummy provider logs and succeeds, the provider-less resend arm throws
+// before any fetch — no network, ever.
+
+describe("the mounted POST /-/admin/config/test_mail (the census B-69 arm)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM users").run();
+    await env.DB.prepare("DELETE FROM sessions").run();
+    await env.DB.prepare("DELETE FROM email_outbox").run();
+    await env.DB
+      .prepare(
+        "INSERT INTO users (id, username, username_lower, display_name, is_admin, created_at) VALUES " +
+          "(1, 'admin', 'admin', 'Site Admin', 1, unixepoch()), " +
+          "(2, 'member', 'member', 'Plain Member', 0, unixepoch())",
+      )
+      .run();
+  });
+
+  /** The MAIL_* override slice the POST pins flip. The generated Env pins
+   *  the deployed var literals ("dummy" etc.), so the overrides ride the
+   *  widened-view property write the demo-armed tests use
+   *  (admin-monitor.test.tsx's hermetic posture): assign onto a FRESH env
+   *  copy through the plain-string view — never mutating the shared env. */
+  type MailOverrides = {
+    MAIL_ENABLED?: string;
+    MAIL_FROM?: string;
+    MAIL_PROVIDER?: string;
+    MAIL_PROVIDER_API_KEY?: string;
+    MAIL_SUBJECT_PREFIX?: string;
+    MAIL_API_BASE?: string;
+  };
+
+  /** The POST pins' env: armed, dummy provider, parseable From — deterministic
+   *  against the operator-local config posture (`.dev.vars`/wrangler.jsonc
+   *  inject into `env`); the caller's overrides land last. */
+  function mailTestEnv(overrides: MailOverrides = {}): ConfigUiTestEnv {
+    const envCopy: ConfigUiTestEnv = { ...configUiEnv };
+    const writable = envCopy as MailOverrides;
+    writable.MAIL_ENABLED = "true";
+    writable.MAIL_FROM = "no-reply@test.local";
+    writable.MAIL_PROVIDER = "dummy";
+    writable.MAIL_PROVIDER_API_KEY = "";
+    writable.MAIL_SUBJECT_PREFIX = "";
+    writable.MAIL_API_BASE = "";
+    for (const key of Object.keys(overrides) as Array<keyof MailOverrides>) {
+      const value = overrides[key];
+      if (value !== undefined) writable[key] = value;
+    }
+    return envCopy;
+  }
+
+  /** POST the rider as the given principal, with explicit deterministic MAIL
+   *  vars (defaults: armed, dummy provider, parseable From). */
+  async function postTestMail(
+    cookie: string | null,
+    body: string,
+    mail: MailOverrides = {},
+    url = `${ORIGIN}/-/admin/config/test_mail`,
+  ): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ORIGIN,
+          ...(cookie === null ? {} : { cookie: `${SESSION_COOKIE_NAME}=${cookie}` }),
+        },
+        body,
+      }),
+      mailTestEnv(mail),
+    );
+  }
+
+  async function outboxCount(): Promise<number> {
+    const rows = await drizzle(env.DB).select({ id: emailOutbox.id }).from(emailOutbox).all();
+    return rows.length;
+  }
+
+  it("303s the anonymous POST onto the login round-trip (the prologue precedes any send)", async () => {
+    const res = await postTestMail(null, "email=root@test.local", { MAIL_ENABLED: "false" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/-/admin/config/test_mail")}`);
+    expect(await outboxCount()).toBe(0);
+  });
+
+  it("404-shells the signed-in non-admin (AdminRequired before the send)", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 2), "email=root@test.local");
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain('class="page-content admin config"');
+    expect(await outboxCount()).toBe(0);
+  });
+
+  it("403s the cross-origin POST (the §2.8 sameOriginGuard rides first)", async () => {
+    const cookie = await mintSession(env.DB, 1);
+    const res = await uiRouter.fetch(
+      new Request(`${ORIGIN}/-/admin/config/test_mail`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://evil.example",
+          cookie: `${SESSION_COOKIE_NAME}=${cookie}`,
+        },
+        body: "email=root@test.local",
+      }),
+      configUiEnv,
+    );
+    expect(res.status).toBe(403);
+    expect(await outboxCount()).toBe(0);
+  });
+
+  it("GET answers chi's 405 (the admin-emails GET-twin convention)", async () => {
+    const res = await uiRouter.fetch(
+      new Request(`${ORIGIN}/-/admin/config/test_mail`, {
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, 1)}` },
+      }),
+      configUiEnv,
+    );
+    expect(res.status).toBe(405);
+  });
+
+  it("DISARMED deployment: the POST answers upstream's SILENT SUCCESS — the positive flash fires verbatim with no mail sent", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "email=root@test.local", { MAIL_ENABLED: "false" });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // mail.go:44-46's MailService == nil → return nil → config.go:36's
+    // Flash.Info — the success text fires even though nothing was sent and
+    // the form itself is unrendered (config.tmpl:192's wrap: the re-rendered
+    // page shows the posture note, no form).
+    expect(html).toContain('<div class="ui positive message">A testing email has been sent to &quot;root@test.local&quot;.</div>');
+    expect(html).toContain("form not rendered — upstream renders the test-mail form");
+    expect(html).not.toContain('action="/-/admin/config/test_mail"');
+    expect(await outboxCount()).toBe(0);
+  });
+
+  it("armed + dummy transport: the sent flash fires and the email_outbox ledger stays EMPTY (the direct-send bypass)", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "email=root@test.local");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="ui positive message">A testing email has been sent to &quot;root@test.local&quot;.</div>');
+    // The fresh re-render is the armed posture: the form renders (the next
+    // send is one click away) and no outbox row exists (upstream's own
+    // bypass — mail.go:45 outside the mail queue; nothing records it).
+    expect(html).toContain('action="/-/admin/config/test_mail"');
+    expect(await outboxCount()).toBe(0);
+  });
+
+  it("armed + unparseable MAIL_FROM: the failure flash embeds sender.go:27's verbatim \"no FROM specified\"", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "email=root@test.local", { MAIL_FROM: "" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      '<div class="ui negative message">Failed to send a testing email to &quot;root@test.local&quot;: no FROM specified</div>',
+    );
+  });
+
+  it("armed + a junk recipient: the failure flash embeds go-mail's verbatim \"no recipient addresses set\" (ErrNoRcptAddresses)", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "email=junk");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      '<div class="ui negative message">Failed to send a testing email to &quot;junk&quot;: no recipient addresses set</div>',
+    );
+  });
+
+  it("the absent email field rides the same failed arm (FormString's \"\" → the recipient parse miss)", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      '<div class="ui negative message">Failed to send a testing email to &quot;&quot;: no recipient addresses set</div>',
+    );
+  });
+
+  it("the body-then-query merge: a query-carried email serves when the body omits the field (FormString's order, body wins)", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "", {}, `${ORIGIN}/-/admin/config/test_mail?email=alt@test.local`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('<div class="ui positive message">A testing email has been sent to &quot;alt@test.local&quot;.</div>');
+    // And the body field beats the query when both exist:
+    const both = await postTestMail(
+      await mintSession(env.DB, 1),
+      "email=body@test.local",
+      {},
+      `${ORIGIN}/-/admin/config/test_mail?email=query@test.local`,
+    );
+    expect(await both.text()).toContain('<div class="ui positive message">A testing email has been sent to &quot;body@test.local&quot;.</div>');
+  });
+
+  it("armed + the provider-less resend arm: the failure flash embeds the transport's config error (no network, no send)", async () => {
+    const res = await postTestMail(await mintSession(env.DB, 1), "email=root@test.local", {
+      MAIL_PROVIDER: "resend",
+      MAIL_PROVIDER_API_KEY: "",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      '<div class="ui negative message">Failed to send a testing email to &quot;root@test.local&quot;: resend: MAIL_PROVIDER_API_KEY is not set (wrangler secret put MAIL_PROVIDER_API_KEY)</div>',
+    );
+    expect(await outboxCount()).toBe(0);
   });
 });
