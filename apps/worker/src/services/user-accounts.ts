@@ -66,7 +66,7 @@
  * old "users table empty" gate.
  */
 
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -77,6 +77,7 @@ import {
   notificationStates,
   oauth2Applications,
   orgMembers,
+  packageVersions,
   packages,
   reactions,
   repoCollaborators,
@@ -774,4 +775,122 @@ export async function applyPasswordReset(
   });
 
   return { outcome: "changed", user: row };
+}
+
+// ---------------------------------------------------------------------------
+// The maintenance sweep — delete_inactive_accounts (census B-68, 2026-11-13)
+//
+// The port of upstream's `delete_inactive_accounts` cron task — the dashboard
+// op and scheduled task the pin registers at services/cron/tasks_extended.go:
+// 26-36 (`RegisterTaskFatal("delete_inactive_accounts", …)` over
+// `user_service.DeleteInactiveUsers(ctx, config.OlderThan)`). It is the ONE
+// member of DashboardPost's fixed maintenance list
+// (templates/admin/dashboard.tmpl's 13 rows) with a real cf-gitea substrate;
+// the other twelve members' derivations (platform-forced / platform-rooted,
+// each with its cite) live in the census row and the dashboard module header.
+// ---------------------------------------------------------------------------
+
+/**
+ * The task's `OlderThan` window: upstream builds it from the service config —
+ * `time.Minute * time.Duration(setting.Service.ActiveCodeLives)`
+ * (tasks_extended.go:30) over the setting default `MustInt(180)`
+ * (modules/setting/service.go:146) — and this tree has no runtime app.ini, so
+ * the DEFAULT stands: 180 minutes, the activation-link lifetime the window
+ * mirrors (an account older than the link expiry and still unactivated is
+ * sweep-eligible; a fresher registration never is).
+ */
+export const INACTIVE_ACCOUNT_OLDER_THAN_MS = 180 * 60 * 1000;
+
+/**
+ * The B-68 sweep — upstream `DeleteInactiveUsers(ctx, olderThan)`
+ * (services/user/user.go:311-334) over `GetInactiveUsers(ctx, olderThan)`
+ * (models/user/user.go:1009-1030), adapted to the landed users store:
+ *
+ *   - Upstream's candidate predicate is `is_active = false` AND type ∈
+ *     {individual, user_reserved}, plus `created_unix < now - olderThan`
+ *     (the window is always > 0 through the task config). Our store carries
+ *     NO `is_active` column — the landed carrier of upstream's inactive
+ *     writes is `status = 'prohibited'` (the admin edit route folds BOTH
+ *     `active: false` and `prohibit_login: true` onto it, api/routes/
+ *     admin-t2.ts's adminEditUser mapping; every HUMAN creation path lands
+ *     'active', services/user-accounts.ts's creation arms), and the reserved
+ *     variants have no cf-gitea enum value yet (schema note) — so the
+ *     predicate is `type = 'user' AND status = 'prohibited' AND created <
+ *     cutoff`.
+ *   - The migration-seeded SYSTEM service principals (`assets` 0003,
+ *     `gitea:deploy-key` 0020) are prohibited-no-email rows upstream has no
+ *     analogue for — excluded by `NON_SYSTEM_USER_ROW` VERBATIM (the exact
+ *     recorded system-row negation; a human prohibited row always keeps its
+ *     creation email, so the exclusion never hides a candidate).
+ *   - Per candidate, upstream calls `DeleteUser(ctx, u, false)` — the
+ *     NON-purge ladder — and its in-transaction count guards surface as
+ *     skip-not-fail: `IsErrUserOwnRepos` / `IsErrUserHasOrgs` /
+ *     `IsErrUserOwnPackages` are caught by DeleteInactiveUsers with a
+ *     log.Warn + continue (user.go:322-327). Ported as the same three counts
+ *     the admin delete route checks (owned repositories, org memberships,
+ *     non-internal package versions — admin-t2.ts's guard block, the
+ *     user.go:234-255 mapping), each > 0 → SKIP; any OTHER error propagates
+ *     and aborts the sweep exactly like upstream's `return err`.
+ *   - The deletions ride `deleteUserCascade(env, id)` (non-purge) — the
+ *     landed `DeleteUser` ladder above — NOT a bare row delete, so the
+ *     census batch, the branch-protection scrub and the redirect handling
+ *     all hold. Candidates are non-owners by construction, so the purge
+ *     arms never engage.
+ *
+ * Returns the number of users deleted (the sweep's observable for pins;
+ * upstream returns only error/nil). Upstream runs the task fire-and-forget
+ * (admin.go:181-186's `go task.RunWithUser`), so its HTTP flash is
+ * "Started Task" regardless of the body's outcome and a failure surfaces in
+ * the server log only — the dashboard caller mirrors that with
+ * catch-and-console.error, never a failure flash.
+ */
+export async function deleteInactiveAccounts(
+  env: DeleteUserEnv,
+  options: { now?: Date } = {},
+): Promise<number> {
+  const cutoff = new Date((options.now ?? new Date()).getTime() - INACTIVE_ACCOUNT_OLDER_THAN_MS);
+  const candidates = await drizzle(env.DB)
+    .select({ id: users.id, username: users.username })
+    .from(users)
+    .where(
+      and(
+        eq(users.type, "user"),
+        eq(users.status, "prohibited"),
+        lt(users.createdAt, cutoff),
+        NON_SYSTEM_USER_ROW,
+      ),
+    )
+    .orderBy(asc(users.id))
+    .all();
+
+  const db = drizzle(env.DB);
+  let deleted = 0;
+  for (const candidate of candidates) {
+    // The three skip guards (user.go:234-255's counts → user.go:322-327's
+    // continue arms): owned repos, org memberships, non-internal package
+    // versions — the exact shapes the admin delete route checks.
+    const repoCount = await db
+      .select({ total: sql<number>`count(*)` })
+      .from(repositories)
+      .where(eq(repositories.ownerId, candidate.id))
+      .get();
+    if ((repoCount?.total ?? 0) > 0) continue;
+    const membershipCount = await db
+      .select({ total: sql<number>`count(*)` })
+      .from(orgMembers)
+      .where(eq(orgMembers.userId, candidate.id))
+      .get();
+    if ((membershipCount?.total ?? 0) > 0) continue;
+    const packageCount = await db
+      .select({ total: sql<number>`count(*)` })
+      .from(packageVersions)
+      .innerJoin(packages, eq(packages.id, packageVersions.packageId))
+      .where(and(eq(packages.ownerId, candidate.id), eq(packageVersions.isInternal, false)))
+      .get();
+    if ((packageCount?.total ?? 0) > 0) continue;
+
+    await deleteUserCascade(env, candidate.id);
+    deleted += 1;
+  }
+  return deleted;
 }

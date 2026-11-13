@@ -39,21 +39,42 @@
  *      comparison; rendering the table header would fabricate the check).
  *   2. Maintenance Operations (dashboard.tmpl:8-72) — upstream's fixed
  *      op-button list (delete_inactive_accounts … sync_repo_tags, each a
- *      cron-registry task or a sync-queue producer, admin.go:161-191) has an
- *      EMPTY intersection with the landed cron registry: `update_mirrors`
- *      alone (routes/admin-degenerate.ts:135-141, the mirror of wrangler
- *      jsonc `triggers.crons`; "run = enqueue"). The landed op is the table's
- *      LIVE row — a real Run button POSTing `op=update_mirrors` to
- *      `/-/admin`, upstream's exact form target (dashboard.tmpl:12) — driven
- *      through the landed producer `enqueueDueMirrorSyncs`, the same body the
- *      API's `POST /admin/cron/{task}` serves. Upstream's fixed list renders
- *      as the posture line under the table, NEVER as rows or buttons (no
- *      cron daemon beyond the wrangler trigger, no SSH host for the resync
- *      pair — dashboard.tmpl:31-40's own conditional arm — no filesystem
- *      health checker, no branches/tags sync queues). Documented divergence:
- *      the table carries the landed registry instead of the fixed list; a
- *      future wrangler cron joins the registry in the same change and this
- *      table grows its row automatically (the loader is the monitor module's).
+ *      cron-registry task or a sync-queue producer, admin.go:161-191). The
+ *      B-68 census split landed the list's PORTABLE members and classified
+ *      the rest; the table now carries, in order:
+ *        a. `delete_inactive_accounts` (dashboard.tmpl:14-17) — the ONE
+ *           fixed-list member with a real cf-gitea substrate: the landed
+ *           sweep (services/user-accounts.ts `deleteInactiveAccounts`, the
+ *           upstream task body's port — DeleteInactiveUsers over
+ *           GetInactiveUsers, adapted to status='prohibited' + the
+ *           system-principal exclusion + the three ownership-skip guards).
+ *           A real Run button POSTing `op=delete_inactive_accounts` to
+ *           `/-/admin`, upstream's exact form target (dashboard.tmpl:12).
+ *        b. The landed cron registry's RUNNABLE rows (`update_mirrors` et
+ *           al. — the disclosed substitution: a future wrangler cron joins
+ *           the registry in the same change and this table grows its row
+ *           automatically; the loader is the monitor module's). Their POSTs
+ *           dispatch through the monitor module's own
+ *           `applyAdminMonitorCronForm` composed verbatim — run body + the
+ *           recorded cron_state tick — so EVERY rendered button really
+ *           executes (this closed the dead-control gap where five of the
+ *           six rendered registry buttons answered task.unknown).
+ *        c. The SSH resync pair (dashboard.tmpl:31-40) behind upstream's OWN
+ *           conditional (`{{if and (not .SSH.Disabled)
+ *           (not .SSH.StartBuiltinServer)}}`): workerd has no SSH daemon
+ *           and no authorized_keys files — the platform-forced pair renders
+ *           NOTHING, exactly like upstream's disabled-SSH posture; the
+ *           conditional is encoded live (the flags above the render).
+ *      The REMAINING ten members stand platform-forced / platform-rooted
+ *      and render as the posture line under the table, NEVER as rows or
+ *      buttons, each with its reason in the note text (no stored archives —
+ *      streamed; no missing-git-dir state — cells materialize on access;
+ *      no git binary for gc/fsck — the engine GC self-drives on alarms; no
+ *      delegate hook files — the gate is in-process and the R2 githooks are
+ *      user content; no LDAP-family sources for the external-user sync; no
+ *      generated repo avatars — no generator exists; no branches/tags sync
+ *      queues). Unknown or bodyless ops POSTed to /-/admin answer the
+ *      task.unknown flash (upstream's cron.GetTask miss, admin.go:186-191).
  *   3. System Status (dashboard.tmpl:74-80 over admin/system_status.tmpl) —
  *      NO SOURCE: the dl is Go runtime introspection
  *      (`updateSystemStatus`, admin.go:71-125 — runtime.MemStats, heap/stack
@@ -79,9 +100,11 @@
  * RUNNABLE subset of it: these rows carry run buttons, and only the arms
  * with a landed run body may render one (the dead-control rule; the monitor
  * cron page renders the FULL census, buttons only where runnable). The run
- * arm is the landed producer `enqueueDueMirrorSyncs`
- * (services/mirror/sync.ts) directly — the API's own POST arm body
- * (admin-degenerate.ts:351), never a fetch to our own /api/v1.
+ * arm composes the monitor module's `applyAdminMonitorCronForm` — each
+ * body the API's own POST arm serves (admin-degenerate.ts's CRON_RUN_BODIES
+ * mirror), never a fetch to our own /api/v1 — plus, ahead of it, the B-68
+ * fixed-list member's own sweep (services/user-accounts.ts
+ * `deleteInactiveAccounts`; the dispatch order above).
  *
  * ## DOM contract (templates/admin/{layout_head,navbar,dashboard}.tmpl at the pin)
  *
@@ -132,11 +155,15 @@
 
 import type { Child } from "hono/jsx";
 
-import { enqueueDueMirrorSyncs } from "../../services/mirror/sync";
+import { deleteInactiveAccounts } from "../../services/user-accounts";
 import type { UiContext } from "../ui-context";
 import { BaseLayout, renderPage } from "../shell";
 import { AdminFamilyNav } from "./admin-users";
-import { loadAdminMonitorCron, type AdminMonitorCronEntry } from "./admin-monitor";
+import {
+  applyAdminMonitorCronForm,
+  loadAdminMonitorCron,
+  type AdminMonitorCronEntry,
+} from "./admin-monitor";
 
 // ---------------------------------------------------------------------------
 // Page chrome + copy text (component-local, the adminMonitorLocale pattern —
@@ -160,17 +187,44 @@ export const adminDashboardLocale = {
   systemStatus: "System Status", // "admin.dashboard.system_status" (dashboard.tmpl:75)
   operationRun: "Run", // "admin.dashboard.operation_run" (the run button label)
   taskUpdateMirrors: "Update Mirrors", // "admin.dashboard.update_mirrors" (the row name)
+  // The B-68 PORTABLE member of the fixed list — its dashboard.tmpl:14-17 row
+  // label (locale_en-US.json "admin.dashboard.delete_inactive_accounts").
+  taskDeleteInactiveAccounts: "Delete all unactivated accounts",
   // The run POST's flash texts (admin.go:188-190 DashboardPost — "%s" is the
-  // task's locale name / the raw op).
+  // task's locale name / the raw op). The registry arms' flashes ride the
+  // monitor module's composed dispatch (identical upstream strings).
   taskStarted: "Started Task: %s", // "admin.dashboard.task.started"
   taskUnknown: "Unknown task: %s", // "admin.dashboard.task.unknown"
-  // cf-gitea additions — the honest-absence answers (the module header's
-  // cards 2 and 3).
+  // cf-gitea additions — the honest-absence answers. maintenancePosture names
+  // ONLY the STANDING members of the fixed list (the B-68 split — the SSH
+  // pair is upstream's own conditional-hide, not a posture member; the
+  // portable member is a real row): each with its one-line reason class.
   maintenancePosture:
-    "Upstream's fixed maintenance list (delete_inactive_accounts, delete_repo_archives, delete_missing_repos, git_gc_repos, resync_all_sshkeys, resync_all_sshprincipals, resync_all_hooks, reinit_missing_repos, sync_external_users, repo_health_check, delete_generated_repository_avatars, sync_repo_branches, sync_repo_tags) has no cf-gitea substrate — no cron daemon beyond the wrangler trigger, no SSH host, no filesystem health checker, no branches/tags sync queues — so those operations render here as this note, never as buttons.",
+    "The remaining fixed maintenance operations have no cf-gitea substrate and render here as this note, never as buttons: delete_repo_archives (archives stream, nothing is stored), delete_missing_repos and reinit_missing_repos (a repository's git store materializes on access — a record missing its git files cannot exist), git_gc_repos (no git binary — the engine's storage garbage collection self-drives on per-repository alarms), resync_all_hooks (push processing is the in-process gate — no hook files execute and the stored hook objects are user content, not the delegate scripts upstream restores), sync_external_users (only OAuth2 login sources exist — upstream's sync walks the LDAP-family sources alone), repo_health_check (no git fsck), delete_generated_repository_avatars (no repository-avatar generator exists), sync_repo_branches and sync_repo_tags (no branches/tags sync queues).",
   systemStatusPosture:
     "System status is not available: the Workers runtime exposes no Go runtime statistics (no goroutine count, no memory/heap/GC counters, no process uptime), so upstream's system status table has no cf-gitea source.",
 } as const;
+
+// ---------------------------------------------------------------------------
+// The SSH posture (dashboard.tmpl:31's conditional —
+// `{{if and (not .SSH.Disabled) (not .SSH.StartBuiltinServer)}}` around the
+// resync_all_sshkeys / resync_all_sshprincipals rows). The B-68 rule for the
+// platform-forced members: mirror upstream's OWN render-or-hide conditions.
+// workerd exposes no SSH daemon and no authorized_keys files (the config
+// page's recorded posture — "no SSH server — git smart-HTTP over HTTPS
+// only"), which is exactly upstream's SSH.Disabled=true posture, so the
+// pair's conditional evaluates FALSE and the rows never render — the same
+// DOM a disabled-SSH upstream deployment produces. Typed `boolean` so the
+// gate stays a live conditional (upstream's template arm), not a fold.
+// ---------------------------------------------------------------------------
+
+/** setting.SSH.Disabled — true: no SSH server exists on Workers. */
+const SSH_DISABLED: boolean = true;
+/** setting.SSH.StartBuiltinServer — no builtin server either. */
+const SSH_START_BUILTIN_SERVER: boolean = false;
+/** The template gate's evaluation: the resync pair renders only when BOTH
+ *  flags are false — never on this platform. */
+const SSH_RESYNC_ROWS_RENDER = !SSH_DISABLED && !SSH_START_BUILTIN_SERVER;
 
 // ---------------------------------------------------------------------------
 // The page data (§3.2 — the landed cron registry via the monitor module's
@@ -223,25 +277,51 @@ function taskDisplayName(name: string): string {
 }
 
 /**
- * The run (DashboardPost's default arm, admin.go:186-191): the known task
- * executes the EXACT body the landed `POST /admin/cron/{task}` serves —
- * `enqueueDueMirrorSyncs` ("run = enqueue", the admin-degenerate posture) —
- * and answers the task.started flash; an unknown task (including upstream's
- * two queue ops sync_repo_branches/sync_repo_tags, admin.go:161-175, whose
- * producers have no cf-gitea queue) answers task.unknown WITHOUT running
- * anything. A failed binding (`op` absent) funnels to the unknown arm
- * (the binding-failure convention).
+ * The run (DashboardPost's dispatch, admin.go:155-194 — the B-68 landing):
+ *   - the fixed list's PORTABLE member `delete_inactive_accounts` runs the
+ *     landed sweep (services/user-accounts.ts deleteInactiveAccounts — the
+ *     upstream task body's port). Upstream fires the task fire-and-forget
+ *     (`go task.RunWithUser`, admin.go:181-186) and answers the task.started
+ *     flash regardless of the body's outcome — a failure surfaces in the
+ *     server log only — so the awaited sweep is caught-and-logged, never a
+ *     failure flash.
+ *   - every other known task executes through the monitor module's registry
+ *     dispatch (`applyAdminMonitorCronForm` composed verbatim): the exact
+ *     body the landed `POST /admin/cron/{task}` serves for each runnable
+ *     arm ("run = enqueue", the admin-degenerate posture) plus the
+ *     cron_state tick a manual run records (upstream's ExecTimes counts
+ *     run STARTS on the shared RunWithUser path — the dashboard trigger
+ *     included, tasks.go:95-97). This closes the dead-control gap where the
+ *     rendered registry rows' POSTs answered task.unknown — every rendered
+ *     button now really executes (ADR-0008's accepted-input rule).
+ *   - an unknown task (including upstream's two queue ops
+ *     sync_repo_branches/sync_repo_tags, admin.go:161-175, whose producers
+ *     have no cf-gitea queue, and the platform-forced fixed-list members —
+ *     no run body exists to answer them) answers task.unknown WITHOUT
+ *     running anything. A failed binding (`op` absent) funnels to the
+ *     unknown arm (the binding-failure convention).
  */
 export async function applyAdminDashboardForm(
   env: Env,
   form: AdminDashboardForm,
   options: { now?: Date } = {},
 ): Promise<AdminDashboardResult> {
-  if (form.op === null || form.op !== "update_mirrors") {
-    return { outcome: "invalid", message: adminDashboardLocale.taskUnknown.replace("%s", form.op ?? "") };
+  if (form.op === "delete_inactive_accounts") {
+    await deleteInactiveAccounts(env, { now: options.now }).catch((error: unknown) => {
+      // Upstream's log.Error arm (admin.go:184-185 — the goroutine logs,
+      // the flash is already out): the sweep is best-effort, the POST
+      // answer stays task.started.
+      console.error("[admin-dashboard] delete_inactive_accounts:", error);
+    });
+    return {
+      outcome: "applied",
+      message: adminDashboardLocale.taskStarted.replace("%s", adminDashboardLocale.taskDeleteInactiveAccounts),
+    };
   }
-  await enqueueDueMirrorSyncs(env, { now: options.now });
-  return { outcome: "applied", message: adminDashboardLocale.taskStarted.replace("%s", taskDisplayName(form.op)) };
+  // The landed registry arms (the six runnable census rows) — the monitor
+  // module's dispatch composed verbatim; its flash texts are upstream's
+  // identical task.started/task.unknown strings.
+  return applyAdminMonitorCronForm(env, { op: form.op, from: "" }, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +385,17 @@ export function AdminDashboardPage(props: {
           {props.flash !== null ? <div class={`ui ${props.flash.kind} message`}>{props.flash.text}</div> : null}
           <table class="ui very basic table tw-mt-0 tw-px-4">
             <tbody>
+              {/* dashboard.tmpl:14-17 — the fixed list's FIRST row, the B-68
+                  PORTABLE member: a real Run button (the DOM upstream renders;
+                  the POST runs the landed sweep, applyAdminDashboardForm). */}
+              <tr>
+                <td>{adminDashboardLocale.taskDeleteInactiveAccounts}</td>
+                <td class="tw-text-right">
+                  <button type="submit" class="ui primary button" name="op" value="delete_inactive_accounts">
+                    {adminDashboardLocale.operationRun}
+                  </button>
+                </td>
+              </tr>
               {props.data.maintenance.map((entry) => (
                 <tr>
                   <td>{taskDisplayName(entry.name)}</td>
@@ -320,12 +411,38 @@ export function AdminDashboardPage(props: {
                   </td>
                 </tr>
               ))}
+              {/* dashboard.tmpl:31-40 — the SSH resync pair behind
+                  upstream's OWN conditional. The gate is FALSE on this
+                  platform (no SSH daemon — the flags above), so the rows
+                  never render: the same hide a disabled-SSH upstream
+                  deployment produces, not a posture note. */}
+              {SSH_RESYNC_ROWS_RENDER ? (
+                <tr>
+                  <td>{"Update the '.ssh/authorized_keys' file with Gitea SSH keys"}</td>
+                  <td class="tw-text-right">
+                    <button type="submit" class="ui primary button" name="op" value="resync_all_sshkeys">
+                      {adminDashboardLocale.operationRun}
+                    </button>
+                  </td>
+                </tr>
+              ) : null}
+              {SSH_RESYNC_ROWS_RENDER ? (
+                <tr>
+                  <td>{"Update the '.ssh/authorized_principals' file with Gitea SSH principals"}</td>
+                  <td class="tw-text-right">
+                    <button type="submit" class="ui primary button" name="op" value="resync_all_sshprincipals">
+                      {adminDashboardLocale.operationRun}
+                    </button>
+                  </td>
+                </tr>
+              ) : null}
             </tbody>
           </table>
         </form>
-        {/* The fixed-list posture (dashboard.tmpl:15-68's twelve-plus rows
-            have no cf-gitea substrate — the module header, card 2). A muted
-            paragraph, never buttons. */}
+        {/* The fixed-list posture (dashboard.tmpl:19-68's remaining rows have
+            no cf-gitea substrate — the B-68 split; the portable member is a
+            real row above and the SSH pair rides upstream's conditional-hide).
+            A muted paragraph, never buttons. */}
         <p class="tw-text-placeholder-text">{adminDashboardLocale.maintenancePosture}</p>
       </div>
 

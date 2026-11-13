@@ -1,18 +1,25 @@
 /**
  * The ADMIN DASHBOARD's tests (the admin-monitor.test.tsx harness): the loader
- * over the landed cron registry, the parse/apply matrix (the run arm drives
- * the landed `enqueueDueMirrorSyncs` producer against a recording queue — the
- * sync.test.ts stub), and the DOM contract of the page render — hono/jsx
- * renderToString.
+ * over the landed cron registry, the parse/apply matrix (the run arms drive
+ * the landed producers against a recording queue — the sync.test.ts stub —
+ * and the B-68 portable op drives the landed inactive-accounts sweep), and
+ * the DOM contract of the page render — hono/jsx renderToString.
  *
  * The deferred matrix (the polish wave, after the window-2c mount e31c0cf):
  * the MOUNTED route arms driven through `uiRouter.fetch()` with a minted
  * session (GET /-/admin, POST /-/admin) — the anonymous 303 onto the login
- * round-trip, the signed-in non-admin's 404 shell, the admin GET's one live
- * maintenance row with upstream's 13 fixed ops as posture TEXT (no dead
- * buttons), the known-op POST's 200 re-render with the positive flash, the
- * unknown-op POST's negative task-unknown flash, and the cross-origin POST's
- * plain 403 (upstream web.go:779's SignInRequired+AdminRequired gate).
+ * round-trip, the signed-in non-admin's 404 shell, the admin GET's live rows
+ * with the STANDING fixed ops as posture TEXT (no dead buttons), the
+ * known-op POSTs' 200 re-render with the positive flash, the unknown-op
+ * POST's negative task-unknown flash, and the cross-origin POST's plain 403
+ * (upstream web.go:779's SignInRequired+AdminRequired gate).
+ *
+ * B-68 (2026-11-13): the fixed list's PORTABLE member `delete_inactive_accounts`
+ * is a live row + POST arm over services/user-accounts.ts deleteInactiveAccounts;
+ * every rendered registry button now really runs (the composed monitor
+ * dispatch — the dead-control gap closed); the SSH resync pair renders
+ * NOTHING (upstream's own dashboard.tmpl:31 conditional at the platform's
+ * Disabled posture); the posture note narrowed to the standing ten.
  */
 
 import { env } from "cloudflare:test";
@@ -64,8 +71,10 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   // repo_mirrors: the loader/apply fixtures. users+sessions: the minted-session
-  // route arms (the session.test.ts cleanup list's auth half).
-  for (const table of ["repo_mirrors", "users", "sessions"]) {
+  // route arms (the session.test.ts cleanup list's auth half). cron_state: the
+  // composed registry dispatch records manual-run ticks (the B-68 compose).
+  // repositories: the sweep's owner-skip fixture.
+  for (const table of ["repo_mirrors", "users", "sessions", "cron_state", "repositories"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 });
@@ -180,6 +189,85 @@ describe("applyAdminDashboardForm (DashboardPost's cron arm over the landed prod
     expect(result).toEqual({ outcome: "invalid", message: "Unknown task: " });
     expect(queue.batches).toEqual([]);
   });
+
+  it("a rendered registry arm runs its REAL body through the composed monitor dispatch (the dead-control fix — demo_sweep's gate-off producer, not task.unknown)", async () => {
+    const queue = recordingQueue();
+    const result = await applyAdminDashboardForm({ ...env, MIRROR_SYNC_QUEUE: queue }, { op: "demo_sweep" }, { now: NOW });
+    // demo_sweep's body runs (the DEMO_MODE gate off → zero enqueues) and the
+    // flash is task.started with the monitor dispatch's locale name — before
+    // B-68 this POST answered task.unknown with the button rendered, a dead
+    // control.
+    expect(result).toEqual({ outcome: "applied", message: "Started Task: Demo Sweep" });
+    expect(queue.batches).toEqual([]);
+    // The composed dispatch recorded the manual-run tick (upstream's
+    // ExecTimes counts run STARTS on the shared RunWithUser path).
+    const ticks = await env.DB.prepare("SELECT arm, runs FROM cron_state WHERE arm = 'demo_sweep'").all<{ arm: string; runs: number }>();
+    expect(ticks.results).toEqual([{ arm: "demo_sweep", runs: 1 }]);
+  });
+
+  it("the SSH pair's ops answer task.unknown — platform-forced, no run body exists to answer them", async () => {
+    const result = await applyAdminDashboardForm(env, { op: "resync_all_sshkeys" }, { now: NOW });
+    expect(result).toEqual({ outcome: "invalid", message: "Unknown task: resync_all_sshkeys" });
+  });
+});
+
+// --- the B-68 portable op (delete_inactive_accounts over the landed sweep) -------
+
+describe("applyAdminDashboardForm op=delete_inactive_accounts (the B-68 sweep)", () => {
+  /** The sweep's five fixture shapes (services/user-accounts.ts
+   *  deleteInactiveAccounts' predicate + skip guards): an aged prohibited
+   *  human (the candidate), a fresh prohibited human, an aged prohibited
+   *  OWNER, an aged ACTIVE human and an aged SYSTEM-shaped row (prohibited
+   *  non-admin with no email — the NON_SYSTEM_USER_ROW exclusion). */
+  async function seedSweepUsers(): Promise<void> {
+    await env.DB
+      .prepare(
+        "INSERT INTO users (id, username, username_lower, email, status, is_admin, type, created_at) VALUES " +
+          // the candidate: prohibited, human (email set), older than the 180-minute window
+          "(101, 'stale', 'stale', 'stale@test.local', 'prohibited', 0, 'user', strftime('%s','2025-06-01')), " +
+          // fresh prohibition: younger than the 180-minute window (an hour before NOW)
+          "(102, 'fresh', 'fresh', 'fresh@test.local', 'prohibited', 0, 'user', strftime('%s','2025-12-31 23:00:00')), " +
+          // aged prohibited but OWNS a repo (the IsErrUserOwnRepos skip)
+          "(103, 'oldowner', 'oldowner', 'oldowner@test.local', 'prohibited', 0, 'user', strftime('%s','2025-06-01')), " +
+          // aged ACTIVE human (never a candidate)
+          "(104, 'ordinary', 'ordinary', 'ordinary@test.local', 'active', 0, 'user', strftime('%s','2025-06-01')), " +
+          // the system-principal shape (prohibited + non-admin + no email)
+          "(105, 'assets-twin', 'assets-twin', NULL, 'prohibited', 0, 'user', strftime('%s','2025-06-01'))",
+      )
+      .run();
+    await env.DB
+      .prepare(
+        "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, visibility) VALUES " +
+          "('swrepo', 'r_swrepo', 'oldowner', 103, 'swrepo', 'public')",
+      )
+      .run();
+  }
+
+  async function survivingIds(): Promise<number[]> {
+    const rows = await env.DB.prepare("SELECT id FROM users ORDER BY id").all<{ id: number }>();
+    return rows.results.map((row) => row.id);
+  }
+
+  it("deletes ONLY the aged prohibited non-owner human — the recent, the owner, the active and the system-shaped survive", async () => {
+    await seedSweepUsers();
+    const result = await applyAdminDashboardForm(env, { op: "delete_inactive_accounts" }, { now: NOW });
+    expect(result).toEqual({
+      outcome: "applied",
+      message: "Started Task: Delete all unactivated accounts",
+    });
+    expect(await survivingIds()).toEqual([102, 103, 104, 105]);
+    // The owner's repo row is untouched (the skip guard ran BEFORE any cascade).
+    const repos = await env.DB.prepare("SELECT id FROM repositories").all<{ id: string }>();
+    expect(repos.results.map((row) => row.id)).toEqual(["swrepo"]);
+  });
+
+  it("a second run is idempotent — the sweep's answer stays applied with nothing left to delete", async () => {
+    await seedSweepUsers();
+    await applyAdminDashboardForm(env, { op: "delete_inactive_accounts" }, { now: NOW });
+    const second = await applyAdminDashboardForm(env, { op: "delete_inactive_accounts" }, { now: NOW });
+    expect(second).toEqual({ outcome: "applied", message: "Started Task: Delete all unactivated accounts" });
+    expect(await survivingIds()).toEqual([102, 103, 104, 105]);
+  });
 });
 
 // --- the DOM --------------------------------------------------------------------
@@ -190,34 +278,49 @@ describe("the dashboard DOM (templates/admin/dashboard.tmpl at the pin)", () => 
     return renderToString(<AdminDashboardPage ctx={ctx} data={data} flash={flash} />);
   }
 
-  it("renders the pageClass discriminator, the two attached sections, and the landed run row", async () => {
+  it("renders the pageClass discriminator, the two attached sections, the B-68 portable row, and the landed run rows", async () => {
     const html = await pageHtml();
     expect(html).toContain('class="page-content admin dashboard"'); // layout_head's pageClass (§2.4.1)
     expect(html).toContain(`>${adminDashboardLocale.maintenanceOperations}</h4>`);
     expect(html).toContain(`>${adminDashboardLocale.systemStatus}</h4>`);
     expect(html).toContain('<form method="post" action="/-/admin">'); // dashboard.tmpl:12, upstream's exact target
-    expect(html).toContain("Update Mirrors"); // the row name (admin.dashboard.update_mirrors)
+    // The B-68 portable member — dashboard.tmpl:14-17's FIRST row as a live
+    // button (the label is upstream's locale string verbatim).
+    expect(html).toContain("Delete all unactivated accounts");
+    expect(html).toContain('<button type="submit" class="ui primary button" name="op" value="delete_inactive_accounts">');
+    expect(html).toContain("Update Mirrors"); // the registry row name (admin.dashboard.update_mirrors)
     expect(html).toContain('<button type="submit" class="ui primary button" name="op" value="update_mirrors">');
     expect(html).toContain(`>${adminDashboardLocale.operationRun}</button>`); // the Run label
   });
 
-  it("renders the honest posture — the fixed-list note and the system-status note, never fake data", async () => {
+  it("renders the honest posture — the narrowed standing-ops note and the system-status note, never fake data", async () => {
     const html = await pageHtml();
-    expect(html).toContain("delete_inactive_accounts"); // the fixed list, disclosed as text
+    expect(html).toContain("The remaining fixed maintenance operations"); // the B-68 narrowed note
+    expect(html).toContain("sync_repo_branches"); // the standing members, disclosed as text
     expect(html).toContain(adminDashboardLocale.systemStatusPosture.replaceAll("'", "&#39;")); // the escaped render
     expect(html).not.toContain("Goroutine"); // no fabricated runtime dl (system_status.tmpl's rows)
     expect(html).not.toContain("Heap"); // no fabricated memstats
     expect(html).not.toContain("is now available"); // the NeedUpdate hint renders nothing (card 1)
   });
 
-  it("renders no dead controls — the unlanded ops appear as text only, never as buttons", async () => {
+  it("renders no dead controls — the standing ops appear as text only, never as buttons; the SSH pair hides entirely (upstream's conditional)", async () => {
     const html = await pageHtml();
-    expect(html).not.toContain('value="delete_inactive_accounts"');
+    expect(html).toContain('value="delete_inactive_accounts"'); // the B-68 portable member IS a live button
     expect(html).not.toContain('value="delete_repo_archives"');
+    expect(html).not.toContain('value="delete_missing_repos"');
     expect(html).not.toContain('value="git_gc_repos"');
-    expect(html).not.toContain('value="resync_all_sshkeys"');
+    expect(html).not.toContain('value="reinit_missing_repos"');
+    expect(html).not.toContain('value="sync_external_users"');
+    expect(html).not.toContain('value="repo_health_check"');
+    expect(html).not.toContain('value="delete_generated_repository_avatars"');
     expect(html).not.toContain('value="sync_repo_branches"');
     expect(html).not.toContain('value="sync_repo_tags"');
+    // dashboard.tmpl:31-40's conditional at the Disabled posture — the rows
+    // AND their labels render NOTHING (no partial disclosure).
+    expect(html).not.toContain('value="resync_all_sshkeys"');
+    expect(html).not.toContain('value="resync_all_sshprincipals"');
+    expect(html).not.toContain("authorized_keys");
+    expect(html).not.toContain("authorized_principals");
   });
 
   it("renders the shared admin navbar — Maintenance open with Dashboard active, every landed family item, nothing unlanded (the F7 fold)", async () => {
@@ -275,15 +378,14 @@ const dashboardAssets: UiAssetsFetcher = {
 
 const dashboardUiEnv: DashboardUiTestEnv = { ...env, ASSETS: dashboardAssets };
 
-/** Upstream's 13 fixed maintenance ops (admin.go:161-191) — the posture
- *  paragraph's TEXT payload, NEVER a Run button (the module header, card 2). */
-const UPSTREAM_FIXED_OPS = [
-  "delete_inactive_accounts",
+/** Upstream's fixed maintenance ops (admin.go:161-191) that STAND — the
+ *  posture paragraph's TEXT payload, NEVER a Run button (the B-68 split:
+ *  delete_inactive_accounts left the set for the live row; the SSH pair is
+ *  upstream's own conditional-hide and renders nothing at all). */
+const STANDING_FIXED_OPS = [
   "delete_repo_archives",
   "delete_missing_repos",
   "git_gc_repos",
-  "resync_all_sshkeys",
-  "resync_all_sshprincipals",
   "resync_all_hooks",
   "reinit_missing_repos",
   "sync_external_users",
@@ -366,22 +468,54 @@ describe("the mounted /-/admin route arms (window-2c)", () => {
     );
   }
 
-  it("GET 200 for the site admin — the ONE live row and the 13 fixed ops as TEXT, never buttons", async () => {
+  it("GET 200 for the site admin — the live rows and the STANDING fixed ops as TEXT, never dead buttons", async () => {
     const res = await getAdminRoute(await mintSession(env.DB, 1));
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('class="page-content admin dashboard"');
     expect(html).toContain('<form method="post" action="/-/admin">');
-    // The landed registry's ONE row: the update_mirrors cell and its Run
-    // button, each rendered exactly once.
+    // The landed registry's update_mirrors row: cell and Run button, each
+    // rendered exactly once.
     expect(html.split("<td>Update Mirrors</td>").length - 1).toBe(1);
     expect(html.split('value="update_mirrors"').length - 1).toBe(1);
-    // The posture paragraph carries all 13 upstream ops as TEXT.
+    // The B-68 portable member: the live fixed row, rendered exactly once
+    // (the label is upstream's locale string).
+    expect(html.split("<td>Delete all unactivated accounts</td>").length - 1).toBe(1);
+    expect(html.split('value="delete_inactive_accounts"').length - 1).toBe(1);
+    // The posture paragraph carries the STANDING upstream ops as TEXT.
     expect(html).toContain(adminDashboardLocale.maintenancePosture.replaceAll("'", "&#39;"));
-    for (const op of UPSTREAM_FIXED_OPS) {
+    for (const op of STANDING_FIXED_OPS) {
       expect(html).toContain(op); // disclosed as text ...
       expect(html).not.toContain(`value="${op}"`); // ... never a dead button
     }
+    // The SSH pair: dashboard.tmpl:31's conditional renders NOTHING (the
+    // platform's Disabled posture) — neither buttons nor text.
+    expect(html).not.toContain("authorized_keys");
+  });
+
+  it("POST op=delete_inactive_accounts runs the landed sweep — the aged prohibited non-owner goes, the guarded and system-shaped survive", async () => {
+    await env.DB
+      .prepare(
+        "INSERT INTO users (id, username, username_lower, email, status, is_admin, type, created_at) VALUES " +
+          "(201, 'stale2', 'stale2', 'stale2@test.local', 'prohibited', 0, 'user', strftime('%s','2025-06-01')), " +
+          "(202, 'keeper', 'keeper', 'keeper@test.local', 'active', 0, 'user', strftime('%s','2025-06-01')), " +
+          "(203, 'assets-twin2', 'assets-twin2', NULL, 'prohibited', 0, 'user', strftime('%s','2025-06-01'))",
+      )
+      .run();
+    const res = await postAdminRoute({ op: "delete_inactive_accounts" }, await mintSession(env.DB, 1));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="ui positive message">Started Task: Delete all unactivated accounts</div>');
+    expect(html).toContain('<form method="post" action="/-/admin">'); // the fresh re-render
+    const ids = await env.DB.prepare("SELECT id FROM users ORDER BY id").all<{ id: number }>();
+    expect(ids.results.map((row) => row.id)).toEqual([1, 2, 202, 203]); // the session principals + the survivors
+  });
+
+  it("POST op=demo_sweep runs the registry body (the composed dispatch) — positive flash, not task.unknown", async () => {
+    const res = await postAdminRoute({ op: "demo_sweep" }, await mintSession(env.DB, 1));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="ui positive message">Started Task: Demo Sweep</div>');
   });
 
   it("GET 303s the anonymous viewer onto the login round-trip (web.go:779's SignInRequired)", async () => {
