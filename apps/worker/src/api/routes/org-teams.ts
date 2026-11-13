@@ -14,6 +14,7 @@ import {
   issues,
   orgMembers,
   repositories,
+  teamInvites,
   teamMembers,
   teamRepoAccess,
   teams,
@@ -239,6 +240,9 @@ function intPathParam(raw: string): number {
 /** `teams` row as selected (src/db/schema.ts). */
 export type TeamRecord = typeof teams.$inferSelect;
 
+/** One team email invitation (upstream `TeamInvite`, team_invite.go:55-63). */
+export type TeamInviteRecord = typeof teamInvites.$inferSelect;
+
 /** NewTeam's typed 422s (services/org/team.go:43–70) — the route maps them. */
 export class TeamNameEmptyError extends Error {
   constructor() {
@@ -263,6 +267,22 @@ export class TeamPermissionMissingError extends Error {
   }
 }
 
+/** `ErrTeamInviteAlreadyExist` (team_invite.go:13-31) — the (team_id, email)
+ *  composite UNIQUE arbiter's typed shape. */
+export class TeamInviteAlreadyExistsError extends Error {
+  constructor(teamId: number, email: string) {
+    super(`team invite already exists [team_id: ${teamId}, email: ${email}]`);
+  }
+}
+
+/** `ErrUserEmailAlreadyAdded` (team_invite.go:44-61) — the invited email
+ *  already sits on the team via an existing member's account. */
+export class UserEmailAlreadyAddedError extends Error {
+  constructor(email: string) {
+    super(`user with email already added [email: ${email}]`);
+  }
+}
+
 /** D1 unique-violation probe (the services/orgs/orgs.ts cause-walk). */
 function isUniqueViolation(error: unknown): boolean {
   let text = error instanceof Error ? error.message : String(error);
@@ -272,6 +292,26 @@ function isUniqueViolation(error: unknown): boolean {
     text += ` ${cause instanceof Error ? cause.message : String(cause)}`;
   }
   return text.includes("UNIQUE constraint failed");
+}
+
+/** The invite token — `util.CryptoRandomString(25)` (team_invite.go:96). */
+const INVITE_TOKEN_LENGTH = 25;
+
+/** `util.CryptoRandomString` (modules/util/util.go:74-77) — the ui/session
+ *  cryptoRandomId port's alphabet + rejection sampling (crypto only — the
+ *  AGENTS.md Workers ID rule keeps Math.random out). */
+function cryptoRandomString(length: number): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let out = "";
+  while (out.length < length) {
+    const buf = crypto.getRandomValues(new Uint8Array((length - out.length) * 2));
+    for (const byte of buf) {
+      if (byte >= 248) continue; // 248 = 4 × 62: uniform remapped range
+      out += alphabet[byte % alphabet.length];
+      if (out.length === length) break;
+    }
+  }
+  return out;
 }
 
 /** Upstream `ParseAccessMode` (perm/access_mode.go:46–62): unknown → 'none'. */
@@ -584,10 +624,14 @@ export class TeamsService {
    * the team row goes): the team id is stripped from every allowlist column
    * of every rule on the org's repos; running it before the batch keeps the
    * rollback shape (a failed scrub deletes nothing). Still-unmodeled upstream
-   * cleanups: `team_invite` (no table), and the review-request rows —
+   * cleanups: the review-request rows —
    * upstream deletes Review{Type: Request, ReviewerTeamID: t.ID} in its
    * DeleteBeans (team.go:218–223) while our pull_reviews.reviewerTeamId rows
-   * survive the delete (the reviews family's gap, not this module's).
+   * survive the delete (the reviews family's gap, not this module's). The
+   * `team_invite` half of DeleteBeans (team.go:218–223 — census B-77) needs
+   * no statement here: `team_invites.team_id` carries the FK ON DELETE
+   * CASCADE (schema.ts `teamInvites`), so the batch's team delete takes the
+   * invite rows with it, exactly DeleteBeans' end state.
    */
   async deleteTeam(team: TeamRecord): Promise<void> {
     const memberIds = (
@@ -810,6 +854,76 @@ export class TeamsService {
       // cleared the arm above) — the un-assign sweep.
       await this.db.delete(issueAssignees).where(and(eq(issueAssignees.assigneeId, userId), inArray(issueAssignees.issueId, repoIssueIds)));
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // The team email-invite lane (census B-77) — upstream
+  // models/organization/team_invite.go. WEB-ONLY upstream (routers/api/v1 and
+  // the swagger bundle carry no invite arm — the module-header API note), so
+  // these arms serve only the ui mounts; NO expiry exists upstream (no TTL
+  // check, no cron cleanup — invites persist until redeemed, admin-removed,
+  // or the team/org dies; see schema.ts `teamInvites`).
+  // -------------------------------------------------------------------------
+
+  /**
+   * `CreateTeamInvite` (team_invite.go:66-107): the (team_id, email)
+   * duplicate probe first (the composite UNIQUE's typed shape), then the
+   * already-member-by-email probe — INNER JOIN team_user x user on the
+   * email (team_invite.go:81-90; the org_id+team_id+email triple) — then
+   * the insert with `util.CryptoRandomString(25)`'s token (alphabet +
+   * rejection sampling per the ui/session cryptoRandomId port of
+   * modules/util/util.go:74-77). The MAIL half lives with the compose
+   * (services/mail/team-invite.ts) — the ui add arm composes the funnel
+   * enqueue AFTER this insert lands, mirroring services/org/team_invite.go's
+   * insert-then-MailTeamInvite order (a mail failure propagates to the
+   * caller — upstream's ServerError — while the invite ROW stands).
+   */
+  async createTeamInvite(doer: { id: number }, team: TeamRecord, email: string): Promise<TeamInviteRecord> {
+    const duplicate = await this.db
+      .select({ id: teamInvites.id })
+      .from(teamInvites)
+      .where(and(eq(teamInvites.teamId, team.id), eq(teamInvites.email, email)))
+      .get();
+    if (duplicate !== undefined) throw new TeamInviteAlreadyExistsError(team.id, email);
+    const alreadyMember = await this.db
+      .select({ userId: teamMembers.userId })
+      .from(teamMembers)
+      .innerJoin(users, eq(users.id, teamMembers.userId))
+      .where(and(eq(teamMembers.orgId, team.orgId), eq(teamMembers.teamId, team.id), eq(users.email, email)))
+      .get();
+    if (alreadyMember !== undefined) throw new UserEmailAlreadyAddedError(email);
+    const now = new Date();
+    const inserted = await this.db
+      .insert(teamInvites)
+      .values({
+        token: cryptoRandomString(INVITE_TOKEN_LENGTH),
+        inviterId: doer.id,
+        orgId: team.orgId,
+        teamId: team.id,
+        email,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning();
+    return inserted[0]!;
+  }
+
+  /** `RemoveInviteByID` (team_invite.go:120-123) — BOTH keys bind (a stale
+   *  iid from another team deletes nothing, upstream's WHERE shape). */
+  async removeInviteById(inviteId: number, teamId: number): Promise<void> {
+    await this.db.delete(teamInvites).where(and(eq(teamInvites.id, inviteId), eq(teamInvites.teamId, teamId)));
+  }
+
+  /** `GetInvitesByTeamID` (team_invite.go:125-130) — unordered find. */
+  async getInvitesByTeamId(teamId: number): Promise<TeamInviteRecord[]> {
+    return this.db.select().from(teamInvites).where(eq(teamInvites.teamId, teamId)).all();
+  }
+
+  /** `GetInviteByToken` (team_invite.go:132-145) — the miss returns null
+   *  (upstream ErrTeamInviteNotFound → the 404 arm). */
+  async getInviteByToken(token: string): Promise<TeamInviteRecord | null> {
+    const row = await this.db.select().from(teamInvites).where(eq(teamInvites.token, token)).get();
+    return row ?? null;
   }
 
   /**

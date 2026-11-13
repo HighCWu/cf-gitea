@@ -929,3 +929,62 @@ ${jobsBlock}	</td></tr></table>
 </body>
 </html>`;
 }
+
+// ---------------------------------------------------------------------------
+// The team invite (templates/mail/org/team_invite.tmpl — census B-77)
+// ---------------------------------------------------------------------------
+
+/** `mail.team_invite.subject` (locale_en-US.json): `%[1]s has invited you to
+ *  join the %[2]s organization`. NOTE the caller applies NO DotEscape here —
+ *  mail_team_invite.go:42 interpolates the raw DisplayName() pair (the body's
+ *  text_1 is where the template DotEscapes). */
+export function teamInviteSubject(inviterDisplayName: string, orgDisplayName: string): string {
+  return `${inviterDisplayName} has invited you to join the ${orgDisplayName} organization`;
+}
+
+/** Data for `renderTeamInviteMail` (team_invite.tmpl's data map). */
+export interface TeamInviteMailData {
+  /** Upstream `.Inviter.DisplayName()` — DotEscape + escape applied at the
+   *  text_1 interpolation, the template's exact order. */
+  inviterDisplayName: string;
+  /** Upstream `.Team.Name` — same treatment. */
+  teamName: string;
+  /** Upstream `.Organization.DisplayName()` — same treatment. */
+  orgDisplayName: string;
+  /** Upstream `.InviteURL` — rendered verbatim (never escaped: the template
+   *  interpolates it as the href AND the link text raw). */
+  inviteUrl: string;
+  /** Upstream `.Invite.Email` — text_3's intended-for note. */
+  inviteEmail: string;
+  /** Upstream AppUrl — TRAILING-SLASH form (the footer concatenates). */
+  appUrl: string;
+  /** Upstream AppName (template funcmap) — the footer link's label. */
+  appName: string;
+}
+
+/**
+ * The team invite body — `templates/mail/org/team_invite.tmpl` over the base
+ * head/footer: `mail.team_invite.text_1` ("%[1]s has invited you to join team
+ * %[2]s in organization %[3]s.", the three names DotEscaped per the template's
+ * `(DotEscape …)` pipeline), `mail.team_invite.text_2`, the break-all link
+ * paragraph, `mail.link_not_working_do_paste` and `mail.team_invite.text_3`
+ * ("Note: This invitation was intended for %[1]s. …") verbatim from
+ * locale_en-US.json.
+ */
+export function renderTeamInviteMail(data: TeamInviteMailData): string {
+  const inviter = escapeHtml(dotEscape(data.inviterDisplayName));
+  const team = escapeHtml(dotEscape(data.teamName));
+  const org = escapeHtml(dotEscape(data.orgDisplayName));
+  const email = escapeHtml(data.inviteEmail);
+  const subject = escapeHtml(teamInviteSubject(data.inviterDisplayName, data.orgDisplayName));
+  return `${baseHead(subject)}
+<body>
+	<p>${inviter} has invited you to join team ${team} in organization ${org}.</p>
+	<p>Please click the following link to join the team:</p><p style="word-break: break-all;"><a href="${data.inviteUrl}">${data.inviteUrl}</a></p>
+	<p>Not working? Try copying and pasting it to your browser.</p>
+	<p>Note: This invitation was intended for ${email}. If you were not expecting this invitation, you can ignore this email.</p>
+
+	${baseFooter(data.appUrl, data.appName)}
+</body>
+</html>`;
+}

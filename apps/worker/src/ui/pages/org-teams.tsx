@@ -113,6 +113,7 @@ import {
   TeamNameEmptyError,
   TeamPermissionMissingError,
   TeamsService,
+  type TeamInviteRecord,
   type TeamRecord,
 } from "../../api/routes/org-teams";
 import { resolveOrgForRequest } from "../../api/services/orgs";
@@ -146,6 +147,7 @@ export const orgTeamsLocale = {
   members: "Members", // "org.members"
   repositories: "Repositories", // cf-gitea addition — the merged repos list's header (upstream's repositories page has none; the org-team-navbar carried the label, dropped with the switch)
   members_none: "No members on this team.", // "org.teams.members.none"
+  pending_invitations: "Pending Invitations", // "org.teams.invite_team_member.list"
   repos_none: "No repositories could be accessed by this team.", // "org.teams.repos.none"
   no_desc: "This team has no description", // "org.teams.no_desc"
   team_access_desc: "Repository access", // "org.team_access_desc"
@@ -297,6 +299,11 @@ export interface OrgTeamDetailData {
   team: TeamRecord;
   members: Array<typeof users.$inferSelect>;
   repos: Array<{ id: string; slug: string }>;
+  /** The pending email invitations (census B-77 — TeamMembers'
+   *  `GetInvitesByTeamID` load, teams.go:409-414: UNCONDITIONAL and
+   *  unbounded upstream; the render gates the section on the owner
+   *  posture, members.tmpl:51). */
+  invites: TeamInviteRecord[];
 }
 
 /**
@@ -314,11 +321,13 @@ export async function loadOrgTeamDetailData(
   if (team === null || team.orgId !== org.id) return null;
   const members = await service.listTeamMemberRows(team.id, { page: 1, pageSize: ORG_TEAMS_PAGE_SIZE });
   const repos = await service.listTeamRepoPairs(team, { page: 1, pageSize: ORG_TEAMS_PAGE_SIZE });
+  const invites = await service.getInvitesByTeamId(team.id);
   return {
     org,
     team,
     members: members.items,
     repos: repos.items.map((pair) => ({ id: pair.repo.id, slug: pair.repo.slug })),
+    invites,
   };
 }
 
@@ -710,8 +719,9 @@ export function OrgTeamDetailPage(props: {
           <div class="ui ten wide column">
             <h4 class="ui top attached header">{orgTeamsLocale.members}</h4>
             {/* members.tmpl:11-17 — the owner's add form (the search box's
-                autocomplete JS reduced to the plain input; the email-invite
-                arm is dead at this pin — no MailService). */}
+                autocomplete JS reduced to the plain input; an unknown name
+                that parses as an email creates a team_invites row when the
+                mailer is armed — the census B-77 add arm). */}
             {isOrgOwner ? (
               <div class="ui top attached segment">
                 <form class="ui form ignore-dirty tw-flex tw-flex-wrap tw-gap-2" action={`${teamActions}/add`} method="post">
@@ -757,6 +767,33 @@ export function OrgTeamDetailPage(props: {
                 </div>
               )}
             </div>
+            {/* members.tmpl:51-70 — the pending invitations (owner-gated;
+                each item the bare Email + the remove form POSTing
+                action/remove_invite with iid). NO invitee decline arm exists
+                upstream (invite.tmpl carries accept-only) — removal is the
+                ORG-side arm. */}
+            {isOrgOwner && data.invites.length > 0 ? (
+              <>
+                <h4 class="ui top attached header">{orgTeamsLocale.pending_invitations}</h4>
+                <div class="ui attached segment">
+                  <div class="flex-divided-list items-with-main">
+                    {data.invites.map((invite) => (
+                      <div class="item tw-items-center">
+                        <div class="item-main">{invite.email}</div>
+                        <div class="item-trailing">
+                          <form method="post" action={`${teamActions}/remove_invite`}>
+                            <input type="hidden" name="iid" value={invite.id} />
+                            <button type="submit" class="ui red button">
+                              {orgTeamsLocale.remove}
+                            </button>
+                          </form>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : null}
             <h4 class="ui top attached header">{orgTeamsLocale.repositories}</h4>
             {/* repositories.tmpl:13-28 — the owner's add form and the
                 add-all/remove-all pair (the confirm attributes reduced to

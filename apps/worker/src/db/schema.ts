@@ -2686,6 +2686,57 @@ export const teamRepoAccess = sqliteTable(
   ],
 );
 
+/**
+ * Team email invitations (upstream `TeamInvite`, team_invite.go:55-63 —
+ * upstream table `team_invite`; renamed `team_invites` per the
+ * team_members/team_repo_access pluralization). The census B-77 lane: an
+ * org owner inviting an unknown name that parses as an email creates a row
+ * with a 25-char token; the bearer redeems at /org/invite/{token}
+ * (teams.go:582-628). Column-faithful port with the repo's conventions:
+ * `token` UNIQUE (upstream `UNIQUE(token) INDEX`); (team_id, email) UNIQUE
+ * (upstream's composite `UNIQUE(team_mail)`) — the duplicate-invite arbiter
+ * AND `GetInvitesByTeamID`'s scan (the composite's team_id lead covers the
+ * plain team_id lookups, so upstream's extra single-column team index is
+ * plan-dead here — the teams_org_idx audit note's cost-model rule). FKs
+ * carry the upstream deletion shape: `org_id` and `team_id` cascade
+ * (org deletion's DeleteBeans removes TeamInvite{OrgID}, org.go:40;
+ * DeleteTeam's DeleteBeans removes the team's invites, team.go:218-223),
+ * while `inviter_id` declares NO FK — upstream user deletion leaves invites
+ * dangling (no bean list touches them), and the redeem arm answers the
+ * dangling-inviter lookup miss with its ServerError 500 (teams.go:593-628).
+ * NO expiry anywhere upstream: no TTL check, no cron cleanup — invites
+ * persist until redeemed, admin-removed, or the team/org dies.
+ */
+export const teamInvites = sqliteTable(
+  "team_invites",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The redemption token — util.CryptoRandomString(25) at the create
+     *  (team_invite.go:96). */
+    token: text("token").notNull(),
+    /** The inviting org owner (upstream `InviterID`). No FK — dangling on
+     *  inviter deletion, upstream-faithful (see the block comment). */
+    inviterId: integer("inviter_id").notNull(),
+    orgId: integer("org_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    teamId: integer("team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "cascade" }),
+    /** The invited email — the token bearer is NOT checked against it
+     *  upstream (teams.go:609-617 joins the team on the token alone). */
+    email: text("email").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .default(sql`(unixepoch())`),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("team_invites_token_uq").on(t.token),
+    uniqueIndex("team_invites_team_email_uq").on(t.teamId, t.email),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // SPEC-0002 account families — user emails, SSH public keys, GPG keys
 // (migration 0016; the API write/read half lives in routes/misc-t3.ts).

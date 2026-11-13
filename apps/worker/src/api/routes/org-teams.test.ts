@@ -49,6 +49,7 @@ beforeEach(async () => {
   // reconsider rider sweeps) go before the repositories rows too.
   for (const table of [
     "protected_branches",
+    "team_invites",
     "team_repo_access",
     "team_members",
     "teams",
@@ -1796,5 +1797,105 @@ describe("the unit-grant matrix (per-unit access levels through the grant seams)
     // the dormant team's covered repo serves because the SIBLING team's
     // effective read carries the max (org/team.go:569-577's any-unit arm).
     expect((await send(`/teams/${covered}/repos/acme/vault`, { headers: authHeaders(s.member.id) })).status).toBe(200);
+  });
+});
+// ---------------------------------------------------------------------------
+// The team email-invite arms (census B-77 — upstream
+// models/organization/team_invite.go). WEB-ONLY upstream (no /api/v1 arm —
+// the route module header), so this battery drives the TeamsService seams
+// directly: the create dedupe pair, the both-key removal, the token read,
+// and the team-delete cascade (DeleteBeans' invite half via the FK).
+// ---------------------------------------------------------------------------
+
+describe("the TeamsService invite arms (team_invite.go)", () => {
+  it("createTeamInvite lands the tokenized row (25-char token, the key fan-out)", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const team = await service.createTeam(s.org, { name: "invitee", permission: "write" });
+    // The EMAIL arrives lowercased — the ADD ARM lowers it (teams.go:168's
+    // strings.ToLower on the form field); the service stores what it is given
+    // (the model insert's shape), the route battery pins the lowering.
+    const invite = await service.createTeamInvite({ id: s.owner.id }, team, "newcomer@example.com");
+    expect(invite.token).toMatch(/^[a-zA-Z0-9]{25}$/); // util.CryptoRandomString(25)
+    expect(invite.inviterId).toBe(s.owner.id);
+    expect(invite.orgId).toBe(s.org.id);
+    expect(invite.teamId).toBe(team.id);
+    expect(invite.email).toBe("newcomer@example.com");
+  });
+
+  it("refuses a duplicate (team_id, email) with the typed already-exists error", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const team = await service.createTeam(s.org, { name: "invitee", permission: "write" });
+    await service.createTeamInvite({ id: s.owner.id }, team, "newcomer@example.com");
+    await expect(service.createTeamInvite({ id: s.owner.id }, team, "newcomer@example.com")).rejects.toThrow(
+      /team invite already exists/,
+    );
+  });
+
+  it("the composite is PER-TEAM: the same email on a second team invites fine", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const teamA = await service.createTeam(s.org, { name: "team-a", permission: "write" });
+    const teamB = await service.createTeam(s.org, { name: "team-b", permission: "write" });
+    await service.createTeamInvite({ id: s.owner.id }, teamA, "newcomer@example.com");
+    const second = await service.createTeamInvite({ id: s.owner.id }, teamB, "newcomer@example.com");
+    expect(second.teamId).toBe(teamB.id);
+  });
+
+  it("refuses an email an existing MEMBER carries (the team_user x user email join)", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const team = await service.createTeam(s.org, { name: "invitee", permission: "write" });
+    await service.addTeamMember(team, s.member.id);
+    await env.DB.prepare(`UPDATE users SET email = 'member@example.com' WHERE id = ${s.member.id}`).run();
+    await expect(service.createTeamInvite({ id: s.owner.id }, team, "member@example.com")).rejects.toThrow(
+      /user with email already added/,
+    );
+    // NOT a member of THIS team → the invite lands even though the address
+    // belongs to an org member of another team (the probe is team-scoped:
+    // team_invite.go:81-90's org_id+team_id+email triple).
+    const other = await service.createTeam(s.org, { name: "other-team", permission: "write" });
+    const invited = await service.createTeamInvite({ id: s.owner.id }, other, "member@example.com");
+    expect(invited.teamId).toBe(other.id);
+  });
+
+  it("getInviteByToken resolves the token and misses to null", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const team = await service.createTeam(s.org, { name: "invitee", permission: "write" });
+    const invite = await service.createTeamInvite({ id: s.owner.id }, team, "newcomer@example.com");
+    expect((await service.getInviteByToken(invite.token))?.id).toBe(invite.id);
+    expect(await service.getInviteByToken("no-such-token")).toBeNull();
+  });
+
+  it("getInvitesByTeamId lists only that team's rows; removeInviteById binds BOTH keys", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const teamA = await service.createTeam(s.org, { name: "team-a", permission: "write" });
+    const teamB = await service.createTeam(s.org, { name: "team-b", permission: "write" });
+    const a1 = await service.createTeamInvite({ id: s.owner.id }, teamA, "a1@example.com");
+    const a2 = await service.createTeamInvite({ id: s.owner.id }, teamA, "a2@example.com");
+    await service.createTeamInvite({ id: s.owner.id }, teamB, "b1@example.com");
+    const listA = await service.getInvitesByTeamId(teamA.id);
+    expect(listA.map((row) => row.email).sort()).toEqual(["a1@example.com", "a2@example.com"]);
+    // A stale iid from another team deletes NOTHING (the both-key WHERE).
+    await service.removeInviteById(a1.id, teamB.id);
+    expect((await service.getInvitesByTeamId(teamA.id)).map((row) => row.id).sort()).toEqual([a1.id, a2.id].sort());
+    // The right pair removes.
+    await service.removeInviteById(a1.id, teamA.id);
+    expect((await service.getInvitesByTeamId(teamA.id)).map((row) => row.id)).toEqual([a2.id]);
+  });
+
+  it("deleteTeam takes the team's invite rows with it (team.go:218-223 DeleteBeans via the FK cascade)", async () => {
+    const s = await seedActors();
+    const service = new TeamsService(env.DB);
+    const doomed = await service.createTeam(s.org, { name: "doomed", permission: "write" });
+    const survivor = await service.createTeam(s.org, { name: "survivor", permission: "write" });
+    await service.createTeamInvite({ id: s.owner.id }, doomed, "doomed@example.com");
+    const kept = await service.createTeamInvite({ id: s.owner.id }, survivor, "kept@example.com");
+    await service.deleteTeam(doomed);
+    expect(await service.getInvitesByTeamId(doomed.id)).toEqual([]);
+    expect((await service.getInviteByToken(kept.token))?.id).toBe(kept.id);
   });
 });
