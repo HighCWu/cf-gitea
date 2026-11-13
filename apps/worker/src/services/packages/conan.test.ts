@@ -441,7 +441,8 @@ describe("the revisions dance (references.go + conan.go:699-833)", () => {
     const pinned = newConanRecipeReference("ConanPackage", "1.2", "gitea", "test", "rev1");
     const key = conanRecipeAsKey(pinned);
     const snapshot = await buildConanSnapshot(env.DB, ownerRow.id, pinned, key);
-    expect(snapshot).toEqual({ "conanfile.py": "" }); // the WebCrypto md5 reduction
+    // B-58: the real md5 — the empty-string era was the recorded WebCrypto reduction
+    expect(snapshot).toEqual({ "conanfile.py": "979929d2c275f5b40c9229afc99c938c" });
     const urls = await buildConanDownloadUrls(env.DB, ownerRow.id, pinned, key, "https://x/files/pkg/1.2/gitea/test/rev1/recipe");
     expect(urls).toEqual({ "conanfile.py": "https://x/files/pkg/1.2/gitea/test/rev1/recipe/conanfile.py" });
     const missingKey = conanRecipeAsKey(newConanRecipeReference("ConanPackage", "1.2", "gitea", "test", "revX"));

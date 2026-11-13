@@ -16,19 +16,35 @@
  * (the OverwriteExisting internal-file arm), and the GET arms open stored
  * files. (Contrast helm — upstream's only per-request render.)
  *
- * ## Documented reductions (each disclosed in SPEC-0016's as-built)
+ * ## The codec + digest tails (census B-58, landed on top of the M7 family)
  *
- *  - `Packages.xz` is NOT generated: the substrate has no xz codec (Go's
- *    ulikulex/xz has no Workers equivalent; the hand-rolled posture forbids a
- *    dependency). apt consumes `Packages.gz` — the mandatory baseline
- *    compression — and Release/by-hash list only the generated files.
- *  - control archives compressed as .xz/.zst answer 400 "unsupported
- *    compression algorithm" (upstream's own default-arm error; Workers has no
- *    decoders). .gz and uncompressed control.tar parse (dpkg-deb's default).
- *  - MD5 is unavailable on Workers' WebCrypto (blobs.ts's three-digest
- *    posture), so the Packages paragraphs omit the `MD5sum:` line and Release
- *    omits the `MD5Sum:` section (apt verifies SHA256; SHA1/SHA512 also
- *    carried). A `by-hash/md5sum/...` request answers 404 (never stored).
+ * Upstream renders `Packages.xz` beside the `.gz` baseline at index-build
+ * time (repository.go:184-187 rides Go's ulikunitz/xz Writer; the file is
+ * stored and served on request), renders the per-file `MD5sum:` line
+ * (repository.go:206) and the Release `MD5Sum:` section (:345-346), serves
+ * `by-hash/md5sum/...` via the `md5sum`→`md5` alias (debian.go:87-89), and
+ * accepts `control.tar.xz` members through the xz Reader with the decoded
+ * stream bounded at 32 MiB (metadata.go:119-125/:141-143). Workers has no xz
+ * surface and WebCrypto lacks MD5, so this module carries the hand-built
+ * codec/digest substrate (`./xz-encode.ts` the stored-form xz encoder whose
+ * output system xz -d expands byte-exactly, `./xz.ts` the LZMA2 decoder with
+ * the same 32 MiB budget gate, `./md5.ts` the RFC 1321 incremental hash):
+ * the index builder now stores `Packages.xz`, the Packages paragraphs carry
+ * the `MD5sum:` line, Release renders the `MD5Sum:` section first (the
+ * upstream section order), `by-hash/md5sum` answers from the stored digest
+ * with upstream's exact-count arm (`len(pfs) != 1` → 404, debian.go:101-104),
+ * and `control.tar.xz` members parse. The upload arm computes the digest in
+ * a second spool pass and fills the blob row's `hash_md5` (the nullable
+ * column with its distinct-NULL UNIQUE — the schema substrate was built for
+ * this flip). Remaining reduction: `control.tar.zst` still answers 400
+ * ("unsupported compression algorithm") — the .xz arm's sibling, recorded in
+ * the census flip note. Legacy blob rows uploaded before this landing carry
+ * hash_md5 NULL: their Packages/Release renders omit the digest line/section
+ * row and their by-hash/md5sum lookup 404s (honest absences; every
+ * post-landing upload carries the digest).
+ *
+ * ## Other documented reductions (each disclosed in SPEC-0016's as-built)
+ *
  *  - Release's `Date:` renders JS toUTCString() — the same RFC 1123 GMT
  *    spelling as Go's time.RFC1123 in UTC.
  *  - Origin/Label: upstream renders setting.AppName; this deployment's
@@ -93,6 +109,9 @@ import {
   type PackageOwnerRow,
 } from "./model";
 import { DuplicatePackageFileError } from "./generic";
+import { Md5 } from "./md5";
+import { xzDecode } from "./xz";
+import { xzEncodeStored } from "./xz-encode";
 import { writeVersionMetadata } from "./protocol-common";
 import {
   emitPackageCreated,
@@ -401,8 +420,15 @@ export async function parseDebianPackage(body: ReadableStream<Uint8Array>): Prom
           const firstMember = members[0];
           if (members.length !== 1 || firstMember === undefined) throw new DebianMissingControlError();
           controlText = findControlInTar(firstMember.payload);
+        } else if (suffix === ".xz") {
+          // upstream accepts the member through the xz Reader with the
+          // DECODED stream bounded at 32 MiB (metadata.go:119-125/:141-143);
+          // the budget rides the decoder (the decompression-bomb gate).
+          const decoded = await xzDecode(memberBytes, { maxOutputBytes: MAX_CONTROL_TAR_SIZE });
+          controlText = findControlInTar(decoded);
         } else {
-          // .xz / .zst — no codec in the substrate (documented reduction).
+          // .zst — the recorded remaining reduction (400, upstream's own
+          // default-arm error message).
           throw new DebianUnsupportedCompressionError();
         }
         if (controlText !== null) return parseDebianControlFile(controlText);
@@ -425,6 +451,19 @@ function findControlInTar(tarBytes: Uint8Array): string | null {
     if (base === "control") return new TextDecoder().decode(member.data);
   }
   return null;
+}
+
+/** One streaming md5 pass over a whole body (the incremental ./md5 walk —
+ *  no buffering; package-scale bodies). */
+async function md5HexOfStream(body: ReadableStream<Uint8Array>): Promise<string> {
+  const md5 = new Md5();
+  const reader = body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value !== undefined) md5.update(value);
+  }
+  return md5.digestHex();
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +525,13 @@ export async function uploadDebianPackage(input: UploadDebianPackageInput): Prom
     const spoolObject = await input.bucket.get(spooled.spoolKey);
     if (spoolObject === null) throw new Error("package spool object vanished");
     const packageInfo = await parseDebianPackage(spoolObject.body as ReadableStream<Uint8Array>);
+    // The digest tail (census B-58): upstream's NewHashedBuffer computes all
+    // four digests during the download (repository.go:206 reads Blob.HashMD5);
+    // the other three rode spoolAndHash, so the md5 pass re-reads the spool
+    // through the incremental hash (a package-scale second GET).
+    const md5Object = await input.bucket.get(spooled.spoolKey);
+    if (md5Object === null) throw new Error("package spool object vanished");
+    const md5Digest = await md5HexOfStream(md5Object.body as ReadableStream<Uint8Array>);
     await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "debian", spooled.size, input.quota);
 
     const { row: pkg } = await getOrInsertPackage(input.d1, {
@@ -511,6 +557,19 @@ export async function uploadDebianPackage(input: UploadDebianPackageInput): Prom
       sha512: spooled.sha512,
       now,
     });
+    // Fill the nullable hash_md5 (NULLs distinct under its UNIQUE — the
+    // schema substrate built for this flip). A deduped row already carries
+    // the same digest (same sha256 = same bytes); a true md5 collision with
+    // a different blob fails the UNIQUE the same way upstream's own four
+    // hash UNIQUEs would.
+    if (blob.hashMd5 === null) {
+      await drizzle(input.d1)
+        .update(packageBlobs)
+        .set({ hashMd5: md5Digest })
+        .where(eq(packageBlobs.id, blob.id))
+        .run();
+      blob.hashMd5 = md5Digest;
+    }
     const objectPresent = (await input.bucket.head(packageBlobContentKey(spooled.sha256))) !== null;
     if (blobCreated || !objectPresent) {
       await copySpoolToContentKey(input.bucket, spooled.spoolKey, spooled.sha256);
@@ -627,9 +686,11 @@ async function searchDebianFiles(
 
 /**
  * `buildPackagesIndices` (repository.go:147-248): the Packages paragraphs
- * (control stanza + Filename/Size/hashes), stored as `Packages` +
- * `Packages.gz` (xz not generated — the documented reduction); the
- * empty-repository arm deletes the pair.
+ * (control stanza + Filename/Size/hashes incl. the `MD5sum:` line,
+ * repository.go:206), stored as `Packages` + `Packages.gz` + `Packages.xz`
+ * (the xz twin rides the stored-form encoder — upstream renders it through
+ * the xz Writer at :184-187/:220); the empty-repository arm deletes the trio
+ * (repository.go:160).
  */
 async function buildPackagesIndices(
   d1: D1Database,
@@ -644,7 +705,7 @@ async function buildPackagesIndices(
   const compositeKey = `${distribution}|${component}|${architecture}`;
   const rows = await searchDebianFiles(d1, owner.id, distribution, component, architecture);
   if (rows.length === 0) {
-    for (const filename of ["Packages", "Packages.gz"]) {
+    for (const filename of ["Packages", "Packages.gz", "Packages.xz"]) {
       await deleteRepositoryFile(d1, repoVersion.version.id, filename, compositeKey);
     }
     return;
@@ -655,6 +716,7 @@ async function buildPackagesIndices(
       `${row.control}\n` +
         `Filename: pool/${distribution}/${component}/${row.file.name}\n` +
         `Size: ${row.blob.size}\n` +
+        (row.blob.hashMd5 !== null ? `MD5sum: ${row.blob.hashMd5}\n` : "") +
         `SHA1: ${row.blob.hashSha1 ?? ""}\n` +
         `SHA256: ${row.blob.hashSha256}\n` +
         `SHA512: ${row.blob.hashSha512 ?? ""}\n`,
@@ -663,6 +725,7 @@ async function buildPackagesIndices(
   const packagesText = paragraphs.join("\n");
   const plain = asciiBytes(packagesText);
   const gzipped = await gzipCompress(plain);
+  const xzStored = xzEncodeStored(plain);
   const properties = {
     [DEBIAN_PROPERTY_INCLUDE_IN_RELEASE]: "",
     [DEBIAN_PROPERTY_DISTRIBUTION]: distribution,
@@ -685,6 +748,14 @@ async function buildPackagesIndices(
     properties,
     now,
   });
+  await storeRepositoryFile(d1, bucket, {
+    versionId: repoVersion.version.id,
+    filename: "Packages.xz",
+    compositeKey,
+    content: xzStored,
+    properties,
+    now,
+  });
 }
 
 /** The include-in-release files of one distribution — the Release checksum
@@ -693,6 +764,7 @@ interface DebianReleaseRow {
   fileId: number;
   filename: string;
   size: number;
+  md5: string | null;
   sha1: string | null;
   sha256: string;
   sha512: string | null;
@@ -713,6 +785,7 @@ async function listIncludeInReleaseFiles(d1: D1Database, versionId: number, dist
       fileId: packageFiles.id,
       filename: packageFiles.name,
       size: packageBlobs.size,
+      md5: packageBlobs.hashMd5,
       sha1: packageBlobs.hashSha1,
       sha256: packageBlobs.hashSha256,
       sha512: packageBlobs.hashSha512,
@@ -797,7 +870,12 @@ async function buildReleaseFiles(
   const ordered = rows
     .map((row) => ({ row, path: `${row.component}/binary-${row.architecture}/${row.filename}` }))
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  // The four checksum sections in upstream's order — MD5Sum first
+  // (repository.go:345-352); rows ` %s %d %s\n` (hash, size, path). A legacy
+  // NULL md5 row omits its line (the honest absence; every post-B-58 upload
+  // carries the digest).
   for (const [header, digest] of [
+    ["MD5Sum:", (row: DebianReleaseRow) => row.md5],
     ["SHA1:", (row: DebianReleaseRow) => row.sha1],
     ["SHA256:", (row: DebianReleaseRow) => row.sha256],
     ["SHA512:", (row: DebianReleaseRow) => row.sha512],
@@ -942,8 +1020,11 @@ export async function openDebianRepositoryFile(
 }
 
 /** `GetRepositoryFileByHash` (debian.go:79-116): files of the internal
- *  version whose blob hash matches; md5sum maps to the never-stored md5 →
- *  404 (the documented reduction). */
+ *  version whose blob hash matches; `md5sum` maps to the `md5` alias
+ *  (debian.go:87-89) answered from the stored digest. Upstream's exact-count
+ *  arm (`len(pfs) != 1` → 404, debian.go:101-104) applies to every
+ *  algorithm — the same blob can back several files, so a multi-match is a
+ *  404, not a first-match serve. */
 export async function openDebianRepositoryFileByHash(
   d1: D1Database,
   bucket: R2Bucket,
@@ -954,20 +1035,24 @@ export async function openDebianRepositoryFileByHash(
   const algo = algorithm.toLowerCase() === "md5sum" ? "md5" : algorithm.toLowerCase();
   const digest = hash.toLowerCase();
   if (!/^(sha1|sha256|sha512|md5)$/.test(algo) || !/^[0-9a-f]+$/.test(digest)) return null;
-  if (algo === "md5") return null; // MD5 never stored (the documented reduction)
   const repoVersion = await getOrCreateInternalPackageVersion(d1, owner.id, "debian", DEBIAN_REPOSITORY_PACKAGE, DEBIAN_REPOSITORY_VERSION);
   const db = drizzle(d1);
   const hashCondition =
-    algo === "sha1" ? eq(packageBlobs.hashSha1, digest) : algo === "sha512" ? eq(packageBlobs.hashSha512, digest) : eq(packageBlobs.hashSha256, digest);
+    algo === "sha1"
+      ? eq(packageBlobs.hashSha1, digest)
+      : algo === "sha512"
+        ? eq(packageBlobs.hashSha512, digest)
+        : algo === "md5"
+          ? eq(packageBlobs.hashMd5, digest)
+          : eq(packageBlobs.hashSha256, digest);
   const match = await db
     .select({ file: packageFiles, blob: packageBlobs })
     .from(packageFiles)
     .innerJoin(packageBlobs, eq(packageBlobs.id, packageFiles.blobId))
     .where(and(eq(packageFiles.versionId, repoVersion.version.id), hashCondition))
-    .limit(1)
     .all();
-  const found = match[0];
-  if (found === undefined) return null;
+  if (match.length !== 1) return null; // upstream's exact-count arm
+  const found = match[0]!;
   const object = await bucket.get(packageBlobContentKey(found.blob.hashSha256));
   if (object === null) return null;
   return { stream: object.body, size: object.size, filename: found.file.name, created: found.file.createdUnix };

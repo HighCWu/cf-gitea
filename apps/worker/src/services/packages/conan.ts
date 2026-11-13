@@ -74,7 +74,7 @@ import {
   hasVersionFileReferences,
   tryInsertFile,
 } from "./model";
-import { packageFiles, packageProperties, packageVersions, packages } from "../../db/schema";
+import { packageBlobs, packageFiles, packageProperties, packageVersions, packages } from "../../db/schema";
 import {
   copySpoolToContentKey,
   getOrInsertBlob,
@@ -84,6 +84,7 @@ import {
 } from "./blobs";
 import { writeVersionMetadata } from "./protocol-common";
 import { deletePackageFile, deletePackageVersionAndReferences } from "./model";
+import { md5Hex } from "./md5";
 import {
   emitPackageCreated,
   emitPackageDeleted,
@@ -671,6 +672,10 @@ export async function uploadConanFile(input: UploadConanFileInput): Promise<Uplo
       throw new Error("package spool object vanished");
     }
     const bytes = new Uint8Array(await spoolObject.arrayBuffer());
+    // The digest tail (census B-58): upstream's NewHashedBuffer computes the
+    // md5 during the download and serveSnapshot (conan.go:187-224) publishes
+    // it as the client-side checksum — ours computes it here.
+    const md5Digest = md5Hex(bytes);
 
     // The parse arms (conan.go:397-441) — BEFORE the version insert.
     let metadata: ConanMetadata | null = null;
@@ -715,6 +720,18 @@ export async function uploadConanFile(input: UploadConanFileInput): Promise<Uplo
       sha512: spooled.sha512,
       now,
     });
+    // Fill the nullable hash_md5 (NULLs distinct under its UNIQUE); a
+    // deduped row already carries the same digest (same sha256 = same
+    // bytes), and a true md5 collision with a different blob fails the
+    // UNIQUE the same way upstream's four hash UNIQUEs would.
+    if (blob.hashMd5 === null) {
+      await drizzle(input.d1)
+        .update(packageBlobs)
+        .set({ hashMd5: md5Digest })
+        .where(eq(packageBlobs.id, blob.id))
+        .run();
+      blob.hashMd5 = md5Digest;
+    }
 
     const contentKey = packageBlobContentKey(spooled.sha256);
     if ((await input.bucket.head(contentKey)) !== null) {
@@ -854,8 +871,10 @@ export async function listConanFilesByKey(
   return { version, entries };
 }
 
-/** serveSnapshot (conan.go:187-224): {filename: md5} — the WebCrypto
- *  reduction renders the EMPTY md5 (the landed blob-row note). */
+/** serveSnapshot (conan.go:187-224): {filename: md5} from the blob row —
+ *  every post-B-58 upload stores the digest; the `?? ""` fallback answers
+ *  only for legacy rows uploaded before the digest arm (upstream never
+ *  renders an empty md5). */
 export async function buildConanSnapshot(
   d1: D1Database,
   ownerId: number,
