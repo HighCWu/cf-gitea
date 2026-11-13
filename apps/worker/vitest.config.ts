@@ -88,7 +88,11 @@ export default defineConfig(async () => {
     // observed), and 4 beforeAll hooks crossed 20s in one run. 30s gives
     // the known-heavy fixtures/walks ~2.2x their quiet-time headroom while
     // still bounding genuine hangs.
-    test: { testTimeout: 30_000, hookTimeout: 30_000 },
+    test: {
+      globalSetup: "./src/test/mail-smtp-stubs.globalsetup.ts",
+      testTimeout: 30_000,
+      hookTimeout: 30_000,
+    },
     // vitest's default for `vitest run` is availableParallelism() - 1 — 31
     // concurrent Miniflare instances on the 32-core dev box. Each instance is
     // a workerd process warming up at once (startup ~1.7s quiet, ~3.2s under

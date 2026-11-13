@@ -31,6 +31,18 @@ AGENTS.md Upstream-Parity Decision Rule clause (b): the platform makes
 upstream's shape impossible and multiple equally faithful adaptations exist
 — hence this decision record before implementation.
 
+**CORRECTED 2026-11-13 (census B-66, proven at runtime — not merely
+re-cited): the "Workers cannot open outbound TCP" premise above is FALSE on
+the current platform.** workerd's `cloudflare:sockets` `connect()` opens
+real TCP sockets from inside the vitest workerd to local listeners through
+miniflare's loopback connector, and the full plaintext SMTP ladder walks it
+(greeting → EHLO → AUTH → MAIL/RCPT/DATA → QUIT). Clause (b) no longer
+applies to the SMTP transport: upstream's shape is hostable, and the
+arm LANDED (§3.4) rather than re-decided. sendmail STANDS impossible
+(process exec does not exist in workerd); `smtp+unix` is refused (no
+unix-domain sockets). The paragraph above is kept as the decision's
+founding record, superseded in the transport axis only.
+
 ### 1.2 In scope (this change)
 
 - The **decision record** (this section + §3): transport choice with the
@@ -167,8 +179,10 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   — `sendmail` → SendmailSender, `dummy` → DummySender, default →
   SMTPSender. The DummySender (`sender/dummy.go:15-23`) renders the message
   and logs it, returning success — the no-op arm.
-- The SMTP transport is the impossible one: `sender/smtp.go:27-60` dials
-  `tcp`/`unix` (`net.Dial`, :40) and TLS-wraps.
+- The SMTP transport: `sender/smtp.go:27-60` dials `tcp`/`unix`
+  (`net.Dial`, :40) and TLS-wraps. *(2026-11-13, B-66: no longer
+  impossible — landed over `cloudflare:sockets` connect(), §3.4; only the
+  `unix` network and the sendmail exec remain platform-impossible.)*
 
 ### 2.3 The queue (upstream queues mail too)
 
@@ -337,6 +351,70 @@ blip. The terminal posture stays upstream's (bounded, logged, visible in
 the row); only the "one provider hiccup kills the mail" edge changes.
 Documented here as the SPEC's divergence ledger entry.
 
+### 3.4 AS-BUILT ADDENDUM (2026-11-13, census B-66): the raw-socket SMTP arm LANDED
+
+With the §1.1 premise corrected at runtime, the decision record's economics
+conclusion (relay as the default provider) stands, and upstream's DEFAULT
+sender is now ALSO ported: `MAIL_PROVIDER=smtp` resolves
+`services/mail/smtp-transport.ts` — the `sender/smtp.go:27-60` session
+ladder over `cloudflare:sockets` connect(), behind the SAME `MailTransport`
+interface (callers never see it; the §3.2 seam unchanged).
+
+- **Session ladder** (arm-for-arm with Go net/smtp at the pin): greeting →
+  EHLO with HELO fallback (Client.hello(); the extension map stays EMPTY
+  after a HELO fallback — every extension arm keys off it) →
+  STARTTLS-when-offered for `smtp+starttls` with the post-TLS re-EHLO
+  (StartTLS's trailing `c.ehlo()`), the verbatim
+  "StartTLS requested, but SMTP server does not support it; falling back to
+  regular SMTP" warn arm → AUTH PLAIN/LOGIN per upstream's contains-order
+  (CRAM-MD5/NTLM offers refuse with a MailPermanentError instead of
+  silently sending unauthenticated — the ADR-0008 posture; CRAM-MD5 is a
+  cheap backlog arm via packages/md5.ts's hand-built RFC-1321 digest, NTLM
+  needs the ntlmssp family) → envelope (`MAIL FROM` carries
+  `BODY=8BITMIME`/`SMTPUTF8` exactly when advertised — Go Client.Mail's
+  params; ENVELOPE_FROM override per mailer.go:201-212 with the "none" arm)
+  → dot-stuffed DATA → QUIT-fails-soft (smtp.go:110-113 logs and returns).
+- **DATA payload** = the go-mail v0.8.1 `WriteTo` analogue: address headers
+  first, generic headers alphabetically (msgwriter's writeGenHeader sort),
+  `MIME-Version: 1.0`, `multipart/alternative` with text/plain first
+  (message.go:64-77), both parts quoted-printable UTF-8 (NewMsg defaults,
+  go-mail msg.go:211-215), RFC 2047 Q encoded-words for non-ASCII
+  Subject/From display names — the encode §5.6 deliberately skips for the
+  RELAY arms is performed at THIS arm's wire edge (the divergence is
+  transport-scoped, not global).
+- **Failure taxonomy** (§3.3 applies unchanged): reply 5xx and envelope/
+  config faults → MailPermanentError; reply 4xx, network throws, timeouts →
+  MailTransientError (the queue retry applies, §3.3's rationale verbatim).
+  The net/smtp upstream error texts ride where upstream has them
+  ("SMTP server does not support AUTH, but credentials provided",
+  "unknown fromServer: %s", the "failed to authenticate SMTP: %w" wrap).
+- **Config inference** = mailer.go:123-151 verbatim (port from protocol:
+  25/465/587; protocol from port; BOTH unset → upstream's own
+  smtps-on-465 fall-through at :148-151). ENABLE_HELO defaults ON
+  (`MustBool(true)`); HELO_HOSTNAME's upstream default is `os.Hostname()`,
+  which workerd has — the recorded adaptation defaults to `"localhost"`.
+- **Platform records** (each with its evidence, never faked):
+  - *TLS arms are REAL-CA-only*: workerd's verifier rejects ANY self-signed
+    certificate both ways (`UnknownIssuer` for a CA:FALSE leaf,
+    `CaUsedAsEndEntity` for a CA:TRUE one) and exposes no custom trust
+    store. The production posture works (the landing's public probes:
+    smtp.gmail.com:465 implicit TLS, cloudflare.com:443). In-test, the TLS
+    *ladder logic* is pinned over the in-memory scripted dial seam (the
+    relay arm's `fetchImpl` shape); no local TLS stub can exist without
+    faking trust.
+  - *FORCE_TRUST_SERVER_CERT / USE_CLIENT_CERT(+files) ship NO var*: the
+    first has no honest analogue (workerd always verifies — an
+    unimplementable knob is never declared), the second none either
+    (`startTls` takes no client certificate).
+  - *smtp+unix* refused at config resolve (no unix sockets in workerd);
+    sendmail stands exec-impossible.
+  - *Deterministic test infra*: vitest `globalSetup` (the pool's Node
+    side) hosts strict conformance stub listeners on ephemeral ports whose
+    wire-byte asserts ride session success/failure (a byte mismatch is a
+    5xx the pin's expect sees); provide/inject carries the ports into the
+    workerd tests. In-workerd `node:net` listeners are NOT host-visible
+    (probe fact — the loopback connector dials the HOST loopback).
+
 ---
 
 ## 4. Data model
@@ -471,7 +549,10 @@ Q-encoding halves of `sanitizeSubject` (mail.go:55) and `EmailTo`
 (user.go:450-465) are NOT applied — a relay transport carries UTF-8 JSON
 end to end, where Q-encoding would surface as literal `=?utf-8?…?=` text
 at the recipient; the header-injection `emailToReplacer` strip
-(user.go:587-596) IS applied.
+(user.go:587-596) IS applied. *(2026-11-13, B-66: the skip is
+transport-scoped — the raw-socket SMTP arm (§3.4) performs the RFC 2047 Q
+encoding at its own wire edge, exactly where upstream's go-mail encoder
+sat.)*
 
 ### 5.7 As-built resolutions (recorded at implementation, same change)
 
@@ -1640,6 +1721,13 @@ No new bindings (the arm reads `DB` + `REPO_TASKS`, both landed). Vars
 | `MAIL_FROM` | unset | `FROM` (mailer.go:24,180-189) — RFC 5322 `Name <addr>` |
 | `MAIL_SUBJECT_PREFIX` | unset (no prefix) | `SUBJECT_PREFIX` (message.go:56-60) |
 | `MAIL_API_BASE` | provider default | (none — test/diagnostic override of the relay base URL) |
+| `MAIL_SMTP_PROTOCOL` | unset (infers) | `PROTOCOL` ∈ {smtp, smtps, smtp+starttls} (mailer.go:36,102) — the B-66 arm; empty infers from `MAIL_SMTP_PORT`, both unset = upstream's smtps-on-465 fall-through (:148-151); `smtp+unix` refuses, `sendmail` stands platform-impossible |
+| `MAIL_SMTP_ADDR` | unset (required to arm smtp) | `SMTP_ADDR` (mailer.go:37) |
+| `MAIL_SMTP_PORT` | unset (infers 25/465/587) | `SMTP_PORT` (mailer.go:38,123-131) |
+| `MAIL_SMTP_USER` | unset (session stays unauthenticated) | `USER` (mailer.go:39; `len(User) > 0` gates the AUTH ladder, smtp.go:64) |
+| `MAIL_SMTP_ENABLE_HELO` | on (`"false"` disables) | `ENABLE_HELO` (mailer.go:41, `MustBool(true)`) |
+| `MAIL_SMTP_HELO_HOSTNAME` | `"localhost"` | `HELO_HOSTNAME` (mailer.go:42; upstream default `os.Hostname()` — workerd has none, the recorded adaptation) |
+| `MAIL_SMTP_ENVELOPE_FROM` | unset (header From is the envelope) | `ENVELOPE_FROM` (mailer.go:24,201-212; the literal `none` keeps the header From) |
 
 The unported upstream knobs (`OVERRIDE_HEADER`, `FROM_DISPLAY_NAME_FORMAT`,
 `EMBED_ATTACHMENT_IMAGES`, `ENVELOPE_FROM` relay-N/A) carry no var — §2.4
@@ -1651,7 +1739,15 @@ surface (SPEC-0004 §2.4) as `AUTO_WATCH_ON_CHANGES`, gating
 Secret: `MAIL_PROVIDER_API_KEY` — name declared in the example's
 `secrets.required` (names only, per the existing comment's discipline);
 value via `wrangler secret put MAIL_PROVIDER_API_KEY`; consumed only by
-the `resend` arm. Local dev: `.dev.vars`.
+the `resend` arm. Local dev: `.dev.vars`. **B-66 adds
+`MAIL_SMTP_PASSWORD`** to the same list — consumed only when
+`MAIL_PROVIDER=smtp` with `MAIL_SMTP_USER` set (upstream `PASSWD`,
+mailer.go:40).
+
+Not carried (the §2.4 ledger covers the relay-era knobs; the B-66
+additions): `FORCE_TRUST_SERVER_CERT` (workerd's TLS always verifies — no
+honest analogue), `USE_CLIENT_CERT`/`CLIENT_CERT_FILE`/`CLIENT_KEY_FILE`
+(`startTls` takes no client certificate), `OVERRIDE_HEADER` (unchanged).
 
 The relay request/response mapping (resend arm): POST `{from, to: [to],
 subject, html, text, reply_to?, headers?}` — 2xx = sent; everything else

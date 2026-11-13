@@ -11,11 +11,16 @@
  *   - `resend` — the HTTP relay arm (the DECISION RECORD's (a)): one JSON
  *     POST to the provider, the API key a wrangler secret
  *     (`MAIL_PROVIDER_API_KEY` — names only in config, never values).
+ *   - `smtp`   — the raw-socket arm (census B-66, smtp-transport.ts): the
+ *     port of upstream's default sender (sender/smtp.go:27-60) over
+ *     workerd's cloudflare:sockets connect() TCP API. The founding
+ *     "Workers cannot open outbound TCP" premise is FALSE on the current
+ *     platform — the B-66 landing carries the probe record. sendmail
+ *     stands platform-impossible (process exec; smtp+unix refused in
+ *     smtp-transport.ts the same way).
  *
- * The raw-socket SMTP and sendmail transports are platform-impossible
- * (sender/smtp.go:40 `net.Dial`; sendmail execs a binary) — the decision
- * record's premise, not an omission. Postmark/SendGrid are future provider
- * arms of this same interface; adding one touches this file only.
+ * Postmark/SendGrid are future provider arms of this same interface;
+ * adding one touches this file only.
  *
  * Failure taxonomy (SPEC §3.3 — the deliberate divergence ledger entry):
  * `MailPermanentError` (provider 4xx — invalid address, unverified domain,
@@ -28,6 +33,7 @@
  */
 
 import type { OutgoingMail } from "./message";
+import { resolveSmtpTransport, type MailSmtpEnv, type SmtpDial } from "./smtp-transport";
 
 /** One transport = one provider. `send` resolves when the provider accepted
  *  the message and throws only the two typed errors below. */
@@ -108,29 +114,39 @@ export class ResendTransport implements MailTransport {
   }
 }
 
-/** The env slice the factory reads (SPEC §6). */
-export interface MailTransportEnv {
+/** The env slice the factory reads (SPEC §6 + the B-66 SMTP extension —
+ *  the SMTP fields live in smtp-transport.ts's MailSmtpEnv, structurally
+ *  compatible with this slice). */
+export interface MailTransportEnv extends MailSmtpEnv {
   MAIL_PROVIDER?: string;
   MAIL_PROVIDER_API_KEY?: string;
   MAIL_API_BASE?: string;
 }
 
 /**
- * The `mailer.go:37-44` protocol switch, reduced: `dummy` (the default —
+ * The `mailer.go:37-44` protocol switch: `dummy` (the default —
  * including unknown values: an unknown PROVIDER must never silently become
- * a REAL sender) and `resend`. `resend` without a key fails the send with
- * a MailPermanentError naming the missing config (upstream Fatal's at boot
+ * a REAL sender), `resend`, and `smtp`. `resend` without a key fails the
+ * send with a MailPermanentError naming the missing config (upstream Fatal's at boot
  * on a malformed mailer section, mailer.go:183-184; we have no boot step,
  * so the row's `failed` + `last_error` is the per-row analogue) — arming
- * the arm is the three-var+secret contract of SPEC §5.1.
+ * the arm is the three-var+secret contract of SPEC §5.1. `smtp` resolves
+ * its MAIL_SMTP_* config the same way (smtp-transport.ts
+ * resolveSmtpTransport — config faults throw MailPermanentError there).
  */
-export function resolveTransport(env: MailTransportEnv, options?: { fetchImpl?: typeof fetch }): MailTransport {
+export function resolveTransport(
+  env: MailTransportEnv,
+  options?: { fetchImpl?: typeof fetch; dial?: SmtpDial },
+): MailTransport {
   const provider = env.MAIL_PROVIDER === undefined || env.MAIL_PROVIDER === "" ? "dummy" : env.MAIL_PROVIDER;
   if (provider === "resend") {
     if (env.MAIL_PROVIDER_API_KEY === undefined || env.MAIL_PROVIDER_API_KEY === "") {
       throw new MailPermanentError("resend: MAIL_PROVIDER_API_KEY is not set (wrangler secret put MAIL_PROVIDER_API_KEY)");
     }
     return new ResendTransport(env.MAIL_PROVIDER_API_KEY, options?.fetchImpl, env.MAIL_API_BASE || "https://api.resend.com");
+  }
+  if (provider === "smtp") {
+    return resolveSmtpTransport(env, options?.dial !== undefined ? { dial: options.dial } : undefined);
   }
   return new DummyTransport();
 }

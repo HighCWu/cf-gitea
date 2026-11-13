@@ -140,10 +140,14 @@
     // default — a self-hosted deployment NEVER sends mail until armed, the
     // same fail-closed class as DEMO_MODE. Arming = MAIL_ENABLED "true" +
     // MAIL_FROM + a provider: "dummy" (the default — upstream's dummy
-    // protocol, services/mailer/sender/dummy.go: render+log+succeed) or
+    // protocol, services/mailer/sender/dummy.go: render+log+succeed),
     // "resend" (the HTTP relay arm — also
-    // `wrangler secret put MAIL_PROVIDER_API_KEY`). The first wired trigger
-    // is POST /admin/users with send_notify=true (upstream
+    // `wrangler secret put MAIL_PROVIDER_API_KEY`), or "smtp" (census B-66:
+    // the raw-socket port of upstream's default sender,
+    // services/mailer/sender/smtp.go:27-60, over workerd's connect() TCP —
+    // configured by the MAIL_SMTP_* block below; also
+    // `wrangler secret put MAIL_SMTP_PASSWORD` when USER is set). The first
+    // wired trigger is POST /admin/users with send_notify=true (upstream
     // routers/api/v1/admin/user.go:153-156); MAIL_SUBJECT_PREFIX /
     // MAIL_API_BASE are optional.
     "MAIL_ENABLED": "false",
@@ -151,6 +155,31 @@
     "MAIL_FROM": "",
     "MAIL_SUBJECT_PREFIX": "",
     "MAIL_API_BASE": "",
+    // The SMTP transport arm's config (census B-66 — upstream's [mailer]
+    // SMTP keys, modules/setting/mailer.go:36-43 + the :123-151 inference):
+    // MAIL_SMTP_PROTOCOL "smtp" | "smtps" | "smtp+starttls" (empty infers
+    // from MAIL_SMTP_PORT; both unset = upstream's smtps-on-465 fall-through;
+    // sendmail and smtp+unix stay platform-impossible), MAIL_SMTP_ADDR the
+    // host (required to arm the provider), MAIL_SMTP_PORT (empty infers
+    // 25/465/587 from the protocol), MAIL_SMTP_USER (empty ⇒ the session
+    // stays unauthenticated, upstream len(User)==0), MAIL_SMTP_ENABLE_HELO
+    // (default on; only the literal "false" disables — MustBool(true)),
+    // MAIL_SMTP_HELO_HOSTNAME (upstream defaults to os.Hostname(); workerd
+    // has none — the recorded adaptation defaults to "localhost"),
+    // MAIL_SMTP_ENVELOPE_FROM (upstream ENVELOPE_FROM — non-empty overrides
+    // the envelope sender; "none" keeps the header From). Upstream's
+    // FORCE_TRUST_SERVER_CERT has NO honest analogue (workerd always
+    // verifies TLS; a self-signed relay cannot be trusted), and
+    // USE_CLIENT_CERT/CLIENT_CERT_FILE/CLIENT_KEY_FILE have none either
+    // (startTls takes no client certificate). TLS arms expect REAL-CA
+    // certificates (smtps on 465 or smtp+starttls on 587).
+    "MAIL_SMTP_PROTOCOL": "",
+    "MAIL_SMTP_ADDR": "",
+    "MAIL_SMTP_PORT": "",
+    "MAIL_SMTP_USER": "",
+    "MAIL_SMTP_ENABLE_HELO": "",
+    "MAIL_SMTP_HELO_HOSTNAME": "",
+    "MAIL_SMTP_ENVELOPE_FROM": "",
     // The notify-mail register gate (specs/email-outbound.md §6, the A2
     // fold): upstream's [service] ENABLE_NOTIFY_MAIL — the mail NOTIFIER
     // registers only when it sits ON TOP of a live mail service
@@ -339,12 +368,14 @@
   // MAIL_PROVIDER_API_KEY is specs/email-outbound.md §6: consumed ONLY when
   // MAIL_PROVIDER=resend; mail stays disabled by default, so most
   // deployments provision the name here and never set a value.
+  // MAIL_SMTP_PASSWORD is specs/email-outbound.md §6 (census B-66):
+  // consumed ONLY when MAIL_PROVIDER=smtp with MAIL_SMTP_USER set.
   // MAIL_INBOUND_SECRET is specs/email-inbound.md §8: the reply-token HMAC
   // key — consumed ONLY when MAIL_INBOUND_ENABLED=true; rotating it
   // invalidates every outstanding token at the next decode (the kill
   // switch, the runbook's inbound posture).
   "secrets": {
-    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY", "MAIL_INBOUND_SECRET"]
+    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY", "MAIL_SMTP_PASSWORD", "MAIL_INBOUND_SECRET"]
   },
   "migrations": [
     {

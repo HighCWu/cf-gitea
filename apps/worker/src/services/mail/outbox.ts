@@ -37,6 +37,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { emailOutbox } from "../../db/schema";
 import { shapeOutgoingMail } from "./message";
+import type { MailSmtpEnv, SmtpDial } from "./smtp-transport";
 import { MailPermanentError, MailTransientError, resolveTransport } from "./transport";
 
 /** The attempt budget — mirrors the repo-tasks consumer's `max_retries: 5`
@@ -49,8 +50,9 @@ export interface MailOutboxMessage {
   mailId: number;
 }
 
-/** Structural env slice (no new bindings — DB + REPO_TASKS landed). */
-export interface MailOutboxEnv {
+/** Structural env slice (no new bindings — DB + REPO_TASKS landed; the
+ *  MAIL_SMTP_* fields ride MailSmtpEnv since census B-66). */
+export interface MailOutboxEnv extends MailSmtpEnv {
   DB: D1Database;
   REPO_TASKS?: Queue;
   APP_URL?: string;
@@ -170,7 +172,7 @@ function clip(text: string): string {
 export async function processMailOutbox(
   env: MailOutboxEnv,
   message: MailOutboxMessage,
-  options: { fetchImpl?: typeof fetch; now?: Date } = {},
+  options: { fetchImpl?: typeof fetch; dial?: SmtpDial; now?: Date } = {},
 ): Promise<ProcessOutcome> {
   const db = drizzle(env.DB);
   const now = options.now ?? new Date();
@@ -208,7 +210,7 @@ export async function processMailOutbox(
   // an untyped error is treated as transient (conservative — the claim's
   // attempt budget bounds it either way).
   try {
-    const transport = resolveTransport(env, { fetchImpl: options.fetchImpl });
+    const transport = resolveTransport(env, { fetchImpl: options.fetchImpl, dial: options.dial });
     const outgoing = shapeOutgoingMail(row, {
       subjectPrefix: env.MAIL_SUBJECT_PREFIX,
       appUrl: env.APP_URL,
@@ -264,7 +266,7 @@ export async function runMailOutboxArm(
   env: MailOutboxEnv,
   body: MailOutboxMessage,
   message: Message,
-  options: { fetchImpl?: typeof fetch; now?: Date } = {},
+  options: { fetchImpl?: typeof fetch; dial?: SmtpDial; now?: Date } = {},
 ): Promise<void> {
   try {
     await processMailOutbox(env, body, options);

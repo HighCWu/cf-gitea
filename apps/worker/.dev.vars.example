@@ -19,6 +19,19 @@ MAIL_FROM=
 MAIL_SUBJECT_PREFIX=
 MAIL_API_BASE=
 MAIL_PROVIDER_API_KEY=
+# The SMTP transport arm (census B-66) — flip MAIL_PROVIDER to "smtp" (+ the
+# vars below) to exercise the raw-socket sender against a local listener,
+# e.g. python3 -m smtpd style stubs. TLS arms expect REAL-CA certificates
+# (workerd rejects self-signed on either side posture); the MAIL_SMTP_*
+# semantics are documented in wrangler.jsonc.example's vars block.
+MAIL_SMTP_PROTOCOL=
+MAIL_SMTP_ADDR=
+MAIL_SMTP_PORT=
+MAIL_SMTP_USER=
+MAIL_SMTP_PASSWORD=
+MAIL_SMTP_ENABLE_HELO=
+MAIL_SMTP_HELO_HOSTNAME=
+MAIL_SMTP_ENVELOPE_FROM=
 # Inbound email (specs/email-inbound.md §8) — OFF by default. Local
 # exercise: set MAIL_INBOUND_ENABLED=true, a reply address carrying
 # %{token} in the user part (the routed zone's domain), and any dev
