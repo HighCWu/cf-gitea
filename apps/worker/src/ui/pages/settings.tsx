@@ -133,7 +133,7 @@
  *   The provider dropdown menu (link_menu) is replaced by the single inline
  *   add form below the list.
  * - The add form fixes the hook type to `gitea` (the generic JSON webhook):
- *   the other nine HOOK_TYPES need provider-specific config fields (Slack
+ *   the other ten HOOK_TYPES need provider-specific config fields (Slack
  *   channel &c.) the form does not render. Events stay the service default
  *   (push-only); the event radio/checkbox matrix is not rendered. Name,
  *   target URL, POST content type, secret and the active flag are the form's

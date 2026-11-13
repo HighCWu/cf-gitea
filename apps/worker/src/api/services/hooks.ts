@@ -58,9 +58,12 @@ import type { RepositoryWithOwner } from "./repository";
 // Upstream validators (routers/api/v1/utils/hook.go + modules/validation)
 // ---------------------------------------------------------------------------
 
-/** `IsValidHookTaskType` (services/webhook/webhook.go:37) — the same set the
- *  vendored `CreateHookOption.type` enum declares; the zod schema gates the
- *  declaration, this gates the message. */
+/** `IsValidHookTaskType` (services/webhook/webhook.go:37-44) — gitea/gogs
+ *  answer true by name, everything else through the registered-requester map;
+ *  the 11-entry set is HOOK_TYPES (the vendored swagger enum's 10 providers
+ *  PLUS `matrix`, whose requester registers upstream and which the API
+ *  therefore accepts — census B-61). The zod schema gates the bind, this
+ *  gates the message. */
 export function isValidHookTaskType(type: string): boolean {
   return (HOOK_TYPES as readonly string[]).includes(type);
 }

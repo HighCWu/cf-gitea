@@ -8,9 +8,12 @@ import { z } from "@hono/zod-openapi";
  * formats, enums, and descriptions. The contract declares no `required`
  * fields on the response models; those mirror that literally.
  * `CreateHookOption` mirrors its `required: [type, config]` and the `type`
- * enum of 10 providers (upstream `CreateHookOption`, modules/structs/hook.go —
- * note `matrix`/`wechatwork`-era drift: the vendored enum is exactly
- * dingtalk/discord/gitea/gogs/msteams/slack/telegram/feishu/wechatwork/packagist).
+ * enum of the vendored contract (upstream `CreateHookOption`,
+ * modules/structs/hook.go — note `matrix`/`wechatwork`-era drift: the vendored
+ * enum is exactly
+ * dingtalk/discord/gitea/gogs/msteams/slack/telegram/feishu/wechatwork/packagist;
+ * the ACCEPTED set widens to upstream's runtime 11 — see HOOK_TYPES below,
+ * census B-61).
  */
 
 /** `#/definitions/Hook.config` — a free string map (`url`, `content_type`, `secret`, ...). */
@@ -73,7 +76,18 @@ export const createHookOptionConfigSchema = z
       'CreateHookOptionConfig has all config options in it\nrequired are "content_type" and "url" Required',
   });
 
-/** The `type` enum of the vendored contract (10 providers). */
+/**
+ * The accepted webhook types — upstream's runtime set (11): the 10 types the
+ * vendored `CreateHookOption.type` swagger enum declares PLUS `matrix`
+ * (census B-61). Upstream's declaration lags its runtime: the binding on
+ * `Type` is only `Required` (modules/structs/hook.go:77) and
+ * `IsValidHookTaskType` (services/webhook/webhook.go:37-44) accepts every
+ * REGISTERED requester — matrix registered its PUT-txn requester
+ * (services/webhook/matrix.go init), so the API accepts `type: "matrix"`
+ * upstream. The zod enum here IS that runtime gate, so matrix joins it; the
+ * vendored swagger file itself is untouched (its 10-value enum stays the
+ * frozen contract, the same doc/runtime split upstream ships).
+ */
 export const HOOK_TYPES = [
   "dingtalk",
   "discord",
@@ -83,6 +97,7 @@ export const HOOK_TYPES = [
   "slack",
   "telegram",
   "feishu",
+  "matrix",
   "wechatwork",
   "packagist",
 ] as const;

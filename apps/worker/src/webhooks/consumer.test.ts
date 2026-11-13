@@ -10,7 +10,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { webhookDeliveries, webhooks } from "../db/schema";
-import { createOwnerHook } from "../api/services/hooks";
+import { createOwnerHook, createRepoHook } from "../api/services/hooks";
 import { emitWebhookDeliveries } from "../issues/webhooks";
 import { encryptInstanceSecretData, INSTANCE_ENVELOPE_PREFIX } from "../services/instance-key";
 import {
@@ -671,6 +671,192 @@ describe("§3.6 recording rules", () => {
     // signatures are always over the stored payload bytes, not the transport form
     const expected = await computeWebhookSignatures("s3cr3t", PAYLOAD);
     expect(calls[1]!.headers["X-Hub-Signature-256"]).toBe(`sha256=${expected.sha256}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-61 — the per-provider request formats (deliver.go's requester dispatch)
+// ---------------------------------------------------------------------------
+
+describe("the HOOK_TYPES zod bind (B-61's enum surface)", () => {
+  it("accepts matrix at the bind and still rejects foreign types (the runtime 11, the vendored declaration's 10)", async () => {
+    const { createHookOptionSchema } = await import("../api/models/webhook");
+    const matrixBind = createHookOptionSchema.safeParse({
+      type: "matrix",
+      config: { url: "http://receiver.test/hook", content_type: "json" },
+    });
+    expect(matrixBind.success).toBe(true); // upstream accepts type: "matrix" (registered requester)
+    const ircBind = createHookOptionSchema.safeParse({
+      type: "irc",
+      config: { url: "http://receiver.test/hook", content_type: "json" },
+    });
+    expect(ircBind.success).toBe(false);
+  });
+});
+
+describe("§3.6 provider request formats (B-61, ./providers/requesters)", () => {
+  const PUSH_PAYLOAD = JSON.stringify(
+    {
+      ref: "refs/heads/main",
+      before: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+      after: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+      compare_url: "",
+      commits: [
+        {
+          id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+          message: "commit message",
+          url: "http://localhost:3000/test/repo/commit/9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+          author: { name: "user1", email: "user1@localhost", username: "user1" },
+        },
+      ],
+      total_commits: 1,
+      head_commit: null,
+      repository: { html_url: "http://localhost:3000/test/repo", name: "repo", full_name: "test/repo" },
+      pusher: { login: "user1", avatar_url: "http://localhost:3000/user1/avatar", html_url: "http://localhost:3000/user1" },
+      sender: { login: "user1", avatar_url: "http://localhost:3000/user1/avatar", html_url: "http://localhost:3000/user1" },
+    },
+    null,
+    2,
+  );
+
+  it("matrix PUTs {url}/{sha1-txn} with the rebuilt matrix payload and signs the REBUILT body", async () => {
+    const hookId = await seedHook({
+      type: "matrix",
+      url: "http://127.0.0.1:8787/_matrix/client/r0/rooms/ROOM/send/m.room.message",
+      meta: JSON.stringify({ homeserver_url: "http://127.0.0.1:8787", room: "!room", message_type: 2 }),
+    });
+    const deliveryId = await seedDelivery(hookId, { eventType: "push", eventGroup: "push", payloadContent: PUSH_PAYLOAD });
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, { WEBHOOK_ALLOWED_HOST_LIST: "loopback" }, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: true });
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0]!;
+    expect(call.method).toBe("PUT");
+    expect(call.url.startsWith("http://127.0.0.1:8787/_matrix/client/r0/rooms/ROOM/send/m.room.message/")).toBe(true);
+    const txn = call.url.split("/").pop()!;
+    expect(txn).toMatch(/^[0-9a-f]{40}$/); // sha1 hex of the trimmed rebuilt body
+
+    // the rebuilt MatrixPayload (msgtype m.text, markdown-converted body)
+    const bodyJson = JSON.parse(call.body ?? "{}") as { msgtype: string; body: string; formatted_body: string };
+    expect(bodyJson.msgtype).toBe("m.text");
+    expect(bodyJson.formatted_body).toContain("pushed 1 commit to");
+    expect(bodyJson.body).toContain("[[test/repo](http://localhost:3000/test/repo)] user1 pushed 1 commit to [main]");
+    expect(call.headers["Content-Type"]).toBe("application/json");
+
+    // signatures sign the REBUILT body, not the stored payload
+    const expected = await computeWebhookSignatures("s3cr3t", call.body ?? "");
+    expect(call.headers["X-Gitea-Signature"]).toBe(expected.sha256);
+    expect(call.headers["X-Hub-Signature-256"]).toBe(`sha256=${expected.sha256}`);
+    // default headers ARE sent for matrix ("has always been sent historically")
+    expect(call.headers["X-Gitea-Event"]).toBe("push");
+    expect(call.headers["X-GitHub-Delivery"]).toBeDefined();
+
+    const row = await deliveryRow(deliveryId);
+    expect(row.state).toBe("delivered");
+    const request = JSON.parse(row.requestContent ?? "{}") as { http_method: string; body: string };
+    expect(request.http_method).toBe("PUT");
+    expect(request.body).toBe(call.body); // the log records the rebuilt body
+  });
+
+  it("an API-created matrix hook (empty meta) fails terminally like upstream's meta parse", async () => {
+    const hook = await createRepoHook(env.DB, "r_test1", {
+      type: "matrix",
+      config: { url: "http://receiver.test/hook", content_type: "json" },
+      active: true,
+      events: ["push"],
+    });
+    const hookId = hook.id;
+    expect(hook.type).toBe("matrix"); // the enum accepts it (B-61)
+    expect(hook.meta).toBe(""); // the API builds meta for slack ONLY (upstream addHook)
+    const deliveryId = await seedDelivery(hookId, { eventType: "push", eventGroup: "push", payloadContent: PUSH_PAYLOAD });
+    const { calls, fetchImpl } = receiverStub(() => {
+      throw new Error("must not send");
+    });
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: false });
+    expect(calls).toHaveLength(0);
+    const row = await deliveryRow(deliveryId);
+    // upstream: GetMatrixPayload meta json fails the empty parse; Deliver wraps (:169-172)
+    expect(row.responseContent ?? "").toContain(
+      "cannot create http request for webhook matrix",
+    );
+    expect(row.responseContent ?? "").toContain("unexpected end of JSON input");
+    expect(row.requestContent).toBeNull();
+    expect((await hookRow(hookId)).lastStatus).toBe(2); // HookStatus.Fail
+  });
+
+  it("slack delivers the reshaped SlackPayload and the stored http_method governs (newJSONRequest)", async () => {
+    const hookId = await seedHook({
+      type: "slack",
+      meta: JSON.stringify({ channel: "general", username: "gitea-bot", icon_url: "", color: "blue" }),
+    });
+    const deliveryId = await seedDelivery(hookId, { eventType: "push", eventGroup: "push", payloadContent: PUSH_PAYLOAD });
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: true });
+
+    const call = calls[0]!;
+    expect(call.method).toBe("POST");
+    expect(call.headers["Content-Type"]).toBe("application/json");
+    const bodyJson = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
+    expect(bodyJson.channel).toBe("general");
+    expect(bodyJson.text).toBe("[<http://localhost:3000/test/repo|test/repo>:<http://localhost:3000/test/repo/src/branch/main|main>] 1 new commit pushed by user1");
+    expect(bodyJson.unfurl_links).toBe(0);
+    // default headers + rebuilt-body signature (deliver.go:91)
+    expect(call.headers["X-Gitea-Delivery"]).toBeDefined();
+    const expected = await computeWebhookSignatures("s3cr3t", call.body ?? "");
+    expect(call.headers["X-Gitea-Signature"]).toBe(expected.sha256);
+  });
+
+  it("feishu sends NO default headers and embeds timestamp/sign for a secreted hook", async () => {
+    const hookId = await seedHook({ type: "feishu", secret: "shhh" });
+    const deliveryId = await seedDelivery(hookId, { eventType: "push", eventGroup: "push", payloadContent: PUSH_PAYLOAD });
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+
+    const call = calls[0]!;
+    expect(call.method).toBe("POST");
+    expect(call.headers["Content-Type"]).toBe("application/json");
+    // prepareJSONRequest(..., false): no X-Gitea/X-Gogs/X-Hub headers at all
+    expect(call.headers["X-Gitea-Delivery"]).toBeUndefined();
+    expect(call.headers["X-Hub-Signature-256"]).toBeUndefined();
+    const bodyJson = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
+    expect(bodyJson.msg_type).toBe("text");
+    expect(typeof bodyJson.timestamp).toBe("number");
+    expect(typeof bodyJson.sign).toBe("string");
+    expect((bodyJson.content as Record<string, unknown>).text).toContain("[test/repo:main] 1 new commit");
+  });
+
+  it("telegram rewrites /sendMessage to /sendRichMessage on the wire", async () => {
+    const hookId = await seedHook({ type: "telegram", url: "http://127.0.0.1:8787/bot/sendMessage" });
+    const deliveryId = await seedDelivery(hookId, { eventType: "push", eventGroup: "push", payloadContent: PUSH_PAYLOAD });
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    await processWebhookDelivery(env.DB, { deliveryId }, { WEBHOOK_ALLOWED_HOST_LIST: "loopback" }, { fetchImpl });
+    expect(calls[0]!.url).toBe("http://127.0.0.1:8787/bot/sendRichMessage");
+    expect(calls[0]!.headers["X-Gitea-Delivery"]).toBeDefined();
+  });
+
+  it("an unknown provider type in a stored row falls back to the default request (Deliver's nil-requester arm)", async () => {
+    const hookId = await seedHook({ type: "irc" });
+    const deliveryId = await seedDelivery(hookId, { eventType: "push", eventGroup: "push", payloadContent: PUSH_PAYLOAD });
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: true });
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.body).toBe(PUSH_PAYLOAD); // the stored payload passes through verbatim
+  });
+
+  it("wraps default-path request errors in upstream's requester-error text (deliver.go:169-172)", async () => {
+    const hookId = await seedHook({ httpMethod: "PUT", type: "gitea" });
+    const deliveryId = await seedDelivery(hookId);
+    const { calls, fetchImpl } = receiverStub(() => new Response(null, { status: 200 }));
+    const outcome = await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    expect(outcome).toEqual({ kind: "delivered", isSucceed: false });
+    expect(calls).toHaveLength(0);
+    const row = await deliveryRow(deliveryId);
+    expect(row.responseContent ?? "").toContain("cannot create http request for webhook gitea[");
+    expect(row.responseContent ?? "").toContain("invalid http method: PUT");
   });
 });
 

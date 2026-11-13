@@ -11,12 +11,18 @@
  *     `MarkTaskDelivered`);
  *  2. read the webhook row; missing row (§4.13 purge) or `is_active=false` ⇒
  *     `state='skipped'`, ack;
- *  3. sign the stored `payload_content` bytes with the secret — HMAC-SHA256
- *     and HMAC-SHA1 via WebCrypto — and build the full upstream header set
- *     (§2.6 `addDefaultHeaders`): `X-Gitea-*`, `X-Gogs-*`, `X-GitHub-*`,
- *     `X-Hub-Signature(-256)`, delivery uuid, event group/type headers;
- *  4. POST `application/json` (or the form/GET parity variants), 5 s timeout
- *     via `AbortSignal.timeout`;
+ *  3. sign the delivery body with the secret — HMAC-SHA256 and HMAC-SHA1 via
+ *     WebCrypto — and build the full upstream header set (§2.6
+ *     `addDefaultHeaders`): `X-Gitea-*`, `X-Gogs-*`, `X-GitHub-*`,
+ *     `X-Hub-Signature(-256)`, delivery uuid, event group/type headers. The
+ *     signed bytes are the stored payload for gitea/gogs/unknown types and the
+ *     REBUILT provider body for provider types (B-61 — the requester dispatch
+ *     of deliver.go:164-172, ./providers/requesters.ts);
+ *  4. send it — POST `application/json` (or the form/GET parity variants) for
+ *     the default request, the per-provider transport for the nine provider
+ *     types (json POST except feishu's headerless arm, matrix's PUT-txn,
+ *     telegram's sendRichMessage rewrite), 5 s timeout via
+ *     `AbortSignal.timeout`;
  *  5. read the response capped at 1 MiB, record `request_content` /
  *     `response_content` (Authorization masked `******`), then
  *     `state='delivered'`, `is_succeed = 2xx`, `webhooks.last_status`.
@@ -100,6 +106,15 @@ import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import { HookStatus, users, webhookDeliveries, webhooks } from "../db/schema";
 import { decryptInstanceSecretData } from "../services/instance-key";
 import { checkWebhookTarget, parseHostPolicy, type EgressMode } from "./ssrf";
+import { planProviderRequest } from "./providers/requesters";
+
+/**
+ * Upstream's default ROOT_URL (modules/setting/server.go:119-120) — the
+ * provider requesters' `setting.AppURL` stand-in when the APP_URL var is
+ * unset (the queue consumer carries no request origin to fall back to; the
+ * webhooks-push appOrigin chain bottoms out at the same value).
+ */
+const DEFAULT_APP_URL = "http://localhost:3000";
 
 /** The only thing a producer puts on the queue (§3.6). */
 export interface WebhookDeliveryMessage {
@@ -113,6 +128,12 @@ export interface WebhookQueueEnv {
   WEBHOOK_ALLOWED_HOST_LIST?: string;
   /** `lax` (default) | `strict`. */
   WEBHOOK_EGRESS_MODE?: string;
+  /**
+   * Upstream `setting.AppURL` — the instance origin the provider request
+   * builders append sender links to (B-61); unset falls back to upstream's
+   * own ROOT_URL default above.
+   */
+  APP_URL?: string;
 }
 
 export interface WebhookDeliveryOptions {
@@ -258,6 +279,35 @@ export async function resolveWebhookAuthorization(d1: D1Database, stored: string
   return decryptInstanceSecretData(d1, stored);
 }
 
+/**
+ * The `addDefaultHeaders` set (deliver.go:94-143), in upstream's Add order —
+ * shared by the default request path and the provider requesters that pass
+ * `withDefaultHeaders=true` (every provider except feishu).
+ */
+function defaultHeaderSet(
+  delivery: { uuid: string; eventType: string; eventGroup: string },
+  targetType: string,
+  signatures: WebhookSignatures,
+): Record<string, string> {
+  return {
+    "X-Gitea-Delivery": delivery.uuid,
+    "X-Gitea-Event": delivery.eventGroup,
+    "X-Gitea-Event-Type": delivery.eventType,
+    "X-Gitea-Signature": signatures.sha256,
+    "X-Gitea-Hook-Installation-Target-Type": targetType,
+    "X-Gogs-Delivery": delivery.uuid,
+    "X-Gogs-Event": delivery.eventGroup,
+    "X-Gogs-Event-Type": delivery.eventType,
+    "X-Gogs-Signature": signatures.sha256,
+    "X-Hub-Signature": `sha1=${signatures.sha1}`,
+    "X-Hub-Signature-256": `sha256=${signatures.sha256}`,
+    "X-GitHub-Delivery": delivery.uuid,
+    "X-GitHub-Event": delivery.eventGroup,
+    "X-GitHub-Event-Type": delivery.eventType,
+    "X-GitHub-Hook-Installation-Target-Type": targetType,
+  };
+}
+
 /** Build the request for one delivery (headers in upstream `addDefaultHeaders` order). */
 export function buildWebhookRequest(input: {
   hook: {
@@ -275,23 +325,7 @@ export function buildWebhookRequest(input: {
   signatures: WebhookSignatures;
 }): BuiltWebhookRequest {
   const { hook, payloadText, delivery, targetType, signatures } = input;
-  const headers: Record<string, string> = {
-    "X-Gitea-Delivery": delivery.uuid,
-    "X-Gitea-Event": delivery.eventGroup,
-    "X-Gitea-Event-Type": delivery.eventType,
-    "X-Gitea-Signature": signatures.sha256,
-    "X-Gitea-Hook-Installation-Target-Type": targetType,
-    "X-Gogs-Delivery": delivery.uuid,
-    "X-Gogs-Event": delivery.eventGroup,
-    "X-Gogs-Event-Type": delivery.eventType,
-    "X-Gogs-Signature": signatures.sha256,
-    "X-Hub-Signature": `sha1=${signatures.sha1}`,
-    "X-Hub-Signature-256": `sha256=${signatures.sha256}`,
-    "X-GitHub-Delivery": delivery.uuid,
-    "X-GitHub-Event": delivery.eventGroup,
-    "X-GitHub-Event-Type": delivery.eventType,
-    "X-GitHub-Hook-Installation-Target-Type": targetType,
-  };
+  const headers = defaultHeaderSet(delivery, targetType, signatures);
 
   const method = hook.httpMethod === "" ? "POST" : hook.httpMethod.toUpperCase();
   let url = hook.url;
@@ -397,7 +431,7 @@ export type DeliveryOutcome =
 export async function processWebhookDelivery(
   d1: D1Database,
   message: WebhookDeliveryMessage,
-  env: Pick<WebhookQueueEnv, "WEBHOOK_ALLOWED_HOST_LIST" | "WEBHOOK_EGRESS_MODE">,
+  env: Pick<WebhookQueueEnv, "WEBHOOK_ALLOWED_HOST_LIST" | "WEBHOOK_EGRESS_MODE" | "APP_URL">,
   options: WebhookDeliveryOptions = {},
 ): Promise<DeliveryOutcome> {
   const db = drizzle(d1);
@@ -433,8 +467,11 @@ export async function processWebhookDelivery(
     return { kind: "skipped", reason: hook === undefined ? "hook-missing" : "inactive" };
   }
 
-  // §3.6 step 3 — sign the stored payload bytes with the hook secret.
-  const signatures = await computeWebhookSignatures(hook.secret, delivery.payloadContent);
+  // §3.6 step 3 — sign the stored payload bytes with the hook secret. (For a
+  // PROVIDER hook type the signing input is the REBUILT provider body, not the
+  // stored bytes — the plan step below resolves that first, mirroring
+  // deliver.go's requester dispatch at :164-172 feeding addDefaultHeaders at
+  // :91 with the requester's body.)
   const targetType = await resolveTargetType(db, hook);
 
   const recordFailure = async (
@@ -468,32 +505,84 @@ export async function processWebhookDelivery(
     );
   }
 
-  let built: BuiltWebhookRequest;
+  // B-61 — the provider requester dispatch (deliver.go:164-172): the request
+  // plan is resolved BEFORE signatures because every provider requester signs
+  // the REBUILT body. Errors carry upstream's wrap text (:169-172).
+  let plan: Awaited<ReturnType<typeof planProviderRequest>>;
   try {
-    built = buildWebhookRequest({
+    plan = await planProviderRequest({
       hook: {
+        type: hook.type,
         url: hook.url,
         httpMethod: hook.httpMethod,
-        contentType: hook.contentType,
-        authorizationHeader,
+        secret: hook.secret,
+        meta: hook.meta,
       },
+      event: delivery.eventType,
       payloadText: delivery.payloadContent,
-      delivery: { uuid: delivery.uuid, eventType: delivery.eventType, eventGroup: delivery.eventGroup },
-      targetType,
-      signatures,
+      appUrl: env.APP_URL ?? DEFAULT_APP_URL,
+      now,
     });
   } catch (error) {
-    // Terminal request-construction error (unsupported method, bad URL form):
-    // recorded like any other failure so the row never sticks in `delivering`
-    // and every event costs one attempt, never a retry loop (§3.6).
+    const message = error instanceof Error ? error.message : String(error);
     return await recordFailure(
       {
         status: 0,
         headers: {},
-        body: `Delivery: ${error instanceof Error ? error.message : String(error)}`,
+        body: `Delivery: cannot create http request for webhook ${hook.type}[${hook.id} ${hook.url}]: ${message}`,
       },
       null,
     );
+  }
+
+  let signatures: WebhookSignatures;
+  let built: BuiltWebhookRequest;
+  if (plan.kind === "provider") {
+    // The requester's body is the signed and logged body (deliver.go:90-91,
+    // :175-183 — RequestInfo.Body = the requester's body bytes).
+    signatures = await computeWebhookSignatures(hook.secret, plan.body);
+    const headers = plan.defaultHeaders
+      ? defaultHeaderSet(
+          { uuid: delivery.uuid, eventType: delivery.eventType, eventGroup: delivery.eventGroup },
+          targetType,
+          signatures,
+        )
+      : {};
+    headers["Content-Type"] = plan.contentType;
+    if (authorizationHeader !== null && authorizationHeader !== "") {
+      headers["Authorization"] = authorizationHeader;
+    }
+    built = { url: plan.url, method: plan.method, headers, body: plan.body, loggedBody: plan.loggedBody };
+  } else {
+    signatures = await computeWebhookSignatures(hook.secret, delivery.payloadContent);
+    try {
+      built = buildWebhookRequest({
+        hook: {
+          url: hook.url,
+          httpMethod: hook.httpMethod,
+          contentType: hook.contentType,
+          authorizationHeader,
+        },
+        payloadText: delivery.payloadContent,
+        delivery: { uuid: delivery.uuid, eventType: delivery.eventType, eventGroup: delivery.eventGroup },
+        targetType,
+        signatures,
+      });
+    } catch (error) {
+      // Terminal request-construction error (unsupported method, bad URL
+      // form): recorded like any other failure so the row never sticks in
+      // `delivering` and every event costs one attempt, never a retry loop
+      // (§3.6). Upstream wraps requester errors identically (deliver.go:171).
+      const message = error instanceof Error ? error.message : String(error);
+      return await recordFailure(
+        {
+          status: 0,
+          headers: {},
+          body: `Delivery: cannot create http request for webhook ${hook.type}[${hook.id} ${hook.url}]: ${message}`,
+        },
+        null,
+      );
+    }
   }
 
   // SSRF gate (§3.6 Egress) — before any request is issued.
