@@ -37,11 +37,11 @@ B-65 (receiver half), B-70 (page half) — plus v1.5.7's B-24/29/34.
   THREE emit-site wirings (releases.ts publish arms / repo.ts transfer
   route / update.ts refreshRunStatus tail — one line each, named in the
   receivers' doc comments).
-- **B-70's remainder** — the ui/index.ts admin-region mounts (family+parse
-  +handler+registration, shapes precisely mapped in /tmp/B70-progress.md:
-  the adminPagePrologue ladder, ~:4963 parse region, ~:20099 registration
-  block). The page + matrix battery are LANDED and green; the page is
-  inert until the mounts land.
+- **B-70 — CLOSED 2026-11-13**: the mounts had already landed (they rode
+  the f8fe5ac fold; c13b23c/90b1526's "parked/NOT flipped" messages lagged
+  their trees); the resume unit verified every region (import/family/parse/
+  handlers/registrations), the battery pins the full surface, and the AD11
+  cell carries the ANSWERED stamp. Nothing remains.
 - **B-59** — derivation complete in /tmp/B59-progress.md: NO migration
   needed (teams.units_map exists); the gap is ~20 lines in
   orgMemberAccessMode (packages/model.ts) + 6 test cases; the guard
