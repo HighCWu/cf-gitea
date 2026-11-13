@@ -42,10 +42,9 @@ B-65 (receiver half), B-70 (page half) — plus v1.5.7's B-24/29/34.
   their trees); the resume unit verified every region (import/family/parse/
   handlers/registrations), the battery pins the full surface, and the AD11
   cell carries the ANSWERED stamp. Nothing remains.
-- **B-59** — derivation complete in /tmp/B59-progress.md: NO migration
-  needed (teams.units_map exists); the gap is ~20 lines in
-  orgMemberAccessMode (packages/model.ts) + 6 test cases; the guard
-  subtlety (blanket-write skips the unit fold) is spelled out.
+- **B-59 — CLOSED 2026-11-13**: the seam landed (teamPackagesUnitMode +
+  the blanket-write guard over teams.units_map, 6 pins green); the
+  "columns migration" framing was a misnomer — the column already existed.
 
 **Open, not started**: B-52 (agit refs/for/* — L, feature lane), B-53
 (block_on_codeowner_reviews + protected-file merge gates — L, feature

@@ -812,12 +812,39 @@ export function maxAccessMode(a: PackageAccessMode, b: PackageAccessMode): Packa
 }
 
 /**
- * The §4.1 org access-mode fold (ratification 8): an org member's grants are
- * `org_members.role` ('owner' = the Owners-team bridge → owner rank) UNIONed
- * with every team row's `authorize` (≥ read → package read, ≥ write →
- * package write — no per-unit column, the landed teams collapse), floored at
- * read for ANY membership row — upstream HasOrgOrUserVisible's membership arm
- * (org.go:458-461: visibility-satisfies OR member) applied at
+ * Upstream `Team.UnitAccessMode(unit.TypePackages)` over our JSON collapse:
+ * the `teams.units_map` entry for `repo.packages` (upstream's team_unit row,
+ * team_unit.go:15-21) parsed through the org-teams ladder — read/write/admin;
+ * absent key, unknown value, unparseable JSON or a null map (plain-permission
+ * team) → none. `owner` is not API-writable per-unit (parseAccessMode never
+ * yields it, access_mode.go:46-62), so the value space stays below the
+ * MaxPerm cap (unit.go:229-234 returns admin for TypePackages — a no-op
+ * here). The team's own `authorize` is NOT folded here; the caller folds it
+ * per team, mirroring UnitAccessModeEx's `max(mode, t.AccessMode)`.
+ */
+function teamPackagesUnitMode(unitsMap: string | null): "none" | "read" | "write" | "admin" {
+  if (unitsMap === null) return "none";
+  try {
+    const entry = (JSON.parse(unitsMap) as Record<string, unknown>)["repo.packages"];
+    return entry === "read" || entry === "write" || entry === "admin" ? entry : "none";
+  } catch {
+    return "none";
+  }
+}
+
+/**
+ * The §4.1 org access-mode fold (ratification 8; the per-unit packages grant
+ * landed over the EXISTING `teams.units_map` column — B-59, no migration:
+ * the column and its write path pre-date the read): an org member's grants
+ * are `org_members.role` ('owner' = the Owners-team bridge → owner rank)
+ * UNIONed with the team union — upstream's two-phase read (package.go:
+ * 136-153): the blanket is max(`authorize`); ONLY while it stays below write
+ * does the per-team loop fold in each team's per-unit `repo.packages` mode
+ * via `max(authorize, unit mode)` (UnitAccessModeEx, team.go:203-217). The
+ * guard is load-bearing: a blanket ≥ write skips the loop entirely, so it
+ * wins over a sibling team's packages-unit admin, exactly as upstream.
+ * Floored at read for ANY membership row — upstream HasOrgOrUserVisible's
+ * membership arm (org.go:458-461: visibility-satisfies OR member) applied at
  * package.go:155-157, so a PLAIN member (no team row) of a private org still
  * reads, exactly as upstream's post-union fallback grants. A non-member stays
  * none and falls through to the visibility read arm.
@@ -831,18 +858,24 @@ async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number
     .get();
   // The membership floor: any org_members row reads at least (upstream
   // HasOrgOrUserVisible org.go:458-461 via package.go:155-157); the team
-  // authorize union below only raises it.
+  // union below only raises it.
   let mode: PackageAccessMode = memberRole === undefined ? "none" : memberRole.role === "owner" ? "owner" : "read";
-  // The team authorize union — every team row counts (upstream's
-  // UnitAccessMode(TypePackages) loop with the per-unit overrides collapsed).
   const teamRows = await db
-    .select({ authorize: teams.authorize })
+    .select({ authorize: teams.authorize, unitsMap: teams.unitsMap })
     .from(teams)
     .innerJoin(teamMembers, eq(teamMembers.teamId, teams.id))
     .where(and(eq(teams.orgId, orgId), eq(teamMembers.userId, doerId)))
     .all();
-  for (const team of teamRows) {
-    mode = maxAccessMode(mode, team.authorize);
+  // package.go:142 — the blanket guard: at write or above the per-team unit
+  // loop is SKIPPED (upstream takes the blanket verbatim there); below it
+  // every team contributes max(authorize, per-unit packages mode).
+  const blanket = teamRows.reduce<PackageAccessMode>((acc, team) => maxAccessMode(acc, team.authorize), "none");
+  if (ACCESS_MODE_RANK[blanket] >= ACCESS_MODE_RANK.write) {
+    mode = maxAccessMode(mode, blanket);
+  } else {
+    for (const team of teamRows) {
+      mode = maxAccessMode(maxAccessMode(mode, team.authorize), teamPackagesUnitMode(team.unitsMap));
+    }
   }
   return mode;
 }
@@ -854,11 +887,13 @@ async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number
  *      passes the verdict via `ownerVisibleToDoer`, false → none);
  *   2. site admin → owner mode (DoerIsSiteAdminFullAccess);
  *   3. owner self → owner mode;
- *   4. org owner: the §4.1 fold (membership role + team authorize union,
- *      floored at read for any membership row — HasOrgOrUserVisible's
- *      membership arm, org.go:458-461 via package.go:155-157), then the
- *      visibility read arm — MEMBERSHIP IS CONSULTED FIRST, so a private
- *      org's own members (team-granted OR plain) keep their read;
+ *   4. org owner: the §4.1 fold (membership role + the team union — the
+ *      authorize blanket, and below a write blanket each team's per-unit
+ *      packages grant, package.go:136-153 — floored at read for any
+ *      membership row — HasOrgOrUserVisible's membership arm, org.go:458-461
+ *      via package.go:155-157), then the visibility read arm — MEMBERSHIP IS
+ *      CONSULTED FIRST, so a private org's own members (team-granted OR
+ *      plain) keep their read;
  *   5. user owner: public → anyone, limited → any authenticated doer,
  *      private → self/admin only.
  *

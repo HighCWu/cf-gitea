@@ -964,11 +964,13 @@ standing with their cites from the modules 14/15 pass). **Surprises of the sweep
     omits both with an economics record — while the same tree already ships
     hand-built zstd and bz2 decoders (the conda/composer landings), the
     existence proof that xz and MD5 are workerd-viable (modules 12/13 sweep).
-23. **The org-team package grant is collapsed to one axis (B-59).** Upstream
-    reads each team's `TypePackages` unit mode (an org's packages-only team
-    grants exactly that); ours folds every team to `teams.access_mode` —
-    SPEC-0016 §4.1's ratification, but the SPEC's own record concedes the
-    parity path is a columns migration, i.e. a choice (modules 12/13 sweep).
+23. **The org-team package grant WAS collapsed to one axis (B-59 — LANDED
+    2026-11-13).** Upstream reads each team's `TypePackages` unit mode; ours
+    folded every team to `teams.access_mode` — the resume unit landed the
+    per-unit read seam over the existing `teams.units_map` (NO migration
+    was needed; the parked "columns migration" framing was a misnomer):
+    `teamPackagesUnitMode` + the blanket-write guard, upstream's
+    package.go:142 composition, pinned in model.test.ts's B-59 describe.
 24. **The package deleted-arm delivers nothing upstream-side (B-60).** Every
     upstream registry deleted endpoint (npm unpublish, the nuget/rubygems/
     chef/terraform version deletes, conan, the distro file-delete folds, the

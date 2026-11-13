@@ -581,6 +581,125 @@ describe("determinePackageAccessMode", () => {
     expect(await determinePackageAccessMode(env.DB, privateRow, null)).toBe("none");
   });
 
+  // B-59 — the per-unit org-team packages grant (upstream package.go:136-153
+  // + UnitAccessModeEx team.go:203-217) over the existing `teams.units_map`
+  // column. Each test seeds the JSON the org-teams write path stores
+  // (assignTeamPermission: units given → authorize 'none' + the map).
+  describe("per-unit org-team packages grant (B-59)", () => {
+    const seedUnitTeam = async (
+      orgId: number,
+      name: string,
+      authorize: "none" | "read" | "write",
+      unitsMapJson: string | null,
+    ) => {
+      const rows = await db()
+        .insert(teams)
+        .values({ orgId, lowerName: name, name, authorize, unitsMap: unitsMapJson })
+        .returning()
+        .all();
+      const id = rows[0]?.id;
+      if (id === undefined) throw new Error("team seed failed");
+      return id;
+    };
+
+    it("packages-unit read team → package read, and read only (pull-yes / push-no)", async () => {
+      const org = await seedUser("acme", { type: "org", visibility: "private" });
+      const member = await seedUser("unitreader");
+      await db().insert(orgMembers).values({ orgId: org.id, userId: member.id, role: "member", createdAt: NOW });
+      const teamId = await seedUnitTeam(org.id, "pkg-read", "none", JSON.stringify({ "repo.code": "write", "repo.packages": "read" }));
+      await db().insert(teamMembers).values({ orgId: org.id, teamId, userId: member.id });
+      // A private org: the floor alone would grant read too — the pin is that
+      // the unit grant lands EXACTLY read (no write pull-through from the
+      // sibling repo.code override, no admin from anywhere).
+      expect(await determinePackageAccessMode(env.DB, { id: org.id, type: "org", visibility: "private" }, { id: member.id, isAdmin: false })).toBe("read");
+    });
+
+    it("packages-unit write team → package write (private org: the floor alone would only read)", async () => {
+      const org = await seedUser("acme2", { type: "org", visibility: "private" });
+      const member = await seedUser("unitwriter");
+      await db().insert(orgMembers).values({ orgId: org.id, userId: member.id, role: "member", createdAt: NOW });
+      const teamId = await seedUnitTeam(org.id, "pkg-write", "none", JSON.stringify({ "repo.packages": "write" }));
+      await db().insert(teamMembers).values({ orgId: org.id, teamId, userId: member.id });
+      expect(await determinePackageAccessMode(env.DB, { id: org.id, type: "org", visibility: "private" }, { id: member.id, isAdmin: false })).toBe("write");
+    });
+
+    it("absent packages key + authorize none → the floor/visibility arm only", async () => {
+      const org = await seedUser("acme3", { type: "org" });
+      const member = await seedUser("otherunit");
+      const outsider = await seedUser("outsider");
+      await db().insert(orgMembers).values({ orgId: org.id, userId: member.id, role: "member", createdAt: NOW });
+      const teamId = await seedUnitTeam(org.id, "code-only", "none", JSON.stringify({ "repo.code": "admin" }));
+      await db().insert(teamMembers).values({ orgId: org.id, teamId, userId: member.id });
+      const orgRow = { id: org.id, type: "org", visibility: "public" } as const;
+      // The repo.code admin override grants NOTHING here; the member reads
+      // through the floor, the non-member through the public visibility arm.
+      expect(await determinePackageAccessMode(env.DB, orgRow, { id: member.id, isAdmin: false })).toBe("read");
+      expect(await determinePackageAccessMode(env.DB, orgRow, { id: outsider.id, isAdmin: false })).toBe("read");
+      // Private flip: the member keeps the membership floor, the outsider
+      // goes blind (controls unchanged).
+      await db().update(users).set({ visibility: "private" }).where(eq(users.id, org.id));
+      const privateRow = { id: org.id, type: "org", visibility: "private" } as const;
+      expect(await determinePackageAccessMode(env.DB, privateRow, { id: member.id, isAdmin: false })).toBe("read");
+      expect(await determinePackageAccessMode(env.DB, privateRow, { id: outsider.id, isAdmin: false })).toBe("none");
+    });
+
+    it("the blanket-write guard: blanket write wins over a sibling team's packages-unit admin (package.go:142)", async () => {
+      const org = await seedUser("acme4", { type: "org", visibility: "private" });
+      const member = await seedUser("bothteams");
+      await db().insert(orgMembers).values({ orgId: org.id, userId: member.id, role: "member", createdAt: NOW });
+      const blanketTeamId = await seedUnitTeam(org.id, "writers", "write", null);
+      const unitAdminTeamId = await seedUnitTeam(org.id, "pkg-admin", "none", JSON.stringify({ "repo.packages": "admin" }));
+      await db().insert(teamMembers).values([
+        { orgId: org.id, teamId: blanketTeamId, userId: member.id },
+        { orgId: org.id, teamId: unitAdminTeamId, userId: member.id },
+      ]);
+      // Upstream SKIPS the per-team loop once the blanket reaches write —
+      // the sibling team's packages-unit admin is never consulted, so the
+      // member writes (not admins) even holding both grants.
+      expect(await determinePackageAccessMode(env.DB, { id: org.id, type: "org", visibility: "private" }, { id: member.id, isAdmin: false })).toBe("write");
+    });
+
+    it("blanket read + packages-unit admin → admin (the MaxPerm cap is a no-op below a write blanket)", async () => {
+      const org = await seedUser("acme5", { type: "org", visibility: "private" });
+      const member = await seedUser("readplusadmin");
+      await db().insert(orgMembers).values({ orgId: org.id, userId: member.id, role: "member", createdAt: NOW });
+      const blanketTeamId = await seedUnitTeam(org.id, "readers", "read", null);
+      const unitAdminTeamId = await seedUnitTeam(org.id, "pkg-admin", "none", JSON.stringify({ "repo.packages": "admin" }));
+      await db().insert(teamMembers).values([
+        { orgId: org.id, teamId: blanketTeamId, userId: member.id },
+        { orgId: org.id, teamId: unitAdminTeamId, userId: member.id },
+      ]);
+      // blanket read < write → the loop runs; the unit team folds
+      // max(none, admin) = admin — unit.go's MaxPerm caps at admin for
+      // TypePackages, a no-op in our API-writable value space.
+      expect(await determinePackageAccessMode(env.DB, { id: org.id, type: "org", visibility: "private" }, { id: member.id, isAdmin: false })).toBe("admin");
+    });
+
+    it("garbage unit values parse to none (owner/banana entries, corrupt JSON)", async () => {
+      const org = await seedUser("acme6", { type: "org", visibility: "private" });
+      const ownerValue = await seedUser("gowner");
+      const banana = await seedUser("gbanana");
+      const corrupt = await seedUser("gcorrupt");
+      await db().insert(orgMembers).values([
+        { orgId: org.id, userId: ownerValue.id, role: "member", createdAt: NOW },
+        { orgId: org.id, userId: banana.id, role: "member", createdAt: NOW },
+        { orgId: org.id, userId: corrupt.id, role: "member", createdAt: NOW },
+      ]);
+      // 'owner' is not API-writable per-unit (parseAccessMode never yields
+      // it) — the read side refuses it, so the member stays at the floor.
+      const ownerTeamId = await seedUnitTeam(org.id, "g-owner", "none", JSON.stringify({ "repo.packages": "owner" }));
+      await db().insert(teamMembers).values({ orgId: org.id, teamId: ownerTeamId, userId: ownerValue.id });
+      const bananaTeamId = await seedUnitTeam(org.id, "g-banana", "none", JSON.stringify({ "repo.packages": "banana" }));
+      await db().insert(teamMembers).values({ orgId: org.id, teamId: bananaTeamId, userId: banana.id });
+      const corruptTeamId = await seedUnitTeam(org.id, "g-corrupt", "none", "{not json");
+      await db().insert(teamMembers).values({ orgId: org.id, teamId: corruptTeamId, userId: corrupt.id });
+      const orgRow = { id: org.id, type: "org", visibility: "private" } as const;
+      expect(await determinePackageAccessMode(env.DB, orgRow, { id: ownerValue.id, isAdmin: false })).toBe("read");
+      expect(await determinePackageAccessMode(env.DB, orgRow, { id: banana.id, isAdmin: false })).toBe("read");
+      expect(await determinePackageAccessMode(env.DB, orgRow, { id: corrupt.id, isAdmin: false })).toBe("read");
+    });
+  });
+
   // The require-sign-in-view instance flag (SPEC-0003 §2.4 row 6, packages
   // arm): services/context/package.go:120 — INSIDE determineAccessMode,
   // `RequireSignInViewStrict && (doer == nil || doer.IsGhost())` → none. The

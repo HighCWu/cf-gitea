@@ -700,7 +700,13 @@ updates §2.1's table + the divergence ledger with its documented reductions.
    vs adding a `team_unit` packages row upstream-parity. Proposal: the
    collapse, consistent with the landed teams model; upstream parity can
    arrive as a columns migration later if a deployment needs per-unit
-   granularity.
+   granularity. **AS-BUILT RESOLUTION (B-59, 2026-11-13)**: parity arrived
+   WITHOUT a migration — the read seam landed over the existing
+   `teams.units_map` (determinePackageAccessMode's orgMemberAccessMode
+   folds per-team `max(authorize, units_map["repo.packages"])` behind
+   upstream's blanket-write guard, package.go:130-146); the collapse's
+   wire behavior is superseded where a team declares a packages unit
+   mode.
 
 ### Ratification (2026-10-29, orchestrator)
 
