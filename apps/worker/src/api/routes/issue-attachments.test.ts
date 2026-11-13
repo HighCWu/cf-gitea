@@ -11,7 +11,10 @@
  * PUT/GET blob pair (411/413/download_count), the 413 threshold at the
  * service seam, the issue-404 / comment-404 / attachment-belongs-to 404
  * rules, the archived 423s, the poster-or-writer gates of both families
- * (incl. the locked-issue arm), and the 201-on-edit / 204-on-delete codes.
+ * (incl. the locked-issue arm), the 201-on-edit / 204-on-delete codes, and
+ * the allow-list enforcement on all four write arms (census B-81 — the
+ * settings quartet's published extension list; unlisted extensions 422 with
+ * upstream's exact ErrFileTypeForbidden message, listed ones pass).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -190,7 +193,7 @@ async function seedComment(issue: TestIssue, posterId = 1): Promise<number> {
   return only(rows).id;
 }
 
-async function seedAttachmentDirect(issue: TestIssue, name = "stored.bin"): Promise<{ id: number; key: string }> {
+async function seedAttachmentDirect(issue: TestIssue, name = "stored.dmp"): Promise<{ id: number; key: string }> {
   const row = await uploadIssueAttachment({
     bucket: env.REPO_PACKS,
     d1: env.DB,
@@ -323,15 +326,15 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
 
     const issue2 = await seedIssue();
     const withQuery = multipartBody("compat-boundary-42", [
-      { name: "attachment", filename: "original.bin", body: "query wins" },
+      { name: "attachment", filename: "original.dmp", body: "query wins" },
     ]);
-    const resQuery = await makeApp()(`${REPO_PATH}/issues/${issue2.index}/assets?name=from-query`, {
+    const resQuery = await makeApp()(`${REPO_PATH}/issues/${issue2.index}/assets?name=from-query.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": withQuery.contentType, "Content-Length": String(withQuery.bytes.byteLength) },
       body: withQuery.bytes,
     });
     expect(resQuery.status).toBe(201);
-    expect((await resQuery.json<Record<string, unknown>>()).name).toBe("from-query");
+    expect((await resQuery.json<Record<string, unknown>>()).name).toBe("from-query.dmp");
   });
 
   it("400s when the name cannot be determined and when the multipart part is missing", async () => {
@@ -358,7 +361,7 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
 
   it("411s a stream upload without Content-Length", async () => {
     const issue = await seedIssue();
-    const request = new Request(`https://example.com${REPO_PATH}/issues/${issue.index}/assets?name=x.bin`, {
+    const request = new Request(`https://example.com${REPO_PATH}/issues/${issue.index}/assets?name=x.dmp`, {
       method: "POST",
       headers: { Authorization: `token ${TOKEN}`, "Content-Type": "application/octet-stream" },
       body: new Blob(["chunked bytes"]).stream(),
@@ -389,13 +392,13 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
 
   it("lets the issue poster attach without repo write access (canUserWriteIssueAttachment)", async () => {
     const issue = await seedIssue({ posterId: 3 });
-    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=poster.bin`, {
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=poster.dmp`, {
       method: "POST",
       headers: { ...posterAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "ok",
     });
     expect(res.status).toBe(201);
-    expect((await res.json<Record<string, unknown>>()).name).toBe("poster.bin");
+    expect((await res.json<Record<string, unknown>>()).name).toBe("poster.dmp");
   });
 
   it("404s an unknown issue index and 423s an archived repo (mustNotBeArchived precedes the handler)", async () => {
@@ -426,7 +429,7 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
 
   it("attaches to pull requests too (the shared issue row)", async () => {
     const pr = await seedIssue({ isPull: true });
-    const res = await makeApp()(`${REPO_PATH}/issues/${pr.index}/assets?name=pr.bin`, {
+    const res = await makeApp()(`${REPO_PATH}/issues/${pr.index}/assets?name=pr.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "ok",
@@ -442,7 +445,7 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
     // old pin asserted the unenforced flag and 201'd through it). Disabling
     // BOTH units 404s the subtree with the bare not-found body.
     await saveRepoSettings(env.DB, REPO_ID, { hasIssues: false, hasPullRequests: false }, new Date());
-    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=x.bin`, {
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=x.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "1" },
       body: "x",
@@ -455,13 +458,13 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
     // picks by the issue's OWN unit — the pull uploads, the plain issue 404s.
     await saveRepoSettings(env.DB, REPO_ID, { hasPullRequests: true }, new Date());
     const pr = await seedIssue({ isPull: true });
-    const pullAsset = await makeApp()(`${REPO_PATH}/issues/${pr.index}/assets?name=pr.bin`, {
+    const pullAsset = await makeApp()(`${REPO_PATH}/issues/${pr.index}/assets?name=pr.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "ok",
     });
     expect(pullAsset.status).toBe(201);
-    const plainAsset = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=x.bin`, {
+    const plainAsset = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=x.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "1" },
       body: "x",
@@ -488,7 +491,7 @@ describe("GET /repos/{owner}/{repo}/issues/{index}/assets (issueListIssueAttachm
   it("hides comment attachments from the issue list and answers an empty list", async () => {
     const issue = await seedIssue();
     const commentId = await seedComment(issue);
-    await seedCommentAttachment(issue, commentId, "in-comment.bin");
+    await seedCommentAttachment(issue, commentId, "in-comment.dmp");
     const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([]);
@@ -507,14 +510,14 @@ describe("GET/PATCH/DELETE …/issues/{index}/assets/{attachment_id} (issueGet/E
     const other = await seedIssue();
     const attach = await seedAttachmentDirect(issue);
     const commentId = await seedComment(issue);
-    const inComment = await seedCommentAttachment(issue, commentId, "comment.bin");
+    const inComment = await seedCommentAttachment(issue, commentId, "comment.dmp");
 
     const ok = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets/${attach.id}`);
     expect(ok.status).toBe(200);
     const body = await ok.json<Record<string, unknown>>();
     expect(body.id).toBe(attach.id);
-    expect(body.name).toBe("stored.bin");
-    expect(body.size).toBe("bytes of stored.bin".length);
+    expect(body.name).toBe("stored.dmp");
+    expect(body.size).toBe("bytes of stored.dmp".length);
 
     // another issue's index → "no such attachment in issue"
     const cross = await makeApp()(`${REPO_PATH}/issues/${other.index}/assets/${attach.id}`);
@@ -588,7 +591,7 @@ describe("GET/PATCH/DELETE …/issues/{index}/assets/{attachment_id} (issueGet/E
 
   it("deletes: object gone first, then the row, 204 — and 404s repeats", async () => {
     const issue = await seedIssue();
-    const attach = await seedAttachmentDirect(issue, "doomed.bin");
+    const attach = await seedAttachmentDirect(issue, "doomed.dmp");
     const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets/${attach.id}`, { method: "DELETE", headers: auth });
     expect(res.status).toBe(204);
     expect(await drizzle(env.DB).select().from(issueAttachments).all()).toHaveLength(0);
@@ -607,14 +610,14 @@ describe("the comment family (/repos/{owner}/{repo}/issues/comments/{id}/assets�
     const issue = await seedIssue();
     const commentId = await seedComment(issue);
 
-    const created = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=c.bin`, {
+    const created = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=c.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "4" },
       body: "cccc",
     });
     expect(created.status).toBe(201);
     const createdBody = await created.json<Record<string, unknown>>();
-    expect(createdBody.name).toBe("c.bin");
+    expect(createdBody.name).toBe("c.dmp");
     const attachmentId = createdBody.id as number;
 
     const row = only(await drizzle(env.DB).select().from(issueAttachments).all());
@@ -627,7 +630,7 @@ describe("the comment family (/repos/{owner}/{repo}/issues/comments/{id}/assets�
 
     const got = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets/${attachmentId}`);
     expect(got.status).toBe(200);
-    expect((await got.json<Record<string, unknown>>()).name).toBe("c.bin");
+    expect((await got.json<Record<string, unknown>>()).name).toBe("c.dmp");
 
     const deleted = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets/${attachmentId}`, {
       method: "DELETE",
@@ -652,7 +655,7 @@ describe("the comment family (/repos/{owner}/{repo}/issues/comments/{id}/assets�
   it("lets the comment poster attach; a locked issue denies the poster without write", async () => {
     const issue = await seedIssue();
     const commentId = await seedComment(issue, 3); // poster 3's comment
-    const ok = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=by-poster.bin`, {
+    const ok = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=by-poster.dmp`, {
       method: "POST",
       headers: { ...posterAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "ok",
@@ -661,14 +664,14 @@ describe("the comment family (/repos/{owner}/{repo}/issues/comments/{id}/assets�
 
     // lock the issue: the poster-without-write arm of CanSelfChangeOrAccessContent
     await drizzle(env.DB).update(issues).set({ isLocked: true }).where(eq(issues.id, issue.id));
-    const locked = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=nope.bin`, {
+    const locked = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=nope.dmp`, {
       method: "POST",
       headers: { ...posterAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "no",
     });
     expect(locked.status).toBe(403);
     // write access rides through the lock
-    const writer = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=writer.bin`, {
+    const writer = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=writer.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "ok",
@@ -680,7 +683,7 @@ describe("the comment family (/repos/{owner}/{repo}/issues/comments/{id}/assets�
     const issue = await seedIssue();
     const commentId = await seedComment(issue);
     const otherComment = await seedComment(issue);
-    const created = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=x.bin`, {
+    const created = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=x.dmp`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "1" },
       body: "x",
@@ -709,13 +712,13 @@ describe("the comment family (/repos/{owner}/{repo}/issues/comments/{id}/assets�
 describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () => {
   it("initiates with a body-less POST: 201 + Attachment + Location, no bytes yet", async () => {
     const issue = await seedIssue();
-    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.bin`, {
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.dmp`, {
       method: "POST",
       headers: { ...auth },
     });
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
-    expect(body.name).toBe("relay.bin");
+    expect(body.name).toBe("relay.dmp");
     expect(body.size).toBe(0);
     const location = res.headers.get("Location");
     expect(location).toBe(
@@ -728,7 +731,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
 
   it("relay PUTs the bytes with the write gate, then GET streams them back with the download count", async () => {
     const issue = await seedIssue();
-    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.bin`, {
+    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.dmp`, {
       method: "POST",
       headers: { ...auth },
     });
@@ -755,7 +758,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     expect(putBody.sha256).toBe(await sha256Hex(payload));
 
     const row = only(await drizzle(env.DB).select().from(issueAttachments).all());
-    expect(row.r2Key).toBe(issueAttachmentKey("r_7402", row.id, "relay.bin"));
+    expect(row.r2Key).toBe(issueAttachmentKey("r_7402", row.id, "relay.dmp"));
     expect(await storedBytes(row.r2Key ?? "")).toEqual(payload);
 
     const got = await makeApp()(blobUrl);
@@ -769,7 +772,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     // to the pipeline). The header set also carries nosniff, the sandbox CSP
     // and the zero-duration Cache-Control.
     expect(got.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
-    expect(got.headers.get("Content-Disposition")).toBe("inline; filename=relay.bin");
+    expect(got.headers.get("Content-Disposition")).toBe("inline; filename=relay.dmp");
     expect(got.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(got.headers.get("Content-Security-Policy")).toBe("sandbox allow-scripts allow-modals allow-popups allow-downloads");
     expect(got.headers.get("Cache-Control")).toBe("max-age=0, private, must-revalidate");
@@ -781,7 +784,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
 
   it("blob GET basename's a slash-carrying stored name in Content-Disposition (httplib path.Base)", async () => {
     const issue = await seedIssue();
-    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.bin`, {
+    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.dmp`, {
       method: "POST",
       headers: { ...auth },
     });
@@ -802,7 +805,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     // must never leak into Content-Disposition.
     await drizzle(env.DB)
       .update(issueAttachments)
-      .set({ name: "nested/dir/relay.bin" })
+      .set({ name: "nested/dir/relay.dmp" })
       .where(eq(issueAttachments.id, attachmentId));
     const got = await makeApp()(blobUrl);
     expect(got.status).toBe(200);
@@ -812,12 +815,12 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     // and the WORD is the sniff pipeline's INLINE default (serve.go:135-141;
     // the text payload resolves text/plain → the SVG-disabled download arm
     // cannot fire), not the former hardcoded "attachment" (moved this wave).
-    expect(got.headers.get("Content-Disposition")).toBe(`inline; filename=relay.bin`);
+    expect(got.headers.get("Content-Disposition")).toBe(`inline; filename=relay.dmp`);
   });
 
   it("an accented stored name masks the safe arm and appends the lowercase RFC 2231 twin (the Go bytes)", async () => {
     const issue = await seedIssue();
-    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=rapport.bin`, {
+    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=rapport.dmp`, {
       method: "POST",
       headers: { ...auth },
     });
@@ -833,7 +836,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
         })
       ).status,
     ).toBe(200);
-    await drizzle(env.DB).update(issueAttachments).set({ name: "rapport (final)é.bin" }).where(eq(issueAttachments.id, attachmentId));
+    await drizzle(env.DB).update(issueAttachments).set({ name: "rapport (final)é.dmp" }).where(eq(issueAttachments.id, attachmentId));
     const got = await makeApp()(blobUrl);
     expect(got.status).toBe(200);
     // getSafeName masks é→_ (quotes: () are printable non-token → quoted arm,
@@ -841,13 +844,13 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     // word is the pipeline's INLINE (the text payload's resolved type;
     // serve.go:135-141 — moved from the former hardcoded "attachment").
     expect(got.headers.get("Content-Disposition")).toBe(
-      `inline; filename="rapport (final)_.bin"; filename*=utf-8''rapport%20%28final%29%C3%A9.bin`,
+      `inline; filename="rapport (final)_.dmp"; filename*=utf-8''rapport%20%28final%29%C3%A9.dmp`,
     );
   });
 
   it("relay GET 404s a pending row and a lying relay PUT is capped/validated", async () => {
     const issue = await seedIssue();
-    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=pending.bin`, {
+    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=pending.dmp`, {
       method: "POST",
       headers: { ...auth },
     });
@@ -876,7 +879,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
   it("relay PUT enforces the family gate for comment attachments and 413s over the cap at the service seam", async () => {
     const issue = await seedIssue();
     const commentId = await seedComment(issue);
-    const init = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=crelay.bin`, {
+    const init = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=crelay.dmp`, {
       method: "POST",
       headers: { ...auth },
     });
@@ -900,7 +903,7 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
         issueId: issue.id,
         commentId: 0,
         uploaderId: 1,
-        name: "too-big.bin",
+        name: "too-big.dmp",
         content: streamOf(payload),
         multipart: false,
         declaredLength: 64,
@@ -910,8 +913,125 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     // the failed upload leaves no extra row (the pending relay row above stays)
     const rowsAfter = await drizzle(env.DB).select().from(issueAttachments).all();
     expect(rowsAfter).toHaveLength(rowsBefore.length);
-    expect(rowsAfter.some((row) => row.name === "too-big.bin")).toBe(false);
+    expect(rowsAfter.some((row) => row.name === "too-big.dmp")).toBe(false);
     expect(await listAttachmentKeys()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The allow-list (census B-81 — upstream upload.Verify over
+// setting.Attachment.AllowedTypes; the quartet's published constant)
+// ---------------------------------------------------------------------------
+
+describe("the issue-attachment allow-list (upload.Verify extension arm)", () => {
+  const FORBIDDEN_MESSAGE = "This file cannot be uploaded or modified due to a forbidden file extension or type.";
+
+  it("create: an unlisted extension 422s with upstream's exact message before any row or bytes land", async () => {
+    const issue = await seedIssue();
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=script.exe`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "4" },
+      body: "evil",
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ message: FORBIDDEN_MESSAGE, url: ERROR_URL });
+    // nothing persisted — upstream answers 422 from Verify, pre-store
+    expect(await drizzle(env.DB).select().from(issueAttachments).all()).toHaveLength(0);
+    expect(await listAttachmentKeys()).toHaveLength(0);
+  });
+
+  it("create: a listed extension passes (the .dmp fixtures throughout this battery ride the same arm)", async () => {
+    const issue = await seedIssue();
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=report.pdf`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
+      body: "ok",
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json<Record<string, unknown>>()).name).toBe("report.pdf");
+  });
+
+  it("comment create: the multipart part filename validates too (422, exact message)", async () => {
+    const issue = await seedIssue();
+    const commentId = await seedComment(issue);
+    const { bytes, contentType } = multipartBody("allowlist-boundary-1", [
+      { name: "attachment", filename: "payload.exe", body: "evil bytes" },
+    ]);
+    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": contentType, "Content-Length": String(bytes.byteLength) },
+      body: bytes,
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ message: FORBIDDEN_MESSAGE, url: ERROR_URL });
+    expect(await drizzle(env.DB).select().from(issueAttachments).all()).toHaveLength(0);
+  });
+
+  it("relay initiation: the phase-1 ?name= validates before the pending row (422, no row)", async () => {
+    const issue = await seedIssue();
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=forbidden.exe`, {
+      method: "POST",
+      headers: { ...auth },
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ message: FORBIDDEN_MESSAGE, url: ERROR_URL });
+    expect(await drizzle(env.DB).select().from(issueAttachments).all()).toHaveLength(0);
+  });
+
+  it("rename: an unlisted extension 422s with the exact message and the stored name stays", async () => {
+    const issue = await seedIssue();
+    const attach = await seedAttachmentDirect(issue, "before.log");
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets/${attach.id}`, {
+      method: "PATCH",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "after.exe" }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ message: FORBIDDEN_MESSAGE, url: ERROR_URL });
+    // persist-on-pass: the forbidden rename never touched the row
+    const row = only(await drizzle(env.DB).select().from(issueAttachments).all());
+    expect(row.name).toBe("before.log");
+  });
+
+  it("comment rename: an unlisted extension 422s (the issue_comment_attachment.go:287-288 twin)", async () => {
+    const issue = await seedIssue();
+    const commentId = await seedComment(issue);
+    const attach = await seedCommentAttachment(issue, commentId, "in-comment.log");
+    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets/${attach.id}`, {
+      method: "PATCH",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "swap.exe" }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ message: FORBIDDEN_MESSAGE, url: ERROR_URL });
+    const row = only(await drizzle(env.DB).select().from(issueAttachments).all());
+    expect(row.name).toBe("in-comment.log");
+  });
+
+  it("rename with no name change re-validates the stored name (upstream's UpdateAttachment shape)", async () => {
+    const issue = await seedIssue();
+    const attach = await seedAttachmentDirect(issue, "keep.log");
+    const empty = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets/${attach.id}`, {
+      method: "PATCH",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(empty.status).toBe(201);
+    expect((await empty.json<Record<string, unknown>>()).name).toBe("keep.log");
+  });
+
+  it("the 422 outranks nothing the 413 pre-check owns (the recorded ordering corner)", async () => {
+    // An oversized FORBIDDEN body answers the declared-length 413 first —
+    // upstream verifies type before size (attachment.go:79-84); ours keeps
+    // the R2 known-length discipline's pre-check (module header's recorded
+    // corner). The pin freezes OUR answer so a reorder is deliberate.
+    const issue = await seedIssue();
+    const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=big.exe`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": String(MAX_ISSUE_ATTACHMENT_BYTES + 1) },
+      body: "x",
+    });
+    expect(res.status).toBe(413);
   });
 });
 
@@ -954,7 +1074,7 @@ describe("POST comment assets: the UpdateComment blocked arm", () => {
     const commentId = await seedComment(issue, 2); // the reader's own comment — the write gate passes
     await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: 2, note: "", createdAt: new Date() });
 
-    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=blocked.bin`, {
+    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=blocked.dmp`, {
       method: "POST",
       headers: { ...readerAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "no",
@@ -974,7 +1094,7 @@ describe("POST comment assets: the UpdateComment blocked arm", () => {
     await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: 2, note: "", createdAt: new Date() });
     await addOrUpdateCollaborator(env.DB, REPO_ID, 2, "admin", new Date());
 
-    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=admin.bin`, {
+    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=admin.dmp`, {
       method: "POST",
       headers: { ...readerAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
       body: "ok",

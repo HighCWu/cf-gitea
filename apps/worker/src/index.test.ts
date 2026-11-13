@@ -1018,17 +1018,20 @@ describe("the unclaimed-repo-path 404 carve (upstream context_response.go:129-15
     expect(await post.text()).toBe("not found\n");
   });
 
-  it("keeps the /api/v1 unknown-path 404 contract (plain, any accept)", async () => {
+  it("keeps the /api/v1 unknown-path 404 contract (upstream GlobalNotFound bytes, any accept)", async () => {
     // "api" is a dispatcher exclusion — the carve never touches the API tree,
-    // and Hono's default notFound stays its answer for ANY accept (the
-    // audit's API-parity ledger note: plain `404 Not Found`, not upstream's
-    // JSON error body — a recorded divergence, not this carve's to flip).
+    // and the root app's global not-found arm (census B-78: upstream's
+    // routers/init.go:209-212 → Go http.NotFound) answers ANY accept with the
+    // exact bytes — body `404 page not found\n`, net/http's
+    // `text/plain; charset=utf-8` spelling, nosniff — never the JSON error
+    // body, never the HTML shell.
     const api = await SELF.fetch("https://example.com/api/v1/nope", {
       headers: { accept: "text/html" },
     });
     expect(api.status).toBe(404);
-    expect(api.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
-    expect(await api.text()).toBe("404 Not Found");
+    expect(api.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(api.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await api.text()).toBe("404 page not found\n");
   });
 });
 
@@ -1121,16 +1124,17 @@ describe("the /user auth-page family carve (upstream web.go:597-599 + 768-771)",
     expect(await res.text()).toBe("Not Found\n");
   });
 
-  it("keeps unregistered tails under the family on Hono's default 404 (the isLoginPath grain)", async () => {
+  it("keeps unregistered tails under the family on the root GlobalNotFound bytes (the isLoginPath grain)", async () => {
     // The carve hands the WHOLE /user/{oauth2,link_account*} prefix to Hono;
-    // a shape no mount registers takes Hono's default plain 404 — upstream's
-    // own unregistered-route posture (chi answers its 404 the same way), the
-    // /login/junk twin's established answer.
+    // a shape no mount registers takes the root app's global not-found arm —
+    // upstream's own unregistered-route posture (chi's root NotFound answers
+    // its unmatched tails the same way), the /login/junk twin's established
+    // answer.
     for (const path of [`/user/oauth2/${sourceName}/junk`, "/user/link_account/junk"]) {
       const res = await SELF.fetch(`https://example.com${path}`, { redirect: "manual" });
       expect(res.status).toBe(404);
-      expect(res.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
-      expect(await res.text()).toBe("404 Not Found");
+      expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+      expect(await res.text()).toBe("404 page not found\n");
     }
   });
 
@@ -1220,15 +1224,16 @@ describe("the consolidated auth fold (the webauthn + two_factor carve, upstream 
     return buildAssertionResponse({ credentialId, authData, clientData, signature, userHandle: null });
   }
 
-  it("keeps unregistered family tails on Hono's default 404 (the isLoginPath grain)", async () => {
+  it("keeps unregistered family tails on the root GlobalNotFound bytes (the isLoginPath grain)", async () => {
     // The carve hands the WHOLE prefix to Hono; a shape no mount registers
-    // takes Hono's plain default — never the engine's lowercase `not found\n`
-    // and never the HTML 404 shell (the /user/oauth2 twin's pin).
+    // takes the root app's global not-found arm — never the engine's
+    // lowercase `not found\n` and never the HTML 404 shell (the
+    // /user/oauth2 twin's pin).
     for (const path of ["/user/webauthn/junk", "/user/settings/security/webauthn/junk", "/user/two_factor/junk"]) {
       const res = await SELF.fetch(`https://example.com${path}`, { redirect: "manual" });
       expect(res.status).toBe(404);
-      expect(res.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
-      expect(await res.text()).toBe("404 Not Found");
+      expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+      expect(await res.text()).toBe("404 page not found\n");
     }
   });
 

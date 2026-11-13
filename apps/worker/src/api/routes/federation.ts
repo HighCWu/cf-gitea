@@ -199,11 +199,14 @@ function goHttpError(status: number, text: string): Response {
   });
 }
 
-/** The disabled API arm — the router's native not-found bytes (Hono's
- *  default handler: `c.text("404 Not Found", 404)`), the "absent from the
- *  router" posture api.go:1007's registration conditional produces. */
-function routerNativeNotFound(c: Context<ApiEnv>): Response {
-  return c.text("404 Not Found", 404);
+/** The disabled API arm — the router's native not-found bytes: upstream's
+ *  root GlobalNotFound (routers/init.go:209-212 → Go `http.NotFound`), the
+ *  "absent from the router" posture api.go:1007's registration conditional
+ *  produces. The root app's global not-found arm (src/index.ts, census B-78)
+ *  answers the same `404 page not found\n` shape for the tree — this explicit
+ *  arm stays self-contained so the gate never depends on mount plumbing. */
+function routerNativeNotFound(_c: Context<ApiEnv>): Response {
+  return goHttpError(404, "404 page not found");
 }
 
 /** chi v5.4.0's methodMap (tree.go — incl. the RFC-10008 QUERY placeholder,

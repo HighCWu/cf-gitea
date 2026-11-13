@@ -150,6 +150,35 @@ app.onError(async (error, c) => {
   }
 });
 
+// THE GLOBAL NOT-FOUND ARM (census B-78 — the MS4 recorded-divergence flip):
+// unregistered paths answer the root router's GlobalNotFound
+// (routers/init.go:209-212): Go `http.NotFound` = `http.Error(w,
+// "404 page not found", 404)` — body `404 page not found\n` (trailing
+// newline), `Content-Type: text/plain; charset=utf-8` (net/http's own
+// spelling, WITH the space — Gitea's PlainText omits it),
+// `X-Content-Type-Options: nosniff`. Hono's default not-found (`404 Not
+// Found`, no newline, no nosniff) was the recorded divergence this handler
+// replaces. Registered on the ROOT app exactly like upstream's root chi
+// router: chi Mount bubbles unmatched sub-tree requests to the parent's
+// NotFound, and Hono `route()` composition matches that shape — a sub-app's
+// own notFound never fires under route(), while `c.notFound()` calls inside
+// ANY merged handler (the UI drift-guard arms) resolve to THIS handler
+// (hono-base.js dispatch hands the app's notFoundHandler to every context),
+// so one registration restores the bytes tree-wide — the API tree, the
+// federation disabled arms, the web carve tails. The security-headers
+// middleware still stamps the pair post-next (dispatch runs the matched
+// middleware chain before the notFound fall-through), so nosniff + SAMEORIGIN
+// ride exactly like upstream's tree-wide SecurityHeadersHandler.
+app.notFound(() =>
+  new Response("404 page not found\n", {
+    status: 404,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    },
+  }),
+);
+
 // THE SECURITY-HEADERS MIDDLEWARE (usability F2, docs/usability/findings-latency-health.md):
 // upstream stamps `X-Content-Type-Options: nosniff` + `X-Frame-Options:
 // SAMEORIGIN` on EVERY response leaving Gitea — SecurityHeadersHandler

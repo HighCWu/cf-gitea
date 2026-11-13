@@ -22,6 +22,13 @@ import {
   readableStreamFromGenerator,
 } from "../services/release-assets";
 import { findIssueByRepoAndIndex, findRepoCommentById, commentNotExistError, issueErrorToApiError } from "../services/issues";
+// The landed upload.Verify port (the repo-upload family's twin — census
+// B-81's validator; reused, not re-ported).
+import { verifyUploadFileType } from "../../services/upload-staging";
+// The published allow-list — ONE source with the settings quartet (census
+// B-81): the exact string /settings/attachment advertises is the string the
+// write arms enforce.
+import { GENERAL_ATTACHMENT_SETTINGS } from "./misc-t2";
 import { assertIssueRowUnit, assertIssuesOrPullsUnit, issuePullUnits } from "../services/issue-unit-gates";
 import { assertNotBlockedForIssueContent } from "../services/blocks";
 import {
@@ -119,11 +126,27 @@ import type { RepositoryWithOwner } from "../services/repository";
  *     declares 403 only for comment-create — issue_attachment.go:364 fires
  *     for all three issue writes), 411 (missing Content-Length on inline
  *     uploads), 412 (mustEnableIssuesOrPulls — unreachable, every repo has
- *     the issues unit enabled), 500 (unexpected store failures);
- *   - the 422 arms of POST are declared but unreachable: upstream's 422 is
- *     the allowed-types rejection (issue_attachment.go:196-198) and this
- *     instance gates attachment types at no point (the release-assets.ts
- *     posture); PATCH's declared 422 fires on a malformed JSON body only.
+ *     the issues unit enabled), 500 (unexpected store failures).
+ *
+ * The allow-list (census B-81 — formerly the "declared but unreachable" 422
+ * note): upstream's 422 IS the allowed-types rejection — create through
+ * upload.Verify (issue_attachment.go:196-198 → services/attachment/
+ * attachment.go:78), rename through UpdateAttachment's Verify
+ * (issue_attachment.go:273-279 → attachment.go:94-97), both answering
+ * `ctx.APIError(422, err.Error())` with upload.ErrFileTypeForbidden's exact
+ * message. The enforcement lives here now (assertAttachmentTypeAllowed over
+ * the settings quartet's published constant, reusing the landed
+ * upload-staging Verify port), on ALL FOUR write arms plus
+ * the relay initiation; the declared 422 on PATCH additionally fires on a
+ * malformed JSON body (bodyBind422). Ordering corner, recorded: upstream
+ * verifies the type BEFORE the size cap (Verify then the maxFileSize check,
+ * attachment.go:79-84), while our declared-length 413 pre-check
+ * (readCreateBody, the R2 known-length discipline) precedes the name walk —
+ * an oversized body with a FORBIDDEN extension answers 413 here where
+ * upstream answers 422; allowed-type oversize still 413s both ways (the
+ * store's per-chunk cap keeps that arm). The release-asset family needs no
+ * counterpart: upstream's release allow-list default is the empty string =
+ * allow-all (modules/setting/repository.go:176).
  *
  * Documented divergences (upstream behavior vs this instance):
  *   - upstream CreateIssueAttachment bumps the issue's content_version via
@@ -359,6 +382,38 @@ async function findCommentAttachment(d1: D1Database, commentId: number, rawAttac
 
 /** SPEC-0005 §3.3 / the landed asset-LFS cap convention — 512 MiB. */
 export const MAX_ISSUE_ATTACHMENT_BYTES = 512 * 1024 * 1024;
+
+/**
+ * The issue-attachment allow-list gate — census B-81. Upstream's
+ * upload.Verify extension arm (services/context/upload/upload.go), the shared
+ * validator both upstream arms run: create
+ * (issue_attachment.go:196-198 → services/attachment/attachment.go:78
+ * `upload.Verify(buf, name, setting.Attachment.AllowedTypes)`) and rename
+ * (:273-279 → UpdateAttachment's `upload.Verify(nil, name, ...)`,
+ * attachment.go:94-97 — the nil buffer SKIPS the mime arms, extension-only).
+ * Forbidden answers upstream's exact 422 (`ctx.APIError(422,
+ * ErrFileTypeForbidden.Error())`); nothing persists.
+ *
+ * The validator is the LANDED PORT (services/upload-staging.ts
+ * verifyUploadFileType — the repo-upload family's Verify twin, magic-number
+ * sniff included); this family reuses it rather than growing a second port.
+ * The call sites pass the EMPTY buffer — the port's `len(buf) <= 1` arm then
+ * skips the mime checks exactly like upstream's nil-buffer Verify. Recorded
+ * (not silent): upstream's create DOES sniff the first 1024 bytes, but this
+ * instance's configured list is the PUBLISHED CONSTANT — extension-only
+ * entries, no runtime knob can add a mime entry — and under an
+ * extension-only list the sniff arms cannot change any outcome (an allowed
+ * extension passes at the extension arm before sniffing; an unlisted one
+ * fails the loop regardless of the sniff), so the empty-buffer call is
+ * behavioral-equivalent for every reachable input while the streaming
+ * upload stays un-buffered (AGENTS.md Workers rules).
+ */
+function assertAttachmentTypeAllowed(fileName: string): void {
+  const refusal = verifyUploadFileType(new Uint8Array(0), fileName, GENERAL_ATTACHMENT_SETTINGS.allowed_types);
+  if (refusal !== null) {
+    throw new ApiError(422, refusal);
+  }
+}
 
 /** R2 multipart-upload part size for the multipart path (≥ 5 MiB minimum). */
 const UPLOAD_PART_BYTES = 8 * 1024 * 1024;
@@ -805,6 +860,13 @@ export function registerIssueAttachmentRoutes(
 
     const uploaderId = c.get("authUser")?.id ?? 0;
     const parsed = await readCreateBody(c.req.raw, queryName);
+    // The allow-list gate (census B-81): upstream Verify runs BEFORE any row
+    // or bytes land (issue_attachment.go:196-198; the relay twin carries no
+    // upstream counterpart, so its phase-1 validates the ?name= the same
+    // way). The relay PUT that later stores bytes under the row's name is
+    // safe without its own check — the name was validated here and only the
+    // validated rename arm can ever change it.
+    assertAttachmentTypeAllowed(parsed.relay ? queryName : parsed.name);
     if (parsed.relay) {
       // Two-phase initiation: the row only, 201 + the upload URL in the
       // Location header (module header flow 2).
@@ -967,8 +1029,12 @@ export function registerIssueAttachmentRoutes(
       const row = await findIssueAttachment(c.env.DB, issue.id, c.req.valid("param").attachment_id);
       const form = c.req.valid("json");
       // Upstream renames only when a non-empty name arrives
-      // (issue_attachment.go:268-271); there is no content to re-validate,
-      // so the declared 422 arm (allowed-types, :273-279) stays unreachable.
+      // (issue_attachment.go:268-271), then UpdateAttachment verifies the
+      // FINAL name against the allow-list — :273-279, the nil-buffer Verify
+      // (extension-only) that answers the declared 422 and persists nothing
+      // (census B-81; an unchanged stored name re-validates too, upstream's
+      // exact shape).
+      assertAttachmentTypeAllowed(form.name !== undefined && form.name !== "" ? form.name : row.name);
       if (form.name !== undefined && form.name !== "") {
         await drizzle(c.env.DB).update(issueAttachments).set({ name: form.name }).where(eq(issueAttachments.id, row.id));
       }
@@ -1152,6 +1218,11 @@ export function registerIssueAttachmentRoutes(
       }
       const row = await findCommentAttachment(c.env.DB, target.comment.id, c.req.valid("param").attachment_id);
       const form = c.req.valid("json");
+      // The rename arm's allow-list verify — the comment family's
+      // UpdateAttachment twin (issue_comment_attachment.go:287-288, the same
+      // nil-buffer extension-only Verify; final name, persist-on-pass —
+      // census B-81).
+      assertAttachmentTypeAllowed(form.name !== undefined && form.name !== "" ? form.name : row.name);
       if (form.name !== undefined && form.name !== "") {
         await drizzle(c.env.DB).update(issueAttachments).set({ name: form.name }).where(eq(issueAttachments.id, row.id));
       }

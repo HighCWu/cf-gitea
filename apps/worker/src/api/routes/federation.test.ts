@@ -136,6 +136,19 @@ async function api(
 ): Promise<Response> {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
+  // Production parity: the unmatched-tail bytes come from the ROOT app's
+  // global not-found arm (src/index.ts, census B-78 — upstream's
+  // GlobalNotFound); the standalone harness mirrors that handler verbatim so
+  // the unregistered-tail pins see the production shape.
+  app.notFound(() =>
+    new Response("404 page not found\n", {
+      status: 404,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "x-content-type-options": "nosniff",
+      },
+    }),
+  );
   if (opts?.auth !== undefined) {
     const auth = opts.auth;
     app.use("*", async (c, next) => {
@@ -641,11 +654,14 @@ describe("the /api/v1 stubs — registration gate", () => {
     for (const federation of [undefined, "false"]) {
       const nodeinfo = await api("/nodeinfo", {}, { federation });
       expect(nodeinfo.status, "nodeinfo disabled").toBe(404);
-      expect(await nodeinfo.text(), "nodeinfo disabled").toBe("404 Not Found");
+      // upstream's GlobalNotFound bytes (init.go:209-212 → http.NotFound) —
+      // the exact shape the root app's global not-found arm answers in
+      // production (census B-78); this explicit arm self-contains them.
+      expect(await nodeinfo.text(), "nodeinfo disabled").toBe("404 page not found\n");
 
       const activitypub = await api("/activitypub/user-id/1", { method: "POST" }, { federation });
       expect(activitypub.status, "activitypub disabled").toBe(404);
-      expect(await activitypub.text(), "activitypub disabled").toBe("404 Not Found");
+      expect(await activitypub.text(), "activitypub disabled").toBe("404 page not found\n");
     }
   });
 });
@@ -668,7 +684,11 @@ describe("the /api/v1 arms — the gate and the scope ladder", () => {
     ]) {
       const response = await api(path, {}, { federation: "true" });
       expect(response.status, path).toBe(404);
-      expect(await response.text(), path).toBe("404 Not Found");
+      // In production the unmatched tail falls through the merged router to
+      // the root app's global not-found arm (census B-78 — upstream's
+      // GlobalNotFound bytes); the standalone harness mirrors that handler
+      // so the unit pin sees the same bytes (see the api() helper).
+      expect(await response.text(), path).toBe("404 page not found\n");
     }
   });
 
@@ -802,7 +822,7 @@ describe("the method arms — chi's 405 tree, no HEAD fallback", () => {
 
     const options = await api("/nodeinfo", { method: "OPTIONS" }, { federation: "false" });
     expect(options.status).toBe(404);
-    expect(await options.text()).toBe("404 Not Found");
+    expect(await options.text()).toBe("404 page not found\n");
   });
 
   it("API activitypub arms: every known non-registered method tree-405s with Allow, BEFORE the scope gate", async () => {
@@ -834,7 +854,7 @@ describe("the method arms — chi's 405 tree, no HEAD fallback", () => {
     }
     const inboxOptions = await api("/activitypub/user-id/1/inbox", { method: "OPTIONS" }, { federation: "false" });
     expect(inboxOptions.status).toBe(404);
-    expect(await inboxOptions.text()).toBe("404 Not Found");
+    expect(await inboxOptions.text()).toBe("404 page not found\n");
   });
 });
 

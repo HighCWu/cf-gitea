@@ -88,14 +88,14 @@ describe("API JSON class", () => {
   });
 });
 
-describe("API plain 404 class (Hono default notFound)", () => {
+describe("API plain 404 class (the root GlobalNotFound arm)", () => {
   it("stamps nosniff + frame posture, no CSP, on the plain text answer", async () => {
     const response = await SELF.fetch("https://example.com/api/v1/nope", {
       headers: { accept: "text/html" },
     });
     expect(response.status).toBe(404);
-    expect(response.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
-    expect(await response.text()).toBe("404 Not Found");
+    expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(await response.text()).toBe("404 page not found\n");
     expectUniversalPosture(response.headers);
     expect(response.headers.get("content-security-policy")).toBeNull();
   });
