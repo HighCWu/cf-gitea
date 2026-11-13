@@ -558,7 +558,7 @@ export interface ContainerOwner {
   id: number;
   usernameLower: string;
   visibility: "public" | "limited" | "private";
-  type: "user" | "org";
+  type: "user" | "org" | "bot";
 }
 
 async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, image: string, now = new Date()) {

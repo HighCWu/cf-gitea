@@ -223,7 +223,7 @@ function compileRulePattern(pattern: string): RegExp | null {
  *  user rows (schema.ts users.type, upstream's own trick). */
 interface CleanupOwnerRow {
   id: number;
-  type: "user" | "org";
+  type: "user" | "org" | "bot";
   visibility: "public" | "limited" | "private";
   usernameLower: string;
 }

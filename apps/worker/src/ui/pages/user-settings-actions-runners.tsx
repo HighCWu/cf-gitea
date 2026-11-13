@@ -227,7 +227,7 @@ export async function loadUserSettingsActionsRunnersPageData(
       : Promise.resolve([] as { id: string; ownerNamespace: string; slug: string }[]),
     ownerIds.length > 0
       ? db.select({ id: users.id, username: users.username, type: users.type }).from(users).where(inArray(users.id, ownerIds)).all()
-      : Promise.resolve([] as { id: number; username: string; type: "user" | "org" }[]),
+      : Promise.resolve([] as { id: number; username: string; type: "user" | "org" | "bot" }[]),
   ]);
   const reposById = new Map(repoRows.map((row) => [row.id, row]));
   const ownersById = new Map(ownerRows.map((row) => [row.id, row]));

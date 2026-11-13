@@ -308,7 +308,7 @@ export const MAX_PAGE_SIZE = 50;
 /** The org projection of a `users` row as selected from Drizzle — OrgRecord
  *  plus the `type` discriminator the §4.11 type gate reads. */
 interface OrgUserRow extends OrgRecord {
-  type: "user" | "org";
+  type: "user" | "org" | "bot";
 }
 
 /** Shared projection: the org columns of `users` (the landed table's

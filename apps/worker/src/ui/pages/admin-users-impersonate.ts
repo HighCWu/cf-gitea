@@ -142,7 +142,7 @@ export type AdminUserImpersonateOutcome =
 export interface AdminImpersonateTarget {
   readonly id: number;
   readonly username: string;
-  readonly type: "user" | "org";
+  readonly type: "user" | "org" | "bot";
 }
 
 /**

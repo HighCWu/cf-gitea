@@ -100,7 +100,7 @@ export interface AlpineOwner {
   id: number;
   usernameLower: string;
   visibility: "public" | "limited" | "private";
-  type: "user" | "org";
+  type: "user" | "org" | "bot";
 }
 
 export const ALPINE_PROPERTY_METADATA = "alpine.metadata";

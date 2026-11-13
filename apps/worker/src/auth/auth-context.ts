@@ -35,7 +35,7 @@ export interface AuthUser {
    * sets them); hand-built AuthUser slices (predicate-only bridges) omit
    * them and the adapter then renders the documented defaults.
    */
-  type?: "user" | "org";
+  type?: "user" | "org" | "bot";
   visibility?: "public" | "limited" | "private";
   numStars?: number;
   /** The row's `last_login_at` — the last SESSION MINT instant (upstream

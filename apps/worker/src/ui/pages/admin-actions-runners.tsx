@@ -415,7 +415,7 @@ export async function loadAdminActionsRunnersPageData(
       : Promise.resolve([] as { id: string; ownerNamespace: string; slug: string }[]),
     ownerIds.length > 0
       ? db.select({ id: users.id, username: users.username, type: users.type }).from(users).where(inArray(users.id, ownerIds)).all()
-      : Promise.resolve([] as { id: number; username: string; type: "user" | "org" }[]),
+      : Promise.resolve([] as { id: number; username: string; type: "user" | "org" | "bot" }[]),
   ]);
   const reposById = new Map(repoRows.map((row) => [row.id, row]));
   const ownersById = new Map(ownerRows.map((row) => [row.id, row]));
@@ -683,7 +683,7 @@ export async function loadAdminActionsRunnerEditPageData(
   // The runner's OWN belongs-to enrichment (LoadAttributes runner.go:170-186).
   let repoFullName: string | null = null;
   let ownerName: string | null = null;
-  let ownerType: "user" | "org" | null = null;
+  let ownerType: "user" | "org" | "bot" | null = null;
   if (runner.repoId !== "") {
     const repoRow = (
       await db

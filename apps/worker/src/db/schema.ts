@@ -664,12 +664,19 @@ export const users = sqliteTable(
     // recreated): type, profile columns, the maintained member counter, and
     // the org-only team-access flag. Upstream user.go:48–165.
     // -------------------------------------------------------------------------
-    /** Upstream UserType 0/1 (user.go:48–67): 'user' | 'org' — orgs ARE user
-     *  rows (upstream's own trick, `Organization.TableName()` = "user",
+    /** Upstream UserType (user.go:48–67): 'user' (Individual, 0) | 'org'
+     *  (Organization, 1) | 'bot' (UserTypeBot, 4) — orgs ARE user rows
+     *  (upstream's own trick, `Organization.TableName()` = "user",
      *  gitea/models/organization/org.go:76–87). Usernames and org slugs share
      *  `users_username_lower_uq`; owner lookups stay one type-blind read.
-     *  Reserved variants (2–5) have no cf-gitea equivalent yet. */
-    type: text("type", { enum: ["user", "org"] }).notNull().default("user"),
+     *  'bot' (B-72, 2026-11-13): upstream's admin-created account class —
+     *  the web create arm mints bot rows (users.go:190-193) with an EMPTY
+     *  passwd (createUser :788-794 stores passwd=''+salt=''+algo=''; bots
+     *  never password-authenticate — the login lookups are Individual-only,
+     *  user.go:1137/:1405, mirrored by password-auth.ts's `type='user'`
+     *  filters). Reserved variants (2–3) and RemoteUser (5) have no
+     *  cf-gitea equivalent yet. */
+    type: text("type", { enum: ["user", "org", "bot"] }).notNull().default("user"),
     /** Upstream FullName (user.go:99–105); null for unused profile fields. */
     fullName: text("full_name"),
     description: text("description"),
