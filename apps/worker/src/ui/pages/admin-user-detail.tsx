@@ -85,12 +85,19 @@
  *   - view_orgs: "Organizations (Total: N)" + the membership rows — the
  *     placeholder avatar glyph (the org-home avatar-slot rule), the name
  *     link, the Private badge on private orgs, the "Joined on" date line
- *     (DateUtils.AbsoluteShort — formatAdminDate). The Remove All button +
- *     modal and the per-org Remove buttons are OMITTED — they POST to
- *     `/-/admin/users/{id}/orgs/*` (web.go:826-827), unlanded writes (the
- *     dead-control rule). The listing is the landed
- *     `OrgService.listUserOrgs` (the GET /user/orgs read, maxVisibility
- *     "private" — the admin sees every membership upstream's
+ *     (DateUtils.AbsoluteShort — formatAdminDate). THE REMOVE ARMS (the
+ *     census B-71 pair, web.go:824-825): the Remove All button opens the
+ *     remove-all-orgs-modal upstream (view_orgs.tmpl:7-21) and the per-org
+ *     Remove button is a link-action with the confirm modal
+ *     (view_orgs.tmpl:47-49) — the no-JS reduction posts the same paths
+ *     plain (`{link}/orgs/remove-all` and `{link}/orgs/{orgId}/remove`, the
+ *     landed index.ts families "admin-user-orgs-remove-all" /
+ *     "admin-user-org-remove"; the JS-dialect classes and the confirm
+ *     dialogs drop, the impersonate button's reduction). The refusal /
+ *     success flashes ride upstream's JSONRedirect("") — the no-session-flash
+ *     reduction 303s onto this page (the arms' handler notes). The listing
+ *     is the landed `OrgService.listUserOrgs` (the GET /user/orgs read,
+ *     maxVisibility "private" — the admin sees every membership upstream's
  *     GetUserOrganizations lists), capped at the service's MAX_PAGE_SIZE —
  *     upstream pages with ListOptionsAll (unbounded); a target with >50
  *     orgs truncates, the documented reduction.
@@ -174,6 +181,8 @@ export const adminUserDetailLocale = {
   requires_activation: "Requires activation", // "settings.requires_activation" (:10)
   private: "Private", // "repo.desc.private" (view_orgs.tmpl:31)
   joined_on: "Joined on %s", // "user.joined_on" (view_orgs.tmpl:37)
+  remove_all: "Remove All", // "remove_all" (view_orgs.tmpl:7 — the B-71 sweep button)
+  remove: "Remove", // "remove" (view_orgs.tmpl:49 — the B-71 per-org button)
   avatar_section: "Avatar", // "settings.avatar" (edit.tmpl:190's section header — the fold's title)
   impersonate: "Impersonate", // "admin.users.impersonate" (view.tmpl:8 — the header's POST button)
   edit: "Edit", // "admin.users.edit" (view.tmpl:10 — the header's Edit link)
@@ -386,13 +395,23 @@ function UserEmailsBlock(props: { emails: AdminUserEmailEntry[] }) {
   );
 }
 
-/** The view_orgs block (view_orgs.tmpl — the remove arms omitted, the
- *  module header). */
-function UserOrgsBlock(props: { orgs: OrgRecord[] }) {
+/** The view_orgs block (view_orgs.tmpl — the B-71 remove arms live, the
+ *  module header carries the reductions). */
+function UserOrgsBlock(props: { userId: number; orgs: OrgRecord[] }) {
+  const link = adminUserLink(props.userId);
   return (
     <>
-      <h4 class="ui top attached header">
-        {adminUserDetailLocale.organizations} ({adminUserDetailLocale.total.replace("%d", String(props.orgs.length))})
+      <h4 class="ui top attached header flex-left-right">
+        <span>
+          {adminUserDetailLocale.organizations} ({adminUserDetailLocale.total.replace("%d", String(props.orgs.length))})
+        </span>
+        {props.orgs.length > 0 ? (
+          /* view_orgs.tmpl:7-21's show-modal button + remove-all-orgs-modal —
+             the no-JS reduction posts the modal form's action plain. */
+          <form method="post" action={`${link}/orgs/remove-all`}>
+            <button type="submit" class="ui red tiny button">{adminUserDetailLocale.remove_all}</button>
+          </form>
+        ) : null}
       </h4>
       {props.orgs.length > 0 ? (
         <div class="ui attached segment">
@@ -416,6 +435,14 @@ function UserOrgsBlock(props: { orgs: OrgRecord[] }) {
                       <Icon name="octicon-calendar" /> {adminUserDetailLocale.joined_on.replace("%s", formatAdminDate(org.createdAt))}
                     </span>
                   </div>
+                </div>
+                {/* view_orgs.tmpl:46-50's item-trailing Remove (the
+                    link-action + data-modal-confirm dialect — the no-JS
+                    reduction posts the same URL plain). */}
+                <div class="item-trailing">
+                  <form method="post" action={`${link}/orgs/${org.id}/remove`}>
+                    <button type="submit" class="ui red tiny button">{adminUserDetailLocale.remove}</button>
+                  </form>
                 </div>
               </div>
             ))}
@@ -517,7 +544,7 @@ export function AdminUserDetailPage(props: { ctx: UiContext; data: AdminUserDeta
         )}
       </div>
 
-      <UserOrgsBlock orgs={data.orgs} />
+      <UserOrgsBlock userId={user.id} orgs={data.orgs} />
     </AdminFamilyShell>
   );
 }

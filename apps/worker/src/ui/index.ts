@@ -1238,7 +1238,7 @@ import {
   IMPERSONATE_UNKNOWN_USER_ERROR,
   adminUserImpersonate,
 } from "./pages/admin-users-impersonate";
-import { adminUserAvatarDelete, adminUserAvatarUpload, adminUserLink } from "./pages/admin-users-avatar";
+import { adminUserAvatarDelete, adminUserAvatarUpload, adminUserLink, loadAdminAvatarUser } from "./pages/admin-users-avatar";
 import { ADMIN_USERS_LIST_LINK, loadAdminUserDetail, renderAdminUserDetailPage } from "./pages/admin-user-detail";
 import {
   loadAdminUserEdit,
@@ -1881,7 +1881,7 @@ import { toApiUser } from "../api/auth";
 import { ApiError } from "../api/errors";
 import { IssuesService } from "../issues/service";
 import { deleteNoticesByIds, emptyNotices, parseNoticeIds } from "../services/notices";
-import { OrgService, type OrgRecord } from "../services/orgs/orgs";
+import { MAX_PAGE_SIZE, OrgService, type OrgRecord } from "../services/orgs/orgs";
 // Window-2d: the four repo-settings tab modules.
 import {
   applyRepoGitHook,
@@ -3843,7 +3843,14 @@ export interface AdminRoute {
     | "admin-user-edit"
     | "admin-users-impersonate"
     | "admin-user-avatar"
-    | "admin-user-avatar-delete";
+    | "admin-user-avatar-delete"
+    // The census B-71 org-removal pair (web.go:824-825 — POST-only upstream,
+    // the GET twins answer chi's 405): the per-org remove
+    // (admin.RemoveUserFromOrg, users.go:624-651) and the remove-all sweep
+    // (admin.RemoveUserFromAllOrgs, users.go:651-683) — the user-detail
+    // page's org section is the forms' only source (view_orgs.tmpl).
+    | "admin-user-org-remove"
+    | "admin-user-orgs-remove-all";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -3864,6 +3871,9 @@ export interface AdminRoute {
    *  families — the digits-only PathParamInt64 parity, junk stays
    *  engine-404). */
   adminUserId?: number;
+  /** The positive-integer {org_id} (the admin-user-org-remove family —
+   *  web.go:824's param; the same digits-only PathParamInt64 posture). */
+  orgId?: number;
   /** The monitor queue-manage pair's qid (the Cloudflare queue NAME). */
   qid?: string;
   /** The positive-integer {id} for the admin actions families — the
@@ -4797,6 +4807,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (tail.length === 4 && tail[0] === "users" && tail[2] === "avatar" && tail[3] === "delete" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-user-avatar-delete", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    // The census B-71 org-removal pair (web.go:824-825 — POST-only upstream,
+    // the GET twins answer chi's 405): the remove-all literal and the per-org
+    // remove inside the /orgs group — chi claims the static segment before
+    // the {org_id} param; both ids are the same digits-only parity (junk
+    // stays engine-404).
+    if (tail.length === 4 && tail[0] === "users" && tail[2] === "orgs" && tail[3] === "remove-all" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-user-orgs-remove-all", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    if (
+      tail.length === 5 &&
+      tail[0] === "users" &&
+      tail[2] === "orgs" &&
+      tail[4] === "remove" &&
+      /^\d+$/.test(tail[1] as string) &&
+      /^\d+$/.test(tail[3] as string)
+    ) {
+      return {
+        family: "admin-user-org-remove",
+        adminUserId: Number.parseInt(tail[1] as string, 10),
+        orgId: Number.parseInt(tail[3] as string, 10),
+      };
     }
     if (tail.length === 1 && tail[0] === "orgs") return { family: "admin-orgs" };
     if (tail.length === 1 && tail[0] === "repos") return { family: "admin-repos" };
@@ -14328,6 +14360,94 @@ async function adminUserAvatarDeleteSubmit(c: Context<{ Bindings: Env }>, userId
   return p.respond(new Response(null, { status: 303, headers: { location: outcome.redirect } }));
 }
 
+/**
+ * POST /-/admin/users/{userid}/orgs/{org_id}/remove (web.go:824 — census
+ * B-71, admin.RemoveUserFromOrg, routers/web/admin/users.go:624-651): the
+ * user-detail page's per-org Remove button (view_orgs.tmpl:47-49's
+ * link-action data-url — the no-JS plain-form reduction posts the same path).
+ * prepareUserInfo's unknown-{userid} arm is the LIST redirect (users.go:
+ * 269-281 — the detail page's landed posture, the avatar seam's read);
+ * GetOrgByID's miss is ServerError (users.go:630-635) — 500 plain, never a
+ * silent redirect. The remove itself is the landed `OrgService.removeMember`
+ * (the full RemoveOrgUser port — the race-proof last-owner guard, the
+ * num_members decrement and the team sweep ride the service); upstream's
+ * ErrLastOrgOwner arm flashes form.last_org_owner and JSONRedirect("")s
+ * (users.go:638-643) — the no-session-flash reduction 303s onto the detail
+ * page with the membership INTACT — and every other failure is
+ * ServerError ("RemoveOrgUser", users.go:644-646). The non-member no-op
+ * (services/org/user.go:31-35's `!has → nil`) is a success arm.
+ */
+async function adminUserOrgRemoveSubmit(c: Context<{ Bindings: Env }>, userId: number, orgId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if ((await loadAdminAvatarUser(c.env.DB, userId)) === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  }
+  const orgs = new OrgService(c.env.DB);
+  if ((await orgs.getOrgById(orgId)) === null) {
+    return p.respond(new Response("Internal Server Error", { status: 500 }));
+  }
+  try {
+    await orgs.removeMember(orgId, userId);
+  } catch (error) {
+    if (!(error instanceof LastOrgOwnerError)) {
+      return p.respond(new Response("Internal Server Error", { status: 500 })); // ServerError("RemoveOrgUser")
+    }
+    // ErrLastOrgOwner: the refusal flash drops in the no-session-flash
+    // reduction — the JSONRedirect("") reload is the bare 303, membership
+    // intact (the guard held the delete in-batch).
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
+}
+
+/**
+ * POST /-/admin/users/{userid}/orgs/remove-all (web.go:825 — census B-71,
+ * admin.RemoveUserFromAllOrgs, routers/web/admin/users.go:651-683): the
+ * user-detail page's Remove All button (view_orgs.tmpl:7's show-modal
+ * opening the form-fetch-action dialog — the no-JS reduction posts the same
+ * path plain). prepareUserInfo's unknown-{userid} arm is the LIST redirect.
+ * The org set is GetUserOrganizations (users.go:656-659) — upstream's model
+ * read is UNBOUNDED (models/organization/org_user.go:59-64, no ListOptions),
+ * so the landed listUserOrgs pages drain up front (a short page ends it) and
+ * the sweep runs over the collected set, upstream's collect-then-loop shape.
+ * The loop's skip semantics are the pin: an ErrLastOrgOwner refusal skips
+ * the org (users.go:664-666 — "some may require another owner first"), any
+ * other failure skips too (users.go:667-669's log.Error + continue), and
+ * removeMember's non-member no-op counts as removed (upstream's nil return
+ * passes the `removedCount++`). The some_orgs_removed warning and
+ * all_orgs_removed success flashes drop in the no-session-flash reduction;
+ * JSONRedirect("") is the 303 onto the detail page either way.
+ */
+async function adminUserOrgsRemoveAllSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if ((await loadAdminAvatarUser(c.env.DB, userId)) === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  }
+  const orgs = new OrgService(c.env.DB);
+  const targets: OrgRecord[] = [];
+  for (let page = 1; ; page++) {
+    const list = await orgs.listUserOrgs(userId, { maxVisibility: "private", page, pageSize: MAX_PAGE_SIZE });
+    targets.push(...list.items);
+    if (list.items.length < MAX_PAGE_SIZE) break;
+  }
+  for (const target of targets) {
+    try {
+      await orgs.removeMember(target.id, userId);
+    } catch {
+      // ErrLastOrgOwner skips the org (users.go:664-666); any other failure
+      // skips too (users.go:667-669's log.Error + continue) — one bad org
+      // never aborts the sweep.
+      continue;
+    }
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
+}
+
 async function adminUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
@@ -20293,6 +20413,16 @@ uiRouter.post("/-/admin/users/:userid{\\d+}/edit", (c) => adminUserEditSubmit(c,
 uiRouter.post("/-/admin/users/:userid{\\d+}/impersonate", (c) => adminUsersImpersonateSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.post("/-/admin/users/:userid{\\d+}/avatar", (c) => adminUserAvatarSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.post("/-/admin/users/:userid{\\d+}/avatar/delete", (c) => adminUserAvatarDeleteSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
+// The census B-71 org-removal pair (web.go:824-825 — POST-only upstream;
+// the GET twins answer chi's 405 — the admin-repos-delete convention). The
+// remove-all literal and the {org_id}/remove param shape never shadow:
+// different depths, and the param claims digits only.
+uiRouter.post("/-/admin/users/:userid{\\d+}/orgs/remove-all", (c) => adminUserOrgsRemoveAllSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
+uiRouter.get("/-/admin/users/:userid{\\d+}/orgs/remove-all", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/users/:userid{\\d+}/orgs/:orgid{\\d+}/remove", (c) =>
+  adminUserOrgRemoveSubmit(c, Number.parseInt(c.req.param("userid"), 10), Number.parseInt(c.req.param("orgid"), 10)),
+);
+uiRouter.get("/-/admin/users/:userid{\\d+}/orgs/:orgid{\\d+}/remove", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
 // The listing's delete write (web.go:851 — POST-only; the GET twin answers

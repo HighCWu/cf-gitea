@@ -26,8 +26,12 @@
  *   - THE REPOSITORIES (view.tmpl:31-38): every OWNED repo, slug ASC, the
  *     private badge, the shared row's description line.
  *   - THE ORGS (view_orgs.tmpl): the membership rows with the private
- *     badge + joined-on line; the remove arms render NOWHERE (unlanded
- *     writes — the dead-control rule).
+ *     badge + joined-on line; THE REMOVE ARMS (census B-71, web.go:824-825)
+ *     render as the no-JS plain-form reductions — the Remove All sweep
+ *     button (only when orgs exist, the `{{if $userOrgs}}` gate) and the
+ *     per-org Remove buttons, POSTing `{link}/orgs/remove-all` and
+ *     `{link}/orgs/{orgId}/remove` (the landed index.ts families; the
+ *     handlers' suite lives in ui/index.test.ts).
  *   - THE AVATAR FOLD: the upload form + delete button point at the landed
  *     admin-users-avatar.ts seams (`/-/admin/users/{id}/avatar[ /delete]`),
  *     whose redirects land HERE; the impersonate button and the edit link
@@ -84,6 +88,8 @@ interface Seeded {
   bobProhibitedId: number;
   orgPublicName: string;
   orgPrivateName: string;
+  orgPublicId: number;
+  orgPrivateId: number;
 }
 
 async function seedUser(options: Parameters<typeof seedVerifiedUser>[0] & { email?: string; fullName?: string | null; location?: string | null; website?: string | null }): Promise<{ id: number; username: string }> {
@@ -150,6 +156,8 @@ async function seedDetail(): Promise<Seeded> {
     bobProhibitedId: bob.id,
     orgPublicName: pub.username,
     orgPrivateName: priv.username,
+    orgPublicId: pub.id,
+    orgPrivateId: priv.id,
   };
 }
 
@@ -257,18 +265,37 @@ describe("the render (view.tmpl + the folds)", () => {
     expect(html).toContain("Total: 2");
   });
 
-  it("the orgs block: the membership rows with the private badge + joined-on; NO remove arms", async () => {
+  it("the orgs block: the membership rows with the private badge + joined-on + the B-71 remove arms", async () => {
     const seeded = await seedDetail();
     const data = (await loadAdminUserDetail(env.DB, seeded.aliceId))!;
     const html = renderAdminUserDetailPage(ctx, { ...data });
     expect(html).toContain(`href="/${seeded.orgPublicName}"`);
     expect(html).toContain(`href="/${seeded.orgPrivateName}"`);
     expect(html).toContain("Joined on Jan 1, 2026");
-    // The dead-control rule: view_orgs' remove-all modal + per-org Remove
-    // buttons are unlanded writes — they render nowhere.
+    // The B-71 pair's no-JS reductions (view_orgs.tmpl:7-21 + :46-50): the
+    // Remove All sweep form and the per-org Remove forms, each POSTing the
+    // landed index.ts family's path.
+    expect(html).toContain('class="ui top attached header flex-left-right"');
+    expect(html).toContain(`action="/-/admin/users/${seeded.aliceId}/orgs/remove-all"`);
+    expect(html).toContain(`>${adminUserDetailLocale.remove_all}</button>`);
+    expect(html).toContain(`action="/-/admin/users/${seeded.aliceId}/orgs/${seeded.orgPublicId}/remove"`);
+    expect(html).toContain(`action="/-/admin/users/${seeded.aliceId}/orgs/${seeded.orgPrivateId}/remove"`);
+    expect(html).toContain(`>${adminUserDetailLocale.remove}</button>`);
+    // The upstream modal dialog and its JS dialect drop in the reduction.
     expect(html).not.toContain("remove-all-orgs-modal");
+    expect(html).not.toContain("data-modal-confirm");
+    expect(html).not.toContain("link-action");
+  });
+
+  it("the orgs block on an org-less target: NO Remove All button (the `{{if $userOrgs}}` gate), the rows absent", async () => {
+    const seeded = await seedDetail();
+    const data = (await loadAdminUserDetail(env.DB, seeded.bobProhibitedId))!;
+    const html = renderAdminUserDetailPage(ctx, { ...data });
+    expect(data.orgs).toHaveLength(0);
     expect(html).not.toContain("/orgs/remove-all");
-    expect(html).not.toContain("/orgs/remove");
+    // The empty segment list drops with the gate (view_orgs.tmpl:25).
+    expect(html).toContain(adminUserDetailLocale.organizations);
+    expect(html).toContain("Total: 0");
   });
 
   it("THE AVATAR FOLD: the upload form + delete button target the landed admin-users-avatar seams", async () => {

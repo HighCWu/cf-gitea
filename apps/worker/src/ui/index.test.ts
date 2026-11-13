@@ -571,6 +571,16 @@ describe("parseUiRoute", () => {
     ["/-/admin/users/x/edit", null], // junk id
     ["/-/admin/users/7/edit/extra", null], // deeper tails stay engine-owned
     ["/-/admin/users/edit", null], // the literal stays unclaimed (digits only)
+    // The B-71 org-removal pair (web.go:824-825 — POST-only; the remove-all
+    // literal and the {org_id}/remove param shape hold apart by tail length,
+    // both ids digits-only).
+    ["/-/admin/users/7/orgs/remove-all", { family: "admin-user-orgs-remove-all", adminUserId: 7 }],
+    ["/-/admin/users/7/orgs/9/remove", { family: "admin-user-org-remove", adminUserId: 7, orgId: 9 }],
+    ["/-/admin/users/x/orgs/remove-all", null], // junk userid
+    ["/-/admin/users/7/orgs/x/remove", null], // junk org id
+    ["/-/admin/users/7/orgs/9/remove/extra", null], // deeper tails stay engine-owned
+    ["/-/admin/users/7/orgs/9", null], // the bare org id stays unclaimed
+    ["/-/admin/users/7/orgs/remove-all/extra", null],
     // The repo-scoped twin stays unclaimed — the repo settings actions
     // family has no scoped-workflows tail (the engine's 404).
     ["/alice/demo/settings/actions/scoped-workflows", null],
@@ -1732,7 +1742,7 @@ describe("the five dead-route fixes' route pins", () => {
     await drizzle(env.DB).insert(issues).values({ repoId: repo.id, index: 1, title: "pinned", posterId: alice.id, createdAt: new Date(1_700_000_000 * 1000) });
     const issue = await drizzle(env.DB).select({ id: issues.id }).from(issues).where(eq(issues.repoId, repo.id)).get();
     if (issue === undefined) throw new Error("seed issue missing");
-    await drizzle(env.DB).insert(issuePins).values({ issueId: issue.id, repoId: repo.id, pinOrder: 1 });
+    await drizzle(env.DB).insert(issuePins).values({ issueId: issue.id, repoId: repo.id, isPull: false, pinOrder: 1 });
     const cookie = await mintSession(env.DB, alice.id);
 
     // The admin (owner) DELETE: 204, the pin row gone, the unpin system
@@ -2541,6 +2551,121 @@ describe("POST /-/admin/repos/delete (web.go:851)", () => {
       body: new URLSearchParams({ id: "whatever" }).toString(),
     });
     expect(res.status).toBe(404);
+  });
+});
+
+// --- the census B-71 org-removal pair (web.go:824-825 — the user-detail
+//     page's view_orgs arms over the landed OrgService.removeMember) -------
+
+describe("POST /-/admin/users/{id}/orgs/{org}/remove + /orgs/remove-all (web.go:824-825)", () => {
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  function orgPost(path: string, cookie: string): RequestInit {
+    return {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local", cookie },
+      body: "",
+    };
+  }
+
+  it("the per-org remove: a site admin 303s onto the detail page, the membership row and the team sweep go, the counter follows", async () => {
+    const admin = await seedVerifiedUser({ username: "orgrm-admin", isAdmin: true });
+    const target = await seedVerifiedUser({ username: "orgrm-target" });
+    const other = await seedVerifiedUser({ username: "orgrm-owner" });
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const org = await orgs.createOrg({ name: "orgrm-org", ownerId: other.id, visibility: "public" });
+    expect(await orgs.addMember(org.id, target.id)).toBe(true);
+    const team = await teams.createTeam(org, { name: "orgrm-dev", permission: "write" });
+    await teams.addTeamMember(team, target.id);
+    expect((await orgs.getOrgById(org.id))?.numMembers).toBe(2);
+
+    const res = await fetchUi(`/-/admin/users/${target.id}/orgs/${org.id}/remove`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/-/admin/users/${target.id}`);
+    expect(await orgs.getMembership(org.id, target.id)).toBeNull();
+    // The team sweep rode the same service call (the grants read
+    // team_members WITHOUT re-checking org membership).
+    const swept = await drizzle(env.DB).select({ id: teamMembers.id }).from(teamMembers).where(eq(teamMembers.userId, target.id)).all();
+    expect(swept).toHaveLength(0);
+    expect((await orgs.getOrgById(org.id))?.numMembers).toBe(1);
+  });
+
+  it("the last-owner refusal: 303 reload with the membership INTACT (ErrLastOrgOwner — the flash drops, the row must not)", async () => {
+    const admin = await seedVerifiedUser({ username: "orgrm2-admin", isAdmin: true });
+    const owner = await seedVerifiedUser({ username: "orgrm2-owner" });
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "orgrm2-org", ownerId: owner.id, visibility: "public" });
+
+    const res = await fetchUi(`/-/admin/users/${owner.id}/orgs/${org.id}/remove`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/-/admin/users/${owner.id}`);
+    expect(await orgs.getMembership(org.id, owner.id)).not.toBeNull();
+  });
+
+  it("the miss ladder: unknown userid 303s to the LIST (prepareUserInfo); unknown org_id 500s (ServerError); a non-member org is a silent success", async () => {
+    const admin = await seedVerifiedUser({ username: "orgrm3-admin", isAdmin: true });
+    const member = await seedVerifiedUser({ username: "orgrm3-member" });
+    const other = await seedVerifiedUser({ username: "orgrm3-owner" });
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "orgrm3-org", ownerId: other.id, visibility: "public" });
+
+    const ghostUser = await fetchUi(`/-/admin/users/${member.id + 10_000}/orgs/${org.id}/remove`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(ghostUser.status).toBe(303);
+    expect(ghostUser.headers.get("location")).toBe("/-/admin/users");
+
+    const ghostOrg = await fetchUi(`/-/admin/users/${member.id}/orgs/${org.id + 10_000}/remove`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(ghostOrg.status).toBe(500);
+
+    // The non-member no-op (services/org/user.go:31-35's `!has → nil`) is a
+    // success arm — 303, and the actual member's row untouched.
+    const noop = await fetchUi(`/-/admin/users/${member.id}/orgs/${org.id}/remove`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(noop.status).toBe(303);
+    expect(noop.headers.get("location")).toBe(`/-/admin/users/${member.id}`);
+    expect(await orgs.getMembership(org.id, other.id)).not.toBeNull();
+  });
+
+  it("the GET twins answer 405 (POST-only upstream); a non-admin POST 404-shells (the prologue's gate)", async () => {
+    const twinAll = await fetchUi("/-/admin/users/1/orgs/remove-all", { method: "GET" });
+    expect(twinAll.status).toBe(405);
+    expect(twinAll.headers.get("allow")).toBe("POST");
+    const twinOne = await fetchUi("/-/admin/users/1/orgs/2/remove", { method: "GET" });
+    expect(twinOne.status).toBe(405);
+    expect(twinOne.headers.get("allow")).toBe("POST");
+
+    const plain = await seedVerifiedUser({ username: "orgrm4-plain" });
+    const forbidden = await fetchUi("/-/admin/users/1/orgs/remove-all", orgPost("/x", await sessionHeader(plain.id)));
+    expect(forbidden.status).toBe(404);
+  });
+
+  it("remove-all: every removable org clears, the last-owner org survives (users.go:664-666's skip); an unknown userid 303s to the LIST", async () => {
+    const admin = await seedVerifiedUser({ username: "orgall-admin", isAdmin: true });
+    const target = await seedVerifiedUser({ username: "orgall-target" });
+    const other = await seedVerifiedUser({ username: "orgall-owner" });
+    const orgs = new OrgService(env.DB);
+    const plainA = await orgs.createOrg({ name: "orgall-a", ownerId: other.id, visibility: "public" });
+    const plainB = await orgs.createOrg({ name: "orgall-b", ownerId: other.id, visibility: "public" });
+    const ownedC = await orgs.createOrg({ name: "orgall-c", ownerId: target.id, visibility: "public" });
+    await orgs.addMember(plainA.id, target.id);
+    await orgs.addMember(plainB.id, target.id);
+
+    const res = await fetchUi(`/-/admin/users/${target.id}/orgs/remove-all`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/-/admin/users/${target.id}`);
+    expect(await orgs.getMembership(plainA.id, target.id)).toBeNull();
+    expect(await orgs.getMembership(plainB.id, target.id)).toBeNull();
+    // The sole-owner org skipped — "some may require another owner first".
+    expect(await orgs.getMembership(ownedC.id, target.id)).not.toBeNull();
+
+    const ghost = await fetchUi(`/-/admin/users/${target.id + 10_000}/orgs/remove-all`, orgPost("/x", await sessionHeader(admin.id)));
+    expect(ghost.status).toBe(303);
+    expect(ghost.headers.get("location")).toBe("/-/admin/users");
   });
 });
 
