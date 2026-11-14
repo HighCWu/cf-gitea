@@ -323,6 +323,19 @@ describe("the render (view.tmpl + the folds)", () => {
     expect(html).toContain(`href="/-/admin/users/${seeded.aliceId}/edit"`);
     expect(html).toContain(">Edit</a>");
   });
+
+  it("a bot target renders NO impersonate button (view.tmpl:9's `{{if not .User.IsTypeBot}}` — live since B-72 handoff 3); the edit link stays", async () => {
+    const seeded = await seedDetail();
+    await drizzle(env.DB).update(users).set({ type: "bot" }).where(eq(users.id, seeded.aliceId));
+    const data = (await loadAdminUserDetail(env.DB, seeded.aliceId))!;
+    const html = renderAdminUserDetailPage(ctx, { ...data });
+    expect(html).not.toContain(`action="/-/admin/users/${seeded.aliceId}/impersonate"`);
+    expect(html).not.toContain(">Impersonate</button>");
+    expect(html).toContain(`href="/-/admin/users/${seeded.aliceId}/edit"`);
+    // No type label renders on the detail page (view_details carries only
+    // the Admin label — upstream's own).
+    expect(html).not.toContain(">Bot</span>");
+  });
 });
 
 /** The unknown-id redirect target — the module re-exports the pair's const;

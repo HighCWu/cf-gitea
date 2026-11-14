@@ -54,13 +54,17 @@
  *                                  shape) is prohibited, so the status arm
  *                                  covers it).
  *                                  + the "Admin" basic label when isAdmin
- *                                  (list.tmpl:110-111); the Reserved (type 2)
- *                                  / Remote (type 5) / Bot
- *                                  (shared/user/user_type_label) arms are
- *                                  unreachable — `users.type` is only
- *                                  'user'|'org' and this list is type='user'
- *                                  (the individual family; orgs live on the
- *                                  sibling page) — no row can carry them
+ *                                  (list.tmpl:110-111), then the Bot mark
+ *                                  (shared/user/user_type_label,
+ *                                  list.tmpl:117) on bot rows — LIVE since
+ *                                  B-72 (the users.type 'bot' value; the
+ *                                  loader lists the individual + bot
+ *                                  family, upstream's unfiltered web list
+ *                                  includes the type); the Reserved
+ *                                  (type 2) / Remote (type 5) arms stay
+ *                                  unreachable — those types have no D1
+ *                                  enum members (orgs live on the sibling
+ *                                  page)
  *                                  (sortable: alphabetically/reverse-
  *                                  alphabetically, data-sortt-default)
  *   Email Address                  users.email ?? "" (list.tmpl:119)
@@ -774,7 +778,8 @@ export interface AdminUsersData {
 
 /**
  * The list load — `admin.Users` → `RenderUserSearch` over the landed columns:
- * type='user' (upstream's individual family — orgs never surface, users.go:74),
+ * the individual + bot family (upstream's unfiltered list kinds minus the
+ * D1-absent reserved/remote values — orgs never surface, users.go:74-75),
  * the admin-actor keyword triple (username/full name/email — SearchByEmail,
  * the API twin's exact instr() predicate), the five status filters (the
  * header's mapping) + the user_type arm, the sort, one page of 50.
@@ -784,7 +789,13 @@ export interface AdminUsersData {
  */
 export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminUsersData> {
   const params = parseAdminUsersListParams(search);
-  const conditions: SQL[] = [eq(users.type, "user")];
+  // Upstream's unfiltered web list carries EVERY listable account kind
+  // (users.go:74-75: Individual + UserReserved + Bot + RemoteUser — "an
+  // administrator needs to list every account kind"; orgs never surface).
+  // The reserved/remote types have no D1 enum members, so the base is the
+  // individual + bot family (B-72 handoff 5 — bot rows are listable, the
+  // label arm is reachable).
+  const conditions: SQL[] = [sql`${users.type} in ('user', 'bot')`];
 
   if (params.keyword !== "") {
     const keyword = params.keyword.toLowerCase();
@@ -813,8 +824,15 @@ export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams
   if (statusFilter.is_restricted === "1" || statusFilter.is_2fa_enabled === "1") {
     conditions.push(sql`0 = 1`);
   }
+  // The user_type filter (users.go:74-79): the posted type parses through
+  // convert.UserTypeFromString — "User" narrows to Individuals, "Bot" to
+  // bots (live since B-72), junk/absent stays unfiltered (the parser
+  // absorbs junk to ""). Organizations are never listable here.
   if (userType === "Bot") {
-    conditions.push(sql`0 = 1`); // no bot rows exist (users.type is 'user'|'org')
+    conditions.push(eq(users.type, "bot"));
+  }
+  if (userType === "User") {
+    conditions.push(eq(users.type, "user"));
   }
 
   const where = and(...conditions);
@@ -1129,6 +1147,13 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
                       <span>{row.username}</span>
                     )}
                     {row.isAdmin ? <span class="ui basic label tw-py-0 tw-align-baseline">{adminUsersLocale.admin_label}</span> : null}
+                    {/* shared/user/user_type_label (list.tmpl:117): the Bot
+                        mark rides AFTER the admin/reserved/remote chain —
+                        live since B-72 (the loader lists bot rows; upstream's
+                        unfiltered web list includes the type). */}
+                    {row.type === "bot" ? (
+                      <span class="ui basic label tw-py-0 tw-align-baseline">{adminUsersLocale.user_type_bot}</span>
+                    ) : null}
                   </td>
                   <td class="gt-ellipsis tw-max-w-48">{row.email ?? ""}</td>
                   {/* The auth-source cell: every account is local (the

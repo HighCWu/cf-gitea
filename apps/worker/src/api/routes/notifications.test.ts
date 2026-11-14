@@ -60,6 +60,7 @@ const TOKEN_MUTER = "muter-token";
 const TOKEN_ORGOWNER = "orgowner-token";
 const TOKEN_TEAMGRANT = "teamgrant-token";
 const TOKEN_PLAINMEMBER = "plainmember-token";
+const TOKEN_BOT = "bot-token";
 
 const T_TRANSFER = new Date("2026-03-03T00:00:00Z"); // the pending transfer's insert stamp
 
@@ -130,7 +131,9 @@ function resolver(): AuthResolver {
                       ? "teamgrant"
                       : token === TOKEN_PLAINMEMBER
                         ? "plainmember"
-                        : null;
+                        : token === TOKEN_BOT
+                          ? "notifybot"
+                          : null;
       if (login === null) {
         return null;
       }
@@ -573,6 +576,46 @@ describe("recipient arms and gates", () => {
     await service.changeTitle(draft.issue, "ready for review", 1, T3);
     expect(await neighborList()).toContain(draft.issue.id);
   });
+
+  it("a bot resolves NO threads through ANY arm (notification_list.go:158-160's materialization skip — live since B-72)", async () => {
+    const service = new IssuesService(env.DB);
+    const botId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "notifybot", usernameLower: "notifybot", type: "bot", status: "active", createdAt: SEED })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+
+    // Three arms reach for the bot: the repo-watch row, the poster arm, and
+    // the mention carrier (each issue carries foreign activity besides).
+    await watchRepo(env.DB, REPO_ID, botId, SEED);
+    const watched = await service.createIssue({ repoId: REPO_ID, title: "bot watch", content: "x", posterId: 1, now: T1 });
+    await service.addComment({ issueId: watched.id, posterId: neighborId, content: "foreign", now: T2 });
+    const authored = await service.createIssue({ repoId: REPO_ID, title: "bot authored", content: "x", posterId: botId, now: T1 });
+    await service.addComment({ issueId: authored.id, posterId: 1, content: "owner reply", now: T2 });
+    const mentioned = await service.createIssue({ repoId: REPO_ID, title: "bot mentioned", content: "x", posterId: 1, now: T1 });
+    await service.addComment({ issueId: mentioned.id, posterId: neighborId, content: "ping", now: T2 });
+    await drizzle(env.DB).insert(issueUsers).values({ userId: botId, issueId: mentioned.id, isMentioned: true });
+
+    // Upstream materializes NO notification rows for a bot — the derived
+    // whole-union gate is its twin: an empty mailbox at 200, not an error,
+    // while the OTHER watchers' mailboxes stay untouched (the gate is
+    // caller-scoped).
+    const listed = await send("/notifications", authed(undefined, TOKEN_BOT));
+    expect(listed.status).toBe(200);
+    expect(await listed.json<Thread[]>()).toEqual([]);
+    const neighborList = (await (await send("/notifications", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>()).map(
+      (thread) => thread.id,
+    );
+    expect(neighborList).toContain(watched.id);
+
+    // The single-thread arm answers the non-recipient refusal (403 — the
+    // derived model's recorded deviation-3 posture; upstream's row-less bot
+    // would 404, the same delta every non-recipient caller already rides).
+    const thread = await send(`/notifications/threads/${watched.id}`, authed(undefined, TOKEN_BOT));
+    expect(thread.status).toBe(403);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -943,6 +986,49 @@ describe("the repository-source leg — pending-transfer threads (deviation 7)",
     expect(plainView.map((thread) => thread.id)).not.toContain(-transfer.id); // membership without the grant
     const carolView = await (await send("/notifications", authed(undefined, TOKEN_CAROL))).json<Thread[]>();
     expect(carolView.map((thread) => thread.id)).not.toContain(-transfer.id);
+  });
+
+  it("a bot resolves NO repo-transfer thread (notification.go:129/:140 — the target-user refusal and the org-grantee skip, live since B-72)", async () => {
+    // The target-user arm: upstream `else if !newOwner.IsTypeBot()` — a bot
+    // target gets NO transfer notification at all.
+    const botId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "notifybot", usernameLower: "notifybot", type: "bot", status: "active", createdAt: SEED })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    const botTransfer = await seedTransfer(REPO_ID, botId);
+    const botView = await send("/notifications", authed(undefined, TOKEN_BOT));
+    expect(botView.status).toBe(200);
+    expect((await botView.json<Thread[]>()).map((thread) => thread.id)).not.toContain(-botTransfer.id);
+    // The single-thread arm rides the same gate (the non-recipient refusal).
+    const botThread = await send(`/notifications/threads/-${botTransfer.id}`, authed(undefined, TOKEN_BOT));
+    expect(botThread.status).toBe(403);
+
+    // The org-grantee arm: a bot org OWNER (a can-create-org-repo grant)
+    // is skipped — upstream notification.go:129's IsTypeBot continue. A
+    // human owner in the same org still receives, so the skip is
+    // caller-scoped, not query-scoped.
+    const seeded = await drizzle(env.DB)
+      .insert(users)
+      .values([
+        { username: "theorg2", usernameLower: "theorg2", type: "org", status: "active", createdAt: SEED },
+        { username: "orgowner", usernameLower: "orgowner", status: "active", createdAt: SEED },
+      ])
+      .returning({ id: users.id, username: users.username })
+      .all();
+    const orgId = seeded.find((row) => row.username === "theorg2")!.id;
+    const humanOwnerId = seeded.find((row) => row.username === "orgowner")!.id;
+    await drizzle(env.DB).insert(orgMembers).values([
+      { orgId, userId: humanOwnerId, role: "owner", isPublic: false, createdAt: SEED },
+      { orgId, userId: botId, role: "owner", isPublic: false, createdAt: SEED },
+    ]);
+    const orgTransfer = await seedTransfer(REPO2_ID, orgId);
+    const humanView = await send("/notifications", authed(undefined, TOKEN_ORGOWNER));
+    expect((await humanView.json<Thread[]>()).map((thread) => thread.id)).toContain(-orgTransfer.id);
+    const botOrgView = await send("/notifications", authed(undefined, TOKEN_BOT));
+    expect((await botOrgView.json<Thread[]>()).map((thread) => thread.id)).not.toContain(-orgTransfer.id);
   });
 
   it("PATCH marks through the KV arm (never notification_states); pin implies non-unread; NewAvailable follows", async () => {

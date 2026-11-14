@@ -20,9 +20,13 @@
  *     get user") — 400 — NOT the avatar pair's prepareUserInfo list
  *     redirect (impersonate does its own lookup, users.go:565-568).
  *   - The bot guard (u.IsTypeBot → JSONError impersonate_bot_not_allowed,
- *     users.go:569-571) is a DOCUMENTED DEAD ARM here: our users.type is
- *     the SPEC-0002 two-value enum ("user" | "organization") with no bot
- *     value, so no row can trip it — recorded, not ported.
+ *     users.go:569-571) is LIVE since B-72 (the users.type 'bot' value
+ *     landed): a bot target answers 400 JSONError with the en-US locale
+ *     string ("Bot accounts are non-interactive and cannot be
+ *     impersonated.") — the same buildJsonErrorMap shape as the
+ *     unknown-user arm. B-72 handoff 3; the former documented-dead-arm
+ *     note is history. Upstream's UI twin hides the button for bots
+ *     (view.tmpl:9) — admin-user-detail.tsx carries that gate.
  *   - The session flip errors "already impersonating a user"
  *     (impersonate.go:16-18) → ctx.ServerError → the 500 page
  *     (users.go:575-577): the port answers the app's plain-text 500
@@ -88,6 +92,10 @@
  *   - already-impersonating→ 500 plain text `IMPERSONATE_REFUSED_BODY`
  *                            (upstream ServerError's status over the
  *                            app's plain-text error shape)
+ *   - bot-refused          → 400 JSON `IMPERSONATE_BOT_REFUSED_ERROR`
+ *                            (the en-US locale string under the
+ *                            buildJsonErrorMap shape — the unknown-user
+ *                            arm's convention)
  *   - session-gone         → 303 `/login?redirect_to=<this path>` +
  *                            `clearSessionSetCookie()` (the expired
  *                            session's anonymous round-trip)
@@ -127,18 +135,29 @@ export const IMPERSONATE_UNKNOWN_USER_ERROR = { errorMessage: "unable to get use
  *  plain-text error posture carries the same status). */
 export const IMPERSONATE_REFUSED_BODY = "unable to impersonate user";
 
+/** The bot-refusal JSONError body — users.go:569-571's
+ *  `ctx.JSONError(ctx.Tr("admin.users.impersonate_bot_not_allowed"))`
+ *  rendered at the pin's en-US locale (locale_en-US.json:3095), under
+ *  context.go:276-278's buildJsonErrorMap shape — the unknown-user arm's
+ *  exact convention, answered 400 (JSONError's status, context.go:285). */
+export const IMPERSONATE_BOT_REFUSED_ERROR = {
+  errorMessage: "Bot accounts are non-interactive and cannot be impersonated.",
+  renderFormat: "text",
+} as const;
+
 /** The arm's outcome union (the wiring's map, above). */
 export type AdminUserImpersonateOutcome =
   | { outcome: "impersonated" }
   | { outcome: "unknown-user" }
+  | { outcome: "bot-refused" }
   | { outcome: "already-impersonating" }
   | { outcome: "session-gone" };
 
 /** The target slice the arm needs (any users row passes upstream's
- *  GetUserByID — orgs included; only the bot type would refuse, and our
- *  enum has no bot value — the dead arm above). `username` + `type` feed
- *  the audit row's scope snapshot (upstream ScopeFromUser's shape: an org
- *  target scopes as `organization`, refs.go:44-50). */
+ *  GetUserByID — orgs included; a BOT row refuses at the guard below —
+ *  users.go:569-571, live since B-72). `username` + `type` feed the audit
+ *  row's scope snapshot (upstream ScopeFromUser's shape: an org target
+ *  scopes as `organization`, refs.go:44-50). */
 export interface AdminImpersonateTarget {
   readonly id: number;
   readonly username: string;
@@ -177,8 +196,12 @@ export async function adminUserImpersonate(
 ): Promise<AdminUserImpersonateOutcome> {
   const target = await loadAdminImpersonateTarget(d1, targetUserId);
   if (target === null) return { outcome: "unknown-user" };
-  // Upstream's bot guard (users.go:569-571) is a dead arm here — our
-  // users.type enum has no bot value (module header); nothing to check.
+  // Upstream's bot guard (users.go:569-571) — LIVE since B-72: a bot
+  // target refuses BEFORE the flip (bots are non-interactive; a session
+  // flip onto one would be a sign-in-shaped backdoor past their
+  // no-password posture). The wiring maps the outcome to the 400
+  // JSONError (IMPERSONATE_BOT_REFUSED_ERROR).
+  if (target.type === "bot") return { outcome: "bot-refused" };
   // A transient D1 failure propagates (§4.8 — never masquerade as an
   // outcome); the admin-deleted race cannot reach the flip as a FK error
   // (the impersonator_user_id cascade removes the session row first, and

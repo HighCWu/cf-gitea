@@ -69,7 +69,7 @@ interface UserInsert {
   email?: string;
   isAdmin?: boolean;
   status?: "active" | "prohibited";
-  type?: "user" | "org";
+  type?: "user" | "org" | "bot";
   visibility?: "public" | "limited" | "private";
   createdAt?: number;
 }
@@ -126,11 +126,12 @@ beforeEach(async () => {
 // --- the loader: the type gate + the listing posture ---------------------------
 
 describe("loadAdminUsersData — the gates", () => {
-  it("lists every account kind EXCEPT orgs; prohibited accounts are listed (no active gate)", async () => {
+  it("lists every account kind EXCEPT orgs — bots included since B-72; prohibited accounts are listed (no active gate)", async () => {
     await seedBaseFixtures();
+    await insertUser({ username: "ci-robot", type: "bot" });
     const data = await load("");
-    expect(data.total).toBe(4); // root + alice + bob + carol; myorg excluded
-    expect(data.items.map((row) => row.username).sort()).toEqual(["alice", "bob", "carol", "root"]);
+    expect(data.total).toBe(5); // root + alice + bob + carol + ci-robot; myorg excluded
+    expect(data.items.map((row) => row.username).sort()).toEqual(["alice", "bob", "carol", "ci-robot", "root"]);
   });
 
   it("the keyword matches username, full name, and email (the admin actor's SearchByEmail arm)", async () => {
@@ -165,10 +166,13 @@ describe("loadAdminUsersData — the gates", () => {
     expect((await load("status_filter[is_2fa_enabled]=0")).total).toBe(4);
   });
 
-  it("user_type=User is the default family; user_type=Bot answers an honest empty list", async () => {
+  it("user_type=User narrows to the individuals; user_type=Bot lists the bots (users.go:74-79, live since B-72)", async () => {
     await seedBaseFixtures();
-    expect((await load("user_type=User")).total).toBe(4);
-    expect((await load("user_type=Bot")).total).toBe(0);
+    await insertUser({ username: "ci-robot", type: "bot" });
+    expect((await load("user_type=User")).items.map((row) => row.username).sort()).toEqual(["alice", "bob", "carol", "root"]);
+    expect((await load("user_type=Bot")).items.map((row) => row.username)).toEqual(["ci-robot"]);
+    // Unfiltered carries both kinds; orgs never surface.
+    expect((await load("")).total).toBe(5);
   });
 
   it("a stray source_id is ignored (no auth-source store — the dropdown never renders)", async () => {
@@ -336,6 +340,19 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     // posture) — the link-crawl D1 row.
     expect(html).not.toContain('href="/carol"');
     expect(html).toContain("<span>carol</span>");
+  });
+
+  it("bot rows carry the shared/user/user_type_label Bot mark beside the name (list.tmpl:117 — live since B-72 handoff 5)", async () => {
+    await seedBaseFixtures();
+    await insertUser({ username: "ci-robot", type: "bot" });
+    const html = render(await load("user_type=Bot"));
+    // The label span mirrors upstream's template byte-for-byte (the basic
+    // label classes, the concept_user_bot text), AFTER the name link.
+    expect(html).toContain('<a href="/ci-robot">ci-robot</a>');
+    expect(html).toContain('<span class="ui basic label tw-py-0 tw-align-baseline">Bot</span>');
+    // Human rows carry no Bot mark.
+    const humans = render(await load("user_type=User"));
+    expect(humans).not.toContain(">Bot</span>");
   });
 
   it("the synthetic gitea:deploy-key identity (negative id, prohibited) never links a profile (the D2 row)", async () => {

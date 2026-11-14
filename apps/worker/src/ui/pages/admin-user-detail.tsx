@@ -32,11 +32,11 @@
  *     (admin-users-impersonate.ts, migration 0058 — its upstream
  *     `link-action data-url` JS dialect reduces to the no-JS form POST, the
  *     house convention; the success arm 303s onto /user/settings) and the
- *     edit link `/{id}/edit` is the landed admin-user-edit page. Upstream's
- *     `{{if not .User.IsTypeBot}}` guard is a documented dead arm here — the
- *     users.type enum has no bot value (the impersonate module's own note).
- *     The no-JS form is rendered in upstream's flex-text-block span beside
- *     the Edit anchor.
+ *     edit link `/{id}/edit` is the landed admin-user-edit page. The
+ *     `{{if not .User.IsTypeBot}}` guard is LIVE since B-72 (the
+ *     users.type 'bot' value): a bot row renders NO impersonate button
+ *     (the write seam refuses besides — B-72 handoff 3). The no-JS form is
+ *     rendered in upstream's flex-text-block span beside the Edit anchor.
  *   - view_details: the 48px avatar (the landed serving seam
  *     `/user/avatar/{name}/48`), the shared/user/name link (upstream
  *     DisplayNameWithFullName — "name (Full Name)" when the full name is
@@ -472,16 +472,21 @@ export function AdminUserDetailPage(props: { ctx: UiContext; data: AdminUserDeta
               button + Edit link against the LIVE targets (the module header —
               the landed impersonate POST's no-JS form reduction inside
               upstream's flex-text-block span, and the landed edit page's
-              anchor; the IsTypeBot guard is a dead arm, the users.type enum
-              has no bot value). */}
+              anchor). The Impersonate button is GATED off for bot rows
+              (view.tmpl:9's `{{if not .User.IsTypeBot}}` — live since B-72;
+              the write seam's own guard, admin-users-impersonate.ts, backs
+              it). No type label renders here — upstream's view_details
+              carries only the Admin label (view_details.tmpl:10). */}
           <h4 class="ui top attached header flex-left-right">
             <span>{adminUserDetailLocale.details}</span>
             <span class="flex-text-block">
-              <form method="post" action={`${link}/impersonate`}>
-                <button type="submit" class="ui primary compact tiny basic button">
-                  {adminUserDetailLocale.impersonate}
-                </button>
-              </form>
+              {user.type !== "bot" ? (
+                <form method="post" action={`${link}/impersonate`}>
+                  <button type="submit" class="ui primary compact tiny basic button">
+                    {adminUserDetailLocale.impersonate}
+                  </button>
+                </form>
+              ) : null}
               <a class="ui primary compact tiny button" href={`${link}/edit`}>
                 {adminUserDetailLocale.edit}
               </a>

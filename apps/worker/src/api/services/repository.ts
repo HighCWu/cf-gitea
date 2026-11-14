@@ -434,13 +434,16 @@ export async function repositoryPermissionsWithTeams(
 
 /**
  * Upstream `UserTypeToString` (gitea/services/convert/user.go:15–22): org
- * rows render "Organization", everything else "User" (reserved variants and
- * bots have no D1 enum members yet). Shared by BOTH user serializers
- * (`toApiUser`, services/user.ts; `apiUserFromRow` below) so an org user row
- * never renders the wire type "User" anywhere — the S5 serializer fix.
+ * rows render "Organization", bot rows "Bot" (the `users.type` 'bot' value
+ * landed with B-72 — the API edit arm's real conversion makes bot rows
+ * reachable through every serializer), everything else "User" (the reserved
+ * variants have no D1 enum members). Shared by BOTH user serializers
+ * (`toApiUser`, services/user.ts; `apiUserFromRow` below) so a non-default
+ * user row never renders the wire type "User" wrongly anywhere — the S5
+ * serializer fix.
  */
-export function userTypeToApiString(type: UserRow["type"]): "User" | "Organization" {
-  return type === "org" ? "Organization" : "User";
+export function userTypeToApiString(type: UserRow["type"]): "User" | "Organization" | "Bot" {
+  return type === "org" ? "Organization" : type === "bot" ? "Bot" : "User";
 }
 
 /**

@@ -246,6 +246,15 @@ export const AuditActions = {
   // no cf-gitea surface to emit from (every user is LOCAL — deviation 1 of
   // api/routes/admin-t2.ts).
   UserCreate: defineAction("user:create", "Created user {scope}."),
+  // The type-change row (action.go:74 — id AND template verbatim):
+  // `audit.Record(ctx, audit_model.UserType, u, "user_type",
+  // u.Type.DisplayName())` at services/user/update.go:217 — the shared
+  // UpdateUser tail, so BOTH admin edit arms (API adminEditUser + the web
+  // EditUserPost) emit when the conversion lands. B-72's handoff 1: the
+  // conversion became real when users.type gained 'bot'; `{user_type}` is
+  // DisplayName's English ("Bot"/"User" — user.go:67-77, the UI translates
+  // concept_user_* instead).
+  UserType: defineAction("user:type:update", "Changed type of user {scope} to {user_type}."),
   // SPEC-0002 §6 (PWD-2) — the password-family emits (action.go:69/76,
   // ids AND templates verbatim):
   //   - UserAuthenticationFailTwoFactor — the API Basic password arm's

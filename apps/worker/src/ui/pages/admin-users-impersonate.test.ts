@@ -29,9 +29,10 @@
  *   - THE START AUDIT ROW (users.go:580): emitted after the flip lands —
  *     actor the admin, scope the target, upstream's rendered message;
  *     the refusal and the unknown-user arms emit nothing.
- *   - THE BOT GUARD, DOCUMENTED DEAD (users.go:569-571): our users.type
- *     enum has no bot value — pinned by asserting an org-typed target (the
- *     closest non-user type that EXISTS) impersonates like any row.
+ *   - THE BOT GUARD, LIVE SINCE B-72 (users.go:569-571): a bot target
+ *     refuses BEFORE the flip — the bot-refused outcome (the wiring maps
+ *     it to the 400 JSONError with the en-US locale string), the session
+ *     row untouched, no audit row.
  *
  * Fixture discipline (the avatar suite's pattern): tables wiped per test
  * (children first), ids captured at seed time — never hardcoded.
@@ -46,6 +47,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { auditEvents, sessions, users } from "../../db/schema";
 import { exitImpersonationBySecret, impersonateSessionUser, lookupValidSession, mintSession, verifySession } from "../session";
 import {
+  IMPERSONATE_BOT_REFUSED_ERROR,
   IMPERSONATE_SUCCESS_REDIRECT,
   IMPERSONATE_UNKNOWN_USER_ERROR,
   adminUserImpersonate,
@@ -240,6 +242,33 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
       scopeName: "forge",
       origin: "ui",
       message: "User dave started impersonating user forge.",
+    });
+  });
+
+  it("refuses a bot target BEFORE the flip (users.go:569-571 — live since B-72): JSONError body constant, no flip, no audit row", async () => {
+    const { adminId } = await seedUsers();
+    const botId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values([{ username: "ci-robot", usernameLower: "ci-robot", type: "bot", status: "active", createdAt: T0 }])
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    const cookieValue = await mintSession(env.DB, adminId);
+    const sessionId = cookieValue.split(":")[0] ?? "";
+
+    const outcome = await adminUserImpersonate(env.DB, { sessionId, adminUserId: adminId }, botId);
+
+    expect(outcome).toEqual({ outcome: "bot-refused" });
+    // The session row is untouched — no flip happened (upstream returns
+    // before ImpersonateUser) and no START row emits.
+    expect(await rowIdentity(sessionId)).toEqual({ userId: adminId, impersonatorUserId: null });
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+    // The body the wiring answers 400 with — the en-US locale string under
+    // the buildJsonErrorMap shape (the unknown-user arm's convention).
+    expect(IMPERSONATE_BOT_REFUSED_ERROR).toEqual({
+      errorMessage: "Bot accounts are non-interactive and cannot be impersonated.",
+      renderFormat: "text",
     });
   });
 });

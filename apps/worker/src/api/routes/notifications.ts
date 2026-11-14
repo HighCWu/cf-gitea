@@ -107,8 +107,9 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  *    the repository outranks every other source, including mentions",
  *    notification_list.go:135-141; the mail fan-out's twin at
  *    services/mail/notify.ts) and the bot skip (upstream skips
- *    IsTypeBot users at materialization, :158-160 — vacuous here: our
- *    users.type enum is "user"/"org" only, no bot rows can exist).
+ *    IsTypeBot users at materialization, :158-160 — LIVE since B-72: a bot
+ *    caller resolves no threads; the gate rides recipientExpr beside the
+ *    mute rule).
  *    Access-revoked users remain excluded upstream-only (no revocation
  *    model).
  * 5. Subject sources: Issue/Pull derive from issue activity;
@@ -138,7 +139,9 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  *    exact disjunction over the collapsed owners-team bridge); NO mute arm
  *    (upstream's mute pass is the issue-source assembly's own post-join,
  *    notification_list.go:135-141 — this class holds no watcher rows to
- *    mute) and no bot skip (vacuous, deviation 4's note). The subject
+ *    mute) and the bot skip (upstream notification.go:129/140 — LIVE since
+ *    B-72: a bot target user or bot org-grantee resolves no repo thread;
+ *    the gate rides repoRecipientExpr). The subject
  *    renders upstream's Repository arm verbatim (convert/notification.go:
  *    87-94): title = the full name, URL = the RELATIVE repo path (the
  *    converter's own FIXME kept), absolute html_url, the empty
@@ -551,9 +554,11 @@ function wipTitleExpr(): SQL {
  *   (derived-model timing, deviation 1).
  *
  * Bot recipients: upstream skips user.IsTypeBot() users when materializing
- * (notification_list.go:158-160). Our users.type enum carries only
- * "user"/"org" — the collapsed user-type model has no bot rows, so the skip
- * is vacuously true here and no filter arm exists (documented equivalence).
+ * (notification_list.go:158-160 — a bot NEVER gets a notification row, so
+ * its mailbox is permanently empty and getThread finds no row). The
+ * derived model's equivalent placement is a whole-union gate beside the
+ * mute rule: a bot caller resolves NO threads anywhere (B-72 handoff 4 —
+ * the users.type 'bot' value landed, the skip is no longer vacuous).
  */
 function recipientExpr(userId: number): SQL {
   return sql`(
@@ -585,6 +590,10 @@ function recipientExpr(userId: number): SQL {
     and not exists (
       select 1 from repo_watchers ig
       where ig.repo_id = ${issues.repoId} and ig.user_id = ${userId} and ig.mode = ${WatchMode.Dont}
+    )
+    and exists (
+      select 1 from users bt
+      where bt.id = ${userId} and bt.type = 'user'
     )
   )`;
 }
@@ -944,20 +953,31 @@ function repoLastActivityExpr(): SQL {
  * OR a `team_members × teams` row with `can_create_org_repo` or
  * `authorize='owner'`, both scoped to the target org id. The org arms only
  * ever match org-id targets (membership rows exist for orgs alone), so no
- * type conjunct is needed. NO mute arm and no bot skip (deviation 7).
+ * type conjunct is needed. NO mute arm. The BOT SKIP (upstream
+ * notification.go:129 skips IsTypeBot users inside the org grant set and
+ * :140's `!newOwner.IsTypeBot()` refuses a bot target outright — live
+ * since B-72) collapses caller-relative to one scalar gate: a bot caller
+ * is never a recipient, because the target arm implies the target IS the
+ * caller and the org arms skip bot grantees (B-72 handoff 4).
  */
 function repoRecipientExpr(userId: number): SQL {
   return sql`(
-    ${repoTransfer.newOwnerId} = ${userId}
-    or exists (
-      select 1 from org_members om
-      where om.org_id = ${repoTransfer.newOwnerId} and om.user_id = ${userId} and om.role = 'owner'
+    (
+      ${repoTransfer.newOwnerId} = ${userId}
+      or exists (
+        select 1 from org_members om
+        where om.org_id = ${repoTransfer.newOwnerId} and om.user_id = ${userId} and om.role = 'owner'
+      )
+      or exists (
+        select 1 from team_members tm
+        join teams t on t.id = tm.team_id
+        where tm.user_id = ${userId} and t.org_id = ${repoTransfer.newOwnerId}
+          and (t.can_create_org_repo = 1 or t.authorize = 'owner')
+      )
     )
-    or exists (
-      select 1 from team_members tm
-      join teams t on t.id = tm.team_id
-      where tm.user_id = ${userId} and t.org_id = ${repoTransfer.newOwnerId}
-        and (t.can_create_org_repo = 1 or t.authorize = 'owner')
+    and exists (
+      select 1 from users bt
+      where bt.id = ${userId} and bt.type = 'user'
     )
   )`;
 }
