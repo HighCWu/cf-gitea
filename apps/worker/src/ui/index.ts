@@ -993,6 +993,10 @@ import {
   type TeamInviteRecord,
   type TeamRecord,
 } from "../api/routes/org-teams";
+// B-77's routed unify — the org-team add arm's email fork shares misc-t3's
+// ValidateEmail port (email_address.go:121-129) instead of the former
+// byte-identical module-local twin.
+import { validateEmailFormat } from "../api/routes/misc-t3";
 import { sendTeamInviteMail } from "../services/mail/team-invite";
 import { LastOrgOwnerError } from "../services/orgs/errors";
 import { isDoerOrgMember, setOrgMembershipPublic } from "../api/services/orgs";
@@ -12861,32 +12865,12 @@ async function orgTeamNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
 // /org/invite/{token} GET+POST, web.go:976-978)
 // ---------------------------------------------------------------------------
 
-/** Upstream `user_model.ValidateEmail`'s address-syntax half
- *  (email_address.go:121-129 — `validation.IsEmailAddressValid` plus the
- *  default-empty domain allow/block lists, which are unmodeled here). The
- *  module-local twin carries the misc-t3 validateEmailFormat shape (that
- *  module's port of the same upstream source — its copy is module-private,
- *  and this file's invite region is the only other consumer). */
 /** The add arm's mailer gate read — the STRUCTURAL view (the generated Env
  *  pins the deployed var literal, so the comparison rides the widened param,
  *  sendTestMail's exact pattern). `setting.MailService != nil`'s polarity is
  *  the SPEC §5.1 strict gate: only the exact "true" arms. */
 function mailerArmed(env: { MAIL_ENABLED?: string }): boolean {
   return env.MAIL_ENABLED === "true";
-}
-
-function inviteEmailValid(email: string): boolean {
-  if (/[^\x21-\x7e]/.test(email)) return false; // no non-ASCII / controls
-  const at = email.indexOf("@");
-  if (at <= 0 || at !== email.lastIndexOf("@") || at === email.length - 1) return false;
-  const local = email.slice(0, at);
-  const domain = email.slice(at + 1);
-  if (local.length > 64 || domain.length > 255) return false;
-  if (/^[.-]|[.-]$|\.\./.test(local)) return false;
-  if (domain.startsWith("[")) {
-    return /^\[(\d{1,3}(\.\d{1,3}){3}|IPv6:[0-9a-fA-F:]+)\]$/.test(domain); // address literal
-  }
-  return /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i.test(domain);
 }
 
 /**
@@ -15754,15 +15738,16 @@ async function orgTeamActionSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
         // Census B-77 — teams.go:171-194's unknown-name fork: when the
         // mailer is armed (`setting.MailService != nil`; our strict polarity
         // MAIL_ENABLED === "true", notify.ts:799) AND the name parses as an
-        // email (`ValidateEmail`, email_address.go:121-129 — the module-local
-        // inviteEmailValid twin; the domain allow/block lists are unmodeled),
+        // email (`ValidateEmail`, email_address.go:121-129 — the shared
+        // misc-t3 validateEmailFormat port, B-77's routed unify; the domain
+        // allow/block lists are unmodeled),
         // CreateTeamInvite lands the tokenized row and the mail rides the
         // funnel (a mail failure propagates = upstream's ServerError; the
         // duplicate / already-member refusals flash AND still redirect
         // upstream — the no-session-flash reduction keeps them messageless
         // 303s). No mailer or not an email: the user_not_exist flash's
         // redirect. EVERY arm here lands on the team page.
-        if (mailerArmed(c.env) && inviteEmailValid(uname)) {
+        if (mailerArmed(c.env) && validateEmailFormat(uname)) {
           try {
             const inviter = viewer.kind === "user" ? await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get() : undefined;
             if (inviter !== undefined) {

@@ -48,7 +48,15 @@ export function escapeHtml(raw: string): string {
     .replaceAll("'", "&#39;");
 }
 
-/** `mail.register_notify.title` (locale_en-US.json): `%[1]s, welcome to %[2]s`. */
+/** `mail.register_notify.title` (locale_en-US.json): `%[1]s, welcome to %[2]s` —
+ *  the base head's title line, composed from ALREADY-ESCAPED args (upstream
+ *  `TrHTML` escapes each string arg ONCE — localestore.go:156-171 — and the
+ *  resulting `template.HTML` inserts raw into `<title>{{.}}</title>`, so the
+ *  composition here must NOT re-escape). NOTE this is the TITLE format, not
+ *  the email subject: upstream's subject is `TrString("mail.register_notify",
+ *  setting.AppName)` = "Welcome to %s" with the AppName only, never the name
+ *  (mail_user.go:123) — register-notify.ts's use of this helper as the
+ *  subject is a recorded divergence routed to that module's owner. */
 export function registerNotifySubject(displayName: string, appName: string): string {
   return `${displayName}, welcome to ${appName}`;
 }
@@ -121,7 +129,6 @@ export interface RegisterNotifyData {
  * `options/locale/locale_en-US.json`.
  */
 export function renderRegisterNotify(data: RegisterNotifyData): string {
-  const displayName = escapeHtml(data.displayName);
   const dotEscaped = escapeHtml(dotEscape(data.displayName));
   const username = escapeHtml(data.username);
   const appName = escapeHtml(data.appName);
@@ -129,9 +136,15 @@ export function renderRegisterNotify(data: RegisterNotifyData): string {
   const loginUrl = `${appUrl}user/login`;
   const setPwdUrl = `${appUrl}user/forgot_password`;
 
-	return `${baseHead(escapeHtml(registerNotifySubject(dotEscaped, appName)))}
+	// The head title composes the once-escaped args WITHOUT a second pass
+	// (upstream TrHTML escapes each arg once and inserts the template.HTML
+	// raw — the previous whole-line re-escape double-escaped any name with
+	// markup characters: &amp;lt;b&amp;gt; where upstream has &lt;b&gt;).
+	// The body's hi_user_x carries the DotEscaped name per the template's
+	// line 9 — BOTH interpolation sites declare the DotEscape pipeline.
+	return `${baseHead(registerNotifySubject(dotEscaped, appName))}
 <body>
-	<p>Hi <b>${displayName}</b>,</p>
+	<p>Hi <b>${dotEscaped}</b>,</p>
 	<p>This is your registration confirmation email for ${appName}!</p>
 	<p>You can now log in via username: ${username}.</p><p><a href="${loginUrl}">${loginUrl}</a></p>
 	<p>If this account has been created for you, please <a href="${setPwdUrl}">set your password</a> first.</p>
@@ -1027,9 +1040,9 @@ export function resetPasswordMailSubject(): string {
  *  DotEscape'd display name; TrHTML escapes plain-string args ONCE
  *  (localestore.go:156-171) and the template.HTML result inserts raw into
  *  `<title>{{.}}</title>` — so the caller passes the ALREADY-ESCAPED name and
- *  this composes without a second pass (the register_notify twin composes the
- *  escaped name then re-escapes the whole line; identical bytes for
- *  special-char-free names — the divergence is noted in its test). */
+ *  this composes without a second pass (the register_notify twin composes
+ *  the same way — the former whole-line re-escape there was the routed
+ *  B-84 defect, fixed in renderRegisterNotify). */
 export function resetPasswordMailTitle(escapedDotEscapedDisplayName: string): string {
   return `${escapedDotEscapedDisplayName}, you have requested to recover your account`;
 }

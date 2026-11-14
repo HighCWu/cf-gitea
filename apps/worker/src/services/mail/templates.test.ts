@@ -84,9 +84,29 @@ describe("renderRegisterNotify (register_notify.tmpl layout)", () => {
       appUrl: "https://g.example/",
     });
     expect(dotted).toContain(`<title>Al\u200d.\u200dice, welcome to Gitea</title>`);
-    // ...and the DOT-ESCAPED form appears ONLY in the title (the body
-    // paragraphs use the raw DisplayName, per the template).
-    expect(dotted).toContain("<p>Hi <b>Al.ice</b>,</p>");
+    // ...and the body's hi_user_x carries the DotEscaped name TOO — the
+    // template declares the DotEscape pipeline at BOTH sites (line 9's
+    // mail.hi_user_x arg and line 4's title arg).
+    expect(dotted).toContain(`<p>Hi <b>Al\u200d.\u200dice</b>,</p>`);
+  });
+
+  it("escapes the title args ONCE (TrHTML's contract — no whole-line re-escape)", () => {
+    // Upstream: TrHTML HTMLEscapeString's each string arg exactly once
+    // (localestore.go:156-171) and the template.HTML result inserts RAW into
+    // <title>{{.}}</title> (head.tmpl line 5) — a display name carrying
+    // markup must appear single-escaped, never the double-escaped
+    // &amp;lt;… bytes the former whole-line re-escape produced.
+    const hostile = renderRegisterNotify({
+      displayName: "<b>Eve</b> & Sons",
+      username: "eve",
+      appName: "Gitea",
+      appUrl: "https://g.example/",
+    });
+    expect(hostile).toContain(
+      "<title>&lt;b&gt;Eve&lt;/b&gt; &amp; Sons, welcome to Gitea</title>",
+    );
+    expect(hostile).not.toContain("&amp;lt;");
+    expect(hostile).not.toContain("&amp;amp;");
   });
 
   it("renders the base footer's AppUrl + AppName cell", () => {

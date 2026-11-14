@@ -766,8 +766,11 @@ function toApiEmail(entry: EmailEntry, user?: { id: number; username: string }) 
 /** Upstream ValidateEmail (email_address.go:121-129): a syntax check plus the
  *  domain allow/block lists (both empty by default → allowed). The regex is
  *  a pragmatic RFC-5322-lite stand-in for Go's net/mail.ParseAddress — the
- *  module header documents the divergence. */
-function validateEmailFormat(email: string): boolean {
+ *  module header documents the divergence. Exported since B-77's routed
+ *  unify: this is the one port of that upstream source — the org-team add
+ *  arm's email fork (ui/index.ts) rides it instead of its former
+ *  byte-identical private twin. */
+export function validateEmailFormat(email: string): boolean {
   if (/[^\x21-\x7e]/.test(email)) {
     return false; // no non-ASCII / controls (upstream rejects non-ASCII too)
   }
