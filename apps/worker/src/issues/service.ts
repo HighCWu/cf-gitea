@@ -429,6 +429,14 @@ export class IssuesService {
    * `pull_requests` row share ONE batch with the counter allocation — PRs and
    * issues draw from one per-repo sequence (§2.2/§3.1) — and the PR row lands
    * with `status = checking` (§3.4). Repo counter: `num_pulls`.
+   *
+   * Upstream's NewPullRequest ALSO writes the FIRST type-29 push comment at
+   * create (services/pull/pull.go:145, both flows) — that arm is
+   * services-level (it needs the engine cell and the flow's landed head
+   * ref), so it rides the callers' create tails, not this method: the
+   * github flow's route tail (api/routes/pulls.ts
+   * createGithubFirstPushComment) and the agit flow's tail
+   * (api/services/agit.ts createAgitFirstPushComment).
    */
   async createPullRequest(input: CreatePullRequestInput): Promise<{ issue: IssueRow; pullRequest: PullRequestRow }> {
     const { statements, resultIndex } = await this.issueCreationStatements(input, { isPull: true });

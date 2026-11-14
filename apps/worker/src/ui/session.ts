@@ -176,7 +176,7 @@ import {
   verifyScratchToken,
   type PendingTwofaTicket,
 } from "../auth/two-factor";
-import { AuditActions, emitAudit } from "../services/audit";
+import { AuditActions, auditClientIp, emitAudit } from "../services/audit";
 import { demoModeEnabled } from "../services/demo-sweep";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { listActiveOAuth2Sources } from "../services/auth-sources/store";
@@ -2019,6 +2019,11 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   const outcome = await applyPasswordReset(c.env.DB, user.id, password, retype, {
     policy: resolvePasswordPolicy(c.env),
     configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+    // The audit row's client address (the auditClientIp derivation —
+    // CF-Connecting-IP, absent = null, never the limiter's sentinel string;
+    // the same shape ui/index.ts's change arms thread). AUDITCTX2's landed
+    // null default was this next-touch: the third applyPasswordReset caller.
+    ipAddress: auditClientIp(c.req.raw.headers),
   });
   if (outcome.outcome !== "changed") return invalid(code, outcome.message);
 

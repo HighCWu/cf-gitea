@@ -312,6 +312,52 @@ describe("the TOTP ladder on the wire (X-Gitea-OTP)", () => {
       expect(rows[0]?.action).toBe("user:authentication:fail:twofactor");
     });
   });
+
+  it("the totp-fail row stamps CF-Connecting-IP — the auditClientIp derivation, distinct from the limiter's bucket key (AUDITCTX2's aligned shape)", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    await seedTotp(alice);
+
+    const res = await call("/_whoami", {
+      headers: { Authorization: basicHeader("Alice", pw), "X-Gitea-OTP": "000000", "CF-Connecting-IP": "203.0.113.77" },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual(GENERIC_401);
+
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "user:authentication:fail:twofactor",
+        actorId: alice.id,
+        origin: "api",
+        actorCredential: null,
+        ipAddress: "203.0.113.77",
+      });
+    });
+  });
+
+  it("the header-less totp-fail row records NULL — never the limiter's 'unknown' sentinel (same header, deliberately separate derivations)", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    await seedTotp(alice);
+
+    const res = await call("/_whoami", {
+      headers: { Authorization: basicHeader("Alice", pw), "X-Gitea-OTP": "000000" },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual(GENERIC_401);
+
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.action).toBe("user:authentication:fail:twofactor");
+      // An audit row's ipAddress is a client ADDRESS or null (the
+      // AuditEventInput contract) — the absent header records null here,
+      // NOT the limiter bucket key's "unknown" sentinel string.
+      expect(rows[0]?.ipAddress).toBeNull();
+    });
+  });
 });
 
 // -----------------------------------------------------------------------------

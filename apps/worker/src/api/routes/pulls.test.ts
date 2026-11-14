@@ -77,7 +77,7 @@ beforeEach(async () => {
   // PR head refs the create flow lands on `recluse/blocked` so the next
   // per-repo index cannot CAS-conflict (the pulls.test.ts convention).
   // The renamed-fork suite below adds its base cells (append-only).
-  const cleanupCells = ["recluse/blocked", "cf-gitea-stub/emptypr", "cf-gitea-stub/renfork", "cf-gitea-stub/renfork2", "cf-gitea-stub/chainchild"];
+  const cleanupCells = ["recluse/blocked", "cf-gitea-stub/emptypr", "cf-gitea-stub/renfork", "cf-gitea-stub/renfork2", "cf-gitea-stub/chainchild", "cf-gitea-stub/pushcmt"];
   for (const cellName of cleanupCells) {
     const cell = env.REPO.getByName(cellName);
     const { refs } = await cell.listRefs();
@@ -314,6 +314,43 @@ describe("POST /repos/{owner}/{repo}/pulls: the equal-tips arms (the string gate
     // The refs/pull/1/head CAS write landed at the shared tip.
     const refNames = (await env.REPO.getByName("cf-gitea-stub/emptypr").listRefs()).refs.map((ref) => ref.name);
     expect(refNames).toContain("refs/pull/1/head");
+    // The EMPTY create adds no type-29 comment: upstream's shouldCreate is
+    // false on an empty baseTip..headTip walk (comment.go:44-45) — the PR
+    // row still exists (created either way), the first-comment arm is
+    // silent.
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /repos/{owner}/{repo}/pulls: the create arm's FIRST type-29 push
+// comment (NewPullRequest's shared pin, services/pull/pull.go:145 — BOTH
+// flows; the github route tail's createGithubFirstPushComment)
+// ---------------------------------------------------------------------------
+
+describe("POST /repos/{owner}/{repo}/pulls: the create arm's FIRST type-29 push comment", () => {
+  it("lands the create-shape type-29 row ({is_force_push:false, commit_ids:[head]}, poster = the doer) — the base..head walk over the PR's own commit", async () => {
+    const slug = "pushcmt";
+    await seedRepo(1, "cf-gitea-stub", slug);
+    const mainTip = await seedEngineBranches("cf-gitea-stub", slug, []);
+    // Upstream's create pin (pull.go:145): CreatePushPullComment with
+    // oldRef = the BASE BRANCH REF — resolved to the base tip, never
+    // ZERO_OID (comment.go:107-113) — and isForcePush = the literal false.
+    // The head here is parented on main's tip, so the normal walk
+    // (comment.go:43-45: rev-list --reverse -n limit baseTip..headTip) is
+    // exactly the PR's own commit, oldest-first.
+    const featureTip = await seedFeatureAhead("cf-gitea-stub", slug, mainTip);
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "first push comment", head: "feature", base: "main" }),
+    });
+    expect(res.status).toBe(201);
+    const issue = (await db().select().from(issues).all())[0]!;
+    const rows = await db().select().from(comments).all();
+    expect(rows).toHaveLength(1); // ONE row — no force marker pair at create
+    expect(rows[0]).toMatchObject({ issueId: Number(issue.id), type: CommentType.PullRequestPush, posterId: 1 });
+    expect(JSON.parse(rows[0]!.content ?? "")).toEqual({ is_force_push: false, commit_ids: [featureTip] });
   });
 });
 

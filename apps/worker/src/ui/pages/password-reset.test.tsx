@@ -48,7 +48,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
 import { renderToString } from "hono/jsx/dom/server";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { userSignInPassword } from "../../auth/password-auth";
@@ -568,6 +568,34 @@ describe("POST /user/reset_password — the apply ladder", () => {
     const row = await userRow(alice.id);
     expect(row.mustChangePassword).toBe(false);
     expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
+  });
+
+  it("the apply's audit row stamps the request's CF-Connecting-IP (the auditClientIp threading — ResetPasswdPost's apply is the third applyPasswordReset caller, AUDITCTX2's next-touch), credential null", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    await seedPassword(alice, "previous horse battery staple");
+    const code = await mintCode(alice);
+
+    const res = await request("/user/reset_password", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", "CF-Connecting-IP": "203.0.113.42" },
+      body: new URLSearchParams({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD }).toString(),
+    });
+    expect(res.status).toBe(303);
+
+    // The row emits detached (`void emitAudit`) — poll, the
+    // change-password.test.ts posture for fire-and-forget rows.
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "user:password",
+        actorId: alice.id,
+        actorCredential: null, // a reset CODE is the credential — no doer token
+        scopeType: "user",
+        origin: "ui",
+        ipAddress: "203.0.113.42",
+      });
+    });
   });
 });
 

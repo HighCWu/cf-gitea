@@ -70,7 +70,9 @@ import { z } from "zod";
 import { issues, milestones, PRStatus, pullRequests, teams, users } from "../../db/schema";
 import { emitIssueEvent } from "../../services/issue-events";
 import { IssueError, MilestoneNotExistError } from "../../issues/errors";
+import { CommentType } from "../../issues/comment-types";
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
+import { MAX_PUSH_COMMITS_IN_COMMENT } from "../../services/webhooks-push";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -120,7 +122,7 @@ import {
   pullRequestDiff,
   pullRequestDiffShortStat,
 } from "../services/pull-engine";
-import { branchRef, engineReads, isFullObjectId, refTipMap, tagRef } from "../services/engine";
+import { branchRef, engineCell, engineReads, isFullObjectId, pullHeadRef, refTipMap, tagRef } from "../services/engine";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
 import {
   apiUserFromRow,
@@ -726,6 +728,72 @@ const getPullByBaseHeadRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
+/**
+ * The github-flow CREATE arm's FIRST type-29 push comment — upstream's
+ * NewPullRequest creates it for BOTH flows with one call (services/pull/
+ * pull.go:145): `CreatePushPullComment(ctx, issue.Poster, pr,
+ * git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false)`. The
+ * create shape derived at that pin mirrors the agit flow's landed
+ * `createAgitFirstPushComment` (api/services/agit.ts — a reverse import
+ * would cycle, so the minimal walk+insert shape is ported here):
+ *
+ *   - oldRef is the BASE BRANCH REF (`refs/heads/<base>`, modules/git/
+ *     ref.go BranchPrefix) — never empty, never ZERO_OID — so the walk
+ *     resolves the base branch's live tip; newRef is `refs/pull/N/head`
+ *     (GetGitHeadRefName, models/issues/pull.go:406), landed moments
+ *     earlier by this route's createPullHeadRef (upstream's PushToBaseRepo
+ *     runs at pull.go:138-140, ahead of the comment in the same tx).
+ *   - The doer is `issue.Poster` — at create the PR poster IS the pusher.
+ *   - isForcePush is the LITERAL false: the force arm never runs at create
+ *     — no merge-base walk, no `{is_force_push, [old, new]}` marker
+ *     comment, no old-comment reconcile (comment.go:24-45's force branch).
+ *   - The walk is the normal-push shape over the resolved tips:
+ *     `rev-list --reverse -n limit baseTip..headTip` (comment.go:43-45 over
+ *     GetCommitIDsBetweenReverse, modules/git/compare.go:48-55) — the PR's
+ *     own commits, oldest-first, capped at the newest
+ *     MAX_PUSH_COMMITS_IN_COMMENT — and an EMPTY walk (a head that adds
+ *     nothing beyond its base) creates NO comment (shouldCreate=false,
+ *     comment.go:44-45).
+ *   - NO `PullRequestPushCommits` mail: the create pin fires none — the
+ *     notify rides only the shared push path (pull.go:406-411, the update
+ *     callers).
+ *
+ * Upstream's comment failure FAILS the whole NewPullRequest (pull.go:145-147
+ * → the RemoveRef cleanup at :155-160); the route's recorded degradation
+ * posture keeps the created PR and logs (the same posture every landed
+ * create-tail leg documents). Never throws.
+ */
+async function createGithubFirstPushComment(c: Context<ApiEnv>, found: RepositoryWithOwner, pr: PullRequestRow, posterId: number | null): Promise<void> {
+  try {
+    const cell = engineCell(c.env, found.repo);
+    const start = branchRef(pr.baseBranch);
+    const end = pullHeadRef(pr.index);
+    const collected: string[] = [];
+    for (let page = 0; page < 2; page += 1) {
+      const result = await cell.listCommitsRange(start, end, MAX_PUSH_COMMITS_IN_COMMENT, page);
+      if (result === null) {
+        console.error(`[pulls] ${found.repo.ownerNamespace}/${found.repo.slug}: push-comment walk ${start}..${end} failed`);
+        return;
+      }
+      for (const commit of result.commits) collected.push(commit.oid);
+      if (!result.more) break;
+    }
+    const commitIds = collected.slice(-MAX_PUSH_COMMITS_IN_COMMENT);
+    if (commitIds.length === 0) return; // upstream shouldCreate=false — nothing beyond the base
+    await new IssuesService(c.env.DB, c.env).addComment({
+      issueId: pr.issueId,
+      type: CommentType.PullRequestPush,
+      posterId,
+      content: JSON.stringify({ is_force_push: false, commit_ids: commitIds }),
+      now: new Date(),
+    });
+  } catch (error) {
+    console.error(
+      `[pulls] ${found.repo.ownerNamespace}/${found.repo.slug}: the create arm's first push comment failed (the PR stands): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -1133,6 +1201,16 @@ export function registerPullRoutes(
         id: requester.id ?? 0,
         isAdmin: requester.is_admin === true,
       });
+
+      // The FIRST type-29 push comment — upstream's NewPullRequest writes it
+      // for BOTH flows inside the create tx AFTER the assignees and the
+      // flow's ref arm, BEFORE the codeowners/webhook arms (services/pull/
+      // pull.go:145 → :149-152 codeowners → :187 opened). Landed here —
+      // after the head ref (createPullHeadRef, our PushToBaseRepo) and the
+      // assignees — with the create shape's specifics (the helper's
+      // docstring carries the cites). The agit flow's create arm lands the
+      // same comment through its own tail (api/services/agit.ts).
+      await createGithubFirstPushComment(c, found, pr, issue.posterId ?? null);
 
       // NewPullRequest's reviewer arms (services/pull/pull.go:169-181):
       // `issue_service.ReviewRequest` / `TeamReviewRequest` run AFTER the tx
