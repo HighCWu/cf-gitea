@@ -301,12 +301,13 @@ async function evictRepo(slug: string): Promise<EvictRepo> {
  *  create-updates in a single receive round-trip), so the deletion target
  *  pack2 lands at push 2 and the four filler uploads evict its chunk. The
  *  deletion-target geometry is identical to the old seven-push shape: C1 is
- *  a cached tip whose tree2/blob2 are cache-cold, every surviving ancestor
- *  (B/A/root, treeR, blobR) lives in the SURVIVING packRB, and the reachable
- *  walks of the filler tips still read through the dead pack (their
- *  closure-broken reports). The defaultBranch pin and the base/HEAD hygiene
- *  are evictRepo's, for the same reasons (see there; the deleteApiRef seam
- *  verdict is threePackRepo's comment). */
+ *  a cached tip whose tree2/blob2 are cache-cold, and every surviving
+ *  ancestor (B/A/root, treeR, blobR) lives in the SURVIVING packRB — so the
+ *  only READ-path loss is tree2 under the readable tip (the tree-missing
+ *  report; the lost-content reads answer the read RPCs' not-found shape,
+ *  see the injected test below). The defaultBranch pin and the base/HEAD
+ *  hygiene are evictRepo's, for the same reasons (see there; the
+ *  deleteApiRef seam verdict is threePackRepo's comment). */
 async function treeRepo(slug: string): Promise<EvictRepo> {
   const { storageKey, token, repoId } = await createRepo(slug);
   await drizzle(env.DB).update(repositories).set({ defaultBranch: "root" }).where(eq(repositories.id, repoId));
@@ -439,13 +440,17 @@ describe("checkRepoInvariants: injected violations", () => {
     const report = await checkRepoInvariants(env, seeded.target);
     expect(report.ok).toBe(false);
     expect(report.partial).toBe(false);
-    // A mid-chain pack loss poisons every tip's provable closure (the DO's
-    // reachability walk reads through the dead node), so every visited tip
-    // reports — but every READ-path violation is a closure-broken, and the
-    // never-advertised ancestor A (the actually-deleted content) is among
-    // them. The catalog cross-check adds the one catalog-pack-missing for
-    // the deleted pack itself (cache-independent — see the docstring).
-    expect(report.violations.length).toBeGreaterThanOrEqual(1);
+    // The never-advertised ancestor A is the only closure member whose BYTES
+    // died with pack1: B (an advertised-at-push-time tip) reads from the DO's
+    // object cache, and every surviving-tree read rides packR/pack2 — so the
+    // one READ-path violation is closure-broken at A itself (A's read answers
+    // the read RPCs' not-found shape — the engine degrades lost pack bytes to
+    // null, NOTICE.md 2026-11-14). The catalog cross-check adds the one
+    // catalog-pack-missing for the deleted pack (cache-independent — see the
+    // docstring). Exactly two: the read-path closure-broken at A and the
+    // catalog half's pack flag (the deterministic post-degrade shape — the
+    // pre-degrade throw shape poisoned every walked tip instead).
+    expect(report.violations).toHaveLength(2);
     expect(
       report.violations.every((v) => v.kind === "closure-broken" || v.kind === "catalog-pack-missing"),
     ).toBe(true);
@@ -460,11 +465,15 @@ describe("checkRepoInvariants: injected violations", () => {
     const report = await checkRepoInvariants(env, seeded.target);
     expect(report.ok).toBe(false);
     // The tip commit itself reads from the DO's object cache (mask, see the
-    // module docstring); its tree and blob do not. Tips above the dead pack
-    // also lose their provable closure (see the closure test above), and the
-    // catalog half flags the deleted pack directly.
+    // module docstring); its tree and blob do not — the tree read answers the
+    // read RPCs' not-found shape (the engine degrades lost pack bytes to
+    // null, NOTICE.md 2026-11-14) and reports tree-missing. The surviving
+    // closure (B/A/root in packRB) reads cleanly: with lost content degrading
+    // to not-found, a mid-chain loss no longer poisons tips whose own
+    // closure provably reads — the catalog half flags the deleted pack
+    // directly.
     const kinds = new Set(report.violations.map((v) => v.kind));
-    expect([...kinds].sort()).toEqual(["catalog-pack-missing", "closure-broken", "tree-missing"]);
+    expect([...kinds].sort()).toEqual(["catalog-pack-missing", "tree-missing"]);
     const tree = report.violations.find((v) => v.kind === "tree-missing");
     expect(tree?.oid).toBe(seeded.treeC1);
   });

@@ -16,7 +16,7 @@ import {
   Service,
   PackCache,
 } from "./git/protocol";
-import type { ReadGate } from "./git/packstore";
+import { PackLostError, type ReadGate } from "./git/packstore";
 import {
   beginReceive,
   beginForkImport,
@@ -621,6 +621,27 @@ interface FileDiff {
   hunks: Hunk[];
   add: number;
   del: number;
+}
+
+/**
+ * The read RPCs' lost-content degradation (NOTICE.md 2026-11-14 row): when a
+ * pack's stored bytes are gone (`PackLostError` — the R2 object was deleted
+ * out-of-band, or a SQLite chunk row was lost), the READ family answers its
+ * own not-found shape (`lost()`) instead of rejecting the RPC. Every read
+ * RPC already documents that shape for an unresolvable/missing object, and
+ * the worker's invariants checker classifies the null arms identically —
+ * while a rejected DO RPC surfaces as a DO-side "uncaught exception" in the
+ * vitest runtime even when the caller catches it (the injected-violations
+ * battery's rejection noise). Transport-class and corruption failures (gate
+ * denial, unbound backend, inflate/delta errors, unreachable cell) still
+ * throw; the clone arms and receive paths, which consume the store
+ * DIRECTLY rather than through these RPCs, keep the loud failure.
+ */
+function degradeLostContent<T>(promise: Promise<T>, lost: () => T): Promise<T> {
+  return promise.catch((error: unknown) => {
+    if (error instanceof PackLostError) return lost();
+    throw error;
+  });
 }
 
 export class RepoCell extends DurableObject<Env> {
@@ -1544,8 +1565,10 @@ export class RepoCell extends DurableObject<Env> {
         if (r.name.startsWith("refs/tags/")) {
           // peeledRefTarget reads the refs row's peeled column (written once at
           // first peel), so repeat calls never re-walk the tag object; a cold
-          // peel's tag-object reads ride the content lease (gate)
-          const peeled = await this.store.peeledRefTarget(r.name, r.oid, gate);
+          // peel's tag-object reads ride the content lease (gate). A lost tag
+          // object degrades to no peeled entry (the advertisement stays valid;
+          // the tag's own reads report the loss).
+          const peeled = await degradeLostContent(this.store.peeledRefTarget(r.name, r.oid, gate), () => null);
           if (peeled && peeled !== r.oid) entry.peeled = peeled;
         }
         refs.push(entry);
@@ -1557,12 +1580,15 @@ export class RepoCell extends DurableObject<Env> {
   /** `id` is a branch, tag, full ref, or reachable oid; absent means HEAD. */
   async readCommit(id?: string): Promise<CommitJson | null> {
     this.rpcBind();
-    return this.withContentLease(async (gate) => {
-      const rr = await this.resolveRef(id, gate);
-      if (!rr) return null;
-      const c = await this.peelToCommit(rr.oid, gate);
-      return c ? commitJson(c.oid, c.commit) : null;
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const rr = await this.resolveRef(id, gate);
+        if (!rr) return null;
+        const c = await this.peelToCommit(rr.oid, gate);
+        return c ? commitJson(c.oid, c.commit) : null;
+      }),
+      () => null,
+    );
   }
 
   /**
@@ -1582,13 +1608,16 @@ export class RepoCell extends DurableObject<Env> {
    */
   async readTag(id: string): Promise<TagJson | null> {
     this.rpcBind();
-    return this.withContentLease(async (gate) => {
-      const obj = await this.store.get(id, gate);
-      if (!obj || obj.type !== "tag") return null;
-      const t = parseTag(obj.data);
-      const { message } = splitTagSignature(t.message);
-      return { oid: id, object: t.object, type: t.type, tag: t.tag, tagger: t.tagger, message };
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const obj = await this.store.get(id, gate);
+        if (!obj || obj.type !== "tag") return null;
+        const t = parseTag(obj.data);
+        const { message } = splitTagSignature(t.message);
+        return { oid: id, object: t.object, type: t.type, tag: t.tag, tagger: t.tagger, message };
+      }),
+      () => null,
+    );
   }
 
   async listLog(
@@ -1596,16 +1625,20 @@ export class RepoCell extends DurableObject<Env> {
     opts: { path?: string; ofs?: number; n?: number; skipCacheWrite?: boolean } = {}
   ): Promise<LogResult> {
     this.rpcBind();
-    return this.withContentLease(async (gate) => {
-      const rr = await this.resolveRef(ref, gate);
-      if (!rr) return { commits: [], more: false };
-      const n = Math.min(Math.max(opts.n ?? LOG_PAGE, 1), 100);
-      const ofs = Math.max(opts.ofs ?? 0, 0);
-      const filter: LogFilter = opts.path ? { path: decodePath("/" + opts.path) } : {};
-      const cacheOpts = opts.skipCacheWrite ? { skipCacheWrite: true } : undefined;
-      const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter, gate, cacheOpts);
-      return { commits: entries.map((e) => commitJson(e.oid, e.commit)), more };
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const rr = await this.resolveRef(ref, gate);
+        if (!rr) return { commits: [], more: false };
+        const n = Math.min(Math.max(opts.n ?? LOG_PAGE, 1), 100);
+        const ofs = Math.max(opts.ofs ?? 0, 0);
+        const filter: LogFilter = opts.path ? { path: decodePath("/" + opts.path) } : {};
+        const cacheOpts = opts.skipCacheWrite ? { skipCacheWrite: true } : undefined;
+        const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter, gate, cacheOpts);
+        return { commits: entries.map((e) => commitJson(e.oid, e.commit)), more };
+      }),
+      // the unresolvable-tip shape — the same page an unresolvable ref gives
+      () => ({ commits: [], more: false }),
+    );
   }
 
   /**
@@ -1626,39 +1659,46 @@ export class RepoCell extends DurableObject<Env> {
     if (paths.length > TREE_COMMITS_MAX_PATHS) {
       throw new Error(`listTreeCommits: too many paths (${paths.length} > ${TREE_COMMITS_MAX_PATHS})`);
     }
-    return this.withContentLease(async (gate) => {
-      const rr = await this.resolveRef(ref, gate);
-      const first = rr ? await this.peelToCommit(rr.oid, gate) : null;
-      if (!first) return { commits: paths.map(() => null) };
-      const entries = await this.walkTreeCommits(
-        first,
-        paths.map((p) => decodePath("/" + p)),
-        gate
-      );
-      return { commits: entries.map((e) => (e ? commitJson(e.oid, e.commit) : null)) };
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const rr = await this.resolveRef(ref, gate);
+        const first = rr ? await this.peelToCommit(rr.oid, gate) : null;
+        if (!first) return { commits: paths.map(() => null) };
+        const entries = await this.walkTreeCommits(
+          first,
+          paths.map((p) => decodePath("/" + p)),
+          gate
+        );
+        return { commits: entries.map((e) => (e ? commitJson(e.oid, e.commit) : null)) };
+      }),
+      // the unresolvable-ref shape — all-null, per the contract above
+      () => ({ commits: paths.map(() => null) }),
+    );
   }
 
   async listTree(ref?: string, path = ""): Promise<TreeResult | null> {
     this.rpcBind();
-    return this.withContentLease(async (gate) => {
-      const rr = await this.resolveRef(ref, gate);
-      if (!rr) return null;
-      const head = await this.peelToCommit(rr.oid, gate);
-      if (!head) return null;
-      const segs = decodePath("/" + path);
-      const found = await this.lookupPath(head.commit.tree, segs, gate);
-      if (!found || found.kind !== "tree") return null;
-      const entries: TreeEntryJson[] = found.entries.map((e) => {
-        const type = isTreeMode(e.mode) ? ("tree" as const) : isGitlinkMode(e.mode) ? ("commit" as const) : ("blob" as const);
-        const out: TreeEntryJson = { name: e.name, mode: e.mode, type, oid: e.oid };
-        // typeAndSize is an index-only SQLite read — no R2 GET, nothing to gate
-        const meta = type === "blob" ? this.store.typeAndSize(e.oid) : null;
-        if (meta) out.size = meta.size;
-        return out;
-      });
-      return { oid: found.oid, entries };
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const rr = await this.resolveRef(ref, gate);
+        if (!rr) return null;
+        const head = await this.peelToCommit(rr.oid, gate);
+        if (!head) return null;
+        const segs = decodePath("/" + path);
+        const found = await this.lookupPath(head.commit.tree, segs, gate);
+        if (!found || found.kind !== "tree") return null;
+        const entries: TreeEntryJson[] = found.entries.map((e) => {
+          const type = isTreeMode(e.mode) ? ("tree" as const) : isGitlinkMode(e.mode) ? ("commit" as const) : ("blob" as const);
+          const out: TreeEntryJson = { name: e.name, mode: e.mode, type, oid: e.oid };
+          // typeAndSize is an index-only SQLite read — no R2 GET, nothing to gate
+          const meta = type === "blob" ? this.store.typeAndSize(e.oid) : null;
+          if (meta) out.size = meta.size;
+          return out;
+        });
+        return { oid: found.oid, entries };
+      }),
+      () => null,
+    );
   }
 
   /** Changes id2..id (default id2 = first parent of id, like the diff page). */
@@ -1668,50 +1708,56 @@ export class RepoCell extends DurableObject<Env> {
     opts?: { skipCacheWrite?: boolean }
   ): Promise<DiffResult | null> {
     this.rpcBind();
-    return this.withContentLease(async (gate) => {
-      const rr = await this.resolveRef(id, gate);
-      if (!rr) return null;
-      const head = await this.peelToCommit(rr.oid, gate, opts);
-      if (!head) return null;
-      let oldOid: string | null = null;
-      if (id2) {
-        const rr2 = await this.resolveRef(id2, gate);
-        const c2 = rr2 ? await this.peelToCommit(rr2.oid, gate, opts) : null;
-        if (!c2) return null;
-        oldOid = c2.oid;
-      } else {
-        oldOid = head.commit.parents[0] ?? null;
-      }
-      // Every scan read below (parent load, tree flattening) skips the
-      // ObjCache write like the log walks: a diff is a scan over history,
-      // and caching its boundary commits and trees would extend the serve
-      // cache's hot set one level past every walked window — the invariants
-      // checker's documented detection horizon depends on scan-touched
-      // content reading through to R2 (NOTICE.md 2026-11-02 row).
-      const oldCommit = oldOid ? await this.loadCommit(oldOid, gate, opts) : null;
-      const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree, gate, opts);
-      return {
-        old: oldOid,
-        new: head.oid,
-        truncated,
-        files: files.map((f) => ({ path: f.path, old: f.o, new: f.n, kind: f.kind, add: f.add, del: f.del, hunks: f.hunks })),
-      };
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const rr = await this.resolveRef(id, gate);
+        if (!rr) return null;
+        const head = await this.peelToCommit(rr.oid, gate, opts);
+        if (!head) return null;
+        let oldOid: string | null = null;
+        if (id2) {
+          const rr2 = await this.resolveRef(id2, gate);
+          const c2 = rr2 ? await this.peelToCommit(rr2.oid, gate, opts) : null;
+          if (!c2) return null;
+          oldOid = c2.oid;
+        } else {
+          oldOid = head.commit.parents[0] ?? null;
+        }
+        // Every scan read below (parent load, tree flattening) skips the
+        // ObjCache write like the log walks: a diff is a scan over history,
+        // and caching its boundary commits and trees would extend the serve
+        // cache's hot set one level past every walked window — the invariants
+        // checker's documented detection horizon depends on scan-touched
+        // content reading through to R2 (NOTICE.md 2026-11-02 row).
+        const oldCommit = oldOid ? await this.loadCommit(oldOid, gate, opts) : null;
+        const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree, gate, opts);
+        return {
+          old: oldOid,
+          new: head.oid,
+          truncated,
+          files: files.map((f) => ({ path: f.path, old: f.o, new: f.n, kind: f.kind, add: f.add, del: f.del, hunks: f.hunks })),
+        };
+      }),
+      () => null,
+    );
   }
 
   async readBlob(ref: string | undefined, path: string): Promise<BlobResult | null> {
     this.rpcBind();
-    return this.withContentLease(async (gate) => {
-      const rr = await this.resolveRef(ref, gate);
-      if (!rr) return null;
-      const head = await this.peelToCommit(rr.oid, gate);
-      if (!head) return null;
-      const found = await this.lookupPath(head.commit.tree, decodePath("/" + path), gate);
-      if (!found || found.kind !== "blob") return null;
-      const obj = await this.store.get(found.entry.oid, gate);
-      if (!obj || obj.type !== "blob") return null;
-      return { oid: found.entry.oid, mode: found.entry.mode, data: obj.data };
-    });
+    return degradeLostContent(
+      this.withContentLease(async (gate) => {
+        const rr = await this.resolveRef(ref, gate);
+        if (!rr) return null;
+        const head = await this.peelToCommit(rr.oid, gate);
+        if (!head) return null;
+        const found = await this.lookupPath(head.commit.tree, decodePath("/" + path), gate);
+        if (!found || found.kind !== "blob") return null;
+        const obj = await this.store.get(found.entry.oid, gate);
+        if (!obj || obj.type !== "blob") return null;
+        return { oid: found.entry.oid, mode: found.entry.mode, data: obj.data };
+      }),
+      () => null,
+    );
   }
 
   /**
@@ -2451,8 +2497,18 @@ export class RepoCell extends DurableObject<Env> {
       // detection horizon (worker src/invariants/check.ts) to everything
       // this walk touched (NOTICE.md 2026-11-02 row). The persistent
       // reachable-set cache (loadReachable/saveReachable) is the intended
-      // memo for this walk.
-      const obj = await this.store.get(oid, gate, { skipCacheWrite: true });
+      // memo for this walk. A LOST pack's object cannot expand the frontier:
+      // the proof walk treats it as a leaf (the degradeLostContent sibling,
+      // NOTICE.md 2026-11-14 row) so a mid-chain loss does not poison the
+      // provability of targets the surviving graph still reaches — the lost
+      // object's own reads report through the read RPCs' null arms.
+      let obj: Awaited<ReturnType<GitStore["get"]>>;
+      try {
+        obj = await this.store.get(oid, gate, { skipCacheWrite: true });
+      } catch (error) {
+        if (!(error instanceof PackLostError)) throw error;
+        continue;
+      }
       if (!obj) continue;
       if (obj.type === "commit") {
         const c = parseCommit(obj.data);

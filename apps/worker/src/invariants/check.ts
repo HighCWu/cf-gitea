@@ -9,9 +9,12 @@
  * generated dist-types RPCs) plus the REPO_PACKS R2 binding for prefix
  * probes. `readCommit`/`listTree` are not passive index reads: they resolve
  * through the DO's GitStore, which fetches object bytes from R2 pack files,
- * so a deleted/corrupt pack surfaces as a thrown RPC — availability is
- * proved by reading, exactly the "readable, verified, parseable" bar of
- * invariant 1 (ref closure availability) in the design inputs.
+ * so availability is proved by reading, exactly the "readable, verified,
+ * parseable" bar of invariant 1 (ref closure availability) in the design
+ * inputs. A deleted/corrupt pack surfaces as the RPC's not-found shape
+ * (null — the engine degrades lost pack bytes to the documented null arms,
+ * engine NOTICE.md 2026-11-14) or, for corruption/transport classes, a
+ * thrown RPC; either arm lands in `violations` below.
  *
  * Catalog half (engine RPC `listPackCatalog`, landed): the pack_catalog (DO
  * SQLite) is paged through a read-only, lease-free RPC and cross-checked

@@ -8,6 +8,18 @@ import { ObjCache, ObjRec } from "../receive/objcache";
 import { REPO_PACK_BASELINE_SQL, replayRepoSchema, schemaSealedError } from "./migrations";
 
 export const PACK_CHUNK = 1024 * 1024;
+
+/**
+ * A pack's stored BYTES are gone while its index still claims the object:
+ * the R2 pack object was deleted out-of-band (or the SQLite `pack_data`
+ * chunk row was lost). This is the CONTENT-LOSS class — the read RPCs
+ * degrade it to their own not-found shape (repo.ts `degradeLostContent`)
+ * so a lost pack answers reads instead of throwing over the DO RPC
+ * boundary; every other consumer (clone arms, receive paths) keeps the
+ * loud failure. "R2 backend not bound" and delta-chain corruption stay
+ * plain Errors (configuration/corruption, not loss).
+ */
+export class PackLostError extends Error {}
 /**
  * The segmented serve path's R2 Range-GET segment bound (SPEC-0011 §4.1, M3.2).
  * Chosen as one PACK_CHUNK (1 MiB): readRaw already fetches pack regions as
@@ -413,7 +425,7 @@ export class PackStore {
       const obj = await this.r2.bucket.get(key, {
         range: { offset: seq * PACK_CHUNK, length: PACK_CHUNK },
       });
-      if (!obj) throw new Error(`pack ${packKey}: missing R2 object ${key}`);
+      if (!obj) throw new PackLostError(`pack ${packKey}: missing R2 object ${key}`);
       chunk = new Uint8Array(await obj.arrayBuffer());
     } else {
       const rows = this.sql
@@ -423,7 +435,7 @@ export class PackStore {
           seq
         )
         .toArray();
-      if (!rows.length) throw new Error(`pack ${packKey}: missing chunk ${seq}`);
+      if (!rows.length) throw new PackLostError(`pack ${packKey}: missing chunk ${seq}`);
       chunk = new Uint8Array(rows[0].data);
     }
     if (!opts?.skipCacheWrite) {

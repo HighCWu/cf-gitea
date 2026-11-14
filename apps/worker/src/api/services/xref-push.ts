@@ -424,7 +424,14 @@ async function walkPushedCommits(input: UpdateIssuesForPushInput): Promise<Commi
   if (/^0+$/.test(input.update.old)) {
     let log: Awaited<ReturnType<typeof cell.listLog>>;
     try {
-      log = await cell.listLog(input.update.next, { ofs: 0, n: PUSH_NEW_BRANCH_COMMITS_LIMIT });
+      // skipCacheWrite — the same scan-walk cache discipline as the webhook
+      // walk's seam (webhooks-push.ts, the engine's NOTICE.md 2026-11-02
+      // row): a log scan reads the FULL ancestry of the pushed branch, and
+      // caching scanned ancestors would extend the serve cache's hot set one
+      // walk past every pushed tip — the invariants checker's documented
+      // detection horizon depends on never-advertised ancestors reading
+      // through to R2.
+      log = await cell.listLog(input.update.next, { ofs: 0, n: PUSH_NEW_BRANCH_COMMITS_LIMIT, skipCacheWrite: true });
     } catch (error) {
       console.error(
         `[xref-push] ${input.repo.ownerNamespace}/${input.repo.slug}: branch-create walk failed for ${input.update.ref}: ${error instanceof Error ? error.message : String(error)}`,
