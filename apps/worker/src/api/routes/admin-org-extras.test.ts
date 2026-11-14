@@ -15,11 +15,12 @@
 
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, users } from "../../db/schema";
+import { repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { RepoService } from "../../repos/service";
 import { AuditActions, findAuditEvents } from "../../services/audit";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
@@ -242,6 +243,87 @@ describe("DELETE /orgs/{org}/repos (orgDeleteRepos)", () => {
     expect(after.map((row) => row.id)).toEqual(["9603"]);
   });
 
+  it("fires the per-repo deleted webhook over the landed emitRepoEvent machinery (org.go:528's notify=true → notifier.go:126-136)", async () => {
+    const { owner, org } = await seedActors();
+    await seedOrgRepo("9606", "hooked-a", org);
+    await seedOrgRepo("9607", "hooked-b", org);
+    // A user-owned repo in the same namespace spelling must NOT emit.
+    await drizzle(env.DB).insert(repositories).values({
+      id: "9608",
+      storageKey: "r_9608",
+      ownerNamespace: "org-owner",
+      ownerId: owner.id,
+      slug: "personal",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: NOW,
+    });
+    const seedHook = async (target: { ownerId?: number; repoId?: string }): Promise<number> => {
+      const rows = await drizzle(env.DB)
+        .insert(webhooks)
+        .values({
+          ...target,
+          url: "https://hooks.invalid/org-sweep",
+          events: JSON.stringify({ choose_events: true, branch_filter: "*", events: { repository: true } }),
+          isActive: true,
+          type: "gitea",
+          createdAt: NOW,
+          updatedAt: NOW,
+        })
+        .returning({ id: webhooks.id })
+        .all();
+      return rows[0]!.id;
+    };
+    // One ORG-LEVEL hook: upstream's owner-wide hook hears EVERY swept
+    // repo's delete (the matcher's ownerId leg — repo.go:69-70 fires
+    // EventSource{Repository: repo} per repo, and the org's hooks match it).
+    const orgHook = await seedHook({ ownerId: org.id });
+    // The deleted repo's OWN repo-scoped hook must stay SILENT: the loop
+    // emits AFTER the §2.5.5 pipeline, whose cascade already swept the
+    // repo's webhook rows — the documented ordering deviation shared with
+    // repo.ts repoDelete (upstream triggers BEFORE its cascade because its
+    // queued tasks outlive the hook rows; our delivery rows are the source
+    // of truth and the cascade deletes them with the repo).
+    await seedHook({ repoId: "9606" });
+
+    const res = await router()(`/orgs/${org.username}/repos`, { method: "DELETE", headers: authHeaders(owner.id) });
+    expect(res.status).toBe(202);
+
+    // Exactly one delivery per swept repo, all on the org hook; the repo's
+    // own hook is gone (cascaded) and the user-owned survivor emits nothing.
+    const deliveries = await drizzle(env.DB).select().from(webhookDeliveries).all();
+    expect(deliveries).toHaveLength(2);
+    expect(new Set(deliveries.map((row) => row.hookId))).toEqual(new Set([orgHook]));
+    expect(new Set(deliveries.map((row) => row.repoId))).toEqual(new Set(["9606", "9607"]));
+    const byRepo = new Map(deliveries.map((row) => [row.repoId, row]));
+    for (const row of deliveries) {
+      expect(row.eventType).toBe("repository");
+      expect(row.eventGroup).toBe("repository"); // not in EVENT_GROUPS → the identity group
+      // In-process caller: no execution context, no queue producer — rows
+      // stay `pending` (repo-events.ts's documented test arm).
+      expect(row.state).toBe("pending");
+      const payload = JSON.parse(row.payloadContent) as Record<string, unknown>;
+      // §2.7 RepositoryPayload (modules/structs/hook.go:566) — deleted
+      // carries NO changes block.
+      expect(Object.keys(payload).sort()).toEqual(["action", "organization", "repository", "sender"]);
+      expect(payload.action).toBe("deleted");
+    }
+    // The PRE-delete render (the loop fetched `found` before the pipeline
+    // deleted the row) and the sender/organization identity: doer as sender,
+    // the owner user row as organization (notifier.go:126-136's ToUser pair).
+    const payloadA = JSON.parse(byRepo.get("9606")!.payloadContent) as {
+      repository: { full_name: string };
+      organization: { login: string };
+      sender: { login: string };
+    };
+    expect(payloadA.repository.full_name).toBe("acme/hooked-a");
+    expect(payloadA.organization.login).toBe("acme");
+    expect(payloadA.sender.login).toBe("org-owner");
+    const payloadB = JSON.parse(byRepo.get("9607")!.payloadContent) as { repository: { full_name: string } };
+    expect(payloadB.repository.full_name).toBe("acme/hooked-b");
+  });
+
   it("records a repository:delete audit row per swept repo with the org-owner actor (org.go:528's doer through repository.go:75 — B-75's residue)", async () => {
     const { owner, org } = await seedActors();
     await seedOrgRepo("9604", "audited-a", org);
@@ -271,6 +353,54 @@ describe("DELETE /orgs/{org}/repos (orgDeleteRepos)", () => {
     const res = await router()(`/orgs/${org.username}/repos`, { method: "DELETE", headers: authHeaders(owner.id) });
     expect(res.status).toBe(204);
     expect(await findAuditEvents(drizzle(env.DB), { action: AuditActions.RepositoryDelete })).toHaveLength(0);
+  });
+
+  it("a per-repo failure CONTINUES the sweep: the sibling still deletes and the failure is logged (the CreateNotice(NoticeRepository) analog, org.go:521-536)", async () => {
+    const { owner, org } = await seedActors();
+    const doomedId = "9609";
+    await seedOrgRepo(doomedId, "doomed-fails", org);
+    await seedOrgRepo("9610", "swept-anyway", org);
+
+    // The notice store is a deferred census row, so upstream's
+    // CreateNotice(NoticeRepository, desc) + log.Error pair (org.go:529-530)
+    // is observable here as the loop's console.error line only. Inject the
+    // failure at the service seam — one repo's DeleteRepository rejects,
+    // exactly the org.go:528-533 arm — with the real pipeline running for
+    // the sibling (the org-teams.test.ts spy model).
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The unbound read IS the point: the mock delegates the non-doomed repos
+    // to the real pipeline through the pre-spy capture.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const original = RepoService.prototype.deleteRepository;
+    const serviceSpy = vi
+      .spyOn(RepoService.prototype, "deleteRepository")
+      .mockImplementation(function (this: RepoService, ...args: Parameters<typeof original>) {
+        if (args[0] === doomedId) return Promise.reject(new Error("simulated cascade failure"));
+        return original.apply(this, args);
+      });
+    try {
+      const res = await router()(`/orgs/${org.username}/repos`, { method: "DELETE", headers: authHeaders(owner.id) });
+      // The detached loop never fails the response (upstream answers 202 at
+      // the goroutine launch, org.go:576-578).
+      expect(res.status).toBe(202);
+      // The continue arm: the failing repo's row SURVIVES, the healthy
+      // sibling went through the pipeline.
+      const remaining = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+      expect(remaining.map((row) => row.id)).toEqual([doomedId]);
+      // Exactly one notice-analog line, naming the org, the repo and the cause.
+      const failureCalls = errSpy.mock.calls.filter((args) => String(args[0]).includes("org repo deletion failed"));
+      expect(failureCalls).toHaveLength(1);
+      expect(String(failureCalls[0]![0])).toContain(`org ${org.username} repo ${doomedId}`);
+      expect(String(failureCalls[0]![0])).toContain("simulated cascade failure");
+      // Success-only audit semantics (repository.go:75's post-cascade
+      // record): only the swept sibling carries the row — the failed arm's
+      // batch never landed, so it never recorded.
+      const auditRows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.RepositoryDelete });
+      expect(auditRows.map((row) => row.scopeName)).toEqual(["acme/swept-anyway"]);
+    } finally {
+      serviceSpy.mockRestore();
+      errSpy.mockRestore();
+    }
   });
 
   it("403s a plain member and an outsider with the upstream message; 404s an unknown org", async () => {
