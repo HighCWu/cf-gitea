@@ -340,6 +340,103 @@ describe("DELETE /users/{username}/tokens/{token} (userDeleteAccessToken)", () =
 });
 
 // ---------------------------------------------------------------------------
+// THE ADMIN MINTS FOR A BOT (census B-72 handoff 4 — the bot-token tails).
+// Derivation at the pin fc493688: the API family carries NO user-type gate —
+// POST /users/{username}/tokens is reqSelfOrAdmin()+reqBasicOrRevProxyAuth()
+// (api.go:1067-1071) over user.CreateAccessToken (user/app.go:78-166), which
+// keys the mint on ctx.ContextUser.ID unconditionally, and the group's
+// UserAssignmentAPI name lookup is GetUserByName — ANY user type at this pin
+// (models/user/user.go:1133 "any user type"; the individual-only filter lives
+// in GetIndividualUserByName :1137, the LOGIN lookups). So a site admin mints
+// a bot's token straight through this route — there is NO 400-on-bot-target
+// arm to port (that refusal exists only on the WEB admin pair,
+// getTargetBot's bot_token_only, routers/web/admin/users.go:367-377, which
+// refuses NON-bot targets). Admin-managed tokens are a bot's ONLY auth path
+// upstream — the minted credential then authenticates the bot through the
+// type-blind PAT arm (pinned in auth/middleware.test.ts's bot describe).
+// ---------------------------------------------------------------------------
+describe("the admin mints FOR a bot (B-72 handoff 4 — user/app.go:78-166 is type-blind)", () => {
+  /** A bot-typed users row (the admin-created class — the API cannot mint
+   *  one, CreateUserOption carries no type field, structs/admin_user.go). */
+  async function seedBot(username: string): Promise<{ id: number; username: string }> {
+    const rows = await drizzle(env.DB)
+      .insert(users)
+      .values({ username, usernameLower: username, status: "active", type: "bot", createdAt: NOW })
+      .returning({ id: users.id, username: users.username })
+      .all();
+    return rows[0]!;
+  }
+
+  it("a site admin mints a bot's token: 201 shape, the row lands on the bot, the audit names the pair", async () => {
+    const bot = await seedBot("deploy-bot");
+    const res = await router()(
+      `/users/${bot.username}/tokens`,
+      jsonAuth(token(admin), { name: "bot-credentials", scopes: ["read:repository"] }),
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json<Record<string, string | number | string[]>>();
+    expect(body.name).toBe("bot-credentials");
+    expect(typeof body.sha1).toBe("string");
+    expect(body.token_last_eight).toBe((body.sha1 as string).slice(-8));
+    expect(body.scopes).toEqual(["read:repository"]);
+    // the mint is real and owned by the BOT row (uid = the bot)
+    const service = new TokenService(env.DB);
+    const listed = await service.list(bot.id, 1, 30);
+    expect(listed.total).toBe(1);
+    expect(listed.tokens[0]).toMatchObject({ name: "bot-credentials", scopes: "read:repository" });
+    expect(await service.verify(body.sha1 as string)).toMatchObject({ user: { id: bot.id, type: "bot" } });
+    // audit.Record(ctx, UserAccessTokenAdd) — app.go:156: owner = the
+    // CONTEXT user (the BOT, applications.go:133's template), the actor =
+    // the calling admin; vars.scope carries the bot's name. (audit_events
+    // is not in the file's reset list — scope the find to THIS mint's row.)
+    const { auditEvents } = await import("../../db/schema");
+    const events = await drizzle(env.DB).select().from(auditEvents).all();
+    const addRow = events.find((row) => row.action === "user:accesstoken:add" && row.scopeId === String(bot.id));
+    expect(addRow).toBeDefined();
+    expect(addRow?.scopeType).toBe("user");
+    expect(addRow?.scopeId).toBe(String(bot.id));
+    expect(addRow?.scopeName).toBe(bot.username);
+    expect(addRow?.actorName).toBe(admin.username);
+    expect(JSON.parse(addRow?.metadata ?? "{}")).toEqual({
+      token: "bot-credentials",
+      token_scope: "read:repository",
+    });
+  });
+
+  it("the admin lists and revokes the bot's tokens (the inventory the web panel reads); a non-admin stays 403", async () => {
+    const bot = await seedBot("ci-bot");
+    const send = router();
+    const minted = await new TokenService(env.DB).mint({ userId: bot.id, name: "ci", scopes: "all" });
+    // GET /users/{bot}/tokens — the admin's read (ListAccessTokens keys on
+    // ctx.ContextUser.ID, app.go:44-49 — the bot's rows, any type)
+    const list = await send(`/users/${bot.username}/tokens`, authed(token(admin)));
+    expect(list.status).toBe(200);
+    const rows = await list.json<Array<Record<string, unknown>>>();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: minted.id, name: "ci" });
+    // reqSelfOrAdmin (api.go:373-379) is type-blind too: a non-admin
+    // cannot read (nor mint, nor delete) the bot's tokens
+    expect((await send(`/users/${bot.username}/tokens`, authed(token(owner)))).status).toBe(403);
+    expect(
+      (await send(`/users/${bot.username}/tokens`, jsonAuth(token(owner), { name: "x", scopes: ["all"] }))).status,
+    ).toBe(403);
+    // DELETE — the admin revokes the bot's credential by id (204), then the row is gone
+    expect(
+      (await send(`/users/${bot.username}/tokens/${minted.id}`, { method: "DELETE", ...authed(token(admin)) })).status,
+    ).toBe(204);
+    expect(await new TokenService(env.DB).list(bot.id, 1, 30)).toMatchObject({ total: 0 });
+    const { auditEvents } = await import("../../db/schema");
+    const events = await drizzle(env.DB).select().from(auditEvents).all();
+    const removeRow = events.find(
+      (row) => row.action === "user:accesstoken:remove" && row.scopeId === String(bot.id),
+    );
+    expect(removeRow).toBeDefined();
+    expect(removeRow?.scopeId).toBe(String(bot.id));
+    expect(removeRow?.actorName).toBe(admin.username);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tracked-time aggregates
 // ---------------------------------------------------------------------------
 

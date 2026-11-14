@@ -737,3 +737,134 @@ describe("the OAuth2 dotted-credential dispatch (services/auth/oauth2.go:110-128
     expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
   });
 });
+
+// ---------------------------------------------------------------------------
+// THE BOT-TOKEN ARMS (census B-72 handoff 4 — admin-managed access tokens
+// are a BOT's only upstream auth path). Derivation at the pin fc493688:
+// the PAT arm carries NO user-type gate anywhere — services/auth/basic.go
+// VerifyAuthToken:90-107 resolves GetUserByID(token.UID) regardless of type
+// (only the OAuth2-GRANT arm gates: oauth2.go:122-124 `!user.IsIndividual()`
+// → inapplicable), and the same token resolves through BOTH parseAuthBasic
+// shapes (basic.go:44-59). A bot row therefore authenticates the API (and
+// git over Basic-with-token) with its admin-minted PAT exactly like an
+// individual, while remaining web-unreachable (Session.Verify refuses
+// non-individuals, session.go:51-55 — landed in ui/session.ts:488-492 — and
+// the password lookups are Individual-only). The resolver below is
+// type-blind on purpose: rowToUser carries the users.type column and the
+// middleware attaches it untouched.
+// ---------------------------------------------------------------------------
+describe("the bot doer's token arms (B-72 handoff 4 — basic.go:90-107, oauth2.go:122-124)", () => {
+  let botSeq = 0;
+
+  /** A bot row + its admin-minted PAT (the only credential class a bot can
+   *  hold upstream — getTargetBot's arms, routers/web/admin/users.go:378-395,
+   *  and the API twin POST /users/{username}/tokens). */
+  async function seedBotWithToken(scopes: string): Promise<{ userId: number; username: string; token: string }> {
+    botSeq += 1;
+    const username = `test-bot-${botSeq}`;
+    const user = await seedVerifiedUser({ username, type: "bot" });
+    const minted = await mintFor(user.id, `${username}-token`, scopes);
+    return { userId: user.id, username, token: minted.plaintext };
+  }
+
+  it("a bot's PAT resolves the bot doer through the Bearer arm and feeds the scope gate", async () => {
+    const bot = await seedBotWithToken("read:repository");
+    const who = await call("https://example.com/_whoami", {
+      headers: { Authorization: `token ${bot.token}` },
+    });
+    const identity = await who.json<{ user: string; isBasicAuth: boolean }>();
+    expect(identity.user).toBe(bot.username);
+    expect(identity.isBasicAuth).toBe(false);
+    // the bot's scope feeds the gate like any doer's: read:repository passes
+    const ok = await call("https://example.com/_repo", {
+      headers: { Authorization: `token ${bot.token}` },
+    });
+    expect(ok.status).toBe(200);
+    // …and a missing category answers the same 403 body carrying the bot's scope
+    const denied = await call("https://example.com/_repo", {
+      headers: { Authorization: `token ${(await seedBotWithToken("read:issue")).token}` },
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({
+      message: scopeErrorMessage("read:repository", "read:issue"),
+      url: SWAGGER_URL,
+    });
+  });
+
+  it("a bot's PAT resolves through BOTH Basic-carried shapes (username-as-token + password-as-token)", async () => {
+    const asUsername = await seedBotWithToken("read:repository");
+    const who = await call("https://example.com/_whoami", {
+      headers: { Authorization: basicTokenHeader(asUsername.token) },
+    });
+    const identity = await who.json<{ user: string; isBasicAuth: boolean }>();
+    expect(identity.user).toBe(asUsername.username);
+    expect(identity.isBasicAuth).toBe(true);
+    const asPassword = await seedBotWithToken("read:repository");
+    const ok = await call("https://example.com/_repo", {
+      headers: { Authorization: basicHeader("ignored", asPassword.token) },
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("a bot never password-authenticates through the Basic arm → the generic 401", async () => {
+    // the PAT arm misses (the name is not a token) and the password
+    // sign-in's lookups are Individual-only (GetIndividualUserByName,
+    // user.go:1137 — landed in password-auth.ts's type='user' filters):
+    // the arm answers the same generic body, never a bot-specific one
+    const bot = await seedBotWithToken("read:repository");
+    const denied = await call("https://example.com/_whoami", {
+      headers: { Authorization: basicHeader(bot.username, "irrelevant") },
+    });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
+  });
+
+  it("a bot's OAuth2 GRANT credential is refused (the grant arm's IsIndividual gate)", async () => {
+    // upstream refuses non-individuals in the dotted dispatch's grant branch
+    // (services/auth/oauth2.go:122-124 `!user.IsIndividual()` → nil) — our
+    // resolveOAuth2AccessTokenCredential pins it as `user.type !== "user"`
+    // → null. Only the GRANT arm gates; the dotless PAT arm above does not.
+    const { drizzle } = await import("drizzle-orm/d1");
+    const { oauth2Applications } = await import("../db/schema");
+    const { getOrCreateGrant } = await import("../services/oauth2/grants");
+    const { loadOAuth2SigningMaterial, mintTokenTrio } = await import("../services/oauth2/token");
+    botSeq += 1;
+    const bot = await seedVerifiedUser({ username: `grant-bot-${botSeq}`, type: "bot" });
+    const clientId = `bot-client-${botSeq}`;
+    const appRow = (
+      await drizzle(env.DB)
+        .insert(oauth2Applications)
+        .values({
+          uid: 0,
+          name: `bot-app-${botSeq}`,
+          clientId,
+          clientSecret: "",
+          confidentialClient: false,
+          redirectUris: '["http://127.0.0.1"]',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning()
+    )[0]!;
+    const T0 = new Date(Date.now() - 60_000);
+    const { grant } = await getOrCreateGrant(env.DB, { userId: bot.id, applicationId: appRow.id, scope: "read:repository" }, T0);
+    const result = await mintTokenTrio({
+      db: env.DB,
+      grant,
+      application: appRow,
+      user: (await drizzle(env.DB).select().from(users).where(eq(users.id, bot.id)).get())!,
+      material: await loadOAuth2SigningMaterial(env.DB),
+      issuer: "https://example.com",
+      appUrl: "https://example.com/",
+      bucket: env.REPO_PACKS,
+      now: T0,
+    });
+    if (!result.ok) throw new Error("mint failed");
+    const accessToken = (result.response as { access_token: string }).access_token;
+    const denied = await call("https://example.com/_whoami", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
+  });
+});

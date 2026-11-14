@@ -14,6 +14,11 @@ export interface SeedUserOptions {
   username?: string;
   isAdmin?: boolean;
   status?: "active" | "prohibited";
+  /** users.type — "user" (Individual) | "org" | "bot" (UserTypeBot, 4).
+   *  Bots exist only as admin-created rows upstream (B-72); a seed with
+   *  type "bot" carries no password material, exactly like the web create
+   *  arm's empty-passwd branch (users.go:190-193 over user.go:788-794). */
+  type?: "user" | "org" | "bot";
 }
 
 export async function seedVerifiedUser(options: SeedUserOptions = {}): Promise<{ id: number; username: string }> {
@@ -25,6 +30,7 @@ export async function seedVerifiedUser(options: SeedUserOptions = {}): Promise<{
       usernameLower: username.toLowerCase(),
       isAdmin: options.isAdmin ?? false,
       status: options.status ?? "active",
+      type: options.type ?? "user",
       createdAt: new Date(),
     })
     .returning()
