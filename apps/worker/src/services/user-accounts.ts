@@ -104,6 +104,7 @@ import {
   type PwnedResult,
 } from "../auth/password-policy";
 import { newPasswordRecord, newSalt, verifyPassword } from "../auth/password";
+import { AuditActions, emitAudit, type AuditOrigin } from "./audit";
 
 // ---------------------------------------------------------------------------
 // The ALLOW_SIGNUP gate (upstream DISABLE_REGISTRATION, inverted polarity)
@@ -879,6 +880,139 @@ export async function applyPasswordReset(
   });
 
   return { outcome: "changed", user: row };
+}
+
+// ---------------------------------------------------------------------------
+// The UpdateUser audit tail (census B-89 — services/user/update.go:204-218)
+// ---------------------------------------------------------------------------
+
+/**
+ * The actor thread for {@link emitUserColumnAuditRows}: upstream
+ * `audit.Record(ctx, action, u, …)` reads the actor off the request context
+ * (the admin doer) and the origin/IP off the request info; our seam takes
+ * them explicitly (no module-level request state — the Workers rules).
+ */
+export interface UserColumnAuditContext {
+  /** The editing doer's id (upstream `ctx.Doer.ID`). */
+  actorId: number;
+  /** The editing doer's username (the actor_name snapshot). */
+  actorName: string;
+  /** "api" for the PATCH route, "ui" for a web arm. */
+  origin: AuditOrigin;
+  /** The client address; null when the seam has none. */
+  ipAddress?: string | null;
+  /**
+   * The `active` FIELD the edit posted (upstream `opts.IsActive`'s value —
+   * update.go:111-114); `undefined` = not posted. This is the deviation-6
+   * fold's audit consequence: upstream carries `is_active` (UpdateUser) and
+   * `prohibit_login` (UpdateAuth) as SEPARATE columns, and only the
+   * is_active arm has an audit tail (:204-206) — the UpdateAuth
+   * ProhibitLogin arm records NOTHING (update.go:281-293's tail names only
+   * UserPassword/UserAuthenticationSource). Our single `status` column
+   * folds both, so a flip's DRIVER must be named: a flip with
+   * `activePosted` set to the posted value emits
+   * `user:status:active {active: <posted>}` (upstream's `u.IsActive` after
+   * the opts IS the posted value, :105-114), a prohibit_login-only flip
+   * emits NOTHING — upstream-faithful silence.
+   */
+  activePosted?: boolean;
+}
+
+/**
+ * The shared UpdateUser audit tail — the port of the service-layer block
+ * upstream runs after EVERY UpdateUser commit (services/user/update.go:
+ * 204-218): compare the post-write state against the pre-write snapshot
+ * (:68) and record one row per ACTUALLY-changed audited column, in
+ * upstream's fixed order (active → admin → restricted → visibility):
+ *
+ *   - `user:status:active` (:205-206) — only an active-driven status flip
+ *     (the `activePosted` rule, {@link UserColumnAuditContext});
+ *   - `user:status:admin` (:207-209) — `{admin}` = the NEW IsAdmin;
+ *   - `user:status:restricted` (:210-212) — `{restricted}` = the NEW
+ *     IsRestricted. No landed route writes `users.restricted` yet (the API
+ *     PATCH accepts-and-ignores the field — admin-t2.ts's
+ *     editUserOptionSchema docstring; the WEB edit arm writes it but is a
+ *     separate surface), so this arm fires the moment any write site lands
+ *     the column — the emit must not lag the write.
+ *   - `user:visibility:update` (:213-215) — `{old_visibility}`/
+ *     `{new_visibility}` = VisibleType.String()'s "public"/"limited"/
+ *     "private" (visible_type.go:44-50) — exactly the landed enum domain.
+ *
+ * (The tail's fifth row, `user:type:update`, is B-72's — emitted inline at
+ * the write sites' conversion arms, upstream order BEFORE nothing: the type
+ * arm is the tail's LAST member, so callers run the type emit after this
+ * helper to preserve :204-218's order.)
+ *
+ * No-op on an equal before/after — upstream's `!=` guards are the same
+ * compare (:204/:207/:210/:213), so an unchanged value emits nothing even
+ * when the option was posted. Write-site failure posture (upstream
+ * writeEvent, audit/event.go:129-133, the landed arms' convention): the
+ * CALLER catches — a failed audit INSERT logs and never errorizes the
+ * successful write.
+ */
+export async function emitUserColumnAuditRows(
+  d1: D1Database,
+  before: Pick<UserAccountRow, "id" | "username" | "isAdmin" | "visibility" | "restricted" | "status">,
+  after: Pick<UserAccountRow, "isAdmin" | "visibility" | "restricted" | "status">,
+  context: UserColumnAuditContext,
+): Promise<void> {
+  const db = drizzle(d1);
+  const base = {
+    actorId: context.actorId,
+    actorName: context.actorName,
+    actorCredential: null,
+    scopeType: "user",
+    scopeId: before.id,
+    scopeName: before.username,
+    origin: context.origin,
+    ipAddress: context.ipAddress ?? null,
+  } as const;
+
+  // :204-206 — active-driven flips only (the fold's audit consequence, the
+  // context doc). `activePosted === (after.status === "active")` additionally
+  // refuses a combo post where the fold's outcome went the OTHER way from the
+  // posted active (e.g. active:true + prohibit_login:true → prohibited):
+  // upstream would emit `{active: true}` from the is_active arm and nothing
+  // from the prohibit arm, never a false-true row.
+  if (
+    before.status !== after.status &&
+    context.activePosted !== undefined &&
+    context.activePosted === (after.status === "active")
+  ) {
+    await emitAudit(db, {
+      ...base,
+      action: AuditActions.UserActive,
+      vars: { scope: before.username, active: String(context.activePosted) },
+    });
+  }
+  // :207-209.
+  if (before.isAdmin !== after.isAdmin) {
+    await emitAudit(db, {
+      ...base,
+      action: AuditActions.UserAdmin,
+      vars: { scope: before.username, admin: String(after.isAdmin) },
+    });
+  }
+  // :210-212.
+  if (before.restricted !== after.restricted) {
+    await emitAudit(db, {
+      ...base,
+      action: AuditActions.UserRestricted,
+      vars: { scope: before.username, restricted: String(after.restricted) },
+    });
+  }
+  // :213-215.
+  if (before.visibility !== after.visibility) {
+    await emitAudit(db, {
+      ...base,
+      action: AuditActions.UserVisibility,
+      vars: {
+        scope: before.username,
+        old_visibility: before.visibility,
+        new_visibility: after.visibility,
+      },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

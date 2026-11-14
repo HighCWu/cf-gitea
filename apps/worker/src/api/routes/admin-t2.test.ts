@@ -1138,6 +1138,125 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(redirected.status).toBe(307);
     expect(redirected.headers.get("Location")).toBe("/admin/users/renamed");
   });
+
+  // -------------------------------------------------------------------------
+  // The UpdateUser audit tail (B-89, services/user/update.go:204-218) — the
+  // family emits ride the shared emitUserColumnAuditRows helper at the exact
+  // upstream point (after the UPDATE, before the type row). Upstream fires a
+  // row per ACTUALLY-changed column against the pre-write snapshot (:68).
+  // -------------------------------------------------------------------------
+
+  it("emits user:status:active on an active flip — and NOTHING on a prohibit_login-only flip (B-89, update.go:204-206 vs the UpdateAuth tail's prohibit silence)", async () => {
+    const off = await adminSend("/admin/users/neighbor", jsonPatch({ active: false }));
+    expect(off.status).toBe(200);
+    let rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:status:active",
+      actorId: adminId,
+      actorName: "cf-gitea-stub",
+      scopeType: "user",
+      scopeId: String(neighborId),
+      scopeName: "neighbor",
+      origin: "api",
+      message: "Changed activation status of user neighbor to false.",
+    });
+
+    const back = await adminSend("/admin/users/neighbor", jsonPatch({ active: true }));
+    expect(back.status).toBe(200);
+    rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({
+      action: "user:status:active",
+      message: "Changed activation status of user neighbor to true.",
+    });
+
+    // The prohibit arm: the status column flips (deviation 6) but upstream's
+    // prohibit_login write rides UpdateAuth, whose tail (update.go:281-293)
+    // records no prohibit row — so the fold's driver stays silent here too.
+    const prohibit = await adminSend("/admin/users/neighbor", jsonPatch({ prohibit_login: true }));
+    expect(prohibit.status).toBe(200);
+    rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(2);
+  });
+
+  it("emits user:status:admin on a grant and a demote; the last-admin 400 emits nothing (B-89, update.go:207-209)", async () => {
+    // root is the ONLY admin: the guard 400s BEFORE the write — upstream's
+    // ErrDeleteLastAdminUser return precedes UpdateUserCols, so no row.
+    const demote = await adminSend("/admin/users/root", jsonPatch({ admin: false }));
+    expect(demote.status).toBe(400);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+
+    const grant = await adminSend("/admin/users/neighbor", jsonPatch({ admin: true }));
+    expect(grant.status).toBe(200);
+    let rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:status:admin",
+      scopeId: String(neighborId),
+      message: "Changed admin status of user neighbor to true.",
+    });
+
+    // Neighbor is now the second admin → the demote proceeds and emits.
+    const demoted = await adminSend("/admin/users/neighbor", jsonPatch({ admin: false }));
+    expect(demoted.status).toBe(200);
+    rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({
+      action: "user:status:admin",
+      message: "Changed admin status of user neighbor to false.",
+    });
+  });
+
+  it("emits user:visibility:update with old/new on a change; the same-value post is silent (B-89, update.go:213-215)", async () => {
+    const change = await adminSend("/admin/users/neighbor", jsonPatch({ visibility: "limited" }));
+    expect(change.status).toBe(200);
+    let rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:visibility:update",
+      scopeName: "neighbor",
+      origin: "api",
+      message: "Changed visibility of user neighbor from public to limited.",
+    });
+
+    // The posted-but-equal value: upstream's `u.Visibility != oldVisibility`
+    // guard (:213) is silent — the :160 column guard never writes it either.
+    const same = await adminSend("/admin/users/neighbor", jsonPatch({ visibility: "limited" }));
+    expect(same.status).toBe(200);
+    rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+  });
+
+  it("accepts restricted without a write and without a row (the deviation-1 accepted-and-ignored set; the emit arm fires when a write site lands the column)", async () => {
+    const res = await adminSend("/admin/users/neighbor", jsonPatch({ restricted: true }));
+    expect(res.status).toBe(200);
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(row.restricted).toBe(false); // the pre-existing accepted-and-ignore posture
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("a combined patch emits the family in upstream order BEFORE the type row (B-89, update.go:204-218's fixed order)", async () => {
+    // root with a second admin beside it: admin:false passes the last-admin
+    // guard AND the Bot conversion's effective-admin check (the 1105 test's
+    // fold), so ONE patch carries all four family/type diffs at once.
+    await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "root2", usernameLower: "root2", isAdmin: true, status: "active", createdAt: NOW });
+    const res = await adminSend(
+      "/admin/users/root",
+      jsonPatch({ active: false, admin: false, visibility: "private", type: "Bot" }),
+    );
+    expect(res.status).toBe(200);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual([
+      "user:status:active",
+      "user:status:admin",
+      "user:visibility:update",
+      "user:type:update",
+    ]);
+    expect(rows.map((r) => r.scopeName)).toEqual(["root", "root", "root", "root"]);
+  });
 });
 
 // ---------------------------------------------------------------------------

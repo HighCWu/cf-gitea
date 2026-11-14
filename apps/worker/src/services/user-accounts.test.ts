@@ -21,17 +21,18 @@
 
 import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { AuditActions, findAuditEvents } from "./audit";
 import { newPasswordRecord, newSalt, verifyPassword } from "../auth/password";
-import { users } from "../db/schema";
+import { auditEvents, users } from "../db/schema";
 import {
   applyPasswordReset,
   changeOwnPassword,
   deleteUserCascade,
+  emitUserColumnAuditRows,
   initWindowOpen,
   initializeAdminUser,
 } from "./user-accounts";
@@ -319,5 +320,131 @@ describe("the configured-hash-spec threading (census B-87's consumption half —
     const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, id)).get())!;
     expect(row.passwdHashAlgo).toBe(CONFIGURED_SPEC);
     expect(await verifyPassword("A-Reset-Pass-Value!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// Census B-89 — the UpdateUser audit tail (services/user/update.go:204-218).
+// Upstream's shared service tail records one row per ACTUALLY-changed audited
+// column against the :68 pre-write snapshot, in fixed order active → admin →
+// restricted → visibility; the helper is that tail's port, and these pins hold
+// the per-column semantics directly (the write sites' route-level arms live in
+// admin-t2.test.ts's PATCH describe).
+// ---------------------------------------------------------------------------------
+
+describe("emitUserColumnAuditRows — the UpdateUser audit tail (B-89, update.go:204-218)", () => {
+  /** The :68 snapshot shape — plain literals; the helper compares fields, no
+   *  row reads of its own. `as const` keeps the enum columns' literal unions
+   *  (users.visibility / users.status domains). */
+  const BEFORE = { id: 4242, username: "tailtarget", isAdmin: false, visibility: "public", restricted: false, status: "active" } as const;
+
+  beforeEach(async () => {
+    await applyAuthD1Migrations();
+    await env.DB.prepare("DELETE FROM audit_event").run();
+  });
+
+  it("an active-driven flip emits user:status:active with the POSTED value (:204-206)", async () => {
+    await emitUserColumnAuditRows(env.DB, BEFORE, { ...BEFORE, status: "prohibited" }, {
+      actorId: 1,
+      actorName: "root",
+      origin: "api",
+      activePosted: false,
+    });
+    const rows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserActive });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:status:active",
+      actorId: 1,
+      actorName: "root",
+      scopeType: "user",
+      scopeId: "4242",
+      scopeName: "tailtarget",
+      origin: "api",
+      message: "Changed activation status of user tailtarget to false.", // the registry template rendered
+    });
+  });
+
+  it("a prohibit_login-only flip emits NOTHING — upstream's UpdateAuth tail records no prohibit row (:281-293)", async () => {
+    await emitUserColumnAuditRows(env.DB, BEFORE, { ...BEFORE, status: "prohibited" }, {
+      actorId: 1,
+      actorName: "root",
+      origin: "api",
+      // activePosted undefined: the flip's driver was prohibit_login, whose
+      // upstream write arm has no audit tail.
+    });
+    expect(await findAuditEvents(drizzle(env.DB), { actionPrefix: "user:" })).toHaveLength(0);
+  });
+
+  it("an admin flip emits user:status:admin in BOTH directions with the new value (:207-209)", async () => {
+    await emitUserColumnAuditRows(env.DB, BEFORE, { ...BEFORE, isAdmin: true }, {
+      actorId: 1,
+      actorName: "root",
+      origin: "api",
+    });
+    await emitUserColumnAuditRows(env.DB, { ...BEFORE, isAdmin: true }, BEFORE, {
+      actorId: 1,
+      actorName: "root",
+      origin: "api",
+    });
+    // The read is the raw id-ordered select — findAuditEvents' default sort
+    // is timestamp_desc, and same-second rows would reverse the pair.
+    const rows = await drizzle(env.DB)
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, AuditActions.UserAdmin))
+      .orderBy(asc(auditEvents.id))
+      .all();
+    expect(rows.map((r) => r.message)).toEqual([
+      "Changed admin status of user tailtarget to true.",
+      "Changed admin status of user tailtarget to false.",
+    ]);
+  });
+
+  it("a visibility change emits user:visibility:update with old/new (:213-215)", async () => {
+    await emitUserColumnAuditRows(env.DB, BEFORE, { ...BEFORE, visibility: "limited" }, {
+      actorId: 1,
+      actorName: "root",
+      origin: "api",
+    });
+    const rows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserVisibility });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.message).toBe("Changed visibility of user tailtarget from public to limited.");
+  });
+
+  it("a restricted flip emits user:status:restricted — the arm fires when a write site lands the column (:210-212)", async () => {
+    await emitUserColumnAuditRows(env.DB, BEFORE, { ...BEFORE, restricted: true }, {
+      actorId: 1,
+      actorName: "root",
+      origin: "ui",
+    });
+    const rows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserRestricted });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ origin: "ui", message: "Changed restricted status of user tailtarget to true." });
+  });
+
+  it("an equal before/after emits NOTHING across the family — the != guards (:204/:207/:210/:213)", async () => {
+    await emitUserColumnAuditRows(env.DB, BEFORE, BEFORE, {
+      actorId: 1,
+      actorName: "root",
+      origin: "api",
+      activePosted: true, // posted but unchanged — upstream's IsActive true→true is silent too
+    });
+    expect(await findAuditEvents(drizzle(env.DB), { actionPrefix: "user:" })).toHaveLength(0);
+  });
+
+  it("a full-diff emits in upstream order active → admin → restricted → visibility (:204-218's fixed order)", async () => {
+    await emitUserColumnAuditRows(
+      env.DB,
+      BEFORE,
+      { ...BEFORE, isAdmin: true, visibility: "private", restricted: true, status: "prohibited" },
+      { actorId: 1, actorName: "root", origin: "api", activePosted: false },
+    );
+    const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+    expect(rows.map((r) => r.action)).toEqual([
+      "user:status:active",
+      "user:status:admin",
+      "user:status:restricted",
+      "user:visibility:update",
+    ]);
   });
 });

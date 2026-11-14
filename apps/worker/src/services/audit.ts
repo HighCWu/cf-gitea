@@ -246,6 +246,18 @@ export const AuditActions = {
   // no cf-gitea surface to emit from (every user is LOCAL — deviation 1 of
   // api/routes/admin-t2.ts).
   UserCreate: defineAction("user:create", "Created user {scope}."),
+  // The UpdateUser status trio (B-89, action.go:71-73 — ids AND templates
+  // verbatim): the shared service tail's per-column rows
+  // (services/user/update.go:204-212) — each fires only when the value
+  // ACTUALLY changed against the :68 pre-write snapshot, with the new
+  // boolean as the var. `{active}` rides the deviation-6 status fold's
+  // active-driven flips (services/user-accounts.ts
+  // emitUserColumnAuditRows); `{restricted}` arms the moment a write site
+  // lands the is_restricted column (the API PATCH still accepts-and-ignores
+  // the field — admin-t2.ts's editUserOptionSchema docstring).
+  UserActive: defineAction("user:status:active", "Changed activation status of user {scope} to {active}."),
+  UserRestricted: defineAction("user:status:restricted", "Changed restricted status of user {scope} to {restricted}."),
+  UserAdmin: defineAction("user:status:admin", "Changed admin status of user {scope} to {admin}."),
   // The type-change row (action.go:74 — id AND template verbatim):
   // `audit.Record(ctx, audit_model.UserType, u, "user_type",
   // u.Type.DisplayName())` at services/user/update.go:217 — the shared
@@ -255,6 +267,17 @@ export const AuditActions = {
   // DisplayName's English ("Bot"/"User" — user.go:67-77, the UI translates
   // concept_user_* instead).
   UserType: defineAction("user:type:update", "Changed type of user {scope} to {user_type}."),
+  // The visibility-change row (B-89, action.go:78 — id AND template
+  // verbatim): `audit.Record(ctx, audit_model.UserVisibility, u,
+  // "old_visibility", oldVisibility.String(), "new_visibility",
+  // u.Visibility.String())` at update.go:213-215 — the tail's only
+  // two-var row; the strings are VisibleType.String()'s
+  // "public"/"limited"/"private" (visible_type.go:44-50), exactly our
+  // users.visibility enum domain.
+  UserVisibility: defineAction(
+    "user:visibility:update",
+    "Changed visibility of user {scope} from {old_visibility} to {new_visibility}.",
+  ),
   // SPEC-0002 §6 (PWD-2) — the password-family emits (action.go:69/76,
   // ids AND templates verbatim):
   //   - UserAuthenticationFailTwoFactor — the API Basic password arm's

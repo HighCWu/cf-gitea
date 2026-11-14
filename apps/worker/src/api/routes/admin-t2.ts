@@ -24,7 +24,7 @@ import { AuditActions, auditEventInsert, emitAudit } from "../../services/audit"
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
 import { enqueueRegisterNotifyMail } from "../../services/mail/register-notify";
-import { deleteUserCascade } from "../../services/user-accounts";
+import { deleteUserCascade, emitUserColumnAuditRows } from "../../services/user-accounts";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { createOrgOptionSchema, organizationSchema } from "../models/organization";
@@ -1229,18 +1229,47 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (convertedType !== null) patch.type = convertedType;
     if (Object.keys(patch).length > 0) {
       await drizzle(c.env.DB).update(users).set(patch).where(eq(users.id, target.id));
+      // UpdateUser's audit tail (B-89, services/user/update.go:204-218 —
+      // the shared service block upstream runs after EVERY UpdateUser
+      // commit, :200's UpdateUserCols): one row per ACTUALLY-changed
+      // audited column against the pre-UPDATE target snapshot (:68), in
+      // upstream's fixed order active → admin → restricted → visibility;
+      // the type emit below is the tail's LAST member (:216-218) and stays
+      // after it. `after` is the write's own intent (upstream compares the
+      // mutated in-memory struct, :68 vs :204-218 — not a re-read). The
+      // status fold's driver rule: only an `active` post emits
+      // user:status:active — upstream's prohibit_login write rides
+      // UpdateAuth, whose tail (:281-293) records no prohibit row. The
+      // restricted arm cannot fire here yet: the PATCH still
+      // accepts-and-ignores the field (deviation 1), so after.restricted is
+      // always the old value. Failure posture = upstream writeEvent
+      // (audit/event.go:129-133): a failed audit INSERT logs and never
+      // errorizes the successful write.
+      const doer = c.get("authUser");
+      // The wire-model User's id/username are wire-OMITTABLE — the authed
+      // admin row always carries them (the create arm's guard posture).
+      if (doer?.id === undefined) {
+        throw new ApiError(401, "Unauthorized");
+      }
+      await emitUserColumnAuditRows(
+        c.env.DB,
+        target,
+        { ...target, ...patch },
+        {
+          actorId: doer.id,
+          actorName: doer.username ?? doer.login ?? "",
+          origin: "api",
+          activePosted: form.active,
+        },
+      ).catch((error: unknown) => {
+        console.log(`[audit] user update-family rows failed (scope=${target.id}): ${String(error)}`);
+      });
       if (convertedType !== null) {
         // UpdateUser's type-change audit (update.go:217:
         // `audit.Record(ctx, audit_model.UserType, u, "user_type",
         // u.Type.DisplayName())`) — the shared service tail, so the API arm
         // emits exactly like the web arm. DisplayName's English render
         // ("Bot"/"User") is the var (the UI translates concept_user_*).
-        const doer = c.get("authUser");
-        // The wire-model User's id/username are wire-OMITTABLE — the authed
-        // admin row always carries them (the create arm's guard posture).
-        if (doer?.id === undefined) {
-          throw new ApiError(401, "Unauthorized");
-        }
         await emitAudit(drizzle(c.env.DB), {
           action: AuditActions.UserType,
           actorId: doer.id,
