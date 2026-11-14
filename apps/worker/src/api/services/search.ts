@@ -20,10 +20,13 @@
  * - `searchRepositories` (services/repository.ts — the `/repos/search` half)
  *   is reused VERBATIM through `searchExploreRepos` below. The only addition
  *   is the session-doer → API `Viewer` seam: the session viewer's
- *   `{ id, username, isAdmin }` maps onto the two requester fields the WHERE
- *   actually reads (`login`, `is_admin` — the contract `User` model's fields
- *   are optional, so the seam constructs a legal value, no casts), and
- *   `includePrivate` carries upstream's `Private: ctx.Doer != nil`.
+ *   `{ id, username, isAdmin, restricted? }` maps onto the requester fields
+ *   the WHERE actually reads (`id` — the grant arms' join key; `login`,
+ *   `is_admin`; and — the IDCHAIN seam fix — `restricted`, feeding the
+ *   restricted arc's repo_list.go:661-703 composition; the contract `User`
+ *   model's fields are optional, so the seam constructs a legal value, no
+ *   casts), and `includePrivate` carries upstream's
+ *   `Private: ctx.Doer != nil`.
  * - `searchUsers` (services/user.ts — the `/users/search` half) has no
  *   options for the explore page's Types/IsActive gates: without them the
  *   org rows that share the `users` table surface on a "Users" page. Rather
@@ -51,6 +54,20 @@ export interface ExploreDoer {
   /** Display-cased login — the seam lowercases it like the service does. */
   username: string;
   isAdmin: boolean;
+  /**
+   * The doer's `users.is_restricted` carry (IDCHAIN seam fix): rendered onto
+   * `Viewer.requester.restricted` so `searchRepositories`' restricted arc
+   * (repository.ts — the repo_list.go:661-703 composition) applies to the
+   * explore surface exactly as it applies to the API's own `viewerOf`
+   * requesters. Optional per the file's hand-built-literal convention
+   * (absent reads false, upstream's zero value); the UI session chain does
+   * NOT yet deliver the flag (ui/session.ts's `SessionUser`, ui/viewer.ts's
+   * `Viewer`, and the explore page's doer slice all drop it — the recorded
+   * convergence-backlog residual), so a caller that carries it gets the
+   * restricted composition while the current session doers read
+   * non-restricted.
+   */
+  restricted?: boolean;
 }
 
 export interface ExploreListOptions {
@@ -105,7 +122,24 @@ export async function searchExploreRepos(
 ): Promise<ExploreRepoListPage> {
   const viewer: Viewer = {
     origin: "",
-    requester: doer === null ? null : { login: doer.username, is_admin: doer.isAdmin },
+    requester:
+      doer === null
+        ? null
+        : {
+            // The numeric id feeds the grant arms BOTH compositions read
+            // (`teamGrantCondition`/`collaboratorGrantCondition` and the
+            // non-restricted `publicInPrivateOrgCondition` all join on
+            // `requester.id` — undefined silently drops every granted row).
+            id: doer.id,
+            login: doer.username,
+            is_admin: doer.isAdmin,
+            // The restricted carry (`ExploreDoer.restricted`, the users.
+            // is_restricted column's contract field): the restricted arc
+            // (repository.ts) reads it off the requester — without it a
+            // restricted explore doer silently reads the non-restricted
+            // composition (the IDCHAIN seam this render closes).
+            restricted: doer.restricted === true,
+          },
   };
   const mapped = exploreRepoSort(opts.sort);
   const listing = await searchRepositories(d1, viewer, {

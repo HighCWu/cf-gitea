@@ -1241,6 +1241,66 @@ describe("the RESTRICTED-USER arms (repo_list.go:665-674/:694-700 skips, :697-69
     ]);
   });
 
+  it("the explore doer's restricted carry applies the same composition through searchExploreRepos (the IDCHAIN seam)", async () => {
+    const { rest, plain } = await seedRestrictedFixture();
+
+    // The DELIVERED flag — an explore doer carrying `restricted` rides the
+    // restricted composition exactly like the API's `viewerOf` requesters:
+    // limpub (limited-profile owner's public) and pubinpriv (private org's
+    // public) drop, the own/granted edges survive.
+    const restricted = await searchExploreRepos(
+      env.DB,
+      { id: rest.id, username: rest.username, isAdmin: false, restricted: true },
+      { keyword: "", page: 1, limit: 20, sort: "" },
+    );
+    expect(restricted.items.map((p) => p.repo.slug).sort()).toEqual([
+      "adminown",
+      "granted",
+      "open",
+      "plainown",
+      "restown",
+      "restvault",
+      "vault",
+    ]);
+
+    // The ABSENT flag — the current UI session shape (no carry yet; the
+    // session chain drops it, the recorded backlog residual) reads false,
+    // upstream's zero value: the same fixture rows the plain control keeps.
+    const withoutCarry = await searchExploreRepos(
+      env.DB,
+      { id: rest.id, username: rest.username, isAdmin: false },
+      { keyword: "", page: 1, limit: 20, sort: "" },
+    );
+    expect(withoutCarry.items.map((p) => p.repo.slug).sort()).toEqual([
+      "adminown",
+      "granted",
+      "limpub",
+      "open",
+      "plainown",
+      "pubinpriv",
+      "restown",
+      "restvault",
+      "vault",
+    ]);
+
+    // The NON-restricted twin on identical edges — the control that proves
+    // the first list's shape is the restricted composition, not the fixture.
+    const control = await searchExploreRepos(
+      env.DB,
+      { id: plain.id, username: plain.username, isAdmin: false },
+      { keyword: "", page: 1, limit: 20, sort: "" },
+    );
+    expect(control.items.map((p) => p.repo.slug).sort()).toEqual([
+      "adminown",
+      "granted",
+      "limpub",
+      "open",
+      "plainown",
+      "pubinpriv",
+      "restown",
+    ]);
+  });
+
   it("RequireSignInViewStrict drops the replacement arm entirely (repo_list.go:697-699's else)", async () => {
     const { rest } = await seedRestrictedFixture();
     const strict = await searchRepositories(env.DB, restrictedViewerFor(rest, { strict: true }), {

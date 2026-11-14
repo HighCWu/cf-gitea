@@ -31,7 +31,7 @@ import { env } from "cloudflare:workers";
 import { STUB_USER, createStubAuthResolver, type AuthResolver } from "../../api/auth";
 import type { User } from "../../api/models/user";
 import { authUserToApiUser } from "../../api/services/user";
-import type { AuthUser } from "../../auth/auth-context";
+import { rowToUser } from "../token-service";
 import { users } from "../../db/schema";
 import { mintFor, seedVerifiedUser, type SeedUserOptions } from "./seeds";
 
@@ -64,38 +64,29 @@ export interface SeedIdentityOptions extends SeedUserOptions {
  * The contract-`User` projection the token-identity path applies: the
  * CANONICAL `authUserToApiUser` (api/services/user.ts) — the SAME converter
  * the production auth middlewares' `identityFrom` rides — rendered from the
- * `AuthUser` slice `rowToUser` (auth/token-service.ts) builds, mapped
- * literally from the row. Upstream converts the doer as
- * `ToUser(ctx.Doer, ctx.Doer)` (routers/api/v1/user/userGetCurrent), so the
- * self-viewer shape renders the row's real values through
- * `apiUserFromRow`'s authed arm (truthful is_admin/active/prohibit_login,
- * email, visibility, type, the username compat key, the row-derived URLs) —
- * the old convention-synced copy of the pre-canonical serializer is deleted
- * (it had already drifted: no `username` key, hardcoded "public"/"en-US"/
- * empty URLs while the canonical render grew row-derived values).
+ * PRODUCTION `rowToUser` (auth/token-service.ts) output, called directly on
+ * the row. Delegation (not a hand-built `AuthUser` literal) is the
+ * IDCHAIN-seam fix: the rig's copy of the row→AuthUser mapping had drifted
+ * from the production constructor exactly when production grew a render- or
+ * behavior-relevant carry (it omitted `lastLoginAt`, then `restricted` when
+ * IDCHAIN threaded the `users.is_restricted` flag through `rowToUser` — so
+ * rig-resolved identities silently read non-restricted where production
+ * identities carried the flag). Delegating makes drift structurally
+ * impossible: every column `rowToUser` carries — present or future — flows
+ * into the rig's identities by construction.
+ *
+ * Upstream converts the doer as `ToUser(ctx.Doer, ctx.Doer)`
+ * (routers/api/v1/user/userGetCurrent), so the self-viewer shape renders the
+ * row's real values through `apiUserFromRow`'s authed arm (truthful
+ * is_admin/active/prohibit_login, email, visibility, type, the username
+ * compat key, the row-derived URLs).
  *
  * `origin` is "" — the rig mints outside any request, so avatar/html render
  * the same relative shape the production helper produces when no origin is
  * known (`toApiUser`'s `origin ?? ""` arm, api/auth.ts).
  */
 export function identityUserFromRow(row: UserRow): User {
-  const authUser: AuthUser = {
-    id: row.id,
-    username: row.username,
-    usernameLower: row.usernameLower,
-    email: row.email,
-    displayName: row.displayName,
-    location: row.location,
-    website: row.website,
-    description: row.description,
-    isAdmin: row.isAdmin,
-    status: row.status,
-    createdAt: row.createdAt,
-    type: row.type,
-    visibility: row.visibility,
-    numStars: row.numStars,
-  };
-  return authUserToApiUser(authUser, "");
+  return authUserToApiUser(rowToUser(row), "");
 }
 
 /**

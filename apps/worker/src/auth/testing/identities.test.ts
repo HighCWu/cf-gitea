@@ -20,13 +20,16 @@
  */
 
 import { env } from "cloudflare:workers";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { STUB_USER, createStubAuthResolver } from "../../api/auth";
 import { createApiRouter } from "../../api/router";
+import { users } from "../../db/schema";
 import { TokenService } from "../token-service";
 import { applyAuthD1Migrations } from "./apply-d1-migrations";
-import { createIdentityAuthResolver, seedIdentity, tokenHeader } from "./identities";
+import { createIdentityAuthResolver, identityUserFromRow, seedIdentity, tokenHeader } from "./identities";
 import { resetAuthTables } from "./seeds";
 
 beforeAll(applyAuthD1Migrations);
@@ -66,6 +69,21 @@ describe("seedIdentity — the multi-identity mint", () => {
       following_count: 0,
       last_login: "0001-01-01T00:00:00Z", // no users column yet; upstream authed-gates it (convert/user.go:118-124)
     });
+  });
+
+  it("the projection carries the row's restricted flag — production rowToUser parity (the IDCHAIN rig seam)", async () => {
+    const rest = await seedIdentity({ username: "rest" });
+    expect(rest.user.restricted).toBe(false); // the column's default (upstream's zero value)
+
+    // Flip the row the way production arms do (the admin-user-edit arm /
+    // the filters battery's fixture pattern), re-select, and re-project:
+    // the delegated rowToUser constructor carries the flag the old
+    // hand-built literal dropped.
+    await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.id, rest.id));
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, rest.id)).all())[0];
+    if (row === undefined) throw new Error("identity seed failed: user row missing after update");
+    expect(row.restricted).toBe(true);
+    expect(identityUserFromRow(row).restricted).toBe(true);
   });
 
   it("issues REAL tokens — each verifies through the production TokenService to its own user", async () => {

@@ -154,8 +154,48 @@ SPEC's no-outbound-TCP premise corrected in specs/email-outbound.md
   lenient matching exists to mask staleness — the harness is byte-exact
   (goldens.test.ts's renderGoldenCase throws on the first differing
   byte).
-- IDCHAIN's two fidelity seams (the test rig's identityUserFromRow; the
-  UI-explore requester at api/services/search.ts:108).
+- (CLOSED 2026-11-14, IDCHAIN-SEAMS — seam 1 in full; seam 2's owned
+  boundary closed, its UI delivery leg ESCALATED below) IDCHAIN's two
+  fidelity seams:
+  (1) The test rig's `identityUserFromRow` (auth/testing/identities.ts) no
+  longer hand-builds a 14-field `AuthUser` literal — it delegates to the
+  PRODUCTION constructor (`rowToUser` → `authUserToApiUser`), so the rig
+  resolves through the exact shape production's `resolveAuth` carries and
+  the row→identity mapping cannot drift again (the old copy had already
+  omitted `lastLoginAt` and — IDCHAIN's named gap — the `restricted` carry,
+  making rig identities silently read non-restricted where production
+  identities carried the flag). Pinned: identities.test.ts's restricted-row
+  re-projection arm.
+  (2) The UI-explore requester seam (api/services/search.ts) renders the
+  flag at the owned boundary: `ExploreDoer` gained `restricted?` and the
+  `searchExploreRepos` `Viewer.requester` construction now carries
+  `restricted: doer.restricted === true`, so a doer that delivers the flag
+  rides `searchRepositories`' restricted arc (repo_list.go:661-703
+  composition) exactly like the API's `viewerOf` requesters. The restricted
+  pin EXPOSED a second divergence in the same hand-built slice: it dropped
+  `requester.id` — the grant arms' join key (`teamGrantCondition`/
+  `collaboratorGrantCondition`/`publicInPrivateOrgCondition` all join on
+  it, silently skipped via the `userId === undefined` guards) — so
+  collaborator/team grants and the private-org-public arm were dead on the
+  explore surface for EVERY signed-in doer; the close now renders
+  `id: doer.id` too. Pinned: the filters battery's restricted describe
+  (delivered flag drops limpub/pubinpriv through the explore surface while
+  the granted rows survive; absent flag reads false, upstream's zero value
+  — both polarities pinned).
+  ESCALATED (the seam's delivery leg — outside the closing unit's ownership
+  grant, recorded per the stop rule): the UI session chain drops
+  `users.is_restricted` at every hop — `ui/session.ts`'s `SessionUser`
+  (:363; built at verifySession :543 and lookupValidSession :814, both with
+  the full row in hand), `ui/viewer.ts`'s `Viewer` user arm +
+  `resolveViewer` (:82-94), and `explore.tsx`'s `exploreDoer` (:140) — so a
+  restricted session doer's /explore/repos reads the NON-restricted
+  composition and sees limited-owner-public / private-org-public rows
+  upstream would hide (the leak polarity). Close: thread the flag
+  SessionUser → Viewer → ExploreDoer (the `impersonatorUserId` precedent is
+  the additive pattern; the viewer projection is that file's owner to relax
+  — SPEC-0010's session/viewer surfaces, exact-shape golden pins live
+  there). Until delivered, `ExploreDoer` without the flag reads
+  non-restricted — pinned as such in the filters battery.
 - The probe battery's blip-era fixture rows (the next cleanup-audit run
   sweeps them).
 
