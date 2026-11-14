@@ -37,42 +37,14 @@ disclosure).
 
 ## 2. The open rows (the whole remaining board)
 
-- **B-52** (agit push-to-propose — L, feature lane, **IN FLIGHT as
-  B52R2**): the rebuild unit rides the freeze window — the agit service
-  sits uncommitted in the tree (`apps/worker/src/api/services/agit.ts`)
-  and the wave's mid-run tsc bursts attributed to its in-flight files
-  (ff42b41/a86d769/bf6bdaa; 8462ae7's re-run came back clean). It also
-  carries B-53's push-side file-pattern family in its gate.ts window
-  (see §3). Resume point: the census row §21/B-52 (our gate already
-  removed the narrower agit-adjacent decline, `gate.ts:309-322`; the
-  flow itself is the port: `refs/for/<branch>` + push options ->
-  server-side PR, `services/pull/pull.go:586`'s UpdateRefForAgit,
-  hook_proc_receive.go:18-25).
-- **B-46** (xref writers — L, feature lane, **IN FLIGHT at refresh**):
-  the B46 unit is dispatched on the writer arm. The timeline READER is
-  fully built and pinned (`api/issues.test.ts:4233`); the writers are a
-  pure D1+regex subsystem (content scanned with the reference regex
-  set, xref comment rows type-3/6 written ON the referenced issue; edits
-  neuter). Resume point: §7.4 row I20 (`references.go:35-41`, `:66-76`).
-- **B-47** (push-integrated issue closes — L, rides B-46): every branch
-  push walks commit messages, writes `commit_ref` comments and
-  closes/reopens per the keyword table (`services/issue/commit.go:126+`,
-  `findActionKeywords`, the `CloseIssuesViaCommitInAnyBranch` gate); our
-  push tail (`git-http/gate.ts:344-375`) has no issue arm. Resume point:
-  §7.4 row I21 — rides B-46's scanner + the push tail window.
-
-(Closed since the freeze prep's draft: **B-79** — POST /markup's
-FilePath file mode now dispatches by extension, the RULE-4
-silent-ignore closed (8fd4010): markdown-family extensions
-(.md/.markdown/.mdown/.mkd/.livemd) render under the landed file
-policy; unknown extensions answer the derived 422 "unable to find a
-render"; Wiki:true still overrides Mode.)
-
-Nothing else is open. Parked list: EMPTY — the v1.5.8 parks all landed
-(B-58 PKGTAILS2, B-65 EMIT65) or closed by verification (B-70 MOUNT70);
-B-66's connect()-premise park was resolved by B-66R's landing (the
-SPEC's no-outbound-TCP premise corrected in specs/email-outbound.md
-§1.1).
+**NONE.** The 2026-11-14 wave drained the board to zero: B-52 (agit —
+B52R2, 1846b7f + the engine-seam landing 4c7ca97), B-46 (the xref writers,
+284c47b), B-47 (push-integrated closes, 83ce0ac), B-79 (8fd4010), and every
+§3 hand-off closed in-wave (see git log 8462ae7..83ce0ac). What remains on
+the rows is RECORDED optional tails, not open defects: B-52's type-29 push
+comment / review-stale maintenance / StartPullRequestCheckImmediately;
+B-46's comment arms (comment.go:920/:1204/:1234) + routes/pulls.ts origin
+threading; B-47's ref-comment xref scan rides B-46's same remainder.
 
 ## 3. The hand-off queue (the wave's recorded remainders, each with its owner)
 
@@ -243,15 +215,11 @@ real-Go-digest fixture row as its pin; the probe harness arm is moot.
 And §1's census docs-debt — CENSUSDOC 133ed08 landed the B-58 flips,
 the B-37 stamp, and the graduation protocol.)
 
-## 5. The L-class feature lanes (explicitly NOT convergence blockers)
+## 5. The L-class feature lanes (ALL LANDED 2026-11-14)
 
-B-52 agit push-to-propose (in flight as B52R2); B-46 the xref writers
-(in flight — the B46 unit); B-47 rides B-46's scanner + the push tail
-window. Each is a feature-sized port with a pin derivation on its
-census row — scheduled work, not compatibility defects. (B-53's
-codeowner gates and B-72's UserTypeBot axis LANDED this wave; B-53's
-remaining tails are only the §3 items — the push-side family riding
-B52R2's window and the \p{...} task-4 check.)
+B-52 agit push-to-propose (1846b7f/4c7ca97), B-46 the xref writers
+(284c47b), B-47 the push-close scanner (83ce0ac). The census board
+B-11..B-89 stands fully drained at the v1.5.9 freeze.
 
 **The standing rule after this freeze**: the 04:05 routine keeps the
 lights on (drift checks, the cleanup-audit); units dispatch only on
