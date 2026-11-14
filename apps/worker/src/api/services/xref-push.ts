@@ -451,7 +451,13 @@ async function walkPushedCommits(input: UpdateIssuesForPushInput): Promise<Commi
   for (let page = 0; page * WALK_PAGE_SIZE < WALK_MAX_COMMITS; page++) {
     let range: Awaited<ReturnType<typeof cell.listCommitsRange>>;
     try {
-      range = await cell.listCommitsRange(input.update.old, input.update.next, WALK_PAGE_SIZE, page);
+      // skipCacheWrite — the same scan-walk cache discipline as the
+      // branch-create arm above (the engine's NOTICE.md 2026-11-02 row): a
+      // range walk reads the FULL old..new ancestry, and caching scanned
+      // ancestors would extend the serve cache's hot set one walk past every
+      // pushed tip — the invariants checker's documented detection horizon
+      // depends on never-advertised ancestors reading through to R2.
+      range = await cell.listCommitsRange(input.update.old, input.update.next, WALK_PAGE_SIZE, page, { skipCacheWrite: true });
     } catch (error) {
       console.error(
         `[xref-push] ${input.repo.ownerNamespace}/${input.repo.slug}: range walk failed for ${input.update.ref}: ${error instanceof Error ? error.message : String(error)}`,

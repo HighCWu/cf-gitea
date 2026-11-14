@@ -1319,15 +1319,19 @@ export async function mergeBase(
 }
 
 /** §4.1 `base..head`, topological, oldest first, `page` 0-based. Null when
- * either side does not resolve to a commit. */
+ * either side does not resolve to a commit. `opts.skipCacheWrite` (the
+ * bulk-scan discipline, NOTICE.md 2026-11-02 row) suppresses the ObjCache
+ * WRITE on every walk read — the worker's push-settle UPDATE walks pass it so
+ * scanned ancestry never extends the serve cache's hot set. */
 export async function listCommitsRange(
   host: LeaseHost,
   base: string,
   head: string,
   limit: number,
-  page = 0
+  page = 0,
+  opts: { skipCacheWrite?: boolean } = {}
 ): Promise<{ commits: import("./repo").CommitJson[]; more: boolean } | null> {
-  return graphListCommitsRange(host.store, base, head, limit, page);
+  return graphListCommitsRange(host.store, base, head, limit, page, { skipCacheWrite: opts.skipCacheWrite });
 }
 
 /** §4.1 `rev-list --left-right --count base head` in one walk. */

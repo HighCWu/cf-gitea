@@ -35,20 +35,28 @@ export interface WalkAnswer<T> {
 }
 
 /** Walk options; tests override the budget to exercise exhaustion without
- * building a 50k-commit repository. */
+ * building a 50k-commit repository. `skipCacheWrite` is honored by
+ * `listCommitsRange` (the bulk-scan walk): its object reads — resolution peel
+ * included — skip the lifetime ObjCache WRITE (reads still hit), the same
+ * scan discipline as `listLog`'s walkLog (NOTICE.md 2026-11-02 row; the
+ * worker's push-settle walks must not extend the serve cache's hot set). */
 export interface WalkOpts {
   maxVisits?: number;
+  skipCacheWrite?: boolean;
 }
 
 /** Commit-object cache for one walk: every visited commit is read exactly once. */
 export class CommitReader {
   private cache = new Map<string, Commit | null>();
-  constructor(private store: GitStore) {}
+  constructor(
+    private store: GitStore,
+    private opts: WalkOpts = {}
+  ) {}
 
   async commit(oid: string): Promise<Commit | null> {
     const hit = this.cache.get(oid);
     if (hit !== undefined) return hit;
-    const obj = await this.store.get(oid);
+    const obj = await this.store.get(oid, undefined, this.opts.skipCacheWrite ? { skipCacheWrite: true } : undefined);
     const c = obj?.type === "commit" ? parseCommit(obj.data) : null;
     this.cache.set(oid, c);
     return c;
@@ -280,11 +288,12 @@ export async function listCommitsRange(
   if (limit <= 0) return { commits: [], more: false };
   if (page < 0) page = 0;
   const maxVisits = opts.maxVisits ?? MERGE_BASE_MAX_VISITS;
-  const baseOid = await resolveCommitish(store, base);
-  const headOid = await resolveCommitish(store, head);
+  const cacheOpts = opts.skipCacheWrite ? { skipCacheWrite: true } : undefined;
+  const baseOid = await resolveCommitish(store, base, cacheOpts);
+  const headOid = await resolveCommitish(store, head, cacheOpts);
   if (!headOid || !baseOid) return null;
 
-  const reader = new CommitReader(store);
+  const reader = new CommitReader(store, opts);
   const excluded = (await parentClosure(reader, baseOid, maxVisits)).set;
 
   // collect the in-range set; the topological order over it is decided below
@@ -407,22 +416,33 @@ export async function countDivergence(store: GitStore, base: string, head: strin
  * and refs/pull/* must resolve by name. Pure reads (§4.6): no peeled-memo
  * writes on this path.
  */
-export async function resolveCommitish(store: GitStore, id: string | null | undefined): Promise<string | null> {
+export async function resolveCommitish(
+  store: GitStore,
+  id: string | null | undefined,
+  opts: { skipCacheWrite?: boolean } = {}
+): Promise<string | null> {
   if (!id) return null;
   for (const cand of [`refs/heads/${id}`, `refs/tags/${id}`, id]) {
     const oid = store.getRef(cand);
-    if (oid) return peelToCommitOid(store, oid);
+    if (oid) return peelToCommitOid(store, oid, opts);
   }
   // a bare oid (readDiff's servable shape, minus the UI reachability gate)
-  return peelToCommitOid(store, id);
+  return peelToCommitOid(store, id, opts);
 }
 
 /** Follow tag objects down to a commit (bounded, pure — no memo writes; the
- * read-only rule §4.6). Returns null for missing objects / non-tag chains. */
-export async function peelToCommitOid(store: GitStore, oid: string): Promise<string | null> {
+ * read-only rule §4.6). Returns null for missing objects / non-tag chains.
+ * `opts.skipCacheWrite` suppresses the ObjCache WRITE on the peel reads
+ * (reads still hit) — the bulk-scan walks' resolution discipline. */
+export async function peelToCommitOid(
+  store: GitStore,
+  oid: string,
+  opts: { skipCacheWrite?: boolean } = {}
+): Promise<string | null> {
+  const cacheOpts = opts.skipCacheWrite ? { skipCacheWrite: true } : undefined;
   let cur = oid;
   for (let i = 0; i < 10; i++) {
-    const obj = await store.get(cur);
+    const obj = await store.get(cur, undefined, cacheOpts);
     if (!obj) return null;
     if (obj.type === "commit") return cur;
     if (obj.type === "tag") {

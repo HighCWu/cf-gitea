@@ -1406,9 +1406,19 @@ export class RepoCell extends DurableObject<Env> {
     return mergeBase(this.leaseHost(), a, b);
   }
 
-  /** `base..head` commits, topological, oldest first (SPEC-0001b §4.1). */
-  async listCommitsRange(base: string, head: string, limit: number, page = 0): Promise<{ commits: CommitJson[]; more: boolean } | null> {
-    return listCommitsRange(this.leaseHost(), base, head, limit, page);
+  /** `base..head` commits, topological, oldest first (SPEC-0001b §4.1).
+   * `opts.skipCacheWrite` mirrors `listLog`'s flag: a bulk scan (the webhook
+   * push-settle's UPDATE walk) must not inflate the walked ancestry into the
+   * lifetime ObjCache — the invariants checker's detection horizon reads
+   * through the cache to R2 (NOTICE.md 2026-11-02 row). */
+  async listCommitsRange(
+    base: string,
+    head: string,
+    limit: number,
+    page = 0,
+    opts: { skipCacheWrite?: boolean } = {}
+  ): Promise<{ commits: CommitJson[]; more: boolean } | null> {
+    return listCommitsRange(this.leaseHost(), base, head, limit, page, opts);
   }
 
   /** `rev-list --left-right --count base head` in one walk (§4.1). */

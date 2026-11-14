@@ -20,15 +20,25 @@
 //       force-push (real ancestry over the lease-staged rows, ONE
 //       classifyReceive RPC per push) / delete — index-aligned, with
 //       { repo, pusher? } context.
-//   3.  a rejected command renders its `reject` string as the report-status
+//   3.  force-push classification is real ancestry over the lease-staged
+//       rows; a create classifies as create.
+//   4.  a rejected command renders its `reject` string as the report-status
 //       ng message, NEVER applies, and its sibling in the same push lands.
-//   4.  an all-rejected push skips finalize, releases the lease WITH a sweep
+//   5.  an all-rejected push skips finalize, releases the lease WITH a sweep
 //       (no staging debris; the next push is not lease-blocked) and renders
 //       all-ng.
-//   5.  a throwing hook fails the whole request closed (500, refs unmoved,
-//       lease released — a follow-up push works).
-//   6.  a malformed verdict array (wrong length) fails CLOSED with the fixed
+//   6.  deletes classify as delete; an allowed delete lands.
+//   7.  a throwing hook fails the whole request closed (500) and frees the
+//       lease.
+//   8.  a malformed verdict array (wrong length) fails CLOSED with the fixed
 //       contract-violation message; `undefined` allows everything.
+//   9.  the pusher identity rides the hook context (the in-process channel).
+//   10. listCommitsRange's skipCacheWrite (the INVFIX walk discipline, both
+//       xref-push arms): a range walk over pack-resident, ObjCache-cold
+//       content reads the walked ancestry WITHOUT inflating the DO lifetime
+//       ObjCache — the no-flag twin on the same fixture inflates it (the
+//       observable is live), and the goldens are byte-equal (the option
+//       changes cache behavior, not results).
 import { DatabaseSync } from "node:sqlite";
 import { register } from "node:module";
 
@@ -167,6 +177,33 @@ const A = commitOf("a root", [], "blob a\n");
 const B = commitOf("b child of a", [A.oid], "blob b\n");
 const C = commitOf("c divergent root", [], "blob c\n");
 const D = commitOf("d child of c", [C.oid], "blob d\n");
+
+/** Check 10's fixture: a commit chain whose EVERY object rides ONE pack —
+ *  commit i carries its own blob+tree and commits its predecessor. A single
+ *  create push lands the whole ancestry, and creates run no ancestry walk,
+ *  so nothing is ever ObjCache-warm: the range walk's suppressed cache
+ *  WRITES are observable per oid. */
+function chainOf(entries) {
+  const objects = [];
+  const oids = [];
+  let parents = [];
+  for (const [message, blobText] of entries) {
+    const blob = te.encode(blobText);
+    const blobOid = hashObject("blob", blob);
+    const tree = serializeTree([{ mode: "100644", oid: blobOid, name: "f.txt" }]);
+    const commit = serializeCommit({ tree: tree.oid, parents, author: PERSON, committer: PERSON, message });
+    objects.push({ type: "blob", data: blob }, { type: "tree", data: tree.data }, { type: "commit", data: commit.data });
+    oids.push(commit.oid);
+    parents = [commit.oid];
+  }
+  return { oids, pack: buildPack(objects) };
+}
+const CHAIN = chainOf([
+  ["chain root", "blob chain root\n"],
+  ["chain mid", "blob chain mid\n"],
+  ["chain tip", "blob chain tip\n"],
+]);
+const [CHAIN_ROOT, CHAIN_MID, CHAIN_TIP] = CHAIN.oids;
 
 // ---- the receive harness (real flow, real control plane, in-memory R2) -----
 
@@ -555,6 +592,65 @@ await check("9. the pusher identity rides the hook context (the in-process chann
     { pusher: { id: 7, login: "mirroring" }, validatePush: recordingHook((commands) => commands.map(() => ({}))) }
   );
   assertEq(seen[0].ctx, { repo: REPO, pusher: { id: 7, login: "mirroring" } }, "ctx.pusher verbatim");
+});
+
+await check("10. listCommitsRange skipCacheWrite: the range walk reads the ancestry WITHOUT inflating the ObjCache (the UPDATE-arm walk discipline)", async () => {
+  // The INVFIX/W5 discipline pinned BEHAVIORALLY (worker xref-push.ts's
+  // UPDATE arm now passes the flag; the engine NOTICE 2026-11-02 row's
+  // cache contract): the walked old..new ancestry must stay OUT of the
+  // GitStore-lifetime ObjCache — the invariants checker's detection horizon
+  // reads through the cache to R2, so cached scanned ancestry blinds
+  // pack-loss detection to everything the walk touched.
+  //
+  // Observable: the rig's GitStore exposes its ObjCache. The DO stub rides
+  // the real control plane below (the same execution path the DO RPC takes;
+  // repo.ts's cell method is the same opts bag forwarded one line, the
+  // dist-types boundary tsc covers).
+  async function chainRepo() {
+    const t = makeRepo();
+    const res = await postReceive(t, receiveBody([`${ZERO_OID} ${CHAIN_TIP} refs/heads/range`], CHAIN.pack.bytes));
+    assertEq(res.status, 200, "http status");
+    assertEq(parseReport(new Uint8Array(await res.arrayBuffer())).results, [{ ref: "refs/heads/range", ok: true }], "chain create landed");
+    // fixture precondition: a create runs no ancestry walk, so the walked
+    // ANCESTRY (root + mid) is pack-resident and ObjCache-cold before any
+    // range walk. (The pushed TIP itself may arrive warm — receive's own
+    // tip read, the same posture as walkLog's peel-cached tip; the walk
+    // discipline owns the ancestry, never the tip.)
+    for (const oid of [CHAIN_ROOT, CHAIN_MID]) {
+      assertEq(t.store.cache.get(oid) ?? null, null, `fixture precondition: ${oid.slice(0, 7)} cold`);
+    }
+    return t;
+  }
+
+  // the flag twin: walk range CHAIN_ROOT..CHAIN_TIP (reads the root via the
+  // exclusion closure and both children via the frontier) — cache untouched
+  const tFlag = await chainRepo();
+  const flagged = await controlPlane.listCommitsRange(tFlag.host, CHAIN_ROOT, CHAIN_TIP, 10, 0, { skipCacheWrite: true });
+  assert(flagged !== null, "flagged walk answered");
+  assertEq(
+    flagged.commits.map((c) => c.oid),
+    [CHAIN_MID, CHAIN_TIP],
+    "flagged walk content (oldest-first, base excluded)"
+  );
+  assertEq(flagged.more, false, "flagged walk page exhausted");
+
+  // the no-flag twin: the SAME walk WITHOUT the flag inflates the walked
+  // ancestry — the falsification control proving the observable is live and
+  // the flag (not some incidental mechanism) is what suppressed the writes
+  const tPlain = await chainRepo();
+  const plain = await controlPlane.listCommitsRange(tPlain.host, CHAIN_ROOT, CHAIN_TIP, 10, 0);
+  assert(plain !== null, "no-flag walk answered");
+  for (const oid of [CHAIN_ROOT, CHAIN_MID]) {
+    assert(tPlain.store.cache.get(oid) !== undefined, `no-flag control: ${oid.slice(0, 7)} inflated without the flag`);
+  }
+
+  // the option changes cache behavior, never results: byte-equal goldens
+  assertEq(JSON.stringify(flagged), JSON.stringify(plain), "flagged vs no-flag goldens byte-equal");
+
+  // THE contract: the flagged walk left the walked ancestry un-inflated
+  for (const oid of [CHAIN_ROOT, CHAIN_MID]) {
+    assertEq(tFlag.store.cache.get(oid) ?? null, null, `flagged walk left ${oid.slice(0, 7)} uncached`);
+  }
 });
 
 console.log(`\ncheck-validate-push: ${planned - failures.length}/${planned} checks passed`);
