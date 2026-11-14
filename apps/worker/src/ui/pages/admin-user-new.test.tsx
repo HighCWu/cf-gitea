@@ -54,6 +54,8 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { userSignInPassword } from "../../auth/password-auth";
+import { CONFIGURED_HASH_SPEC, PasswordHashUnsupportedError, hashAlgorithmToSpec, verifyPassword } from "../../auth/password";
+import { resolvePasswordPolicy } from "../../api/config";
 import { auditEvents, emailOutbox, loginSources, userRedirects, users } from "../../db/schema";
 import type { MailOutboxMessage } from "../../services/mail/outbox";
 import { parseUiRoute } from "../index";
@@ -178,8 +180,14 @@ function createForm(overrides: Record<string, string> = {}, checked: string[] = 
   return form;
 }
 
-async function submit(seeded: Seeded, form: URLSearchParams, mailer?: ReturnType<typeof armedMailer>, doerId = seeded.adminId) {
-  return submitAdminUserCreate(env.DB, doerId, parseAdminUserCreateForm(form), mailer);
+async function submit(
+  seeded: Seeded,
+  form: URLSearchParams,
+  mailer?: ReturnType<typeof armedMailer>,
+  doerId = seeded.adminId,
+  knobs?: Parameters<typeof submitAdminUserCreate>[4],
+) {
+  return submitAdminUserCreate(env.DB, doerId, parseAdminUserCreateForm(form), mailer, knobs);
 }
 
 async function rowByName(name: string) {
@@ -432,6 +440,91 @@ describe("the submit — the password ladder (users.go:199-211, unconditioned pe
     ).toEqual({ outcome: "created", userId: anyNumber() });
     const row = await rowByName("src-user");
     expect(row!.passwd).toMatch(/^[0-9a-f]{100}$/); // the ladder ran; the hash stored
+  });
+});
+
+// --- the submit: the ARMED config ladder (census B-87's :392 handoff) ---------------
+
+describe("the submit — the armed config ladder (B-87: submitAdminUserCreate's knobs)", () => {
+  it("an ARMED MIN_PASSWORD_LENGTH=16 re-renders the 16-floor text for a default-legal password; nothing lands", async () => {
+    const seeded = await seedNew();
+    const before = await userCount();
+    const knobs = { policy: resolvePasswordPolicy({ MIN_PASSWORD_LENGTH: "16" }) };
+    expect(await submit(seeded, createForm({ password: "Fresh-1a", user_name: "floored", email: "floored@example.com" }), undefined, seeded.adminId, knobs)).toEqual({
+      outcome: "invalid",
+      message: "Password length cannot be less than 16 characters.",
+      field: "password",
+    });
+    expect(await userCount()).toBe(before);
+    expect(await rowByName("floored")).toBeNull();
+  });
+
+  it("an ARMED PASSWORD_COMPLEXITY rejects the single-class password (the ARMED re-render shape the default-accepts pin above defers here); a strong password CREATES", async () => {
+    const seeded = await seedNew();
+    const knobs = { policy: resolvePasswordPolicy({ PASSWORD_COMPLEXITY: "lower,upper,digit" }) };
+    const weak = await submit(seeded, createForm({ password: "alllowercase123" }), undefined, seeded.adminId, knobs);
+    expect(weak).toMatchObject({ outcome: "invalid", field: "password" });
+    expect((weak as { message?: string }).message).toContain("At least one uppercase character");
+    expect(await rowByName("new-user")).toBeNull();
+
+    const strong = await submit(
+      seeded,
+      createForm({ password: "Fresh-1a", user_name: "armed-strong", email: "armed-strong@example.com" }),
+      undefined,
+      seeded.adminId,
+      knobs,
+    );
+    expect(strong.outcome).toBe("created");
+    expect(await rowByName("armed-strong")).not.toBeNull();
+  });
+
+  it("an ARMED ladder still skips BOTS (:199's gate wraps the knobs too)", async () => {
+    const seeded = await seedNew();
+    const knobs = { policy: resolvePasswordPolicy({ MIN_PASSWORD_LENGTH: "16", PASSWORD_COMPLEXITY: "lower,upper,digit,spec" }) };
+    expect(
+      await submit(
+        seeded,
+        createForm({ user_type: "Bot", user_name: "armed-bot", email: "armed-bot@example.com", password: "x" }),
+        undefined,
+        seeded.adminId,
+        knobs,
+      ),
+    ).toEqual({ outcome: "created", userId: anyNumber() });
+    expect((await rowByName("armed-bot"))!.type).toBe("bot");
+  });
+
+  it("the configured hash spec threads into SetPassword: the row stores the PASSED spec and verifies under it", async () => {
+    const seeded = await seedNew();
+    const knobs = { configuredHashSpec: "pbkdf2$10000$50" };
+    expect(
+      await submit(
+        seeded,
+        createForm({ user_name: "spec-user", email: "spec-user@example.com" }),
+        undefined,
+        seeded.adminId,
+        knobs,
+      ),
+    ).toEqual({ outcome: "created", userId: anyNumber() });
+    const row = await rowByName("spec-user");
+    expect(row!.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(await verifyPassword("Fresh-1a", row!.passwd, row!.salt, "pbkdf2$10000$50")).toBe(true);
+    // …and NOT under the landed default spec (the threading is real).
+    expect(await verifyPassword("Fresh-1a", row!.passwd, row!.salt, CONFIGURED_HASH_SPEC)).toBe(false);
+  });
+
+  it("an UNEXECUTABLE configured spec refuses through the controlled error (the log.Fatal posture — the route's onError answers explicitly)", async () => {
+    const seeded = await seedNew();
+    const before = await userCount();
+    await expect(
+      submit(
+        seeded,
+        createForm({ user_name: "refused", email: "refused@example.com" }),
+        undefined,
+        seeded.adminId,
+        { configuredHashSpec: hashAlgorithmToSpec("scrypt") },
+      ),
+    ).rejects.toBeInstanceOf(PasswordHashUnsupportedError);
+    expect(await userCount()).toBe(before); // no partial row
   });
 });
 

@@ -17,7 +17,13 @@
  * algorithm (pbkdf2.go:44-47, "MUST NOT BE CHANGED"); the configured
  * PASSWORD_HASH_ALGO default "pbkdf2" dealiases to the spec
  * "pbkdf2$50000$50" (setting.go:26,30; security.go:175 stores the dealiased
- * spec). Phase A hardwires the configured algorithm (the knob is Phase C).
+ * spec). Census B-87's consumption half made the configured algorithm
+ * ENV-DRIVEN: the SetPassword/needsRehash arms accept the caller's resolved
+ * specification (`configuredPasswordHashAlgo(env).specification` in
+ * api/config.ts), with the landed pbkdf2 default standing when a caller
+ * passes none — upstream's boot-time log.Fatal on an unexecutable spec
+ * (security.go:176-178) becomes the controlled parse error at the arm
+ * (Workers has no boot hook).
  *
  * Census B-86 lands the argon2id + bcrypt VERIFY arms (the PWD-3 benchmark's
  * static-wasm shape — password-wasm.ts over the vendored hash-wasm binaries,
@@ -42,7 +48,17 @@
 import { timingSafeDigestEqual } from "./digest";
 import { argon2idBytes, bcryptVerifyCrypt, ensurePasswordWasm } from "./password-wasm";
 
-/** The hardwired PASSWORD_HASH_ALGO config name (setting.go:13). */
+/**
+ * The DEFAULT PASSWORD_HASH_ALGO config name (setting.go:13). The DEFAULT
+ * arm of the env-driven posture (census B-87's consumption half): the arms
+ * below accept the caller's env-resolved configured specification, and when
+ * no caller resolves one (tests, pre-threading call sites) this landed
+ * pbkdf2 default stands. Upstream resolves the var ONCE at boot
+ * (security.go:175); Workers resolves per request, so callers bridge env →
+ * `configuredPasswordHashAlgo(env).specification` (api/config.ts) → these
+ * arms — this module cannot import the reader (the reader parses THROUGH
+ * this module's chain).
+ */
 export const CONFIGURED_HASH_ALGO = "pbkdf2";
 
 /**
@@ -74,8 +90,12 @@ export const PRODUCTION_PBKDF2_ITERATION_CAP = 100_000;
 export const PRODUCTION_ARGON2_MEMORY_CEILING_BYTES = 128 * 1024 * 1024;
 
 /**
- * The dealiased configured specification stored in `passwd_hash_algo` on
- * every SetPassword (setting.go:26,30 + security.go:175).
+ * The dealiased DEFAULT configured specification stored in `passwd_hash_algo`
+ * on every SetPassword that did not receive an env-resolved spec
+ * (setting.go:26,30 + security.go:175). The DEFAULT arm of the env-driven
+ * posture (see CONFIGURED_HASH_ALGO): a caller threads
+ * `configuredPasswordHashAlgo(env).specification` to make the configured
+ * algorithm live; unset, this landed pbkdf2$50000$50 default stands.
  */
 export const CONFIGURED_HASH_SPEC = "pbkdf2$50000$50";
 
@@ -439,24 +459,46 @@ export function bytesToHex(bytes: Uint8Array): string {
  * CONFIGURED algorithm, store the configured spec. The caller persists
  * passwd/salt/passwdHashAlgo (authenticate.go:64 updates exactly these
  * three columns on rehash).
+ *
+ * `configuredSpec` is the ENV-DRIVEN arm (census B-87's consumption half):
+ * callers with a request env thread
+ * `configuredPasswordHashAlgo(env).specification` (api/config.ts — the
+ * alias chain's dealiased form, security.go:175); omitted, the landed
+ * pbkdf2$50000$50 default stands. An UNEXECUTABLE configured spec refuses
+ * through the controlled parse inside hashPasswordWithAlgo (scrypt/
+ * above-cap/unparseable → PasswordHashUnsupportedError — the recorded
+ * Workers posture for upstream's boot log.Fatal, security.go:176-178), and
+ * a non-pbkdf2 executable spec (argon2/bcrypt) refuses through
+ * hashPasswordWithAlgo's verify-only guard — both explicit, never a
+ * silent fallback to the default algorithm.
  */
-export async function newPasswordRecord(password: string): Promise<{
+export async function newPasswordRecord(
+  password: string,
+  configuredSpec: string = CONFIGURED_HASH_SPEC,
+): Promise<{
   passwd: string;
   salt: string;
   passwdHashAlgo: string;
 }> {
   const salt = newSalt();
-  const passwd = await hashPasswordWithAlgo(password, salt, CONFIGURED_HASH_SPEC);
-  return { passwd, salt, passwdHashAlgo: CONFIGURED_HASH_SPEC };
+  const passwd = await hashPasswordWithAlgo(password, salt, configuredSpec);
+  return { passwd, salt, passwdHashAlgo: configuredSpec };
 }
 
 /**
  * authenticate.go:60 — rehash-on-login condition: the stored algorithm
  * differs from the CONFIGURED SPECIFICATION (settings store the dealiased
  * spec, security.go:175) OR the salt is not the current 32-char length.
+ * `configuredSpec` is the env-driven arm (see newPasswordRecord): callers
+ * thread the env-resolved specification so an operator's PASSWORD_HASH_ALGO
+ * becomes the comparison target; omitted, the landed default stands.
  */
-export function needsRehash(storedAlgoSpec: string, salt: string): boolean {
-  return storedAlgoSpec !== CONFIGURED_HASH_SPEC || salt.length !== SALT_BYTE_LENGTH * 2;
+export function needsRehash(
+  storedAlgoSpec: string,
+  salt: string,
+  configuredSpec: string = CONFIGURED_HASH_SPEC,
+): boolean {
+  return storedAlgoSpec !== configuredSpec || salt.length !== SALT_BYTE_LENGTH * 2;
 }
 
 /** user.go:427-430 IsPasswordSet — an empty row never reaches a hash call. */

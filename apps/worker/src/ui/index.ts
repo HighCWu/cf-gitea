@@ -1241,6 +1241,7 @@ import {
   renderAdminMonitorQueueManagePage,
 } from "./pages/admin-monitor";
 import {
+  IMPERSONATE_BOT_REFUSED_ERROR,
   IMPERSONATE_REFUSED_BODY,
   IMPERSONATE_SUCCESS_REDIRECT,
   IMPERSONATE_UNKNOWN_USER_ERROR,
@@ -1364,6 +1365,10 @@ import {
   renderUserSettingsAccountPage,
 } from "./pages/user-settings-account";
 import { applyPasswordReset, changeOwnPassword } from "../services/user-accounts";
+// Census B-87: the password-knob readers over the deploy config (SPEC-0002
+// §6.5) — the two UpdateAuth web arms + the admin-create arm thread the
+// resolved policy (and the configured hash spec) into the ladders.
+import { configuredPasswordHashAlgo, resolvePasswordPolicy } from "../api/config";
 import { renderMustChangePasswordPage } from "./pages/change-password";
 import {
   applyUserSettingsNotificationsActionsForm,
@@ -12051,7 +12056,14 @@ async function userSettingsAccountPasswordSubmit(c: Context<{ Bindings: Env }>):
   const p = await userSettingsTabPrologue(c, true);
   if (!p.ok) return p.response;
   const form = parseUserSettingsAccountPasswordForm(await readUrlEncodedForm(c.req.raw));
-  const outcome = await changeOwnPassword(c.env.DB, p.viewer.id, form);
+  // Census B-87: the ladder reads the deploy config (upstream's
+  // update.go:256-264 reads the settings at the same arm) — an ARMED
+  // MIN_PASSWORD_LENGTH/PASSWORD_COMPLEXITY/PASSWORD_CHECK_PWN gates here
+  // too; unset stays upstream's default (the pwned fetch rides the runtime
+  // global, only tests inject one).
+  const outcome = await changeOwnPassword(c.env.DB, p.viewer.id, form, {
+    policy: resolvePasswordPolicy(c.env),
+  });
   if (outcome.outcome === "changed") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/account" } }));
   }
@@ -12104,11 +12116,15 @@ async function userSettingsChangePasswordSubmit(c: Context<{ Bindings: Env }>): 
     return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
   }
   const params = await readUrlEncodedForm(c.req.raw);
+  // Census B-87: the shared UpdateAuth arm reads the deploy config exactly
+  // like upstream (update.go:256-264) — the resolved policy gates the
+  // ladder (unset stays upstream's default).
   const outcome = await applyPasswordReset(
     c.env.DB,
     p.viewer.id,
     params.get("password") ?? "",
     params.get("retype") ?? "",
+    { policy: resolvePasswordPolicy(c.env) },
   );
   if (outcome.outcome === "changed") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
@@ -14519,7 +14535,15 @@ async function adminUserNewSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const form = parseAdminUserCreateForm(await readUrlEncodedForm(c.req.raw));
   // The prologue guarantees a signed admin; the narrow keeps it cast-free.
   const doerId = p.ctx.viewer.kind === "user" ? p.ctx.viewer.id : 0;
-  const outcome = await submitAdminUserCreate(c.env.DB, doerId, form, c.env);
+  // Census B-87: the create ladder reads the deploy config — the resolved
+  // policy (MIN_PASSWORD_LENGTH/PASSWORD_COMPLEXITY/PASSWORD_CHECK_PWN) and
+  // the configured hash spec (PASSWORD_HASH_ALGO's dealiased form; an
+  // unexecutable config raises the module's controlled unsupported error,
+  // the recorded Workers posture for upstream's boot log.Fatal).
+  const outcome = await submitAdminUserCreate(c.env.DB, doerId, form, c.env, {
+    policy: resolvePasswordPolicy(c.env),
+    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+  });
   if (outcome.outcome === "invalid") {
     const data = await loadAdminUserNew(c.env.DB);
     return p.respond(
@@ -14539,10 +14563,11 @@ async function adminUserNewSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
 }
 
 /** POST /-/admin/users/{userid}/impersonate (the 9c929dc chain's mount):
- *  the four-outcome ladder — impersonated 303s to /user/settings,
- *  unknown-user 400s with upstream's JSON body, already-impersonating 500s
- *  plain (never a silent redirect), session-gone bounces to login with the
- *  clear-cookie. */
+ *  the five-outcome ladder — impersonated 303s to /user/settings,
+ *  unknown-user and bot-refused 400 with upstream's JSON bodies (the
+ *  bot-refusal is B-72's handoff 3, users.go:569-571 live),
+ *  already-impersonating 500s plain (never a silent redirect),
+ *  session-gone bounces to login with the clear-cookie. */
 async function adminUsersImpersonateSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
@@ -14563,6 +14588,14 @@ async function adminUsersImpersonateSubmit(c: Context<{ Bindings: Env }>, userId
   if (outcome.outcome === "unknown-user") {
     return p.respond(
       new Response(JSON.stringify(IMPERSONATE_UNKNOWN_USER_ERROR), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  if (outcome.outcome === "bot-refused") {
+    return p.respond(
+      new Response(JSON.stringify(IMPERSONATE_BOT_REFUSED_ERROR), {
         status: 400,
         headers: { "content-type": "application/json;charset=utf-8" },
       }),

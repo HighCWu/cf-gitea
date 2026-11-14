@@ -410,6 +410,70 @@ describe("newPasswordRecord (user.go:407-414 SetPassword pure part)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------------
+// Census B-87's consumption half — the CONFIGURED algorithm is ENV-DRIVEN:
+// the arms accept the caller's env-resolved specification
+// (api/config.ts configuredPasswordHashAlgo(env).specification), the landed
+// pbkdf2 default stands when a caller passes none, and an unexecutable
+// configured spec refuses through the controlled parse error (upstream's
+// boot log.Fatal, security.go:176-178 — Workers has no boot hook).
+// ---------------------------------------------------------------------------------
+
+describe("the env-driven configured algorithm (B-87: configuredSpec threading)", () => {
+  const LEGACY_FLOOR_SPEC = "pbkdf2$10000$50"; // executable, below the cap (the pbkdf2_v1 dealias)
+
+  it("newPasswordRecord hashes and stores the PASSED spec; omitted keeps the landed default", async () => {
+    const threaded = await newPasswordRecord("threaded-Pw0rd!", LEGACY_FLOOR_SPEC);
+    expect(threaded.passwdHashAlgo).toBe(LEGACY_FLOOR_SPEC);
+    expect(await verifyPassword("threaded-Pw0rd!", threaded.passwd, threaded.salt, threaded.passwdHashAlgo)).toBe(true);
+    // The digest really used the passed parameters (10k iter → verifiable
+    // only under the same spec's parse) and the salt is a fresh 32-hex.
+    expect(threaded.salt).toMatch(/^[0-9a-f]{32}$/);
+
+    const byDefault = await newPasswordRecord("default-Pw0rd!");
+    expect(byDefault.passwdHashAlgo).toBe(CONFIGURED_HASH_SPEC);
+    expect(needsRehash(byDefault.passwdHashAlgo, byDefault.salt)).toBe(false);
+  });
+
+  it("needsRehash compares against the CONFIGURED algo, not the hardcoded default", () => {
+    const goodSalt = newSalt();
+    // An instance configured to the pbkdf2_v1 floor: its stored rows need no
+    // rehash, but a row from the OLD default does.
+    expect(needsRehash(LEGACY_FLOOR_SPEC, goodSalt, LEGACY_FLOOR_SPEC)).toBe(false);
+    expect(needsRehash(CONFIGURED_HASH_SPEC, goodSalt, LEGACY_FLOOR_SPEC)).toBe(true);
+    // Omitted configuredSpec: the landed default is the comparison target
+    // (the pre-B-87 posture, byte-identical).
+    expect(needsRehash(LEGACY_FLOOR_SPEC, goodSalt)).toBe(true);
+    // Salt-length rule rides unchanged on the threaded arm.
+    expect(needsRehash(LEGACY_FLOOR_SPEC, "abcdefghij", LEGACY_FLOOR_SPEC)).toBe(true);
+  });
+
+  it("an UNEXECUTABLE configured spec refuses through the controlled parse error (the log.Fatal posture)", async () => {
+    // scrypt: platform-impossible family; pbkdf2_hi: above the production cap.
+    for (const name of ["scrypt", "pbkdf2_hi"]) {
+      const spec = hashAlgorithmToSpec(name);
+      // The reader's executable flag is exactly this parse failing.
+      expect(() => parseStoredHashAlgo(spec), name).toThrow(PasswordHashUnsupportedError);
+      await expect(newPasswordRecord("refused-pw", spec)).rejects.toBeInstanceOf(PasswordHashUnsupportedError);
+    }
+    // The stored record is untouched by a refused SetPassword — the throw
+    // happens before any digest is produced (parse-first inside
+    // hashPasswordWithAlgo), so a caller never persists a half record.
+  });
+
+  it("an executable-but-verify-only configured spec (argon2) refuses through the same controlled error", async () => {
+    const spec = hashAlgorithmToSpec("argon2");
+    expect(parseStoredHashAlgo(spec).hasher).toBe("argon2"); // parses fine…
+    // …but hashing under it is not implemented (the B-86 arms are
+    // verify-only) — the refusal is explicit, never a silent pbkdf2 digest.
+    await expect(newPasswordRecord("argon2-configured-pw", spec)).rejects.toBeInstanceOf(PasswordHashUnsupportedError);
+    // And the comparison half: a stored old-default row WOULD rehash toward
+    // the configured argon2 spec (the caller's newPasswordRecord then
+    // refuses — the explicit-error posture, ADR-0008 rule 4).
+    expect(needsRehash(CONFIGURED_HASH_SPEC, newSalt(), spec)).toBe(true);
+  });
+});
+
 describe("bytesToHex (the digest/salt wire format)", () => {
   it("hex-encodes bytes lowercase without padding", () => {
     expect(bytesToHex(new Uint8Array([0x0f, 0xa1, 0x02]))).toBe("0fa102");

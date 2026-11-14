@@ -188,6 +188,7 @@ import {
 } from "../../services/orgs/errors";
 import { usableUsernameError } from "../../services/orgs/orgs";
 import { findLoginSources, type LoginSourceRow } from "../../services/auth-sources/store";
+import { DEFAULT_PASSWORD_POLICY, type PasswordPolicy } from "../../auth/password-policy";
 import { newPasswordRecord, newSalt } from "../../auth/password";
 import { AuditActions, auditEventInsert } from "../../services/audit";
 import {
@@ -343,6 +344,24 @@ function isUniqueCollision(error: unknown): boolean {
 }
 
 /**
+ * The deploy-config knobs the create ladder consumes (census B-87's
+ * :392 handoff — upstream reads the SAME settings at users.go:199-219's
+ * ladder over the shared UpdateAuth): `policy` is
+ * `resolvePasswordPolicy(env)` (an ARMED MIN_PASSWORD_LENGTH/
+ * PASSWORD_COMPLEXITY/PASSWORD_CHECK_PWN gates the ladder; omitted =
+ * DEFAULT_PASSWORD_POLICY, upstream's default config), and
+ * `configuredHashSpec` is `configuredPasswordHashAlgo(env).specification`
+ * (the SetPassword algorithm; omitted = the landed pbkdf2 default — an
+ * unexecutable configured spec refuses through the module's controlled
+ * PasswordHashUnsupportedError, the recorded Workers posture for upstream's
+ * boot log.Fatal).
+ */
+export interface AdminUserCreateKnobs {
+  policy?: PasswordPolicy;
+  configuredHashSpec?: string;
+}
+
+/**
  * POST /-/admin/users/new (admin.NewUserPost, users.go:151-265) over the
  * landed seams — the module header carries the ladder and every reduction.
  * The caller supplies the prologue-gated doer (the audit's actor; the
@@ -350,12 +369,14 @@ function isUniqueCollision(error: unknown): boolean {
  * `mailer` is the wiring's env (RegisterNotifyEnv's structural slice);
  * omitting it skips the notify arm (the seam's gate still answers
  * "disabled" for an unconfigured mailer at runtime — never load-bearing).
+ * `knobs` threads the deploy config (B-87 — see AdminUserCreateKnobs).
  */
 export async function submitAdminUserCreate(
   d1: D1Database,
   doerId: number,
   form: AdminUserCreateForm,
   mailer?: RegisterNotifyEnv,
+  knobs?: AdminUserCreateKnobs,
 ): Promise<AdminUserCreateOutcome> {
   const db = drizzle(d1);
 
@@ -398,9 +419,11 @@ export async function submitAdminUserCreate(
   // user local — upstream's :202 login-type gate has no non-local target
   // here). The texts are validateNewPassword's — the landed web-EDIT
   // twin's ladder (the pwned arm :211-219 is dormant, the API twin's
-  // posture).
+  // posture). Census B-87: the knob-resolved policy threads in (see
+  // AdminUserCreateKnobs) — an ARMED config gates the ladder; the omitted
+  // default is upstream's.
   if (!isBot) {
-    const policy = validateNewPassword(form.password);
+    const policy = validateNewPassword(form.password, knobs?.policy ?? DEFAULT_PASSWORD_POLICY);
     if (policy !== null) {
       return { outcome: "invalid", message: policy, field: "password" };
     }
@@ -441,7 +464,9 @@ export async function submitAdminUserCreate(
   const now = new Date();
   // The hashed record only for a user create; a bot row carries the
   // empty-passwd triple (user.go:788-794 — no hash call, salt+algo '').
-  const record = isBot ? null : await newPasswordRecord(form.password);
+  // Census B-87: SetPassword runs under the configured algorithm (the
+  // threaded spec; omitted = the landed pbkdf2 default).
+  const record = isBot ? null : await newPasswordRecord(form.password, knobs?.configuredHashSpec);
   const doer = await db
     .select({ username: users.username, fullName: users.fullName })
     .from(users)

@@ -531,6 +531,88 @@ describe("POST /login — failure paths re-render at 200 and count one limiter f
   });
 });
 
+// ---------------------------------------------------------------------------------
+// Census B-87 — the ENABLE_PASSWORD_SIGNIN_FORM knob over the session router.
+// The page module's render battery lives in login-external-auth.test.tsx; this
+// describe pins the ROUTER arms the B-87 handoff assigned to session.ts: the
+// GET call-site threading and the POST /login 403 (auth.go:293-295 —
+// SignInPost's first statement, ctx.HTTPError(403) → Go http.Error's
+// plain-text "Forbidden" body, not an HTML error page).
+// ---------------------------------------------------------------------------------
+
+describe("ENABLE_PASSWORD_SIGNIN_FORM — the session-router gate (auth.go:293-295)", () => {
+  // The generated Env types the var as its literal default ("true"); the
+  // knob slice Omit-and-rewidens it so tests can arm "false" and unset.
+  const knobEnv = testEnv as Omit<UiTestEnv, "ENABLE_PASSWORD_SIGNIN_FORM"> & {
+    ENABLE_PASSWORD_SIGNIN_FORM?: string;
+  };
+
+  it("off: POST /login answers the plain-text 403 — no form render, no limiter failure, no session row", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const pw = await seedPassword(alice);
+    const ip = "10.3.3.3";
+    knobEnv.ENABLE_PASSWORD_SIGNIN_FORM = "false";
+    try {
+      const res = await request("/login", form({ user_name: alice.username, password: pw }, { "x-forwarded-for": ip }));
+      expect(res.status).toBe(403);
+      expect(res.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(await res.text()).toBe("Forbidden\n");
+      // The gate precedes the ladder: upstream never reaches its own
+      // limiter either, and the valid pair proves nothing was verified.
+      expect(await failureCount(ip)).toBe(0);
+      expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
+      expect(cookieHeader(res)).toBe("");
+    } finally {
+      delete knobEnv.ENABLE_PASSWORD_SIGNIN_FORM;
+    }
+  });
+
+  it("off: GET /login renders the form-hidden shape through the real router (the reader → renderLoginPage threading)", async () => {
+    knobEnv.ENABLE_PASSWORD_SIGNIN_FORM = "false";
+    try {
+      const res = await request("/login");
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain('action="/login" method="post"');
+      expect(html).not.toContain('name="user_name"');
+      expect(html).not.toContain("/user/forgot_password");
+      // The page itself still renders (the header + segment survive).
+      expect(html).toContain("Sign In");
+    } finally {
+      delete knobEnv.ENABLE_PASSWORD_SIGNIN_FORM;
+    }
+  });
+
+  it("the go-ini MustBool(true) parse arms: '0'/'f'/'false' arm off; '1'/'TRUE'/' true '/junk and ABSENT stay on", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const pw = await seedPassword(alice);
+    const arms: Array<[string | undefined, boolean]> = [
+      ["0", true],
+      ["f", true],
+      ["false", true],
+      ["1", false],
+      ["TRUE", false],
+      [" true ", false],
+      ["junk", false],
+      [undefined, false],
+    ];
+    for (const [value, off] of arms) {
+      if (value === undefined) {
+        delete knobEnv.ENABLE_PASSWORD_SIGNIN_FORM;
+      } else {
+        knobEnv.ENABLE_PASSWORD_SIGNIN_FORM = value;
+      }
+      try {
+        const res = await request("/login", form({ user_name: alice.username, password: pw }));
+        expect(res.status, `ENABLE_PASSWORD_SIGNIN_FORM=${String(value)}`).toBe(off ? 403 : 303);
+      } finally {
+        delete knobEnv.ENABLE_PASSWORD_SIGNIN_FORM;
+      }
+    }
+  });
+});
+
 describe("POST /login — the shared per-IP limiter blocks (§2.2 step 1, §4.7)", () => {
   it("answers 429 + Retry-After in the gate's plain-text shape once the window budget is spent", async () => {
     const ip = "10.2.2.2";

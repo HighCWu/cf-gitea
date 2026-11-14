@@ -147,6 +147,7 @@ import {
 } from "../auth/middleware";
 import { userSignInPassword } from "../auth/password-auth";
 import { generateUserTimeLimitCode, verifyUserTimeLimitCode } from "../auth/reset-code";
+import { enablePasswordSignInForm } from "../api/config";
 import { applyPasswordReset } from "../services/user-accounts";
 import {
   enqueueResetPasswordMail,
@@ -1238,6 +1239,11 @@ async function loginPage(c: RouteContext): Promise<Response> {
     adminInit: (await initWindowOpen(c.env.DB)) ? { open: true, error: null } : undefined,
     signUpLink: allowSignup(c.env),
     oauth2Sources: oauth2LoginSourceButtons(activeSources),
+    // Census B-87: `[service] ENABLE_PASSWORD_SIGNIN_FORM` (service.go:180,
+    // default true) gates the sign-in form on the GET arm too — off renders
+    // signin_inner.tmpl:13-49's shape (the whole <form> + the forgot-password
+    // link gone, external buttons stay without the divider).
+    enablePasswordSignInForm: enablePasswordSignInForm(c.env),
   });
   if (setCookie === null) return c.html(html, 200);
   return c.html(html, 200, { "set-cookie": setCookie });
@@ -1258,7 +1264,19 @@ async function renderLoginFailure(
     return assembled.response;
   }
   await recorded.catch(() => {});
-  return c.html(renderLoginPage({ ctx: assembled.ctx, redirectTo, error }), 200);
+  // The failure re-render threads the form gate like the GET arm (census
+  // B-87): with the knob off this render is unreachable from POST /login
+  // (the 403 below answers first), but the shape parity keeps every
+  // renderLoginPage call site resolving the same reader.
+  return c.html(
+    renderLoginPage({
+      ctx: assembled.ctx,
+      redirectTo,
+      error,
+      enablePasswordSignInForm: enablePasswordSignInForm(c.env),
+    }),
+    200,
+  );
 }
 
 /** POST /login (§2.2) — rate-limit first, verify the PAT, capability-gate
@@ -1272,6 +1290,24 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // §2.8 layer 2 — the login POST is a non-GET UI route.
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
+
+  // Census B-87 — the ENABLE_PASSWORD_SIGNIN_FORM POST gate (auth.go:293-295,
+  // SignInPost's FIRST statement: `if !setting.Service.EnablePasswordSignInForm
+  // { ctx.HTTPError(http.StatusForbidden) }`). Upstream's ctx.HTTPError is
+  // base.go:105-113 → Go http.Error: a PLAIN-TEXT "Forbidden\n" body with
+  // text/plain + X-Content-Type-Options: nosniff — not an HTML error page.
+  // The house's plain-403 header convention (the CSRF gate's
+  // crossOriginRejected) carries the same pair. The gate precedes the
+  // limiter: a request the server refuses outright records no failure
+  // (upstream never reaches its own limiter either). The GET arm hides the
+  // form (loginPage above), so a browser cannot produce this POST normally;
+  // the arm closes the direct POST.
+  if (!enablePasswordSignInForm(c.env)) {
+    return new Response("Forbidden\n", {
+      status: 403,
+      headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+    });
+  }
 
   const now = new Date();
   const ip = clientIp(c.req.raw);
@@ -1304,7 +1340,8 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // counts one limiter failure. The PAT-as-password behavior is REMOVED:
   // upstream never accepted a token in the password field (SPEC-0010
   // §2.2's interim posture is superseded). The EnablePasswordSignInForm
-  // gate (default TRUE, service.go:180) has no knob until Phase C.
+  // gate (default TRUE, service.go:180) landed with census B-87 — its 403
+  // arm answers above, before this ladder runs.
   if (form.userName === null || form.userName.trim() === "" || form.password === null || form.password === "") {
     return invalid();
   }
