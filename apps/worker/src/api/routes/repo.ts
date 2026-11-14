@@ -904,7 +904,12 @@ export function registerRepoRoutes(
       registry: c.env.REGISTRY.getByName("registry"),
       queue: c.env.REPO_TASKS,
       tombstone: (engineName) => tombstoneRepoDO(c.env, engineName),
-    }).deleteRepository(found.repo.id);
+    }).deleteRepository(found.repo.id, {
+      // AUDIT-REC's handoff (B-75): the doer-attributed RepositoryDelete row
+      // (org.go:528's ctx threading — the bulk arm's shape).
+      actor: { id: c.get("authUser")?.id ?? 0, name: c.get("authUser")?.login ?? "Unknown" },
+      origin: "api",
+    });
     // Webhook: repository deleted (upstream DeleteRepository,
     // notifier.go:126-127). DEVIATION (documented): upstream triggers BEFORE
     // its cascade ("we need to trigger them before deleting it…",

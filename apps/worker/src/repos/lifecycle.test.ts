@@ -21,6 +21,7 @@ import { loadRepoSettings, saveRepoSettings } from "../api/services/repo-setting
 import {
   RepoNameCollisionError,
   RepoNameInvalidError,
+  RepoNotExistError,
   RepoService,
   isReservedOwnerName,
   isUsableRepoName,
@@ -35,6 +36,7 @@ import { createWikiPage, readWikiPage } from "../services/wiki";
 import { starRepo } from "../api/services/stars";
 import { watchRepo } from "../api/services/repo-watchers";
 import { addOrUpdateCollaborator } from "../api/services/repo-collaborators";
+import { findAuditEvents } from "../services/audit";
 import { CommentType } from "../issues/comment-types";
 import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "./testing/git-pack";
 
@@ -51,7 +53,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_settings", "repo_transfer", "repo_redirects", "repo_counters", "stars", "repositories"]) {
+  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_settings", "repo_transfer", "repo_redirects", "repo_counters", "stars", "repositories", "audit_event"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users WHERE username_lower != 'assets'").run();
@@ -1043,6 +1045,51 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     const write = await SELF.fetch("https://example.com/alice/vanishing.git/info/refs?service=git-receive-pack");
     expect(write.status).toBe(401);
     expect(write.headers.get("www-authenticate")).toBe('Basic realm="Gitea"'); // the OAuth2-enabled realm (SPEC oauth2-provider §2.11 flip)
+  });
+
+  it("records the repository:delete audit row in the cascade batch (repository.go:75 — B-75's residue): the attributed shape, the nil-context Unknown shape, and no row for a miss", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const svc = service();
+    const audited = await createRepo({ id: alice.id, usernameLower: "alice" }, "audited");
+    await svc.deleteRepository(audited.id, { actor: { id: alice.id, name: "alice" }, origin: "api" });
+
+    // The row commits with the cascade (the create arm's in-batch shape):
+    // action + rendered message, the doer as actor, the repo as scope.
+    const attributed = await findAuditEvents(drizzle(env.DB), { action: "repository:delete" });
+    expect(attributed).toHaveLength(1);
+    expect(attributed[0]).toMatchObject({
+      action: "repository:delete",
+      actorId: alice.id,
+      actorName: "alice",
+      scopeType: "repository",
+      scopeId: audited.id,
+      scopeName: "alice/audited",
+      origin: "api",
+      message: "Deleted repository alice/audited.",
+    });
+
+    // A caller outside a request (the purge-consumer retries, the demo
+    // sweep) omits the audit context — upstream's nil-context posture
+    // verbatim: actorRef(nil) records id 0 named "Unknown" rather than
+    // dropping the event (refs.go:22-29), getOrigin defaults "system"
+    // (event.go:93-96).
+    const unthreaded = await createRepo({ id: alice.id, usernameLower: "alice" }, "unthreaded");
+    await svc.deleteRepository(unthreaded.id);
+    const rows = await findAuditEvents(drizzle(env.DB), { action: "repository:delete" });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      actorId: 0,
+      actorName: "Unknown",
+      scopeId: unthreaded.id,
+      scopeName: "alice/unthreaded",
+      origin: "system",
+    });
+
+    // A failed delete never emits: the RepoNotExistError throws before the
+    // batch, and the batch's own failure would roll the audit row back with
+    // it (§4.2's atomicity) — count unchanged.
+    await expect(svc.deleteRepository("no-such-repo")).rejects.toBeInstanceOf(RepoNotExistError);
+    expect(await findAuditEvents(drizzle(env.DB), { action: "repository:delete" })).toHaveLength(2);
   });
 });
 

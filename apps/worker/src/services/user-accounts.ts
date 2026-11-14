@@ -345,6 +345,37 @@ export async function initializeAdminUser(
     // read — same statement-then-read serialization), but never assume.
     return { outcome: "already-initialized" };
   }
+  // B-73's residue — install.go:479's audit row: upstream records
+  // `audit.RecordAs(ctx, adminUser, UserCreate, adminUser)` between the
+  // CreateUser success and the auto-login token mint (:479 sits before
+  // CreateAuthTokenForUserID :481). Ours runs at the SAME point — after the
+  // guarded insert wins, before the caller's session mint — with the admin
+  // as BOTH actor and scope (RecordAs's explicit-actor shape: the install
+  // request has no signed-in doer to attribute; upstream names the created
+  // admin itself). The emitted-only-on-the-winner property is structural:
+  // the race loser and the invalid forms return above this line. Origin
+  // "ui" (the first-run install page is a web surface) and ipAddress null —
+  // this seam has no request thread to read the client address from
+  // (upstream reads it off SetRequestInfo's published request info). The
+  // failure posture is upstream's writeEvent (event.go:129-133): a failed
+  // audit INSERT logs and never errorizes the successful create.
+  const { AuditActions, emitAudit } = await import("./audit");
+  try {
+    await emitAudit(drizzle(d1), {
+      action: AuditActions.UserCreate,
+      actorId: user.id,
+      actorName: user.username,
+      scopeType: "user",
+      scopeId: user.id,
+      scopeName: user.username,
+      origin: "ui",
+      ipAddress: null,
+      vars: { scope: user.username },
+      timestamp: now,
+    });
+  } catch (error) {
+    console.error(`install-admin: audit row failed: ${String(error)}`);
+  }
   return { outcome: "created", user };
 }
 

@@ -20,6 +20,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../../db/schema";
+import { AuditActions, findAuditEvents } from "../../services/audit";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -116,6 +117,7 @@ beforeEach(async () => {
     "repo_units",
     "repo_transfer",
     "repo_redirects",
+    "audit_event",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
@@ -238,6 +240,37 @@ describe("DELETE /orgs/{org}/repos (orgDeleteRepos)", () => {
     expect(res.status).toBe(202);
     const after = await drizzle(env.DB).select().from(repositories).all();
     expect(after.map((row) => row.id)).toEqual(["9603"]);
+  });
+
+  it("records a repository:delete audit row per swept repo with the org-owner actor (org.go:528's doer through repository.go:75 — B-75's residue)", async () => {
+    const { owner, org } = await seedActors();
+    await seedOrgRepo("9604", "audited-a", org);
+    await seedOrgRepo("9605", "audited-b", org);
+
+    const res = await router()(`/orgs/${org.username}/repos`, { method: "DELETE", headers: authHeaders(owner.id) });
+    expect(res.status).toBe(202);
+
+    // One row per swept repo (the per-repo loop's DeleteRepository carries
+    // the request doer upstream — org.go:528 — whose audit row names it).
+    // The harness contract identity carries `login` only, so the actor name
+    // rides the canonical username fallback; origin "api" (the bulk arm IS
+    // an api surface — upstream SetRequestInfo's origin leg).
+    const rows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.RepositoryDelete });
+    expect(rows.map((row) => row.scopeName).sort()).toEqual(["acme/audited-a", "acme/audited-b"]);
+    for (const row of rows) {
+      expect(row.actorId).toBe(owner.id);
+      expect(row.actorName).toBe("org-owner");
+      expect(row.scopeType).toBe("repository");
+      expect(row.origin).toBe("api");
+      expect(row.message).toBe(`Deleted repository ${row.scopeName}.`);
+    }
+  });
+
+  it("the empty-org 204 records no audit row (nothing was deleted)", async () => {
+    const { owner, org } = await seedActors();
+    const res = await router()(`/orgs/${org.username}/repos`, { method: "DELETE", headers: authHeaders(owner.id) });
+    expect(res.status).toBe(204);
+    expect(await findAuditEvents(drizzle(env.DB), { action: AuditActions.RepositoryDelete })).toHaveLength(0);
   });
 
   it("403s a plain member and an outsider with the upstream message; 404s an unknown org", async () => {

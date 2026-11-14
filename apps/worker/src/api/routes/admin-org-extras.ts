@@ -272,6 +272,16 @@ export function registerAdminOrgExtrasRoutes(
       return c.body(null, 204);
     }
 
+    // The audit actor (B-75's residue): upstream passes the REQUEST DOER into
+    // every per-repo DeleteRepository (org.go:528 `DeleteRepository(ctx,
+    // doer, repo, true)`), whose audit row names that doer
+    // (repository.go:75). Snapshot the identity before the detached loop —
+    // the contract identity always carries the row-truth username
+    // (api/services/user.ts's canonical conversion), the `??` arm is only
+    // reachable for hand-built literals.
+    const authUser = c.get("authUser");
+    const auditActor = { id: doer.id, name: authUser.username ?? authUser.login ?? "" };
+
     const deleteAll = (async () => {
       for (const repoId of repoIds) {
         try {
@@ -291,7 +301,7 @@ export function registerAdminOrgExtrasRoutes(
             registry: c.env.REGISTRY.getByName("registry"),
             queue: c.env.REPO_TASKS,
             tombstone: (engineName) => tombstoneRepoDO(c.env, engineName),
-          }).deleteRepository(found.repo.id);
+          }).deleteRepository(found.repo.id, { actor: auditActor, origin: "api" });
           const identity = repositoryEventIdentity(viewerOf(c), found);
           await emitRepoEvent(c, {
             repoId: found.repo.id,

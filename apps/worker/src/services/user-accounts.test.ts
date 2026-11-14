@@ -19,10 +19,12 @@
  * each test re-applies the schema before seeding.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:test";
+import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { AuditActions, findAuditEvents } from "./audit";
 import { deleteUserCascade, initWindowOpen, initializeAdminUser } from "./user-accounts";
 
 async function seedActorPair(): Promise<{ actorId: number; receiverId: number }> {
@@ -165,5 +167,58 @@ describe("the admin-init window counts HUMANS only (act_runner smoke 2026-10-30,
     // resurrected /install here; the identity-of-origin predicate does not.
     await env.DB.prepare("UPDATE users SET status = 'prohibited' WHERE username_lower = 'root'").run();
     expect(await initWindowOpen(env.DB)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// B-73's residue — install.go:479's audit row. Upstream initAdminUser records
+// `audit.RecordAs(ctx, adminUser, UserCreate, adminUser)` between the CreateUser
+// success and the auto-login mint; ours runs at the same point (the created
+// verdict, before the caller's session). The loser arms emit nothing.
+// ---------------------------------------------------------------------------------
+
+describe("initializeAdminUser's audit row (install.go:479 — B-73's residue)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run();
+  });
+
+  it("the created arm records the user:create row — the admin as BOTH actor and scope, origin ui", async () => {
+    await seedSystemPremise();
+    const result = await initializeAdminUser(env.DB, ADMIN_FORM);
+    expect(result.outcome).toBe("created");
+
+    const rows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserCreate });
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.actorId).toBe(result.outcome === "created" ? result.user.id : -1);
+    expect(row.actorName).toBe("Root");
+    expect(row.scopeType).toBe("user");
+    expect(row.scopeId).toBe(String(result.outcome === "created" ? result.user.id : -1));
+    expect(row.scopeName).toBe("Root");
+    expect(row.origin).toBe("ui");
+    expect(row.message).toBe("Created user Root.");
+  });
+
+  it("the race loser (already-initialized) records nothing — only the winner's create emits", async () => {
+    await seedSystemPremise();
+    const first = await initializeAdminUser(env.DB, ADMIN_FORM);
+    expect(first.outcome).toBe("created");
+    expect(await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserCreate })).toHaveLength(1);
+
+    const second = await initializeAdminUser(env.DB, {
+      username: "Second",
+      email: "second@example.com",
+      password: "x",
+      retype: "x",
+    });
+    expect(second.outcome).toBe("already-initialized");
+    expect(await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserCreate })).toHaveLength(1);
+  });
+
+  it("an invalid form records nothing (the verdict returns before any insert)", async () => {
+    await seedSystemPremise();
+    const invalid = await initializeAdminUser(env.DB, { username: "", email: "x@example.com", password: "p", retype: "p" });
+    expect(invalid.outcome).toBe("invalid");
+    expect(await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserCreate })).toHaveLength(0);
   });
 });

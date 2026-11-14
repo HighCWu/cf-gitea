@@ -1080,11 +1080,28 @@ export class RepoService {
    * destroy, deriving each name's `.wiki` sibling itself (src/repos/purge.ts),
    * so the message shape stays `{storageKey, engineNames}`.
    *
+   * The audit row (B-75's residue): upstream `DeleteRepository` closes with
+   * `audit.Record(ctx, audit_model.RepositoryDelete, repo)` AFTER the cascade
+   * succeeds (services/repository/repository.go:75 — success-only semantics).
+   * Ours rides the delete batch itself, so a failed cascade rolls the audit
+   * row back with it — the same "the event exists iff the write did" shape
+   * the create arm's in-batch emit gives (§4.2). Attribution comes from the
+   * optional `auditCtx`: request-backed callers pass the doer + origin
+   * (upstream's signed-in user + SetRequestInfo origin); a caller outside a
+   * request (the purge-consumer retries, the demo sweep) omits it and the row
+   * records upstream's nil-context shape exactly — actor 0 named "Unknown"
+   * (refs.go:22-29: "record the event with an 'Unknown' actor rather than
+   * dropping it", with the log line so the unthreaded entry point stays
+   * visible) and origin "system" (getOrigin's default, event.go:93-96).
+   *
    * Returns the engine names the repo was known by (current + redirected), so
    * the purge consumer tombstones and destroys every cell the repo ever
    * lived in; R2 itself is reached through the single immutable storage_key.
    */
-  async deleteRepository(repoId: string): Promise<{ engineNames: string[] }> {
+  async deleteRepository(
+    repoId: string,
+    auditCtx: { actor?: { id: number; name: string }; origin?: AuditOrigin } = {},
+  ): Promise<{ engineNames: string[] }> {
     const repo = await this.get(repoId);
     if (repo === null) throw new RepoNotExistError(repoId);
     const current = engineName(repo.ownerNamespace, repo.slug);
@@ -1274,6 +1291,22 @@ export class RepoService {
       // The row is gone: git requests miss at repo resolution; the §4.1 race
       // logic makes a concurrent push-create re-create a FRESH row/key (§4.8).
       this.db.delete(repositories).where(eq(repositories.id, repoId)),
+      // B-75's residue — repository.go:75's audit row, riding the cascade
+      // batch (the create arm's slice-one shape): scope_id is the client
+      // UUID and the full name is already resolved above, so the row is
+      // fully attributed in-statement. Unthreaded callers record the
+      // upstream nil-context shape (the docstring's refs.go/event.go cites).
+      auditEventInsert(this.db, {
+        action: AuditActions.RepositoryDelete,
+        actorId: auditCtx.actor?.id ?? 0,
+        actorName: auditCtx.actor?.name ?? "Unknown",
+        scopeType: "repository",
+        scopeId: repoId,
+        scopeName: `${repo.ownerNamespace}/${repo.slug}`,
+        origin: auditCtx.origin ?? "system",
+        vars: { scope: `${repo.ownerNamespace}/${repo.slug}` },
+        metadata: { status: repo.status },
+      }),
     ] satisfies BatchStatements);
 
     // Step 2: DO tombstone (markDeleted RPC) — refuses new receive leases and
