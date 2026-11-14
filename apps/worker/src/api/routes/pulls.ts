@@ -1083,6 +1083,10 @@ export function registerPullRoutes(
           allowMaintainerEdit: form.allow_maintainer_edit ?? true, // DefaultAllowMaintainerEdit (repo_unit default)
           headSha: headTip.oid,
           mergeBase: mergeBaseOid,
+          // The xref scan's AppURL (B-46): the request origin rewrites
+          // AppURL-prefixed full URLs into short refs (references.go:330-339)
+          // — PR create shares NewIssueWithIndex's AddCrossReferences tail.
+          appUrl: new URL(c.req.url).origin,
         }));
       } catch (error) {
         // The create route's milestone miss renders the BARE 404
@@ -1349,8 +1353,10 @@ export function registerPullRoutes(
         const oldTitle = issue.title;
         // The IssuesService fold carries the IssueChangeTitle mail receiver
         // (services/mailer/notify.go:80-90 — upstream fires it from
-        // ChangeTitle, issue.go:127).
-        const updated = await service.changeTitle(issue, title, actorId, now);
+        // ChangeTitle, issue.go:127). The xref scan's AppURL rides the
+        // request origin (B-46 — the ChangeIssueTitle tail,
+        // models/issues/issue_update.go:217).
+        const updated = await service.changeTitle(issue, title, actorId, now, new URL(c.req.url).origin);
         if (updated !== null) {
           issue = updated;
         }
@@ -1374,7 +1380,9 @@ export function registerPullRoutes(
       const body = patchField(form.body);
       if (body !== undefined && body !== (issue.content ?? "")) {
         const oldContent = issue.content ?? "";
-        const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now, actorId);
+        // The xref scan's AppURL rides the request origin (B-46 — the
+        // ChangeIssueContent tail, models/issues/issue_update.go:345).
+        const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now, actorId, new URL(c.req.url).origin);
         if (updated === null) {
           // Lost the concurrent CAS race — upstream ErrIssueAlreadyChanged.
           throw new ApiError(409, "the issue is already changed");

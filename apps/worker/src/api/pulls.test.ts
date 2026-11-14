@@ -14,7 +14,10 @@
  * precondition + content_version CAS 409, the base/head column lookup, and
  * the webhook triggers (pull_request opened/edited/closed/reopened via
  * emitWebhookDeliveries — rows land inline, the Queue enqueue is the
- * executionCtx-guarded no-op under app.request).
+ * executionCtx-guarded no-op under app.request). The xref scan's AppURL
+ * threading (B-46): the request origin rides the PR create/title/body arms,
+ * so a full-URL cross-repo reference in a PR body/title writes the xref row
+ * (upstream's non-nil AppURL arm — short refs scanned before, full URLs not).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -25,7 +28,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
 import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, PRStatus, pullRequests, pullReviews, repoCounters, repoSettings, repositories, ReviewType, teamMembers, teamRepoAccess, teams, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
-import { CommentType } from "../issues/comment-types";
+import { CommentType, RefAction } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, pullHeadRef, refTipMap } from "./services/engine";
 import { prefetchPullRequestRenderContext, pullRequestCodeOwnersReview, toApiPullRequest } from "./services/pulls";
@@ -1962,5 +1965,71 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     expect(batched.find((p) => p.title === "head team")?.head?.repo?.permissions?.push).toBe(true);
     expect(batched.find((p) => p.title === "head hidden")?.head?.repo_id).toBe(-1);
     expect(batched.find((p) => p.title === "head ghost")?.head?.repo).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The xref scan's AppURL (B-46) — the request origin threads the PR surface's
+// create/title/body arms exactly as routes/issues.ts does since 284c47b. A
+// full-URL cross-repo reference in a PR body/title now writes the xref row
+// (upstream's non-nil AppURL arm, references.go:330-339); the service-layer
+// callers without a threaded origin keep the nil-pattern arm (short refs
+// only) — that arm is pinned in services/xref.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("the xref scan's AppURL — the request origin threads the PR arms (B-46)", () => {
+  /** Every xref comment row ON an issue (the referenced side). */
+  async function xrefRowsOn(issueId: number) {
+    const rows = await db().select().from(comments).where(eq(comments.issueId, issueId)).all();
+    return rows.sort((a, b) => a.id - b.id);
+  }
+
+  it("POST create scans a body full-URL reference through the request origin (the non-nil AppURL arm)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "xref-create");
+    const target = await seedIssue(repoId, "target");
+    await seedEngineBranches(owner.usernameLower, "xref-create", ["feature"]);
+
+    const res = await createPull("/repos/alice/xref-create/pulls", {
+      title: "origin",
+      body: `This is https://example.com/alice/xref-create/issues/${target.index}, foo`,
+      head: "feature",
+      base: "main",
+    });
+    expect(res.status).toBe(201);
+
+    // The origin issue behind the created PR (the 201 body's `id` is the
+    // pull_requests row id, not the issue id — resolve through the cache).
+    const pr = (await prRowByRepo(repoId))[0];
+    if (pr === undefined) throw new Error("created PR row missing");
+    const rows = (await xrefRowsOn(target.id)).filter((r) => r.refIssueId === pr.issueId);
+    expect(rows).toHaveLength(1);
+    // The origin is a PR, so the row ON the target is the type-6 pull_ref.
+    expect(rows[0]?.type).toBe(CommentType.PullRef);
+    expect(rows[0]?.refAction).toBe(RefAction.None);
+  });
+
+  it("PATCH title and body scan through the same origin, with removeOld (the edit neuter)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "xref-edit");
+    const t1 = await seedIssue(repoId, "t1");
+    const t2 = await seedIssue(repoId, "t2");
+    // The stub identity (id 1) is the poster, so it may edit.
+    const pr = await seedPull(repoId, "origin", { posterId: 1 });
+
+    const titleRes = await patchPull(`/repos/alice/xref-edit/pulls/${pr.index}`, {
+      title: `About https://example.com/alice/xref-edit/issues/${t1.index}`,
+    });
+    expect(titleRes.status).toBe(201);
+    expect((await xrefRowsOn(t1.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
+
+    const bodyRes = await patchPull(`/repos/alice/xref-edit/pulls/${pr.index}`, {
+      body: `and https://example.com/alice/xref-edit/issues/${t2.index}`,
+    });
+    expect(bodyRes.status).toBe(201);
+    // The title reference survives the body edit (kept, not duplicated) and
+    // the body's full-URL reference lands through the same origin.
+    expect((await xrefRowsOn(t1.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
+    expect((await xrefRowsOn(t2.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
   });
 });
