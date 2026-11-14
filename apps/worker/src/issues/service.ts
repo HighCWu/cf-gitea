@@ -64,6 +64,7 @@ import {
 import { newIssueUserSeedRows, updateIssueMentions } from "../services/mentions/carrier";
 import { getRepoAssignees } from "../services/mentions/repo-assignees";
 import { findIssueMentions } from "../services/mentions/service";
+import { syncIssueCrossReferences } from "../api/services/xref";
 
 export type IssueRow = typeof issues.$inferSelect;
 export type CommentRow = typeof comments.$inferSelect;
@@ -163,6 +164,14 @@ export interface CreateIssueInput {
   ownerOrgId?: number | null;
   /** Branch reference for close-via-commit gating (§4.6). */
   ref?: string | null;
+  /**
+   * The instance AppURL for the cross-reference scan (B-46): the
+   * `giteaIssuePullPattern` base that rewrites AppURL-prefixed full URLs into
+   * `owner/repo#N` short refs (references.go:186-190). Route callers thread
+   * the request origin; callers without one get upstream's nil-pattern arm
+   * (references.go:333-337) — short refs still scan.
+   */
+  appUrl?: string;
   now?: Date;
 }
 
@@ -391,6 +400,18 @@ export class IssuesService {
     if (rows[0] === undefined) {
       throw new Error("issue creation batch committed without returning rows");
     }
+    // NewIssueWithIndex's tail (models/issues/issue_update.go:449):
+    // AddCrossReferences(doer, removeOld=false) — the xref writer lane, B-46.
+    // Upstream runs it INSIDE the create tx before the notify fires; the
+    // landed create is not one transaction (the documented committed-prefix
+    // posture), so the scan runs right after the batch, ahead of the notify.
+    await syncIssueCrossReferences(this.d1, {
+      origin: rows[0],
+      doerId: input.posterId ?? null,
+      removeOld: false,
+      appUrl: input.appUrl ?? "",
+      now: input.now ?? new Date(),
+    });
     await this.notifyMailNewIssue(rows[0], input.now ?? new Date());
     return rows[0];
   }
@@ -432,6 +453,17 @@ export class IssuesService {
     if (issue === undefined || pullRequest === undefined) {
       throw new Error("issue/PR creation batch committed without returning rows");
     }
+    // PR creation SHARES the NewIssueWithIndex arm (models/issues/pull.go:478
+    // NewPullRequest → NewIssueWithIndex → AddCrossReferences) — same shape
+    // and posture as the createIssue tail above, but the row type is
+    // CommentTypePullRef (6) because the origin is a PR.
+    await syncIssueCrossReferences(this.d1, {
+      origin: issue,
+      doerId: input.posterId ?? null,
+      removeOld: false,
+      appUrl: input.appUrl ?? "",
+      now: input.now ?? new Date(),
+    });
     await this.notifyMailNewPullRequest(issue, input.now ?? new Date());
     return { issue, pullRequest };
   }
@@ -736,9 +768,9 @@ export class IssuesService {
    * receiver's WIP-transition gate keys on the pair (notifyIssueTitleChanged).
    * Best-effort — the write above stays committed.
    */
-  async changeTitle(issue: IssueRow, title: string, actorId: number | null, now: Date): Promise<IssueRow | null> {
+  async changeTitle(issue: IssueRow, title: string, actorId: number | null, now: Date, appUrl = ""): Promise<IssueRow | null> {
     const oldTitle = issue.title;
-    const updated = await changeIssueTitle(this.d1, issue, title, actorId, now);
+    const updated = await changeIssueTitle(this.d1, issue, title, actorId, now, appUrl);
     if (updated !== null) await this.notifyMailTitleChanged(updated, oldTitle, actorId, now);
     return updated;
   }

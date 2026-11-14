@@ -46,6 +46,7 @@ import { findCollaborator } from "./repo-collaborators";
 import { pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
+import { syncIssueCrossReferences } from "./xref";
 import {
   addIssueToColumn,
   cardTypeToString,
@@ -1315,13 +1316,17 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
  * humanized time bodies + tracked_time (types 13/14 — see
  * trackedTimeOfComment) and the type-19/20 dependent_issue
  * (LoadDepIssueDetails → ToAPIIssue). Deferred metadata renders the Go zero
- * exactly like upstream's empty columns: the review/resolve_doer arms and
- * the xref issue enrichment (the xref writers land with the push pipeline).
+ * exactly like upstream's empty columns: the review/resolve_doer arms. The
+ * xref enrichment LANDED with the xref writers (B-46): `ref_issue` is the
+ * full ToAPIIssue render of the referring issue (RefIssueID != 0,
+ * services/convert/issue_comment.go:130-137) and `ref_comment` the
+ * ToAPIComment render of the referring comment (RefCommentID != 0,
+ * :139-151 — rendered against THIS timeline's repo, upstream's `repo` arg).
  *
  * THE DEGENERATE ARMS DROP THE ROW (ledger ⑬-#16, services/convert/
  * issue_comment.go:34-68): upstream's per-type loads ERROR on a dangling
  * reference and ToTimelineComment answers `return nil` — the row leaves no
- * metadata render behind. Four arms error upstream and drop here:
+ * metadata render behind. Six arms error upstream and drop here:
  *   - the assignee user row missing (LoadAssigneeUserAndTeam →
  *     GetPossibleUserByID ErrUserNotExist, :37-40);
  *   - the assignee team row missing (the same load's team leg →
@@ -1330,7 +1335,13 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
  *     (LoadDepIssueDetails → GetIssueByID error, :44-47; the pair is
  *     FK-coupled to the issue, so both collapse to one arm);
  *   - the expected tracked-time entry absent (LoadTime → GetTrackedTimeByID
- *     error, :53-56 — see trackedTimeOfComment's `missing`).
+ *     error, :53-56 — see trackedTimeOfComment's `missing`);
+ *   - the referring issue row (or its repo pair) unresolvable
+ *     (GetIssueByID(RefIssueID) error, :131-135 — the pair collapses into
+ *     the same arm: upstream's ToAPIIssue would answer the zero `&api.Issue{}`
+ *     on a LoadRepo error, a render our contract cannot emit);
+ *   - the referring comment row, its issue or its poster unresolvable
+ *     (GetCommentByID(RefCommentID) / LoadPoster errors, :140-149).
  * The silent-nil arms stay null METADATA renders, matching upstream's
  * `has → set, else log-and-continue` loads: a dangling milestone
  * (comment.go:619-638) or label (:575-588) renders null old_milestone/
@@ -1445,6 +1456,55 @@ export async function toTimelineComment(
     return null;
   }
 
+  // The xref enrichment arms (services/convert/issue_comment.go:130-151,
+  // landed with the B-46 writers): the referring issue's full ToAPIIssue
+  // render and the referring comment's ToAPIComment render (the latter
+  // against THIS timeline's repo, upstream's `repo` argument). A dangling
+  // row anywhere in either chain is the degenerate drop — return null.
+  let refIssue: Issue | null = null;
+  const refIssueId = comment.refIssueId ?? 0;
+  if (refIssueId > 0) {
+    const refIssueRow = await drizzle(d1)
+      .select()
+      .from(issues)
+      .where(eq(issues.id, refIssueId))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (refIssueRow === undefined) return null; // GetIssueByID error, :131-135
+    const refPair = await findRepositoryById(d1, refIssueRow.repoId);
+    if (refPair === null) return null; // the pair collapse (see the docstring)
+    refIssue = await toApiIssue(d1, viewer, refPair, refIssueRow);
+  }
+  let refComment: Comment | null = null;
+  const refCommentId = comment.refCommentId ?? 0;
+  if (refCommentId > 0) {
+    const refCommentRow = await drizzle(d1)
+      .select()
+      .from(comments)
+      .where(eq(comments.id, refCommentId))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (refCommentRow === undefined) return null; // GetCommentByID error, :140-144
+    if (refCommentRow.posterId === null) return null; // LoadPoster error, :145-147
+    const refPosterRow = await drizzle(d1)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, refCommentRow.posterId))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (refPosterRow === undefined) return null; // LoadPoster's ErrUserNotExist arm
+    const refIssueRow = await drizzle(d1)
+      .select()
+      .from(issues)
+      .where(eq(issues.id, refCommentRow.issueId))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (refIssueRow === undefined) return null; // the render needs the issue row
+    const refPair = await findRepositoryById(d1, refIssueRow.repoId);
+    if (refPair === null) return null;
+    refComment = await toApiComment(d1, viewer, pair, refIssueRow, refCommentRow);
+  }
+
   return {
     id: comment.id,
     type: COMMENT_TYPE_NAMES[comment.type] ?? "comment",
@@ -1464,8 +1524,8 @@ export async function toTimelineComment(
     new_title: comment.newTitle ?? "",
     old_ref: comment.oldRef ?? "",
     new_ref: comment.newRef ?? "",
-    ref_issue: null, // xref enrichment (RefIssueID join) lands with the xref writers
-    ref_comment: null,
+    ref_issue: refIssue,
+    ref_comment: refComment,
     ref_action: refActionName(comment.refAction),
     ref_commit_sha: comment.commitSha ?? "",
     review_id: comment.reviewId ?? 0,
@@ -2065,9 +2125,14 @@ type BatchStatement = Parameters<DrizzleD1Database["batch"]>[number][number];
 
 /**
  * `issue_service.ChangeTitle` — title update + `change_title` (10) comment +
- * the num_comments fold, one batch.
+ * the num_comments fold, one batch; then ChangeIssueTitle's tail
+ * (models/issues/issue_update.go:217) — AddCrossReferences(doer,
+ * removeOld=true) over the NEW title + the (unchanged) content, neutering
+ * stale references and writing fresh ones (the xref writer lane, B-46).
+ * `appUrl` threads the instance AppURL for the URL-rewrite arm ("" = the
+ * nil-pattern arm — see xref.ts's module header).
  */
-export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: string, actorId: number | null, now: Date): Promise<IssueRow | null> {
+export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: string, actorId: number | null, now: Date, appUrl = ""): Promise<IssueRow | null> {
   const oldTitle = issue.title;
   const results = await drizzle(d1).batch([
     drizzle(d1)
@@ -2090,7 +2155,17 @@ export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: s
       .set({ numComments: sql`num_comments + 1` })
       .where(eq(issues.id, issue.id)),
   ] as const);
-  return results[0][0] ?? null;
+  const updated = results[0][0] ?? null;
+  if (updated !== null) {
+    await syncIssueCrossReferences(d1, {
+      origin: updated,
+      doerId: actorId,
+      removeOld: true,
+      appUrl,
+      now,
+    });
+  }
+  return updated;
 }
 
 /**
@@ -2104,9 +2179,13 @@ export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: s
  * conditional-abort — history rows follow the successful update (upstream
  * keeps all four statements in one tx; the crash-window divergence is SPEC
  * §4). `actorId` attributes the edited revision (upstream doer.ID); omitted
- * → the issue poster (§5.1 of the SPEC, route threading follow-up).
+ * → the issue poster (§5.1 of the SPEC, route threading follow-up). After the
+ * write, ChangeIssueContent's tail (models/issues/issue_update.go:345) —
+ * AddCrossReferences(doer, removeOld=true) over the NEW content (+ the
+ * unchanged title), the xref writer lane (B-46). `appUrl` threads the
+ * instance AppURL for the URL-rewrite arm ("" = the nil-pattern arm).
  */
-export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: string, expectedVersion: number, now: Date, actorId?: number | null): Promise<IssueRow | null> {
+export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: string, expectedVersion: number, now: Date, actorId?: number | null, appUrl = ""): Promise<IssueRow | null> {
   const updated = await drizzle(d1)
     .update(issues)
     .set({ content: body, contentVersion: sql`content_version + 1`, updatedAt: now })
@@ -2130,6 +2209,13 @@ export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: str
     await insertIssueContentHistory(d1, issue.id, 0, { ...newRevision, isFirstCreated: false });
   }
   await keepLimitedIssueContentHistory(d1, issue.id, 0);
+  await syncIssueCrossReferences(d1, {
+    origin: row,
+    doerId: actorId ?? null,
+    removeOld: true,
+    appUrl,
+    now,
+  });
   return row;
 }
 

@@ -87,6 +87,7 @@ import {
 import { parseMilestoneDeadline } from "../services/milestones";
 import { pullRequestDiffShortStat } from "../services/pull-engine";
 import { toApiPullRequest } from "../services/pulls";
+import { isXRefCommentAccessible } from "../services/xref";
 import {
   apiUserFromRow,
   canViewRepositoryWithTeams,
@@ -1264,6 +1265,9 @@ export function registerIssueRoutes(
             canWrite && form.milestone !== undefined && form.milestone !== 0 ? form.milestone : null,
           labelIds: canWrite ? (form.labels ?? []) : [],
           ref: form.ref ?? "",
+          // The xref scan's AppURL (B-46): the request origin rewrites
+          // AppURL-prefixed full URLs into short refs (references.go:330-339).
+          appUrl: new URL(c.req.url).origin,
         });
       } catch (error) {
         asApiError(error);
@@ -1593,7 +1597,9 @@ export function registerIssueRoutes(
       // The IssuesService fold carries the IssueChangeTitle mail receiver
       // (services/mailer/notify.go:80-90 — upstream fires it from
       // ChangeTitle, issue.go:127).
-      const updated = await service.changeTitle(issue, title, actorId, now);
+      // The xref scan's AppURL rides the request origin (B-46 — the
+      // ChangeIssueTitle tail, models/issues/issue_update.go:217).
+      const updated = await service.changeTitle(issue, title, actorId, now, new URL(c.req.url).origin);
       if (updated !== null) {
         issue = updated;
       }
@@ -1639,7 +1645,9 @@ export function registerIssueRoutes(
         found.repo.ownerId,
       );
       const oldContent = issue.content ?? "";
-      const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now, actorId);
+      // The xref scan's AppURL rides the request origin (B-46 — the
+      // ChangeIssueContent tail, models/issues/issue_update.go:345).
+      const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now, actorId, new URL(c.req.url).origin);
       if (updated === null) {
         // Lost the concurrent CAS race — upstream ErrIssueAlreadyChanged.
         throw new ApiError(409, "the issue is already changed");
@@ -2061,9 +2069,17 @@ export function registerIssueRoutes(
     // shape is unchanged, and the per-row fallback stays intact for
     // omitted-preload callers.
     const timelineContext = await prefetchTimelineContext(c.env.DB, rows);
+    const candidates = rows.filter((comment) => comment.type !== CommentType.Code); // upstream drops code comments
+    // isXRefCommentAccessible (issue_comment.go:197-222): a cross-repo xref
+    // row whose ORIGIN repo is gone or unreadable by the viewer leaves the
+    // stream (landed with the B-46 writers — the rows exist now;
+    // services/xref.ts carries the derivation). The probe short-circuits for
+    // non-ref rows and same-repo rows, so only genuine cross-repo rows pay a
+    // read.
+    const accessible = await Promise.all(candidates.map((comment) => isXRefCommentAccessible(c.env.DB, viewer, comment, found.repo.id)));
     const converted = await Promise.all(
-      rows
-        .filter((comment) => comment.type !== CommentType.Code) // upstream drops code comments
+      candidates
+        .filter((_, i) => accessible[i])
         .map((comment) => toTimelineComment(c.env.DB, viewer, found, issue, comment, timelineContext)),
     );
     // The degenerate-arm drop (ledger ⑬-#16): a convert whose metadata load
