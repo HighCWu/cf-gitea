@@ -66,7 +66,7 @@ import { repoUnits, repositories, users } from "../db/schema";
 // visibility layer (SPEC-0007 §3.5 + SPEC-0005): one grant resolution
 // (org/team arms + the collaborator row), no drift.
 import { doerRepoAccessMode } from "../api/services/repository";
-import { requireSignInViewEnabled } from "../api/config";
+import { configuredPasswordHashAlgo, enableBasicAuthentication, requireSignInViewEnabled } from "../api/config";
 
 type RepositoryRow = typeof repositories.$inferSelect;
 
@@ -264,17 +264,46 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
       // THE BASIC PASSWORD ARM (SPEC-0002 §6.2 git-HTTPS row; upstream
       // services/auth/basic.go:135-161 runs in the git routes' auth chain):
       // the token arms missed + HTTP Basic carried (username, password) +
-      // EnableBasicAuth (default TRUE, no knob until Phase C) → the full
-      // password sign-in, WebAuthn-enrolled hard-reject folded into the
-      // generic failure (identity never establishes → the challenge,
-      // githttp.go:146-159's !IsSigned arm), TOTP passcode consumed
-      // atomically from X-Gitea-OTP. Every miss → the same 401 challenge.
+      // EnableBasicAuth → the full password sign-in, WebAuthn-enrolled
+      // hard-reject folded into the generic failure (identity never
+      // establishes → the challenge, githttp.go:146-159's !IsSigned arm),
+      // TOTP passcode consumed atomically from X-Gitea-OTP. Every miss →
+      // the same 401 challenge.
       if (parsed?.basicAuth !== undefined && parsed?.basicAuth !== null) {
+        // THE KNOB (basic.go:139-141, census B-87 — the same gate the API
+        // chain's Basic arm carries): with EnableBasicAuth OFF the password
+        // method is NOT APPLICABLE — `return nil, nil`, the chain ends
+        // UNSIGNED and the request proceeds ANONYMOUS (the matrix's row-1
+        // decide: a public read serves, a protected route answers its own
+        // challenge). NEVER the failed-credential challenge here: upstream
+        // never tests the pair, so the failure limiter is not touched
+        // either. Basic-carried TOKENS verified above and stay unaffected
+        // (the gate sits AFTER the access-token arm, mirroring the API
+        // chain's ordering).
+        if (!enableBasicAuthentication(env)) {
+          return decide(
+            op,
+            repo,
+            owner,
+            input.ownerVisibility,
+            input.unitAnonymousRead,
+            null,
+            null,
+            "none",
+            oauth2FeatureEnabled(env),
+            requireSignInViewEnabled(env),
+          );
+        }
+        // Census B-87: the sign-in ladder reads the deploy config exactly
+        // like upstream — the configured PASSWORD_HASH_ALGO drives the
+        // rehash-on-login's comparison AND rewrite target; unset stays the
+        // landed pbkdf2 default.
         const outcome = await basicPasswordArm(
           env.DB,
           parsed.basicAuth,
           req.headers.get("X-Gitea-OTP") ?? "",
           now,
+          { configuredHashSpec: configuredPasswordHashAlgo(env).specification },
         );
         if (outcome.kind === "ok") {
           input.waitUntil(limiterResetFailOpen(limiter, ip));

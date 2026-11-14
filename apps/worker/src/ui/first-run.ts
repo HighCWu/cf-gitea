@@ -61,7 +61,7 @@ import {
   signUpLocale,
 } from "./pages/first-run";
 import { loginFirstRunLocale, oauth2LoginSourceButtons } from "./pages/login";
-import { enablePasswordSignInForm } from "../api/config";
+import { configuredPasswordHashAlgo, enablePasswordSignInForm } from "../api/config";
 import { listActiveOAuth2Sources } from "../services/auth-sources/store";
 import { demoModeEnabled } from "../services/demo-sweep";
 import {
@@ -233,7 +233,15 @@ async function installSubmit(c: RouteContext): Promise<Response> {
     password: fields.admin_passwd,
     retype: fields.admin_passwd,
   };
-  const result = await initializeAdminUser(c.env.DB, form);
+  // Census B-87: the install arm reads the deploy config exactly like
+  // upstream (security.go:175 — SetPassword runs under the loaded settings
+  // at install.go's CreateUser prepare) — the configured PASSWORD_HASH_ALGO
+  // is the bootstrap admin's hash target; unset stays the landed pbkdf2
+  // default. No policy option: upstream's install arm validates only
+  // non-empty + match (user.go:783-794 — the service arm's recorded shape).
+  const result = await initializeAdminUser(c.env.DB, form, {
+    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+  });
 
   if (result.outcome === "created") {
     // The auto-login (install.go:479–490 parity): the winner's browser

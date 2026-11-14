@@ -12059,10 +12059,12 @@ async function userSettingsAccountPasswordSubmit(c: Context<{ Bindings: Env }>):
   // Census B-87: the ladder reads the deploy config (upstream's
   // update.go:256-264 reads the settings at the same arm) — an ARMED
   // MIN_PASSWORD_LENGTH/PASSWORD_COMPLEXITY/PASSWORD_CHECK_PWN gates here
-  // too; unset stays upstream's default (the pwned fetch rides the runtime
-  // global, only tests inject one).
+  // too, and the configured PASSWORD_HASH_ALGO is SetPassword's target
+  // (security.go:175); unset stays upstream's default (the pwned fetch
+  // rides the runtime global, only tests inject one).
   const outcome = await changeOwnPassword(c.env.DB, p.viewer.id, form, {
     policy: resolvePasswordPolicy(c.env),
+    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
   });
   if (outcome.outcome === "changed") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/account" } }));
@@ -12118,13 +12120,17 @@ async function userSettingsChangePasswordSubmit(c: Context<{ Bindings: Env }>): 
   const params = await readUrlEncodedForm(c.req.raw);
   // Census B-87: the shared UpdateAuth arm reads the deploy config exactly
   // like upstream (update.go:256-264) — the resolved policy gates the
-  // ladder (unset stays upstream's default).
+  // ladder and the configured PASSWORD_HASH_ALGO is SetPassword's target
+  // (security.go:175); unset stays upstream's default.
   const outcome = await applyPasswordReset(
     c.env.DB,
     p.viewer.id,
     params.get("password") ?? "",
     params.get("retype") ?? "",
-    { policy: resolvePasswordPolicy(c.env) },
+    {
+      policy: resolvePasswordPolicy(c.env),
+      configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+    },
   );
   if (outcome.outcome === "changed") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
@@ -14483,7 +14489,15 @@ async function adminUserEditSubmit(c: Context<{ Bindings: Env }>, userId: number
   const form = parseAdminUserEditForm(await readUrlEncodedForm(c.req.raw));
   // The prologue guarantees a signed admin; the narrow keeps it cast-free.
   const doerId = p.ctx.viewer.kind === "user" ? p.ctx.viewer.id : 0;
-  const outcome = await submitAdminUserEdit(c.env.DB, userId, doerId, form);
+  // Census B-87: the edit ladder reads the deploy config exactly like
+  // upstream (update.go:256-264 for the policy; security.go:175 for the
+  // hash spec) — the resolved policy gates the password arm's ladder and
+  // the configured hash spec is SetPassword's target; unset stays
+  // upstream's default (the landed pbkdf2 arm).
+  const outcome = await submitAdminUserEdit(c.env.DB, userId, doerId, form, {
+    policy: resolvePasswordPolicy(c.env),
+    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+  });
   if (outcome.outcome === "unknown-target") {
     return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
   }

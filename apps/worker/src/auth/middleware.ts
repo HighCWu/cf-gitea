@@ -21,7 +21,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../db/schema";
-import { enableBasicAuthentication, type PasswordConfigEnv } from "../api/config";
+import { configuredPasswordHashAlgo, enableBasicAuthentication, type PasswordConfigEnv } from "../api/config";
 import type { AuthEnv, AuthInfo, AuthToken, AuthUser } from "./auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "./httpauth";
 import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./failure-limiter";
@@ -246,11 +246,17 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
           await next();
           return;
         }
+        // Census B-87: the sign-in ladder reads the deploy config exactly
+        // like upstream (authenticate.go's UserSignIn runs under the loaded
+        // settings) — the configured PASSWORD_HASH_ALGO drives the
+        // rehash-on-login's comparison AND rewrite target; unset stays the
+        // landed pbkdf2 default.
         const outcome = await basicPasswordArm(
           c.env.DB,
           parsed.basicAuth,
           c.req.header("X-Gitea-OTP") ?? "",
           now,
+          { configuredHashSpec: configuredPasswordHashAlgo(basicAuthEnv).specification },
         );
         if (outcome.kind === "webauthn-enrolled") {
           // Upstream logs nothing extra here; the message is ErrUserAuthMessage's.
@@ -454,14 +460,22 @@ export type BasicPasswordOutcome =
  * Failures here are upstream's generic auth-error class, except the
  * WebAuthn reject. Context-free (db + the OTP passcode as parameters) so
  * the git-HTTP arm reuses it outside a Hono context (git-http/acl.ts).
+ * `options.configuredHashSpec` is the caller's env-resolved
+ * PASSWORD_HASH_ALGO specification (census B-87's consumption half — see
+ * PasswordSignInOptions.configuredHashSpec): the sign-in's rehash-on-login
+ * compares against AND rewrites under the configured spec. Omitted, the
+ * landed pbkdf2 default stands.
  */
 export async function basicPasswordArm(
   db: D1Database,
   basic: { username: string; password: string },
   otpPasscode: string,
   now: Date,
+  options?: { configuredHashSpec?: string },
 ): Promise<BasicPasswordOutcome> {
-  const signIn = await userSignInPassword(db, basic.username, basic.password);
+  const signIn = await userSignInPassword(db, basic.username, basic.password, {
+    configuredHashSpec: options?.configuredHashSpec,
+  });
   if (!signIn.ok) {
     if (signIn.failure.kind === "unsupported-hash") {
       return { kind: "unsupported-hash", message: signIn.failure.error.message };

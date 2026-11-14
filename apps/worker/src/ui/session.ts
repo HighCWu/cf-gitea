@@ -147,7 +147,7 @@ import {
 } from "../auth/middleware";
 import { userSignInPassword } from "../auth/password-auth";
 import { generateUserTimeLimitCode, verifyUserTimeLimitCode } from "../auth/reset-code";
-import { enablePasswordSignInForm } from "../api/config";
+import { configuredPasswordHashAlgo, enablePasswordSignInForm } from "../api/config";
 import { applyPasswordReset } from "../services/user-accounts";
 import {
   enqueueResetPasswordMail,
@@ -1345,7 +1345,13 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   if (form.userName === null || form.userName.trim() === "" || form.password === null || form.password === "") {
     return invalid();
   }
-  const signIn = await userSignInPassword(c.env.DB, form.userName, form.password);
+  // Census B-87: the sign-in ladder reads the deploy config exactly like
+  // upstream (authenticate.go's UserSignIn runs under the loaded settings)
+  // — the configured PASSWORD_HASH_ALGO drives the rehash-on-login's
+  // comparison AND rewrite target; unset stays the landed pbkdf2 default.
+  const signIn = await userSignInPassword(c.env.DB, form.userName, form.password, {
+    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+  });
   if (!signIn.ok) {
     if (signIn.failure.kind === "prohibited") {
       // Upstream renders the dedicated prohibit-login PAGE (auth.go:316-320);
