@@ -102,6 +102,7 @@ import {
   prefetchPullRequestRenderContext,
   pullRequestAlreadyExistsError,
   pullRequestNotExistError,
+  pullRequestCodeOwnersReview,
   resolveHeadRepo,
   toApiPullRequest,
 } from "../services/pulls";
@@ -1140,13 +1141,22 @@ export function registerPullRoutes(
       // the 500 races a created PR, both upstream's and ours).
       const reviews = new PullReviewsService(c.env.DB, c.env);
       const doerId = requester.id ?? 0;
+      // NewPullRequest's CODEOWNERS arm (services/pull/pull.go:149-152, the
+      // pullRequestCodeOwnersReview ladder): the changed files' code owners
+      // get review-REQUEST rows BEFORE the explicit reviewer arms — upstream
+      // writes them inside the create tx (:151-153) and announces them first
+      // (ReviewRequestNotify, :166); the landed arm runs on the committed
+      // row with the same ordering (rows → announce → explicit loops), the
+      // same failure direction (an error 500s the create — the committed-
+      // prefix wart above; upstream's tx additionally rolls the PR back).
+      const codeOwnerRequests = await pullRequestCodeOwnersReview(c.env, c.env.DB, found, issue, pr, doerId);
       // The review_request payloads share ONE ToPayloadPullRequest render
       // (upstream re-converts per notifier call, notifier.go:793-815 — the
       // shared render is the cheaper adapter; the payload mode carries the
       // head repo past the doer's visibility, convert/pull.go:33-37).
       let reviewPayloadRender: Awaited<ReturnType<typeof toApiPullRequest>> | null = null;
       let reviewRepositoryRender: ReturnType<typeof toApiRepository> | null = null;
-      if (createReviewers.length > 0 || createTeamReviewers.length > 0) {
+      if (codeOwnerRequests.length > 0 || createReviewers.length > 0 || createTeamReviewers.length > 0) {
         const reviewDiffStats = await pullRequestDiffShortStat(c, found, pr);
         reviewPayloadRender = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "payload", reviewDiffStats === null ? undefined : { diffStats: reviewDiffStats });
         reviewRepositoryRender = toApiRepository(viewerOf(c), found);
@@ -1166,6 +1176,13 @@ export function registerPullRoutes(
             commit_id: "",
           },
         });
+      // ReviewRequestNotify's announce order (:206-219): the auto arm's
+      // webhooks fire FIRST, one per landed user request and one per team
+      // request (the team arm's requested_reviewer omission is the module's
+      // recorded webhook convention).
+      for (const request of codeOwnerRequests) {
+        await reviewRequestEvent(request.kind === "user" ? apiUserFromRow(request.user, viewer) : null);
+      }
       for (const reviewer of createReviewers) {
         if (reviewer.type === "org") {
           throw new ApiError(500, `Organization can't be added as reviewer [user_id: ${doerId}, repo_id: ${found.repo.id}]`);

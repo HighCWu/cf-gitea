@@ -1,13 +1,17 @@
 import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueLabels, labels, issues, pullRequests, repositories, users, PRFlow, type TeamAccessMode } from "../../db/schema";
+import { issueLabels, labels, issues, pullRequests, pullReviews, repositories, teams, users, PRFlow, ReviewType, type TeamAccessMode } from "../../db/schema";
+import { discoverCodeOwnerRules, matchCodeOwnerRules, type CodeOwnerRule } from "../../services/codeowners";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
+import type { ApiEnv } from "../env";
 import type { PullRequest, PRBranchInfo } from "../models/pull";
+import { branchRef, engineReads, pullHeadRef } from "./engine";
 import { findForkByOwner } from "./forks";
 import { hasWorkInProgressPrefix, prefetchIssueRenderContext, toApiIssue, type IssueRenderContext } from "./issues";
 import { mergeableOfRow } from "./pull-engine";
+import { PullReviewsService } from "./pull-reviews";
 import {
   apiUserFromRow,
   canViewRepository,
@@ -802,4 +806,173 @@ export async function existingRepoLabelIds(d1: D1Database, repoId: string, label
     .orderBy(asc(labels.id))
     .all();
   return rows.map((row) => row.id);
+}
+
+// ---------------------------------------------------------------------------
+// The PR-create auto codeowner review-request arm (census B-53 remainder #2 —
+// PullRequestCodeOwnersReview, services/issue/pull.go:253–310). On PR create
+// (and every other upstream caller) the changed files' CODEOWNERS get
+// review-REQUEST rows through the landed AddReviewRequest/AddTeamReviewRequest
+// cores, so the merge gate's block_on_codeowner_reviews arm can be satisfied
+// without a manual request round-trip.
+// ---------------------------------------------------------------------------
+
+/** One added review request of the auto arm — the route turns each into its
+ *  `pull_request_review_request` webhook (upstream ReviewRequestNotify,
+ *  services/issue/review_request.go:206–219: the user arm one webhook per
+ *  reviewer, the team arm ONE per team request — the landed webhook
+ *  convention the standalone reviewer lanes document). */
+export type CodeOwnerReviewRequest = { kind: "user"; user: UserRow } | { kind: "team"; team: typeof teams.$inferSelect };
+
+/**
+ * `PullRequestCodeOwnersReview` (services/issue/pull.go:253–310), over the
+ * B-53 landed pieces. The ladder:
+ *
+ *  1. WIP skip (:258–260 — IsWorkInProgress is the title-prefix probe,
+ *     models/issues/pull.go:751-756).
+ *  2. `getCodeOwnerRules` (:37–84): a FORK base repo has no rules BEFORE any
+ *     read (:46–48); the base-branch tip read (:50–52) and the CODEOWNERS
+ *     discovery (:82–85) run on the caller's engine reads. Unlike the merge
+ *     gate's fail-closed carriers, the auto arm's discovery errors FAIL THE
+ *     CALLER (a missing tip or an over-size file propagates through
+ *     getMatchingCodeOwnerRules → PullRequestCodeOwnersReview →
+ *     NewPullRequest, which errors the create — services/pull/pull.go:
+ *     149–152), so the two null arms answer 500s here.
+ *  3. No rules → no-op (:87–90 + :271-273 — the early return lands BEFORE
+ *     any git walk, so a repo without CODEOWNERS pays nothing).
+ *  4. The changed-files walk (:114–122): the merge base of the base tip and
+ *     the head ref — `pr.MergeBase` is the stored create-time value when the
+ *     row carries it, the live merge-base read otherwise (the landed
+ *     pullRequestDiffForEnv composition; the unrelated-histories pair has NO
+ *     merge base and `git.MergeBase` ERRORS there, merge.go:27–29 — the
+ *     create fails with it) — then GetFilesChangedBetween over the ref pair
+ *     (repo_compare.go:84); a failed walk errors too (:119–122).
+ *  5. The rules×files match (:125–145) with the COMPLETE FLAG IGNORED
+ *     (:271's `_` — the upstream comment: the notifier only requests
+ *     reviews, a partial (budget-truncated) rule set is acceptable; only the
+ *     merge gate fails closed on it).
+ *  6. No matching rules → no-op (:275–277).
+ *  7. The uniq owner sets (:281–289 — users by id, teams keyed by id; ours
+ *     stores slim {id,...} rows in the rules, so both re-resolve from D1 —
+ *     the same data upstream held in hand).
+ *  8. `GetReviewsByIssueID` + `contain` (:297–309, review_list.go:162–196):
+ *     the latest review of each INDIVIDUAL reviewer over
+ *     approve/reject/request/comment rows that are NOT dismissed — a user
+ *     with ANY such latest row is never auto-requested (even a comment
+ *     counts; a dismissed row leaves them empty-handed and requestable).
+ *  9. The loops (:311–345): the poster is skipped, contained users are
+ *     skipped, each surviving user/team goes through the landed request
+ *     core with `isCodeOwners=true` (the CODEOWNERS comment marker,
+ *     review.go:764/:866) and the doer is the POSTER (issue.Poster — both
+ *     model calls pass it; our core's internal mail fan-out is
+ *     ReviewRequestNotify's per-receiver delivery).
+ *
+ * Returns the requests that actually landed (the webhook emission stays with
+ * the route, the landed convention). An error propagates — upstream's create
+ * answers 500 and rolls its transaction; ours answers 500 with the PR row
+ * already committed, the same documented committed-prefix wart the explicit
+ * reviewer arms record.
+ */
+export async function pullRequestCodeOwnersReview(
+  env: ApiEnv["Bindings"],
+  d1: D1Database,
+  pair: RepositoryWithOwner,
+  issue: IssueRow,
+  pr: PullRequestRow,
+  doerId: number,
+): Promise<CodeOwnerReviewRequest[]> {
+  if (hasWorkInProgressPrefix(issue.title)) return []; // :258–260
+
+  const reads = engineReads(env, pair.repo);
+  if (pair.repo.forkParent !== null) return []; // :46–48 — before any read
+  const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
+  if (baseTip === null) {
+    // GetBranchCommit's error arm (:50–52) — NewPullRequest fails the create.
+    throw new ApiError(500, `get base branch commit failed [branch: ${pr.baseBranch}]`);
+  }
+  const rules: CodeOwnerRule[] | null = await discoverCodeOwnerRules(d1, (path) => reads.readBlob(baseTip.oid, path));
+  if (rules === null) {
+    // The over-size CODEOWNERS fail-closed carrier (:75–79) — an upstream
+    // error string ("CODEOWNERS file %q exceeds the maximum readable size").
+    throw new ApiError(500, "CODEOWNERS file exceeds the maximum readable size");
+  }
+  if (rules.length === 0) return []; // :87–90 → :271-273, before any walk
+
+  const headCommit = await reads.readCommit(pullHeadRef(pr.index));
+  if (headCommit === null) {
+    // pr.GetGitHeadRefName's read error arm (:114–117) — unreachable at
+    // create (the ref was just written); kept for the arm's totality.
+    throw new ApiError(500, `get head ref failed [ref: ${pullHeadRef(pr.index)}]`);
+  }
+  let mergeBase = pr.mergeBase;
+  if (mergeBase === null) {
+    const base = await reads.mergeBase(baseTip.oid, headCommit.oid);
+    mergeBase = base !== null && base.tag === "ok" ? base.base : null;
+  }
+  if (mergeBase === null) {
+    // The unrelated-histories pair: git.MergeBase answers "merge-base ... doesn't
+    // exist" (merge.go:27–29) and getMatchingCodeOwnerRules propagates — the
+    // create fails (services/pull/pull.go:149–152). The landed merge gate
+    // fails CLOSED on the same state (pull-engine's recorded arm); the create
+    // arm fails LOUD, exactly upstream's error direction.
+    throw new ApiError(500, "merge-base for the pull request's refs doesn't exist");
+  }
+  const diff = await reads.readDiff(headCommit.oid, mergeBase);
+  if (diff === null) {
+    // GetFilesChangedBetween's error arm (:119–122) — the create fails.
+    throw new ApiError(500, "get changed files failed");
+  }
+  const changedFiles = diff.files.map((file) => file.path);
+
+  // :271's `_` — the complete flag is deliberately not consulted here.
+  const { matching } = matchCodeOwnerRules(rules, changedFiles);
+  if (matching.length === 0) return []; // :275–277
+
+  // The uniq owner sets (:281–289), re-resolved from D1 (our rules store
+  // slim rows — upstream held the full user/team rows in the rule).
+  const userIds = [...new Set(matching.flatMap((rule) => rule.users.map((owner) => owner.id)))];
+  const teamIds = [...new Set(matching.flatMap((rule) => rule.teams.map((owner) => owner.id)))];
+  const userRows = userIds.length === 0 ? [] : await drizzle(d1).select().from(users).where(inArray(users.id, userIds)).all();
+  const teamRows = teamIds.length === 0 ? [] : await drizzle(d1).select().from(teams).where(inArray(teams.id, teamIds)).all();
+
+  // GetReviewsByIssueID + contain (:297–309, review_list.go:162–196) — the
+  // latest-per-individual-reviewer map over the four counted types, NOT
+  // dismissed; ASC updated order makes the last write per reviewer the
+  // latest (upstream takes reviews[len-1], :196).
+  const reviewRows = await drizzle(d1)
+    .select()
+    .from(pullReviews)
+    .where(eq(pullReviews.issueId, issue.id))
+    .orderBy(asc(pullReviews.updatedAt))
+    .all();
+  const latestPerReviewer = new Map<number, typeof pullReviews.$inferSelect>();
+  for (const row of reviewRows) {
+    if (row.reviewerTeamId !== 0) continue;
+    if (row.type !== ReviewType.Approve && row.type !== ReviewType.Comment && row.type !== ReviewType.Reject && row.type !== ReviewType.Request) continue;
+    if (row.dismissed) continue;
+    latestPerReviewer.set(row.reviewerId, row);
+  }
+
+  const reviews = new PullReviewsService(d1, env);
+  const requests: CodeOwnerReviewRequest[] = [];
+
+  for (const user of userRows) {
+    // :312 — the poster never self-requests; any latest counted review row
+    // (approve/reject/request/comment) suppresses the auto request.
+    if (issue.posterId !== null && user.id === issue.posterId) continue;
+    if (latestPerReviewer.has(user.id)) continue;
+    const review = await reviews.addReviewRequest(pair, issue, pr, user, doerId, true);
+    if (review === null) continue; // comment == nil (:323–325) — the internal already-requested skip
+    requests.push({ kind: "user", user });
+  }
+
+  for (const team of teamRows) {
+    // :332–345 — no contain pre-filter on the team arm (the request core's
+    // own already-requested skip is the gate, review.go:830–838).
+    const review = await reviews.addTeamReviewRequest(issue, pr, team, doerId, true);
+    if (review === null) continue; // :336–338
+    requests.push({ kind: "team", team });
+  }
+
+  return requests;
 }

@@ -106,12 +106,13 @@
  *   SPEC-0013 §6 "stored-only, never enforced"): the box may show a required
  *   check as failed while the landed POST /merge would still succeed. The
  *   fragment is the upstream card; the divergence is the gate, not the render.
- * - `isBlockedByCodeowners` and `isBlockedByChangedProtectedFiles` have no
- *   landed predicates (the service's §6 omissions) — their blocker items and
- *   their `hasOverridableBlockers` contribution are omitted, keeping the
- *   protection blockers a faithful projection of `checkPullBranchProtections`
- *   (approvals, rejected reviews, official review requests, outdated branch)
- *   plus the stored required-check state above.
+ * - `isBlockedByCodeowners` and `isBlockedByChangedProtectedFiles` RENDER
+ *   since the B-53R2 wiring (the landed gate predicates + the reads-threaded
+ *   `pullGateGitInputsFromReads` collection): the git view computes lazily,
+ *   only when a rule arms one of the two arms, and the seam-optional callers
+ *   (no `reads`) omit the items — unknown is not blocked, the same degrade
+ *   family as the branch-tip `listTips` seam. `hasOverridableBlockers`
+ *   carries both flags (issue_view.go:984-986).
  * - `IsPullRequestBroken` (the "data_broken" blocker) reduces to the missing
  *   head-repo row (the deleted-fork arm); upstream's second arm (head branch
  *   commit ≠ the PR's internal ref — push-sync staleness) needs engine reads
@@ -250,6 +251,7 @@ import {
   ensurePullRequestChecked,
   hasUnmergedPullRequestsByHeadInfo,
   mergePullRequest,
+  pullGateGitInputsFromReads,
   pullRequestDiffShortStat,
   updatePullRequestBranch,
 } from "../../api/services/pull-engine";
@@ -270,11 +272,15 @@ import {
   mergeBlockedByOutdatedBranch,
   mergeBlockedByRejectedReview,
   grantedApprovalsCount,
+  hasAllRequiredCodeownerReviews,
+  mergeBlockedByProtectedFiles,
   parseRuleConfig,
   principalAccessOf,
   principalAccessOfRow,
+  protectedFilePatterns,
   type PrincipalAccess,
   type ProtectedBranchConfig,
+  type PullBranchProtectionGit,
 } from "../../services/branch-protection";
 import {
   contextMatchesRequired,
@@ -318,7 +324,10 @@ export const pullMergeBoxLocale = {
     "This pull request doesn't have enough required approvals yet. {granted} of {required} approvals granted from users or teams on the allowlist.", // "repo.pulls.blocked_by_approvals_whitelisted"
   blocked_by_rejection: "This pull request has changes requested by an official reviewer.", // "repo.pulls.blocked_by_rejection"
   blocked_by_official_review_requests: "This pull request has official review requests.", // "repo.pulls.blocked_by_official_review_requests"
+  blocked_by_codeowners: "This pull request is missing approval from one or more code owners.", // "repo.pulls.blocked_by_codeowners"
   blocked_by_outdated_branch: "This pull request is blocked because it's outdated.", // "repo.pulls.blocked_by_outdated_branch"
+  blocked_by_changed_protected_files_1: "This pull request is blocked because it changes a protected file:", // "repo.pulls.blocked_by_changed_protected_files_1"
+  blocked_by_changed_protected_files_n: "This pull request is blocked because it changes protected files:", // "repo.pulls.blocked_by_changed_protected_files_n"
   status_checking: "Some checks are pending", // "repo.pulls.status_checking"
   status_checks_success: "All checks were successful", // "repo.pulls.status_checks_success"
   status_checks_failure_optional: "Some optional checks failed", // "repo.pulls.status_checks_failure_optional"
@@ -1557,6 +1566,42 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
       listItems: [],
     });
   }
+
+  // --- the B-53 arms (issue_view.go:1097-1116, prepareMergeBoxProtectedRules)
+  // The git view threads through the loader's optional `reads` seam
+  // (pullGateGitInputsFromReads — the ONE landed collection); it computes
+  // LAZILY, only when a rule arms one of the two arms (the gate's own
+  // posture). Absent reads = the seam-optional callers — the items OMIT
+  // (unknown is not blocked; the same degrade family as the branch-tip
+  // `listTips` seam, whose POST seams re-check server-side).
+  const codeownersArmed = config?.blockOnCodeownerReviews === true;
+  const protectedFilesArmed = config !== null && protectedFilePatterns(config.protectedFilePatterns).length > 0;
+  let gateGit: PullBranchProtectionGit | null = null;
+  if ((codeownersArmed || protectedFilesArmed) && input.reads !== undefined) {
+    gateGit = await pullGateGitInputsFromReads(input.reads, repo, pr, d1);
+  }
+
+  // isBlockedByCodeowners = !HasAllRequiredCodeownerReviews (:1097-1106) —
+  // the landed gate's own evaluator over the threaded view; one item, no
+  // detail list.
+  let isBlockedByCodeowners = false;
+  if (codeownersArmed && gateGit !== null) {
+    isBlockedByCodeowners = !(await hasAllRequiredCodeownerReviews(d1, config, {
+      issueId: issue.id,
+      commitsBehind: pr.commitsBehind ?? 0,
+      posterId: issue.posterId ?? 0,
+      git: gateGit,
+    }));
+    if (isBlockedByCodeowners) {
+      protectionBlockers.push({
+        icon: "octicon-x",
+        iconClass: "tw-text-red",
+        info: pullMergeBoxLocale.blocked_by_codeowners,
+        listItems: [],
+      });
+    }
+  }
+
   if (config !== null) {
     isBlockedByOutdatedBranch = mergeBlockedByOutdatedBranch(config, pr.commitsBehind ?? 0);
   }
@@ -1567,6 +1612,32 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
       info: pullMergeBoxLocale.blocked_by_outdated_branch,
       listItems: [],
     });
+  }
+  // isBlockedByChangedProtectedFiles = len(pull.ChangedProtectedFiles) != 0
+  // (:1107-1116) — the matched paths render as the item's detail list
+  // (upstream escapeStringSliceToHTML); ours re-derives them from the same
+  // live walk the gate reads (upstream's pipeline stored
+  // pr.ChangedProtectedFiles). Blocked-with-no-list = the fail-closed walk
+  // carrier — the plural text with no detail items.
+  let isBlockedByChangedProtectedFiles = false;
+  let protectedChangedPaths: string[] = [];
+  if (protectedFilesArmed && gateGit !== null) {
+    isBlockedByChangedProtectedFiles = mergeBlockedByProtectedFiles(config, gateGit);
+    if (gateGit.changedFiles !== null && gateGit.changedFiles.complete) {
+      const patterns = protectedFilePatterns(config.protectedFilePatterns);
+      protectedChangedPaths = gateGit.changedFiles.paths.filter((path) => patterns.some((pattern) => pattern.test(path.toLowerCase())));
+    }
+    if (isBlockedByChangedProtectedFiles) {
+      protectionBlockers.push({
+        icon: "octicon-x",
+        iconClass: "tw-text-red",
+        info:
+          protectedChangedPaths.length === 1
+            ? pullMergeBoxLocale.blocked_by_changed_protected_files_1
+            : pullMergeBoxLocale.blocked_by_changed_protected_files_n,
+        listItems: protectedChangedPaths,
+      });
+    }
   }
   // The required-check blocker items (pull.go:487-493) — the stored rule
   // config's state, DISPLAY of a gate our merge route does not enforce
@@ -1636,9 +1707,16 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
   }
 
   // --- canMergeNow (issue_view.go:1020-1026 over the landed gate) ----------
-  // The signing half is dropped (module doc).
+  // The signing half is dropped (module doc); the B-53 flags ride the
+  // upstream hasOverridableBlockers list (:984-986).
   const hasOverridableBlockers =
-    isBlockedByApprovals || isBlockedByRejection || isBlockedByOfficialReviewRequests || isBlockedByOutdatedBranch || hasStatusCheckBlocker;
+    isBlockedByApprovals ||
+    isBlockedByRejection ||
+    isBlockedByOfficialReviewRequests ||
+    isBlockedByCodeowners ||
+    isBlockedByOutdatedBranch ||
+    isBlockedByChangedProtectedFiles ||
+    hasStatusCheckBlocker;
   // canBypassProtection (issue_view.go:1007-1015 over the landed predicate):
   // the force_merge escape's own port.
   const canBypassProtection = config !== null && (await canBypassBranchProtection(d1, config, access));

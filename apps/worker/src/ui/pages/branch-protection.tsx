@@ -37,12 +37,14 @@
  *
  * The form renders exactly the arms SPEC-0013 v1 ENFORCES — the merge-side
  * set (required approvals, approvals whitelist, rejected-review /
- * official-request / outdated-branch blocks, merge + bypass allowlists,
- * admin override) and the push-side set (direct-push allowlist, force push,
- * deletion). The API also writes the stored-but-unenforced arms —
- * protected/unprotected file patterns, require_signed_commits, status
- * checks, block_on_codeowner_reviews (§6: no file walking, no signature
- * surface, no CI consumer, no CODEOWNERS) — and those are NOT rendered: a
+ * official-request / CODEOWNERS-review (B-53R2: the merge gate arms it) /
+ * outdated-branch blocks, merge + bypass allowlists, admin override) and the
+ * push-side set (direct-push allowlist, force push, deletion), PLUS the two
+ * B-53 merge-gate fields (protected/unprotected file patterns — the merge
+ * arm reads the protected half; the unprotected half stores for the push
+ * gate, whose enforcement is the B-52 lane). The API also writes the still
+ * stored-but-unenforced arms — require_signed_commits, status checks (§6:
+ * no signature surface, no CI consumer) — and those are NOT rendered: a
  * control that pretends protection the engine does not deliver would be
  * worse than its absence. On edit they keep their stored values (the form
  * carries no field for them). The list's meta line IS the surface where the
@@ -215,6 +217,12 @@ export const branchProtectionLocale = {
   patterns: "Patterns", // "repo.settings.protect_patterns"
   name_pattern: "Protected Branch Name Pattern", // "repo.settings.protect_branch_name_pattern"
   name_pattern_help: "Examples: main, release/**", // the %s-doc-link tail dropped (no external docs surface) — cf-gitea reduction
+  protected_file_patterns: "Protected file patterns (separated using semicolon ';'):", // "repo.settings.protect_protected_file_patterns"
+  protected_file_patterns_help:
+    "Protected files are not allowed to be changed directly even if user has rights to add, edit, or delete files in this branch. Multiple patterns can be separated using semicolon (';'). Examples: .drone.yml, /docs/**/*.txt.", // the %s-doc-link halves dropped — the name_pattern_help reduction
+  unprotected_file_patterns: "Unprotected file patterns (separated using semicolon ';'):", // "repo.settings.protect_unprotected_file_patterns"
+  unprotected_file_patterns_help:
+    "Unprotected files that are allowed to be changed directly if user has write access, bypassing push restriction. Multiple patterns can be separated using semicolon (';'). Examples: .drone.yml, /docs/**/*.txt.", // the %s-doc-link halves dropped — the name_pattern_help reduction
   event_push: "Push", // "repo.settings.event_push"
   disable_push: "Disable Push", // "repo.settings.protect_disable_push"
   enable_push: "Enable Push", // "repo.settings.protect_enable_push"
@@ -251,6 +259,8 @@ export const branchProtectionLocale = {
   bypass_allowlist_teams: "Allowlisted teams for bypassing protection:", // "repo.settings.protect_bypass_allowlist_teams"
   block_rejected_reviews: "Block merge on rejected reviews", // "repo.settings.block_rejected_reviews"
   block_on_official_review_requests: "Block merge on official review requests", // "repo.settings.block_on_official_review_requests"
+  block_on_codeowner_reviews: "Require approval from code owners", // "repo.settings.block_on_codeowner_reviews"
+  block_on_codeowner_reviews_desc: "Merging will only be possible if at least one code owner per code owner rule has given an approving review.", // "repo.settings.block_on_codeowner_reviews_desc"
   block_outdated_branch: "Block merge if pull request is outdated", // "repo.settings.block_outdated_branch"
   block_admin_merge_override: "Administrators must follow branch protection rules", // "repo.settings.block_admin_merge_override"
   names_help: "Comma-separated names.", // cf-gitea addition — the dropdown multiselect's no-JS replacement hint
@@ -259,7 +269,7 @@ export const branchProtectionLocale = {
   saved_flash: "Branch protection for rule", // "repo.settings.update_protect_branch_success" head; the "…" form is "%s" has been updated." — rendered split
   glob_badge: "glob", // cf-gitea addition — the wildcard rule badge (IsRuleNameSpecial)
   unenforced_note:
-    "The stored-but-unenforced arms (protected file patterns, signed commits, status checks, CODEOWNER reviews — SPEC-0013 §6) have no fields here; an edit keeps their stored values.", // cf-gitea addition
+    "The stored-but-unenforced arms (signed commits, status checks — SPEC-0013 §6) have no fields here; an edit keeps their stored values.", // cf-gitea addition
   readonly_name_note: "Rule names cannot be renamed: the API edit arm keys the rule by its name.", // cf-gitea addition
   required_rule_name: "Rule name cannot be empty.", // cf-gitea addition (the HTML5 required backs this; upstream's flash key is protected_branch_required_rule_name)
   required_approvals_min: "Required approvals cannot be negative.", // "repo.settings.protected_branch_required_approvals_min"
@@ -374,6 +384,10 @@ export function ruleCountParts(config: ProtectedBranchConfig): string[] {
   if (config.enableBypassAllowlist) {
     parts.push(`bypass allowlist: ${countWord(config.bypassAllowlistUserIds.length, "user")}, ${countWord(config.bypassAllowlistTeamIds.length, "team")}`);
   }
+  if (config.blockOnCodeownerReviews) parts.push("codeowner reviews: required");
+  const patternCount = (patterns: string): number => patterns.split(";").filter((expr) => expr.trim() !== "").length;
+  if (config.protectedFilePatterns.trim() !== "") parts.push(`protected files: ${patternCount(config.protectedFilePatterns)} ${patternCount(config.protectedFilePatterns) === 1 ? "pattern" : "patterns"}`);
+  if (config.unprotectedFilePatterns.trim() !== "") parts.push(`unprotected files: ${patternCount(config.unprotectedFilePatterns)} ${patternCount(config.unprotectedFilePatterns) === 1 ? "pattern" : "patterns"}`);
   if (config.enableStatusCheck) parts.push(`status checks: ${config.statusCheckContexts.length} contexts`);
   return parts;
 }
@@ -416,8 +430,15 @@ export interface BranchProtectionForm {
   ignoreStaleApprovals: boolean;
   blockOnRejectedReviews: boolean;
   blockOnOfficialReviewRequests: boolean;
+  blockOnCodeownerReviews: boolean;
   blockOnOutdatedBranch: boolean;
   blockAdminMergeOverride: boolean;
+  /** The B-53 file-pattern pair — the merge arm reads the protected half;
+   *  the unprotected half stores for the push gate (the B-52 lane). Stored
+   *  RAW (no compile validation — neither upstream web nor API validates,
+   *  settings/protected_branch.go:307-308). */
+  protectedFilePatterns: string;
+  unprotectedFilePatterns: string;
 }
 
 /** Parse one urlencoded POST (the template's input names verbatim; the
@@ -457,8 +478,11 @@ export function parseBranchProtectionForm(params: URLSearchParams): BranchProtec
     ignoreStaleApprovals: (params.get("ignore_stale_approvals") ?? "") !== "",
     blockOnRejectedReviews: (params.get("block_on_rejected_reviews") ?? "") !== "",
     blockOnOfficialReviewRequests: (params.get("block_on_official_review_requests") ?? "") !== "",
+    blockOnCodeownerReviews: (params.get("block_on_codeowner_reviews") ?? "") !== "",
     blockOnOutdatedBranch: (params.get("block_on_outdated_branch") ?? "") !== "",
     blockAdminMergeOverride: (params.get("block_admin_merge_override") ?? "") !== "",
+    protectedFilePatterns: params.get("protected_file_patterns") ?? "",
+    unprotectedFilePatterns: params.get("unprotected_file_patterns") ?? "",
   };
 }
 
@@ -500,8 +524,11 @@ export function emptyBranchProtectionForm(): BranchProtectionForm {
     ignoreStaleApprovals: false,
     blockOnRejectedReviews: false,
     blockOnOfficialReviewRequests: false,
+    blockOnCodeownerReviews: false,
     blockOnOutdatedBranch: false,
     blockAdminMergeOverride: false,
+    protectedFilePatterns: "",
+    unprotectedFilePatterns: "",
   };
 }
 
@@ -563,8 +590,11 @@ export async function editFormOfRule(d1: D1Database, pair: RepositoryWithOwner, 
     ignoreStaleApprovals: config.ignoreStaleApprovals,
     blockOnRejectedReviews: config.blockOnRejectedReviews,
     blockOnOfficialReviewRequests: config.blockOnOfficialReviewRequests,
+    blockOnCodeownerReviews: config.blockOnCodeownerReviews,
     blockOnOutdatedBranch: config.blockOnOutdatedBranch,
     blockAdminMergeOverride: config.blockAdminMergeOverride,
+    protectedFilePatterns: config.protectedFilePatterns,
+    unprotectedFilePatterns: config.unprotectedFilePatterns,
   };
 }
 
@@ -725,10 +755,13 @@ async function applyFormArms(d1: D1Database, pair: RepositoryWithOwner, form: Br
       requiredApprovals: form.requiredApprovals > 0 ? form.requiredApprovals : 0,
       blockOnRejectedReviews: form.blockOnRejectedReviews,
       blockOnOfficialReviewRequests: form.blockOnOfficialReviewRequests,
+      blockOnCodeownerReviews: form.blockOnCodeownerReviews,
       blockOnOutdatedBranch: form.blockOnOutdatedBranch,
       dismissStaleApprovals: form.dismissStaleApprovals,
       ignoreStaleApprovals: form.ignoreStaleApprovals,
       blockAdminMergeOverride: form.blockAdminMergeOverride,
+      protectedFilePatterns: form.protectedFilePatterns,
+      unprotectedFilePatterns: form.unprotectedFilePatterns,
       // The unrendered arms stay the zero config (absent scalars decode as
       // Go zeros on the API arm — the honest subset).
     };
@@ -837,13 +870,15 @@ async function applyFormArms(d1: D1Database, pair: RepositoryWithOwner, form: Br
   }
   config.blockOnRejectedReviews = form.blockOnRejectedReviews;
   config.blockOnOfficialReviewRequests = form.blockOnOfficialReviewRequests;
+  config.blockOnCodeownerReviews = form.blockOnCodeownerReviews;
   config.blockOnOutdatedBranch = form.blockOnOutdatedBranch;
   config.dismissStaleApprovals = form.dismissStaleApprovals;
   config.ignoreStaleApprovals = form.ignoreStaleApprovals;
   config.blockAdminMergeOverride = form.blockAdminMergeOverride;
-  // The unrendered arms (status checks, signed commits, file patterns,
-  // codeowner blocks — SPEC-0013 §6) keep their stored values: `config`
-  // started as the parsed stored blob.
+  config.protectedFilePatterns = form.protectedFilePatterns;
+  config.unprotectedFilePatterns = form.unprotectedFilePatterns;
+  // The unrendered arms (status checks, signed commits — SPEC-0013 §6) keep
+  // their stored values: `config` started as the parsed stored blob.
 
   await sanitizeRuleWhitelists(d1, pair.repo, config, stored);
   await drizzle(d1)
@@ -1214,14 +1249,17 @@ function RadioField(props: { name: string; value: string; label: string; help: s
   );
 }
 
-/** One checkbox field (the template's `.ui.checkbox` shape). */
-function CheckboxField(props: { id: string; name: string; label: string; checked: boolean }) {
+/** One checkbox field (the template's `.ui.checkbox` shape); `help` is the
+ *  template's `<p class="help">` desc arm (the block_on_codeowner_reviews
+ *  `_desc` entry, protected_branch.tmpl:288). */
+function CheckboxField(props: { id: string; name: string; label: string; checked: boolean; help?: string }) {
   return (
     <div class="field">
       <div class="ui checkbox">
         <input id={props.id} name={props.name} type="checkbox" checked={props.checked} />
         <label for={props.id}>{props.label}</label>
       </div>
+      {props.help !== undefined ? <p class="help">{props.help}</p> : null}
     </div>
   );
 }
@@ -1295,6 +1333,19 @@ function BranchProtectionEditPage(props: { ctx: UiContext; data: BranchProtectio
                   ) : (
                     <p class="help">{branchProtectionLocale.name_pattern_help}</p>
                   )}
+                </div>
+                {/* protected_branch.tmpl:20-28 — the two B-53 file-pattern
+                    inputs, stored raw (neither upstream arm validates the
+                    globs; the merge arm compiles leniently at gate time). */}
+                <div class="field">
+                  <label for="protected_file_patterns">{branchProtectionLocale.protected_file_patterns}</label>
+                  <input id="protected_file_patterns" name="protected_file_patterns" type="text" value={form.protectedFilePatterns} autocomplete="off" />
+                  <p class="help">{branchProtectionLocale.protected_file_patterns_help}</p>
+                </div>
+                <div class="field">
+                  <label for="unprotected_file_patterns">{branchProtectionLocale.unprotected_file_patterns}</label>
+                  <input id="unprotected_file_patterns" name="unprotected_file_patterns" type="text" value={form.unprotectedFilePatterns} autocomplete="off" />
+                  <p class="help">{branchProtectionLocale.unprotected_file_patterns_help}</p>
                 </div>
 
                 <h5 class="ui dividing header">{branchProtectionLocale.event_push}</h5>
@@ -1488,6 +1539,16 @@ function BranchProtectionEditPage(props: { ctx: UiContext; data: BranchProtectio
                   name="block_on_official_review_requests"
                   label={branchProtectionLocale.block_on_official_review_requests}
                   checked={form.blockOnOfficialReviewRequests}
+                />
+                {/* protected_branch.tmpl:283-289 — the B-53 gate's toggle,
+                    immediately after block_on_official_review_requests in the
+                    upstream template's checkbox run. */}
+                <CheckboxField
+                  id="block_on_codeowner_reviews"
+                  name="block_on_codeowner_reviews"
+                  label={branchProtectionLocale.block_on_codeowner_reviews}
+                  checked={form.blockOnCodeownerReviews}
+                  help={branchProtectionLocale.block_on_codeowner_reviews_desc}
                 />
                 <CheckboxField
                   id="block_on_outdated_branch"

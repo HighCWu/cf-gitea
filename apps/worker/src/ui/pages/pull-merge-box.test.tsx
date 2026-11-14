@@ -13,7 +13,7 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { Context } from "hono";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
@@ -1980,4 +1980,180 @@ describe("getDefaultMergeMessageParts' ClosingIssues var (the xref compose)", ()
   // renders the literal and the merge message still composes. D1 has no
   // fault-injection seam here (the poster/head reads precede the guard and
   // would throw first), so the arm is pinned by the code path's structure.
+});
+
+// --- the B-53 blocker items (isBlockedByCodeowners / isBlockedByChangedProtectedFiles)
+// issue_view.go:1097-1116's prepareMergeBoxProtectedRules arms over the
+// LANDED gate predicates: the git view threads through the loader's `reads`
+// seam (pullGateGitInputsFromReads — the ONE landed collection), the
+// codeowner item clears with the owner's approval, the protected-files item
+// renders the matched path list, and the seam-optional callers omit the
+// items (unknown is not blocked). A dedicated repo carries REAL engine
+// content: cowbase's tip holds the CODEOWNERS file, the PR changes one.txt.
+
+describe("the B-53 blocker items (the codeowner + protected-files arms)", () => {
+  let b53RepoId = "";
+  let b53IssueId = 0;
+  let b53Index = 0;
+  let ghostIssueId = 0;
+  let ghostIndex = 0;
+  const b53Pair = { ownerNamespace: "alice", slug: "b53box" };
+
+  /** The rule row on `base` — updated per test (the loader re-reads it). */
+  async function setRule(base: string, apply: (config: ReturnType<typeof emptyRuleConfig>) => void): Promise<void> {
+    const config = emptyRuleConfig();
+    apply(config);
+    const existing = await d1().select().from(protectedBranches).where(and(eq(protectedBranches.repoId, b53RepoId), eq(protectedBranches.ruleName, base))).all();
+    if (existing.length > 0) {
+      await d1().update(protectedBranches).set({ rules: serializeRuleConfig(config) }).where(eq(protectedBranches.id, existing[0]!.id));
+      return;
+    }
+    await d1().insert(protectedBranches).values({
+      repoId: b53RepoId,
+      ruleName: base,
+      priority: 0,
+      rules: serializeRuleConfig(config),
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+  }
+
+  async function loadB53(issueId: number, index: number, options: { reads?: boolean } = {}): Promise<PullMergeBoxData | null> {
+    const found = (await findPullRequestByIndex(env.DB, b53RepoId, index))!;
+    expect(found.issue.id).toBe(issueId);
+    return loadPullMergeBoxData(env.DB, {
+      repo: await repoRow(b53RepoId),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+      ...(options.reads === false ? {} : { reads: engineReads(env, b53Pair) }),
+    });
+  }
+
+  beforeAll(async () => {
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "b53box",
+      isPrivate: false,
+      status: "ready",
+    });
+    b53RepoId = repo.id;
+    const root = await landCommit(b53Pair, branchRef("main"), { parents: [], message: "root", fileName: "README.md", content: "# b53box\n" });
+    // cowbase: the CODEOWNERS file at the base tip — the discovery read.
+    await landCommit(b53Pair, branchRef("cowbase"), { parents: [root], message: "codeowners", fileName: "CODEOWNERS", content: String.raw`.*\.txt @bob` + "\n" });
+    // The head: a child changing one.txt (the codeowner rule's language AND
+    // the protected-files glob both hit it).
+    const head = await landCommit(b53Pair, branchRef("cowhead"), { parents: [root], message: "change", fileName: "one.txt", content: "one\n" });
+    await env.REPO.getByName("alice/b53box").setHead("main");
+    const service = new IssuesService(env.DB);
+    const made = await service.createPullRequest({
+      repoId: b53RepoId,
+      title: "feat: gated change",
+      posterId: cara.id, // NOT the codeowner — an author-owned rule would be waived
+      headRepoId: b53RepoId,
+      baseBranch: "cowbase",
+      headBranch: "cowhead",
+      now: new Date((T0 + 400) * 1000),
+    });
+    b53IssueId = made.issue.id;
+    b53Index = made.pullRequest.index;
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable, headSha: head }).where(eq(pullRequests.id, made.pullRequest.id));
+    const landed = await env.REPO.getByName("alice/b53box").commitApiChange({ ref: pullHeadRef(b53Index), expectedOldOid: ZERO_OID, newOid: head });
+    if (landed.tag !== "committed") throw new Error(`b53box pull ref failed: ${landed.tag}`);
+    // The rows-only twin: base branch `ghostbase` has NO engine branch — the
+    // discovery's GetBranchCommit arm fails closed.
+    const ghost = await service.createPullRequest({
+      repoId: b53RepoId,
+      title: "feat: ghost base",
+      posterId: cara.id,
+      headRepoId: b53RepoId,
+      baseBranch: "ghostbase",
+      headBranch: "cowhead",
+      now: new Date((T0 + 410) * 1000),
+    });
+    ghostIssueId = ghost.issue.id;
+    ghostIndex = ghost.pullRequest.index;
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable }).where(eq(pullRequests.id, ghost.pullRequest.id));
+  });
+
+  it("renders the codeowner blocker while an owner hasn't approved, and clears it after the (unofficial) approval — the prompt section flips with hasOverridableBlockers", async () => {
+    await setRule("cowbase", (config) => {
+      config.blockOnCodeownerReviews = true;
+    });
+    const blocked = await loadB53(b53IssueId, b53Index);
+    const infos = sectionOf(blocked!, 0).map((item) => item.info);
+    expect(infos).toContain("This pull request is missing approval from one or more code owners.");
+    // The fail-closed arms are quiet here (the walk is complete, the
+    // CODEOWNERS parse is real): exactly the one blocker.
+    expect(infos).toHaveLength(1);
+    // Overridable → the BYPASS prompt renders (alice is the repo admin),
+    // never the can-auto-merge line (hasOverridableBlockers true).
+    const blockedPrompts = sectionOf(blocked!, 1).map((item) => item.info);
+    expect(blockedPrompts).toContain("As an administrator, you may still merge this pull request.");
+    expect(blockedPrompts).not.toContain("This pull request can be merged automatically.");
+
+    // Bob's UNOFFICIAL approval satisfies the evaluator (OfficialOnly false)
+    // and the blocker clears; with no other armed arm the prompt section
+    // carries the can-auto-merge line.
+    await d1().insert(pullReviews).values({
+      type: ReviewType.Approve,
+      reviewerId: bob.id,
+      issueId: b53IssueId,
+      official: false,
+      dismissed: false,
+      stale: false,
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+    const cleared = await loadB53(b53IssueId, b53Index);
+    expect(sectionOf(cleared!, 0).map((item) => item.info)).not.toContain("This pull request is missing approval from one or more code owners.");
+    expect(sectionOf(cleared!, 1).map((item) => item.info)).toContain("This pull request can be merged automatically.");
+  });
+
+  it("renders the protected-files blocker with the matched path list; patterns the walk misses leave the PR unblocked", async () => {
+    await setRule("cowbase", (config) => {
+      config.protectedFilePatterns = "one.txt";
+    });
+    const blocked = await loadB53(b53IssueId, b53Index);
+    const items = sectionOf(blocked!, 0);
+    const item = items.find((entry) => entry.info === "This pull request is blocked because it changes a protected file:");
+    expect(item).toBeDefined(); // the SINGULAR text — one matched path
+    expect(item!.listItems).toEqual(["one.txt"]);
+    // Still overridable-blocked: the admin bypass prompt, not can-auto-merge.
+    expect(sectionOf(blocked!, 1).map((p) => p.info)).toContain("As an administrator, you may still merge this pull request.");
+
+    // The control: patterns outside the walk — no item, the prompt section
+    // flips to can-auto-merge.
+    await setRule("cowbase", (config) => {
+      config.protectedFilePatterns = "docs/*";
+    });
+    const clean = await loadB53(b53IssueId, b53Index);
+    expect(sectionOf(clean!, 0)).toEqual([]);
+    expect(sectionOf(clean!, 1).map((item) => item.info)).toContain("This pull request can be merged automatically.");
+  });
+
+  it("fails closed on the missing base tip (the discovery's GetBranchCommit arm) — and the seam-absent callers OMIT the items", async () => {
+    await setRule("ghostbase", (config) => {
+      config.blockOnCodeownerReviews = true;
+      config.protectedFilePatterns = "one.txt";
+    });
+    const failClosed = await loadB53(ghostIssueId, ghostIndex);
+    const infos = sectionOf(failClosed!, 0).map((item) => item.info);
+    // codeownerRules null → the evaluator answers false → the item; the
+    // changedFiles null → the protected-files arm answers true (its detail
+    // list stays empty — the plural text, no listed files).
+    expect(infos).toContain("This pull request is missing approval from one or more code owners.");
+    expect(infos).toContain("This pull request is blocked because it changes protected files:");
+    const protectedItem = sectionOf(failClosed!, 0).find((item) => item.info.startsWith("This pull request is blocked because it changes protected files"));
+    expect(protectedItem!.listItems).toEqual([]);
+
+    // The reads-absent call omits BOTH items (unknown is not blocked — the
+    // same degrade family the listTips seam documents).
+    const seamAbsent = await loadB53(ghostIssueId, ghostIndex, { reads: false });
+    const absentInfos = sectionOf(seamAbsent!, 0).map((item) => item.info);
+    expect(absentInfos).not.toContain("This pull request is missing approval from one or more code owners.");
+    expect(absentInfos).not.toContain("This pull request is blocked because it changes protected files:");
+  });
 });

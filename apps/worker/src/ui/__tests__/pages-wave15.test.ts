@@ -459,10 +459,15 @@ describe("GET /{owner}/{repo}/settings/branches/edit (the form)", () => {
     expect(html).toContain('id="required_approvals" name="required_approvals" type="number" min="0" value="0"');
     expect(html).toContain('id="enable_approvals_whitelist" name="enable_approvals_whitelist" type="checkbox"');
     expect(html).toContain('id="block_on_outdated_branch" name="block_on_outdated_branch" type="checkbox"');
-    expect(html).not.toContain('name="protected_file_patterns"');
+    // The B-53 merge-gate fields render (B-53R2): the pattern pair in the
+    // Patterns section, the codeowner toggle after the official-request one.
+    expect(html).toContain('id="protected_file_patterns" name="protected_file_patterns" type="text" value=""');
+    expect(html).toContain('id="unprotected_file_patterns" name="unprotected_file_patterns" type="text" value=""');
+    expect(html).toContain('id="block_on_codeowner_reviews" name="block_on_codeowner_reviews" type="checkbox"');
+    expect(html).toContain("Require approval from code owners");
+    // The still-unenforced arms do not render.
     expect(html).not.toContain('name="require_signed_commits"');
     expect(html).not.toContain('name="enable_status_check"');
-    expect(html).not.toContain('name="block_on_codeowner_reviews"');
     // The unenforced-arms note renders.
     expect(html).toContain("stored-but-unenforced arms");
     // User-owned repo: no team inputs.
@@ -481,6 +486,9 @@ describe("GET /{owner}/{repo}/settings/branches/edit (the form)", () => {
     // The stored bindings (the ToBranchProtection render reduced to the form).
     expect(html).toContain('id="required_approvals" name="required_approvals" type="number" min="0" value="0"');
     expect(html).toContain('id="enable_push_none" name="enable_push" type="radio" value="none" checked=""');
+    // The stored B-53 fields bind their values (the edit round-trip source).
+    expect(html).toContain('id="protected_file_patterns" name="protected_file_patterns" type="text" value="secrets/**"');
+    expect(html).toContain('id="block_on_codeowner_reviews" name="block_on_codeowner_reviews" type="checkbox" checked=""');
     // The unrendered arms are absent from the form even when stored.
     expect(html).not.toContain('name="status_check_contexts"');
   });
@@ -686,8 +694,63 @@ describe("POST /{owner}/{repo}/settings/branches/edit (the edit arm)", () => {
     expect(config.enableStatusCheck).toBe(true);
     expect(config.statusCheckContexts).toEqual(["ci/test"]);
     expect(config.requireSignedCommits).toBe(true);
-    expect(config.protectedFilePatterns).toBe("secrets/**");
+    // The B-53 fields are RENDERED now: a POST that omits them is the
+    // cleared-form submission (the browser posts the rendered inputs back),
+    // so the stored secrets/** + codeowner toggle clear.
+    expect(config.protectedFilePatterns).toBe("");
+    expect(config.unprotectedFilePatterns).toBe("");
+    expect(config.blockOnCodeownerReviews).toBe(false);
+  });
+
+  it("stores the B-53 fields when the form carries them (create + the edit round-trip)", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const created = await fetchUi(
+      "/alice/wave15/settings/branches/edit",
+      formPost(
+        "/alice/wave15/settings/branches/edit",
+        {
+          rule_id: "0",
+          rule_name: "b53-fields",
+          enable_push: "none",
+          required_approvals: "0",
+          protected_file_patterns: "secrets/**;.drone.yml",
+          unprotected_file_patterns: "docs/",
+          block_on_codeowner_reviews: "on",
+        },
+        fixture.ownerCookie,
+      ),
+    );
+    expect(created.status).toBe(303);
+    const db = drizzle(env.DB);
+    const repo = (await db.select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15"))).get())!;
+    const row = (await db.select().from(protectedBranches).where(and(eq(protectedBranches.repoId, repo.id), eq(protectedBranches.ruleName, "b53-fields"))).get())!;
+    const config = parseRuleConfig(row.rules);
+    expect(config.protectedFilePatterns).toBe("secrets/**;.drone.yml");
+    expect(config.unprotectedFilePatterns).toBe("docs/");
     expect(config.blockOnCodeownerReviews).toBe(true);
+
+    // The edit round-trip: the GET renders them, the POST carries them back
+    // unchanged; a second POST with the toggle off clears it.
+    const edited = await fetchUi(
+      "/alice/wave15/settings/branches/edit",
+      formPost(
+        "/alice/wave15/settings/branches/edit",
+        {
+          rule_id: String(row.id),
+          rule_name: "b53-fields",
+          enable_push: "none",
+          required_approvals: "0",
+          protected_file_patterns: "secrets/**;.drone.yml",
+          unprotected_file_patterns: "docs/",
+        },
+        fixture.ownerCookie,
+      ),
+    );
+    expect(edited.status).toBe(303);
+    const after = parseRuleConfig((await db.select().from(protectedBranches).where(eq(protectedBranches.id, row.id)).get())!.rules);
+    expect(after.protectedFilePatterns).toBe("secrets/**;.drone.yml");
+    expect(after.unprotectedFilePatterns).toBe("docs/");
+    expect(after.blockOnCodeownerReviews).toBe(false); // the omitted checkbox clears
   });
 
   it("clears the bypass and deletion allowlists when their flags come off", async () => {

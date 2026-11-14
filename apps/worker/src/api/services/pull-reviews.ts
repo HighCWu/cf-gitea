@@ -452,7 +452,11 @@ export class PullReviewsService {
    * AddReviewRequest (models/issues/review.go:697–768): the already-requested
    * skip, the closed/merged 403, the official-flag clear, the REQUEST row,
    * the CommentTypeReviewRequest (27) comment. Returns the created row or
-   * null (skipped).
+   * null (skipped). `isCodeOwners` rides the model's 5th argument
+   * (review.go:764 — SpecialDoerNameCodeOwners lands in the comment's
+   * `comment_meta_data` so the timeline renders the CODEOWNERS doer, not the
+   * poster; the B-53 auto arm passes true, the human request arms default
+   * false, exactly the two upstream callers).
    */
   async addReviewRequest(
     found: RepositoryWithOwner,
@@ -460,6 +464,7 @@ export class PullReviewsService {
     pullRequest: PullRequestRow,
     reviewer: UserRow,
     doerId: number, // requireAuth guarantees the id (the route's `doer.id ?? 0`)
+    isCodeOwners = false,
   ): Promise<ReviewRow | null> {
     const db = this.db;
     const now = new Date();
@@ -493,7 +498,9 @@ export class PullReviewsService {
     const review = inserted[0]!;
 
     // The type-27 comment RETURNS its row — the mail arm composes over it
-    // (upstream's `comment`, review_request.go:38).
+    // (upstream's `comment`, review_request.go:38). The CODEOWNERS marker
+    // rides comment_meta_data (buildCreateCommentMetaData, comment.go:847–
+    // 860: an empty SpecialDoerName stores NULL).
     const [commentRows] = await db.batch([
       db.insert(comments).values({
         type: CommentType.ReviewRequest,
@@ -502,6 +509,7 @@ export class PullReviewsService {
         assigneeId: reviewer.id,
         removedAssignee: 0,
         reviewId: review.id,
+        commentMetaData: isCodeOwners ? JSON.stringify({ special_doer_name: "CODEOWNERS" }) : null,
         createdAt: now,
         updatedAt: now,
       }).returning(),
@@ -536,6 +544,7 @@ export class PullReviewsService {
     pullRequest: PullRequestRow,
     team: typeof teams.$inferSelect,
     doerId: number,
+    isCodeOwners = false, // review.go:822–876's 5th argument — the same CODEOWNERS comment marker
   ): Promise<typeof pullReviews.$inferSelect | null> {
     const db = this.db;
     const now = new Date();
@@ -571,6 +580,7 @@ export class PullReviewsService {
         issueId: issue.id,
         reviewId: review.id,
         assigneeTeamId: team.id, // upstream AssigneeTeamID (review.go:865)
+        commentMetaData: isCodeOwners ? JSON.stringify({ special_doer_name: "CODEOWNERS" }) : null,
         createdAt: now,
         updatedAt: now,
       }).returning(),

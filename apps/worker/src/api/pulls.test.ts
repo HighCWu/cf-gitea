@@ -27,8 +27,8 @@ import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, PRStatus, pullRequests, pullReviews, repoCounters, repoSettings, repositories, ReviewType, teamMembers, teamRepoAccess, teams, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
-import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
-import { prefetchPullRequestRenderContext, toApiPullRequest } from "./services/pulls";
+import { ZERO_OID, branchRef, engineReads, pullHeadRef, refTipMap } from "./services/engine";
+import { prefetchPullRequestRenderContext, pullRequestCodeOwnersReview, toApiPullRequest } from "./services/pulls";
 import { findRepositoryByPath, type Viewer } from "./services/repository";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
@@ -859,6 +859,226 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
       url: ERROR_URL,
     });
     expect(await prRowByRepo(repoId)).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The PR-create auto codeowner review-request arm (census B-53 remainder #2 —
+// PullRequestCodeOwnersReview, services/issue/pull.go:253-310, wired into
+// NewPullRequest at services/pull/pull.go:149-152). Real engine content: the
+// CODEOWNERS file sits on the BASE branch tip (the discovery read), the
+// changed files come from the mergeBase..head walk, and the requests ride the
+// landed review-request cores (the B-48/B-49 class) with the CODEOWNERS
+// comment marker. Upstream order: the auto webhooks announce BEFORE opened
+// (ReviewRequestNotify :166 → notify.NewPullRequest :187).
+// ---------------------------------------------------------------------------
+
+describe("POST create — the auto codeowner review-request arm (PullRequestCodeOwnersReview)", () => {
+  it("requests the changed files' code owners: REQUEST row + CODEOWNERS-marked type-27 comment, webhook BEFORE opened, poster skipped, a user with any latest review row skipped", async () => {
+    // The poster is the stub (id 1, the token identity); Alice owns the repo
+    // and owns the .txt rule — not the poster, no review row → requested.
+    await seedUser("Alice");
+    const repoId = await seedRepo("alice", "co-auto-a");
+    const tip = await seedEngineBranches("alice", "co-auto-a", ["feature"]);
+    const bob = await seedUser("Bob");
+    await landChildCommit("alice", "co-auto-a", "main", tip, [{ name: "CODEOWNERS", content: String.raw`.*\.txt @Alice` + "\n" }], "codeowners\n");
+    await landChildCommit("alice", "co-auto-a", "feature", tip, [
+      { name: "README.md", content: "# co-auto-a v2\n" },
+      { name: "notes.txt", content: "a\n" },
+    ], "child\n");
+    const hookId = await seedHook(repoId, ["pull_request", "pull_request_review_request"]);
+    const res = await createPull("/repos/alice/co-auto-a/pulls", { title: "auto request", head: "feature", base: "main" });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ requested_reviewers: Array<{ login: string }> }>();
+    // The 201 render consults the request rows — Alice rides them.
+    expect(body.requested_reviewers.map((u) => u.login)).toEqual(["Alice"]);
+
+    const pr = await prRowByRepo(repoId);
+    const requests = await db().select().from(pullReviews).where(eq(pullReviews.issueId, pr[0]!.issueId)).all();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.type).toBe(ReviewType.Request);
+    const aliceRows = await db().select().from(users).where(eq(users.usernameLower, "alice")).all();
+    expect(requests[0]!.reviewerId).toBe(aliceRows[0]!.id);
+    expect(requests[0]!.reviewerTeamId).toBe(0);
+    expect(requests.some((r) => r.reviewerId === bob.id)).toBe(false); // Bob is not a rule owner here
+    // The type-27 comment carries the CODEOWNERS special doer
+    // (review.go:764 — comment_meta_data {"special_doer_name":"CODEOWNERS"}),
+    // the poster rides poster_id.
+    const comments27 = await db().select().from(comments).where(and(eq(comments.issueId, pr[0]!.issueId), eq(comments.type, CommentType.ReviewRequest))).all();
+    expect(comments27).toHaveLength(1);
+    expect(comments27[0]!.assigneeId).toBe(aliceRows[0]!.id);
+    expect(JSON.parse(comments27[0]!.commentMetaData ?? "null")).toEqual({ special_doer_name: "CODEOWNERS" });
+
+    // Webhook order: the auto review_request FIRST, then opened (:166 → :187).
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string; requested_reviewer?: { login: string } });
+    expect(payloads[0]?.action).toBe("review_requested");
+    expect(payloads[0]?.requested_reviewer?.login).toBe("Alice");
+    expect(payloads[1]?.action).toBe("opened");
+  });
+
+  it("skips the arms: no CODEOWNERS, non-matching changed files, a WIP title, and the author-only rule (the poster is never self-requested)", async () => {
+    await seedUser("Alice");
+    await seedRepo("alice", "co-auto-b");
+    const tip = await seedEngineBranches("alice", "co-auto-b", ["feature", "f2", "f3", "f4"]);
+    // Each head carries the same .txt change; main's CODEOWNERS content
+    // mutates between the creates (distinct base/head pairs — no 409s).
+    for (const branch of ["feature", "f2", "f3", "f4"]) {
+      await landChildCommit("alice", "co-auto-b", branch, tip, [{ name: "notes.txt", content: "a\n" }], `child ${branch}\n`);
+    }
+    // No CODEOWNERS anywhere — the arm returns before any git walk.
+    const bare = await createPull("/repos/alice/co-auto-b/pulls", { title: "bare", head: "feature", base: "main" });
+    expect(bare.status).toBe(201);
+
+    // CODEOWNERS matching only .json while the changed set is README.md +
+    // notes.txt (the two-point mergeBase..head walk counts the head-side
+    // tree changes in both directions) — no matching rule, no request
+    // (:275-277).
+    const mainTip1 = (refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "co-auto-b" }).listRefs())).get(branchRef("main"))!.target;
+    await landChildCommit("alice", "co-auto-b", "main", mainTip1, [{ name: "CODEOWNERS", content: String.raw`.*\.json @Alice` + "\n" }], "codeowners json\n");
+    const unmatching = await createPull("/repos/alice/co-auto-b/pulls", { title: "unmatching", head: "f2", base: "main" });
+    expect(unmatching.status).toBe(201);
+
+    // The author-only rule: the poster (the stub) owns every rule → the
+    // reviewer set empties and the arm skips (upstream :312's poster arm).
+    const mainTip2 = (refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "co-auto-b" }).listRefs())).get(branchRef("main"))!.target;
+    await landChildCommit("alice", "co-auto-b", "main", mainTip2, [{ name: "CODEOWNERS", content: String.raw`.* @cf-gitea-stub` + "\n" }], "codeowners self\n");
+    const authorOnly = await createPull("/repos/alice/co-auto-b/pulls", { title: "author only", head: "f3", base: "main" });
+    expect(authorOnly.status).toBe(201);
+
+    // A WIP title skips the whole arm even with a MATCHING rule owned by
+    // someone else (:258-260).
+    const mainTip3 = (refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "co-auto-b" }).listRefs())).get(branchRef("main"))!.target;
+    await landChildCommit("alice", "co-auto-b", "main", mainTip3, [{ name: "CODEOWNERS", content: String.raw`.* @Alice` + "\n" }], "codeowners alice\n");
+    const wip = await createPull("/repos/alice/co-auto-b/pulls", { title: "WIP: gated", head: "f4", base: "main" });
+    expect(wip.status).toBe(201);
+    const rows = await db().select().from(pullReviews).all();
+    expect(rows).toHaveLength(0);
+    const comments27 = await db().select().from(comments).where(eq(comments.type, CommentType.ReviewRequest)).all();
+    expect(comments27).toHaveLength(0);
+  });
+
+  it("requests the matching org TEAM: the request row carries reviewerTeamId, the webhook omits requested_reviewer (the landed team convention)", async () => {
+    await seedUser("Alice");
+    const repoId = await seedRepo("alice", "co-auto-c");
+    const tip = await seedEngineBranches("alice", "co-auto-c", ["feature"]);
+    await db().insert(users).values({ username: "creworg", usernameLower: "creworg", isAdmin: false, status: "active", type: "org", visibility: "public", createdAt: new Date("2026-01-01T00:00:00Z") });
+    const orgRows = await db().select().from(users).where(eq(users.usernameLower, "creworg")).all();
+    const teamRows = await db().insert(teams).values({ orgId: orgRows[0]!.id, lowerName: "crew", name: "Crew", authorize: "write" }).returning({ id: teams.id }).all();
+    await landChildCommit("alice", "co-auto-c", "main", tip, [{ name: "CODEOWNERS", content: String.raw`.*\.txt @creworg/Crew` + "\n" }], "codeowners\n");
+    await landChildCommit("alice", "co-auto-c", "feature", tip, [
+      { name: "README.md", content: "# co-auto-c v2\n" },
+      { name: "notes.txt", content: "a\n" },
+    ], "child\n");
+    const hookId = await seedHook(repoId, ["pull_request", "pull_request_review_request"]);
+
+    const res = await createPull("/repos/alice/co-auto-c/pulls", { title: "team request", head: "feature", base: "main" });
+    expect(res.status).toBe(201);
+    const pr = await prRowByRepo(repoId);
+    const requests = await db().select().from(pullReviews).where(eq(pullReviews.issueId, pr[0]!.issueId)).all();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.reviewerTeamId).toBe(teamRows[0]!.id);
+    expect(requests[0]!.reviewerId).toBe(0);
+    const comments27 = await db().select().from(comments).where(and(eq(comments.issueId, pr[0]!.issueId), eq(comments.type, CommentType.ReviewRequest))).all();
+    expect(comments27[0]!.assigneeTeamId).toBe(teamRows[0]!.id);
+    expect(JSON.parse(comments27[0]!.commentMetaData ?? "null")).toEqual({ special_doer_name: "CODEOWNERS" });
+
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string; requested_reviewer?: unknown });
+    expect(payloads[0]?.action).toBe("review_requested");
+    expect(payloads[0]?.requested_reviewer).toBeUndefined();
+    expect(payloads[1]?.action).toBe("opened");
+  });
+
+  it("fails the create on the unrelated-histories pair when rules exist (git.MergeBase's NotExist error, merge.go:27-29 — the create answers 500, the committed-prefix wart keeps the row, no requests land)", async () => {
+    await seedUser("Alice");
+    const repoId = await seedRepo("alice", "co-auto-d");
+    const tip = await seedEngineBranches("alice", "co-auto-d", ["feature"]);
+    await landChildCommit("alice", "co-auto-d", "main", tip, [{ name: "CODEOWNERS", content: String.raw`.* @Alice` + "\n" }], "codeowners\n");
+    // An ORPHAN root on `orphan` — no common ancestor with main.
+    const blob = new TextEncoder().encode("orphan root\n");
+    const blobOid = await gitObjectOid("blob", blob);
+    const tree = serializeTree([{ mode: "100644", name: "orphan.txt", oid: blobOid }]);
+    const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000009, tz: "+0000" };
+    const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "orphan\n" });
+    const cell = env.REPO.getByName("alice/co-auto-d");
+    const put = await cell.putApiObjects([
+      { oid: blobOid, type: "blob", data: blob },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: commit.oid, type: "commit", data: commit.data },
+    ]);
+    expect(put.tag).toBe("ok");
+    const land = await cell.commitApiChange({ ref: branchRef("orphan"), expectedOldOid: ZERO_OID, newOid: commit.oid });
+    expect(land.tag).toBe("committed");
+
+    const res = await createPull("/repos/alice/co-auto-d/pulls", { title: "unrelated", head: "orphan", base: "main" });
+    expect(res.status).toBe(500);
+    // The committed-prefix wart (the explicit reviewer arms' documented
+    // posture — upstream's tx rolls the PR back, ours keeps the row).
+    const rows = await prRowByRepo(repoId);
+    expect(rows).toHaveLength(1);
+    const requests = await db().select().from(pullReviews).where(eq(pullReviews.issueId, rows[0]!.issueId)).all();
+    expect(requests).toHaveLength(0);
+  });
+
+  // The contain arm's NON-create states — unreachable through the POST route
+  // (a fresh PR's issue has no review rows when the arm runs inside the
+  // create), reachable through the arm's other upstream callers (the push
+  // sync AddTestPullRequestTask, pull.go:464-470; the WIP→ready title
+  // transition, issue.go:121-127). Called directly over a seeded PR with
+  // pre-existing review rows: GetReviewsByIssueID's latest-per-reviewer map
+  // (review_list.go:162-196) counts approve/reject/request/comment rows that
+  // are NOT dismissed; a dismissed latest row leaves the user requestable.
+  it("contain semantics over pre-existing reviews (service level): an approved owner, a comment-only owner and a requested owner are skipped; a dismissed latest row re-requests", async () => {
+    await seedUser("Alice");
+    const repoId = await seedRepo("alice", "co-auto-e");
+    const tip = await seedEngineBranches("alice", "co-auto-e", ["feature"]);
+    await landChildCommit("alice", "co-auto-e", "main", tip, [{ name: "CODEOWNERS", content: String.raw`.* @Alice @Bob @Cara @Dan` + "\n" }], "codeowners\n");
+    await landChildCommit("alice", "co-auto-e", "feature", tip, [{ name: "notes.txt", content: "a\n" }], "child\n");
+    const bob = await seedUser("Bob");
+    const cara = await seedUser("Cara");
+    const dan = await seedUser("Dan");
+    const created = await service().createPullRequest({ repoId, title: "contain", posterId: 1, headRepoId: repoId, baseBranch: "main", headBranch: "feature" });
+    const issueId = created.issue.id;
+
+    const bobId = bob.id;
+    const caraId = cara.id;
+    const danId = dan.id;
+    const aliceRows = await db().select().from(users).where(eq(users.usernameLower, "alice")).all();
+    const aliceId = aliceRows[0]!.id;
+    const now = new Date();
+    await db().insert(pullReviews).values([
+      { type: ReviewType.Approve, reviewerId: bobId, issueId, content: "", dismissed: false, createdAt: now, updatedAt: now },
+      { type: ReviewType.Comment, reviewerId: caraId, issueId, content: "", dismissed: false, createdAt: now, updatedAt: now },
+      { type: ReviewType.Request, reviewerId: danId, issueId, content: "", dismissed: false, createdAt: now, updatedAt: now },
+      { type: ReviewType.Approve, reviewerId: aliceId, issueId, content: "", dismissed: true, createdAt: now, updatedAt: now },
+    ]);
+
+    const pair = (await findRepositoryByPath(env.DB, "alice", "co-auto-e"))!;
+    const pr = (await prRowByRepo(repoId))[0]!;
+    const issueRow = (await db().select().from(issues).where(eq(issues.id, issueId)).all())[0]!;
+    // The service create does NOT land refs/pull/N/head (the route's
+    // createPullHeadRef does) — the arm reads it, so land it here.
+    const featureTip = (refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "co-auto-e" }).listRefs())).get(branchRef("feature"))!.target;
+    const headLand = await env.REPO.getByName("alice/co-auto-e").commitApiChange({ ref: pullHeadRef(pr.index), expectedOldOid: ZERO_OID, newOid: featureTip });
+    expect(headLand.tag).toBe("committed");
+    const landed = await pullRequestCodeOwnersReview(env, env.DB, pair, issueRow, pr, 1);
+    const requesterIds: number[] = [];
+    for (const request of landed) {
+      if (request.kind === "user") requesterIds.push(request.user.id);
+    }
+    requesterIds.sort((a, b) => a - b);
+    // Bob's latest is an undismissed APPROVE, Cara's a COMMENT, Dan's a
+    // REQUEST — all three contained. Alice's only row is DISMISSED —
+    // excluded from the map, so she is requestable: exactly her request
+    // lands.
+    expect(requesterIds).toEqual([aliceId]);
+    const rows = await db().select().from(pullReviews).where(eq(pullReviews.issueId, issueId)).all();
+    const requestRows = rows.filter((r) => r.type === ReviewType.Request);
+    expect(requestRows).toHaveLength(2); // Dan's seeded one + Alice's new one
+    expect(requestRows.some((r) => r.reviewerId === aliceId)).toBe(true);
+    // The new row's comment carries the marker.
+    const comments27 = await db().select().from(comments).where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.ReviewRequest))).all();
+    expect(comments27).toHaveLength(1);
+    expect(comments27[0]!.assigneeId).toBe(aliceId);
   });
 });
 

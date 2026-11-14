@@ -267,22 +267,49 @@ export async function pullRequestDiff(
  * plain-protected merge pays nothing.
  */
 export async function pullGateGitInputs(env: ApiEnv["Bindings"], pair: RepositoryWithOwner, pr: PullRequestRow, d1: D1Database): Promise<PullBranchProtectionGit> {
-  const isFork = pair.repo.forkParent !== null;
-  const changedFiles = await pullRequestDiffForEnv(env, pair, pr)
-    .then((range): PullBranchProtectionGit["changedFiles"] => ({
-      paths: range.files.map((file) => file.path),
-      // A null merge base (unrelated histories → the Empty state) leaves the
-      // walk incomplete: upstream's git.MergeBase errors there and the
-      // codeowner gate fails closed (services/issue/pull.go:161-165 →
-      // :171-175).
-      complete: range.mergeBase !== null && !range.truncated,
-    }))
-    .catch((): null => null);
+  return pullGateGitInputsFromReads(engineReads(env, pair.repo), pair.repo, pr, d1);
+}
+
+/**
+ * The SAME collection over a caller-provided reads bundle — the B-53R2
+ * merge-box display arms thread it through the loader's optional `reads`
+ * seam (the callers already build `engineReads(env, repo)` for the squash
+ * walk and the branch tips), so the box evaluates the two blockers over the
+ * ONE landed composition instead of re-implementing the walk. The walk
+ * pieces mirror `pullRequestDiffForEnv`'s arms verbatim: the stored
+ * `pr.mergeBase` when the row carries it, the live merge-base read
+ * otherwise; a null merge base answers `{paths: [], complete: false}`; a
+ * null diff answers the empty COMPLETE walk (the carrier's landed posture);
+ * a failed ref read answers null (fail closed).
+ */
+export async function pullGateGitInputsFromReads(
+  reads: EngineReads,
+  repo: Pick<RepositoryWithOwner["repo"], "forkParent" | "ownerNamespace" | "slug">,
+  pr: PullRequestRow,
+  d1: D1Database,
+): Promise<PullBranchProtectionGit> {
+  const isFork = repo.forkParent !== null;
+  const changedFiles = await (async (): Promise<PullBranchProtectionGit["changedFiles"]> => {
+    const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
+    const headCommit = await reads.readCommit(pullHeadRef(pr.index));
+    if (baseTip === null || headCommit === null) return null;
+    let mergeBase = pr.mergeBase;
+    if (mergeBase === null) {
+      const base = await reads.mergeBase(baseTip.oid, headCommit.oid);
+      mergeBase = base !== null && base.tag === "ok" ? base.base : null;
+    }
+    // A null merge base (unrelated histories → the Empty state) leaves the
+    // walk incomplete: upstream's git.MergeBase errors there and the
+    // codeowner gate fails closed (services/issue/pull.go:161-165 →
+    // :171-175).
+    if (mergeBase === null) return { paths: [], complete: false };
+    const diff = await reads.readDiff(headCommit.oid, mergeBase);
+    return { paths: (diff?.files ?? []).map((file) => file.path), complete: !diff?.truncated };
+  })().catch((): null => null);
 
   const codeownerRules = isFork
     ? [] // :62-64 — a fork base repo has no codeowner rules, before any read
     : await (async (): Promise<CodeOwnerRule[] | null> => {
-        const reads = engineReads(env, pair.repo);
         const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
         if (baseTip === null) return null; // GetBranchCommit error — fail closed
         return discoverCodeOwnerRules(d1, (path) => reads.readBlob(baseTip.oid, path));
