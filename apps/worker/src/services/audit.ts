@@ -252,9 +252,13 @@ export const AuditActions = {
   // ACTUALLY changed against the :68 pre-write snapshot, with the new
   // boolean as the var. `{active}` rides the deviation-6 status fold's
   // active-driven flips (services/user-accounts.ts
-  // emitUserColumnAuditRows); `{restricted}` arms the moment a write site
-  // lands the is_restricted column (the API PATCH still accepts-and-ignores
-  // the field — admin-t2.ts's editUserOptionSchema docstring).
+  // emitUserColumnAuditRows); `{restricted}` is LIVE — the API PATCH write
+  // (admin-t2.ts, update.go:135-139's presence gate) arms the helper on a
+  // flip, and the API CREATE arm lands the column at insert
+  // (admin/user.go:122-125's overwriteDefault.IsRestricted) while emitting NO
+  // restricted row there: upstream's create carries only UserCreate
+  // (admin/user.go:149) — the trio lives in the UpdateUser tail, which create
+  // never calls.
   UserActive: defineAction("user:status:active", "Changed activation status of user {scope} to {active}."),
   UserRestricted: defineAction("user:status:restricted", "Changed restricted status of user {scope} to {restricted}."),
   UserAdmin: defineAction("user:status:admin", "Changed admin status of user {scope} to {admin}."),

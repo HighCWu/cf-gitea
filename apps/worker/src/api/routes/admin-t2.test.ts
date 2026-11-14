@@ -388,7 +388,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(ok.status).toBe(201);
   });
 
-  it("persists must_change_password=false from the body; source_id/login_name/restricted stay accepted-and-ignored (deviation 1)", async () => {
+  it("persists must_change_password=false from the body; source_id/login_name stay accepted-and-ignored (deviation 1)", async () => {
     const res = await adminSend(
       "/admin/users",
       jsonAdmin({
@@ -399,7 +399,6 @@ describe("POST /admin/users (adminCreateUser)", () => {
         send_notify: true,
         source_id: 7,
         login_name: "ext-id",
-        restricted: true,
       }),
     );
     expect(res.status).toBe(201);
@@ -408,6 +407,53 @@ describe("POST /admin/users (adminCreateUser)", () => {
     // The explicit *bool override of the default-true (admin/user.go:93-95).
     const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "tokenonly")).limit(1))[0]!;
     expect(row.mustChangePassword).toBe(false);
+  });
+
+  it("threads restricted through the create: a present value lands the column, absent stays false (admin/user.go:122-125 → user.go:741-742, B-89's follow-up); the UserCreate audit arm carries no restricted row", async () => {
+    // optional.FromPtr(form.Restricted) → overwriteDefault.IsRestricted
+    // (admin/user.go:122-125): a PRESENT field writes ANY value — true here.
+    const flagged = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "restricted-true", email: "rtrue@example.com", password: "Sup3r-Secret!", restricted: true }),
+    );
+    expect(flagged.status).toBe(201);
+    const flaggedBody: Record<string, unknown> = await flagged.json();
+    expect(flaggedBody.restricted).toBe(true); // the toApiUser render reflects the column in the same response
+    const trueRow = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "restricted-true")).limit(1)
+    )[0]!;
+    expect(trueRow.restricted).toBe(true);
+
+    // An ABSENT field keeps createUser's default (user.go:712
+    // setting.Service.DefaultUserIsRestricted — unset → false; user.go:741-742
+    // never fires without a Some).
+    const defaulted = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "restricted-absent", email: "rabsent@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(defaulted.status).toBe(201);
+    const absentRow = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "restricted-absent")).limit(1)
+    )[0]!;
+    expect(absentRow.restricted).toBe(false);
+
+    // A PRESENT false writes false through the same Has() arm (the value
+    // happens to equal the default, but the write is real).
+    const explicitFalse = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "restricted-false", email: "rfalse@example.com", password: "Sup3r-Secret!", restricted: false }),
+    );
+    expect(explicitFalse.status).toBe(201);
+    const falseRow = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "restricted-false")).limit(1)
+    )[0]!;
+    expect(falseRow.restricted).toBe(false);
+
+    // Upstream's create emits ONLY UserCreate (admin/user.go:149) — no
+    // restricted-family row at create (the status trio lives in the
+    // UpdateUser tail, update.go:204-218, which create never calls).
+    const audits = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(audits.map((row) => row.action)).toEqual(["user:create", "user:create", "user:create"]);
   });
 
   it("409s on the shared-namespace collision and the duplicate email", async () => {
@@ -628,19 +674,46 @@ describe("GET /admin/users (adminSearchUsers)", () => {
   });
 
   it("evaluates the unmodeled-column filters against the constant state (deviation 4)", async () => {
-    // Every cf-gitea user is local and un-restricted: the false filters match
-    // everyone, the true filters match nothing. (The 2FA filter left this
-    // deviation when the two_factor store landed — its own describe below.)
+    // Every cf-gitea user is local: the false filters match everyone, the
+    // true filters match nothing. (The 2FA filter left this deviation when
+    // the two_factor store landed; is_restricted left it when
+    // users.is_restricted landed and the write arms followed — its own
+    // describe arm below.)
     const locals = await adminSend("/admin/users?source_id=0", authed());
     expect(locals.headers.get("X-Total-Count")).toBe("6");
     const foreign = await adminSend("/admin/users?source_id=7", authed());
     expect(foreign.headers.get("X-Total-Count")).toBe("0");
-    const unrestricted = await adminSend("/admin/users?is_restricted=false", authed());
-    expect(unrestricted.headers.get("X-Total-Count")).toBe("6");
-    const restricted = await adminSend("/admin/users?is_restricted=true", authed());
-    expect(restricted.headers.get("X-Total-Count")).toBe("0");
     const external = await adminSend("/admin/users?login_name=ext-id", authed());
     expect(external.headers.get("X-Total-Count")).toBe("0");
+  });
+
+  it("filters is_restricted by exact boolean match — both polarities, absent = no filter (search.go:118-120; admin/user.go:500-501)", async () => {
+    // The column landed NOT NULL DEFAULT false, so the six fixture users are
+    // all unrestricted; one explicit flag creates the restricted side.
+    await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.usernameLower, "bravo"));
+
+    // is_restricted=true → only the restricted rows.
+    const restricted = await adminSend("/admin/users?is_restricted=true", authed());
+    expect(restricted.headers.get("X-Total-Count")).toBe("1");
+    expect(((await restricted.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["bravo"]);
+
+    // is_restricted=false → only the unrestricted rows (the EXACT match —
+    // NOT a "true-only" arm).
+    const unrestricted = await adminSend("/admin/users?is_restricted=false", authed());
+    expect(unrestricted.headers.get("X-Total-Count")).toBe("5");
+    expect(
+      (await unrestricted.json<Array<Record<string, unknown>>>()).every((entry) => entry.login !== "bravo"),
+    ).toBe(true);
+
+    // Param absent → no filter at all (search.go:118's Has() gate — the
+    // option is armed only when the form string is non-empty,
+    // admin/user.go:500-501).
+    const unfiltered = await adminSend("/admin/users", authed());
+    expect(unfiltered.headers.get("X-Total-Count")).toBe("6");
+
+    // The filter ANDs with the keyword arm like every other condition.
+    const combined = await adminSend("/admin/users?q=brav&is_restricted=true", authed());
+    expect(((await combined.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["bravo"]);
   });
 
   it("reads the is_2fa_enabled filter against the two_factor store — BOTH polarities (search.go:142-162)", async () => {

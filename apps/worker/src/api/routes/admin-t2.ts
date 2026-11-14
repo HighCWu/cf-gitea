@@ -131,12 +131,15 @@ import { toApiUser } from "../services/user";
  *      conversion-to-bot path; UpdateAuth's service-level twin
  *      (update.go:231-235) covers an ALREADY-bot target — both 400 with
  *      `a bot account cannot have a password or authentication source`.
- *   4. **No restricted / external-login columns**: the `restricted` filter
- *      evaluates against the constant false-everything state (true filters
- *      match nothing); `source_id`/`login_name` filters likewise (every user
- *      is local). `is_2fa_enabled` LEFT this deviation when the `two_factor`
+ *   4. **No external-login columns**: the `source_id`/`login_name` filters
+ *      evaluate against the constant local-everything state (every user is
+ *      local). `is_2fa_enabled` LEFT this deviation when the `two_factor`
  *      store landed (migration 0059) — the filter is the real EXISTS over it
  *      by uid, both polarities live (search.go:142–162's LEFT JOIN in twin).
+ *      `is_restricted` LEFT it too once `users.is_restricted` landed (and the
+ *      PATCH/CREATE arms write it): the filter is the exact-match boolean
+ *      `is_restricted = <value>` (search.go:118–120), engaged only when the
+ *      param is present and non-empty (admin/user.go:500–501).
  *   5. **No `updated` column**: the adminSearchUsers `updated` sort orders by
  *      `created_at` (upstream orders by `updated_unix`, user/search.go:21–36).
  *   6. **`active`/`prohibit_login` conflation**: upstream keeps two columns;
@@ -358,11 +361,15 @@ async function searchAdminUsers(
   if (isAdminRaw !== null && isAdminRaw !== "") {
     conditions.push(eq(users.isAdmin, formBoolValue(isAdminRaw)));
   }
-  // restricted: constant false-everything state (deviation 4 — no
-  // users.restricted column exists).
+  // IsRestricted (search.go:118-120): the route arms the option only when the
+  // param is present and non-empty (admin/user.go:500-501's
+  // `ctx.FormString("is_restricted") != ""` gate), then the filter is the
+  // EXACT-MATCH boolean `is_restricted = <value>` — both polarities live
+  // against the landed users.is_restricted column (the deviation-4
+  // false-everything posture is cured: the PATCH and CREATE arms write it).
   const isRestrictedRaw = url.searchParams.get("is_restricted");
-  if (isRestrictedRaw !== null && isRestrictedRaw !== "" && formBoolValue(isRestrictedRaw)) {
-    conditions.push(sql`0 = 1`);
+  if (isRestrictedRaw !== null && isRestrictedRaw !== "") {
+    conditions.push(eq(users.restricted, formBoolValue(isRestrictedRaw)));
   }
   const isTwoFaRaw = url.searchParams.get("is_2fa_enabled");
   if (isTwoFaRaw !== null && isTwoFaRaw !== "") {
@@ -462,9 +469,22 @@ const adminSearchUsersRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
  * Mirror of the contract's `CreateUserOption` (required: username, email).
  * `password` and `must_change_password` are LIVE (SPEC-0002 §6): the ladder
  * enforces upstream's 400s (admin/user.go:102–120) and the flag stores with
- * the default-true semantics (admin/user.go:89–95). `source_id` /
- * `login_name` remain accepted-and-ignored — deviation 1 (every user is
- * local). `send_notify` LEFT deviation 1 when the mailer landed
+ * the default-true semantics (admin/user.go:89–95). `restricted` is LIVE
+ * (the B-89 follow-up): upstream threads it through
+ * `overwriteDefault.IsRestricted` (admin/user.go:122–125,
+ * `optional.FromPtr(form.Restricted)`) into createUser's overwrite loop
+ * (user.go:741–742 `if overwrite.IsRestricted.Has()`) against the user.go:712
+ * default `setting.Service.DefaultUserIsRestricted` (unset → false; no config
+ * surface landed) — a present field lands ANY value, an absent field stays
+ * false; the landed `users.is_restricted` column carries it and the response
+ * render reflects it. NO template interplay (`Meta{}` carries no restricted)
+ * and NO visibility interplay (Visibility has its own overwrite arm,
+ * admin/user.go:127–129). Upstream's create emits ONLY the UserCreate audit
+ * row (admin/user.go:149) — no restricted-family row exists at create (the
+ * status trio lives in the UpdateUser tail, update.go:204–218, which create
+ * never calls). `source_id` / `login_name` remain accepted-and-ignored —
+ * deviation 1 (every user is local). `send_notify` LEFT deviation 1 when the
+ * mailer landed
  * (specs/email-outbound.md §2.5): it fires the register-notify mail via
  * services/mail/register-notify.ts, upstream admin/user.go:153-156 parity.
  * Out-of-enum `visibility` dies in the request validator (runtime-only 400
@@ -564,6 +584,15 @@ async function insertCreatedUser(
           // FullName, so a user-typed create fills both.
           displayName: form.full_name ?? null,
           isAdmin: false,
+          // IsRestricted at create (admin/user.go:122-125 → createUser:
+          // user.go:712's `setting.Service.DefaultUserIsRestricted` default →
+          // user.go:741-742's `if overwrite.IsRestricted.Has()`): the API
+          // binds optional.FromPtr(form.Restricted), so a present field
+          // writes ANY value and an absent field keeps the default — false,
+          // the setting's unset value (no config surface landed). The
+          // `?? false` fold is observationally identical to upstream's
+          // overwrite-or-default while the default stays constant.
+          restricted: form.restricted ?? false,
           status: "active",
           visibility: form.visibility ?? "public",
           fullName: form.full_name ?? null,
