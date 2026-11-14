@@ -60,32 +60,50 @@
  *      api/routes/pulls.ts — upstream's own cleanup posture,
  *      services/pull/pull.go:157).
  *
- * The parity remainder (upstream arms the update arm runs that this lane
- * defers — recorded here and in the census row, not silently dropped):
- * `CreatePushPullComment` (the type-29 pull_push comment) and the
- * review-stale/dismiss maintenance (`MarkReviewsAsStale`/
- * `MarkReviewsAsNotStale`/`DismissApprovalReviews`) plus
- * `StartPullRequestCheckImmediately` on the update arm. The lane does run
- * the D1 re-arm (head_sha/status/divergence, the §3.4 sync shape) and the
- * `pull_request` action=opened (create) / `pull_request_sync`
- * action=synchronized (update) webhooks; the D-7c auto-merge re-check
- * enqueues through the shared push tail because the translated command IS a
- * `refs/pull/N/head` command to the collector.
+ * The update arm runs ALL of upstream's ProcReceive update wall-clock (the
+ * tails below): the D1 re-arm (head_sha/status/divergence — the §3.4 sync
+ * shape, and the markChecking half of `StartPullRequestCheckImmediately`),
+ * the review-stale/dismiss maintenance (`MarkReviewsAsStale`/
+ * `DismissApprovalReviews` under the base rule's dismiss_stale_approvals /
+ * `MarkReviewsAsNotStale`, agit.go:262-280 — gated on the PR ROW's stored
+ * head, not the shared push path's content comparison), the immediate
+ * mergeability check (the queue work of `StartPullRequestCheckImmediately`,
+ * check.go:76-80, run inline through `ensurePullRequestChecked` — the
+ * landed lazy-check family), the type-29 `pull_push` comment (upstream's
+ * `CreatePushPullComment` — the SAME comment family as normal PR head
+ * pushes, services/pull/comment.go:95-160, with the agit specifics: the
+ * doer is the agit pusher, old/new are the head ref's pre-/post-move oids,
+ * and isForcePush is the `force-push` OPTION value (agit.go:297), not the
+ * shared path's ancestry derivation) with its `PullRequestPushCommits`
+ * mail, and the `pull_request` action=opened (create) /
+ * `pull_request_sync` action=synchronized (update) webhooks; the D-7c
+ * auto-merge re-check enqueues through the shared push tail because the
+ * translated command IS a `refs/pull/N/head` command to the collector.
+ * Upstream's create arm has NO immediate check either way (NewPullRequest,
+ * pull.go:100-193, starts none for either flow — the fresh row waits for
+ * its first consumer, our landed §3.4 lazy posture), and it writes the
+ * FIRST type-29 comment at create (pull.go:145, both flows) — that
+ * create-arm first comment is the one recorded remainder.
  */
 
-import { and, eq } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/d1";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
+import { Context } from "hono";
 
+import type { ApiEnv } from "../env";
 import { ActionType, recordAction, type ActionDraft } from "./activity-feeds";
 import { isUserBlockedBy } from "./blocks";
 import { branchRef, pullHeadRef } from "./engine";
-import { pullRequestDiffShortStatForEnv } from "./pull-engine";
+import { ensurePullRequestChecked, pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { apiUserFromRow, findRepositoryById, toApiRepository, type RepositoryRow, type UserRow, type Viewer } from "./repository";
 import { toApiPullRequest } from "./pulls";
-import { appOrigin } from "../../services/webhooks-push";
+import { appOrigin, DISMISS_STALE_MESSAGE, MAX_PUSH_COMMITS_IN_COMMENT } from "../../services/webhooks-push";
+import { findRule, parseRuleConfig } from "../../services/branch-protection";
+import { notifyPullRequestPushCommits } from "../../services/mail/notify";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import { IssuesService, ellipsisDisplayString, MAX_TITLE_DISPLAY_WIDTH } from "../../issues/service";
-import { issues, PRFlow, PRStatus, pullRequests, users } from "../../db/schema";
+import { CommentType } from "../../issues/comment-types";
+import { comments, issues, PRFlow, PRStatus, pullRequests, pullReviews, ReviewType, users } from "../../db/schema";
 
 /** Upstream `ForPrefix` (modules/git/ref.go:73). */
 export const FOR_PREFIX = "refs/for/";
@@ -244,6 +262,11 @@ export type AgitPlanEntry =
       index: number;
       headBranch: string;
       baseBranch: string;
+      /** The `force-push` OPTION value (agit.go:107 read once per receive;
+       *  the shared push path derives force-ness from ancestry instead —
+       *  upstream's agit comment and result carry the OPTION's value even
+       *  when the history was actually fast-forward, agit.go:297). */
+      forcePush: boolean;
     };
 
 export interface AgitPlan {
@@ -461,6 +484,7 @@ async function planOne(
       index,
       headBranch,
       baseBranch: resolved.base,
+      forcePush: pushOptionBool(options, "force-push"),
     };
     memo.set(memoKey, entry);
     return entry;
@@ -1211,16 +1235,52 @@ export async function applyAgitCreateTail(
   }
 }
 
-/** The update arm's post-receive work: the §3.4 re-arm (head_sha cache,
- *  status=checking re-arming the lazy mergeability check, the recomputed
- *  divergence — syncPullRequestHead's D1 shape, CAS-guarded by has_merged=0
- *  like upstream's UpdateColsIfNotMerged), then the `pull_request_sync`
- *  action=synchronized webhook (upstream PullRequestSynchronized,
- *  notifier.go:835-845 — before/after are the head ref's old/new oids).
- *  Upstream's type-29 push comment and the review-stale/dismiss maintenance
- *  are the recorded remainder (module header). */
+/**
+ * The update arm's post-receive work — upstream's whole ProcReceive update
+ * wall-clock after UpdateRefForAgit (agit.go:262-330), in upstream's order:
+ *
+ *   1. the §3.4 re-arm (head_sha cache, status=checking, recomputed
+ *      divergence — syncPullRequestHead's D1 shape, CAS-guarded by
+ *      has_merged=0 like upstream's UpdateColsIfNotMerged). This is ALSO
+ *      the markChecking half of StartPullRequestCheckImmediately
+ *      (check.go:64-74 — status=Checking through UpdateColsIfNotMerged);
+ *   2. the review-stale/dismiss maintenance (agit.go:262-280), gated on the
+ *      PR ROW's stored head vs the new oid (upstream captures
+ *      pr.HeadCommitID BEFORE UpdateRefForAgit, agit.go:236-237 — the row
+ *      inequality, NOT the shared push path's content comparison,
+ *      pull.go:503-538): MarkReviewsAsStale (every row, review.go:624-628),
+ *      then DismissApprovalReviews when the BASE branch's rule sets
+ *      dismiss_stale_approvals (services/pull/review.go:339-365 — the
+ *      undismissed approvals flip dismissed and each lands a type-32
+ *      comment), then MarkReviewsAsNotStale against the new head
+ *      (review.go:630-635). Every leg log-and-continue (agit.go's
+ *      log.Error arms);
+ *   3. StartPullRequestCheckImmediately's QUEUE work run inline
+ *      (agit.go:279 — upstream enqueues, the worker runs the mergeability
+ *      check; ours runs the landed lazy-check family
+ *      `ensurePullRequestChecked` right here on the still-checking fresh
+ *      row, which self-gates on has_merged/status). The CREATE arm has no
+ *      check upstream either (NewPullRequest starts none — module header);
+ *   4. `CreatePushPullComment` — the type-29 push comment, the SAME family
+ *      as normal PR head pushes (services/pull/comment.go:95-160; the
+ *      normal-push caller pull.go:406) with the agit specifics: the doer is
+ *      the agit pusher, old/new are the head ref's pre-/post-move oids
+ *      (agit.go:188-194 + 296), and isForcePush is the `force-push` OPTION
+ *      value (agit.go:297), not the shared path's ancestry derivation.
+ *      Errors log-only (agit.go:298); a created comment fires the
+ *      `PullRequestPushCommits` mail (:300-302);
+ *   5. the `pull_request_sync` action=synchronized webhook (upstream
+ *      PullRequestSynchronized, notifier.go:835-845 — before/after are the
+ *      head ref's old/new oids), refetched post-check so the payload
+ *      carries the settled mergeability.
+ *
+ * `env` is the FULL bindings type (not the planner's AgitEnv slice): the
+ * check leg's `ensurePullRequestChecked` rides a synthetic ApiEnv context
+ * (the consumerApiContext pattern, services/pull-automerge.ts:496) whose
+ * Bindings is the generated Env.
+ */
 export async function applyAgitUpdateTail(
-  env: AgitEnv,
+  env: Env,
   repo: RepositoryRow,
   engineRepo: string,
   entry: Extract<AgitPlanEntry, { kind: "update" }>,
@@ -1228,10 +1288,18 @@ export async function applyAgitUpdateTail(
   requestOrigin: string | undefined,
   waitUntil: ((promise: Promise<void>) => void) | undefined,
 ): Promise<void> {
+  const log = (message: string) => console.error(`[agit] ${repo.ownerNamespace}/${repo.slug}: ${message}`);
   try {
+    const db = drizzle(env.DB);
+    // 0. The row's PRE-update head — upstream's staleness gate reads the PR
+    // row's stored head BEFORE UpdateRefForAgit moves it (agit.go:236-237).
+    const preRow = await db.select().from(pullRequests).where(eq(pullRequests.id, entry.prId)).get();
+    const rowHeadChanged = preRow !== undefined && (preRow.headSha ?? "") !== entry.new;
+
+    // 1. The re-arm (steps 1 + 3's markChecking half, see the docstring).
     const cell = env.REPO.getByName(engineRepo);
     const divergence = await cell.countDivergence(branchRef(entry.baseBranch), entry.translatedRef);
-    await drizzle(env.DB)
+    await db
       .update(pullRequests)
       .set({
         headSha: entry.new,
@@ -1243,14 +1311,86 @@ export async function applyAgitUpdateTail(
 
     const pair = await findRepositoryById(env.DB, repo.id);
     if (pair === null) return;
+    const issueRow = await db.select().from(issues).where(eq(issues.id, entry.issueId)).get();
+    const prRow = await db.select().from(pullRequests).where(eq(pullRequests.id, entry.prId)).get();
+    if (issueRow === undefined || prRow === undefined) return;
+
+    // 2. The review maintenance (agit.go:262-280) — log-and-continue per
+    // leg, exactly like upstream's log.Error arms.
+    if (rowHeadChanged) {
+      const now = new Date();
+      // 2a. MarkReviewsAsStale — EVERY review row of the issue
+      // (models/issues/review.go:625 — no type filter upstream either).
+      try {
+        await db.update(pullReviews).set({ stale: true, updatedAt: now }).where(eq(pullReviews.issueId, entry.issueId)).run();
+      } catch (error) {
+        log(`MarkReviewsAsStale failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // 2b. DismissApprovalReviews under the base rule's
+      // dismiss_stale_approvals (GetFirstMatchProtectedBranchRule +
+      // pb.DismissStaleApprovals, agit.go:266-276).
+      try {
+        const rule = await findRule(env.DB, pair.repo.id, entry.baseBranch);
+        if (rule !== null && parseRuleConfig(rule.rules).dismissStaleApprovals) {
+          const approvals = await db
+            .select({ id: pullReviews.id })
+            .from(pullReviews)
+            .where(and(eq(pullReviews.issueId, entry.issueId), eq(pullReviews.type, ReviewType.Approve), eq(pullReviews.dismissed, false)))
+            .all();
+          for (const approval of approvals) {
+            await db.batch([
+              db.update(pullReviews).set({ dismissed: true, updatedAt: now }).where(eq(pullReviews.id, approval.id)),
+              db.insert(comments).values({
+                type: CommentType.DismissReview,
+                posterId: pusherRow.id,
+                issueId: entry.issueId,
+                content: DISMISS_STALE_MESSAGE,
+                reviewId: approval.id,
+                createdAt: now,
+                updatedAt: now,
+              }),
+              db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, entry.issueId)),
+            ]);
+          }
+        }
+      } catch (error) {
+        log(`DismissApprovalReviews failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // 2c. MarkReviewsAsNotStale against the new head (review.go:630-635 —
+      // reviews recorded against the exact new commit are fresh).
+      try {
+        await db
+          .update(pullReviews)
+          .set({ stale: false, updatedAt: now })
+          .where(and(eq(pullReviews.issueId, entry.issueId), eq(pullReviews.commitId, entry.new)))
+          .run();
+      } catch (error) {
+        log(`MarkReviewsAsNotStale failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    // 3. StartPullRequestCheckImmediately's queue work, inline (agit.go:279):
+    // the re-arm above wrote status=checking (markChecking); the landed
+    // lazy-check family settles it right here (self-gated: a merged row or
+    // a non-checking status is returned unchanged).
+    let checkedRow = prRow;
+    if (!prRow.hasMerged && prRow.status === PRStatus.Checking) {
+      const api = new Context<ApiEnv>(new Request("https://agit.local/agit-tail", { method: "POST" }), { env });
+      checkedRow = await ensurePullRequestChecked(api, pair, prRow);
+    }
+
+    // 4. The type-29 push comment (agit.go:296-302).
+    if (!prRow.hasMerged) {
+      await createAgitPushComment(env, engineRepo, issueRow, checkedRow, entry, pusherRow, log);
+    }
+
+    // 5. The synchronized webhook (PullRequestSynchronized), post-check so
+    // the payload renders the settled row.
     const origin = appOrigin(env, requestOrigin);
     const sender = apiUserFromRow(pusherRow, { origin, requester: null });
     const viewer: Viewer = { origin, requester: sender };
-    const issueRow = await drizzle(env.DB).select().from(issues).where(eq(issues.id, entry.issueId)).get();
-    const prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.id, entry.prId)).get();
-    if (issueRow === undefined || prRow === undefined) return;
-    const diffStats = await pullRequestDiffShortStatForEnv(env, pair, prRow);
-    const rendered = await toApiPullRequest(env.DB, viewer, pair, issueRow, prRow, "payload", diffStats === null ? undefined : { diffStats });
+    const diffStats = await pullRequestDiffShortStatForEnv(env, pair, checkedRow);
+    const rendered = await toApiPullRequest(env.DB, viewer, pair, issueRow, checkedRow, "payload", diffStats === null ? undefined : { diffStats });
     await emitAgitWebhook(env, waitUntil, {
       repoId: pair.repo.id,
       ownerId: pair.repo.ownerId,
@@ -1267,12 +1407,189 @@ export async function applyAgitUpdateTail(
       },
     });
   } catch (error) {
-    console.error(
-      `[agit] ${repo.ownerNamespace}/${repo.slug}: update tail for ${entry.originalRef} failed (the push stands): ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    log(`update tail for ${entry.originalRef} failed (the push stands): ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/** Upstream `PushActionContent` (models/issues/comment.go:375-381) — the
+ *  type-29 comment's `content` JSON. */
+interface PushActionContent {
+  is_force_push: boolean;
+  /** is_force_push=true: the [old head, new head] pair; else the pushed
+   *  commits, oldest-first. */
+  commit_ids: string[];
+}
+
+/**
+ * `CreatePushPullComment` for the agit update arm (services/pull/comment.go
+ * 95-160, called at agit.go:296) — the SAME type-29 family as the shared
+ * push path's landed port (services/webhooks-push.ts createPushPullComment),
+ * with the agit flow's specifics: isForcePush is the `force-push` OPTION
+ * value carried on the plan entry (agit.go:297), and old/new are the head
+ * ref's pre-/post-move oids. Normal push: the capped oldest-first
+ * old..new list, only when non-empty (shouldCreate, comment.go:44-45).
+ * Force push: the merge-base(base, new) whole-PR walk (always created, walk
+ * errors logged-only, comment.go:24-39) PLUS the `{is_force_push, [old,
+ * new]}` marker comment, with the old-comment reconcile folded in first.
+ * The created comment fires the `PullRequestPushCommits` mail
+ * (notifyPullRequestPushCommits — agit.go:300-302's notify arm; the shared
+ * path's wrapper re-reads the doer, ours already holds pusherRow). Never
+ * throws — upstream logs a comment failure and continues (agit.go:298).
+ */
+async function createAgitPushComment(
+  env: Env,
+  engineRepo: string,
+  issueRow: typeof issues.$inferSelect,
+  prRow: typeof pullRequests.$inferSelect,
+  entry: Extract<AgitPlanEntry, { kind: "update" }>,
+  pusherRow: UserRow,
+  log: (message: string) => void,
+): Promise<void> {
+  try {
+    const cell = env.REPO.getByName(engineRepo);
+    let commitIds: string[];
+    if (entry.forcePush) {
+      // comment.go:24-39 — the force arm always creates, walk errors logged.
+      const mb = await cell.mergeBase(branchRef(prRow.baseBranch), entry.new);
+      commitIds = mb !== null && mb.tag === "ok" && mb.base !== null ? await newestLimitedAgitCommitIds(cell, mb.base, entry.new, log) : [];
+      commitIds = await reconcileAgitForcePushComments(env.DB, entry.issueId, commitIds);
+    } else {
+      commitIds = await newestLimitedAgitCommitIds(cell, entry.old, entry.new, log);
+      if (commitIds.length === 0) return; // upstream shouldCreate=false
+    }
+
+    const now = new Date();
+    const service = new IssuesService(env.DB);
+    let normalComment: typeof comments.$inferSelect | null = null;
+    if (commitIds.length > 0) {
+      normalComment = await service.addComment({
+        issueId: entry.issueId,
+        type: CommentType.PullRequestPush,
+        posterId: pusherRow.id,
+        content: JSON.stringify({ is_force_push: false, commit_ids: commitIds } satisfies PushActionContent),
+        now,
+      });
+    }
+    let forceComment: typeof comments.$inferSelect | null = null;
+    if (entry.forcePush) {
+      // The marker comment — CommitIDs is the [old head, new head] pair
+      // (models/issues/comment.go:377-379).
+      forceComment = await service.addComment({
+        issueId: entry.issueId,
+        type: CommentType.PullRequestPush,
+        posterId: pusherRow.id,
+        content: JSON.stringify({ is_force_push: true, commit_ids: [entry.old, entry.new] } satisfies PushActionContent),
+        now,
+      });
+    }
+    const comment = entry.forcePush ? forceComment : normalComment;
+    if (comment === null) return;
+    // notify_service.PullRequestPushCommits (agit.go:300-302) — the mail
+    // arm; commits carry their MessageTitle (services/issue/comments.go
+    // :157-189's receiver load), the force pair passes none.
+    const commits: Array<{ sha: string; title: string }> = [];
+    if (!entry.forcePush) {
+      for (const id of commitIds) {
+        const read = await cell.readCommit(id);
+        commits.push({ sha: id, title: read?.subject ?? "" });
+      }
+    }
+    await notifyPullRequestPushCommits(
+      env,
+      {
+        issue: issueRow,
+        comment,
+        doer: pusherRow,
+        headBranch: prRow.headBranch,
+        isForcePush: entry.forcePush,
+        commits,
+        ...(entry.forcePush ? { oldCommit: entry.old, newCommit: entry.new } : {}),
+      },
+      { now },
+    );
+  } catch (error) {
+    log(`CreatePushPullComment failed (upstream's log-and-continue, agit.go:298): ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * The newest-capped `start..end` commit-id list, oldest-first — upstream
+ * `rev-list --reverse -n limit start..end` (comment.go:47-55 keeps the
+ * NEWEST `limit` of the range). The engine's listCommitsRange caps a page
+ * keeping the OLDEST, so the newest window is collected by paging; bounded
+ * at two pages of the cap — the shared push path's landed walk verbatim
+ * (services/webhooks-push.ts newestLimitedCommitIds, the one documented
+ * deviation from upstream's exact window noted there).
+ */
+async function newestLimitedAgitCommitIds(
+  cell: { listCommitsRange(base: string, head: string, limit: number, page?: number): Promise<{ commits: Array<{ oid: string }>; more: boolean } | null> },
+  start: string,
+  end: string,
+  log: (message: string) => void,
+): Promise<string[]> {
+  const collected: string[] = [];
+  for (let page = 0; page < 2; page += 1) {
+    const result = await cell.listCommitsRange(start, end, MAX_PUSH_COMMITS_IN_COMMENT, page);
+    if (result === null) {
+      log(`push-comment walk ${start.slice(0, 7)}..${end.slice(0, 7)} failed`);
+      return collected.length > 0 ? collected.slice(-MAX_PUSH_COMMITS_IN_COMMENT) : [];
+    }
+    for (const commit of result.commits) collected.push(commit.oid);
+    if (!result.more) break;
+    if (page === 1) log(`push-comment walk truncated at ${collected.length} commits`);
+  }
+  return collected.slice(-MAX_PUSH_COMMITS_IN_COMMENT);
+}
+
+/**
+ * The force-push comment reconcile (comment.go:41-66 +
+ * cleanUpOldCommitCommentsForNewForcePush:70-92): every old NON-force
+ * type-29 comment of the issue keeps only commit ids still present in the
+ * new force list (emptied comments are deleted, others re-serialized), and
+ * ids covered by a surviving old comment are removed from the new list (the
+ * new comment carries only NEW ids). Old force-push comments are kept
+ * verbatim. Counter-neutral, like upstream's raw update/delete. Parse
+ * failures skip the comment. The shared push path's landed port verbatim
+ * (services/webhooks-push.ts reconcileForcePushComments).
+ */
+async function reconcileAgitForcePushComments(db: D1Database, issueId: number, newCommitIds: string[]): Promise<string[]> {
+  const oldComments = await drizzle(db)
+    .select()
+    .from(comments)
+    .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.PullRequestPush)))
+    .all();
+  const pending = new Set(newCommitIds);
+  const deleteIds: number[] = [];
+  const updates: Array<{ id: number; content: string }> = [];
+  for (const oldComment of oldComments) {
+    let data: PushActionContent;
+    try {
+      data = JSON.parse(oldComment.content ?? "") as PushActionContent;
+    } catch {
+      continue;
+    }
+    if (data.is_force_push === true) continue;
+    const kept = data.commit_ids.filter((id) => pending.has(id));
+    if (kept.length === 0) {
+      deleteIds.push(oldComment.id);
+      continue;
+    }
+    for (const id of kept) pending.delete(id);
+    if (kept.length !== data.commit_ids.length) {
+      updates.push({ id: oldComment.id, content: JSON.stringify({ is_force_push: false, commit_ids: kept }) });
+    }
+  }
+  const statements: Parameters<DrizzleD1Database["batch"]>[number][number][] = [];
+  if (deleteIds.length > 0) {
+    statements.push(drizzle(db).delete(comments).where(inArray(comments.id, deleteIds)));
+  }
+  for (const update of updates) {
+    statements.push(drizzle(db).update(comments).set({ content: update.content }).where(eq(comments.id, update.id)));
+  }
+  for (const statement of statements) {
+    await drizzle(db).batch([statement]);
+  }
+  return [...pending];
 }
 
 /** A create whose translated command did not land: the pre-allocated rows

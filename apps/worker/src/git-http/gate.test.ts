@@ -81,7 +81,7 @@ import {
   resolveAgitBaseTopic,
   splitCommitTitleBody,
 } from "../api/services/agit";
-import { deployKeys, PRFlow, repoCounters, repoRedirects, repoSettings, repositories, issues, protectedBranches, pullRequests, releases, userBlocking, users, webhookDeliveries, webhooks, comments, trackedTimes, actions } from "../db/schema";
+import { deployKeys, PRFlow, PRStatus, repoCounters, repoRedirects, repoSettings, repositories, issues, protectedBranches, pullRequests, pullReviews, releases, ReviewType, userBlocking, users, webhookDeliveries, webhooks, comments, trackedTimes, actions } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig, type ProtectedBranchConfig } from "../services/branch-protection";
 import { purgeRepoMessage } from "../repos/purge";
 import { IssuesService } from "../issues/service";
@@ -3285,11 +3285,15 @@ async function seedAgitWebhook(repoId: string): Promise<void> {
 }
 
 /** The agit battery's extra sweep (the file-level beforeEach does not clear
- *  the PR family or the block table). */
+ *  the PR family, the block table, or the update-tail's comment/review/
+ *  protection tables). */
 async function sweepAgitTables(): Promise<void> {
   await env.DB.prepare("DELETE FROM pull_requests").run();
   await env.DB.prepare("DELETE FROM issues").run();
   await env.DB.prepare("DELETE FROM user_blocking").run();
+  await env.DB.prepare("DELETE FROM comments").run();
+  await env.DB.prepare("DELETE FROM pull_reviews").run();
+  await env.DB.prepare("DELETE FROM protected_branches").run();
 }
 
 describe("agit lane pure helpers (the upstream ports)", () => {
@@ -3481,6 +3485,137 @@ describe("the agit update arm (the same proposal moves refs/pull/N/head)", () =>
     expect(parseAgitResponse(await same.arrayBuffer()).report).toContain("ng refs/for/main/topic-u new commit is same with old commit");
     const still = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.id, created.id)).get();
     expect(still!.headSha).toBe(second.oid);
+  });
+
+  /** One agit receive over the wired SELF app; returns the report text. */
+  async function pushAgit(engineName: string, token: string, commands: { old?: string; oid: string; ref: string }[], pack: Uint8Array | undefined, pushOptions: string[]): Promise<string> {
+    const response = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody(commands, { pack, pushOptions }),
+    });
+    expect(response.status).toBe(200);
+    return parseAgitResponse(await response.arrayBuffer()).report;
+  }
+
+  /** Create one proposal (refs/for/main/<topic>) and return its issue id. */
+  async function seedProposal(engineName: string, token: string, topic: string): Promise<{ first: { oid: string; pack: Uint8Array }; issueId: number; prId: number }> {
+    const first = await buildAgitCommitPack({ message: "proposal base\n" });
+    const report = await pushAgit(engineName, token, [{ oid: first.oid, ref: `refs/for/main/${topic}` }], first.pack, [`topic=${topic}`]);
+    expect(report).toContain(`ok refs/for/main/${topic}\n`);
+    const pr = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
+    return { first, issueId: pr.issueId, prId: pr.id };
+  }
+
+  /** The issue's type-29 `pull_push` rows, id order. */
+  async function type29Rows(issueId: number) {
+    return drizzle(env.DB)
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.PullRequestPush)))
+      .all();
+  }
+
+  it("the re-push lands the type-29 push comment (normal walk + force-option reconcile) and settles the check immediately", async () => {
+    const { engineName, token, ownerId } = await seedTailRepo("agitpushcomment");
+    const { first, issueId, prId } = await seedProposal(engineName, token, "topic-p");
+    // The create arm writes no type-29 row here — upstream's create-arm
+    // first comment rides NewPullRequest (pull.go:145, both flows) and is
+    // the recorded remainder; the UPDATE arm owns the family (agit.go:296).
+    expect(await type29Rows(issueId)).toHaveLength(0);
+
+    // Normal fast-forward: the capped old..new walk, non-empty → ONE comment
+    // carrying the pushed commits, posted by the agit pusher (comment.go's
+    // CreateCommentOptions doer = the agit pusher).
+    const second = await buildAgitCommitPack({ message: "proposal follow-up\n", parent: first.oid, file: "agit content v2\n" });
+    expect(await pushAgit(engineName, token, [{ oid: second.oid, ref: "refs/for/main/topic-p" }], second.pack, [])).toContain("ok refs/for/main/topic-p\n");
+    let rows = await type29Rows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content ?? "")).toEqual({ is_force_push: false, commit_ids: [second.oid] });
+    expect(rows[0]!.posterId).toBe(ownerId);
+
+    // StartPullRequestCheckImmediately's queue work (agit.go:279): the
+    // re-arm wrote status=checking (markChecking) and the tail's inline
+    // check settled the row BEFORE the response returned — no lazy GET
+    // needed.
+    const checked = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.id, prId)).get();
+    expect(checked!.status).not.toBe(PRStatus.Checking);
+
+    // Force update to an UNRELATED tip under the option: upstream's
+    // isForcePush is the OPTION VALUE (agit.go:297 — not the shared path's
+    // ancestry derivation), so the force arm runs: the old non-force
+    // comment reconciles away (its ids are not in the force list) and the
+    // boundary marker lands; the unrelated tip's merge base is empty → an
+    // empty walk → ONLY the marker row survives.
+    const rewritten = await buildAgitCommitPack({ message: "rewritten proposal\n", file: "rewritten root\n" });
+    expect(await pushAgit(engineName, token, [{ oid: rewritten.oid, ref: "refs/for/main/topic-p" }], rewritten.pack, ["force-push"])).toContain("ok refs/for/main/topic-p\n");
+    rows = await type29Rows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content ?? "")).toEqual({ is_force_push: true, commit_ids: [second.oid, rewritten.oid] });
+  });
+
+  it("the re-push marks existing reviews stale and refreshes reviews made against the new head (no rule: no dismissal)", async () => {
+    const { engineName, token, ownerId } = await seedTailRepo("agitstale");
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const { first, issueId } = await seedProposal(engineName, token, "topic-s");
+    const second = await buildAgitCommitPack({ message: "proposal follow-up\n", parent: first.oid, file: "agit content v2\n" });
+    // One approval against the CURRENT head (will go stale) and one already
+    // recorded against the INCOMING head (MarkReviewsAsNotStale refreshes
+    // it — review.go:630-635's exact commit_id match).
+    await drizzle(env.DB)
+      .insert(pullReviews)
+      .values([
+        { type: ReviewType.Approve, reviewerId: ownerId, issueId, content: "", official: true, commitId: first.oid, stale: false, dismissed: false, createdAt: new Date(), updatedAt: new Date() },
+        { type: ReviewType.Approve, reviewerId: bob.id, issueId, content: "", official: false, commitId: second.oid, stale: false, dismissed: false, createdAt: new Date(), updatedAt: new Date() },
+      ])
+      .run();
+
+    expect(await pushAgit(engineName, token, [{ oid: second.oid, ref: "refs/for/main/topic-s" }], second.pack, [])).toContain("ok refs/for/main/topic-s\n");
+    const reviews = await drizzle(env.DB).select().from(pullReviews).where(eq(pullReviews.issueId, issueId)).all();
+    const aliceReview = reviews.find((r) => r.reviewerId === ownerId)!;
+    expect(aliceReview.stale).toBe(true);
+    expect(aliceReview.dismissed).toBe(false);
+    const bobReview = reviews.find((r) => r.reviewerId === bob.id)!;
+    expect(bobReview.stale).toBe(false);
+    expect(bobReview.dismissed).toBe(false);
+    // No rule on main → the dismiss arm never runs (agit.go:266-276 gates
+    // on GetFirstMatchProtectedBranchRule's DismissStaleApprovals).
+    const dismissals = await drizzle(env.DB)
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.DismissReview)))
+      .all();
+    expect(dismissals).toHaveLength(0);
+  });
+
+  it("the re-push dismisses stale approvals when the base rule sets dismiss_stale_approvals (type-32 comments, num_comments bump)", async () => {
+    const { repoId, engineName, token, ownerId } = await seedTailRepo("agitdismiss");
+    await seedFileRule(repoId, "main", { dismissStaleApprovals: true });
+    const { first, issueId } = await seedProposal(engineName, token, "topic-d");
+    await drizzle(env.DB)
+      .insert(pullReviews)
+      .values({ type: ReviewType.Approve, reviewerId: ownerId, issueId, content: "", official: true, commitId: first.oid, stale: false, dismissed: false, createdAt: new Date(), updatedAt: new Date() })
+      .run();
+    const issueBefore = (await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())!;
+
+    const second = await buildAgitCommitPack({ message: "proposal follow-up\n", parent: first.oid, file: "agit content v2\n" });
+    expect(await pushAgit(engineName, token, [{ oid: second.oid, ref: "refs/for/main/topic-d" }], second.pack, [])).toContain("ok refs/for/main/topic-d\n");
+
+    const review = (await drizzle(env.DB).select().from(pullReviews).where(eq(pullReviews.issueId, issueId)).all())[0]!;
+    expect(review.dismissed).toBe(true);
+    const dismissals = await drizzle(env.DB)
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.DismissReview)))
+      .all();
+    expect(dismissals).toHaveLength(1);
+    expect(dismissals[0]!.content).toBe("New commits pushed, approval review dismissed automatically according to repository settings");
+    expect(dismissals[0]!.reviewId).toBe(review.id);
+    const issueAfter = (await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())!;
+    // TWO bumps: the type-29 push comment (CreatePushPullComment lands it on
+    // every applied update) AND the type-32 dismissal — upstream's
+    // CreateComment bumps num_comments for both.
+    expect(issueAfter.numComments).toBe(issueBefore.numComments + 2);
   });
 });
 
