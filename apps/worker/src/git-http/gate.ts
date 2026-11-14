@@ -170,6 +170,7 @@ import { appOrigin } from "../services/webhooks-push";
 import { oauth2FeatureEnabled } from "../services/oauth2/token";
 import { CARGO_INDEX_REPOSITORY_NAME } from "../services/packages/cargo";
 import type { AutoMergeCheckMessage } from "../services/pull-automerge";
+import { updateIssuesForPush, type XrefPushEnv } from "../api/services/xref-push";
 
 /**
  * Requests the gate has already authorized. The engine `authorize` hook
@@ -433,7 +434,7 @@ async function handleAgitReceive(
   // is unchanged; the agit path's translated commands ARE
   // `refs/pull/N/head` commands to it, so the D-7c auto-merge re-check
   // enqueues for moved proposals exactly like the head-sync's own pushes).
-  const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: pusher?.id ?? 0 };
+  const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], branchPushes: [], pusherId: pusher?.id ?? 0 };
 
   // 3. The kept forward commands: fall-through verbatim, translated onto
   // their real refs, rejected dropped.
@@ -520,7 +521,7 @@ async function handleAgitReceive(
   // first-push settle (the wave-settle-is-empty fix) and the R5/B-54/D-7c
   // tail (the collector saw the KEPT commands — plain or translated).
   const scheduleSharedTail = (): void => {
-    ctx.waitUntil(applyPushTail(env, repo, engineRepo, pushTail));
+    ctx.waitUntil(applyPushTail(env, repo, engineRepo, pushTail, url.origin));
     if (repo.isEmpty) {
       ctx.waitUntil(settleCreatingRepo(env, repo.id, engineRepo, url.origin));
     }
@@ -1291,9 +1292,9 @@ async function handleUnknownRepository(
       // The B-54/R5 tail rides the raced push-create forward too (the loser
       // of the create race is a normal receive — its tag commands mint/flip
       // like every other push).
-      const racedTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: verified.user.id };
+      const racedTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], branchPushes: [], pusherId: verified.user.id };
       const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), pushTailValidator(env, raced.repo, racedTail));
-      ctx.waitUntil(applyPushTail(env, raced.repo, `${route.owner}/${route.repo}`, racedTail));
+      ctx.waitUntil(applyPushTail(env, raced.repo, `${route.owner}/${route.repo}`, racedTail, url.origin));
       ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`, url.origin));
       return response;
     }
@@ -1338,9 +1339,9 @@ async function handleUnknownRepository(
   // runs its full tag sync (a seed push that lands main + tags in one
   // receive mints their is_tag rows right here — without the collector the
   // push-created repos' first push silently skipped every tag arm).
-  const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: verified.user.id };
+  const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], branchPushes: [], pusherId: verified.user.id };
   const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), pushTailValidator(env, created, pushTail));
-  ctx.waitUntil(applyPushTail(env, created, `${route.owner}/${route.repo}`, pushTail));
+  ctx.waitUntil(applyPushTail(env, created, `${route.owner}/${route.repo}`, pushTail, url.origin));
   ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`, url.origin));
   return response;
 }
@@ -1678,12 +1679,13 @@ export interface PushTailEnv extends Pick<Env, "DB" | "REPO"> {
 }
 
 /**
- * The R5/D-7c command set one receive may contribute: tag deletions and
- * PR-head pushes that PASSED the per-ref policy (a rejected command never
- * applies, so it never reaches the tail). Collected inside the validator
- * callback — the only in-process point that sees the receive's command
- * list — and consumed by applyPushTail after the forward returns. Exported
- * for the tail tests (the same shape the validator fills).
+ * The R5/D-7c/B-47 command set one receive may contribute: tag deletions,
+ * tag additions, PR-head pushes and BRANCH pushes that PASSED the per-ref
+ * policy (a rejected command never applies, so it never reaches the tail).
+ * Collected inside the validator callback — the only in-process point that
+ * sees the receive's command list — and consumed by applyPushTail after the
+ * forward returns. Exported for the tail tests (the same shape the
+ * validator fills).
  */
 export interface PushTailCommands {
   /** Tag names (refs/tags/ stripped) with an allowed delete command. */
@@ -1693,9 +1695,14 @@ export interface PushTailCommands {
   tagAdds: string[];
   /** Issue indexes (refs/pull/N/head's N) with an allowed create/move. */
   prHeadPushes: number[];
+  /** Branch commands (full ref + tips) with an allowed create/update — the
+   *  B-47 issue-walk's collection (a delete walks nothing: upstream's queue
+   *  arm skips deleted branches, push.go:146). */
+  branchPushes: { ref: string; old: string; next: string }[];
   /** The authenticated pusher's user id — the minted rows' publisher
-   *  (upstream pushUpdateAddTags' `pusher.ID`); 0 when no identity was
-   *  resolved (anonymous cannot reach an allowed write; kept as defense). */
+   *  (upstream pushUpdateAddTags' `pusher.ID`) and the issue walk's doer
+   *  (upstream opts.PusherID); 0 when no identity was resolved (anonymous
+   *  cannot reach an allowed write; kept as defense). */
   pusherId: number;
 }
 
@@ -1730,6 +1737,12 @@ function pushTailValidator(env: Env, repo: RepositoryRow, tail: PushTailCommands
         const head = PR_HEAD_REF_PATTERN.exec(cmd.ref);
         if (head !== null && cmd.kind !== "delete") {
           tail.prHeadPushes.push(Number(head[1]));
+        }
+        // B-47: a non-delete BRANCH command rides the issue walk (the queue
+        // arm's IsBranch + !IsDelRef scope, push.go:139-146; a delete walks
+        // nothing).
+        if (cmd.ref.startsWith("refs/heads/") && cmd.kind !== "delete") {
+          tail.branchPushes.push({ ref: cmd.ref, old: cmd.old, next: cmd.new });
         }
       }
     }
@@ -1797,6 +1810,17 @@ function repoTasksQueue(env: { REPO_TASKS?: unknown }): { sendBatch(messages: { 
  * enqueues for every PR-head push and lets the consumer's ladder decide —
  * "not scheduled → skip" (pull-automerge.ts) is the named idempotence, and
  * the cron producer re-probes every scheduled row each tick regardless.
+ *
+ * B-47 — branch pushes: the push-integrated issue walk
+ * (api/services/xref-push.ts updateIssuesForPush — upstream
+ * UpdateIssuesCommit at services/repository/push.go:184, reached per branch
+ * update that is NOT a delete). Upstream runs it INSIDE the queue handler
+ * before notify PushCommits; ours is the tail's fourth leg, per collected
+ * command, wrapped per command (one command's failure — upstream's queue
+ * logs the whole item — logs and leaves the rest of the batch standing).
+ * The walk covers the commit-message scan itself (commit_ref comments,
+ * keyword closes/reopens, the branch-scope gate) — see xref-push.ts's
+ * module header for the full upstream walk.
  */
 /**
  * The B-54 tail's per-add engine reads — upstream pushUpdateAddTags'
@@ -1860,12 +1884,20 @@ async function readPushTagAdds(
 }
 
 export async function applyPushTail(
-  env: PushTailEnv,
+  env: XrefPushEnv,
   repo: RepositoryRow,
   engineRepo: string,
   tail: PushTailCommands,
+  requestOrigin?: string,
 ): Promise<void> {
-  if (tail.tagDeletes.length === 0 && tail.tagAdds.length === 0 && tail.prHeadPushes.length === 0) return;
+  if (
+    tail.tagDeletes.length === 0 &&
+    tail.tagAdds.length === 0 &&
+    tail.prHeadPushes.length === 0 &&
+    tail.branchPushes.length === 0
+  ) {
+    return;
+  }
   try {
     const refList = (await env.REPO.getByName(engineRepo).listRefs()).refs ?? [];
     const refNames = new Set(refList.map((ref) => ref.name));
@@ -1913,6 +1945,35 @@ export async function applyPushTail(
         error instanceof Error ? error.message : String(error)
       }`,
     );
+  }
+
+  // B-47 — the branch-walk leg, OUTSIDE the tag legs' try (a walk failure —
+  // e.g. a deps-blocked close propagating — must not mask the tag legs'
+  // settled state, and per-command wrapping mirrors upstream's queue
+  // handler: one failing item logs and leaves the rest standing,
+  // push.go:50-59). The env view rides the full XrefPushEnv family shape —
+  // the real bindings carry the four, and the APP_URL var flows through
+  // (the full generated Env satisfies the interface structurally).
+  const walkedRefs = new Set(tail.branchPushes.map((cmd) => cmd.ref));
+  for (const ref of walkedRefs) {
+    const command = tail.branchPushes.find((cmd) => cmd.ref === ref)!;
+    try {
+      await updateIssuesForPush({
+        env,
+        repo,
+        engineRepo,
+        pusherId: tail.pusherId === 0 ? null : tail.pusherId,
+        branch: ref.slice("refs/heads/".length),
+        update: { ref: command.ref, old: command.old, next: command.next },
+        requestOrigin,
+      });
+    } catch (error) {
+      console.error(
+        `[push-tail] ${repo.ownerNamespace}/${repo.slug}: issue walk for ${ref} failed (the applied push stands): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 }
 

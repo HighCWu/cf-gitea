@@ -55,7 +55,7 @@
  */
 
 import { SELF, env } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -81,10 +81,11 @@ import {
   resolveAgitBaseTopic,
   splitCommitTitleBody,
 } from "../api/services/agit";
-import { deployKeys, PRFlow, repoCounters, repoRedirects, repoSettings, repositories, issues, protectedBranches, pullRequests, releases, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { deployKeys, PRFlow, repoCounters, repoRedirects, repoSettings, repositories, issues, protectedBranches, pullRequests, releases, userBlocking, users, webhookDeliveries, webhooks, comments, trackedTimes, actions } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig, type ProtectedBranchConfig } from "../services/branch-protection";
 import { purgeRepoMessage } from "../repos/purge";
 import { IssuesService } from "../issues/service";
+import { CommentType } from "../issues/comment-types";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "../repos/testing/git-pack";
@@ -2000,15 +2001,19 @@ describe("upstream-parity arms: mirror 403 body, pre-auth 403s, go-get on every 
 // ---------------------------------------------------------------------------
 
 
-/** A sendBatch-recording REPO_TASKS stub (pull-automerge.test.ts's
- *  spyQueue shape). */
-function spyQueue(): { sendBatch: (messages: { body: unknown }[]) => Promise<unknown>; bodies: { body: unknown }[][] } {
+/** A sendBatch-recording REPO_TASKS stub — Queue-SHAPED so the B-47-widened
+ *  XrefPushEnv tail env accepts it structurally (the D-7c test's `{...env,
+ *  REPO_TASKS: spy}` spread); the bodies log is the assertion surface. */
+function spyQueue(): Queue<unknown> & { bodies: { body: unknown }[][] } {
   const bodies: { body: unknown }[][] = [];
+  const metrics = { backlogCount: 0, backlogBytes: 0 };
   return {
     bodies,
+    metrics: () => Promise.resolve(metrics),
+    send: () => Promise.resolve({ metadata: { metrics } }),
     sendBatch: (messages) => {
-      bodies.push(messages);
-      return Promise.resolve();
+      bodies.push([...messages]);
+      return Promise.resolve({ metadata: { metrics } });
     },
   };
 }
@@ -2121,7 +2126,7 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     // The tail invoked with a delete whose ref is STILL THERE (the shape a
     // CAS-conflicted command leaves behind): the verify filters it, D1
     // untouched.
-    const tail: PushTailCommands = { tagDeletes: ["v1"], tagAdds: [], prHeadPushes: [], pusherId: ownerId };
+    const tail: PushTailCommands = { tagDeletes: ["v1"], tagAdds: [], prHeadPushes: [], branchPushes: [], pusherId: ownerId };
     await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, tail);
 
     const row = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).get();
@@ -2229,7 +2234,7 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
 
   it("the mint's verify arm: a collected add whose ref is absent post-push mints nothing (the CAS-conflict shape)", async () => {
     const { repoId, engineName, ownerId } = await seedTailRepo("b54conflict");
-    const tail: PushTailCommands = { tagDeletes: [], tagAdds: ["ghost"], prHeadPushes: [], pusherId: ownerId };
+    const tail: PushTailCommands = { tagDeletes: [], tagAdds: ["ghost"], prHeadPushes: [], branchPushes: [], pusherId: ownerId };
     await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, tail);
     expect(await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all()).toEqual([]);
   });
@@ -2258,7 +2263,7 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
       tagAdds: ["rel-tag", "pure-tag"],
-      prHeadPushes: [],
+      prHeadPushes: [], branchPushes: [],
       pusherId: ownerId,
     });
 
@@ -2332,7 +2337,7 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     await applyPushTail(tailEnv, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
       tagAdds: [],
-      prHeadPushes: [7],
+      prHeadPushes: [7], branchPushes: [],
       pusherId: 0,
     });
     expect(queue.bodies.length).toBe(1);
@@ -2343,7 +2348,7 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     await applyPushTail(tailEnv, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
       tagAdds: [],
-      prHeadPushes: [7, 7],
+      prHeadPushes: [7, 7], branchPushes: [],
       pusherId: 0,
     });
     expect((queue.bodies[1] ?? []).length).toBe(1);
@@ -2353,16 +2358,522 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
     await applyPushTail({ ...env, REPO_TASKS: quiet }, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
       tagAdds: [],
-      prHeadPushes: [],
+      prHeadPushes: [], branchPushes: [],
       pusherId: 0,
     });
     await applyPushTail({ ...env, REPO_TASKS: quiet }, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
       tagDeletes: [],
       tagAdds: [],
-      prHeadPushes: [99], // no issues row at index 99
+      prHeadPushes: [99], branchPushes: [], // no issues row at index 99
       pusherId: 0,
     });
     expect(quiet.bodies).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The B-47 push tail — push-integrated issue closes (UpdateIssuesCommit,
+// services/issue/commit.go:126-238, reached from the push-update queue at
+// services/repository/push.go:184): every NON-delete branch push walks the
+// pushed range's commit messages (FindAllIssueReferences — the non-markdown
+// scan), writes type-4 commit_ref comments and closes/reopens referenced
+// issues per the keyword table — gated by the canclose/cancomment ladder,
+// the self-reference guard, and the pushed repo's CloseIssuesViaCommitInAnyBranch
+// branch scope. The walk rides the tail validator's branch collection +
+// applyPushTail's branch leg; the range reads are the engine's EXISTING
+// listCommitsRange/listLog RPCs (no new seam). The tails run in waitUntil on
+// the runner — vi.waitFor polls, the settle precedent.
+// ---------------------------------------------------------------------------
+
+/** buildPack's fixed commit stamp (the walk's objects carry it too). */
+const B47_PERSON = { name: "Test User", email: "test@example.com", time: 1700000000, tz: "+0000" };
+
+/** Worker-side object hash (the wiki-seeding shape — the `type size\0`
+ *  header, putApiObjects re-verifies). */
+async function b47Oid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function b47ObjectHeader(type: number, size: number): Uint8Array {
+  const bytes: number[] = [];
+  let first = (type << 4) | (size & 0x0f);
+  let rest = size >> 4;
+  while (rest > 0) {
+    bytes.push(first | 0x80);
+    first = rest & 0x7f;
+    rest >>= 7;
+  }
+  bytes.push(first);
+  return new Uint8Array(bytes);
+}
+
+function b47Be32(value: number): Uint8Array {
+  return new Uint8Array([(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value]);
+}
+
+/** zlib-deflate via the workerd-native transform (git-pack.ts's shape). */
+async function b47Deflate(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
+ * A self-contained one-commit pack whose commit message is CUSTOM (buildPack's
+ * is fixed): serializeCommit frames the object bytes (oid computed there),
+ * the pack wrap is repos/testing/git-pack.ts's shape (header, per-object
+ * type+size varint + deflate, trailing SHA-1 over the whole stream).
+ * `parent` chains the commit onto an existing tip so an update-range walk
+ * (listCommitsRange old..new) sees exactly it.
+ */
+async function buildMessagePack(message: string, parent?: string): Promise<{ oid: string; pack: Uint8Array }> {
+  const blob = new TextEncoder().encode(`payload ${message.length}\n`);
+  const blobSha = await b47Oid("blob", blob);
+  const tree = serializeTree([{ mode: "100644", name: "file.txt", oid: blobSha }]);
+  const tip = serializeCommit({
+    tree: tree.oid,
+    parents: parent === undefined ? [] : [parent],
+    author: B47_PERSON,
+    committer: B47_PERSON,
+    message,
+  });
+  const entries: { type: number; body: Uint8Array }[] = [
+    { type: 3, body: blob }, // OBJ_BLOB
+    { type: 2, body: tree.data }, // OBJ_TREE
+    { type: 1, body: tip.data }, // OBJ_COMMIT
+  ];
+  const chunks: Uint8Array[] = [new TextEncoder().encode("PACK"), b47Be32(2), b47Be32(entries.length)];
+  for (const entry of entries) {
+    chunks.push(b47ObjectHeader(entry.type, entry.body.length));
+    chunks.push(await b47Deflate(entry.body));
+  }
+  const soFar = chunks.reduce((acc, chunk) => {
+    const merged = new Uint8Array(acc.byteLength + chunk.byteLength);
+    merged.set(acc, 0);
+    merged.set(chunk, acc.byteLength);
+    return merged;
+  }, new Uint8Array(0));
+  const checksum = new Uint8Array(await crypto.subtle.digest("SHA-1", soFar));
+  const pack = new Uint8Array(soFar.byteLength + 20);
+  pack.set(soFar, 0);
+  pack.set(checksum, soFar.byteLength);
+  return { oid: tip.oid, pack };
+}
+
+/** An update receive-pack body with the REAL old tip (buildReceivePackBody
+ *  always sends the zero old — a create; an update must carry the live tip
+ *  or the engine's CAS refuses it). */
+function b47UpdateBody(oldTip: string, oid: string, ref: string, pack: Uint8Array): Uint8Array {
+  const section =
+    pktLine(`${oldTip} ${oid} ${ref}\0report-status side-band-64k`) + "0000";
+  const head = new TextEncoder().encode(section);
+  const body = new Uint8Array(head.byteLength + pack.byteLength);
+  body.set(head, 0);
+  body.set(pack, head.byteLength);
+  return body;
+}
+
+/** One open issue row (the D-7c fixture's raw-insert shape). */
+async function seedB47Issue(
+  repoId: string,
+  index: number,
+  patch: Partial<typeof issues.$inferInsert> = {},
+): Promise<number> {
+  const inserted = await drizzle(env.DB)
+    .insert(issues)
+    .values({
+      repoId,
+      index,
+      title: `issue ${index}`,
+      isPull: false,
+      isClosed: false,
+      posterId: null,
+      ref: "",
+      ...patch,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning({ id: issues.id });
+  return inserted[0]!.id;
+}
+
+/** An owner-level webhooks row matching the issues family (the settle
+ *  fixture's shape). */
+async function seedB47Hook(ownerId: number): Promise<number> {
+  const inserted = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({
+      repoId: null,
+      ownerId,
+      url: "https://hooks.example.com/b47",
+      events: JSON.stringify({ choose_events: true, events: { issues: true } }),
+      isActive: true,
+    })
+    .returning({ id: webhooks.id })
+    .all();
+  return inserted[0]!.id;
+}
+
+describe("the B-47 push tail: commit messages write commit_ref rows and close/reopen issues (UpdateIssuesCommit, commit.go:126-238)", () => {
+  beforeEach(async () => {
+    // The global sweep misses the issue-family tables (the R5 describe's
+    // local sweep precedent, extended to the walk's write set).
+    await env.DB.prepare("DELETE FROM issues").run();
+    await env.DB.prepare("DELETE FROM comments").run();
+    await env.DB.prepare("DELETE FROM action").run();
+    await env.DB.prepare("DELETE FROM tracked_time").run();
+    await env.DB.prepare("DELETE FROM pull_requests").run();
+  });
+
+  it("a 'fixes #1' push closes the issue, writes the commit_ref row, the close comment, the webhook and the feed action (end-to-end)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47close");
+    const issueId = await seedB47Issue(repoId, 1, { posterId: ownerId });
+    const hookId = await seedB47Hook(ownerId);
+
+    // THE PUSH: main tip0 -> tip1, message "fixes #1".
+    const { oid, pack } = await buildMessagePack("fixes #1\n\nsome body", tip);
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+      if (row?.isClosed !== true) throw new Error("issue not closed yet");
+    });
+
+    // The issue state (SetIssueAsClosed: is_closed, closed_unix).
+    const issue = (await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())!;
+    expect(issue.isClosed).toBe(true);
+    expect(issue.closedAt).not.toBeNull();
+
+    // The walk's rows: the type-4 commit_ref comment (CreateRefComment —
+    // content `<a href="{repoLink}/commit/{sha}">{first line}</a>`), then the
+    // type-2 close system comment (updateIssueNumbers).
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    const refRow = rows.find((row) => row.type === CommentType.CommitRef);
+    expect(refRow?.commitSha).toBe(oid);
+    expect(refRow?.content).toBe(`<a href="/alice/b47close/commit/${oid}">fixes #1</a>`);
+    expect(refRow?.posterId).toBe(ownerId);
+    expect(rows.find((row) => row.type === CommentType.Close)).toBeDefined();
+
+    // The closed webhook (IssueChangeStatus — commit_id carries the sha).
+    const deliveries = await drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+    expect(deliveries.length).toBe(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { action: string; commit_id: string; number: number };
+    expect(payload.action).toBe("closed");
+    expect(payload.commit_id).toBe(oid);
+    expect(payload.number).toBe(1);
+
+    // The feed action row (feed/notifier.go:66-97 — close_issue "index|").
+    const feed = await drizzle(env.DB).select().from(actions).all();
+    expect(feed.some((row) => row.opType === 12 && row.content === "1|" && row.actUserId === ownerId)).toBe(true);
+  });
+
+  it("a 'reopens #1' push reopens a closed issue (the reopen keyword arm)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47reopen");
+    const issueId = await seedB47Issue(repoId, 1, { posterId: ownerId, isClosed: true, closedAt: new Date() });
+    const hookId = await seedB47Hook(ownerId);
+
+    const { oid, pack } = await buildMessagePack("reopens #1", tip);
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+      if (row?.isClosed !== false) throw new Error("issue not reopened yet");
+    });
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    expect(rows.find((row) => row.type === CommentType.CommitRef)?.commitSha).toBe(oid);
+    expect(rows.find((row) => row.type === CommentType.Reopen)).toBeDefined();
+    const deliveries = await drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { action: string }).action).toBe("reopened");
+  });
+
+  it("the branch scope: knob false closes only from the default branch (the ref comment still writes), the flip opens every branch, the issue.ref pin", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47scope");
+    const cell = env.REPO.getByName(engineName);
+    // refs/heads/feature exists as a real branch (the direct-CAS seeding
+    // shape — commitApiChange), so update pushes onto it carry a live old.
+    const landed = await cell.commitApiChange({ ref: "refs/heads/feature", expectedOldOid: ZERO_OID, newOid: tip });
+    expect(landed.tag).toBe("committed");
+
+    const knobFalse = async (): Promise<void> => {
+      await drizzle(env.DB).update(repositories).set({ closeIssuesViaCommitInAnyBranch: false }).where(eq(repositories.id, repoId));
+    };
+
+    // Arm 1 — knob false: "fixes #2" from feature does NOT close, but the
+    // commit_ref comment STILL writes (CreateRefComment precedes the gate,
+    // commit.go:184-190 vs :207-218).
+    const issue2 = await seedB47Issue(repoId, 2, { posterId: ownerId });
+    const p1 = await buildMessagePack("fixes #2", tip);
+    await knobFalse();
+    const push1 = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, p1.oid, "refs/heads/feature", p1.pack),
+    });
+    expect(push1.status).toBe(200);
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issue2)).all();
+      if (!rows.some((row) => row.type === CommentType.CommitRef)) throw new Error("ref comment not written yet");
+    });
+    expect((await drizzle(env.DB).select().from(issues).where(eq(issues.id, issue2)).get())?.isClosed).toBe(false);
+
+    // Arm 2 — the flip (repositories.closeIssuesViaCommitInAnyBranch = true):
+    // a second feature commit closes it.
+    await drizzle(env.DB).update(repositories).set({ closeIssuesViaCommitInAnyBranch: true }).where(eq(repositories.id, repoId));
+    const p2 = await buildMessagePack("fixes #2 again", p1.oid);
+    const push2 = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(p1.oid, p2.oid, "refs/heads/feature", p2.pack),
+    });
+    expect(push2.status).toBe(200);
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issue2)).get();
+      if (row?.isClosed !== true) throw new Error("issue2 not closed yet");
+    });
+
+    // Arm 3 — knob false again, the issue.ref pin: an issue pinned to
+    // feature closes FROM feature, an identically-pinned one does not close
+    // from main.
+    await knobFalse();
+    const issue3 = await seedB47Issue(repoId, 3, { posterId: ownerId, ref: "refs/heads/feature" });
+    const issue4 = await seedB47Issue(repoId, 4, { posterId: ownerId, ref: "refs/heads/feature" });
+    const p3 = await buildMessagePack("fixes #3", p2.oid);
+    const push3 = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(p2.oid, p3.oid, "refs/heads/feature", p3.pack),
+    });
+    expect(push3.status).toBe(200);
+    const p4 = await buildMessagePack("fixes #4", tip);
+    const push4 = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, p4.oid, "refs/heads/main", p4.pack),
+    });
+    expect(push4.status).toBe(200);
+    // Prove BOTH tails ran before the negative assertion: issue3 closed AND
+    // issue4's ref comment present (walk4 executed, the gate held).
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issue3)).get();
+      const c4 = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issue4)).all();
+      if (row?.isClosed !== true) throw new Error("issue3 not closed yet");
+      if (!c4.some((row) => row.type === CommentType.CommitRef)) throw new Error("issue4 ref comment not written yet");
+    });
+    // issue4 (same ref, pushed from MAIN) stays open — the branch gate.
+    const c4 = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issue4)).all();
+    expect((await drizzle(env.DB).select().from(issues).where(eq(issues.id, issue4)).get())?.isClosed).toBe(false);
+    // issue3's ref comment and close comment both exist; issue4 has its ref
+    // comment only (the close arm never fired).
+    const c3 = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issue3)).all();
+    expect(c3.find((row) => row.type === CommentType.Close)).toBeDefined();
+    expect(c4.find((row) => row.type === CommentType.Close)).toBeUndefined();
+  });
+
+  it("the re-push idempotency: the same commit walked again writes no duplicate ref row and never re-closes", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47idem");
+    const issueId = await seedB47Issue(repoId, 1, { posterId: ownerId });
+    const { oid, pack } = await buildMessagePack("fixes #1", tip);
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+      if (row?.isClosed !== true) throw new Error("issue not closed yet");
+    });
+    const closedAt = (await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())!.closedAt;
+
+    // The deterministic re-walk: the same tail entry, applied again (the
+    // createRefComment (type, issue_id, commit_sha) dedupe is THE re-push
+    // idempotency; the ladder reads isClosed and skips the close arm).
+    const repoRow = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!;
+    await applyPushTail(env, repoRow, engineName, {
+      tagDeletes: [],
+      tagAdds: [],
+      prHeadPushes: [],
+      branchPushes: [{ ref: "refs/heads/main", old: tip, next: oid }],
+      pusherId: ownerId,
+    });
+    const refRows = await drizzle(env.DB)
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.CommitRef)))
+      .all();
+    expect(refRows).toHaveLength(1);
+    const after = (await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())!;
+    expect(after.isClosed).toBe(true);
+    expect(after.closedAt?.getTime()).toBe(closedAt!.getTime());
+  });
+
+  it("a cross-repo full-URL reference closes the other repo's issue from this push (the AppURL rewrite + the cross-reference arm)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const service = new RepoService(env.DB);
+    await service.create({ owner: { id: alice.id, usernameLower: "alice" }, name: "b47a", isPrivate: false });
+    const b = await service.create({ owner: { id: alice.id, usernameLower: "alice" }, name: "b47b", isPrivate: false });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const seed = await buildPack();
+    for (const name of ["b47a", "b47b"]) {
+      const push = await SELF.fetch(`https://example.com/alice/${name}.git/git-receive-pack`, {
+        method: "POST",
+        headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+        body: buildReceivePackBody([{ ref: "refs/heads/main", oid: seed.oid }], seed.pack),
+      });
+      expect(push.status).toBe(200);
+    }
+    const issueB = await seedB47Issue(b.id, 1, { posterId: alice.id });
+    const hookId = await seedB47Hook(alice.id);
+
+    // The message carries the FULL AppURL reference — the scan rewrites it
+    // to alice/b47b#1 (convertFullHTMLReferencesToShortRefs) and the
+    // cross-ref loop resolves it. The active AppURL is the settle test's
+    // chain (the APP_URL var wins over the request origin).
+    const appUrlOrigin = ((env as { APP_URL?: string }).APP_URL ?? "https://example.com").replace(/\/+$/, "");
+    const { oid, pack } = await buildMessagePack(`closes ${appUrlOrigin}/alice/b47b/issues/1`, seed.oid);
+    const push = await SELF.fetch("https://example.com/alice/b47a.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(seed.oid, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueB)).get();
+      if (row?.isClosed !== true) throw new Error("cross-repo issue not closed yet");
+    });
+    // The ref comment landed on B's issue, content linking the PUSHED repo.
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueB)).all();
+    expect(rows.find((row) => row.type === CommentType.CommitRef)?.content).toBe(
+      `<a href="/alice/b47a/commit/${oid}">closes ${appUrlOrigin}/alice/b47b/issues/1</a>`,
+    );
+    const deliveries = await drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+    expect(deliveries.length).toBe(1);
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { action: string }).action).toBe("closed");
+  });
+
+  it("the cancomment gate: an unreadable cross-repo target is skipped whole (no comment, no close)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const service = new RepoService(env.DB);
+    await service.create({ owner: { id: alice.id, usernameLower: "alice" }, name: "b47reader", isPrivate: false });
+    // Carol's PRIVATE repo — alice holds no grant there.
+    const c = await service.create({ owner: { id: carol.id, usernameLower: "carol" }, name: "b47secret", isPrivate: true });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const seed = await buildPack();
+    await SELF.fetch("https://example.com/alice/b47reader.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/main", oid: seed.oid }], seed.pack),
+    });
+    const issueC = await seedB47Issue(c.id, 1, { posterId: carol.id });
+
+    const appUrlOrigin = ((env as { APP_URL?: string }).APP_URL ?? "https://example.com").replace(/\/+$/, "");
+    const { oid, pack } = await buildMessagePack(`fixes ${appUrlOrigin}/carol/b47secret/issues/1`, seed.oid);
+    const push = await SELF.fetch("https://example.com/alice/b47reader.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(seed.oid, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+
+    // Give the waitUntil tail its window, then assert nothing happened.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueC)).get();
+    expect(row?.isClosed).toBe(false);
+    expect(await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueC)).all()).toEqual([]);
+  });
+
+  it("the self-reference guard: a PR's merge commit referencing itself writes nothing (commit.go:180)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47selfref");
+    const issueId = await seedB47Issue(repoId, 5, { posterId: ownerId, isPull: true, title: "PR five" });
+    const { oid, pack } = await buildMessagePack("fixes #5", tip);
+    // The PR row whose merged commit IS the pushed sha (isSelfReference's
+    // MergedCommitID == c.Sha1).
+    await drizzle(env.DB).insert(pullRequests).values({
+      issueId,
+      index: 5,
+      headRepoId: repoId,
+      baseRepoId: repoId,
+      headBranch: "topic",
+      baseBranch: "main",
+      hasMerged: true,
+      mergedCommitId: oid,
+    });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+    expect(row?.isClosed).toBe(false);
+    expect(await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all()).toEqual([]);
+  });
+
+  it("the time-log arm: 'fixes #1 @1h30m' writes the tracked time and the type-14 comment (issueAddTime -> AddTime)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47time");
+    const issueId = await seedB47Issue(repoId, 1, { posterId: ownerId });
+    const { oid, pack } = await buildMessagePack("fixes #1 @1h30m", tip);
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const times = await drizzle(env.DB).select().from(trackedTimes).where(eq(trackedTimes.issueId, issueId)).all();
+      if (times.length === 0) throw new Error("no tracked time yet");
+    });
+    const time = (await drizzle(env.DB).select().from(trackedTimes).where(eq(trackedTimes.issueId, issueId)).all())[0]!;
+    expect(time.seconds).toBe(5400); // 1h30m — commit.go's collapsed units
+    expect(time.userId).toBe(ownerId);
+    // dated by the commit's AUTHOR time (CommitToPushCommit's Timestamp).
+    expect(time.createdAt?.getTime()).toBe(1700000000 * 1000);
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    const addTime = rows.find((row) => row.type === CommentType.AddTimeManual);
+    expect(addTime?.content).toBe("|5400");
+    expect(addTime?.timeId).toBe(time.id);
+    expect((await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())?.isClosed).toBe(true);
+  });
+
+  it("a NEW branch push walks its last 10 commits (the listLog arm — CommitsBeforeLimit) and closes (any-branch knob on)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("b47newbranch");
+    const issueId = await seedB47Issue(repoId, 6, { posterId: ownerId });
+    // topic is NOT the default branch — the scope knob must be on for the
+    // close to fire (the knob-false block is the scope test's arm 1).
+    await drizzle(env.DB).update(repositories).set({ closeIssuesViaCommitInAnyBranch: true }).where(eq(repositories.id, repoId));
+    const { oid, pack } = await buildMessagePack("fixes #6", tip);
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/topic", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+      if (row?.isClosed !== true) throw new Error("issue not closed yet");
+    });
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    expect(rows.find((row) => row.type === CommentType.CommitRef)?.commitSha).toBe(oid);
   });
 });
 
