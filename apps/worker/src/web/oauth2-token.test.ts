@@ -818,6 +818,102 @@ describe("GET /login/oauth/keys (OIDCKeys)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The must-change-password gate (SPEC-0002 §6.3.1's census B-82 residue —
+// upstream mounts the group INSIDE webRoutes under optSignInFromAnyOrigin,
+// web.go:625-631, so verifyAuthWithOptionsWeb's NeedChangePassword branch,
+// web.go:197-206, refuses a flagged holder BEFORE any handler)
+// ---------------------------------------------------------------------------
+
+describe("the must-change-password gate (web.go:625-631's optSignInFromAnyOrigin)", () => {
+  /** A flagged user + the cookie header carrying a live session row. */
+  async function seedFlaggedSession(username: string): Promise<{ userId: number; header: string }> {
+    const user = await seedUser(username);
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, user.id));
+    const { mintSession, SESSION_COOKIE_NAME } = await import("../ui/session");
+    return { userId: user.id, header: `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, user.id)}` };
+  }
+
+  it("a flagged SESSION on userinfo → the 303 onto /user/settings/change_password, never the payload (web.go:202-204)", async () => {
+    const { header } = await seedFlaggedSession("w2gate1");
+    const response = await call("/login/oauth/userinfo", { headers: { cookie: header } });
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/user/settings/change_password");
+  });
+
+  it("the git UA answers the 401 locale string instead (web.go:199-201 — http.Error's wire)", async () => {
+    const { header } = await seedFlaggedSession("w2gate2");
+    const response = await call("/login/oauth/userinfo", { headers: { cookie: header, "user-agent": "git/2.45.0" } });
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("Update your password\n");
+    expect(response.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it("a flagged session on access_token refuses BEFORE form processing (the middleware precedes the handler — a garbage form 303s, not 400s)", async () => {
+    const { header } = await seedFlaggedSession("w2gate3");
+    const response = await call("/login/oauth/access_token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: header },
+      body: new URLSearchParams({ grant_type: "authorization_code" }).toString(),
+    });
+    expect(response.status).toBe(303);
+  });
+
+  it("the flagged BEARER holder is refused too (the group's upstream auth chain is [OAuth2, Session], web.go:130-145)", async () => {
+    const user = await seedUser("w2gate4");
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, user.id));
+    const { TokenService } = await import("../auth/token-service");
+    const pat = await new TokenService(env.DB).mint({ userId: user.id, name: "pat", scopes: "read:user" });
+    const response = await call("/login/oauth/userinfo", { headers: { authorization: `Bearer ${pat.plaintext}` } });
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/user/settings/change_password");
+  });
+
+  it("an impersonated flagged session never gates (common/auth.go:71's carve) — the handler answers its own 401", async () => {
+    const admin = await seedUser("w2gate5admin");
+    const { userId: targetId } = await seedFlaggedSession("w2gate5");
+    const { mintSession, SESSION_COOKIE_NAME, impersonateSessionUser } = await import("../ui/session");
+    const adminCookie = await mintSession(env.DB, admin.id);
+    await impersonateSessionUser(env.DB, adminCookie.split(":")[0]!, admin.id, targetId);
+    // The presented impersonating cookie rides the FLAGGED target: the gate
+    // passes, the userinfo handler's own no-credential 401 answers.
+    const response = await call("/login/oauth/userinfo", { headers: { cookie: `${SESSION_COOKIE_NAME}=${adminCookie}` } });
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("no valid authorization");
+  });
+
+  it("an UNFLAGGED session rides through to the handler's own arms (no regression — the Session method's 401)", async () => {
+    const user = await seedUser("w2gate6");
+    const { mintSession, SESSION_COOKIE_NAME } = await import("../ui/session");
+    const cookie = await mintSession(env.DB, user.id);
+    const response = await call("/login/oauth/userinfo", { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` } });
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("no valid authorization");
+  });
+
+  it("the gate covers every group path: keys and introspect refuse the flagged session identically", async () => {
+    const { header } = await seedFlaggedSession("w2gate7");
+    const keys = await call("/login/oauth/keys", { headers: { cookie: header } });
+    expect(keys.status).toBe(303);
+    const introspect = await call("/login/oauth/introspect", { method: "POST", headers: { cookie: header } });
+    expect(introspect.status).toBe(303);
+  });
+
+  it("OPTIONS with a flagged session still takes the bare 405 (optionsCorsHandler precedes the gate, web.go:630)", async () => {
+    const { header } = await seedFlaggedSession("w2gate8");
+    const response = await call("/login/oauth/keys", { method: "OPTIONS", headers: { cookie: header } });
+    expect(response.status).toBe(405);
+    expect(await response.text()).toBe("");
+  });
+
+  it("an unknown /login/oauth/* subpath 404s ungated (chi group middleware wraps only the group's own routes)", async () => {
+    const { header } = await seedFlaggedSession("w2gate9");
+    const response = await call("/login/oauth/nope", { headers: { cookie: header } });
+    expect(response.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The deny arms + the form parser
 // ---------------------------------------------------------------------------
 

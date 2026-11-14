@@ -38,7 +38,10 @@
  * 405 deny arms). The API-side half of the gate (a disabled provider kills
  * its tokens — services/auth/oauth2.go:32-34) rides
  * resolveOAuth2AccessTokenCredential and stays live via
- * oauth2FeatureEnabled.
+ * oauth2FeatureEnabled. The group's SECOND wrap is the must-change-password
+ * gate (SPEC-0002 §6.3.1's census B-82 residue) — upstream's
+ * optSignInFromAnyOrigin half, refusing a flagged bearer/session holder
+ * before the handlers.
  *
  * ## Byte shapes
  *
@@ -59,6 +62,7 @@ import { Hono, type Context } from "hono";
 import { verifyClientSecret } from "../api/services/oauth2-apps";
 import { parseAuthorizationHeader } from "../auth/httpauth";
 import { ScopeSet } from "../auth/scopes";
+import { lookupValidSession, mustChangePasswordArm, sessionCookieValue } from "../ui/session";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { users } from "../db/schema";
@@ -265,6 +269,70 @@ oauth2Router.use("*", async (c, next) => {
     return httpForbidden();
   }
   await next();
+});
+
+// ---------------------------------------------------------------------------
+// The must-change-password gate (SPEC-0002 §6.3.1's census B-82 residue):
+// upstream mounts this group INSIDE webRoutes under optSignInFromAnyOrigin
+// (web.go:625-631), whose verifyAuthWithOptionsWeb runs the NeedChangePassword
+// branch (web.go:197-206) on the resolved doer BEFORE any handler — a flagged
+// holder is refused with the git-UA 401 locale string or the 303 onto
+// /user/settings/change_password (mustChangePasswordArm's exact wire), never
+// the payload.
+// ---------------------------------------------------------------------------
+
+/** The four paths the JSON group serves (web.go:625-631). chi group
+ *  middleware wraps only the group's own routes, so an unknown
+ *  /login/oauth/* subpath 404s ungated — the whitelist, not a prefix. */
+const MUST_CHANGE_GATED_PATHS = new Set<string>([
+  "/login/oauth/access_token",
+  "/login/oauth/introspect",
+  "/login/oauth/userinfo",
+  "/login/oauth/keys",
+]);
+
+/**
+ * The doer resolution mirrors the group's upstream auth chain
+ * (webAuth.MiddlewareHandler, web.go:127-147): with `webAuth.AllowOAuth2` on
+ * this mount the group is [OAuth2, Session] — the bearer token resolves
+ * FIRST (the same credential seam the userinfo handler reads: dotted grants
+ * and dotless PATs alike), then the session cookie. The impersonation carve
+ * is CheckSignedInUser's `!isImpersonated` (routers/common/auth.go:71) — an
+ * impersonating session never gates. OPTIONS passes straight through:
+ * optionsCorsHandler precedes optSignInFromAnyOrigin in the group option
+ * order (:630), so the bare-405 deny arms answer before the gate ever runs.
+ * A presented credential's D1 failure propagates (fail closed — a flagged
+ * holder's payload must not slip past a transient error), while a request
+ * with no credential at all never probes.
+ */
+oauth2Router.use("*", async (c, next) => {
+  if (c.req.method === "OPTIONS") return await next();
+  if (!MUST_CHANGE_GATED_PATHS.has(new URL(c.req.url).pathname)) return await next();
+  let flagged: boolean | null = null;
+  const bearer = parseAuthorizationHeader(c.req.header("Authorization") ?? "")?.bearerToken?.token ?? null;
+  if (bearer !== null) {
+    const resolved = await resolveUserInfoCredential(c.env.DB, bearer, {
+      enabled: oauth2FeatureEnabled(c.env),
+      configuredAlgorithm: c.env.OAUTH2_SIGNING_ALGORITHM,
+      now: new Date(),
+    });
+    if (resolved !== null) {
+      flagged = resolved.user.mustChangePassword;
+    }
+  }
+  if (flagged === null) {
+    const cookie = sessionCookieValue(c.req.raw);
+    if (cookie !== null) {
+      const session = await lookupValidSession(c.env.DB, cookie);
+      if (session !== null) {
+        if (session.impersonatorUserId !== null) return await next();
+        flagged = session.mustChangePassword;
+      }
+    }
+  }
+  if (flagged !== true) return await next();
+  const arm = mustChangePasswordArm(c.req.raw, true);
+  return arm ?? (await next());
 });
 
 // ---------------------------------------------------------------------------

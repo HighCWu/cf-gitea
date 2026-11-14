@@ -32,7 +32,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { basicHeader, seedVerifiedUser } from "../auth/testing/seeds";
+import { basicHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { totpCode } from "../auth/totp";
 import { applyTwofaEnrollment, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { newPasswordRecord } from "../auth/password";
@@ -369,5 +369,103 @@ describe("the anon-allowed-read exemption under both flag postures (githttp.go:1
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+  });
+});
+
+// -----------------------------------------------------------------------------
+// THE FLAGGED-DOER GATE (SPEC-0002 §6.3.1's census B-82 residue): the smart-
+// HTTP family mounts INSIDE webRoutes under optSignInFromAnyOrigin (web.go:
+// 1782; LFS :1778), whose NeedChangePassword branch (web.go:197-206) answers
+// a flagged doer BEFORE httpBase's ladder — the git UA takes the 401 locale
+// string ("Update your password", http.Error's wire), a non-git UA the 303,
+// never the pack. Identity must ESTABLISH first (both carriers — the
+// password arm's row and the token carrier), so a failed credential still
+// takes the generic challenge below.
+// -----------------------------------------------------------------------------
+
+describe("the flagged-doer must-change gate (optSignInFromAnyOrigin over the git mounts, web.go:197-206/:1782)", () => {
+  async function seedFlaggedUserWithPassword(username: string): Promise<{ id: number; password: string }> {
+    const user = await seedUserWithPassword(username);
+    await drizzle(env.DB).update(users).set({ mustChangePassword: true }).where(eq(users.id, user.id));
+    return user;
+  }
+
+  it("a flagged doer's password-Basic clone → the 401 locale string, verbatim wire (web.go:199-201) — never the advert", async () => {
+    const alice = await seedFlaggedUserWithPassword("Alice");
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "gated", isPrivate: true });
+
+    const res = await infoRefs("alice", "gated", "git-upload-pack", {
+      authorization: basicHeader("Alice", alice.password),
+      "user-agent": "git/2.45.0",
+    });
+    expect(res.status).toBe(401);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe("Update your password\n");
+    expect(res.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    // Identity ESTABLISHED (the flagged row authenticated) — the Basic
+    // challenge header never rides this arm (upstream's HTTPError is a bare
+    // http.Error).
+    expect(res.headers.get("www-authenticate")).toBeNull();
+  });
+
+  it("the gate precedes the repo ladder: a flagged TOTP-enrolled doer WITH a valid OTP answers the must-change 401, not the TOTP plaintext (middleware-before-handler, web.go:197 vs githttp.go:160-172)", async () => {
+    const alice = await seedFlaggedUserWithPassword("Alice");
+    const { secret } = await seedTotp(alice.id);
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "gatedtotp", isPrivate: true });
+
+    const res = await infoRefs("alice", "gatedtotp", "git-upload-pack", {
+      authorization: basicHeader("Alice", alice.password),
+      "x-gitea-otp": await totpCode(secret, Date.now() / 1000),
+      "user-agent": "git/2.45.0",
+    });
+    expect(res.status).toBe(401);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe("Update your password\n");
+    expect(res.headers.get("www-authenticate")).toBeNull();
+  });
+
+  it("the token carrier is gated too (upstream's OAuth2 method resolves the same doer): a flagged holder's PAT → the 401 locale string", async () => {
+    const alice = await seedFlaggedUserWithPassword("Alice");
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "gatedpat", isPrivate: true });
+    const pat = await mintFor(alice.id, "pat", "all");
+
+    const res = await infoRefs("alice", "gatedpat", "git-upload-pack", {
+      authorization: `Bearer ${pat.plaintext}`,
+      "user-agent": "git/2.45.0",
+    });
+    expect(res.status).toBe(401);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe("Update your password\n");
+    expect(res.headers.get("www-authenticate")).toBeNull();
+  });
+
+  it("a NON-git UA takes the 303 redirect arm instead (web.go:202-204) — the arm's UA branch, not a git-only shape", async () => {
+    const alice = await seedFlaggedUserWithPassword("Alice");
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "gatedcurl", isPrivate: true });
+
+    // redirect:"manual" — the default follow would chase the 303 onto the
+    // change-password page (which renders the sign-in round-trip for this
+    // Basic-only, sessionless request) and the pin would assert the wrong
+    // surface entirely.
+    const res = await SELF.fetch(`https://example.com/alice/gatedcurl.git/info/refs?service=git-upload-pack`, {
+      redirect: "manual",
+      headers: {
+        authorization: basicHeader("Alice", alice.password),
+        "user-agent": "curl/8.5.0",
+      },
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/user/settings/change_password");
+  });
+
+  it("a FAILED credential still takes the generic challenge (identity never establishes — the gate needs a doer)", async () => {
+    const alice = await seedFlaggedUserWithPassword("Alice");
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "gatedwrong", isPrivate: true });
+
+    const res = await infoRefs("alice", "gatedwrong", "git-upload-pack", {
+      authorization: basicHeader("Alice", "wrong-password"),
+      "user-agent": "git/2.45.0",
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe(UNAUTHORIZED_BODY);
   });
 });

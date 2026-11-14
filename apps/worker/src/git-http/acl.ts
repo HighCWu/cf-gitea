@@ -7,7 +7,11 @@
  * every caller, anonymous included), then the auth ladder:
  *   credentials → failure limiter → deploy-token verify (upstream's
  *   DeployToken method, registered on the git routes before Basic,
- *   web.go:135-136) → token verify → scope check (row 7) →
+ *   web.go:135-136) → token verify / password arm → the flagged-doer
+ *   must-change gate (optSignInFromAnyOrigin's NeedChangePassword branch,
+ *   web.go:197-206 — a route MIDDLEWARE upstream, so it precedes every
+ *   handler-level refusal below; the deploy key's synthetic user carries no
+ *   flag and skips it) → scope check (row 7) →
  *   doer account status (row 11) → repo grants
  *   (rows 8/9) → push-create (rows 15-20, SPEC-0003 M3).
  *
@@ -45,6 +49,7 @@ import { ScopeSet, SCOPE_ALL } from "../auth/scopes";
 import { authUserFromRow } from "../auth/password-auth";
 import { basicPasswordArm } from "../auth/middleware";
 import { hasTwoFactorByUid } from "../auth/two-factor";
+import { mustChangePasswordArm, userMustChangePassword } from "../ui/session";
 import { AuditActions, emitAudit } from "../services/audit";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import {
@@ -273,6 +278,14 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
         );
         if (outcome.kind === "ok") {
           input.waitUntil(limiterResetFailOpen(limiter, ip));
+          // THE FLAGGED-DOER GATE (SPEC-0002 §6.3.1's census B-82 residue):
+          // the smart-HTTP family mounts INSIDE webRoutes under
+          // optSignInFromAnyOrigin (web.go:1782), whose NeedChangePassword
+          // branch (web.go:197-206) answers a flagged doer BEFORE httpBase's
+          // ladder — the git UA takes the 401 locale string, a non-git UA the
+          // 303 (mustChangePasswordArm's exact wire), never the pack.
+          const mustChangeArm = mustChangePasswordArm(req, outcome.user.mustChangePassword);
+          if (mustChangeArm !== null) return mustChangeArm;
           // THE REPO GATE (githttp.go:152-158, inside its !canAnonymousPull
           // branch): a password-Basic INDIVIDUAL doer with a TOTP enrollment
           // is refused EVEN WITH a valid OTP (the OTP satisfied Basic; the
@@ -344,6 +357,22 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
         ? new TokenService(env.DB).touchLastUsed(verified.token.id, now)
         : Promise.resolve(),
     );
+    // THE FLAGGED-DOER GATE — the token carrier (upstream's OAuth2 method
+    // establishes the same doer on the git routes; the optSignInFromAnyOrigin
+    // branch refuses it before httpBase, web.go:197-206/:1782). AuthUser does
+    // not project the flag — the one PK probe (the §6.3.1 recorded shape);
+    // a probe failure fails closed (the never-fail-open 500).
+    let flagged: boolean;
+    try {
+      flagged = await userMustChangePassword(env.DB, verified.user.id);
+    } catch {
+      return new Response("internal server error\n", {
+        status: 500,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      });
+    }
+    const mustChangeArm = mustChangePasswordArm(req, flagged);
+    if (mustChangeArm !== null) return mustChangeArm;
     // SPEC-0007 §3.5 + SPEC-0005: the doer's resolved grant over the repo
     // (`max` of the Owners-team bridge + covering teams and the
     // `repo_collaborators` row's mode — the same repository-service

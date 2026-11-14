@@ -114,6 +114,7 @@ import {
   type VerifiedDeployKey,
 } from "../auth/deploy-token-service";
 import { D1FailureLimiter } from "../auth/failure-limiter";
+import { mustChangePasswordArm, userMustChangePassword } from "../ui/session";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import {
   limiterCheckFailOpen,
@@ -478,6 +479,23 @@ export async function authorizeLfs(input: {
   // Row 11 parity: disabled/prohibited doer; then upstream httpBase's
   // owner-status check (applies to every caller, owner included).
   if (verified.user.status === "prohibited") return accountDisabled();
+  // B-82's LFS half (HOFF-A's one-line handoff — web.go:1778): a flagged
+  // doer's token-verified LFS request answers mustChangePasswordArm BEFORE
+  // the scope/grant ladder, exactly as the git-HTTP gate (acl.ts:367's
+  // token-carrier probe shape; AuthUser does not project the flag).
+  let flagged: boolean;
+  try {
+    flagged = await userMustChangePassword(env.DB, verified.user.id);
+  } catch {
+    return new Response("internal server error\n", {
+      status: 500,
+      headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+    });
+  }
+  if (flagged) {
+    const arm = mustChangePasswordArm(req, true);
+    if (arm !== null) return arm;
+  }
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
   // The doer's resolved grant over the repo — the SAME repository-service
