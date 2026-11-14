@@ -132,6 +132,45 @@ describe("ParseCodeOwnersLine — the pattern arms (:876-911)", () => {
     expect(rules[0]!.regexp.test("docs/gcp/keep.md")).toBe(false);
   });
 
+  it("\\p{...} property classes match like regexp2's (the u-mode compile, census B-53 remainder (4))", async () => {
+    // regexp2 accepts \p{...} natively (models/issues/pull.go:892 compiles
+    // `^\p{Lu}.*$`); without the u flag JS compiles the same text as the
+    // LITERAL `p{Lu}` — a rule that parses, resolves owners and can never
+    // match a real path. (The tokenizer eats one escape level: the file's
+    // `\\p{Lu}` reaches the parser as `\p{Lu}`, same convention as `\\.`.)
+    const { rules, warnings } = await parseCodeOwners(env.DB, String.raw`\\p{Lu}.* @alice` + "\n");
+    expect(warnings).toEqual([]);
+    expect(rules[0]!.regexp.test("README.md")).toBe(true);
+    expect(rules[0]!.regexp.test("readme.md")).toBe(false);
+    // Unicode-mode matching runs over code points: one astral letter is ONE
+    // \p{L}, the way Go strings count it upstream.
+    const single = await parseCodeOwners(env.DB, String.raw`data/\\p{L}\\.bin @alice` + "\n");
+    expect(single.warnings).toEqual([]);
+    expect(single.rules[0]!.regexp.test("data/𝐀.bin")).toBe(true);
+  });
+
+  it("patterns the u-mode grammar rejects keep the Annex B compile (no regression on .NET-accepted escapes)", async () => {
+    // `\-` outside a class: regexp2/.NET accepts it (identity escape); the
+    // u-mode grammar does not. The fallback keeps the pre-u compile, so the
+    // rule still matches instead of dropping to a warning.
+    const { rules, warnings } = await parseCodeOwners(env.DB, String.raw`foo\\-bar/.* @alice` + "\n");
+    expect(warnings).toEqual([]);
+    expect(rules[0]!.regexp.test("foo-bar/keep.md")).toBe(true);
+    expect(rules[0]!.regexp.test("foobar/keep.md")).toBe(false);
+  });
+
+  it("the safety screen covers property classes: (\\p{L}+)+ drops, (\\p{L})+ stays", async () => {
+    // The exponential shapes are grammar-independent — a property class adds
+    // no backtracking power, and the screen (a static scan ahead of the
+    // compile) must not be blinded by the brace of a property escape.
+    const nested = await parseCodeOwners(env.DB, String.raw`(\\p{L}+)+ @alice` + "\n");
+    expect(nested.rules).toEqual([]);
+    expect(nested.warnings[0]).toContain("match-time safety bound");
+    const safe = await parseCodeOwners(env.DB, String.raw`(\\p{L})+ @alice` + "\n");
+    expect(safe.rules).toHaveLength(1);
+    expect(safe.warnings).toEqual([]);
+  });
+
   it("strip order: the leading ! then the leading / (:888-895)", async () => {
     const { rules } = await parseCodeOwners(env.DB, "!/docs/.* @alice\n");
     expect(rules[0]!.negative).toBe(true);

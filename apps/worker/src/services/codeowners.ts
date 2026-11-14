@@ -261,6 +261,44 @@ function quantifierAt(pattern: string, pos: number): { unbounded: boolean } {
 }
 
 /**
+ * Compile one CODEOWNERS pattern the way upstream's
+ * `regexp2.Compile("^"+pattern+"$", regexp2.None)` accepts it
+ * (models/issues/pull.go:891-892). regexp2 is the .NET family, whose accepted
+ * language no single JS grammar covers, so the compile tries two:
+ *
+ *   1. UNICODE mode (`u`) first — the only JS grammar where `\p{...}` /
+ *      `\P{...}` are property classes (regexp2 accepts them natively) and
+ *      where matching runs over code points (Go strings; an astral path
+ *      character is ONE character to upstream). Without the flag `\p{Lu}`
+ *      compiles as the literal text `p{Lu}`: a rule that parses, resolves its
+ *      owners, and can never match a real path — a silently inert rule
+ *      (census B-53 remainder (4)).
+ *   2. Annex B (no flag) as the FALLBACK — unicode mode rejects shapes .NET
+ *      accepts: an identity escape of a non-syntax character outside a class
+ *      (`foo\-bar`), a brace that is not a quantifier (`a{b`). Those keep
+ *      exactly the pre-existing compile, so no pattern that matched before
+ *      this arm landed stops matching.
+ *
+ * A pattern both grammars reject throws the ANNEX B error — the warning text
+ * the caller renders stays byte-identical to the single-compile era (the
+ * unicode-mode message carries a `/u` suffix).
+ *
+ * The match-time safety screen runs BEFORE this (a static scan of the
+ * pattern text) and is grammar-independent: the exponential shapes it drops
+ * are equally exponential under either flag, and a property class adds no
+ * backtracking power — `(\p{L}+)+` trips the nested-unbounded check exactly
+ * like `(a+)+`.
+ */
+function compileCodeOwnerPattern(pattern: string): RegExp {
+  const expr = `^${pattern}$`;
+  try {
+    return new RegExp(expr, "u");
+  } catch {
+    return new RegExp(expr);
+  }
+}
+
+/**
  * `ParseCodeOwnersLine` (:876-962): the first token is the pattern —
  * `Negative` from a leading `!` (:880), the `!` then a leading `/` stripped
  * (:888-895 — git paths are relative, the anchors make the `/` redundant),
@@ -290,7 +328,7 @@ export async function parseCodeOwnersLine(
 
   let regexp: RegExp;
   try {
-    regexp = new RegExp(`^${pattern}$`);
+    regexp = compileCodeOwnerPattern(pattern);
   } catch (error) {
     warnings.push(`incorrect codeowner regexp: ${error instanceof Error ? error.message : String(error)}`);
     return { rule: null, warnings };

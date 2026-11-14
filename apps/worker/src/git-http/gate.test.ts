@@ -73,7 +73,15 @@ import type { AuthUser } from "../auth/auth-context";
 import { createWikiPage } from "../services/wiki";
 import { ensureCargoIndexMirror } from "../services/packages/cargo-index";
 import type { AutoMergeCheckMessage } from "../services/pull-automerge";
-import { deployKeys, repoCounters, repoRedirects, repoSettings, repositories, issues, releases, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import {
+  agitHeadBranch,
+  parseAgitPushOptionValue,
+  pushOptionBool,
+  pushOptionsMap,
+  resolveAgitBaseTopic,
+  splitCommitTitleBody,
+} from "../api/services/agit";
+import { deployKeys, PRFlow, repoCounters, repoRedirects, repoSettings, repositories, issues, pullRequests, releases, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { IssuesService } from "../issues/service";
 import { RepoService } from "../repos/service";
@@ -2611,4 +2619,568 @@ describe("row 6: require-sign-in-view kills every anonymous pull (SPEC-0003 §2.
     // the flag never consults it).
     expect(await call(fx.repo, "true")).toBe(true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The agit push-to-propose lane (census B-52 — api/services/agit.ts): a
+// `refs/for/<branch>[/<topic>]` command plans against D1 + the branch
+// universe (upstream ProcReceive), the forward translates onto
+// `refs/pull/N/head`, the report renders against the ORIGINAL `refs/for`
+// names with the PR URL message on sideband band 2, and the create/update
+// tails run the PR row work upstream's hook ran inside the receive.
+// ---------------------------------------------------------------------------
+
+/** Build a receive-pack request body for the agit battery: the command
+ *  section (capabilities on the first line), the optional push-options
+ *  section (present exactly when pushOptions is given, like git's
+ *  --push-option), and the optional pack. */
+function buildAgitPushBody(
+  commands: { old?: string; oid: string; ref: string }[],
+  options: { caps?: string; pushOptions?: string[]; pack?: Uint8Array } = {},
+): Uint8Array {
+  const caps = options.caps ?? "report-status side-band-64k push-options";
+  let section = "";
+  commands.forEach((cmd, i) => {
+    const suffix = i === 0 ? `\0${caps}` : "";
+    section += pktLine(`${cmd.old ?? ZERO_OID} ${cmd.oid} ${cmd.ref}${suffix}`);
+  });
+  section += "0000";
+  const chunks: Uint8Array[] = [new TextEncoder().encode(section)];
+  if (options.pushOptions !== undefined) {
+    let opts = "";
+    for (const opt of options.pushOptions) opts += pktLine(opt);
+    opts += "0000";
+    chunks.push(new TextEncoder().encode(opts));
+  }
+  if (options.pack !== undefined) chunks.push(options.pack);
+  return concatBatteryU8(chunks);
+}
+
+/** One self-contained commit pack (blob + tree + commit) with a controllable
+ *  message and optional parent — the agit update tests need a fast-forward
+ *  tip (parented) and a force tip (unrelated), which the fixed
+ *  testing/git-pack builder cannot produce. workerd-safe (WebCrypto +
+ *  CompressionStream), the buildPack shape. */
+async function buildAgitCommitPack(opts: { message: string; file?: string; parent?: string }): Promise<{ oid: string; pack: Uint8Array }> {
+  const blob = new TextEncoder().encode(opts.file ?? "agit content\n");
+  const blobSha = await batterySha1Hex(concatBatteryU8([new TextEncoder().encode(`blob ${blob.length}\0`), blob]));
+  const treeBody = concatBatteryU8([new TextEncoder().encode(`100644 file.txt\0`), batteryRawOid(blobSha)]);
+  const treeSha = await batterySha1Hex(concatBatteryU8([new TextEncoder().encode(`tree ${treeBody.length}\0`), treeBody]));
+  const time = 1700000100;
+  const commitBody = new TextEncoder().encode(
+    `tree ${treeSha}\n` +
+      (opts.parent !== undefined ? `parent ${opts.parent}\n` : "") +
+      `author Agit Tester <agit@example.com> ${time} +0000\n` +
+      `committer Agit Tester <agit@example.com> ${time} +0000\n\n` +
+      opts.message,
+  );
+  const commitSha = await batterySha1Hex(concatBatteryU8([new TextEncoder().encode(`commit ${commitBody.length}\0`), commitBody]));
+  const entries: { type: number; body: Uint8Array }[] = [
+    { type: 3, body: blob },
+    { type: 2, body: treeBody },
+    { type: 1, body: commitBody },
+  ];
+  const chunks: Uint8Array[] = [new TextEncoder().encode("PACK"), batteryBe32(2), batteryBe32(entries.length)];
+  for (const entry of entries) {
+    chunks.push(batteryObjectHeader(entry.type, entry.body.length));
+    chunks.push(await batteryDeflate(entry.body));
+  }
+  chunks.push(await batterySha1Bytes(concatBatteryU8(chunks)));
+  return { oid: commitSha, pack: concatBatteryU8(chunks) };
+}
+
+async function batterySha1Hex(bytes: Uint8Array): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function batterySha1Bytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-1", bytes));
+}
+
+async function batteryDeflate(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer());
+}
+
+function batteryRawOid(oidHex: string): Uint8Array {
+  const raw = new Uint8Array(20);
+  for (let i = 0; i < 20; i++) raw[i] = parseInt(oidHex.slice(i * 2, i * 2 + 2), 16);
+  return raw;
+}
+
+function batteryObjectHeader(type: number, size: number): Uint8Array {
+  const bytes: number[] = [];
+  let first = (type << 4) | (size & 0x0f);
+  let rest = size >> 4;
+  while (rest > 0) {
+    bytes.push(first | 0x80);
+    first = rest & 0x7f;
+    rest >>= 7;
+  }
+  bytes.push(first);
+  return new Uint8Array(bytes);
+}
+
+function batteryBe32(value: number): Uint8Array {
+  return new Uint8Array([(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff]);
+}
+
+function concatBatteryU8(arrays: Uint8Array[]): Uint8Array {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const array of arrays) {
+    out.set(array, offset);
+    offset += array.length;
+  }
+  return out;
+}
+
+/** The serving origin the test env actually carries: the vitest plugin
+ *  injects the wrangler VARS (APP_URL among them) and appOrigin's pinned
+ *  precedence puts the var over the request origin — so the agit hook
+ *  message's PR URL rides the CONFIGURED origin, never the literal request
+ *  host (the same ride-the-real-config posture as services/mirror/
+ *  sync.test.ts; upstream builds the URL from repo.HTMLURL(), agit.go:208). */
+const EXPECTED_APP_ORIGIN = env.APP_URL.replace(/\/+$/, "");
+
+/** Split a sideband-framed receive-pack RESULT: the band-1 report pkt-lines
+ *  and the band-2 remote messages. */
+function parseAgitResponse(body: ArrayBuffer): { report: string; messages: string } {
+  const bytes = new Uint8Array(body);
+  const decoder = new TextDecoder();
+  let band1 = "";
+  let band2 = "";
+  let pos = 0;
+  while (pos + 4 <= bytes.length) {
+    const len = parseInt(decoder.decode(bytes.subarray(pos, pos + 4)), 16);
+    if (len === 0) break;
+    const band = bytes[pos + 4]!;
+    const payload = decoder.decode(bytes.subarray(pos + 5, pos + len));
+    pos += len;
+    if (band === 1) band1 += payload;
+    else if (band === 2) band2 += payload;
+  }
+  return { report: band1, messages: band2 };
+}
+
+/** Seed one active repo webhook subscribed to the two PR event types the
+ *  agit tails emit (the delivery rows the assertions read). */
+async function seedAgitWebhook(repoId: string): Promise<void> {
+  await drizzle(env.DB)
+    .insert(webhooks)
+    .values({ repoId, url: "https://hooks.example/agit-lane", events: JSON.stringify({ events: { pull_request: true, pull_request_sync: true } }), isActive: true })
+    .run();
+}
+
+/** The agit battery's extra sweep (the file-level beforeEach does not clear
+ *  the PR family or the block table). */
+async function sweepAgitTables(): Promise<void> {
+  await env.DB.prepare("DELETE FROM pull_requests").run();
+  await env.DB.prepare("DELETE FROM issues").run();
+  await env.DB.prepare("DELETE FROM user_blocking").run();
+}
+
+describe("agit lane pure helpers (the upstream ports)", () => {
+  it("resolveAgitBaseTopic: exact branch, shortest-prefix split, slashy branches, the miss", () => {
+    const branches = ["main", "release", "release/1.0"];
+    expect(resolveAgitBaseTopic(branches, "main")).toEqual({ base: "main", topic: "" });
+    expect(resolveAgitBaseTopic(branches, "main/my-topic")).toEqual({ base: "main", topic: "my-topic" });
+    // Shortest prefix first (agit.go's in-order range walk): "release" wins
+    // over "release/1.0" when both exist.
+    expect(resolveAgitBaseTopic(branches, "release/1.0/topic")).toEqual({ base: "release", topic: "1.0/topic" });
+    // Without the short prefix, the slashy branch itself is the base.
+    expect(resolveAgitBaseTopic(["release/1.0"], "release/1.0/topic")).toEqual({ base: "release/1.0", topic: "topic" });
+    expect(resolveAgitBaseTopic(branches, "nope/topic")).toBeNull();
+    expect(resolveAgitBaseTopic([], "main")).toBeNull();
+  });
+
+  it("agitHeadBranch: topics namespace under the lowercased pusher, prefixed topics ride as-is", () => {
+    expect(agitHeadBranch("alice", "my-topic")).toBe("alice/my-topic");
+    expect(agitHeadBranch("alice", "alice/my-topic")).toBe("alice/my-topic");
+    expect(agitHeadBranch("alice", "bob/my-topic")).toBe("alice/bob/my-topic");
+  });
+
+  it("parseAgitPushOptionValue: {base64} decodes, failures keep the raw text", () => {
+    expect(parseAgitPushOptionValue("plain")).toBe("plain");
+    expect(parseAgitPushOptionValue("{base64}aGVsbG8=")).toBe("hello");
+    expect(parseAgitPushOptionValue("{base64}!!!not base64!!!")).toBe("{base64}!!!not base64!!!");
+    expect(parseAgitPushOptionValue("{base64}")).toBe("");
+  });
+
+  it("pushOptionsMap + pushOptionBool: the GIT_PUSH_OPTION_* map and Go's ParseBool polarity", () => {
+    const map = pushOptionsMap(["force-push", "topic= my topic ", "bogus=not-a-bool"]);
+    expect(pushOptionBool(map, "force-push")).toBe(true); // bare key = true
+    expect(pushOptionBool(map, "absent")).toBe(false);
+    expect(map.get("topic")).toBe(" my topic ");
+    expect(pushOptionBool(pushOptionsMap(["force-push="]), "force-push")).toBe(true);
+    expect(pushOptionBool(pushOptionsMap(["force-push=true"]), "force-push")).toBe(true);
+    expect(pushOptionBool(pushOptionsMap(["force-push=1"]), "force-push")).toBe(true);
+    expect(pushOptionBool(pushOptionsMap(["force-push=TRUE"]), "force-push")).toBe(true);
+    expect(pushOptionBool(pushOptionsMap(["force-push=false"]), "force-push")).toBe(false);
+    expect(pushOptionBool(pushOptionsMap(["force-push=0"]), "force-push")).toBe(false);
+    expect(pushOptionBool(pushOptionsMap(["force-push=yes"]), "force-push")).toBe(false); // unparseable → None → false
+  });
+
+  it("splitCommitTitleBody: MessageTitle/MessageBody (commit_message.go)", () => {
+    expect(splitCommitTitleBody("title only")).toEqual({ title: "title only", body: "" });
+    expect(splitCommitTitleBody("the title\n\nthe body\n")).toEqual({ title: "the title", body: "the body" });
+    expect(splitCommitTitleBody("  \n  body after blank title \n")).toEqual({ title: "body after blank title", body: "" });
+    expect(splitCommitTitleBody("")).toEqual({ title: "", body: "" });
+  });
+});
+
+describe("the agit create arm end-to-end (refs/for → PR + refs/pull/N/head)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("a refs/for push with options creates the PR, lands refs/pull/1/head, reports the ORIGINAL ref and the URL message", async () => {
+    const { repoId, engineName, ownerId, token } = await seedTailRepo("agitcreate");
+    await seedAgitWebhook(repoId);
+    const { oid, pack } = await buildAgitCommitPack({ message: "proposal one\n" });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid, ref: "refs/for/main/topic-a" }], {
+        pack,
+        pushOptions: ["topic=topic-a", "title=Proposal title", "description=Proposal body"],
+      }),
+    });
+    expect(push.status).toBe(200);
+
+    // The report renders the ORIGINAL refs/for name — the engine saw (and
+    // applied) refs/pull/1/head, the rewrite mapped it back.
+    const { report, messages } = parseAgitResponse(await push.arrayBuffer());
+    expect(report).toContain("unpack ok");
+    expect(report).toContain("ok refs/for/main/topic-a\n");
+    expect(report).not.toContain("ok refs/pull/");
+    // A report-status (v1) client gets NO v2 option lines — those ride only
+    // the negotiated v2 (cmd/hook.go's option lines are consumed by git's
+    // receive-pack and re-rendered per the client's caps; the gate plays
+    // both roles and must not leak v2 directives to a v1 client).
+    expect(report).not.toContain("option ");
+    // The hookPrintResult message rides band 2 with the PR URL.
+    expect(messages).toContain("Visit the existing pull request:\n");
+    expect(messages).toContain(`  ${EXPECTED_APP_ORIGIN}/${engineName}/pulls/1\n`);
+
+    // The engine: the real head ref landed, the refs/for name did NOT.
+    const listed = await env.REPO.getByName(engineName).listRefs();
+    const refs = listed.refs.map((r) => r.name);
+    expect(refs).toContain("refs/pull/1/head");
+    expect(refs).not.toContain("refs/for/main/topic-a");
+    const headTip = listed.refs.find((r) => r.name === "refs/pull/1/head")!.target;
+    expect(headTip).toBe(oid);
+
+    // D1: the PR row (flow=AGit, the username-prefixed head branch, the
+    // option-carried text) and its issue.
+    const pr = await drizzle(env.DB).select().from(pullRequests).all();
+    expect(pr).toHaveLength(1);
+    expect(pr[0]!.index).toBe(1);
+    expect(pr[0]!.flow).toBe(PRFlow.AGit);
+    expect(pr[0]!.headBranch).toBe("alice/topic-a");
+    expect(pr[0]!.baseBranch).toBe("main");
+    expect(pr[0]!.headSha).toBe(oid);
+    expect(pr[0]!.hasMerged).toBe(false);
+    const issue = await drizzle(env.DB).select().from(issues).where(eq(issues.id, pr[0]!.issueId)).get();
+    expect(issue!.title).toBe("Proposal title");
+    expect(issue!.content).toBe("Proposal body");
+    expect(issue!.isPull).toBe(true);
+    expect(issue!.posterId).toBe(ownerId);
+
+    // The opened webhook rode the create tail (the awaited delivery row).
+    const deliveries = await drizzle(env.DB).select().from(webhookDeliveries).all();
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { action: string; number: number };
+    expect(payload.action).toBe("opened");
+    expect(payload.number).toBe(1);
+  });
+
+  it("a refs/for push WITHOUT title/description derives both from the tip commit post-receive", async () => {
+    const { engineName, token } = await seedTailRepo("agitderive");
+    const { oid, pack } = await buildAgitCommitPack({ message: "derived title line\nand the body line\n" });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid, ref: "refs/for/main/derive" }], { pack, pushOptions: [] }),
+    });
+    expect(push.status).toBe(200);
+    const pr = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
+    expect(pr.headBranch).toBe("alice/derive");
+    await vi.waitFor(async () => {
+      const issue = await drizzle(env.DB).select().from(issues).where(eq(issues.id, pr.issueId)).get();
+      expect(issue!.title).toBe("derived title line");
+      expect(issue!.content).toBe("and the body line");
+    });
+  });
+});
+
+describe("the agit update arm (the same proposal moves refs/pull/N/head)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("a fast-forward re-push moves the head ref and the row, emits pull_request_sync; a same-oid re-push ngs", async () => {
+    const { repoId, engineName, token } = await seedTailRepo("agitupdate");
+    await seedAgitWebhook(repoId);
+    const first = await buildAgitCommitPack({ message: "proposal base\n" });
+    const create = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: first.oid, ref: "refs/for/main/topic-u" }], { pack: first.pack, pushOptions: ["topic=topic-u"] }),
+    });
+    expect(create.status).toBe(200);
+    const created = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
+    expect(created.headSha).toBe(first.oid);
+
+    // The fast-forward tip: a child of the first commit.
+    const second = await buildAgitCommitPack({ message: "proposal follow-up\n", parent: first.oid, file: "agit content v2\n" });
+    const update = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: second.oid, ref: "refs/for/main/topic-u" }], { pack: second.pack, pushOptions: [] }),
+    });
+    expect(update.status).toBe(200);
+    const { report, messages } = parseAgitResponse(await update.arrayBuffer());
+    expect(report).toContain("ok refs/for/main/topic-u\n");
+    expect(messages).toContain(`  ${EXPECTED_APP_ORIGIN}/${engineName}/pulls/1\n`);
+    const refTip = (await env.REPO.getByName(engineName).listRefs()).refs.find((r) => r.name === "refs/pull/1/head")!.target;
+    expect(refTip).toBe(second.oid);
+    const updated = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.id, created.id)).get();
+    expect(updated!.headSha).toBe(second.oid);
+    expect(updated!.hasMerged).toBe(false);
+    // ONE row stays (no duplicate proposal), and the synchronized webhook
+    // carries the before/after head oids.
+    expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(1);
+    await vi.waitFor(async () => {
+      const syncs = await drizzle(env.DB).select().from(webhookDeliveries).all();
+      const sync = syncs.find((d) => d.eventType === "pull_request_sync");
+      expect(sync).toBeDefined();
+      const payload = JSON.parse(sync!.payloadContent) as { action: string; before: string; after: string };
+      expect(payload.action).toBe("synchronized");
+      expect(payload.before).toBe(first.oid);
+      expect(payload.after).toBe(second.oid);
+    });
+
+    // The same-oid re-push: upstream's "new commit is same with old commit"
+    // ng (a commands-only body — nothing to apply, nothing forwarded).
+    const same = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: second.oid, ref: "refs/for/main/topic-u" }], { pushOptions: [] }),
+    });
+    expect(same.status).toBe(200);
+    expect(parseAgitResponse(await same.arrayBuffer()).report).toContain("ng refs/for/main/topic-u new commit is same with old commit");
+    const still = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.id, created.id)).get();
+    expect(still!.headSha).toBe(second.oid);
+  });
+});
+
+describe("agit structural rejections synthesize their ng lines (no engine forward)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("delete / missing base / missing topic reject in command order; an all-rejected push never forwards", async () => {
+    const { engineName, token, tip } = await seedTailRepo("agitngs");
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody(
+        [
+          { old: tip, oid: ZERO_OID, ref: "refs/for/main/doomed" },
+          { oid: tip, ref: "refs/for/nonexistent/topic" },
+          { oid: tip, ref: "refs/for/main" },
+        ],
+        { pushOptions: [] },
+      ),
+    });
+    expect(push.status).toBe(200);
+    const { report } = parseAgitResponse(await push.arrayBuffer());
+    expect(report).toContain("unpack ok");
+    expect(report).toContain("ng refs/for/main/doomed Can't delete not exist branch");
+    expect(report).toContain("ng refs/for/nonexistent/topic base-branch does not exist");
+    expect(report).toContain("ng refs/for/main topic-branch is not set");
+    // Nothing landed engine-side and no PR rows exist.
+    const refs = (await env.REPO.getByName(engineName).listRefs()).refs.map((r) => r.name);
+    expect(refs).toEqual(["refs/heads/main"]);
+    expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(issues).all()).toHaveLength(0);
+  });
+
+  it("a mixed push forwards the fall-through command and splices the agit ng into command order", async () => {
+    const { engineName, token } = await seedTailRepo("agitmix");
+    const { oid, pack } = await buildAgitCommitPack({ message: "a real branch\n" });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody(
+        [
+          { oid: oid, ref: "refs/for/nope/topic" },
+          { oid: oid, ref: "refs/heads/feature" },
+        ],
+        { pack, pushOptions: [] },
+      ),
+    });
+    expect(push.status).toBe(200);
+    const { report } = parseAgitResponse(await push.arrayBuffer());
+    // The report keeps the CLIENT's command order (ng first, ok second) —
+    // the engine's own report covered only the fall-through command.
+    const ngAt = report.indexOf("ng refs/for/nope/topic base-branch does not exist");
+    const okAt = report.indexOf("ok refs/heads/feature\n");
+    expect(ngAt).toBeGreaterThan(-1);
+    expect(okAt).toBeGreaterThan(-1);
+    expect(ngAt).toBeLessThan(okAt);
+    const refs = (await env.REPO.getByName(engineName).listRefs()).refs.map((r) => r.name);
+    expect(refs).toContain("refs/heads/feature");
+    expect(refs).not.toContain("refs/for/nope/topic");
+  });
+});
+
+describe("the agit force gate (the engine classifies, upstream's ng text decides)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("an unrelated tip without force-push ngs; with the option it moves", async () => {
+    const { engineName, token } = await seedTailRepo("agitforce");
+    const first = await buildAgitCommitPack({ message: "proposal base\n" });
+    const create = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: first.oid, ref: "refs/for/main/topic-f" }], { pack: first.pack, pushOptions: ["topic=topic-f"] }),
+    });
+    expect(create.status).toBe(200);
+
+    // An UNRELATED tip (no common ancestor with the first): the engine's
+    // classification is force-push, the option is absent — upstream's exact
+    // ng text, the ref and the row untouched.
+    const unrelated = await buildAgitCommitPack({ message: "rewritten history\n", file: "rewritten\n" });
+    const refused = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: unrelated.oid, ref: "refs/for/main/topic-f" }], { pack: unrelated.pack, pushOptions: [] }),
+    });
+    expect(refused.status).toBe(200);
+    expect(parseAgitResponse(await refused.arrayBuffer()).report).toContain("ng refs/for/main/topic-f request `force-push` push option");
+    expect((await env.REPO.getByName(engineName).listRefs()).refs.find((r) => r.name === "refs/pull/1/head")!.target).toBe(first.oid);
+    expect((await drizzle(env.DB).select().from(pullRequests).all())[0]!.headSha).toBe(first.oid);
+
+    // The SAME tip WITH `-o force-push` moves the proposal.
+    const forced = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: unrelated.oid, ref: "refs/for/main/topic-f" }], { pack: unrelated.pack, pushOptions: ["force-push"] }),
+    });
+    expect(forced.status).toBe(200);
+    expect(parseAgitResponse(await forced.arrayBuffer()).report).toContain("ok refs/for/main/topic-f\n");
+    expect((await env.REPO.getByName(engineName).listRefs()).refs.find((r) => r.name === "refs/pull/1/head")!.target).toBe(unrelated.oid);
+    expect((await drizzle(env.DB).select().from(pullRequests).all())[0]!.headSha).toBe(unrelated.oid);
+  });
+});
+
+describe("agit report-status-v2 option lines (cmd/hook.go:604-620)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("a v2 create carries refname + new-oid (no old-oid); a v2 update adds old-oid", async () => {
+    const { engineName, token } = await seedTailRepo("agitv2");
+    const first = await buildAgitCommitPack({ message: "v2 proposal\n" });
+    const create = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: first.oid, ref: "refs/for/main/topic-v" }], {
+        caps: "report-status-v2 side-band-64k push-options",
+        pack: first.pack,
+        pushOptions: ["topic=topic-v"],
+      }),
+    });
+    expect(create.status).toBe(200);
+    const createReport = parseAgitResponse(await create.arrayBuffer()).report;
+    expect(createReport).toContain("ok refs/for/main/topic-v\n");
+    expect(createReport).toContain("option refname refs/pull/1/head\n");
+    expect(createReport).toContain(`option new-oid ${first.oid}\n`);
+    expect(createReport).not.toContain("option old-oid");
+
+    // The update arm renders the old-oid line (the ref existed).
+    const second = await buildAgitCommitPack({ message: "v2 follow-up\n", parent: first.oid, file: "v2 content\n" });
+    const update = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: second.oid, ref: "refs/for/main/topic-v" }], {
+        caps: "report-status-v2 side-band-64k push-options",
+        pack: second.pack,
+        pushOptions: [],
+      }),
+    });
+    expect(update.status).toBe(200);
+    const updateReport = parseAgitResponse(await update.arrayBuffer()).report;
+    expect(updateReport).toContain(`option old-oid ${first.oid}\n`);
+    expect(updateReport).toContain(`option new-oid ${second.oid}\n`);
+  });
+});
+
+describe("the agit blocked gate (NewPullRequest's IsUserBlockedBy arm)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("a pusher blocked by the repo owner ngs with upstream's exact hook UserMsg; no PR row lands", async () => {
+    const { repoId, engineName, ownerId, token } = await seedTailRepo("agitblocked");
+    // The row-level shape of the reachable population (a pusher holding a
+    // write grant — the owner themself here; the block SERVICE's own rules
+    // are another suite's subject). Upstream: the decline lives ONLY in the
+    // proc-receive hook, and its exact UserMsg is the ng text.
+    await drizzle(env.DB)
+      .insert(userBlocking)
+      .values({ blockerId: ownerId, blockeeId: ownerId, note: "", createdAt: new Date() })
+      .run();
+    const { oid, pack } = await buildAgitCommitPack({ message: "should not create\n" });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid, ref: "refs/for/main/topic-b" }], { pack, pushOptions: ["topic=topic-b"] }),
+    });
+    expect(push.status).toBe(200);
+    expect(parseAgitResponse(await push.arrayBuffer()).report).toContain(
+      "ng refs/for/main/topic-b Cannot create pull request because you are blocked by the repository owner.",
+    );
+    expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(issues).all()).toHaveLength(0);
+    expect((await env.REPO.getByName(engineName).listRefs()).refs.map((r) => r.name)).toEqual(["refs/heads/main"]);
+    void repoId;
+  });
+});
+
+describe("agit quiet clients (no report-status negotiation)", () => {
+  beforeEach(sweepAgitTables);
+
+  it("a quiet push still creates the PR and still carries the band-2 message — but no report", async () => {
+    const { repoId, engineName, token } = await seedTailRepo("agitquiet");
+    void repoId;
+    const { oid, pack } = await buildAgitCommitPack({ message: "quiet proposal\n" });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid, ref: "refs/for/main/topic-q" }], {
+        caps: "side-band-64k push-options",
+        pack,
+        pushOptions: ["topic=topic-q"],
+      }),
+    });
+    expect(push.status).toBe(200);
+    const { report, messages } = parseAgitResponse(await push.arrayBuffer());
+    expect(report).toBe(""); // no report-status → no report, exactly the engine's quiet shape
+    expect(messages).toContain(`  ${EXPECTED_APP_ORIGIN}/${engineName}/pulls/1\n`);
+    expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(1);
+  });
+});
+
+describe("the lane boundary: rowless (engine-only) repos keep the engine's literal refs/for", () => {
+  beforeEach(sweepAgitTables);
+
+  it.skipIf(!env.GIT_TOKEN)(
+    "a refs/for push at a repo with NO D1 row applies the literal ref (the D1-repository boundary, census-recorded)",
+    async () => {
+      const { oid, pack } = await buildAgitCommitPack({ message: "rowless\n" });
+      const push = await SELF.fetch("https://example.com/demo/agitrowless.git/git-receive-pack", {
+        method: "POST",
+        headers: { authorization: basicHeader("x", env.GIT_TOKEN), "content-type": RECEIVE_CT },
+        body: buildAgitPushBody([{ oid, ref: "refs/for/main/topic" }], { pack, caps: "report-status side-band-64k" }),
+      });
+      expect(push.status).toBe(200);
+      const refs = (await env.REPO.getByName("demo/agitrowless").listRefs()).refs.map((r) => r.name);
+      expect(refs).toContain("refs/for/main/topic");
+      expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(0);
+    },
+  );
 });

@@ -113,6 +113,25 @@ import {
   scopeForbidden,
 } from "./respond";
 import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
+import {
+  AGIT_NG,
+  AgitProtocolError,
+  agitHookMessageFrames,
+  agitPullUrl,
+  applyAgitCreateTail,
+  applyAgitUpdateTail,
+  isAgitCommandRef,
+  planAgitCommands,
+  pushOptionBool,
+  rebuildReceivePackForward,
+  renderSynthesizedAgitReport,
+  rewriteReceivePackResponse,
+  splitReceivePackSections,
+  sweepAbandonedAgitCreate,
+  type AgitPlan,
+  type AgitPlanEntry,
+  type ReceivePackSections,
+} from "../api/services/agit";
 import { pushUpdateAddTags, pushUpdateDeleteTags, type PushTagAdd } from "../api/services/releases";
 import { loadRepoSettings } from "../api/services/repo-settings";
 import type { AuthUser } from "../auth/auth-context";
@@ -310,74 +329,275 @@ export async function gitHttpGate(
   // proc-receive hook (routers/private/hook_proc_receive.go:29-39), reached
   // solely by push-to-propose `refs/for/*` pushes — `hook_pre_receive` has
   // no blocked check at all, so a blocked user holding a write grant pushes
-  // directly with parity. cf-gitea has no agit flow, so this seam used to
-  // decline EVERY receive-pack from a user blocked by the repo owner —
-  // narrower than upstream, not a defense (the stale-grant state it guarded
-  // is reachable upstream too, and upstream still lets the direct push
-  // through). Removed to parity: direct receives are untouched by the block
-  // relation. When agit lands (the SPEC-0005 push-to-propose surface), the
-  // decline comes back at THAT seam — the proc-receive validator this gate
-  // forwards — surfacing upstream's exact hook UserMsg ("Cannot create pull
-  // request because you are blocked by the repository owner."), not as a
-  // wholesale receive-pack guard.
-  const isPush = route.kind === "receive-pack";
-  const pusher = isPush ? await resolvePushPusher(env, req) : undefined;
+  // directly with parity. The agit lane HAS landed (census B-52,
+  // api/services/agit.ts): the blocked decline now runs inside its planner
+  // (planAgitCommands → the create arm's gate) and surfaces upstream's exact
+  // hook UserMsg as the command's ng line ("Cannot create pull request
+  // because you are blocked by the repository owner.") — not as a wholesale
+  // receive-pack guard. Direct receives stay untouched by the block relation.
+  if (route.kind === "receive-pack") {
+    const pusher = await resolvePushPusher(env, req);
+    return handleAgitReceive(req, url, env, ctx, engine, resolved.repo, `${route.owner}/${route.repo}`, pusher);
+  }
+  // Reads (upload-pack): the plain §2.1 item 5 forward.
+  return forwardToEngine(req, url, env, ctx, engine);
+}
 
-  // §2.1 item 5: invoke the engine and stream its response. The engine hook
-  // sees the gate-cleared mark and waves the request through. Receive-pack
-  // forwards carry the D1-minted immutable storage key (SPEC-0001a §3 Step
-  // 3): the engine's beginReceive resolves R2 addressing from it instead of
-  // the URL name, so renames/transfers never fork the storage namespace —
-  // and the authenticated pusher (in-process, see resolvePushPusher), which
-  // the engine surfaces on PushEvent so the push webhooks name the real
-  // pusher instead of the owner fallback. The validator is the R5/D-7c
-  // collector: the per-push command set is only visible in-process here
-  // (the engine surfaces applied updates on its own onPush hook, wired in
-  // the worker entry — a file this gate does not own), so the wrapper
-  // records the policy-allowed tag-delete / PR-head commands beside the
-  // ordinary evaluation.
+/**
+ * The D1-resolved receive-pack forward with the agit lane (census B-52 —
+ * api/services/agit.ts's module header carries the full upstream walk and
+ * the adaptation rationale; this handler is its wire choreography):
+ *
+ *   1. The request's pkt-line sections parse WITHOUT buffering the pack
+ *      (splitReceivePackSections — the gate owns content-encoding, so the
+ *      gzip decode happens here, before the parse).
+ *   2. Every `refs/for/*` command plans against D1 + the branch universe
+ *      (planAgitCommands — upstream ProcReceive): creates pre-commit the PR
+ *      row, updates resolve the CAS base, structural failures reject.
+ *   3. The forward REBUILDS: translated commands carry their real
+ *      `refs/pull/N/head` refs, rejected commands are dropped, the
+ *      capabilities ride the first kept line, the push-options bytes and the
+ *      pack stream pass through. The lane validator (the shared push policy
+ *      + R5/D-7c tail collector, PLUS the force gate — upstream's
+ *      "request `force-push` push option" ng, decided by the ENGINE's own
+ *      classification) rides the same in-process call options as every
+ *      receive.
+ *   4. The response rewrites: report-status renders against the ORIGINAL
+ *      `refs/for/*` names (v2 option lines included), synthesized ng lines
+ *      splice in command order, the PR URL message rides sideband band 2 —
+ *      and a create whose command did not land sweeps its pre-allocated
+ *      rows. The create/update tails (fill + opened webhook; re-arm +
+ *      synchronized webhook) run inline after the rewrite, upstream's
+ *      ProcReceive wall-clock posture.
+ *
+ * A push with NO agit commands keeps the pre-lane flow exactly: the rebuilt
+ * body is the original command/options bytes plus the untouched pack stream
+ * (chunk boundaries may differ — the engine's pkt parse is chunk-agnostic),
+ * and the response passes through untouched. The transitional families
+ * (push-create, `*.wiki`, the cargo index, the D1-missing passthrough) do
+ * NOT get the lane: agit is a D1-repository behavior (a proposal needs a PR
+ * row and a D1 branch universe), so a `refs/for/*` push at a rowless cell
+ * keeps the engine's literal handling there — the recorded boundary, not a
+ * silent ignore (the census row carries it).
+ */
+async function handleAgitReceive(
+  req: Request,
+  url: URL,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  repo: RepositoryRow,
+  engineRepo: string,
+  pusher: PusherIdentity | null,
+): Promise<Response> {
+  // 1. Sections parse — decoded body first (the rewrite needs pkt-lines, not
+  // gzip). Non-protocol failures answer the §2.3 bare 400 like
+  // forwardToEngine's malformed-gzip catch; the shared plain path below
+  // re-serves the sections it read (once parsed, the stream is consumed).
+  let sections: ReceivePackSections;
+  try {
+    const rawBody = req.body;
+    let body: ReadableStream<Uint8Array>;
+    if (isGzipEncoded(req) && rawBody !== null) {
+      body = await withVerifiedStart(gunzipCapped(asByteStream(rawBody)));
+    } else if (rawBody !== null) {
+      body = asByteStream(rawBody);
+    } else {
+      body = new ReadableStream<Uint8Array>({ start: (controller) => controller.close() });
+    }
+    sections = await splitReceivePackSections(body);
+  } catch (error) {
+    if (error instanceof AgitProtocolError) return bareBadRequest();
+    console.error(`[agit] ${engineRepo}: request parse failed: ${error instanceof Error ? error.message : String(error)}`);
+    return bareBadRequest();
+  }
+
+  // 2. The plan. An unresolvable pusher (the verify race resolvePushPusher
+  // documents) skips the lane — the plain path below applies, the same
+  // defense posture as the tail collector's pusherId 0.
+  const plan: AgitPlan | null =
+    pusher !== null && sections.commands.some((cmd) => isAgitCommandRef(cmd.ref))
+      ? await planAgitCommands(env, repo, engineRepo, pusher, sections.commands, sections.options, sections.caps)
+      : null;
+
+  // The R5/D-7c collector — shared by both paths (the plain path's posture
+  // is unchanged; the agit path's translated commands ARE
+  // `refs/pull/N/head` commands to it, so the D-7c auto-merge re-check
+  // enqueues for moved proposals exactly like the head-sync's own pushes).
   const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], pusherId: pusher?.id ?? 0 };
-  const response = await forwardToEngine(
-    req,
-    url,
-    env,
-    ctx,
-    engine,
-    isPush ? resolved.repo.storageKey : undefined,
-    pusher,
-    isPush ? pushTailValidator(env, resolved.repo, pushTail) : undefined,
-  );
 
-  // First-push settle on ANY empty D1-backed repo (the wave-settle-is-empty
-  // fix; upstream pushNewBranch, services/repository/push.go:255-270 — on
-  // `repo.IsEmpty` a new branch ref sets DefaultBranch + IsEmpty=false for
-  // EVERY repo, not just push-created ones). API-created rows are born
-  // 'ready' + is_empty, and until now a first push through THIS path never
-  // cleared is_empty: generate took the settle-empty arm (content dropped),
-  // repo-search/`empty` renders lied, and the license/size settle legs'
-  // unborn-tip guards read stale state. Scheduled AFTER the awaited forward
-  // (the engine commits refs before its response returns — the same
-  // settle-safety argument as the push-create handshake below); the settle
-  // re-verifies via listRefs and CAS-guards on is_empty, so a failed or
-  // rejected receive is a no-op and a probe/advert never schedules it (this
-  // arm runs only on the receive-pack RPC).
-  //
-  // The R5/B-54/D-7c tail rides the same post-commit window (see
-  // applyPushTail): one listRefs verifies what actually landed, then the
-  // tag mint (adds) / draft-flips (deletes) and the auto-merge re-check
-  // enqueues run — upstream's hook_post_receive → PushUpdate ordering
-  // (push.go:317) reduced to the gate's process. Scheduled for every
-  // authenticated receive with a collected command — the main forward here
-  // AND the push-create forwards (handleUnknownRepository: the FIRST push
-  // of a push-created repo carries the seed tags); a push with neither is a
-  // no-op return before any RPC (applyPushTail's head guard).
-  if (isPush) {
-    ctx.waitUntil(applyPushTail(env, resolved.repo, `${route.owner}/${route.repo}`, pushTail));
-    if (resolved.repo.isEmpty) {
-      ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`, url.origin));
+  // 3. The kept forward commands: fall-through verbatim, translated onto
+  // their real refs, rejected dropped.
+  const forwardCommands = plan
+    ? plan.entries.flatMap((entry, i): { old: string; new: string; ref: string }[] => {
+        const cmd = plan.wireCommands[i]!;
+        if (entry.kind === "fall-through") return [{ old: cmd.old, new: cmd.new, ref: cmd.ref }];
+        if (entry.kind === "reject") return [];
+        return [{ old: entry.old, new: entry.new, ref: entry.translatedRef }];
+      })
+    : sections.commands.map((cmd) => ({ old: cmd.old, new: cmd.new, ref: cmd.ref }));
+
+  // 4a. NOTHING forwards (every command was a rejected `refs/for/*`): the
+  // response synthesizes wholly — no engine call, no lease, no pack read.
+  // Every planned create failed (its command never forwards) — swept here,
+  // awaited, before the client reads the ng.
+  if (plan !== null && forwardCommands.length === 0) {
+    for (const entry of plan.entries) {
+      if (entry.kind === "create") await sweepAbandonedAgitCreate(env, repo, entry);
+    }
+    const bytes = renderSynthesizedAgitReport(
+      plan,
+      sections.caps.includes("side-band-64k"),
+      sections.caps.includes("report-status") || sections.caps.includes("report-status-v2"),
+    );
+    return new Response(bytes, { headers: receivePackResultHeaders() });
+  }
+
+  // 3b/4b. The forward. The lane validator wraps the shared
+  // policy + collector with the agit force gate: a translated command the
+  // ENGINE classified `force-push` (the ancestry check needs the staged
+  // pack — upstream rev-lists inside its hook, agit.go:206-224) rejects
+  // with upstream's exact ng text unless the `force-push` push option
+  // allowed it; the classification feeds the v2 forced-update option line.
+  const translatedByRef = new Map<string, AgitPlanEntry>();
+  if (plan !== null) {
+    for (const entry of plan.entries) {
+      if (entry.kind === "create" || entry.kind === "update") translatedByRef.set(entry.translatedRef, entry);
     }
   }
-  return response;
+  const forcedUpdates = new Map<string, boolean>();
+  const laneValidator: PushValidator = async (commands, hookCtx) => {
+    const verdicts = await pushTailValidator(env, repo, pushTail)(commands, hookCtx);
+    if (verdicts === undefined) return undefined;
+    if (plan !== null && translatedByRef.size > 0) {
+      const forceAllowed = pushOptionBool(plan.options, "force-push");
+      for (let i = 0; i < commands.length; i++) {
+        const cmd = commands[i]!;
+        if (verdicts[i]?.reject !== undefined) continue;
+        const entry = translatedByRef.get(cmd.ref);
+        if (entry === undefined) continue;
+        if (cmd.kind === "force-push" && !forceAllowed) {
+          verdicts[i] = { reject: AGIT_NG.forcePush };
+        } else if (cmd.kind === "force-push") {
+          forcedUpdates.set(cmd.ref, true);
+        }
+      }
+    }
+    return verdicts;
+  };
+
+  const forwardHeaders = new Headers(req.headers);
+  const gitProtocol = req.headers.get("git-protocol");
+  if (gitProtocol !== null && !SAFE_GIT_PROTOCOL_HEADER.test(gitProtocol)) {
+    forwardHeaders.delete("git-protocol"); // §2.3 (prepareEngineRequest's rule)
+  }
+  forwardHeaders.delete("content-encoding"); // the body arrives decoded
+  forwardHeaders.delete("content-length"); // a stream body carries none
+  forwardHeaders.set("x-storage-key", repo.storageKey); // SPEC-0001a §3 Step 3
+  const forwarded = new Request(url, {
+    method: req.method,
+    headers: forwardHeaders,
+    body: rebuildReceivePackForward(forwardCommands, sections.caps, sections.optionsRaw, sections.rest),
+    // stream passthrough (AGENTS.md: never buffer an unbounded body)
+    ...{ duplex: "half" as const },
+  });
+  gateCleared.add(forwarded);
+  const response = await engine.fetch(forwarded, env, ctx, {
+    ...(pusher !== null ? { pusher } : {}),
+    validatePush: laneValidator,
+  });
+
+  // The pre-lane post-commit tails — shared by both paths, unchanged: the
+  // first-push settle (the wave-settle-is-empty fix) and the R5/B-54/D-7c
+  // tail (the collector saw the KEPT commands — plain or translated).
+  const scheduleSharedTail = (): void => {
+    ctx.waitUntil(applyPushTail(env, repo, engineRepo, pushTail));
+    if (repo.isEmpty) {
+      ctx.waitUntil(settleCreatingRepo(env, repo.id, engineRepo, url.origin));
+    }
+  };
+
+  // A non-200 answer (503 busy, 413 too large, 500): no command applied —
+  // every planned create swept before the failure surfaces (the same
+  // await-before-the-client-sees posture as the sweep above).
+  if (response.status !== 200) {
+    if (plan !== null) {
+      for (const entry of plan.entries) {
+        if (entry.kind === "create") await sweepAbandonedAgitCreate(env, repo, entry);
+      }
+    }
+    return response;
+  }
+
+  // 4. The response: the agit rewrite, or the verbatim pass-through.
+  const sideband = sections.caps.includes("side-band-64k");
+  const wantStatus = sections.caps.includes("report-status") || sections.caps.includes("report-status-v2");
+  if (plan === null || !plan.hasAgitCommands) {
+    scheduleSharedTail();
+    return response;
+  }
+
+  // The PR URL messages ride FIRST-class: one hookPrintResult group per
+  // translated command upstream reported (in command order), so the rewrite
+  // needs them before the arms run.
+  const messages: string[] = [];
+  for (const entry of plan.entries) {
+    if (entry.kind === "create" || entry.kind === "update") {
+      messages.push(...agitHookMessageFrames(agitPullUrl(env, repo, url.origin, entry.index)));
+    }
+  }
+
+  let bytes: Uint8Array;
+  let applied: Set<string>;
+  let failed: Set<string>;
+  try {
+    const rewrite = rewriteReceivePackResponse(
+      new Uint8Array(await response.arrayBuffer()),
+      plan,
+      sideband,
+      wantStatus,
+      forcedUpdates,
+      messages,
+    );
+    bytes = rewrite.bytes;
+    applied = rewrite.applied;
+    failed = rewrite.failed;
+  } catch (error) {
+    // A rewrite failure must not corrupt an applied push: the engine's own
+    // response stands (its report names the TRANSLATED refs — the degraded
+    // shape is logged for observability; the arms below still run, keyed on
+    // the unobservable-report blind set).
+    console.error(`[agit] ${engineRepo}: response rewrite failed (engine report passes through): ${error instanceof Error ? error.message : String(error)}`);
+    scheduleSharedTail();
+    return response;
+  }
+
+  // 5. The per-command arms: failed creates sweep; applied entries run
+  // their tails inline (upstream's ProcReceive wall-clock posture — the
+  // report the client is about to read already knows the PR).
+  for (const entry of plan.entries) {
+    if (entry.kind === "create") {
+      if (failed.has(entry.originalRef)) await sweepAbandonedAgitCreate(env, repo, entry);
+      else if (applied.has(entry.originalRef) && plan.pusherRow !== null) {
+        await applyAgitCreateTail(env, repo, engineRepo, entry, plan.pusherRow, url.origin, (p) => ctx.waitUntil(p));
+      }
+    } else if (entry.kind === "update") {
+      if (applied.has(entry.originalRef) && plan.pusherRow !== null) {
+        await applyAgitUpdateTail(env, repo, engineRepo, entry, plan.pusherRow, url.origin, (p) => ctx.waitUntil(p));
+      }
+    }
+  }
+  scheduleSharedTail();
+  return new Response(bytes, { status: response.status, headers: response.headers });
+}
+
+/** The engine's receive result headers (its `receiveHeaders` shape — the
+ *  synthesized all-rejected response carries the same pair). */
+function receivePackResultHeaders(): Record<string, string> {
+  return {
+    "content-type": "application/x-git-receive-pack-result",
+    "cache-control": "no-cache",
+  };
 }
 
 /**
