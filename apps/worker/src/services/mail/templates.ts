@@ -55,8 +55,9 @@ export function escapeHtml(raw: string): string {
  *  composition here must NOT re-escape). NOTE this is the TITLE format, not
  *  the email subject: upstream's subject is `TrString("mail.register_notify",
  *  setting.AppName)` = "Welcome to %s" with the AppName only, never the name
- *  (mail_user.go:123) — register-notify.ts's use of this helper as the
- *  subject is a recorded divergence routed to that module's owner. */
+ *  (mail_user.go:123) — landed by AUTHSMALLS: the subject now comes from
+ *  register-notify.ts's registerNotifyMailSubject(appName); THIS helper is
+ *  the title format only. */
 export function registerNotifySubject(displayName: string, appName: string): string {
   return `${displayName}, welcome to ${appName}`;
 }

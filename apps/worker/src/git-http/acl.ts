@@ -49,7 +49,7 @@ import { ScopeSet, SCOPE_ALL } from "../auth/scopes";
 import { authUserFromRow } from "../auth/password-auth";
 import { basicPasswordArm } from "../auth/middleware";
 import { hasTwoFactorByUid } from "../auth/two-factor";
-import { mustChangePasswordArm, userMustChangePassword } from "../ui/session";
+import { mustChangePasswordArm, userMustChangePassword } from "../ui/must-change-password";
 import { AuditActions, emitAudit } from "../services/audit";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import {

@@ -114,7 +114,7 @@ import {
   type VerifiedDeployKey,
 } from "../auth/deploy-token-service";
 import { D1FailureLimiter } from "../auth/failure-limiter";
-import { mustChangePasswordArm, userMustChangePassword } from "../ui/session";
+import { mustChangePasswordArm, userMustChangePassword } from "../ui/must-change-password";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import {
   limiterCheckFailOpen,

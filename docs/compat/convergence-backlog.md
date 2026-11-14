@@ -117,14 +117,76 @@ SPEC's no-outbound-TCP premise corrected in specs/email-outbound.md
 
 ## 4. The standing cruft list (small, recorded, non-blocking)
 
-- The audit doc's residual cite-convention debt (38 notes, M10-era).
-- The golden files WHWAVE2 flagged for their owning units
-  (admin-hooks.html + the releases/tags set — DOM-consistent but
-  un-rebaselined).
+- (CLOSED 2026-11-14, AUDITDOC) The audit doc's residual cite-convention
+  debt (38 notes, M10-era): the flagged class lives in the webhook audit
+  doc (`docs/compat/webhook-event-coverage.md`) — its pre-M10
+  "Upstream emission" cells cited bare function names
+  (`PushCommits:660→:668`) against the column header's implied
+  notifier.go, plus three dangling `:NN` shorthand picks
+  (`pull_request_comment`). All 24 flagged cells normalized to the
+  post-M10 cite convention (one in-cell `services/webhook/notifier.go`
+  anchor per cell, `:NN` shorthand after; word-diff verified 38 removed
+  span pairs ↔ 38 added, all cite spans, zero claim-text movement), and
+  all 54 cite-sites re-derived against the read-only pin fc493688 —
+  every symbol present (zero [cite-verified-symbol-gone]), every
+  function-start line EXACT, with two stale arm tails corrected
+  (DeleteIssue's issues-arm `:341`→`:338` and PR-arm `:326`→`:320` —
+  the pin's PrepareWebhooks calls sit at 338/320). The 38 figure was
+  CENSUS-M14's census-corpus tally (2026-11-13; 40 at CENSUS-M10); the
+  audit doc's own inventory today is 54 flagged sites (51 bare-function
+  + 3 dangling shorthand) — post-M10 row rewrites moved the count in
+  both directions since M10, and the checker's exact per-item list was
+  never committed, so the delta is recorded honestly rather than
+  force-matched.
+- (CLOSED 2026-11-14, GOLDENS) The golden files WHWAVE2 flagged for
+  their owning units (admin-hooks.html + the releases/tags set —
+  DOM-consistent but un-rebaselined): the rebaseline actually landed in
+  ff18a23 35 minutes after WHWAVE2's flag (WHWAVE2 itself regenerated
+  ONLY settings-hook-detail.html — its print-mode run captured 1 of 97
+  cases; ff18a23 then ran the full update-goldens.mjs over all nine
+  flagged files). Re-verified byte-exact against the current tree
+  (goldens.test.ts scoped run + a sentinel print-mode sweep with every
+  render diffed against the committed bytes): all nine (admin-hooks,
+  releases, releases-writer, release-detail, release-new,
+  releases-feed.rss/.atom, tags-feed.rss/.atom) are IDENTICAL to the
+  current DOM through the whole 11-13/14 landing wave, and a11y.test.ts's
+  release-family consumption is green (91/91). Nothing to rebaseline; no
+  lenient matching exists to mask staleness — the harness is byte-exact
+  (goldens.test.ts's renderGoldenCase throws on the first differing
+  byte).
 - IDCHAIN's two fidelity seams (the test rig's identityUserFromRow; the
   UI-explore requester at api/services/search.ts:108).
 - The probe battery's blip-era fixture rows (the next cleanup-audit run
   sweeps them).
+
+- (NEW 2026-11-14, GOLDENS — ESCALATED to the owning units, deliberately
+  NOT rebaselined) Four goldens OUTSIDE the WHWAVE2 set are RED in the
+  current tree (goldens.test.ts scoped: 4 failed | 93 passed) and will
+  red the freeze's full-suite gate if they stay:
+  (1) admin-monitor-cron.html + admin-monitor.test.tsx (5 its red) — a
+  REAL module-graph regression, not DOM drift: HOFF-A (2634e67, 11-14)
+  added git-http/acl.ts's import of mustChangePasswordArm from
+  ui/session, closing the cycle cron-state -> demo-sweep -> mirror/sync
+  -> git-http/gate -> git-http/acl -> ui/session -> ui/index ->
+  ui/pages/admin-monitor -> cron-state; under it DEMO_SWEEP_CRON
+  resolves undefined inside CRON_ARMS, so all TEN hourly-entry rows
+  render empty Schedule/Next cells (the page battery's loader its fail
+  on the same undefined). The fix is breaking the cycle (re-home the
+  must-change-password probe out of ui/session, or re-point the acl
+  arm's import); regenerating the golden alone would mask it. The
+  committed sources of the page (admin-monitor.tsx, cron-state.ts,
+  demo-sweep.ts) are unchanged since the golden was minted.
+  (2) admin-users.html — intended DOM drift: ADMIN88's CTA header fold
+  (565f814, the list.tmpl:6 Create User Account button + the
+  flex-text-block header); regenerate by the admin-family owner.
+  (3)+(4) org-settings-audit-logs.html + repo-settings-audit-logs.html
+  — intended DOM drift: the audit-filter dropdown gained the post-11-04
+  action registrations (user:create 76ac134/B-73;
+  user:password:resetrequest 699e765/B-84; user:type bf6bdaa/HOFF-C;
+  user:status:active/restricted/admin + user:visibility:update
+  8e5e6c1/UPDAUDIT); regenerate by the audit-pages owner. These three
+  are stale-but-loyal (the bytes faithfully record the landed DOM);
+  only (1) masks nothing — it is the loud witness of the cycle.
 
 (CLOSED since the v1.5.8 issue: the production PBKDF2-iteration-cap
 probe — B-85 landed the parse-time 100k cap guard with the
