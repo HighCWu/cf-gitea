@@ -264,6 +264,80 @@ describe("POST /markup (misc-t2)", () => {
     expect(body.message).toBe("unsupported render mode: asciidoc");
   });
 
+  it("file mode dispatches by FilePath extension: markdown family renders with the repo-file policy", async () => {
+    // markup.Render detects the renderer over WithRelativePath(filePath)
+    // (render.go:195 → renderer.go:66–96): .md lands in the landed markdown
+    // family and keeps the repo-file link policy (relative links resolve in
+    // the file's directory — upstream's stripped refPath + treePath net base).
+    const rendered = await miscSend(
+      "/markup",
+      jsonAuthed({
+        Text: "# CHANGE\n\n[notes](b.md)",
+        Mode: "file",
+        FilePath: "doc/CHANGE.md",
+        Context: "owner/repo/src/branch/main/doc",
+      }),
+    );
+    expect(rendered.status).toBe(200);
+    expect(rendered.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    const html = await rendered.text();
+    expect(html).toContain("<h1");
+    expect(html).toContain('href="https://example.com/owner/repo/src/branch/main/doc/b.md"');
+
+    // The detection lowercases (renderer.go:67 path.Base(strings.ToLower)).
+    const upper = await miscSend("/markup", jsonAuthed({ Text: "# Hi", Mode: "file", FilePath: "README.MD" }));
+    expect(upper.status).toBe(200);
+    expect(await upper.text()).toContain("<h1");
+
+    // Wiki:true still overrides Mode upstream (util.Iif) — the dispatch is
+    // skipped even with a renderer-less FilePath.
+    const wikiOverride = await miscSend(
+      "/markup",
+      jsonAuthed({ Text: "[[Page]]", Mode: "file", FilePath: "x.org", Wiki: true, Context: "owner/repo" }),
+    );
+    expect(wikiOverride.status).toBe(200);
+    expect(await wikiOverride.text()).toContain('href="https://example.com/owner/repo/wiki/Page"');
+  });
+
+  it("file mode with a renderer-less extension answers upstream's no-renderer 422", async () => {
+    // Unknown extension: DetectMarkupRendererByReader's
+    // NewInvalidArgumentErrorf("unable to find a render") (render.go:182),
+    // answered 422 by RenderMarkup's ErrInvalidArgument arm (markup.go:102–103).
+    const noShape = async (filePath: string): Promise<Record<string, unknown>> => {
+      const response = await miscSend("/markup", jsonAuthed({ Text: "x", Mode: "file", FilePath: filePath }));
+      expect(response.status).toBe(422);
+      return await response.json();
+    };
+    expect((await noShape("file.rst")).message).toBe("unable to find a render");
+    // The two-segment fallback matches only REGISTERED patterns — "*.md.gz"
+    // is not one upstream either (renderer.go:74–79), and an extensionless
+    // or empty FilePath never sniffs (render.go:166 RelativePath != "").
+    expect((await noShape("a.md.gz")).message).toBe("unable to find a render");
+    expect((await noShape("noext")).message).toBe("unable to find a render");
+    expect((await noShape("")).message).toBe("unable to find a render");
+
+    // Families upstream REGISTERS but this worker has not ported (orgmode
+    // *.org, csv *.csv/*.tsv, jupyter *.ipynb) must ERROR, never silently
+    // render as markdown (ADR-0008 rule 4) — same no-renderer shape until
+    // those renderers land.
+    expect((await noShape("notes.org")).message).toBe("unable to find a render");
+    expect((await noShape("data.csv")).message).toBe("unable to find a render");
+    expect((await noShape("data.tsv")).message).toBe("unable to find a render");
+    expect((await noShape("nb.ipynb")).message).toBe("unable to find a render");
+  });
+
+  it("FilePath does not participate outside file mode (plain modes untouched)", async () => {
+    // Upstream's mode ""/markdown arm short-circuits before the dispatch
+    // (common/markup.go:34–42) and its /markdown handler passes FilePath "".
+    const raw = await miscSend("/markup", jsonAuthed({ Text: "# Hi", Mode: "markdown", FilePath: "x.org" }));
+    expect(raw.status).toBe(200);
+    expect(await raw.text()).toContain("<h1");
+
+    const bare = await miscSend("/markup", jsonAuthed({ Text: "# Hi" }));
+    expect(bare.status).toBe(200);
+    expect(await bare.text()).toContain("<h1");
+  });
+
   it("requires a token (runtime-only 401, undeclared in the vendored contract)", async () => {
     const response = await miscSend("/markup", {
       method: "POST",

@@ -51,8 +51,16 @@ import { renderMarkdownToHtml } from "../services/markdown";
  *     binding MarkupOption, mode = Iif(Wiki, "wiki", Mode), rendering through
  *     the same common.RenderMarkup port as POST /markdown
  *     (services/markdown.ts, which mirrors markup.go:24–96). The MarkupOption
- *     `FilePath` field ("file mode extension detection", markup.go:14) is
- *     accepted but unused — the landed renderer keys on the mode only.
+ *     `FilePath` field drives the file-mode renderer dispatch: mode "file"
+ *     builds `WithMarkupType("").WithRelativePath(filePath)`
+ *     (routers/common/markup.go:90–95) and markup.Render detects the renderer
+ *     BY EXTENSION (modules/markup/render.go:195 → renderer.go:66–96). The
+ *     landed registry carries the markdown family only
+ *     (LANDED_FILE_RENDERER_PATTERNS below); an extension whose renderer
+ *     family is not ported (orgmode/csv/jupyter/console) or an unknown one
+ *     answers upstream's no-renderer shape — DetectMarkupRendererByReader's
+ *     `NewInvalidArgumentErrorf("unable to find a render")` (render.go:182),
+ *     422 through RenderMarkup's ErrInvalidArgument arm (markup.go:102–103).
  *   - GET/DELETE /token: routers/api/v1/token/token.go GetCurrentToken:19–52 /
  *     DeleteCurrentToken:55–73, wired reqToken() (api.go:1036–1038). The
  *     CurrentAccessToken body carries the PRESENTED credential's row
@@ -434,12 +442,86 @@ function pathJoinRelX(name: string): string {
 }
 
 /**
+ * The file-mode renderer registry over the LANDED renderer families — the
+ * shape of upstream's `fileNameRenderers` map (modules/markup/renderer.go
+ * RegisterRenderer), restricted to renderers this codebase actually ports.
+ * Today that is markdown alone, carrying its registered patterns: upstream's
+ * default markdown FILE_EXTENSIONS (modules/setting/markup.go:82–85 →
+ * fileExtensionsToPatterns, one "*.ext" entry each). Families upstream
+ * registers but this worker has NOT ported (orgmode `*.org`, csv `*.csv` /
+ * `*.tsv`, jupyter `*.ipynb`, console `*.sh-session` + content sniffing)
+ * stay OFF the map on purpose: their extensions must land in upstream's
+ * no-renderer error shape, never silently render as markdown (ADR-0008
+ * rule 4). Extend this map (and the route arm below) when a family lands.
+ */
+const LANDED_FILE_RENDERER_PATTERNS: ReadonlyMap<string, "markdown"> = new Map(
+  ["*.md", "*.markdown", "*.mdown", "*.mkd", "*.livemd"].map((pattern) => [pattern, "markdown" as const]),
+);
+
+/** Go `path.Base` — the final slash-separated element ("" is ".", a
+ * trailing-slash-only path is "/"). */
+function goPathBase(name: string): string {
+  if (name === "") {
+    return ".";
+  }
+  let value = name;
+  while (value.endsWith("/")) {
+    value = value.slice(0, -1);
+  }
+  if (value === "") {
+    return "/";
+  }
+  const slash = value.lastIndexOf("/");
+  return slash === -1 ? value : value.slice(slash + 1);
+}
+
+/** Go `path.Ext` — the suffix beginning at the final dot of the name
+ * ("" when there is no dot). */
+function goPathExt(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot === -1 ? "" : name.slice(dot);
+}
+
+/**
+ * Port of markup.DetectRendererTypeByFilename
+ * (modules/markup/renderer.go:66–82) over the landed registry: the exact
+ * basename pattern first, then "*"+ext1, then the two-segment fallback
+ * "*"+ext2+ext1 (upstream's *.tar.gz shape) — all case-insensitive (the
+ * caller lowercases). Returns null when no LANDED renderer matches; the
+ * route arm turns that into upstream's no-renderer 422 (render.go:182).
+ * Upstream's post-extension content-detector sweep
+ * (renderer.go:90–95, the console sniff) has no landed renderer to find, so
+ * it contributes nothing here.
+ */
+function detectLandedFileRenderer(filename: string): string | null {
+  const basename = goPathBase(filename.toLowerCase());
+  const exact = LANDED_FILE_RENDERER_PATTERNS.get(basename);
+  if (exact !== undefined) {
+    return exact;
+  }
+  const ext1 = goPathExt(basename);
+  if (ext1 === "") {
+    return null;
+  }
+  const byExt1 = LANDED_FILE_RENDERER_PATTERNS.get(`*${ext1}`);
+  if (byExt1 !== undefined) {
+    return byExt1;
+  }
+  const stem = basename.slice(0, basename.length - ext1.length); // strings.CutSuffix
+  const ext2 = goPathExt(stem);
+  if (ext2 === "") {
+    return null;
+  }
+  return LANDED_FILE_RENDERER_PATTERNS.get(`*${ext2}${ext1}`) ?? null;
+}
+
+/**
  * Bind the MarkupOption payload the way Go's `bind(api.MarkupOption{})` does
  * (routers/api/v1/api.go:1022): case-insensitive key matching, absent fields
  * are zero values, malformed payloads → 422 validationError (api.go:841–844).
  * Same standalone-bind posture as routes/markdown.ts.
  */
-function bindMarkupOption(raw: string): { text: string; mode: string; context: string; wiki: boolean } {
+function bindMarkupOption(raw: string): { text: string; mode: string; context: string; filePath: string; wiki: boolean } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -465,6 +547,7 @@ function bindMarkupOption(raw: string): { text: string; mode: string; context: s
     text: schema.data.Text ?? "",
     mode: schema.data.Mode ?? "",
     context: schema.data.Context ?? "",
+    filePath: schema.data.FilePath ?? "",
     wiki: schema.data.Wiki ?? false,
   };
 }
@@ -675,15 +758,25 @@ export function registerMiscT2Routes(
 
   // POST /markup — Markup (markup.go:25–34): mode = Iif(Wiki, "wiki", Mode),
   // rendered through the shared RenderMarkup port (services/markdown.ts — the
-  // unknown-mode 422 carries upstream's exact message). FilePath accepted but
-  // unused (module header).
+  // unknown-mode 422 carries upstream's exact message). File mode dispatches
+  // the renderer by FilePath's extension over the LANDED registry
+  // (detectLandedFileRenderer — markup.Render's extension detection,
+  // render.go:195 → renderer.go:66–96); a renderer-less extension answers
+  // upstream's no-renderer shape — DetectMarkupRendererByReader's
+  // `unable to find a render` invalid-argument error (render.go:182) mapped
+  // to 422 by RenderMarkup's ErrInvalidArgument arm (markup.go:102–103).
+  // Wiki:true overrides Mode upstream (util.Iif), so it skips the dispatch.
   app.openapi(
     markupRoute(requireAuth),
     async (c) => {
       const form = bindMarkupOption(await c.req.text());
+      const mode = form.wiki ? "wiki" : form.mode;
+      if (mode === "file" && detectLandedFileRenderer(form.filePath) === null) {
+        throw new ApiError(422, "unable to find a render");
+      }
       const html = renderMarkdownToHtml({
         text: form.text,
-        mode: form.wiki ? "wiki" : form.mode,
+        mode,
         context: form.context,
         wiki: false,
         origin: new URL(c.req.url).origin,
