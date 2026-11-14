@@ -632,7 +632,12 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
   // is the code-write reduction).
   const showSelectAll = data.canWriteIssues === true && data.items.length > 0;
   return (
-    <BaseLayout ctx={ctx} title={title} pageClass="repository issue-list">
+    <BaseLayout
+      ctx={ctx}
+      title={title}
+      pageClass="repository issue-list"
+      activeTab={data.listKind === "pulls" ? "pulls" : "issues"}
+    >
       <div class="ui container">
         {/* The list-header row (list.tmpl:24-35): the search box (the
             repo/issue/search template) stays unrendered — the keyword grammar

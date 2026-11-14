@@ -438,6 +438,8 @@ describe("repo project board GET /{owner}/{repo}/projects/{id}", () => {
     const html = await res.text();
     expect(html).toContain("repository projects view-project");
     expect(html).toContain("Repo Board");
+    // The strip arms the Projects tab (header.tmpl:149's .IsProjectsPage).
+    expect(html).toContain(`class="active item" href="/wave45-owner/${fixture.repoSlug}/projects"`);
     expect(html).toContain("<em>repo</em> board");
     // The view.tmpl top links row: Labels + Milestones live, New Issue onto
     // the LANDED form (the chooser divergence — no dead path).

@@ -219,6 +219,11 @@ describe("the viewer gates (the signed-in arms wave2's anonymous posture lacks)"
     // and drops the anonymous Sign In item (the shell's viewer branch).
     expect(html).toContain('<a class="item" href="/notifications"');
     expect(html).not.toContain(">Sign In</a>");
+    // The tab strip arms the ISSUES tab (issue_list.go:672's
+    // PageIsIssueList) — never the code default (the usage-reported
+    // regression's pin).
+    expect(html).toContain('class="active item" href="/alice/vault/issues"');
+    expect(html).not.toContain('class="active item" href="/alice/vault"');
   });
 
   it("a signed-in NON-owner still 404-shells on someone else's private repo (sessions buy no visibility)", async () => {
@@ -244,6 +249,10 @@ describe("the viewer gates (the signed-in arms wave2's anonymous posture lacks)"
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain(">pub pull</a>");
+    // The PULLS list arms the Pull Requests tab (issue_list.go:661's
+    // PageIsPullList) — the twin of the issues pin above.
+    expect(html).toContain('class="active item" href="/alice/pubrepo/pulls"');
+    expect(html).not.toContain('class="active item" href="/alice/pubrepo"');
     expect(html).toContain('<a class="item" href="/notifications"');
     expect(html).not.toContain(">Sign In</a>");
   });

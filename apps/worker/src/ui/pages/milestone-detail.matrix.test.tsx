@@ -391,8 +391,14 @@ describe("the detail empty state (a milestone with zero issues)", () => {
     expect(html).toContain("<h1 class=\"tw-flex-1 tw-m-0\">empty m</h1>");
     expect(html).toContain("No results");
     expect(html).toContain("Try adjusting your search filters.");
+    // The strip arms the Issues tab on the milestone's issue list too
+    // (milestone.go:35's PageIsIssueList — the edit sibling's precedent).
+    expect(html).toContain('class="active item" href="/alice/detail/issues"');
     expect(html).not.toContain('id="issue-list"');
     expect(html).not.toContain('<span class="navigation_label">');
+    // The strip arms the Issues tab on the milestone's issue list too
+    // (milestone.go:35's PageIsIssueList — the edit sibling's precedent).
+    expect(html).toContain('class="active item" href="/alice/detail/issues"');
     // Zero issues on BOTH sides: the flip arm must NOT fire (the URL carried
     // no state, but there are no closed issues to flip to all for).
     expect(html).toContain("?state=open");

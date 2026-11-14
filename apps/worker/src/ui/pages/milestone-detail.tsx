@@ -459,6 +459,7 @@ export function MilestoneDetailPage(props: { ctx: UiContext; data: MilestoneDeta
       ctx={ctx}
       title={data.milestone.name}
       pageClass="repository milestone-issue-list"
+      activeTab="issues"
     >
       <div class="ui container">
         <div class="flex-text-block tw-flex-wrap tw-mb-2">
