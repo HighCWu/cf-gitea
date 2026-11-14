@@ -2248,14 +2248,22 @@ describe("the PR-head sync round-trip — a second push moves refs/pull/N/head a
     await waitFor(async () => (await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, index)).get())?.headSha === append.tip, "head_sha cache moved");
     prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, index)).get();
     expect(prRow?.status).toBe(PRStatus.Checking);
-    const pushCommentRows = (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, prRow!.issueId)).all()).filter(
-      (r) => r.type === CommentType.PullRequestPush,
-    );
     // Two rows since TAILS2's github-flow create arm: the CREATE's first
     // push comment (upstream pull.go:145 — the PR's own commits, the base
     // as old) + the SYNC PUSH's comment (the pushed delta). Upstream writes
     // both; the create row's commit_ids carry the original feature tip.
-    expect(pushCommentRows).toHaveLength(2);
+    // The sync tail writes the push comment AFTER the ref move + headSha
+    // CAS the waitFors above cover — WAIT FOR BOTH ROWS (the gate's solo
+    // run caught the race the direct runs won).
+    await waitFor(async () => {
+      const rows = (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, prRow!.issueId)).all()).filter(
+        (r) => r.type === CommentType.PullRequestPush,
+      );
+      return rows.length === 2;
+    }, "both type-29 rows landed (create + sync push)");
+    const pushCommentRows = (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, prRow!.issueId)).all()).filter(
+      (r) => r.type === CommentType.PullRequestPush,
+    );
     const createRow = pushCommentRows.find((r) => JSON.parse(r.content ?? "{}").commit_ids?.[0] !== append.tip);
     const pushRow = pushCommentRows.find((r) => JSON.parse(r.content ?? "{}").commit_ids?.[0] === append.tip);
     expect(createRow).toBeDefined();

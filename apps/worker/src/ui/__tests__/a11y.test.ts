@@ -799,7 +799,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     ).toEqual([["/acme/anvil", "anvil"]]);
   });
 
-  it("milestone-detail: the repo header breadcrumb names owner and repo, the h1 is the milestone title, and the repo tab strip names every tab (Code active)", () => {
+  it("milestone-detail: the repo header breadcrumb names owner and repo, the h1 is the milestone title, and the repo tab strip names every tab (Issues active — milestone.go:35's PageIsIssueList since 6b88549)", () => {
     const root = parseHtmlTree(milestoneDetailGolden);
     const header = descendants(root).find((el) => hasClass(el, "repo-header"));
     expect(header, "the repo header").toBeDefined();
@@ -829,8 +829,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const strip = descendants(root).find((el) => el.tag === "overflow-menu");
     expect(strip, "the repo tab strip").toBeDefined();
     expect(descendants(strip ?? root).filter((el) => el.tag === "a").map((el) => [hasClass(el, "active"), accessibleName(el)])).toEqual([
-      [true, "Code"],
-      [false, "Issues1"],
+      [false, "Code"],
+      [true, "Issues1"],
       [false, "Pull Requests"],
       [false, "Actions"],
       [false, "Packages"],
