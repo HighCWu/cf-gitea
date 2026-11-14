@@ -487,3 +487,25 @@ per engine milestone (M2 lands the first).
   bypass the proxy) or negotiate a higher plan body limit.
 - **e2e new failures beyond the allowlist**: bisect against the gate/engine
   changes; CI fails the build on any divergence by design.
+
+## The account-local posture vars (the B87 lesson, 2026-11-14)
+
+`wrangler.jsonc` is account-local and gitignored — a rebuild from
+`wrangler.jsonc.example` restores the SAFE DEFAULTS, silently flipping the
+deployment's posture. The 2026-11-14 incident: the B87 config rebuild
+restored only the d1 id; `ALLOW_SIGNUP` fell to the example's `false` and
+`DEMO_MODE` to `false` — registration closed AND the periodic demo sweep
+stopped for ~a day before the probe battery's posture arm caught it.
+
+**This deployment's posture (the demo posture)**:
+
+- `ALLOW_SIGNUP: "true"` — open registration
+- `DEMO_MODE: "true"` — the §4.4 banner + the periodic data sweep (the
+  sweep's §2 gate reads exactly this var; false = the sweep NEVER runs)
+
+**After ANY wrangler.jsonc rebuild or restore, diff these FIRST** (before
+build+deploy): the posture pair above, `APP_URL` (the placeholder residue
+class — the 2026-11-14 freeze caught one shipped), the d1 `database_id`,
+and the R2 bucket name. The probe battery's `signup-open` arm is the
+posture canary — a red there with `— the ALLOW_SIGNUP gate is CLOSED` is a
+POSTURE regression, never a code bug.
