@@ -41,9 +41,10 @@
  *     users.go:523 binds `IsRestricted: optional.Some(form.Restricted)`
  *     always-applied like IsAdmin; the checkbox renders the row's flag and
  *     the submit stores both directions), the type
- *     arms (Bot on user/admin/org; junk at the bind), the reset-2FA arm,
- *     the bind arms (silent flagged re-renders), and the unknown-target
- *     LIST redirect.
+ *     arms (the REAL user↔bot conversion since B-72, the admin/org refusal
+ *     arms, the effective-admin fold, the bot password-skip; junk at the
+ *     bind), the reset-2FA arm, the bind arms (silent flagged
+ *     re-renders), and the unknown-target LIST redirect.
  *
  * THE ADMIN GATE is wiring-level (adminPagePrologue — the seams here are
  * POST-gate inputs, the matrix-harness posture: "the module trusts its
@@ -75,7 +76,9 @@ import {
   parseAdminUserEditForm,
   renderAdminUserEditPage,
   submitAdminUserEdit,
+  type AdminUserEditKnobs,
 } from "./admin-user-edit";
+import { verifyPassword } from "../../auth/password";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -233,6 +236,13 @@ async function submit(seeded: Seeded, form: URLSearchParams, doerId = seeded.adm
   return submitAdminUserEdit(env.DB, targetId, doerId, parseAdminUserEditForm(form));
 }
 
+/** The knobs-carrying submit — census B-87's consumption half (SPEC-THREAD):
+ *  the route glue resolves AdminUserEditKnobs from c.env; the pins drive the
+ *  REAL submit with the resolved shape. */
+async function submitKnobs(seeded: Seeded, form: URLSearchParams, knobs: AdminUserEditKnobs) {
+  return submitAdminUserEdit(env.DB, seeded.aliceId, seeded.adminId, parseAdminUserEditForm(form), knobs);
+}
+
 async function rowOf(userId: number) {
   return (await drizzle(env.DB).select().from(users).where(eq(users.id, userId)).get())!;
 }
@@ -274,6 +284,12 @@ describe("the loader (EditUser's data pull over prepareUserInfo)", () => {
     // The gate's arms: admins and orgs cannot convert (CheckConvertUserType).
     expect((await loadAdminUserEdit(env.DB, seeded.adminId))!.canConvertUserType).toBe(false);
     expect((await loadAdminUserEdit(env.DB, seeded.orgId))!.canConvertUserType).toBe(false);
+
+    // BOT rows PASS the check (IsTypeBot short-circuits the not-Individual
+    // arm — B-72 handoff 2): the field renders for a bot, preselected to
+    // Bot, so it can convert back.
+    await drizzle(env.DB).update(users).set({ type: "bot" }).where(eq(users.id, seeded.bobId));
+    expect((await loadAdminUserEdit(env.DB, seeded.bobId))!.canConvertUserType).toBe(true);
 
     // No TOTP row → the constant-false posture (WebAuthn has no store).
     const bob = (await loadAdminUserEdit(env.DB, seeded.bobId))!;
@@ -400,6 +416,23 @@ describe("the render (edit.tmpl at the pin)", () => {
     expect(html).toContain('id="user_type" name="user_type"');
     expect(html).toContain('<option value="User" selected="">');
     expect(html).toContain('<option value="Bot">');
+  });
+
+  it("a bot target renders the user_type dropdown PRESELECTED to Bot, drops the password field, and posts login_type as the hidden 0-0 input (edit.tmpl:17/:43/:82 — B-72 handoff 2)", async () => {
+    const seeded = await seedEdit();
+    await drizzle(env.DB).update(users).set({ type: "bot" }).where(eq(users.id, seeded.aliceId));
+    const html = await renderEdit(seeded);
+    // The preselect: upstream's hidden-input value Iif — the no-JS select
+    // posts the current type unchanged.
+    expect(html).toContain('<option value="User">');
+    expect(html).toContain('<option value="Bot" selected="">');
+    // The password field is not rendered for bots (edit.tmpl:82).
+    expect(html).not.toContain('name="password" type="password"');
+    expect(html).not.toContain(adminUserEditLocale.password_helper);
+    // login_type renders as the hidden "0-0" input (edit.tmpl:43-44's else
+    // arm), no visible dropdown.
+    expect(html).not.toContain('id="login_type" name="login_type"');
+    expect(html).toContain('<input type="hidden" name="login_type" value="0-0"/>');
   });
 
   it("the reset_2fa checkbox renders only when a two_factor row exists", async () => {
@@ -722,25 +755,75 @@ describe("the submit — the restricted arm (users.go:523, the users.is_restrict
 });
 
 describe("the submit — the type arms (CheckConvertUserType at the UpdateUser position)", () => {
-  it("Bot on a plain user re-renders with deviation 3's closest declared error", async () => {
+  it("Bot on a plain user CONVERTS (B-72 handoff 2): the type column rides the profile UPDATE", async () => {
     const seeded = await seedEdit();
     const outcome = await submit(seeded, aliceForm({ user_type: "Bot" }));
-    expect(outcome).toEqual({ outcome: "invalid", message: "user type can not be converted", field: null });
-    expect((await rowOf(seeded.aliceId)).type).toBe("user"); // nothing landed
+    expect(outcome).toEqual({ outcome: "updated" });
+    expect((await rowOf(seeded.aliceId)).type).toBe("bot");
   });
 
-  it("Bot on an admin answers upstream's ErrBotCanNotBeAdmin flash+redirect arm (the flash dropped)", async () => {
+  it("User on a bot converts back (CheckConvertUserType passes for bots)", async () => {
     const seeded = await seedEdit();
-    const outcome = await submit(seeded, blankForm("admin@example.com", ["active"], { user_type: "Bot" }), seeded.adminId, seeded.adminId);
-    expect(outcome).toEqual({ outcome: "redirect" });
-    expect((await rowOf(seeded.adminId)).isAdmin).toBe(true); // the update never landed
+    await drizzle(env.DB).update(users).set({ type: "bot" }).where(eq(users.id, seeded.aliceId));
+    const outcome = await submit(seeded, aliceForm({ user_type: "User" }));
+    expect(outcome).toEqual({ outcome: "updated" });
+    expect((await rowOf(seeded.aliceId)).type).toBe("user");
   });
 
-  it("Bot on an org answers upstream's default ServerError arm", async () => {
+  it("Bot on an admin (checkbox CHECKED) answers upstream's ErrBotCanNotBeAdmin flash+redirect arm (the flash dropped)", async () => {
+    const seeded = await seedEdit();
+    const outcome = await submit(
+      seeded,
+      blankForm("admin@example.com", ["active", "admin"], { user_type: "Bot" }),
+      seeded.adminId,
+      seeded.adminId,
+    );
+    expect(outcome).toEqual({ outcome: "redirect" });
+    const row = await rowOf(seeded.adminId);
+    expect(row.isAdmin).toBe(true); // the update never landed
+    expect(row.type).toBe("user");
+  });
+
+  it("admin UNCHECKED + Bot on a (non-last) admin CONVERTS — the effective-admin fold (opts.IsAdmin applies in-memory first)", async () => {
+    const seeded = await seedEdit();
+    const outcome = await submit(seeded, blankForm("root@example.com", ["active"], { user_type: "Bot" }), seeded.adminId, seeded.secondAdminId);
+    expect(outcome).toEqual({ outcome: "updated" });
+    const row = await rowOf(seeded.secondAdminId);
+    expect(row.isAdmin).toBe(false);
+    expect(row.type).toBe("bot");
+  });
+
+  it("Bot on an org (hand-crafted) answers the ErrUserTypeCanNotConvert flash+redirect arm — errors.Is(util.ErrInvalidArgument) at users.go:541-544, NOT a ServerError", async () => {
     const seeded = await seedEdit();
     const outcome = await submit(seeded, blankForm("forge@example.com", ["active"], { user_type: "Bot" }), seeded.adminId, seeded.orgId);
-    expect(outcome).toEqual({ outcome: "server-error" });
+    expect(outcome).toEqual({ outcome: "redirect" });
     expect((await rowOf(seeded.orgId)).type).toBe("org");
+  });
+
+  it("User on an org (hand-crafted) answers the same ErrUserTypeCanNotConvert arm", async () => {
+    const seeded = await seedEdit();
+    const outcome = await submit(seeded, blankForm("forge@example.com", ["active"], { user_type: "User" }), seeded.adminId, seeded.orgId);
+    expect(outcome).toEqual({ outcome: "redirect" });
+    expect((await rowOf(seeded.orgId)).type).toBe("org");
+  });
+
+  it("the password arm is SKIPPED for an ALREADY-bot target (users.go:459-460 — 'the auth fields hidden for bots still submit their values')", async () => {
+    const seeded = await seedEdit();
+    await drizzle(env.DB).update(users).set({ type: "bot" }).where(eq(users.id, seeded.aliceId));
+    const outcome = await submit(seeded, aliceForm({ password: "Sup3r-Secret!" }));
+    expect(outcome).toEqual({ outcome: "updated" });
+    const row = await rowOf(seeded.aliceId);
+    expect(row.type).toBe("bot");
+    expect(row.passwd).toBe(""); // no hash landed — the ladder never ran
+  });
+
+  it("the password arm is SKIPPED when CONVERTING to bot (the parsed type gates the skip beside the current one)", async () => {
+    const seeded = await seedEdit();
+    const outcome = await submit(seeded, aliceForm({ user_type: "Bot", password: "Sup3r-Secret!" }));
+    expect(outcome).toEqual({ outcome: "updated" });
+    const row = await rowOf(seeded.aliceId);
+    expect(row.type).toBe("bot");
+    expect(row.passwd).toBe("");
   });
 
   it("junk user_type fails the In() bind — the flag-less silent re-render", async () => {
@@ -803,5 +886,55 @@ describe("the submit — the bind arms and the unknown target", () => {
     expect(row.location).toBe("Hamburg");
     expect(row.visibility).toBe("limited");
     expect(row.email).toBe("forge@example.com"); // same-address no-op
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// Census B-87's consumption half — the web edit's SetPassword under the
+// deploy-config knobs (SPEC-THREAD 2026-11-14, the AdminUserEditKnobs battery;
+// the AdminUserCreateKnobs twin pins in admin-user-new.test.tsx). The route
+// glue resolves {policy, configuredHashSpec} from c.env; these pins drive the
+// REAL submit with the resolved shape. "pbkdf2$60000$50" is executable and
+// distinct from the landed default, so the stored passwd_hash_algo is the
+// observable; FLOOR_16 mirrors resolvePasswordPolicy's MIN_PASSWORD_LENGTH=16.
+// ---------------------------------------------------------------------------------
+
+const EDIT_CONFIGURED_SPEC = "pbkdf2$60000$50";
+const EDIT_FLOOR_16_POLICY = { minLength: 16, complexityClasses: [], checkPwned: false };
+
+describe("the submit — the password arm's deploy-config knobs (B-87's consumption half)", () => {
+  it("an ARMED MIN_PASSWORD_LENGTH floor re-renders through the REAL submit; a strong password lands under the configured spec", async () => {
+    const seeded = await seedEdit();
+    const short = await submitKnobs(seeded, aliceForm({ password: "A-Short-Pw!" }), { policy: EDIT_FLOOR_16_POLICY });
+    expect(short).toEqual({
+      outcome: "invalid",
+      message: "Password length cannot be less than 16 characters.",
+      field: "password",
+    });
+    // Nothing stored on the refused arm.
+    const refusedRow = await rowOf(seeded.aliceId);
+    expect(refusedRow.passwdHashAlgo).not.toBe(EDIT_CONFIGURED_SPEC);
+
+    const edited = await submitKnobs(seeded, aliceForm({ password: "A-Long-Enough-Pass!" }), {
+      policy: EDIT_FLOOR_16_POLICY,
+      configuredHashSpec: EDIT_CONFIGURED_SPEC,
+    });
+    expect(edited).toEqual({ outcome: "updated" });
+    const row = await rowOf(seeded.aliceId);
+    expect(row.passwdHashAlgo).toBe(EDIT_CONFIGURED_SPEC);
+    expect(await verifyPassword("A-Long-Enough-Pass!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+  });
+
+  it("omitted knobs keep the landed default arm (the floor-8 default ladder + the default algorithm)", async () => {
+    const seeded = await seedEdit();
+    const short = await submitKnobs(seeded, aliceForm({ password: "a1" }), {});
+    expect(short).toEqual({
+      outcome: "invalid",
+      message: "Password length cannot be less than 8 characters.",
+      field: "password",
+    });
+    const edited = await submitKnobs(seeded, aliceForm({ password: "Fresh-1a" }), {});
+    expect(edited).toEqual({ outcome: "updated" });
+    expect((await rowOf(seeded.aliceId)).passwdHashAlgo).toBe("pbkdf2$50000$50");
   });
 });

@@ -37,15 +37,19 @@
  *     mapped from the typed org errors, flagged on the field.
  *   - `user_type` — renders ONLY when upstream's CanConvertUserType holds
  *     (CheckConvertUserType, services/user/update.go:299-307: admins and
- *     orgs can't convert). Submitting "Bot" hits the landed deviation 3
- *     (our users.type enum has no bot value): plain targets re-render with
- *     the API arm's exact "user type can not be converted" text
- *     (upstream would convert — the closest declared error, admin-t2.ts's
- *     posture); an admin target answers upstream's ErrBotCanNotBeAdmin arm
+ *     orgs can't convert; BOT rows pass — the field renders preselected to
+ *     the current type, edit.tmpl:17's Iif). Since B-72 (the users.type
+ *     'bot' value) the submit CONVERTS for real (users.go:515-518's
+ *     UpdateUser UserType arm): a parsed type differing from the current
+ *     one rides the column patch with the change audited (update.go:217).
+ *     Refusals: an effective-admin target → ErrBotCanNotBeAdmin
  *     (users.go:545-550 — Flash + redirect; the no-flash reduction 303s
- *     silently); an org target answers upstream's default ServerError arm
- *     (users.go:553-556) as the app's plain-text 500 (the impersonate
- *     module's convention). Junk values fail the In(,User,Bot) bind — the
+ *     silently; upstream checks the IN-MEMORY IsAdmin after the posted
+ *     admin checkbox applied, so admin:false + Bot CONVERTS); an org
+ *     target (hand-crafted only — the field doesn't render) →
+ *     ErrUserTypeCanNotConvert → the errors.Is(util.ErrInvalidArgument)
+ *     arm (users.go:541-544 — Flash + redirect, the flash dropped; NOT a
+ *     ServerError). Junk values fail the In(,User,Bot) bind — the
  *     flag-less silent re-render (users.go:421-424's HasError arm; the
  *     rendered select cannot produce junk).
  *   - `login_type` — the auth-source dropdown. Upstream lists Local (0-0)
@@ -271,6 +275,7 @@ import { OrgService, usableUsernameError } from "../../services/orgs/orgs";
 import { findLoginSources, type LoginSourceRow } from "../../services/auth-sources/store";
 import { validateNewPassword } from "../../services/user-accounts";
 import { newPasswordRecord } from "../../auth/password";
+import { DEFAULT_PASSWORD_POLICY, type PasswordPolicy } from "../../auth/password-policy";
 import type { UiContext } from "../ui-context";
 import { AdminFamilyShell, adminUsersLocale } from "./admin-users";
 import { ADMIN_USERS_LIST_LINK, adminUserLink } from "./admin-users-avatar";
@@ -342,7 +347,10 @@ export interface AdminUserEditData {
    *  FindSources over every row, name ASC). */
   sources: LoginSourceRow[];
   /** `user_type` renders only when CheckConvertUserType(u) == nil
-   *  (services/user/update.go:299-307): NOT an admin and NOT an org. */
+   *  (services/user/update.go:299-307): NOT an admin and NOT an org —
+   *  bot rows PASS the check (IsTypeBot short-circuits the
+   *  not-Individual arm), so a bot target renders the field preselected
+   *  to Bot and can convert back (B-72 handoff 2). */
   canConvertUserType: boolean;
   /** hasTOTP || hasWebAuthn (users.go:305-307): the landed two_factor row
    *  is the TOTP half; WebAuthn has no store yet (the constant-false
@@ -364,7 +372,7 @@ export async function loadAdminUserEdit(d1: D1Database, userId: number): Promise
   return {
     user,
     sources,
-    canConvertUserType: !user.isAdmin && user.type === "user",
+    canConvertUserType: !user.isAdmin && user.type !== "org",
     twoFactorEnabled: totp.length > 0,
   };
 }
@@ -450,6 +458,23 @@ export type AdminUserEditOutcome =
   | { outcome: "invalid"; message: string | null; field: AdminUserEditErrorField | null }
   | { outcome: "server-error" };
 
+/**
+ * The deploy-config knobs the edit arm's password ladder consumes (census
+ * B-87's consumption half — the AdminUserCreateKnobs twin): `policy` is
+ * `resolvePasswordPolicy(env)` so an ARMED MIN_PASSWORD_LENGTH/PASSWORD_COMPLEXITY
+ * gates the web edit's ladder too (DEFAULT_PASSWORD_POLICY — upstream's
+ * default config — stands when omitted), and `configuredHashSpec` is
+ * `configuredPasswordHashAlgo(env).specification` so SetPassword stores the
+ * CONFIGURED algorithm (the landed pbkdf2$50000$50 default stands when
+ * omitted; an unexecutable spec refuses through the controlled
+ * PasswordHashUnsupportedError — never a silent fallback). The route glue
+ * resolves both from c.env; the submit stays env-free.
+ */
+export interface AdminUserEditKnobs {
+  policy?: PasswordPolicy;
+  configuredHashSpec?: string;
+}
+
 /** admin-t2.ts's `isLastAdminUser` (route-private — mirrored module-local,
  *  the list page's predicate posture): only the FALSE-set checks
  *  (update.go:145-157). */
@@ -511,7 +536,11 @@ async function renameUserRow(
       db
         .update(users)
         .set({ username: newName, usernameLower: newLower })
-        .where(and(eq(users.id, target.id), eq(users.type, "user"))),
+        // user AND bot rows (orgs route to OrgService.renameOrg before this
+        // seam — the type filter's original org-guard is the routing itself;
+        // B-72's 'bot' value made a bare `type='user'` filter silently skip
+        // a bot's rename).
+        .where(and(eq(users.id, target.id), sql`${users.type} in ('user', 'bot')`)),
       db.delete(userRedirects).where(eq(userRedirects.lowerName, target.usernameLower)),
       db.delete(userRedirects).where(eq(userRedirects.lowerName, newLower)),
       db.insert(userRedirects).values({ lowerName: target.usernameLower, redirectUserId: target.id }),
@@ -557,6 +586,7 @@ export async function submitAdminUserEdit(
   targetId: number,
   doerId: number,
   form: AdminUserEditForm,
+  knobs?: AdminUserEditKnobs,
 ): Promise<AdminUserEditOutcome> {
   const db = drizzle(d1);
   const user = await db.select().from(users).where(eq(users.id, targetId)).get();
@@ -596,23 +626,40 @@ export async function submitAdminUserEdit(
     }
   }
 
+  // --- the posted type (users.go:453-456): upstream parses form.UserType
+  // (the bind admits ""/User/Bot — junk never reaches here) and overrides
+  // the current type on a successful parse; "" = no change. B-72 handoff 2:
+  // the enum carries 'bot' now, so the parse is the REAL conversion's
+  // input.
+  const parsedUserType: "user" | "bot" | null =
+    form.userType === "" ? null : form.userType === "User" ? "user" : "bot";
+
   // --- the auth arm (users.go:464-495 → UpdateAuth): the PASSWORD arm is
   // REAL (SPEC-0002 §6.2 admin-set row — PWD-2 supersedes the interim
   // disabled field): FromNonDefault semantics — EMPTY = unchanged,
   // non-empty → the UpdateAuth ladder (validateNewPassword: min length 8 /
   // complexity → the Err_Password re-render, users.go:486-490), then
   // SetPassword + the remember-me invalidation + the audit row
-  // (update.go:279-283). Our users table has no bot row type (the enum is
-  // user|org) so the upstream bot-skip has no target here — recorded.
-  // login_name / login_type carry no arm (the interim posture stands for
-  // them). The prohibit fold with the SKIP-SELF guard (users.go:476-480),
-  // then the deviation-6 status fold (admin-t2.ts's PATCH posture).
-  if (form.password !== "") {
-    const policy = validateNewPassword(form.password);
+  // (update.go:279-283). The BOT SKIP (users.go:459-460
+  // `!u.IsTypeBot() && userType != UserTypeBot` — "the auth fields hidden
+  // for bots still submit their values"): when the CURRENT type is bot OR
+  // the posted type parses to Bot, the password arm is silently NOT
+  // applied — upstream's own accepted-and-ignore for the fields the
+  // rendered form omits for bots (edit.tmpl:82) but a hand-crafted post
+  // may carry. login_name / login_type carry no arm (the interim posture
+  // stands for them). The prohibit fold with the SKIP-SELF guard
+  // (users.go:476-480), then the deviation-6 status fold (admin-t2.ts's
+  // PATCH posture).
+  if (form.password !== "" && user.type !== "bot" && parsedUserType !== "bot") {
+    // The ladder + SetPassword consume the deploy-config knobs (census
+    // B-87's consumption half — the AdminUserEditKnobs docs; the create
+    // page's identical shape). Omitted knobs = upstream's default config +
+    // the landed default algorithm.
+    const policy = validateNewPassword(form.password, knobs?.policy ?? DEFAULT_PASSWORD_POLICY);
     if (policy !== null) {
       return { outcome: "invalid", message: policy, field: "password" };
     }
-    const record = await newPasswordRecord(form.password);
+    const record = await newPasswordRecord(form.password, knobs?.configuredHashSpec);
     await db
       .update(users)
       .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
@@ -654,11 +701,26 @@ export async function submitAdminUserEdit(
 
   // --- the UpdateUser position (users.go:511-548): the type arms first
   // (CheckConvertUserType lives inside upstream's UpdateUser), then the
-  // last-admin guard, then ONE column UPDATE.
-  if (form.userType === "Bot") {
-    if (user.type === "org") return { outcome: "server-error" }; // ErrUserTypeCanNotConvert → the default ServerError arm
-    if (user.isAdmin) return { outcome: "redirect" }; // ErrBotCanNotBeAdmin → Flash + redirect (the flash dropped)
-    return { outcome: "invalid", message: "user type can not be converted", field: null }; // deviation 3 — upstream converts; our enum has no bot value
+  // last-admin guard, then ONE column UPDATE. B-72 handoff 2 — the REAL
+  // conversion: a parsed type differing from the current one converts
+  // (the type column rides the same UPDATE as the profile columns,
+  // upstream's one UpdateUserCols) with the change audited
+  // (update.go:217). The refusal arms:
+  //   - effective admin (upstream checks the IN-MEMORY IsAdmin after
+  //     opts.IsAdmin applied — the form always posts the checkbox, so the
+  //     posted value IS the effective admin) → ErrBotCanNotBeAdmin →
+  //     Flash + redirect (the flash dropped, the outcome union's
+  //     convention);
+  //   - an org target (only reachable through a hand-crafted post — the
+  //     field doesn't render, CanConvertUserType is false) →
+  //     ErrUserTypeCanNotConvert → errors.Is(util.ErrInvalidArgument) →
+  //     Flash.Error + redirect (users.go:541-544 — NOT the ServerError
+  //     arm; the former deviation-3 posture misread this).
+  //   ErrBotMustBeLocal is vacuous (every row is local — the module
+  //   header).
+  if (parsedUserType !== null && parsedUserType !== user.type) {
+    if (form.admin) return { outcome: "redirect" }; // ErrBotCanNotBeAdmin → Flash + redirect (the flash dropped)
+    if (user.type === "org") return { outcome: "redirect" }; // ErrUserTypeCanNotConvert → the ErrInvalidArgument Flash+redirect arm
   }
   if (form.admin === false && (await isLastAdminUser(d1, user))) {
     return { outcome: "invalid", message: adminUserEditLocale.last_admin, field: null };
@@ -681,7 +743,30 @@ export async function submitAdminUserEdit(
   };
   if (emailChanged) patch.email = form.email;
   if (nextStatus !== null && nextStatus !== user.status) patch.status = nextStatus;
+  const typeChanged = parsedUserType !== null && parsedUserType !== user.type;
+  if (typeChanged) patch.type = parsedUserType;
   await db.update(users).set(patch).where(eq(users.id, user.id));
+  if (typeChanged) {
+    // UpdateUser's type-change audit (update.go:217 — the shared service
+    // tail, the API arm's twin): actor the doer, scope the edited row,
+    // {user_type} DisplayName's English render. A failed insert logs and
+    // never fails the edit (upstream writeEvent's posture).
+    const { AuditActions, emitAudit } = await import("../../services/audit");
+    void emitAudit(db, {
+      action: AuditActions.UserType,
+      actorId: doerId,
+      actorName: user.username, // the seam's actor-name posture (the password arm's)
+      actorCredential: null, // the write rode a session
+      scopeType: "user",
+      scopeId: user.id,
+      scopeName: user.username,
+      origin: "ui",
+      ipAddress: null,
+      vars: { scope: user.username, user_type: parsedUserType === "bot" ? "Bot" : "User" },
+    }).catch((error: unknown) => {
+      console.error(`admin-edit: audit row failed: ${String(error)}`);
+    });
+  }
 
   // --- the reset-2FA arm (users.go:551-556 → DisableTwoFactor,
   // twofactor.go:199-208): the TOTP row dies; the WebAuthn half has no
@@ -742,31 +827,44 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
             <label for="user_name">{adminUserEditLocale.username}</label>
             <input id="user_name" name="user_name" value={user.username} maxlength={40} />
           </div>
-          {/* user_type (:13-26) — the CanConvertUserType gate. */}
+          {/* user_type (:13-26) — the CanConvertUserType gate; bot rows PASS
+              the check (the loader's note), so the select renders for them
+              PRESELECTED to the current type (edit.tmpl:17's
+              `value="{{Iif .User.IsTypeBot "Bot" "User"}}"` — the no-JS
+              select posts the preselected wire value, upstream's hidden
+              input's posture). */}
           {data.canConvertUserType ? (
             <div class="required field">
               <label for="user_type">{adminUsersLocale.user_type}</label>
               <select id="user_type" name="user_type" class="ui selection dropdown">
-                <option value="User" selected>
+                <option value="User" selected={user.type !== "bot"}>
                   {adminUsersLocale.user_type_user}
                 </option>
-                <option value="Bot">{adminUsersLocale.user_type_bot}</option>
+                <option value="Bot" selected={user.type === "bot"}>
+                  {adminUsersLocale.user_type_bot}
+                </option>
               </select>
             </div>
           ) : null}
           {/* login_type (:27-44) — Local + the landed sources; the posted
-              value is the accepted-and-ignored set. */}
-          <div class={fieldClass(err, "loginType", "required js-non-bot field")}>
-            <label for="login_type">{adminUserEditLocale.auth_source}</label>
-            <select id="login_type" name="login_type" class="ui selection dropdown">
-              <option value="0-0" selected>
-                {adminUsersLocale.local}
-              </option>
-              {data.sources.map((source) => (
-                <option value={`${source.type}-${source.id}`}>{source.name}</option>
-              ))}
-            </select>
-          </div>
+              value is the accepted-and-ignored set. For a BOT row upstream
+              renders the hidden input posting "0-0" (edit.tmpl:43-44's else
+              arm — `{{if not .User.IsTypeBot}}`), no visible dropdown. */}
+          {user.type !== "bot" ? (
+            <div class={fieldClass(err, "loginType", "required js-non-bot field")}>
+              <label for="login_type">{adminUserEditLocale.auth_source}</label>
+              <select id="login_type" name="login_type" class="ui selection dropdown">
+                <option value="0-0" selected>
+                  {adminUsersLocale.local}
+                </option>
+                {data.sources.map((source) => (
+                  <option value={`${source.type}-${source.id}`}>{source.name}</option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <input type="hidden" name="login_type" value="0-0" />
+          )}
           {/* visibility (:46-68) — the required dropdown, upstream's 0/1/2
               wire values. */}
           <div class={fieldClass(err, "visibility", "required field")}>
@@ -804,12 +902,16 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               empty with upstream's password_helper; empty = unchanged
               (FromNonDefault), non-empty = the ladder + SetPassword + the
               remember sweep + the audit row. Never echoes (no value attr
-              upstream). */}
-          <div class="js-local js-non-bot field">
-            <label for="password">{adminUserEditLocale.password}</label>
-            <input id="password" name="password" type="password" autocomplete="new-password" />
-            <p class="help">{adminUserEditLocale.password_helper}</p>
-          </div>
+              upstream). NOT RENDERED for a bot row (edit.tmpl:82's
+              `{{if not .User.IsTypeBot}}` — bots are password-less; the
+              submit skips any hand-crafted value besides). */}
+          {user.type !== "bot" ? (
+            <div class="js-local js-non-bot field">
+              <label for="password">{adminUserEditLocale.password}</label>
+              <input id="password" name="password" type="password" autocomplete="new-password" />
+              <p class="help">{adminUserEditLocale.password_helper}</p>
+            </div>
+          ) : null}
 
           {/* The language field (:90-102) is DROPPED — no column, no
               contract field (the module header). */}

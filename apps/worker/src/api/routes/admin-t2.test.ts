@@ -1015,7 +1015,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     );
   });
 
-  it("walks the type arms: Organization 400 parse, admin→Bot 400, plain→Bot the deviation 400", async () => {
+  it("walks the type arms: Organization 400 parse, admin→Bot 400, plain→Bot CONVERTS (B-72 handoff 1)", async () => {
     const org = await adminSend("/admin/users/neighbor", jsonPatch({ type: "Organization" }));
     expect(org.status).toBe(400);
     expect(((await org.json<Record<string, unknown>>())).message).toBe(
@@ -1028,9 +1028,102 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
       "bot user can not be a site administrator",
     );
 
+    // The REAL conversion: 200, the response renders the "Bot" wire type
+    // (convert.UserTypeToString) and the row carries users.type 'bot'.
     const botPlain = await adminSend("/admin/users/neighbor", jsonPatch({ type: "Bot" }));
-    expect(botPlain.status).toBe(400);
-    expect(((await botPlain.json<Record<string, unknown>>())).message).toBe("user type can not be converted");
+    expect(botPlain.status).toBe(200);
+    expect(((await botPlain.json<Record<string, unknown>>())).type).toBe("Bot");
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(row.type).toBe("bot");
+    // UpdateUser's type-change audit (update.go:217): actor the ADMIN,
+    // {user_type} DisplayName's English render.
+    const audits = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      action: "user:type:update",
+      actorId: adminId,
+      actorName: "cf-gitea-stub",
+      scopeType: "user",
+      scopeId: String(neighborId),
+      scopeName: "neighbor",
+      origin: "api",
+      message: "Changed type of user neighbor to Bot.",
+    });
+  });
+
+  it("converts Bot back to User and emits the audit with the User render (bot→user, CheckConvertUserType passes)", async () => {
+    await drizzle(env.DB)
+      .update(users)
+      .set({ type: "bot" })
+      .where(eq(users.id, neighborId));
+    const res = await adminSend("/admin/users/neighbor", jsonPatch({ type: "User" }));
+    expect(res.status).toBe(200);
+    expect(((await res.json<Record<string, unknown>>())).type).toBe("User");
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(row.type).toBe("user");
+    const audits = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ action: "user:type:update", message: "Changed type of user neighbor to User." });
+  });
+
+  it("an ALREADY-bot target refuses auth material without a type change (UpdateAuth's service guard, update.go:231-235)", async () => {
+    await drizzle(env.DB)
+      .update(users)
+      .set({ type: "bot" })
+      .where(eq(users.id, neighborId));
+    const withPassword = await adminSend("/admin/users/neighbor", jsonPatch({ password: "Sup3r-Secret!" }));
+    expect(withPassword.status).toBe(400);
+    expect(((await withPassword.json<Record<string, unknown>>())).message).toBe(
+      "a bot account cannot have a password or authentication source",
+    );
+
+    // Same arm with NO auth material: the edit proceeds (prohibit_login etc.
+    // are UpdateAuth-legal for a bot — the guard is material-scoped only).
+    const noMaterial = await adminSend("/admin/users/neighbor", jsonPatch({ prohibit_login: true }));
+    expect(noMaterial.status).toBe(200);
+    expect(((await noMaterial.json<Record<string, unknown>>())).prohibit_login).toBe(true);
+  });
+
+  it("org targets refuse BOTH conversion directions with ErrUserTypeCanNotConvert (update.go:301)", async () => {
+    const orgId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "forge-org", usernameLower: "forge-org", type: "org", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    const toUser = await adminSend("/admin/users/forge-org", jsonPatch({ type: "User" }));
+    expect(toUser.status).toBe(400);
+    expect(((await toUser.json<Record<string, unknown>>())).message).toBe("user type can not be converted");
+
+    const toBot = await adminSend("/admin/users/forge-org", jsonPatch({ type: "Bot" }));
+    expect(toBot.status).toBe(400);
+    expect(((await toBot.json<Record<string, unknown>>())).message).toBe("user type can not be converted");
+    expect(orgId).not.toBe(neighborId);
+  });
+
+  it("admin:false + type:Bot on an admin target CONVERTS (the effective-admin fold — opts.IsAdmin applies first, update.go:289-303)", async () => {
+    // root is the ONLY admin here → unsetting admin trips the last-admin
+    // guard; seed a second admin so the fold is observable.
+    await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "root2", usernameLower: "root2", isAdmin: true, status: "active", createdAt: NOW });
+    const res = await adminSend("/admin/users/root", jsonPatch({ admin: false, type: "Bot" }));
+    expect(res.status).toBe(200);
+    expect(((await res.json<Record<string, unknown>>())).type).toBe("Bot");
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, adminId)).limit(1))[0]!;
+    expect(row.isAdmin).toBe(false);
+    expect(row.type).toBe("bot");
+  });
+
+  it("admin CHECKED + type:Bot refuses (ErrBotCanNotBeAdmin — the in-memory IsAdmin is true after the checkbox applied)", async () => {
+    const res = await adminSend("/admin/users/neighbor", jsonPatch({ admin: true, type: "Bot" }));
+    expect(res.status).toBe(400);
+    expect(((await res.json<Record<string, unknown>>())).message).toBe("bot user can not be a site administrator");
+    // Nothing persisted — the conversion check precedes the column patch.
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(row.isAdmin).toBe(false);
+    expect(row.type).toBe("user");
   });
 
   it("404s a missing user and 307s a renamed one (UserAssignmentAPI seam)", async () => {
@@ -1567,5 +1660,76 @@ describe("the PASSWORD_CHECK_PWN arm (admin/user.go:113-119 / :220-221)", () => 
     expect(((await miss.json<Record<string, unknown>>())).message).toBe(
       "using Have-I-Been-Pwned service failed: dns timeout",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// Census B-87's consumption half — the configured PASSWORD_HASH_ALGO threading
+// (SPEC-THREAD 2026-11-14). BOTH SetPassword arms store under the env-resolved
+// `configuredPasswordHashAlgo(env).specification` (the alias chain's dealiased
+// form — upstream boots with it, security.go:175; Workers resolves per request).
+// PASSWORD_HASH_ALGO=pbkdf2_v1 dealiases to "pbkdf2$10000$50" — executable and
+// DISTINCT from the landed default "pbkdf2$50000$50" (whose create-arm shape
+// already pins in the create battery above) — so the stored passwd_hash_algo is
+// the observable through the REAL routes.
+// ---------------------------------------------------------------------------------
+
+describe("the configured PASSWORD_HASH_ALGO threading (B-87's consumption half — the two SetPassword arms)", () => {
+  it("the API create stores the created row under the env-resolved configured spec (PASSWORD_HASH_ALGO=pbkdf2_v1 -> pbkdf2$10000$50, NOT the default)", async () => {
+    const send = adminSendKnobs({ PASSWORD_HASH_ALGO: "pbkdf2_v1" });
+    const res = await send(
+      "/admin/users",
+      jsonAdmin({ username: "specstrap", email: "specstrap@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(res.status).toBe(201);
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "specstrap")).limit(1))[0]!;
+    expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(await verifyPassword("Sup3r-Secret!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+    expect(await verifyPassword("wrong-password", row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
+  });
+
+  it("the API edit's SetPassword stores under the env-resolved configured spec", async () => {
+    // The target row lands under the DEFAULT env first (the pre-threading shape)…
+    const made = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "specpatch", email: "specpatch@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(made.status).toBe(201);
+    // …then the PATCH rides the ARMED env: the new record stores pbkdf2_v1's spec.
+    const send = adminSendKnobs({ PASSWORD_HASH_ALGO: "pbkdf2_v1" });
+    const patched = await send("/admin/users/specpatch", jsonPatch({ password: "A-Fresh-Password!" }));
+    expect(patched.status).toBe(200);
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "specpatch")).limit(1))[0]!;
+    expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(await verifyPassword("A-Fresh-Password!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+  });
+
+  it("an unexecutable configured spec refuses BOTH arms through the controlled error — 500, zero partial writes", async () => {
+    const made = await adminSend(
+      "/admin/users",
+      jsonAdmin({ username: "specfail", email: "specfail@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(made.status).toBe(201);
+    const before = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "specfail")).limit(1)
+    )[0]!;
+    const send = adminSendKnobs({ PASSWORD_HASH_ALGO: "scrypt" });
+    // The edit arm: the parse refuses BEFORE the UPDATE — the row untouched.
+    const patched = await send("/admin/users/specfail", jsonPatch({ password: "A-Fresh-Password!" }));
+    expect(patched.status).toBe(500);
+    const after = (
+      await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "specfail")).limit(1)
+    )[0]!;
+    expect(after.passwd).toBe(before.passwd);
+    expect(after.salt).toBe(before.salt);
+    expect(after.passwdHashAlgo).toBe(before.passwdHashAlgo);
+    // The create arm: the parse refuses BEFORE the INSERT batch — no row at all.
+    const failed = await send(
+      "/admin/users",
+      jsonAdmin({ username: "specnope", email: "specnope@example.com", password: "Sup3r-Secret!" }),
+    );
+    expect(failed.status).toBe(500);
+    const orphan = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "specnope")).limit(1);
+    expect(orphan).toHaveLength(0);
   });
 });

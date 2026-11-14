@@ -304,7 +304,7 @@ export type AdminInitOutcome =
 export async function initializeAdminUser(
   d1: D1Database,
   form: AccountForm,
-  options?: { now?: Date },
+  options?: { now?: Date; configuredHashSpec?: string },
 ): Promise<AdminInitOutcome> {
   const invalid = accountFormError(form);
   if (invalid !== null) return { outcome: "invalid", message: invalid };
@@ -324,7 +324,10 @@ export async function initializeAdminUser(
   // The password record is hashed BEFORE the guarded insert so the winning
   // row lands complete (user.go:783-794's prepare step — SetPassword: new
   // salt + current algorithm; rands rides EVERY upstream create, :786).
-  const record = await newPasswordRecord(form.password);
+  // The configured algorithm is the caller's env-resolved spec (census
+  // B-87's consumption half — see PasswordArmOptions.configuredHashSpec);
+  // omitted, the landed pbkdf2 default stands.
+  const record = await newPasswordRecord(form.password, options?.configuredHashSpec);
   const rands = newSalt();
   // The existence-guarded insert: `meta.changes` is the whole verdict. D1
   // serializes writers, so exactly one concurrent submission sees changes
@@ -427,13 +430,20 @@ export function pwnedArmMessage(result: PwnedResult): string | null {
 }
 
 /** The shared options the async password arms take — the policy (resolved
- *  from env by callers that have it; omitted = upstream's default config)
- *  and the pwned check's injectable fetch (tests; production rides the
- *  runtime global fetch). */
+ *  from env by callers that have it; omitted = upstream's default config),
+ *  the pwned check's injectable fetch (tests; production rides the
+ *  runtime global fetch), and the CONFIGURED HASH SPEC (census B-87's
+ *  consumption half): callers with a request env bridge
+ *  `configuredPasswordHashAlgo(env).specification` (api/config.ts) — the
+ *  alias chain's dealiased form upstream boots with (security.go:175);
+ *  omitted, the landed pbkdf2$50000$50 default stands. An unexecutable
+ *  configured spec refuses through the controlled PasswordHashUnsupportedError
+ *  at the SetPassword arm (never a silent fallback to the default). */
 export interface PasswordArmOptions {
   now?: Date;
   policy?: PasswordPolicy;
   fetchImpl?: typeof fetch;
+  configuredHashSpec?: string;
 }
 
 export interface ChangePasswordForm {
@@ -486,7 +496,9 @@ export async function changeOwnPassword(
     if (message !== null) return { outcome: "invalid", message };
   }
 
-  const record = await newPasswordRecord(form.newPassword);
+  // SetPassword under the caller's env-resolved spec (census B-87's
+  // consumption half — see PasswordArmOptions.configuredHashSpec).
+  const record = await newPasswordRecord(form.newPassword, options?.configuredHashSpec);
   const updated = await db
     .update(users)
     .set({
@@ -829,7 +841,9 @@ export async function applyPasswordReset(
   }
 
   const db = drizzle(d1);
-  const record = await newPasswordRecord(newPassword);
+  // SetPassword under the caller's env-resolved spec (census B-87's
+  // consumption half — see PasswordArmOptions.configuredHashSpec).
+  const record = await newPasswordRecord(newPassword, options?.configuredHashSpec);
   const updated = await db
     .update(users)
     .set({

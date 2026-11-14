@@ -48,6 +48,20 @@ export type PasswordSignInResult =
   | { ok: false; failure: PasswordSignInFailure };
 
 /**
+ * The deploy-config knobs the rehash-on-login arm consumes (census B-87's
+ * consumption half): `configuredHashSpec` is the caller's env-resolved
+ * CONFIGURED specification — `configuredPasswordHashAlgo(env).specification`
+ * (api/config.ts, the dealiased security.go:175 value upstream boots with;
+ * this module has no env, so callers with one bridge it — the house
+ * env→reader→arm pattern). Omitted, the landed pbkdf2$50000$50 default
+ * stands (password.ts CONFIGURED_HASH_SPEC): needsRehash compares against
+ * it and the rehash WRITE stores under it.
+ */
+export interface PasswordSignInOptions {
+  configuredHashSpec?: string;
+}
+
+/**
  * `UserSignIn(name|email, password)` against the DB source — the lookup
  * arms (signin.go:27-52) folded with the Authenticate ladder
  * (authenticate.go:46-87). `login` containing "@" goes through the
@@ -59,6 +73,7 @@ export async function userSignInPassword(
   d1: D1Database,
   login: string,
   password: string,
+  options?: PasswordSignInOptions,
 ): Promise<PasswordSignInResult> {
   const db = drizzle(d1);
   let user: UserRow | null;
@@ -112,17 +127,42 @@ export async function userSignInPassword(
   if (!valid) return { ok: false, failure: { kind: "password-invalid" } };
 
   // authenticate.go:55-67 — the rehash-on-login ladder: algorithm moved OR
-  // salt length is not the current 32 — new salt + current algorithm,
-  // updating exactly (passwd, passwd_hash_algo, salt).
+  // salt length is not the current 32 — new salt + the CONFIGURED algorithm
+  // (options.configuredHashSpec, the env-driven arm — see
+  // PasswordSignInOptions), updating exactly (passwd, passwd_hash_algo,
+  // salt).
+  //
+  // When the CONFIGURED spec is verify-only/unexecutable in this runtime
+  // (argon2/bcrypt — the wasm verifier verifies but cannot WRITE; scrypt/
+  // above-cap — parse-refused outright), the rehash WRITE refuses through
+  // the controlled PasswordHashUnsupportedError (password.ts's landed arms
+  // — never a silent fallback to the default algorithm). The DERIVED posture
+  // for this arm: SKIP the migration and let the verified login proceed
+  // (logged for the server log). Upstream propagates SetPassword errors here
+  // (authenticate.go:56-59 `return nil, err`) but can never reach that
+  // mismatch — an unparseable spec dies in the boot log.Fatal
+  // (security.go:176-178) and Go writes argon2 fine — while Workers cannot;
+  // failing a SUCCESSFULLY-verified login over an operator-configured
+  // write-impossible migration target would diverge from upstream's
+  // success-by-default more than skipping the migration does. The row stays
+  // on its stored (verifiable) algorithm; rehashed=false.
   let rehashed = false;
-  if (needsRehash(user.passwdHashAlgo, user.salt)) {
-    const record = await newPasswordRecord(password);
-    await db
-      .update(users)
-      .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
-      .where(eq(users.id, user.id));
-    user = { ...user, passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo };
-    rehashed = true;
+  if (needsRehash(user.passwdHashAlgo, user.salt, options?.configuredHashSpec)) {
+    try {
+      const record = await newPasswordRecord(password, options?.configuredHashSpec);
+      await db
+        .update(users)
+        .set({ passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo })
+        .where(eq(users.id, user.id));
+      user = { ...user, passwd: record.passwd, salt: record.salt, passwdHashAlgo: record.passwdHashAlgo };
+      rehashed = true;
+    } catch (error) {
+      if (error instanceof PasswordHashUnsupportedError) {
+        console.error(`password-auth: rehash skipped (configured spec not writable here): ${error.message}`);
+      } else {
+        throw error;
+      }
+    }
   }
 
   // authenticate.go:71-84 + signin.go:96-98 — prohibit (double gate) and

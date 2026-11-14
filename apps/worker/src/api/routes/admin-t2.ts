@@ -18,9 +18,9 @@ import {
 } from "../../db/schema";
 import { newSalt, newPasswordRecord } from "../../auth/password";
 import { isComplexEnough, isPwned, PASSWORD_PWNED_ERROR_TEXT, type PwnedResult } from "../../auth/password-policy";
-import { resolvePasswordPolicy } from "../config";
+import { configuredPasswordHashAlgo, resolvePasswordPolicy } from "../config";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
-import { AuditActions, auditEventInsert } from "../../services/audit";
+import { AuditActions, auditEventInsert, emitAudit } from "../../services/audit";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
 import { enqueueRegisterNotifyMail } from "../../services/mail/register-notify";
@@ -119,10 +119,18 @@ import { toApiUser } from "../services/user";
  *   3. **`type` conversions**: upstream parses only User/Bot
  *      (services/convert/user.go:27–36 — "Organization" is a 400
  *      `invalid user type "Organization" (expected User, Bot)`, mirrored);
- *      converting a local non-admin user to Bot succeeds upstream but has no
- *      storage variant in `users.type` (enum 'user'|'org') — that arm answers
- *      upstream's CheckConvertUserType 400 `user type can not be converted`
- *      (services/user/update.go:299–307) as the closest declared error.
+ *      a valid user↔Bot conversion CONVERTS for real since B-72 (the
+ *      `users.type` 'bot' value landed): the patch rides the same UPDATE as
+ *      the profile columns (upstream's one UpdateUserCols), the conversion
+ *      checks run against the EFFECTIVE admin (opts.IsAdmin applies
+ *      in-memory first — update.go:289-303), org targets 400
+ *      `user type can not be converted` (ErrUserTypeCanNotConvert) and the
+ *      change emits `user:type:update` (update.go:217; B-72's handoff 1 —
+ *      the former deviation-3 blanket 400 is history). The route-level
+ *      auth-material guard (admin/user.go:200–204) covers the
+ *      conversion-to-bot path; UpdateAuth's service-level twin
+ *      (update.go:231-235) covers an ALREADY-bot target — both 400 with
+ *      `a bot account cannot have a password or authentication source`.
  *   4. **No restricted / external-login columns**: the `restricted` filter
  *      evaluates against the constant false-everything state (true filters
  *      match nothing); `source_id`/`login_name` filters likewise (every user
@@ -532,9 +540,16 @@ async function insertCreatedUser(
   form: CreateUserOption,
   now: Date,
   audit: { actorId: number; actorName: string },
+  configuredHashSpec: string,
 ): Promise<TargetRow> {
   const lower = form.username.toLowerCase();
-  const record = await newPasswordRecord(form.password ?? "");
+  // SetPassword under the request env's CONFIGURED algorithm (census B-87's
+  // consumption half — the route resolves
+  // `configuredPasswordHashAlgo(c.env).specification`; user.go:788-791's
+  // "current algo" IS setting.PasswordHashAlgo). An unexecutable configured
+  // spec refuses through the controlled PasswordHashUnsupportedError before
+  // any write.
+  const record = await newPasswordRecord(form.password ?? "", configuredHashSpec);
   const db = drizzle(d1);
   try {
     const [inserted] = await db.batch([
@@ -1003,10 +1018,19 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (doer?.id === undefined || doer.login === undefined) {
       throw new ApiError(401, "Unauthorized");
     }
-    const row = await insertCreatedUser(c.env.DB, form, new Date(), {
-      actorId: doer.id,
-      actorName: (doer.full_name ?? "").trim() !== "" ? (doer.full_name as string) : doer.login,
-    });
+    // The row's passwd_hash_algo = the env-resolved CONFIGURED spec (census
+    // B-87's consumption half — upstream boots with the dealiased
+    // security.go:175 value; Workers resolves per request).
+    const row = await insertCreatedUser(
+      c.env.DB,
+      form,
+      new Date(),
+      {
+        actorId: doer.id,
+        actorName: (doer.full_name ?? "").trim() !== "" ? (doer.full_name as string) : doer.login,
+      },
+      configuredPasswordHashAlgo(c.env).specification,
+    );
     // The register-notify mail arm (specs/email-outbound.md §2.5) — upstream
     // `if form.SendNotify { mailer.SendRegisterNotifyMail(u) }`
     // (routers/api/v1/admin/user.go:153-156; the web twin admin/users.go:262).
@@ -1042,28 +1066,27 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     const target = await resolveTargetRow(c, username);
     const form = c.req.valid("json");
 
-    // --- type conversion arm (user.go:193–201 → convert.UserTypeFromString)
+    // --- type parse arm (user.go:193–201 → convert.UserTypeFromString):
+    // the posted type only engages when it DIFFERS from the target's
+    // current type string (upstream parses form.Type non-empty and !=
+    // UserTypeToString(u.Type); identical/no posts leave userType None and
+    // nothing below converts). "Organization" fails the parse with the
+    // InvalidArgument text — APIErrorAuto answers it 400 (the wrapper's
+    // message over errorForUser's code). users.type gained 'bot' (B-72), so
+    // "Bot" now parses and CONVERTS below — the deviation-3 blanket 400 is
+    // history.
     const password = form.password ?? "";
-    const currentType = target.type === "org" ? "Organization" : "User";
-    if (form.type !== undefined && form.type !== currentType) {
-      if (form.type === "Organization") {
-        throw new ApiError(400, 'invalid user type "Organization" (expected User, Bot)');
-      }
-      // form.type === "Bot" — upstream's route-level auth-material guard
-      // (admin/user.go:200–204) fires BEFORE the conversion checks: with any
-      // password/auth-source material attached, the dedicated bot 400
-      // answers regardless of admin status. (UpdateAuth's own IsTypeBot fold
-      // for an ALREADY-bot target, update.go:233–235, is unreachable —
-      // deviation 3 stores no bot rows.)
-      if (password !== "" || (form.source_id ?? 0) !== 0 || (form.login_name ?? "") !== "") {
-        throw new ApiError(400, "a bot account cannot have a password or authentication source");
-      }
-      if (target.isAdmin) {
-        throw new ApiError(400, "bot user can not be a site administrator");
-      }
-      // Deviation 3: no bot storage variant — upstream would convert; ours
-      // answers CheckConvertUserType's message instead.
-      throw new ApiError(400, "user type can not be converted");
+    const currentType = target.type === "org" ? "Organization" : target.type === "bot" ? "Bot" : "User";
+    const parsedType = form.type !== undefined && form.type !== currentType ? form.type : null;
+    if (parsedType === "Organization") {
+      throw new ApiError(400, 'invalid user type "Organization" (expected User, Bot)');
+    }
+    // Upstream's route-level auth-material guard (admin/user.go:200–204):
+    // fires ONLY when the NEW type is Bot — a user→Bot conversion carrying
+    // password/auth-source material 400s before UpdateAuth runs, regardless
+    // of admin status.
+    if (parsedType === "Bot" && (password !== "" || (form.source_id ?? 0) !== 0 || (form.login_name ?? "") !== "")) {
+      throw new ApiError(400, "a bot account cannot have a password or authentication source");
     }
 
     // --- the auth arm (admin/user.go:200–226 → UpdateAuth, update.go:
@@ -1071,6 +1094,15 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     // upstream runs UpdateAuth to completion (UpdateUserCols) before
     // ReplacePrimaryEmailAddress; no transaction spans them, so a later 409
     // never rolls the password write back here either.
+    // UpdateAuth's service-level bot guard (update.go:231-235) — REACHABLE
+    // since B-72 (the route-level guard above covers only the
+    // conversion-to-bot path): an ALREADY-bot target refuses any
+    // auth-material assignment even without a type change. Same 400 +
+    // message upstream's APIErrorAuto yields for the InvalidArgumentErrorf
+    // (the wrapper's message over ErrInvalidArgument's 400 code).
+    if (target.type === "bot" && (password !== "" || (form.source_id ?? 0) !== 0 || (form.login_name ?? "") !== "")) {
+      throw new ApiError(400, "a bot account cannot have a password or authentication source");
+    }
     const authPatch: Partial<typeof users.$inferInsert> = {};
     if (password !== "") {
       // optional.FromNonDefault semantics (update.go:249): empty/absent =
@@ -1097,8 +1129,12 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
           throw new ApiError(400, pwned.message);
         }
       }
-      // SetPassword (user.go:407–414): new salt + the CONFIGURED algorithm.
-      const record = await newPasswordRecord(password);
+      // SetPassword (user.go:407–414): new salt + the CONFIGURED algorithm —
+      // the env-resolved spec (census B-87's consumption half, the same
+      // bridge the create arm takes). An unexecutable configured spec
+      // refuses through the controlled PasswordHashUnsupportedError BEFORE
+      // the UPDATE below (no partial write).
+      const record = await newPasswordRecord(password, configuredPasswordHashAlgo(c.env).specification);
       authPatch.passwd = record.passwd;
       authPatch.salt = record.salt;
       authPatch.passwdHashAlgo = record.passwdHashAlgo;
@@ -1145,6 +1181,29 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       throw new DeleteLastAdminUserError(target.id);
     }
 
+    // --- the type conversion (update.go:289-303: `opts.UserType.Has() &&
+    // value != u.Type` → CheckConvertUserType, update.go:295-303). Upstream
+    // checks the IN-MEMORY IsAdmin — opts.IsAdmin applies FIRST (the
+    // UpdateUser column loop runs before the UserType arm), so posting
+    // {admin:false, type:"Bot"} on an admin target CONVERTS (the admin flag
+    // flips false, then the check passes). effectiveAdmin is that fold.
+    // Org targets fail ErrUserTypeCanNotConvert; ErrBotMustBeLocal is
+    // vacuous (every row is local — the module header). B-72 handoff 1: the
+    // REAL conversion lands — users.type gained 'bot', so user↔bot patches
+    // the type column instead of the former deviation-3 blanket 400.
+    let convertedType: "user" | "bot" | null = null;
+    if (parsedType !== null) {
+      const effectiveIsAdmin = form.admin !== undefined ? form.admin : target.isAdmin;
+      if (effectiveIsAdmin) {
+        // CheckConvertUserType's ErrBotCanNotBeAdmin — APIErrorAuto → 400.
+        throw new ApiError(400, "bot user can not be a site administrator");
+      }
+      if (target.type === "org") {
+        throw new ApiError(400, "user type can not be converted");
+      }
+      convertedType = parsedType === "Bot" ? "bot" : "user";
+    }
+
     // --- the column patch (update.go:65–227 reduced to landed columns).
     const patch: Partial<typeof users.$inferInsert> = {};
     if (form.full_name !== undefined) {
@@ -1167,8 +1226,35 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     } else if (activated) {
       patch.status = "active";
     }
+    if (convertedType !== null) patch.type = convertedType;
     if (Object.keys(patch).length > 0) {
       await drizzle(c.env.DB).update(users).set(patch).where(eq(users.id, target.id));
+      if (convertedType !== null) {
+        // UpdateUser's type-change audit (update.go:217:
+        // `audit.Record(ctx, audit_model.UserType, u, "user_type",
+        // u.Type.DisplayName())`) — the shared service tail, so the API arm
+        // emits exactly like the web arm. DisplayName's English render
+        // ("Bot"/"User") is the var (the UI translates concept_user_*).
+        const doer = c.get("authUser");
+        // The wire-model User's id/username are wire-OMITTABLE — the authed
+        // admin row always carries them (the create arm's guard posture).
+        if (doer?.id === undefined) {
+          throw new ApiError(401, "Unauthorized");
+        }
+        await emitAudit(drizzle(c.env.DB), {
+          action: AuditActions.UserType,
+          actorId: doer.id,
+          actorName: doer.username ?? doer.login ?? "",
+          actorCredential: null, // the write rode a token
+          scopeType: "user",
+          scopeId: target.id,
+          scopeName: target.username,
+          origin: "api",
+          vars: { scope: target.username, user_type: convertedType === "bot" ? "Bot" : "User" },
+        }).catch((error: unknown) => {
+          console.log(`[audit] user:type:update row failed (scope=${target.id}): ${String(error)}`);
+        });
+      }
     }
 
     const updated = await findUserById(c.env.DB, target.id);

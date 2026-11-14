@@ -21,11 +21,20 @@
 
 import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:test";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { AuditActions, findAuditEvents } from "./audit";
-import { deleteUserCascade, initWindowOpen, initializeAdminUser } from "./user-accounts";
+import { newPasswordRecord, newSalt, verifyPassword } from "../auth/password";
+import { users } from "../db/schema";
+import {
+  applyPasswordReset,
+  changeOwnPassword,
+  deleteUserCascade,
+  initWindowOpen,
+  initializeAdminUser,
+} from "./user-accounts";
 
 async function seedActorPair(): Promise<{ actorId: number; receiverId: number }> {
   await applyAuthD1Migrations();
@@ -220,5 +229,95 @@ describe("initializeAdminUser's audit row (install.go:479 — B-73's residue)", 
     const invalid = await initializeAdminUser(env.DB, { username: "", email: "x@example.com", password: "p", retype: "p" });
     expect(invalid.outcome).toBe("invalid");
     expect(await findAuditEvents(drizzle(env.DB), { action: AuditActions.UserCreate })).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// Census B-87's consumption half — the configured PASSWORD_HASH_ALGO threading
+// (SPEC-THREAD 2026-11-14). The three service arms take the caller's env-resolved
+// configuredHashSpec (PasswordArmOptions / the init options bag; the route glue
+// bridges configuredPasswordHashAlgo(env).specification — api/config.ts). The pin
+// spec "pbkdf2$60000$50" is EXECUTABLE and DISTINCT from the landed default
+// ("pbkdf2$50000$50"), so the stored passwd_hash_algo is the observable.
+// ---------------------------------------------------------------------------------
+
+const CONFIGURED_SPEC = "pbkdf2$60000$50";
+const FLOOR_16_POLICY = { minLength: 16, complexityClasses: [], checkPwned: false };
+
+/** A human row whose password record landed under the DEFAULT arm — the
+ *  pre-threading shape every deployed instance carries. */
+async function seedPasswordedUser(username: string): Promise<number> {
+  await seedSystemPremise();
+  const record = await newPasswordRecord("Sup3r-Secret!");
+  const [row] = await drizzle(env.DB)
+    .insert(users)
+    .values({
+      username,
+      usernameLower: username.toLowerCase(),
+      email: `${username}@example.com`,
+      isAdmin: false,
+      status: "active",
+      visibility: "public",
+      type: "user",
+      createdAt: new Date(0),
+      passwd: record.passwd,
+      salt: record.salt,
+      passwdHashAlgo: record.passwdHashAlgo,
+      rands: newSalt(),
+    })
+    .returning({ id: users.id })
+    .all();
+  return row!.id;
+}
+
+describe("the configured-hash-spec threading (census B-87's consumption half — the three arms)", () => {
+  it("initializeAdminUser stores the created admin under the CALLER'S configured spec — and verifies under it", async () => {
+    await seedSystemPremise();
+    const result = await initializeAdminUser(env.DB, ADMIN_FORM, { configuredHashSpec: CONFIGURED_SPEC });
+    expect(result.outcome).toBe("created");
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "root")).get())!;
+    expect(row.passwdHashAlgo).toBe(CONFIGURED_SPEC);
+    expect(await verifyPassword("ignored", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+  });
+
+  it("initializeAdminUser without the option keeps the landed default arm (the compiles-unchanged contract)", async () => {
+    await seedSystemPremise();
+    const result = await initializeAdminUser(env.DB, ADMIN_FORM);
+    expect(result.outcome).toBe("created");
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "root")).get())!;
+    expect(row.passwdHashAlgo).toBe("pbkdf2$50000$50");
+  });
+
+  it("changeOwnPassword: an ARMED MIN_PASSWORD_LENGTH floor rejects through the REAL service; a strong password lands under the configured spec (the old-password check still verifies the pre-threading row)", async () => {
+    const id = await seedPasswordedUser("specchg");
+    const short = await changeOwnPassword(
+      env.DB,
+      id,
+      { oldPassword: "Sup3r-Secret!", newPassword: "A-Short-Pw!", retype: "A-Short-Pw!" },
+      { policy: FLOOR_16_POLICY },
+    );
+    expect(short).toMatchObject({ outcome: "invalid", message: "Password length cannot be less than 16 characters." });
+
+    const changed = await changeOwnPassword(
+      env.DB,
+      id,
+      { oldPassword: "Sup3r-Secret!", newPassword: "A-Long-Enough-Pass!", retype: "A-Long-Enough-Pass!" },
+      { policy: FLOOR_16_POLICY, configuredHashSpec: CONFIGURED_SPEC },
+    );
+    expect(changed).toMatchObject({ outcome: "changed" });
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, id)).get())!;
+    expect(row.passwdHashAlgo).toBe(CONFIGURED_SPEC);
+    expect(await verifyPassword("A-Long-Enough-Pass!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+  });
+
+  it("applyPasswordReset (the shared UpdateAuth arm) stores under the configured spec", async () => {
+    const id = await seedPasswordedUser("specreset");
+    const changed = await applyPasswordReset(env.DB, id, "A-Reset-Pass-Value!", "A-Reset-Pass-Value!", {
+      configuredHashSpec: CONFIGURED_SPEC,
+    });
+    expect(changed).toMatchObject({ outcome: "changed" });
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, id)).get())!;
+    expect(row.passwdHashAlgo).toBe(CONFIGURED_SPEC);
+    expect(await verifyPassword("A-Reset-Pass-Value!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
   });
 });
