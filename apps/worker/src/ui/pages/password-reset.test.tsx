@@ -52,7 +52,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { userSignInPassword } from "../../auth/password-auth";
-import { newPasswordRecord } from "../../auth/password";
+import { newPasswordRecord, verifyPassword } from "../../auth/password";
 import { totpCode } from "../../auth/totp";
 import { applyTwofaEnrollment, generateTotpSecret, mintPendingTicket } from "../../auth/two-factor";
 import { generateUserTimeLimitCode, verifyUserTimeLimitCode, TIME_LIMIT_CODE_LENGTH } from "../../auth/reset-code";
@@ -515,6 +515,33 @@ describe("POST /user/reset_password — the apply ladder", () => {
     expect(after.passwd).not.toBe("");
     expect(after.passwdHashAlgo).toBe("pbkdf2$50000$50");
     expect(await verifyUserTimeLimitCode(env.DB, "reset_password", code)).toBeNull();
+  });
+
+  it("the apply stores under the CONFIGURED spec: PASSWORD_HASH_ALGO=pbkdf2_v1 arms the reset route's SetPassword target to pbkdf2$10000$50 (B-87's route-glue half, sixth site — ResetPasswdPost's apply is UpdateAuth under the LOADED settings, password.go:203-207 + update.go:256-264 + security.go:175)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const oldPw = await seedPassword(alice, "previous horse battery staple");
+    const code = await mintCode(alice);
+
+    // The knob rides the helper's PER-REQUEST env override (the live-mail
+    // pins' pattern — a fresh copy, so nothing to restore; app.fetch hands
+    // this object to the handlers; the generated Env types the var as the
+    // example's literal, so the widened assignment cast is the house shape).
+    const specEnv: Env = { ...testEnv };
+    (specEnv as { PASSWORD_HASH_ALGO?: string }).PASSWORD_HASH_ALGO = "pbkdf2_v1";
+    const res = await request("/user/reset_password", form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD }), specEnv);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+
+    const row = await userRow(alice.id);
+    // The stored record is under the DEALIASED configured spec — NOT the
+    // landed pbkdf2$50000$50 default (the route's env-resolution half; the
+    // service-level store pins live in user-accounts.test.ts).
+    expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    // Verified against the STORED algo only — a plain userSignInPassword
+    // would rehash-on-login under the DEFAULT spec and rewrite the row
+    // (the change-password battery's model).
+    expect(await verifyPassword(NEW_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+    expect(await verifyPassword(oldPw, row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
   });
 
   it("a missing / invalid code on POST → the invalid-code re-render (password.go:171-176's commonResetPassword miss)", async () => {

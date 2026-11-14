@@ -147,7 +147,7 @@ import {
 } from "../auth/middleware";
 import { userSignInPassword } from "../auth/password-auth";
 import { generateUserTimeLimitCode, verifyUserTimeLimitCode } from "../auth/reset-code";
-import { configuredPasswordHashAlgo, enablePasswordSignInForm } from "../api/config";
+import { configuredPasswordHashAlgo, enablePasswordSignInForm, resolvePasswordPolicy } from "../api/config";
 import { applyPasswordReset } from "../services/user-accounts";
 import {
   enqueueResetPasswordMail,
@@ -2046,7 +2046,16 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
     }
   }
 
-  const outcome = await applyPasswordReset(c.env.DB, user.id, password, retype);
+  // Census B-87 bridge: upstream ResetPasswdPost's apply is UpdateAuth under
+  // the LOADED SETTINGS (password.go:203-207 -> update.go:256-264 ->
+  // SetPassword, models/user/user.go:411-420) — the resolved policy gates
+  // the ladder and the configured PASSWORD_HASH_ALGO is the hash target;
+  // unset stays upstream's pbkdf2 default (the shared idiom: the POST /login
+  // arm above and ui/index.ts's change arms).
+  const outcome = await applyPasswordReset(c.env.DB, user.id, password, retype, {
+    policy: resolvePasswordPolicy(c.env),
+    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+  });
   if (outcome.outcome !== "changed") return invalid(code, outcome.message);
 
   // password.go:246-258 — the WebAuthn-only user finishes on its own page:

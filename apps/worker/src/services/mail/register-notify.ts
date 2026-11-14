@@ -24,10 +24,22 @@
 
 import { parseMailFrom } from "./message";
 import { enqueueMailOutbox, type EnqueueOutcome, type MailOutboxEnv } from "./outbox";
-import { registerNotifySubject, renderRegisterNotify } from "./templates";
+import { renderRegisterNotify } from "./templates";
 
 /** Upstream `AppName` default (no cf-gitea APP_NAME var yet — see header). */
 export const GITEA_APP_NAME = "Gitea";
+
+/** `mail.register_notify` (locale_en-US.json): `Welcome to %s` — the email
+ *  SUBJECT carries the AppName ONLY, never the display name (upstream
+ *  `TrString("mail.register_notify", setting.AppName)`, mail_user.go:123 —
+ *  `TrString` is the raw fmt with NO HTML escaping; a plain header value).
+ *  The TITLE format (`%[1]s, welcome to %[2]s`) is the BODY's head line and
+ *  stays in templates.ts's `registerNotifySubject` — the subject's previous
+ *  use of that helper composed the wrong locale entry (B-84 routed open,
+ *  fixed here). */
+export function registerNotifyMailSubject(appName: string): string {
+  return `Welcome to ${appName}`;
+}
 
 /** Upstream `IsMailable` (models/user/user.go:538-540) over our row:
  *  a real, active, individual row with an address. */
@@ -104,7 +116,7 @@ export async function enqueueRegisterNotifyMail(
 
   const displayName = displayNameOf(user);
   const appUrl = appUrlWithSlash(env.APP_URL);
-  const subject = registerNotifySubject(displayName, GITEA_APP_NAME);
+  const subject = registerNotifyMailSubject(GITEA_APP_NAME);
   const body = renderRegisterNotify({
     displayName,
     username: user.username,

@@ -24,7 +24,7 @@ import { giteaErrorHandler } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
 import { registerAdminT2Routes } from "../../api/routes/admin-t2";
 import { isMailOutboxMessage, processMailOutbox, type MailOutboxEnv, type MailOutboxMessage } from "./outbox";
-import { appUrlWithSlash, isMailable } from "./register-notify";
+import { appUrlWithSlash, GITEA_APP_NAME, isMailable, registerNotifyMailSubject } from "./register-notify";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -136,7 +136,11 @@ describe("POST /admin/users send_notify — the register-notify mail (end to end
     expect(mail.toAddr).toBe("alice@example.org");
     expect(mail.fromAddress).toBe("noreply@example.com");
     expect(mail.fromDisplayName).toBe("Gitea");
-    expect(mail.subject).toBe("alice, welcome to Gitea");
+    // mail.register_notify ("Welcome to %s") with the AppName ONLY — the
+    // display name never enters the subject (mail_user.go:123 TrString);
+    // the ", welcome to" composition is the TITLE entry, the body's head.
+    expect(mail.subject).toBe("Welcome to Gitea");
+    expect(mail.subject).not.toContain("alice");
     expect(mail.info).toBe(`UID: ${mailIdOf(mail)}, registration notify`);
     expect(mail.dedupeKey).toBe(`register-notify:${mailIdOf(mail)}`);
     expect(mail.bodyHtml).toContain("Hi <b>alice</b>,</p>");
@@ -211,6 +215,13 @@ function mailIdOf(mail: { dedupeKey: string | null }): number {
 }
 
 describe("unit pins", () => {
+  it("registerNotifyMailSubject — mail.register_notify 'Welcome to %s', AppName only (mail_user.go:123)", () => {
+    expect(registerNotifyMailSubject(GITEA_APP_NAME)).toBe("Welcome to Gitea");
+    // A hostile display name can never reach the header — the helper takes
+    // the AppName alone (the TrString arg list has exactly one entry).
+    expect(registerNotifyMailSubject("Gitea")).not.toContain("<");
+  });
+
   it("isMailable — upstream user.go:538-540 over our row", () => {
     expect(
       isMailable({ id: 7, email: "a@b", status: "active", type: "user" }),
