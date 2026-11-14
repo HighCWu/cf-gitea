@@ -841,7 +841,14 @@ export function RepoActionsJobQueuePage(props: { ctx: UiContext; data: JobQueueP
   if (ctx.repo === undefined) throw new Error("RepoActionsJobQueuePage requires ctx.repo");
   const repoLink = `/${ctx.repo.ownerNamespace}/${ctx.repo.slug}`;
   return (
-    <BaseLayout ctx={ctx} title={actionsQueueLocale.actions} pageClass="repository actions">
+    <BaseLayout
+      ctx={ctx}
+      title={actionsQueueLocale.actions}
+      pageClass="repository actions"
+      // upstream job_queue.go:17 arms PageIsActions — the strip's Actions
+      // anchor, not the Code default (the 6b88549 class).
+      activeTab="actions"
+    >
       <div class="ui container">
         <div class="flex-container">
           <RepoActionsQueueSidebar repoLink={repoLink} />

@@ -453,9 +453,12 @@ describe("the mount page (GET — the view.tmpl + view_component.tmpl shell)", (
     expect(html).toContain(`data-locale-cancel="${repoActionsViewLocale.cancel}"`);
     expect(html).toContain(`data-locale-status-waiting="${repoActionsViewLocale.statusWaiting}"`);
     expect(html).toContain(`data-locale-graph-reset-view="${repoActionsViewLocale.graphResetView}"`);
-    // The page shell: .page-content.repository over the repo header (no
-    // actions tab strip yet — no activeTab).
+    // The page shell: .page-content.repository over the repo header; the
+    // strip rides the header with the Actions anchor active (upstream
+    // view.go:206 arms PageIsActions) and NOT the Code anchor.
     expect(html).toContain("page-content repository");
+    expect(html).toContain('class="active item" href="/alice/demo/actions"');
+    expect(html).not.toContain('class="active item" href="/alice/demo"');
     expect(html).toContain("/alice/demo");
     // The browser tab title: run - workflow (no job arm).
     expect(html).toContain("<title>Fix the login bug - .github/workflows/ci.yml - alice/demo</title>");

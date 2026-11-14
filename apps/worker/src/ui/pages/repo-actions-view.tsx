@@ -2244,10 +2244,11 @@ export function RepoActionViewMount(props: { data: RepoActionsViewPageData }) {
 
 /** The full-document render (view.tmpl: `.page-content.repository` over the
  *  repo header — BaseLayout renders both from ctx.repo — and the mount div;
- *  there is no actions tab strip yet, so no activeTab). */
+ *  the strip rides the repo header with the Actions anchor active — upstream
+ *  view.go:206 arms PageIsActions on every run-view arm). */
 export function renderRepoActionsViewPage(ctx: UiContext, data: RepoActionsViewPageData): string {
   return renderPage(
-    <BaseLayout ctx={ctx} title={data.title} pageClass="repository">
+    <BaseLayout ctx={ctx} title={data.title} pageClass="repository" activeTab="actions">
       <RepoActionViewMount data={data} />
     </BaseLayout>,
   );

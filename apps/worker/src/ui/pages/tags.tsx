@@ -460,7 +460,16 @@ export function TagsPage(props: { ctx: UiContext; data: TagsData; flash?: TagsFl
   if (repo === undefined) throw new Error("TagsPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
-    <BaseLayout ctx={ctx} title={tagsLocale.page_title} pageClass="repository tags">
+    <BaseLayout
+      ctx={ctx}
+      title={tagsLocale.page_title}
+      pageClass="repository tags"
+      // upstream release.go:228 (TagsList) arms PageIsTagList — the strip's
+      // single releases anchor is active for tags too (header.tmpl:157's
+      // `or .PageIsReleaseList .PageIsTagList`), not the Code default (the
+      // 6b88549 class).
+      activeTab="releases"
+    >
       <div class="ui container">
         <TagsFlashBlock flash={props.flash} />
         <TagsReleaseHeader repoLink={repoLink} releaseCount={data.releaseCount} tagCount={data.tagCount} />

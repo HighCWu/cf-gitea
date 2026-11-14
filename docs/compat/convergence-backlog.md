@@ -89,6 +89,58 @@ threading; B-47's ref-comment xref scan rides B-46's same remainder.
 
 ## 4. The standing cruft list (small, recorded, non-blocking)
 
+- (CLOSED 2026-11-14, TABSWEEP) The repo tab strip's active-state class —
+  the STRUCTURAL GUARD for the 6b88549 usage-reported regression: every
+  page rendering a repo header (all 68 `repository*` BaseLayout sites;
+  RepoHeader renders only inside shell.tsx's BaseLayout, so the
+  enumeration is complete) audited against the upstream tab-arming flag
+  its route handler arms (header.tmpl:101 ViewCode / :107 IssueList /
+  :123 PullList / :132 Actions / :140-144 IsPackagesPage / :149
+  IsProjectsPage / :157 ReleaseList|TagList / :166 Wiki / :178 Activity /
+  :187 RepoSettings; arming sites re-derived at the pin per handler —
+  settings is the GROUP-level ctxDataSet on the whole /settings group,
+  web.go:1287, so every settings sub-page derives; blame/branches/search
+  ride view-code via prepareRepoViewContent view_home.go:401 +
+  branch.go:45 + search.go:23; compare is ViewCode NOT PullList,
+  compare.go:518). VERDICTS: every family already passed the right tab
+  except THREE latent bugs that fell to BaseLayout's code default — the
+  actions job queue (repo-actions-queue.tsx, upstream job_queue.go:17),
+  the actions run view (repo-actions-view.tsx, upstream view.go:206),
+  and the public tags page (tags.tsx, upstream release.go:228
+  PageIsTagList → the ONE releases anchor, header.tmpl:157) — all three
+  fixed with an explicit activeTab at the page (the 6b88549 pattern),
+  each cited to its arming site. The PORT-POSTURE rows (recorded, kept,
+  NOT bugs): upstream arms NO strip flag on the editor family
+  (PageIsDelete/PageIsUpload are form-mode flags), the commit Diff
+  (PageIsDiff only, commit.go:280 — ours passes code explicitly), the
+  social lists (view.go:362-380 — ours defaults code), releases
+  new/edit (newReleaseCommon arms nothing — ours passes releases
+  explicitly, the golden family), the 404 shell, and on /fork +
+  actions artifact preview upstream renders NO repo header at all (tpl
+  repo/pulls/fork and artifact_preview.tmpl carry no repo/header — our
+  header+code-default is the standing divergence); the migrating page
+  MATCHES (header.tmpl's IsBeingCreated branch arms Code). The commits
+  strip tab remains OUR SPEC-0008 §2.4.1 addition (upstream arms
+  ViewCode + the sub-menu-only PageIsCommits, commit.go:60-65/:108-109 —
+  the landed convention keeps /commits + /graph on the commits anchor).
+  THE GUARD: new
+  `apps/worker/src/ui/__tests__/repo-tab-strip.test.tsx` — drives the
+  REAL router (the issues-list matrix's fetchUi rig) over ONE
+  representative URL per page family (31 cases covering all eleven strip
+  anchors) and asserts the strip's active-anchor set equals the audited
+  expectation, sliced to the overflow-menu region so page-internal
+  sub-menus (the tags header, the labels navbar) cannot mask the strip;
+  32/32 green, PLUS the falsification proof — reverting the tags fix
+  turns exactly the tags case red (1 failed / 31 passed) and re-applying
+  greens — so the class now has a regression net, not just three pins.
+  Whole-green own-eyes: repo-actions-view 77/77 (its strip pin
+  strengthened: Actions anchor active, Code anchor explicitly not),
+  repo-actions-queue 26/26, repo-actions-runs.matrix 72/72,
+  pages-wave25 22/22, releases.matrix 42/42,
+  pages-wave33-tags-releases-tails 19/19; tree tsc 0 (dist-types
+  regenerated); scoped eslint 0 over the five touched files. Goldens
+  untouched (no golden renders tags/actions pages — verified against
+  harness.ts's GOLDEN_CASES inventory).
 - (CLOSED 2026-11-14, AUDITDOC) The audit doc's residual cite-convention
   debt (38 notes, M10-era): the flagged class lives in the webhook audit
   doc (`docs/compat/webhook-event-coverage.md`) — its pre-M10
