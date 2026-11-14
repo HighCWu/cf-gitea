@@ -1252,7 +1252,16 @@ import {
   adminUserImpersonate,
 } from "./pages/admin-users-impersonate";
 import { adminUserAvatarDelete, adminUserAvatarUpload, adminUserLink, loadAdminAvatarUser } from "./pages/admin-users-avatar";
-import { ADMIN_USERS_LIST_LINK, loadAdminUserDetail, renderAdminUserDetailPage } from "./pages/admin-user-detail";
+import {
+  ADMIN_BOT_TOKEN_ONLY_ERROR,
+  ADMIN_USERS_LIST_LINK,
+  adminUserMintBotToken,
+  adminUserRevokeBotToken,
+  type AdminBotTokenActor,
+  loadAdminUserDetail,
+  renderAdminUserDetailPage,
+  withBotTokenMintOutcome,
+} from "./pages/admin-user-detail";
 import {
   loadAdminUserEdit,
   parseAdminUserEditForm,
@@ -3877,7 +3886,14 @@ export interface AdminRoute {
     // (admin.RemoveUserFromAllOrgs, users.go:651-683) — the user-detail
     // page's org section is the forms' only source (view_orgs.tmpl).
     | "admin-user-org-remove"
-    | "admin-user-orgs-remove-all";
+    | "admin-user-orgs-remove-all"
+    // The census B-72 bot-token write pair (web.go:822-823 — POST-only
+    // upstream, the GET twins 405): getTargetBot's gate serves BOTS ONLY
+    // (the admin.users.bot_token_only refusal on a non-bot target) — the
+    // detail page's BotAccessTokens panel (view.tmpl:28-29,
+    // pages/admin-user-detail.tsx) is the forms' only source.
+    | "admin-user-bot-token"
+    | "admin-user-bot-token-delete";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -4876,6 +4892,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (tail.length === 4 && tail[0] === "users" && tail[2] === "avatar" && tail[3] === "delete" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-user-avatar-delete", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    // The census B-72 bot-token write pair (web.go:822-823 — POST-only
+    // upstream; pages/admin-user-detail.tsx's seams): claimed beside the
+    // avatar pair in upstream's route order, digits-only {userid} (junk
+    // stays engine-404). The pair's gate is getTargetBot — a NON-bot
+    // target answers the 400 refusal at the handler, never the parse.
+    if (tail.length === 3 && tail[0] === "users" && tail[2] === "access_tokens" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-user-bot-token", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    if (
+      tail.length === 4 &&
+      tail[0] === "users" &&
+      tail[2] === "access_tokens" &&
+      tail[3] === "delete" &&
+      /^\d+$/.test(tail[1] as string)
+    ) {
+      return { family: "admin-user-bot-token-delete", adminUserId: Number.parseInt(tail[1] as string, 10) };
     }
     // The census B-71 org-removal pair (web.go:824-825 — POST-only upstream,
     // the GET twins answer chi's 405): the remove-all literal and the per-org
@@ -20742,6 +20775,82 @@ uiRouter.post("/-/admin/users/:userid{\\d+}/orgs/:orgid{\\d+}/remove", (c) =>
   adminUserOrgRemoveSubmit(c, Number.parseInt(c.req.param("userid"), 10), Number.parseInt(c.req.param("orgid"), 10)),
 );
 uiRouter.get("/-/admin/users/:userid{\\d+}/orgs/:orgid{\\d+}/remove", () => methodNotAllowed("POST"));
+
+// --- BOTWEB: the census B-72 bot-token write pair (web.go:822-823 — the
+// handoff (4) close-out; pages/admin-user-detail.tsx owns the seams and the
+// panel render). One self-contained region: the two handlers + their
+// registrations. --------------------------------------------------------------
+
+/** The prologue's viewer as the audit arm's actor snapshot — upstream
+ *  audit.Record's doer is the signed-in ADMIN (applications.go:133/:163),
+ *  with the impersonation carry riding the record seam (event.go:124). The
+ *  prologue guarantees a signed admin; the narrow keeps it cast-free. */
+function adminBotTokenActor(viewer: Viewer): AdminBotTokenActor {
+  return viewer.kind === "user"
+    ? { id: viewer.id, username: viewer.username, impersonatorUserId: viewer.impersonatorUserId ?? null }
+    : { id: 0, username: "" };
+}
+
+/** getTargetBot's non-bot refusal (users.go:372-375 — JSONError's 400 under
+ *  the buildJsonErrorMap shape; the impersonate arm's convention). */
+function adminBotTokenRefusal(): Response {
+  return new Response(JSON.stringify(ADMIN_BOT_TOKEN_ONLY_ERROR), {
+    status: 400,
+    headers: { "content-type": "application/json;charset=utf-8" },
+  });
+}
+
+/** POST /-/admin/users/{userid}/access_tokens (admin.NewBotTokenPost,
+ *  users.go:379-383): getTargetBot's gate — an unknown id 500s plain
+ *  (upstream ServerError; the pair does its own lookup, never the list
+ *  redirect) and a NON-bot target answers the 400 refusal, never
+ *  accept-and-ignore — then the mint through the token service. Created
+ *  and invalid both re-render the FRESH page at 200: the one-time
+ *  plaintext, or the negative line + the kept name (the settings page's
+ *  conventions for the same shared template). */
+async function adminUserBotTokenSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsApplicationsForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await adminUserMintBotToken(c.env.DB, adminBotTokenActor(p.ctx.viewer), userId, form);
+  if (outcome.outcome === "unknown-target") return p.respond(new Response("Internal Server Error", { status: 500 }));
+  if (outcome.outcome === "refused") return p.respond(adminBotTokenRefusal());
+  // The re-render reads a FRESH panel after the write (upstream builds a new
+  // NewAccessTokensPanel after the insert, applications.go:139-145); a
+  // target that vanished or stopped being a bot mid-flight is the LIST belt.
+  const fresh = await loadAdminUserDetail(c.env.DB, userId);
+  const data = fresh === null ? null : withBotTokenMintOutcome({ ...fresh, oauth2Enabled: oauth2FeatureEnabled(c.env) }, outcome);
+  if (data === null) return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  return p.respond(c.html(renderAdminUserDetailPage(p.ctx, data), 200));
+}
+
+/** POST /-/admin/users/{userid}/access_tokens/delete (admin.DeleteBotToken,
+ *  users.go:385-389): the same gate; deleted AND missing both 303 back onto
+ *  the detail page (JSONRedirect("")'s reduction after either flash — a
+ *  stale id rides the silent arm, upstream's flash error carries the Go
+ *  error string, no renderable analog). */
+async function adminUserBotTokenDeleteSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await adminUserRevokeBotToken(c.env.DB, adminBotTokenActor(p.ctx.viewer), userId, form.id ?? 0);
+  if (outcome === "unknown-target") return p.respond(new Response("Internal Server Error", { status: 500 }));
+  if (outcome === "refused") return p.respond(adminBotTokenRefusal());
+  return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
+}
+
+// POST-only upstream; the GET twins answer chi's 405 (the B-71 convention).
+uiRouter.post("/-/admin/users/:userid{\\d+}/access_tokens", (c) => adminUserBotTokenSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
+uiRouter.get("/-/admin/users/:userid{\\d+}/access_tokens", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/users/:userid{\\d+}/access_tokens/delete", (c) =>
+  adminUserBotTokenDeleteSubmit(c, Number.parseInt(c.req.param("userid"), 10)),
+);
+uiRouter.get("/-/admin/users/:userid{\\d+}/access_tokens/delete", () => methodNotAllowed("POST"));
+// --- end BOTWEB region -------------------------------------------------------
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
 // The listing's delete write (web.go:851 — POST-only; the GET twin answers

@@ -71,9 +71,63 @@
  *     primary lives on users.email, secondaries in email_addresses, the
  *     primary unshifted when no row carries it), module-local like the list
  *     page's predicate (the module-local-query posture).
- *   - The BotAccessTokens section never renders — `users.type` is
- *     'user'|'org' (no bot value exists, the 2a00e28 dead-arm note), so
- *     view.tmpl:25's `{{if .BotAccessTokens}}` gate is unproducible.
+ *   - THE BOT ACCESS-TOKENS PANEL (view.tmpl:28-29 — LANDED, the B-72
+ *     handoff (4) close-out; the former "unproducible" note is history —
+ *     `users.type` carries 'bot' since B-72): ViewUser's `u.IsTypeBot()`
+ *     gate (users.go:355-359) feeds `.BotAccessTokens` =
+ *     user_setting.NewAccessTokensPanel (applications.go:47-71) and the
+ *     shared access_tokens.tmpl renders it with the bot arms — the
+ *     `admin.users.bot_token_desc` lead line (:17), NO regenerate button
+ *     per row (:51) and NO regenerate modal (:115). Rendered here ONLY for
+ *     type=bot targets: the loader answers `botTokens: null` otherwise
+ *     (the `{{if .BotAccessTokens}}` gate), so a user/org row carries no
+ *     panel and no token read. The scope table drops the `admin` category
+ *     unless the OWNER is a site admin (applications.go:66-68 keys on
+ *     `owner.IsAdmin` — the BOT row's flag, never the viewing admin's).
+ *     The panel's link is upstream's `ctx.Link + "/access_tokens"`
+ *     (users.go:356).
+ *   - THE BOT-TOKEN WRITE PAIR (web.go:822-823, the panel's only arms):
+ *     POST `/{userid}/access_tokens` (admin.NewBotTokenPost →
+ *     user_setting.CreateAccessToken, applications.go:74-146) and POST
+ *     `/{userid}/access_tokens/delete` (admin.DeleteBotToken →
+ *     user_setting.DeleteAccessToken, :158-171), both behind getTargetBot
+ *     (users.go:366-377): GetUserByID's miss is ServerError (500 — NOT
+ *     prepareUserInfo's list redirect, the pair does its own lookup) and a
+ *     NON-bot target answers JSONError `admin.users.bot_token_only` (400,
+ *     the impersonate arm's buildJsonErrorMap convention) — the arm serves
+ *     BOTS ONLY, an accepted POST against a user/org row is REFUSED, never
+ *     accept-and-ignore (other accounts manage their own tokens on
+ *     /user/settings/applications). The machinery is the EXISTING token
+ *     service — `TokenService.mint`/`revoke` + `emitAccessTokenAudit`, the
+ *     account-aggregates API arm's exact pair (routes/account-aggregates.ts
+ *     userCreateToken/userDeleteAccessToken) — never a duplicate store
+ *     path. The audit rows carry owner = THE BOT and actor = THE CALLING
+ *     ADMIN (upstream audit.Record's doer over `owner`, applications.go:133
+ *     /:163 — the API twin's pinned shape), the reason the seams thread the
+ *     explicit actor rather than ride the settings page's
+ *     createTokenFromForm (whose actor IS its owner). Reductions — the
+ *     settings page's adjudicated conventions for the SAME shared template
+ *     (user-settings-applications.tsx's module header):
+ *       * the mint answers the FULL page re-rendered with the one-time
+ *         plaintext in `<code id="new-access-token-value">` (upstream
+ *         renders only the tplAccessTokens fragment with NewTokenValue for
+ *         the form-fetch-action swap, applications.go:139-145; SPEC-0002 §3
+ *         never stores the plaintext — it exists in this one response);
+ *       * an invalid mint (the Required/MaxSize binder arms,
+ *         `settings.at_least_one_permission`,
+ *         `settings.generate_token_name_duplicate`) re-renders with the
+ *         negative line + the kept name (upstream's JSONError arms);
+ *       * the revoke 303s back HERE (JSONRedirect("")'s reduction, the
+ *         B-71 arms' posture); a stale id 303s silently — upstream's
+ *         flash-error arm carries the Go error string
+ *         ("GetAccessTokenByID: …"), no renderable analog;
+ *       * the copy button, the delete confirm dialog and the gt-checkbox
+ *         styling reduce exactly as on the settings page.
+ *     The doer-token child-scope containment (applications.go:108-126)
+ *     needs the doer's token scope in the session identity, which the UI
+ *     session does not carry — the documented settings/API divergence (a
+ *     session doer mints as a scope-less parent, upstream's own
+ *     `hasApiTokenScope == false` arm for a cookie session).
  *   - Repositories: "Repositories (Total: N)" + the SHARED repo list rows —
  *     pages/org-home.tsx's OrgRepoListItem (the shared/repo/list.tmpl row
  *     component, this page is exactly upstream's shared/repo/list
@@ -142,19 +196,51 @@
  *    `uiRouter.get("/-/admin/users/:userid", (c) => adminUserDetailPage(c));`
  *    — AFTER the `/-/admin/users` static (Hono's router prefers the static
  *    literal; the avatar POSTs already carry their own deeper paths).
+ * 5. The bot-token write pair (web.go:822-823 — the SAME users group):
+ *    `UiRoute` gains `admin-user-bot-token` + `admin-user-bot-token-delete`
+ *    (the `adminUserId` payload), claimed in the tail parse beside the
+ *    avatar pair in upstream's route order (`handlesUiRoute` gates the
+ *    dispatcher on the parse — an unclaimed POST never reaches uiRouter):
+ *
+ *      tail.length === 3 && tail[2] === "access_tokens"            → the mint
+ *      tail.length === 4 && tail[2] === "access_tokens"
+ *                        && tail[3] === "delete"                   → the revoke
+ *
+ *    and registered POST-only (the GET twins answer chi's 405 — the B-71
+ *    pair's convention). The handlers are the settings arms' shape: the
+ *    §2.8 sameOriginGuard → adminPagePrologue → the seam → the map —
+ *    `unknown-target` 500 plain (getTargetBot's ServerError), `refused`
+ *    400 JSON `ADMIN_BOT_TOKEN_ONLY_ERROR`, `created`/`invalid` the
+ *    re-rendered page at 200 (`withBotTokenMintOutcome` overlays the
+ *    one-time plaintext or the error slot onto a FRESH load), `deleted`/
+ *    `missing` 303 `adminUserLink(id)`.
  */
 
-import { asc, eq, inArray , sql} from "drizzle-orm";
+import { and, asc, eq, inArray , sql} from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { emailAddresses, repositories, users } from "../../db/schema";
+import type { AuthToken } from "../../auth/auth-context";
+import { TokenNameExistsError, TokenNameTooLongError } from "../../auth/errors";
+import { InvalidScopeError, normalizeScope, ScopeSet, scopeStringSlice } from "../../auth/scopes";
+import { TokenService } from "../../auth/token-service";
+import { emailAddresses, personalAccessTokens, repositories, users } from "../../db/schema";
+import { emitAccessTokenAudit } from "../../services/oauth2/audit-arms";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
+import type { IconName } from "../icons";
 import { Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import { AdminEmbeddedSvg, AdminFamilyShell, adminUsersLocale, formatAdminDate } from "./admin-users";
 import { ADMIN_USERS_LIST_LINK, adminUserLink } from "./admin-users-avatar";
 import { OrgRepoListItem } from "./org-home";
 import { orgSettingsLocale } from "./org-settings";
+import {
+  formatTokenDate,
+  TOKENS_LIST_LIMIT,
+  tokenScopeCategories,
+  userSettingsApplicationsLocale,
+  type TokenListItem,
+  type UserSettingsApplicationsForm,
+} from "./user-settings-applications";
 
 // ---------------------------------------------------------------------------
 // Page copy (upstream locale keys cited; en-US values at the pin)
@@ -186,6 +272,22 @@ export const adminUserDetailLocale = {
   avatar_section: "Avatar", // "settings.avatar" (edit.tmpl:190's section header — the fold's title)
   impersonate: "Impersonate", // "admin.users.impersonate" (view.tmpl:8 — the header's POST button)
   edit: "Edit", // "admin.users.edit" (view.tmpl:10 — the header's Edit link)
+  // --- the bot access-tokens panel (the B-72 handoff (4) close-out; the
+  //     SHARED panel copy — manage_access_token, token_name, the permission
+  //     labels … — rides userSettingsApplicationsLocale, the settings page's
+  //     const for the SAME shared template) ---
+  bot_token_desc: "Bot accounts cannot sign in, so their access tokens are managed here by administrators.", // "admin.users.bot_token_desc" (access_tokens.tmpl:17 — the IsBot lead line)
+  bot_token_only: "Access tokens can only be generated for bot accounts here.", // "admin.users.bot_token_only" (users.go:373 — getTargetBot's non-bot refusal)
+} as const;
+
+/** getTargetBot's JSONError body (users.go:373 — `ctx.Tr("admin.users.
+ *  bot_token_only")` at the pin's en-US locale), rendered under
+ *  context.go:276-278's buildJsonErrorMap shape and answered 400 (the
+ *  impersonate arm's exact convention — IMPERSONATE_BOT_REFUSED_ERROR's
+ *  twin for this pair's shared gate). */
+export const ADMIN_BOT_TOKEN_ONLY_ERROR = {
+  errorMessage: adminUserDetailLocale.bot_token_only,
+  renderFormat: "text",
 } as const;
 
 /** Upstream `DisplayNameWithFullName` (models/user/user.go:496-501): the
@@ -215,6 +317,32 @@ export interface AdminUserDetailRepo {
   description: string;
 }
 
+/** The bot access-tokens panel — upstream AccessTokensPanel
+ *  (user/setting/applications.go:37-45) with the render projections folded
+ *  into TokenListItem (the settings page's row shape, the SAME shared
+ *  template). `IsBot` bakes true — the panel renders only for bot targets —
+ *  and `ScopePublicOnly` bakes the "public-only" scope literal (the settings
+ *  render's value). */
+export interface AdminBotTokensPanel {
+  /** Upstream `.Link` = `ctx.Link + "/access_tokens"` (ViewUser,
+   *  users.go:356) — the generate form's action and the delete rows' POST
+   *  target base (`{link}/delete`, the data-url shape folded into the body
+   *  field — the settings reduction). */
+  link: string;
+  tokens: TokenListItem[];
+  /** GetAccessTokenCategories' SORTED order minus "admin" unless the OWNER
+   *  is a site admin (applications.go:66-68 keys on `owner.IsAdmin` — the
+   *  BOT row's flag, never the viewing admin's). */
+  scopeCategories: string[];
+  /** The minted plaintext, carried exactly once on the mint POST's
+   *  re-render (upstream NewTokenValue, applications.go:151). */
+  newToken: string | null;
+  /** The failed create's message + the kept submission ("" / null on the
+   *  plain GET) — the settings page's error-slot reduction. */
+  error: string | null;
+  formName: string;
+}
+
 /** The page's render inputs. */
 export interface AdminUserDetailData {
   user: typeof users.$inferSelect;
@@ -223,6 +351,11 @@ export interface AdminUserDetailData {
   repos: AdminUserDetailRepo[];
   reposTotal: number;
   orgs: OrgRecord[];
+  /** The bot access-tokens panel (view.tmpl:28-29's `{{if
+   *  .BotAccessTokens}}`): set ONLY for type=bot targets — ViewUser's
+   *  `u.IsTypeBot()` gate (users.go:355-359); a user/org row renders no
+   *  panel and takes no token read. */
+  botTokens: AdminBotTokensPanel | null;
   /** The shell's Integrations gate (the AdminUsersData convention — the
    *  route threads `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
   oauth2Enabled?: boolean;
@@ -234,9 +367,16 @@ export interface AdminUserDetailData {
  * entries (the synthesized-primary union), the owned repos (slug ASC,
  * no visibility filter — the admin view) with batched descriptions, the
  * org memberships (the landed listUserOrgs, the admin's unfiltered
- * ceiling, capped at MAX_PAGE_SIZE — the module header's reduction).
+ * ceiling, capped at MAX_PAGE_SIZE — the module header's reduction), and —
+ * for a BOT target only (users.go:355-359's `u.IsTypeBot()` gate) — the
+ * access-tokens panel. `now` is the panel's HasRecentActivity clock (the
+ * settings loader's fixed-clock parameter).
  */
-export async function loadAdminUserDetail(d1: D1Database, userId: number): Promise<Omit<AdminUserDetailData, "oauth2Enabled"> | null> {
+export async function loadAdminUserDetail(
+  d1: D1Database,
+  userId: number,
+  now: Date = new Date(),
+): Promise<Omit<AdminUserDetailData, "oauth2Enabled"> | null> {
   const db = drizzle(d1);
   const user = await db.select().from(users).where(eq(users.id, userId)).get();
   if (user === undefined) return null;
@@ -282,6 +422,11 @@ export async function loadAdminUserDetail(d1: D1Database, userId: number): Promi
   // the landed read at the admin's unfiltered ceiling.
   const orgs = await new OrgService(d1).listUserOrgs(user.id, { maxVisibility: "private", page: 1, pageSize: 50 });
 
+  // The bot access-tokens panel (users.go:355-359): ViewUser sets
+  // `.BotAccessTokens` ONLY when `u.IsTypeBot()` — every other row answers
+  // null (no panel, no token read).
+  const botTokens = user.type === "bot" ? await loadAdminBotTokensPanel(d1, user, now) : null;
+
   return {
     user,
     emails,
@@ -289,7 +434,225 @@ export async function loadAdminUserDetail(d1: D1Database, userId: number): Promi
     repos: repoRows.map((row) => ({ repo: row, description: descriptions.get(row.id) ?? "" })),
     reposTotal: repoRows.length,
     orgs: orgs.items,
+    botTokens,
   };
+}
+
+// ---------------------------------------------------------------------------
+// The bot access-tokens panel + its write pair (ViewUser's
+// NewAccessTokensPanel, users.go:355-359 → applications.go:47-71; the POST
+// arms web.go:822-823 → users.go:366-389 → applications.go:74-171)
+// ---------------------------------------------------------------------------
+
+/** The panel's link (upstream `ctx.Link + "/access_tokens"`, users.go:356). */
+export function adminBotTokensLink(userId: number): string {
+  return `${adminUserLink(userId)}/access_tokens`;
+}
+
+/** One token's render projections — the settings loader's exact map (the
+ *  SAME shared template rows, access_tokens.tmpl:19-63): DisplayPublicOnly,
+ *  Scope.StringSlice minus the public-only literal, and upstream's AfterLoad
+ *  pair HasUsed / HasRecentActivity (access_token.go:38-39 — the 7-day
+ *  window) over created/last_used_at. */
+function toTokenListItem(token: AuthToken, now: Date): TokenListItem {
+  return {
+    token,
+    publicOnly: ScopeSet.parseLenient(token.scopes).publicOnly,
+    scopes: scopeStringSlice(token.scopes).filter((scope) => scope !== "public-only"),
+    hasUsed: token.lastUsedAt !== null && token.lastUsedAt.getTime() > token.createdAt.getTime(),
+    hasRecentActivity: token.lastUsedAt !== null && token.lastUsedAt.getTime() + 7 * 24 * 60 * 60 * 1000 > now.getTime(),
+  };
+}
+
+/**
+ * NewAccessTokensPanel (applications.go:47-71) for a bot owner: EVERY token
+ * of the owner through the landed `TokenService.list` (upstream db.Find —
+ * no pagination; TOKENS_LIST_LIMIT is the settings page's render bound),
+ * the sorted scope categories minus "admin" unless the OWNER row is a site
+ * admin, and the link. The mint/error slots start empty — the POST handler
+ * overlays them (`withBotTokenMintOutcome`).
+ */
+export async function loadAdminBotTokensPanel(
+  d1: D1Database,
+  owner: Pick<AdminUserDetailData["user"], "id" | "isAdmin">,
+  now: Date = new Date(),
+): Promise<AdminBotTokensPanel> {
+  const page = await new TokenService(d1).list(owner.id, 1, TOKENS_LIST_LIMIT);
+  return {
+    link: adminBotTokensLink(owner.id),
+    tokens: page.tokens.map((token) => toTokenListItem(token, now)),
+    scopeCategories: tokenScopeCategories(owner.isAdmin),
+    newToken: null,
+    error: null,
+    formName: "",
+  };
+}
+
+/** The pair's shared target lookup — getTargetBot (users.go:366-377):
+ *  GetUserByID's miss is `unknown-target` (upstream ServerError — the pair
+ *  does its OWN lookup, never prepareUserInfo's list redirect) and a
+ *  non-bot row is `refused` (JSONError admin.users.bot_token_only — the arm
+ *  serves bots only; other accounts manage their own tokens). */
+async function loadTargetBot(d1: D1Database, userId: number): Promise<{ id: number } | "unknown-target" | "refused"> {
+  const row = await drizzle(d1).select({ id: users.id, type: users.type }).from(users).where(eq(users.id, userId)).get();
+  if (row === undefined) return "unknown-target";
+  if (row.type !== "bot") return "refused";
+  return { id: row.id };
+}
+
+/** The acting admin (upstream audit.Record's doer — `ctx.Doer`, the
+ *  signed-in admin the prologue resolved) plus the impersonation carry
+ *  (event.go:124's Impersonator pair, migration 0058 — the settings PAT
+ *  arms' thread). */
+export interface AdminBotTokenActor {
+  id: number;
+  username: string;
+  impersonatorUserId?: number | null;
+}
+
+/** The mint outcomes the handler maps (the module header's recipe step 5). */
+export type AdminBotTokenMintOutcome =
+  | { outcome: "created"; plaintext: string }
+  | { outcome: "invalid"; message: string; name: string }
+  | { outcome: "refused" }
+  | { outcome: "unknown-target" };
+
+/**
+ * POST /-/admin/users/{userid}/access_tokens — admin.NewBotTokenPost
+ * (users.go:379-383) over getTargetBot + user_setting.CreateAccessToken
+ * (applications.go:74-146), through the EXISTING token service (the
+ * account-aggregates API arm's `TokenService.mint` + `emitAccessTokenAudit`
+ * pair — never a second store path).
+ *
+ * The ladder, upstream's order: the target gate (unknown → refused), the
+ * NewAccessTokenForm binder arms (Required / MaxSize(255) — the settings
+ * twin's spellings), the `scope-*` join's Normalize (an unknown scope
+ * answers the InvalidScopeError message — upstream ServerErrors, unreachable
+ * from the rendered radios; the settings twin's posture), the
+ * HasPermissionScope gate (`settings.at_least_one_permission`), the
+ * duplicate-name arm (`settings.generate_token_name_duplicate`, the
+ * <strong> wrapper stripped), the mint FOR THE BOT (`UID: owner.ID`), then
+ * the UserAccessTokenAdd audit row — owner = the bot, actor = the calling
+ * admin (applications.go:133; the API twin's pinned shape). The plaintext
+ * rides the outcome exactly once.
+ */
+export async function adminUserMintBotToken(
+  d1: D1Database,
+  actor: AdminBotTokenActor,
+  targetUserId: number,
+  form: UserSettingsApplicationsForm,
+  now: Date = new Date(),
+): Promise<AdminBotTokenMintOutcome> {
+  const target = await loadTargetBot(d1, targetUserId);
+  if (target === "unknown-target") return { outcome: "unknown-target" };
+  if (target === "refused") return { outcome: "refused" };
+
+  const invalid = (message: string): AdminBotTokenMintOutcome => ({ outcome: "invalid", message, name: form.name });
+  if (form.name === "") return invalid("Name: Required");
+  let normalized: string;
+  try {
+    normalized = normalizeScope(form.scopesRaw);
+  } catch (error) {
+    if (error instanceof InvalidScopeError) return invalid(error.message);
+    throw error;
+  }
+  if (!ScopeSet.parse(normalized).hasPermissionScope()) {
+    return invalid(userSettingsApplicationsLocale.at_least_one_permission);
+  }
+  let minted: Awaited<ReturnType<TokenService["mint"]>>;
+  try {
+    minted = await new TokenService(d1).mint({ userId: target.id, name: form.name, scopes: normalized, now });
+  } catch (error) {
+    if (error instanceof TokenNameExistsError) {
+      return invalid(`${form.name} has been used as an application name already. Please use a new one.`);
+    }
+    if (error instanceof TokenNameTooLongError) return invalid("Name: MaxSize(255)");
+    throw error;
+  }
+  // audit.Record(ctx, audit_model.UserAccessTokenAdd, owner, "token", t.Name,
+  // "token_scope", t.Scope) (applications.go:133): the scope is the OWNER
+  // (the bot), the actor the DOER (the admin); the write rode a session — no
+  // actor credential.
+  await emitAccessTokenAudit(d1, {
+    userId: target.id,
+    tokenName: minted.name,
+    tokenScope: minted.scopes,
+    verb: "add",
+    origin: "ui",
+    actor: { id: actor.id, username: actor.username },
+    actorCredential: null,
+    impersonatorUserId: actor.impersonatorUserId ?? null,
+  });
+  return { outcome: "created", plaintext: minted.plaintext };
+}
+
+/** The revoke outcomes (the handler's map — `deleted` and `missing` both
+ *  303 back, upstream's JSONRedirect("") after either flash). */
+export type AdminBotTokenRevokeOutcome = "deleted" | "missing" | "refused" | "unknown-target";
+
+/**
+ * POST /-/admin/users/{userid}/access_tokens/delete — admin.DeleteBotToken
+ * (users.go:385-389) over getTargetBot + user_setting.DeleteAccessToken
+ * (applications.go:158-171), through the EXISTING `TokenService.revoke`:
+ * the target gate, then GetAccessTokenByID's owner-scoped load (the row's
+ * NAME feeds the audit pair; a miss is `missing` with NO audit — upstream's
+ * flash-error arm, a stale or foreign id: a token of ANOTHER account never
+ * deletes through a bot's panel, the `(id, owner.ID)` key), the delete, then
+ * the UserAccessTokenRemove audit row — owner = the bot, actor = the calling
+ * admin (applications.go:163).
+ */
+export async function adminUserRevokeBotToken(
+  d1: D1Database,
+  actor: AdminBotTokenActor,
+  targetUserId: number,
+  tokenId: number,
+): Promise<AdminBotTokenRevokeOutcome> {
+  const target = await loadTargetBot(d1, targetUserId);
+  if (target === "unknown-target" || target === "refused") return target;
+
+  const service = new TokenService(d1);
+  // GetAccessTokenByID(id, owner.ID) — the owner-scoped (id, uid) load (the
+  // row's NAME feeds the audit pair): a miss is `missing` with NO audit —
+  // upstream's flash-error arm, a stale or foreign id (a token of ANOTHER
+  // account never deletes through a bot's panel).
+  const row = await drizzle(d1)
+    .select({ id: personalAccessTokens.id, name: personalAccessTokens.name })
+    .from(personalAccessTokens)
+    .where(and(eq(personalAccessTokens.id, tokenId), eq(personalAccessTokens.userId, target.id)))
+    .get();
+  if (row === undefined) return "missing";
+  if (!(await service.revoke(target.id, tokenId))) return "missing";
+  await emitAccessTokenAudit(d1, {
+    userId: target.id,
+    tokenName: row.name,
+    verb: "remove",
+    origin: "ui",
+    actor: { id: actor.id, username: actor.username },
+    actorCredential: null,
+    impersonatorUserId: actor.impersonatorUserId ?? null,
+  });
+  return "deleted";
+}
+
+/**
+ * Overlay a mint outcome onto a FRESH load for the POST's re-render — the
+ * upstream shape: CreateAccessToken builds a NEW panel after the insert and
+ * sets NewTokenValue on it (applications.go:139-145), so the minted row is
+ * already in the list beside its one-time plaintext; an invalid outcome
+ * carries the negative line + the kept name. `null` = the target stopped
+ * being a renderable bot between the write and the reload (deleted or
+ * converted mid-flight) — the caller's LIST-redirect belt.
+ */
+export function withBotTokenMintOutcome(
+  data: AdminUserDetailData,
+  outcome: Extract<AdminBotTokenMintOutcome, { outcome: "created" | "invalid" }>,
+): AdminUserDetailData | null {
+  if (data.botTokens === null) return null;
+  const botTokens: AdminBotTokensPanel =
+    outcome.outcome === "created"
+      ? { ...data.botTokens, newToken: outcome.plaintext }
+      : { ...data.botTokens, error: outcome.message, formName: outcome.name };
+  return { ...data, botTokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +816,171 @@ function UserOrgsBlock(props: { userId: number; orgs: OrgRecord[] }) {
   );
 }
 
+/** The item-leading token glyph — upstream `{{svg "fontawesome-send" 32}}`;
+ *  fontawesome-send is outside the generated icon allowlist — octicon-mail
+ *  is the documented stand-in (the settings page's TOKEN_ICON seam, the
+ *  SAME shared template rows). */
+const BOT_TOKEN_ICON: IconName = "octicon-mail";
+
+/**
+ * The BotAccessTokens block — shared/user/access_tokens.tmpl at the pin
+ * with the bot arms LIVE, the settings page's row-for-row twin (the SAME
+ * shared template, its locale const rides along):
+ *
+ *   - the lead line is `admin.users.bot_token_desc` (:17's IsBot arm);
+ *   - the per-row Regenerate button renders NEVER (:51's `{{if not
+ *     $.IsBot}}`) and the regenerate modal with it (:115) — the delete
+ *     button is the row's only control (:57);
+ *   - the delete posts plain to `{link}/delete` with the hidden `id`
+ *     (the data-url's `?id=` query param folded into the body field); the
+ *     confirm dialog drops (the settings reduction);
+ *   - the generate form posts plain to the panel `link` (upstream's
+ *     form-fetch-action + data-fetch-sync panel swap reduces to this
+ *     full-document render); an invalid mint re-renders with the negative
+ *     line inside the form + the kept name;
+ *   - the minted plaintext renders once in `<code
+ *     id="new-access-token-value">` inside the positive message (:6-14) —
+ *     the copy button drops (the bundle's clipboard JS).
+ */
+function BotAccessTokensBlock(props: { panel: AdminBotTokensPanel }) {
+  const { panel } = props;
+  const L = userSettingsApplicationsLocale;
+  return (
+    <div id="access-token-panel">
+      <h4 class="ui top attached header">{L.manage_access_token}</h4>
+      <div class="ui attached segment">
+        {panel.newToken !== null ? (
+          <div class="ui positive message">
+            <div class="flex-text-block tw-justify-center">
+              <span>{L.generate_token_success}</span>
+              <code id="new-access-token-value">{panel.newToken}</code>
+            </div>
+          </div>
+        ) : null}
+        <div class="flex-divided-list items-with-main">
+          <div class="item">{adminUserDetailLocale.bot_token_desc}</div>
+          {panel.tokens.map((item) => (
+            <div class="item" key={item.token.id}>
+              <div class="item-leading">
+                <span
+                  class={item.hasRecentActivity ? "tw-text-green" : undefined}
+                  data-tooltip-content={item.hasRecentActivity ? L.token_state_desc : undefined}
+                >
+                  <Icon name={BOT_TOKEN_ICON} size={32} />
+                </span>
+              </div>
+              <div class="item-main">
+                <details>
+                  <summary>
+                    <span class="item-title">{item.token.name}</span>
+                  </summary>
+                  <p class="tw-my-1">
+                    {L.repo_and_org_access}
+                    {": "}
+                    {item.publicOnly ? L.permissions_public_only : L.permissions_access_all}
+                  </p>
+                  <p class="tw-my-1">{L.permissions_list}</p>
+                  <ul class="tw-my-1">
+                    {item.scopes.map((scope) => (
+                      <li key={scope}>{scope}</li>
+                    ))}
+                  </ul>
+                </details>
+                <div class="item-body">
+                  <i>
+                    {L.added_on} {formatTokenDate(item.token.createdAt)} — <Icon name="octicon-info" />
+                    {item.hasUsed && item.token.lastUsedAt !== null ? (
+                      <>
+                        {` ${L.last_used} `}
+                        <span class={item.hasRecentActivity ? "tw-text-green" : undefined}>
+                          {formatTokenDate(item.token.lastUsedAt)}
+                        </span>
+                      </>
+                    ) : (
+                      ` ${L.no_activity}`
+                    )}
+                  </i>
+                </div>
+              </div>
+              <div class="item-trailing">
+                <form method="post" action={`${panel.link}/delete`}>
+                  <input type="hidden" name="id" value={String(item.token.id)} />
+                  <button type="submit" class="ui red tiny button">
+                    <Icon name="octicon-trash" />
+                    {` ${L.delete_token}`}
+                  </button>
+                </form>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div class="ui bottom attached segment">
+        {/* access_tokens.tmpl:67 — open when no tokens exist. */}
+        <details open={panel.tokens.length === 0}>
+          <summary>
+            <h4 class="ui header tw-inline-block tw-my-2">{L.generate_new_token}</h4>
+          </summary>
+          <form class="ui form" action={panel.link} method="post">
+            {panel.error !== null ? <div class="ui negative message">{panel.error}</div> : null}
+            <div class="field">
+              <label for="name">{L.token_name}</label>
+              <input id="name" name="name" required maxlength={255} value={panel.formName} />
+            </div>
+            <div class="field">
+              <div class="tw-my-2">{L.repo_and_org_access}</div>
+              <label class="gt-checkbox">
+                <input type="radio" name="scope-public-only" value="public-only" /> {L.permissions_public_only}
+              </label>
+              <label class="gt-checkbox">
+                <input type="radio" name="scope-public-only" value="" checked /> {L.permissions_access_all}
+              </label>
+            </div>
+            <div>
+              <div class="tw-my-2">
+                {L.access_token_desc_lead}{" "}
+                <a href="/api/swagger" target="_blank">
+                  {L.access_token_desc_api}
+                </a>{" "}
+                {L.access_token_desc_middle}{" "}
+                <a href="https://docs.gitea.com/development/oauth2-provider#scopes" target="_blank">
+                  {L.access_token_desc_docs}
+                </a>{" "}
+                {L.access_token_desc_tail}
+              </div>
+              <table class="ui table unstackable tw-my-2">
+                {panel.scopeCategories.map((category) => (
+                  <tr key={category}>
+                    <td>{category}</td>
+                    <td>
+                      <label class="gt-checkbox">
+                        <input type="radio" name={`scope-${category}`} value="" checked /> {L.permission_no_access}
+                      </label>
+                    </td>
+                    <td>
+                      <label class="gt-checkbox">
+                        <input type="radio" name={`scope-${category}`} value={`read:${category}`} /> {L.permission_read}
+                      </label>
+                    </td>
+                    <td>
+                      <label class="gt-checkbox">
+                        <input type="radio" name={`scope-${category}`} value={`write:${category}`} /> {L.permission_write}
+                      </label>
+                    </td>
+                  </tr>
+                ))}
+              </table>
+            </div>
+            <button type="submit" class="ui primary button">
+              {L.generate_token}
+            </button>
+          </form>
+        </details>
+      </div>
+    </div>
+  );
+}
+
 /** The full-document render (the render.tsx pattern). */
 export function renderAdminUserDetailPage(ctx: UiContext, data: AdminUserDetailData): string {
   return renderPage(<AdminUserDetailPage ctx={ctx} data={data} />);
@@ -505,6 +1033,12 @@ export function AdminUserDetailPage(props: { ctx: UiContext; data: AdminUserDeta
           </div>
         </div>
       </div>
+
+      {/* THE BOT ACCESS-TOKENS PANEL (view.tmpl:28-29's `{{if
+          .BotAccessTokens}}` — rendered ONLY for type=bot targets, the
+          loader's users.go:355-359 gate; the write pair is the mounted
+          access_tokens POST family, the module header's recipe step 5). */}
+      {data.botTokens !== null ? <BotAccessTokensBlock panel={data.botTokens} /> : null}
 
       {/* THE AVATAR FORMS (the mission's fold — the write seams' redirect
           target; upstream hosts the form on the unlanded edit page,
