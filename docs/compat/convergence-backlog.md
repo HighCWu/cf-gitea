@@ -1,60 +1,121 @@
-# The convergence backlog (v1.5.8 freeze, 2026-11-04)
+# The convergence backlog (v1.5.9 freeze, 2026-11-14 — current through 8fd4010)
 
-The user-ordered convergence line: census modules complete + S/M drain, the
-L-class feature lanes archived here (not compatibility gaps), the pool to
-zero after the freeze. This document is the authoritative hand-back list —
-everything below is DESIGNED and RECORDED, nothing is lost, and each item
-names its resume point.
+Supersedes the v1.5.8 freeze issue (2026-11-04). The v1.5.8 open list
+drained to the three feature lanes in the 2026-11-13/14 wave (28 board
+rows landed — B-79 the last, 8fd4010; the census closed at 17/17); this
+document is the re-issued authoritative hand-back — everything below is
+DESIGNED and RECORDED, nothing is lost, and each item names its resume
+point.
 
-## 1. The census's honest final state (13/17 modules COMPLETE)
+## 1. The census's final state (17/17 COMPLETE — the census is closed)
 
-Modules 2 (auth), 4 (repos), 5 (users), 6? — see §2's table for the exact
-COMPLETE set (auth, repos, users, git-http, issues, PRs, releases+tags,
-actions, packages, webhooks, notifications+mail, admin = 13).
+All 16 mandate modules ran their pass: modules 1+5 (CENSUS-M15), 16+17
+(CENSUS-M16, with the honest-arithmetic correction), and module 3 — the
+auth password matrix, §20 — closed the census (CENSUS-M3FINAL: 16 graded
+rows + 1 docs-defect, PW17 fixed in-wave by ADMIN88). The board stands at
+**B-11..B-88** (78 rows) with 28 rows landed in this wave alone
+(B-53, B-58, B-59, B-61, B-65, B-66, B-67, B-68, B-69, B-70, B-71, B-72,
+B-73, B-74, B-75, B-76, B-77, B-78, B-79, B-80, B-81, B-82, B-83, B-84,
+B-85, B-86, B-87, B-88). §21's table is now the census's output
+contract: the open rows below ARE the compatibility backlog.
 
-**Not-yet-censused (4)**: module 1 (install), module 3 (the auth password
-matrix — its §2 row carries a stale in-flight owner marker), module 5's
-orgs+teams half (module 5 in the mandate numbering), modules 16-17
-(federation, API-v1). CENSUS-M3's orientation notes are in
-/tmp/CENSUS-M3-progress.md (assignment resolution: 1 + orgs/teams next).
+**Census docs-debt CLOSED (CENSUSDOC 133ed08, docs-only)**: B-58's three
+stale spots fixed (§2's module-12 header, §12's PK8 row, §21's B-58
+board row — stamped LANDED with the full derivation and the pin tallies
+xz 16/16 + debian 23 + conan 23); B-37 stamped done-by-fold (module 3's
+PW6). §21 gained the graduation-protocol paragraph: the release record
+IS the closure evidence for the stamp-less rows, whose honest pre-edit
+count is **31** (B-11..B-45 stragglers — the earlier '~16' estimate
+undercounted; v1.5.7's note asserts "B-11..B-45 landed"; per-row stamps
+deliberately NOT fabricated — the protocol graduates rows via graded
+module rows). Three same-class module-header riders rode the same
+commit: module-14's "B-65/B-66 re-open" and module-15's "B-67..B-72
+re-open" and module-16's re-open clause all flipped LANDED (B-79 was
+module-16's one open row at CENSUSDOC time — since landed, 8fd4010; its
+census row flip rides UPDAUDIT's commit window, per that commit's
+disclosure).
 
-## 2. The B-board's open rows at freeze (from B-11..B-72)
+## 2. The open rows (the whole remaining board)
 
-**Landed this convergence**: B-48, B-49 (+ the PR-create assignees
-beyond-brief arm), B-50, B-51, B-54, B-55, B-56, B-57, B-62, B-63, B-64,
-B-65 (receiver half), B-70 (page half) — plus v1.5.7's B-24/29/34.
+- **B-52** (agit push-to-propose — L, feature lane, **IN FLIGHT as
+  B52R2**): the rebuild unit rides the freeze window — the agit service
+  sits uncommitted in the tree (`apps/worker/src/api/services/agit.ts`)
+  and the wave's mid-run tsc bursts attributed to its in-flight files
+  (ff42b41/a86d769/bf6bdaa; 8462ae7's re-run came back clean). It also
+  carries B-53's push-side file-pattern family in its gate.ts window
+  (see §3). Resume point: the census row §21/B-52 (our gate already
+  removed the narrower agit-adjacent decline, `gate.ts:309-322`; the
+  flow itself is the port: `refs/for/<branch>` + push options ->
+  server-side PR, `services/pull/pull.go:586`'s UpdateRefForAgit,
+  hook_proc_receive.go:18-25).
+- **B-46** (xref writers — L, feature lane, **IN FLIGHT at refresh**):
+  the B46 unit is dispatched on the writer arm. The timeline READER is
+  fully built and pinned (`api/issues.test.ts:4233`); the writers are a
+  pure D1+regex subsystem (content scanned with the reference regex
+  set, xref comment rows type-3/6 written ON the referenced issue; edits
+  neuter). Resume point: §7.4 row I20 (`references.go:35-41`, `:66-76`).
+- **B-47** (push-integrated issue closes — L, rides B-46): every branch
+  push walks commit messages, writes `commit_ref` comments and
+  closes/reopens per the keyword table (`services/issue/commit.go:126+`,
+  `findActionKeywords`, the `CloseIssuesViaCommitInAnyBranch` gate); our
+  push tail (`git-http/gate.ts:344-375`) has no issue arm. Resume point:
+  §7.4 row I21 — rides B-46's scanner + the push tail window.
 
-**Parked mid-build (designs complete, resume points named)**:
-- **B-58** (codec/digest tails) — the ENCODER (Packages.xz store-then-serve)
-  + md5 were green; the LZMA2 DECODER half was mid-build at the stop. Files
-  preserved verbatim in /tmp/pkgtails-parked/ (xz.ts, xz-encode.ts, md5.ts,
-  xz.test.ts — the decoder's 9 pins included); debian.ts/conan.ts rolled
-  back (their edits depended on the parked helpers).
-- **B-65's remainder** — the repository-source thread's API leg (complete
-  design in /tmp/MAILNOTIF2-progress.md step 4: read-time derivation over
-  repo_transfer, user_settings_kv state, negative-id threads, the zod enum
-  widening, two-leg top-K merge) + the per-arm receiver test file + the
-  THREE emit-site wirings (releases.ts publish arms / repo.ts transfer
-  route / update.ts refreshRunStatus tail — one line each, named in the
-  receivers' doc comments).
-- **B-70 — CLOSED 2026-11-13**: the mounts had already landed (they rode
-  the f8fe5ac fold; c13b23c/90b1526's "parked/NOT flipped" messages lagged
-  their trees); the resume unit verified every region (import/family/parse/
-  handlers/registrations), the battery pins the full surface, and the AD11
-  cell carries the ANSWERED stamp. Nothing remains.
-- **B-59 — CLOSED 2026-11-13**: the seam landed (teamPackagesUnitMode +
-  the blanket-write guard over teams.units_map, 6 pins green); the
-  "columns migration" framing was a misnomer — the column already existed.
+(Closed since the freeze prep's draft: **B-79** — POST /markup's
+FilePath file mode now dispatches by extension, the RULE-4
+silent-ignore closed (8fd4010): markdown-family extensions
+(.md/.markdown/.mdown/.mkd/.livemd) render under the landed file
+policy; unknown extensions answer the derived 422 "unable to find a
+render"; Wiki:true still overrides Mode.)
 
-**Open, not started**: B-52 (agit refs/for/* — L, feature lane), B-53
-(block_on_codeowner_reviews + protected-file merge gates — L, feature
-lane), B-66 (SMTP transport arm — the connect()-era premise recheck), B-67
-(admin-packages web write tails), B-68 (dashboard maintenance-ops), B-69
-(SendTestMail), B-71 (admin user↔org removal arms), B-72 (bot users axis —
-L, feature lane), B-61 (provider webhook request formats + the matrix type
-— M, the one WIRE-VISIBLE divergence left on the board).
+Nothing else is open. Parked list: EMPTY — the v1.5.8 parks all landed
+(B-58 PKGTAILS2, B-65 EMIT65) or closed by verification (B-70 MOUNT70);
+B-66's connect()-premise park was resolved by B-66R's landing (the
+SPEC's no-outbound-TCP premise corrected in specs/email-outbound.md
+§1.1).
 
-## 3. The standing cruft list (small, recorded, non-blocking)
+## 3. The hand-off queue (the wave's recorded remainders, each with its owner)
+
+- **B-75's residue (b)** (ff42b41): CLOSED by B75B (8462ae7) — both
+  unpinned bulk-sweep behaviors pinned in the admin-org-extras battery:
+  the per-repo deleted-webhook emission (one repository delivery per
+  swept repo at the ORG hook; the deleted repo's own hook silent) and
+  the partial-failure continue (still 202, the doomed row survives, one
+  notice-analog line, success-only audit semantics).
+- **SPEC-THREAD's route-glue handoffs** (27fb508): CLOSED by GLUE
+  (e4212fe) — every env->reader half now threads at the route layer
+  (middleware.ts's basicPasswordArm; the git-HTTPS chain's SHARED
+  EnableBasicAuth knob — OFF ends the chain UNSIGNED, the request
+  proceeds anonymous; session.ts's POST /login; ui/index.ts's
+  changeOwnPassword/applyPasswordReset/adminUserEditSubmit;
+  first-run.ts's install caller, no policy option). The route-level
+  PINS for those threads are GLUE2's dispatch — in flight.
+- **B-53's precise remainders** (e722325, recorded on the row):
+  (2)+(3)+(5) CLOSED by B53R2 (daa5133) — the PR-create auto codeowner
+  review-request arm ported arm-for-arm (pull.go:253-310; the CODEOWNERS
+  special-doer comments, the review_request webhook before opened), the
+  ui merge-box blocker items render, and the settings page renders +
+  round-trips the protected/unprotected-file patterns and the
+  block_on_codeowner_reviews toggle (an edit POST omitting rendered
+  fields CLEARS them). Remaining: (1) the push-side file-pattern family
+  (hook_pre_receive.go:210-260) — rides B52R2's gate.ts window; (4) the
+  `\p{...}` character-classes-without-u-flag dead-rule note — covered
+  by B52R2's task-4 check.
+- **B-72's remainder after HOFF-C** (bf6bdaa — the five handoffs LANDED:
+  the API edit conversion, the web twin, the live impersonate guard, the
+  notification recipient gate, the admin list filters): two opens — the
+  bot-token tails (a bot's only upstream auth path — feature lane) and
+  the wider UpdateUser column-audit family HOFF-C routed as a census
+  row (user:active/admin/restricted/visibility emits unemitted
+  tree-wide, pre-existing): UPDAUDIT is opening it as row **B-89** (in
+  flight). The notification refusal's 403-vs-404 delta stays the
+  established recorded model (in-test note only).
+- **B-84's routed observation** (699e765): register_notify's title
+  re-escape/DotEscape family — SMALLS4 in flight on it.
+- **B-77's routed note** (df9e82c): the inviteEmailValid twin could
+  unify with misc-t3's port — SMALLS4 in flight on it.
+
+## 4. The standing cruft list (small, recorded, non-blocking)
 
 - The audit doc's residual cite-convention debt (38 notes, M10-era).
 - The golden files WHWAVE2 flagged for their owning units
@@ -64,15 +125,22 @@ L, feature lane), B-61 (provider webhook request formats + the matrix type
   UI-explore requester at api/services/search.ts:108).
 - The probe battery's blip-era fixture rows (the next cleanup-audit run
   sweeps them).
-- The production PBKDF2-iteration-cap probe (PWD-3's ready-made harness
-  arm, un-run — the 50k default is documented-safe by the platform cap).
 
-## 4. The L-class feature lanes (explicitly NOT convergence blockers)
+(CLOSED since the v1.5.8 issue: the production PBKDF2-iteration-cap
+probe — B-85 landed the parse-time 100k cap guard with the
+real-Go-digest fixture row as its pin; the probe harness arm is moot.
+And §1's census docs-debt — CENSUSDOC 133ed08 landed the B-58 flips,
+the B-37 stamp, and the graduation protocol.)
 
-B-52 agit push-to-propose; B-53 codeowner/protected-file merge gates;
-B-72 the UserTypeBot axis. Each is a feature-sized port with a pin
-derivation already on its census row — scheduled work, not compatibility
-defects.
+## 5. The L-class feature lanes (explicitly NOT convergence blockers)
+
+B-52 agit push-to-propose (in flight as B52R2); B-46 the xref writers
+(in flight — the B46 unit); B-47 rides B-46's scanner + the push tail
+window. Each is a feature-sized port with a pin derivation on its
+census row — scheduled work, not compatibility defects. (B-53's
+codeowner gates and B-72's UserTypeBot axis LANDED this wave; B-53's
+remaining tails are only the §3 items — the push-side family riding
+B52R2's window and the \p{...} task-4 check.)
 
 **The standing rule after this freeze**: the 04:05 routine keeps the
 lights on (drift checks, the cleanup-audit); units dispatch only on
