@@ -35,7 +35,7 @@ import { comments, issues, repoCollaborators, repositories, userBlocking, users 
 import { CommentType, RefAction } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { createApiRouter } from "../router";
-import { changeIssueBody } from "./issues";
+import { changeIssueBody, deleteComment, updateCommentBody } from "./issues";
 import {
   convertFullHtmlReferencesToShortRefs,
   findAllIssueReferences,
@@ -1017,5 +1017,269 @@ describe("the reader arms — ref_issue / ref_comment enrichment + the xref filt
     await db().insert(comments).values({ ...refRow, refCommentId: 424242 });
     const after = await timeline(`/repos/alice/visible/issues/${target.index}/timeline`);
     expect(after.filter((r) => r.type === "comment_ref")).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The COMMENT arms (models/issues/comment.go:920 create / :1204 edit /
+// :1234 delete-neuter) — the landed writer parameterized by the comment
+// origin (`Comment.AddCrossReferences`, issue_xref.go:228-246). The reader
+// pins above already proved ref_comment enrichment renders these rows.
+// ---------------------------------------------------------------------------
+
+describe("the comment create arm — CreateComment's tail (comment.go:920)", () => {
+  it("writes one comment_ref (5) row ON the referenced issue carrying ref_comment_id", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    const comment = await service().addComment({
+      issueId: origin.id,
+      posterId: alice.id,
+      content: `See #${target.index} for context`,
+      now: T0,
+    });
+
+    const rows = await xrefRowsFor(target.id, origin.id);
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row?.type).toBe(CommentType.CommentRef);
+    expect(row?.refCommentId).toBe(comment.id);
+    expect(row?.refRepoId).toBe(repoId);
+    expect(row?.refIssueId).toBe(origin.id);
+    expect(row?.refAction).toBe(RefAction.None);
+    expect(row?.refIsPull).toBe(false);
+    expect(row?.posterId).toBe(alice.id);
+    // The referenced issue's counters move with the row (the repo convention).
+    expect((await issueRow(target.id)).numComments).toBe(1);
+  });
+
+  it("scans PER COMMENT: two referencing comments each write their own row", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    const first = await service().addComment({ issueId: origin.id, posterId: alice.id, content: `see #${target.index}`, now: T0 });
+    const second = await service().addComment({ issueId: origin.id, posterId: alice.id, content: `also #${target.index}`, now: T0 });
+
+    const rows = await xrefRowsFor(target.id, origin.id);
+    expect(rows.map((r) => r.refCommentId)).toEqual([first.id, second.id]);
+    expect(rows.every((r) => r.type === CommentType.CommentRef)).toBe(true);
+  });
+
+  it("demotes a close keyword from a plain-issue comment to none (:205-207)", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin", { posterId: alice.id });
+    await service().addComment({ issueId: origin.id, posterId: alice.id, content: `fixes #${target.index}`, now: T0 });
+
+    // Close actions only FROM pull requests — an issue comment carries none.
+    expect((await xrefRowsFor(target.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
+  });
+
+  it("keeps a close keyword from a PR comment — the PR twins share the arm", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target", { posterId: alice.id });
+    const pr = await seedPull(repoId, "the pull", alice.id);
+    await service().addComment({ issueId: pr.id, posterId: alice.id, content: `fixes #${target.index}`, now: T0 });
+
+    const rows = await xrefRowsFor(target.id, pr.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.type).toBe(CommentType.CommentRef);
+    expect(rows[0]?.refAction).toBe(RefAction.Closes);
+    // ref_is_pull carries the COMMENTED issue's posture (a PR).
+    expect(rows[0]?.refIsPull).toBe(true);
+    expect(rows[0]?.refCommentId).not.toBeNull();
+  });
+
+  it("demotes a same-repo close from a non-writer non-poster comment doer (no merger exception for comments, :225-232)", async () => {
+    const alice = await seedUser("alice");
+    const bob = await seedUser("bob");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    // The issue-BODY arm keeps this same shape (the merger exception, the
+    // PR-create pin above); a COMMENT origin (OrigComment != nil) must hold
+    // the write or the target's poster — bob has neither.
+    await service().addComment({ issueId: origin.id, posterId: bob.id, content: `fixes #${target.index}`, now: T0 });
+
+    expect((await xrefRowsFor(target.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
+  });
+
+  it("gates non-content-support types out (system comments scan nothing)", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    await service().addComment({ issueId: origin.id, posterId: alice.id, content: `#${target.index}`, type: CommentType.Label, now: T0 });
+    await service().addComment({ issueId: origin.id, posterId: alice.id, content: `#${target.index}`, type: CommentType.PullRequestPush, now: T0 });
+
+    // HasContentSupport (comment.go:180-186) — types 0/21/22/32 only; the
+    // type-4 commit-ref rows of the B-47 push walk gate out the same way
+    // (the derived no-op recorded in the census).
+    expect(await xrefRowsFor(target.id, origin.id)).toHaveLength(0);
+    expect(await xrefRowsFrom(origin.id)).toHaveLength(0);
+  });
+
+  it("writes nothing for content without references", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const origin = await seedIssue(repoId, "origin");
+    await service().addComment({ issueId: origin.id, posterId: alice.id, content: "no refs here", now: T0 });
+    expect(await xrefRowsFrom(origin.id)).toHaveLength(0);
+  });
+
+  it("POST comments resolves AppURL-prefixed full URLs via the request origin", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+
+    const res = await router()(`/repos/alice/visible/issues/${origin.index}/comments`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: `This is https://example.com/alice/visible/issues/${target.index}, foo` }),
+    });
+    expect(res.status).toBe(201);
+    const created = await res.json<{ id: number }>();
+    const rows = await xrefRowsFor(target.id, origin.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.type).toBe(CommentType.CommentRef);
+    expect(rows[0]?.refCommentId).toBe(created.id);
+    expect(rows[0]?.posterId).toBe(1);
+  });
+});
+
+describe("the comment edit arm — UpdateComment's tail (comment.go:1204)", () => {
+  it("neuters removed references, keeps surviving pairs, writes fresh ones (removeOld=true)", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const t1 = await seedIssue(repoId, "t1");
+    const t2 = await seedIssue(repoId, "t2");
+    const origin = await seedIssue(repoId, "origin");
+    const comment = await service().addComment({
+      issueId: origin.id,
+      posterId: alice.id,
+      content: `see #${t1.index}`,
+      now: T0,
+    });
+
+    // Edit keeps the surviving reference and adds the fresh one — the
+    // keep-fold consumes the (target, action) pair, no duplicate lands.
+    await updateCommentBody(env.DB, comment.id, `see #${t1.index} and #${t2.index}`, T1, alice.id);
+    const afterKeep = await xrefRowsFor(t1.id, origin.id);
+    expect(afterKeep).toHaveLength(1);
+    expect(afterKeep[0]?.refCommentId).toBe(comment.id);
+    expect(afterKeep[0]?.createdAt?.getTime()).toBe(T0.getTime()); // the KEPT row is untouched
+    expect((await xrefRowsFor(t2.id, origin.id)).map((r) => r.refCommentId)).toEqual([comment.id]);
+
+    // Edit removing everything neuters the comment's rows — keyed on the
+    // (origin issue, origin comment) pair.
+    await updateCommentBody(env.DB, comment.id, "no more refs", T1, alice.id);
+    expect((await xrefRowsFor(t1.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.Neutered]);
+    expect((await xrefRowsFor(t2.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.Neutered]);
+  });
+
+  it("re-pairs an action change on a PR comment: the closes row neuters, a none row lands", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target", { posterId: alice.id });
+    const pr = await seedPull(repoId, "the pull", alice.id);
+    const comment = await service().addComment({ issueId: pr.id, posterId: alice.id, content: `fixes #${target.index}`, now: T0 });
+    expect((await xrefRowsFor(target.id, pr.id)).map((r) => r.refAction)).toEqual([RefAction.Closes]);
+
+    await updateCommentBody(env.DB, comment.id, `mentions #${target.index}`, T1, alice.id);
+    const rows = await xrefRowsFor(target.id, pr.id);
+    expect(rows.map((r) => r.refAction)).toEqual([RefAction.Neutered, RefAction.None]);
+    expect(rows[1]?.refCommentId).toBe(comment.id);
+  });
+
+  it("a non-content-support type skips the scan (the gate lives inside the arm)", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    // A type-4 commit_ref row is not content-supporting (comment.go:180-186)
+    // — upstream's UpdateComment would scan nothing for it either.
+    const inserted = await db()
+      .insert(comments)
+      .values({
+        type: CommentType.CommitRef,
+        posterId: alice.id,
+        issueId: origin.id,
+        content: `#${target.index}`,
+        commitSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        createdAt: T0,
+        updatedAt: T0,
+      })
+      .returning()
+      .all();
+    const refRow = inserted[0];
+    expect(refRow).toBeDefined();
+    await updateCommentBody(env.DB, refRow!.id, `#${target.index} edited`, T1, alice.id);
+    expect(await xrefRowsFor(target.id, origin.id)).toHaveLength(0);
+  });
+
+  it("PATCH comments rescans through the request origin, with removeOld", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const t1 = await seedIssue(repoId, "t1");
+    const t2 = await seedIssue(repoId, "t2");
+    const origin = await seedIssue(repoId, "origin", { posterId: 1 }); // the stub may edit
+    const comment = await service().addComment({
+      issueId: origin.id,
+      posterId: 1,
+      content: `This is https://example.com/alice/visible/issues/${t1.index}, foo`,
+      appUrl: "https://example.com", // the route's origin — full URLs scan only with it
+      now: T0,
+    });
+    expect((await xrefRowsFor(t1.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
+
+    const res = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: `now #${t2.index}` }),
+    });
+    expect(res.status).toBe(200);
+    // The URL reference neuters, the fresh short ref lands.
+    expect((await xrefRowsFor(t1.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.Neutered]);
+    expect((await xrefRowsFor(t2.id, origin.id)).map((r) => r.refAction)).toEqual([RefAction.None]);
+  });
+});
+
+describe("the comment delete arm — DeleteComment's neuter (comment.go:1234)", () => {
+  it("neuters the comment's active ref rows (the cascade runs by ref coordinates)", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    const comment = await service().addComment({ issueId: origin.id, posterId: alice.id, content: `see #${target.index}`, now: T0 });
+    expect(await xrefRowsFor(target.id, origin.id)).toHaveLength(1);
+
+    const removed = await deleteComment(env.DB, comment, T1);
+    expect(removed).toBe(true);
+    // The rows sit ON the referenced issue and survive the origin comment's
+    // hard delete — only ref_action moves (issue_xref.go:43-53).
+    const rows = await xrefRowsFor(target.id, origin.id);
+    expect(rows.map((r) => r.refAction)).toEqual([RefAction.Neutered]);
+    expect(rows[0]?.refCommentId).toBe(comment.id);
+    expect(rows[0]?.type).toBe(CommentType.CommentRef);
+  });
+
+  it("a sibling comment's rows survive; already-neutered rows stay neutered", async () => {
+    const alice = await seedUser("alice");
+    const repoId = await seedRepo("alice", "visible", { ownerId: alice.id });
+    const target = await seedIssue(repoId, "target");
+    const origin = await seedIssue(repoId, "origin");
+    const first = await service().addComment({ issueId: origin.id, posterId: alice.id, content: `see #${target.index}`, now: T0 });
+    const second = await service().addComment({ issueId: origin.id, posterId: alice.id, content: `also #${target.index}`, now: T0 });
+
+    await deleteComment(env.DB, first, T1);
+    const rows = await xrefRowsFor(target.id, origin.id);
+    const byComment = new Map(rows.map((r) => [r.refCommentId, r.refAction]));
+    expect(byComment.get(first.id)).toBe(RefAction.Neutered);
+    expect(byComment.get(second.id)).toBe(RefAction.None);
   });
 });

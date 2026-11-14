@@ -38,7 +38,7 @@ import {
   PRFlow,
   PRStatus,
 } from "../db/schema";
-import { CommentType, type CommentTypeValue } from "./comment-types";
+import { commentHasContentSupport, CommentType, type CommentTypeValue } from "./comment-types";
 import {
   IssueAlreadyChangedError,
   IssueError,
@@ -64,7 +64,7 @@ import {
 import { newIssueUserSeedRows, updateIssueMentions } from "../services/mentions/carrier";
 import { getRepoAssignees } from "../services/mentions/repo-assignees";
 import { findIssueMentions } from "../services/mentions/service";
-import { syncIssueCrossReferences } from "../api/services/xref";
+import { syncCommentCrossReferences, syncIssueCrossReferences } from "../api/services/xref";
 
 export type IssueRow = typeof issues.$inferSelect;
 export type CommentRow = typeof comments.$inferSelect;
@@ -210,6 +210,14 @@ export interface AddCommentInput {
   content: string;
   /** Defaults to a plain user comment (type 0). */
   type?: CommentTypeValue;
+  /**
+   * The instance AppURL for the content's xref scan (CreateComment's
+   * AddCrossReferences tail, comment.go:920 — content-supporting types
+   * only). Request-sourced callers thread the origin; callers without one
+   * ride "" — upstream's nil-pattern arm (short refs scan, AppURL-prefixed
+   * full URLs don't).
+   */
+  appUrl?: string;
   now?: Date;
 }
 
@@ -908,6 +916,25 @@ export class IssuesService {
     ] as const);
     const rows = batchRows<CommentRow>(results[0], "comment insert");
     if (rows[0] === undefined) throw new Error("comment batch committed without returning rows");
+    // CreateComment's xref tail (models/issues/comment.go:920 —
+    // comment.AddCrossReferences(doer, removeOld=false)): every
+    // content-supporting type (comment.go:180-186) scans its content and
+    // writes type-5 CommentRef rows ON the referenced issues; system types
+    // (close/label/push/…) gate out inside the arm upstream and here. Runs
+    // BEFORE the notify (upstream's CreateComment tx completes inside
+    // CreateIssueComment before its mention/notify tail, comments.go:76-92).
+    // Errors propagate — upstream fails the surrounding write the same way.
+    if (commentHasContentSupport(rows[0].type)) {
+      await syncCommentCrossReferences(this.d1, {
+        issue: { id: issue.id, repoId: issue.repoId, isPull: issue.isPull },
+        commentId: rows[0].id,
+        content: rows[0].content ?? "",
+        doerId: input.posterId ?? null,
+        removeOld: false,
+        appUrl: input.appUrl ?? "",
+        now,
+      });
+    }
     await this.notifyCommentCreated(issue, rows[0], input, now);
     return rows[0];
   }

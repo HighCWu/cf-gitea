@@ -601,7 +601,14 @@ export function registerIssueT2Routes(
     const form = c.req.valid("json");
     if (form.body !== (row.comment.content ?? "")) {
       const oldContent = row.comment.content ?? "";
-      await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date(), doer?.id ?? null);
+      await updateCommentBody(
+        c.env.DB,
+        row.comment.id,
+        form.body,
+        new Date(),
+        doer?.id ?? null,
+        new URL(c.req.url).origin, // the xref scan's AppURL (B-46's comment arm, comment.go:1204)
+      );
       row.comment = { ...row.comment, content: form.body };
       // Webhook: comment edited (UpdateComment:420-461's emission, the
       // global pair's exact shape — `issue.IsPull` discriminant,

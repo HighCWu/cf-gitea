@@ -1486,7 +1486,14 @@ export function registerIssueRoutes(
       // pre-edit content into the notifier (UpdateComment:420-461's
       // `changes.body.from`).
       const oldContent = row.comment.content ?? "";
-      await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date(), editor.id ?? null); // actorId: the revision attributes its editor
+      await updateCommentBody(
+        c.env.DB,
+        row.comment.id,
+        form.body,
+        new Date(),
+        editor.id ?? null, // actorId: the revision attributes its editor; the xref tail's doer (comment.go:1204)
+        new URL(c.req.url).origin, // the xref scan's AppURL (B-46's comment arm, comment.go:1204)
+      );
       row.comment = { ...row.comment, content: form.body };
       // Webhook: comment edited — the `issue.IsPull` discriminant picks
       // issue_comment / pull_request_comment.
@@ -1902,7 +1909,15 @@ export function registerIssueRoutes(
         issue.posterId,
         found.repo.ownerId,
       );
-      const comment = await service.addComment({ issueId: issue.id, posterId: requester.id, content: form.body });
+      const comment = await service.addComment({
+        issueId: issue.id,
+        posterId: requester.id,
+        content: form.body,
+        // CreateComment's xref tail (comment.go:920) — the request origin
+        // threads the AppURL (B-46's convention; the markdown-entry scan's
+        // same-host link arm reads it).
+        appUrl: new URL(c.req.url).origin,
+      });
       const rendered = await toApiComment(c.env.DB, viewer, found, issue, comment);
       // Webhook: created (issue_comment; PR comments map to
       // pull_request_comment with the same payload shape, §2.7).

@@ -27,7 +27,7 @@ import {
   trackedTimes,
   users,
 } from "../../db/schema";
-import { CommentType } from "../../issues/comment-types";
+import { commentHasContentSupport, CommentType, RefAction } from "../../issues/comment-types";
 import { IssueError } from "../../issues/errors";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
@@ -46,7 +46,7 @@ import { findCollaborator } from "./repo-collaborators";
 import { pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
-import { syncIssueCrossReferences } from "./xref";
+import { syncCommentCrossReferences, syncIssueCrossReferences } from "./xref";
 import {
   addIssueToColumn,
   cardTypeToString,
@@ -1939,10 +1939,10 @@ export async function findRepoCommentById(d1: D1Database, repoId: string, commen
 }
 
 /** `comment.Type.HasContentSupport()` (models/issues/comment.go:180). The
- *  raw column is a plain integer; the membership check needs no narrowing. */
-export function commentHasContentSupport(type: number): boolean {
-  return type === CommentType.Comment || type === CommentType.Code || type === CommentType.Review || type === CommentType.DismissReview;
-}
+ *  raw column is a plain integer; the membership check needs no narrowing.
+ *  The definition lives on the leaf comment-types module (issues/service.ts
+ *  needs it for CreateComment's xref arm without an import cycle). */
+export { commentHasContentSupport } from "../../issues/comment-types";
 
 // ---------------------------------------------------------------------------
 // Issue content history write paths (specs/issue-content-history.md —
@@ -2053,8 +2053,13 @@ export async function softDeleteIssueContentHistory(d1: D1Database, historyId: n
 
 /** PATCH comment: body + content_version bump + updated stamp, riding the
  *  content-history write hook (specs/issue-content-history.md §3 — upstream
- *  services/issue/comments.go UpdateComment). */
-export async function updateCommentBody(d1: D1Database, commentId: number, body: string, now: Date, actorId?: number | null): Promise<CommentRow | null> {
+ *  services/issue/comments.go UpdateComment), then UpdateComment's xref tail
+ *  (models/issues/comment.go:1204 — AddCrossReferences(doer, removeOld=true):
+ *  the neuter+rewrite over the NEW content; `appUrl` threads the instance
+ *  AppURL, "" = the nil-pattern arm). The doer is the EDITOR (upstream hands
+ *  UpdateComment's doer through). Null when the row is already gone — no
+ *  scan rides a missed update. */
+export async function updateCommentBody(d1: D1Database, commentId: number, body: string, now: Date, actorId?: number | null, appUrl = ""): Promise<CommentRow | null> {
   // The gate reads the PRIOR row (old content, poster, created stamp, type)
   // — upstream's c.Content != oldContent && c.Type.HasContentSupport()
   // (comments.go:112).
@@ -2073,6 +2078,7 @@ export async function updateCommentBody(d1: D1Database, commentId: number, body:
     .returning();
   const newRevision = { posterId: actorId ?? prior.posterId, editedAt: now, contentText: body };
 
+  let updated: CommentRow | null;
   if (backfill !== null) {
     // The lazy first-revision back-fill rides the same batch as the update
     // (upstream's tx; a failed update rolls the snapshot back with it).
@@ -2082,26 +2088,56 @@ export async function updateCommentBody(d1: D1Database, commentId: number, body:
       insertIssueContentHistory(d1, prior.issueId, commentId, { ...newRevision, isFirstCreated: false }),
     ] as const);
     await keepLimitedIssueContentHistory(d1, prior.issueId, commentId);
-    return results[1][0] ?? null;
-  }
-  if (!needsHistory) {
+    updated = results[1][0] ?? null;
+  } else if (!needsHistory) {
     const rows = await updateStatement;
-    return rows[0] ?? null;
+    updated = rows[0] ?? null;
+  } else {
+    const results = await drizzle(d1).batch([
+      updateStatement,
+      insertIssueContentHistory(d1, prior.issueId, commentId, { ...newRevision, isFirstCreated: false }),
+    ] as const);
+    await keepLimitedIssueContentHistory(d1, prior.issueId, commentId);
+    updated = results[0][0] ?? null;
   }
-  const results = await drizzle(d1).batch([
-    updateStatement,
-    insertIssueContentHistory(d1, prior.issueId, commentId, { ...newRevision, isFirstCreated: false }),
-  ] as const);
-  await keepLimitedIssueContentHistory(d1, prior.issueId, commentId);
-  return results[0][0] ?? null;
+
+  // UpdateComment's xref tail (comment.go:1204). Upstream's model layer runs
+  // AddCrossReferences unconditionally and the gate lives INSIDE the arm
+  // (HasContentSupport, comment.go:180-186) — mirrored here on the prior
+  // row's type. The scan reads the NEW content through the markdown entry.
+  if (updated !== null && commentHasContentSupport(prior.type)) {
+    const originRows = await drizzle(d1)
+      .select({ id: issues.id, repoId: issues.repoId, isPull: issues.isPull })
+      .from(issues)
+      .where(eq(issues.id, prior.issueId))
+      .limit(1)
+      .all();
+    const origin = originRows[0];
+    if (origin !== undefined) {
+      await syncCommentCrossReferences(d1, {
+        issue: { id: origin.id, repoId: origin.repoId, isPull: origin.isPull },
+        commentId,
+        content: body,
+        doerId: actorId ?? null,
+        removeOld: true,
+        appUrl,
+        now,
+      });
+    }
+  }
+  return updated;
 }
 
 /**
  * DELETE comment (`issue_service.DeleteComment` reduced): unlink + the
- * num_comments decrement + the content-history hard-delete in one batch
- * (upstream models/issues/comment.go:1215-1219 deletes the comment's
- * ContentHistory rows in the same tx — a comment's revisions never outlive
- * it). False when the row is already gone.
+ * num_comments decrement + the content-history hard-delete + DeleteComment's
+ * xref neuter (models/issues/comment.go:1234 → issue_xref.go:43-53: the
+ * comment's ACTIVE ref rows — ref_action in none/closes/reopens with
+ * `ref_issue_id` = the comment's issue and `ref_comment_id` = the comment —
+ * become neutered; the rows sit on the REFERENCED issues, so this cascade
+ * runs by ref coordinates, cross-issue). All four legs one batch (upstream's
+ * tx; upstream deletes the ContentHistory rows in the same tx — a comment's
+ * revisions never outlive it). False when the row is already gone.
  */
 export async function deleteComment(d1: D1Database, comment: CommentRow, now: Date): Promise<boolean> {
   const results = await drizzle(d1).batch([
@@ -2111,6 +2147,17 @@ export async function deleteComment(d1: D1Database, comment: CommentRow, now: Da
       .set({ numComments: sql`MAX(num_comments - 1, 0)`, updatedAt: now })
       .where(eq(issues.id, comment.issueId)),
     drizzle(d1).delete(issueContentHistory).where(eq(issueContentHistory.commentId, comment.id)),
+    // neuterCrossReferences (issue_xref.go:43-53) — ONLY ref_action moves.
+    drizzle(d1)
+      .update(comments)
+      .set({ refAction: RefAction.Neutered })
+      .where(
+        and(
+          eq(comments.refIssueId, comment.issueId),
+          eq(comments.refCommentId, comment.id),
+          inArray(comments.refAction, [RefAction.None, RefAction.Closes, RefAction.Reopens]),
+        ),
+      ),
   ] as const);
   const removed = results[0] as Array<{ id: number }>;
   return removed.length > 0;

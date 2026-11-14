@@ -94,3 +94,14 @@ export const RefAction = {
   Reopens: 2,
   Neutered: 3,
 } as const;
+
+/**
+ * `CommentType.HasContentSupport()` (models/issues/comment.go:180-186): the
+ * types whose content the xref scanner reads and the content-history lane
+ * tracks — plain comments, code comments, reviews and dismissed reviews.
+ * Lives on the leaf module so both the API service layer and the
+ * IssuesService (issues/service.ts) can use it without an import cycle.
+ */
+export function commentHasContentSupport(type: number): boolean {
+  return type === CommentType.Comment || type === CommentType.Code || type === CommentType.Review || type === CommentType.DismissReview;
+}

@@ -82,9 +82,31 @@
  *      PR creation SHARES (models/issues/pull.go:478 NewPullRequest →
  *      NewIssueWithIndex), title edit `ChangeIssueTitle` (issue_update.go:217)
  *      and body edit `ChangeIssueContent` (issue_update.go:345), both with
- *      removeOld=true. The comment arms (comment.go:920/:1204/:1234 — type-5
- *      rows and the delete neuter) are NOT in this lane; they are the census
- *      row's recorded remainder.
+ *      removeOld=true. The COMMENT arms land in the same lane through
+ *      `syncCommentCrossReferences` — `Comment.AddCrossReferences`
+ *      (issue_xref.go:228-246) funnels into the SAME `createCrossReferences`
+ *      upstream: it gates on `CommentType.HasContentSupport()`
+ *      (comment.go:180-186 — types 0 Comment / 21 Code / 22 Review / 32
+ *      DismissReview), scans ONLY the comment content through the markdown
+ *      entry (`c.Issue.createCrossReferences(ctx, xrefCtx, "", c.Content)`),
+ *      always writes CommentTypeCommentRef (5) rows carrying
+ *      `ref_comment_id`, and passes `OrigComment` — which alone kills the
+ *      same-repo merger exception in `verifyReferencedIssue` (:225-232's
+ *      `|| ctx.OrigComment != nil`). Upstream call sites: comment CREATE
+ *      `CreateComment` (models/issues/comment.go:920, removeOld=false —
+ *      every content-supporting type, the type-4 commit-ref rows NOT
+ *      included: `HasContentSupport()` is false for CommentTypeCommitRef, so
+ *      the B-47 push walk's ref comments scan nothing upstream either —
+ *      derived no-op, recorded), comment EDIT `UpdateComment` (comment.go:1204,
+ *      removeOld=true — the neuter+rewrite keyed (origin issue, origin
+ *      comment)), comment DELETE `DeleteComment` → `neuterCrossReferences`
+ *      (comment.go:1234 → issue_xref.go:43-53: active rows — ref_action in
+ *      none/closes/reopens — with `ref_issue_id` = the comment's issue and
+ *      `ref_comment_id` = the comment become neutered; the rows sit on the
+ *      REFERENCED issues, so the delete cascades cross-issue by ref
+ *      coordinates). The type-5 rows fire NO webhook upstream — they are
+ *      model-layer `CreateComment` inserts and the notifiers fire only in the
+ *      service `CreateIssueComment`, once, for the USER comment.
  *
  *      Divergences, each recorded:
  *      - num_comments: upstream counts ONLY Comment+Review types
@@ -909,6 +931,55 @@ export interface SyncIssueCrossReferencesInput {
   /** The instance AppURL (request origin); "" = the nil-pattern arm. */
   appUrl: string;
   now: Date;
+  /**
+   * The COMMENT arm's presence marker (`crossReferencesContext.OrigComment`,
+   * issue_xref.go:36): set when the origin is a comment — the scan then runs
+   * over `origin.content` ALONE (upstream passes plaincontent="" and the
+   * comment as mdcontent), rows are always type 5 carrying this id in
+   * `ref_comment_id`, the remove-old fold keys on it, and the same-repo
+   * merger exception of `verifyReferencedIssue` (:225-232) is disabled.
+   * Callers go through `syncCommentCrossReferences`; this field is the
+   * shared writer's internal seam.
+   */
+  originCommentId?: number | null;
+}
+
+/**
+ * The COMMENT arm's input (`Comment.AddCrossReferences`, issue_xref.go:228-246):
+ * the scan reads ONLY the comment's content, through the markdown entry.
+ */
+export interface SyncCommentCrossReferencesInput {
+  /** The issue the comment sits on (the origin coordinates of every row). */
+  issue: { id: number; repoId: string; isPull: boolean };
+  /** The comment's id — the row's `ref_comment_id`. */
+  commentId: number;
+  /** The comment's content (the markdown-entry scan input — ("", c.Content)). */
+  content: string;
+  /** The acting user (the poster on create, the EDITOR on edit); null rides the anonymous arms. */
+  doerId: number | null;
+  /** `AddCrossReferences(removeOld)` — false on create, true on edit (comment.go:920/:1204). */
+  removeOld: boolean;
+  /** The instance AppURL (request origin); "" = the nil-pattern arm. */
+  appUrl: string;
+  now: Date;
+}
+
+/**
+ * `Comment.AddCrossReferences` (issue_xref.go:228-246) — the comment arm
+ * entry; the shared writer below is `createCrossReferences` (:77-134). The
+ * HasContentSupport type gate (comment.go:180-186) is the CALLER's fold —
+ * upstream applies it at this entry's head (:230-232), and callers here
+ * reach it only for content-supporting types for the same reason.
+ */
+export function syncCommentCrossReferences(d1: D1Database, input: SyncCommentCrossReferencesInput): Promise<void> {
+  return syncIssueCrossReferences(d1, {
+    origin: { ...input.issue, title: "", content: input.content },
+    doerId: input.doerId,
+    removeOld: input.removeOld,
+    appUrl: input.appUrl,
+    now: input.now,
+    originCommentId: input.commentId,
+  });
 }
 
 /** The resolved target of one reference (the write list's entry). */
@@ -918,25 +989,33 @@ interface ResolvedXref {
 }
 
 /**
- * `Issue.AddCrossReferences` (issue_xref.go:60-75) + `createCrossReferences`
- * (:77-134): scan the title (non-markdown entry) and body (markdown entry),
- * resolve the targets, fold the remove-old neuter/keep pair, and write one
- * type-3 (issue origin) / type-6 (PR origin) row ON THE REFERENCED issue
- * carrying `ref_repo_id`/`ref_issue_id`/`ref_comment_id`/`ref_action`/
- * `ref_is_pull` of the ORIGIN. The referenced issue's num_comments (this
- * repo's counts-system-comments convention) and updated_unix move with each
- * row. Errors propagate — upstream fails the surrounding write the same way;
- * the landed committed-prefix posture of the non-transactional create/edit
- * batches applies on top.
+ * `Issue.AddCrossReferences` (issue_xref.go:60-75) / `Comment.AddCrossReferences`
+ * (:228-246) + the shared `createCrossReferences` (:77-134): scan the title
+ * (non-markdown entry) and body (markdown entry) — or the comment content
+ * alone through the markdown entry when `originCommentId` is set — resolve
+ * the targets, fold the remove-old neuter/keep pair, and write one type-3
+ * (issue origin) / type-6 (PR origin) / type-5 (comment origin) row ON THE
+ * REFERENCED issue carrying `ref_repo_id`/`ref_issue_id`/`ref_comment_id`/
+ * `ref_action`/`ref_is_pull` of the ORIGIN. The referenced issue's
+ * num_comments (this repo's counts-system-comments convention) and
+ * updated_unix move with each row. Errors propagate — upstream fails the
+ * surrounding write the same way; the landed committed-prefix posture of the
+ * non-transactional create/edit batches applies on top.
  */
 export async function syncIssueCrossReferences(d1: D1Database, input: SyncIssueCrossReferencesInput): Promise<void> {
   const options: ReferenceScanOptions = { appUrl: input.appUrl };
-  const refs = [
-    ...findAllIssueReferences(input.origin.title, options),
-    ...findAllIssueReferencesMarkdown(input.origin.content ?? "", options),
-  ];
+  const commentOriginId: number | null = input.originCommentId ?? null;
+  const commentArm = commentOriginId !== null;
+  // The comment arm scans ("", c.Content) — plaincontent empty, the comment
+  // through the markdown entry; the title/plain entries never run there.
+  const refs = commentArm
+    ? findAllIssueReferencesMarkdown(input.origin.content ?? "", options)
+    : [
+        ...findAllIssueReferences(input.origin.title, options),
+        ...findAllIssueReferencesMarkdown(input.origin.content ?? "", options),
+      ];
   const doer = input.doerId === null ? null : await loadDoer(d1, input.doerId);
-  const resolved = await resolveCrossReferences(d1, input.origin, doer, refs);
+  const resolved = await resolveCrossReferences(d1, input.origin, doer, refs, commentArm);
 
   const database = drizzle(d1);
   const statements: BatchStatement[] = [];
@@ -944,14 +1023,15 @@ export async function syncIssueCrossReferences(d1: D1Database, input: SyncIssueC
   if (input.removeOld) {
     // findOldCrossReferences (:35-41): the origin's LIVE rows — ref_action in
     // (none, closes, reopens), ref_issue_id = the origin, ref_comment_id
-    // unset (our NULL ≡ upstream's 0 for title/body refs).
+    // unset for title/body refs (our NULL ≡ upstream's 0) or the origin
+    // comment's id for comment refs.
     const old = await database
       .select({ id: comments.id, issueId: comments.issueId, refAction: comments.refAction })
       .from(comments)
       .where(
         and(
           eq(comments.refIssueId, input.origin.id),
-          isNull(comments.refCommentId),
+          commentOriginId !== null ? eq(comments.refCommentId, commentOriginId) : isNull(comments.refCommentId),
           inArray(comments.refAction, [RefAction.None, RefAction.Closes, RefAction.Reopens]),
         ),
       )
@@ -989,15 +1069,18 @@ function writeStatements(
   input: SyncIssueCrossReferencesInput,
   entry: ResolvedXref,
 ): BatchStatement[] {
+  const commentOriginId: number | null = input.originCommentId ?? null;
   return [
     database.insert(comments).values({
-      type: input.origin.isPull ? CommentType.PullRef : CommentType.IssueRef,
+      // Comment origins always write CommentTypeCommentRef (5) — issue_xref.go
+      // :36/:240 — regardless of whether the commented issue is a pull.
+      type: commentOriginId !== null ? CommentType.CommentRef : input.origin.isPull ? CommentType.PullRef : CommentType.IssueRef,
       posterId: input.doerId ?? null,
       issueId: entry.issueId,
       content: "",
       refRepoId: input.origin.repoId,
       refIssueId: input.origin.id,
-      refCommentId: null,
+      refCommentId: commentOriginId,
       refAction: entry.action,
       refIsPull: input.origin.isPull,
       createdAt: input.now,
@@ -1038,10 +1121,10 @@ async function loadDoer(d1: D1Database, doerId: number): Promise<XrefDoer | null
  *      raw action is actionable (:209-244): an unreadable target or a
  *      doer-blocked-by-target-poster/owner DROPS the row; an actionable raw
  *      reference from a doer who is neither the target's poster nor a writer
- *      of the target repo demotes to None when cross-repo (the same-repo
- *      title/body case is upstream's deliberate exception — "the merger
- *      should be responsible for checking whether the reference should
- *      resolve", :219-232);
+ *      of the target repo demotes to None when cross-repo — or when the
+ *      origin is a COMMENT (`|| ctx.OrigComment != nil`, :225-232: the
+ *      same-repo merger exception is a title/body-only privilege, a comment
+ *      origin must hold the write or the poster to keep a close action);
  *   6. self-references never enter the list and duplicates fold to one entry,
  *      a later non-None action upgrading the fold (:178-190).
  */
@@ -1050,6 +1133,7 @@ async function resolveCrossReferences(
   origin: XrefOriginIssue,
   doer: XrefDoer | null,
   refs: IssueReference[],
+  commentArm: boolean,
 ): Promise<ResolvedXref[]> {
   const database = drizzle(d1);
   const list: ResolvedXref[] = [];
@@ -1100,9 +1184,10 @@ async function resolveCrossReferences(
         ref.action !== RefAction.None &&
         (doer === null || refIssue.posterId === null || doer.id !== refIssue.posterId) &&
         !(await canWriteIssuesOrPulls(d1, repoPair.repo, doer)) &&
-        refIssue.repoId !== origin.repoId
-        // `|| ctx.OrigComment != nil` — the comment arm is not in this lane;
-        // every caller here is a title/body write (OrigComment nil).
+        (refIssue.repoId !== origin.repoId || commentArm)
+        // (:225-232) `refIssue.RepoID != ctx.OrigIssue.RepoID || ctx.OrigComment != nil`:
+        // the merger exception is title/body-only — a comment origin keeps a
+        // close action only through the poster or a write grant.
       ) {
         refAction = RefAction.None;
       }
