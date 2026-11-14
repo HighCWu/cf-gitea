@@ -6,7 +6,7 @@ closes the census at 17/17, drains the B-board's open rows to the three
 feature lanes, runs every handoff to its landing, and lands three
 platform discoveries into the record.
 
-Deployed as version **`[[ORCHESTRATOR-FILLS: deploy id]]`**. Migrations
+Deployed as version **`354fd57f-bbf5-4f89-bdee-afe3bea8e6c4`**. Migrations
 **0078-0079** remote-applied FIRST (freeze preflight 2026-11-14: both
 PENDING remote application — the freeze chain applies them) (0078 — the
 TABLEMISS batch: issue_labels
@@ -14,8 +14,30 @@ rebuilt with the surrogate id pk, issue_pins rebuilt at upstream struct
 order with is_pull, pull_requests.type + changed_protected_files,
 package_blob_uploads.hash_state_bytes; 0079 — the team_invites block:
 token UNIQUE, the (team_id,email) composite, org/team FK-cascades, the
-inviter deliberately FK-less). Composite gate **`[[ORCHESTRATOR-FILLS:
-files / pass / fail / timeouts]]`**.
+inviter deliberately FK-less). Composite gate **PASS on the release
+tree**: 508 files in phase 1 (505 pass, 2 load-timeout files + 1 assertion
+file — all three solo-adjudicated GREEN), every file green across 6 phases
+(513 file-runs total, 585s wall; 8 vitest-worker teardown races downgraded
+to note per the composite-gate protocol). The gate's first run caught THREE
+real reds — all fixed in-wave: two stale-pin families the 11-13 landings
+outdated without their batteries re-run (debian's retired MD5/xz-control
+reductions incl. the quota-salvage count miscount, and ADMIN88's CTA-fold
+heading), and the B-47 walk x invariants interaction (INVFIX: the walk
+breached the engine's skipCacheWrite discipline + the workerd DO-RPC
+double-report, fixed by the PackLostError null-shape degradation in the
+engine). One deploy-blocker caught by the freeze chain itself: the
+account-local wrangler.jsonc carried the APP_URL PLACEHOLDER (a residue of
+the B87 config rebuild — only the d1 id had been restored); restored,
+rebuilt, redeployed before the probe battery. PROBE BATTERY: the first full sweep
+(202 probes, 20 batteries) recorded 16 fails + 7 platform warns — ALL 16
+traced to a transient network patch between the host and Cloudflare (fetch
+failed / gnutls classes, cascading 404s from one fetch-failed repo create);
+the six affected batteries re-ran ALL GREEN (0 fails), the mon-qset family
+stays the recorded platform-warn class, and the two pre-known cleanup-audit
+residues were swept (2 probe-era protected_branches rows + 3 non-standing
+action rows; the standing fixture trio restored). The per-run probe PAT was
+minted before the battery and SWEPT after (row deleted, table verified
+empty, token files shredded).
 
 ## The census closes at 17/17
 
