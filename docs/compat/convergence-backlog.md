@@ -267,6 +267,28 @@ real-Go-digest fixture row as its pin; the probe harness arm is moot.
 And §1's census docs-debt — CENSUSDOC 133ed08 landed the B-58 flips,
 the B-37 stamp, and the graduation protocol.)
 
+- (NEW 2026-11-14, DRIFT — tooling, no board rows) The Gitea Upstream
+  Drift Analyzer landed (`scripts/upstream-drift.mjs`, usage in
+  `scripts/upstream-drift.README.md`): the census's manual drift
+  mapping automated for the NEXT re-pin. Given two submodule commits it
+  diffs the controller-side surface (`templates/**/*.tmpl` +
+  `routers/` + `services/` + `models/`), re-scans our tree's upstream
+  citation anchors (explicit `.go:`/`.tmpl:` cites — including the
+  suites' ~2.9k test-description cites — plus bare `:NNN` shorthand
+  bound to the nearest explicit path in its comment block), and grades
+  each affected cite into (a) CITED-LINE MOVED / (b) CITED REGION
+  CHANGED / (c) FILE ADDED-REMOVED, with informational sections for
+  uncited changed surface, unattributable ambiguous cites, tests in
+  scope (name-stem match) and census-board hints. Zero npm deps,
+  read-only over `gitea/`; validated three ways (39/39 `--selftest`
+  including a real temp-git fixture; hand-verified hunk math with
+  byte-identical content-shift checks on 3 sampled files; the baseline
+  artifact `docs/compat/upstream-drift-baseline.md` = the real window
+  `fc49368845~10 → fc49368845` — 100 upstream files touched, 1091 (a) /
+  71 (b) / 46 (c) hits across 291 of our files, 255 suites likely in
+  scope). Wiring note: the root `package.json` `"drift"` script line is
+  orchestrator-owned and pending.
+
 ## 5. The L-class feature lanes (ALL LANDED 2026-11-14)
 
 B-52 agit push-to-propose (1846b7f/4c7ca97), B-46 the xref writers

@@ -29,7 +29,8 @@
     "db:generate": "pnpm --filter cf-gitea-worker db:generate",
     "db:migrate:local": "pnpm --filter cf-gitea-worker db:migrate:local",
     "db:migrate:remote": "pnpm --filter cf-gitea-worker db:migrate:remote",
-    "pretypecheck": "pnpm gen:icons"
+    "pretypecheck": "pnpm gen:icons",
+    "drift": "node scripts/upstream-drift.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
