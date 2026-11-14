@@ -163,7 +163,6 @@ import {
   renderResetPasswordPage,
   resetWrongUserMessage,
 } from "./pages/password-reset";
-import { changePasswordLocale } from "./pages/change-password";
 import {
   clearTwofaSetCookie,
   getTwoFactorByUid,
@@ -373,6 +372,15 @@ export interface SessionUser {
    *  the goldens), so page-level consumers that hold only a viewer id use
    *  `userMustChangePassword` below. */
   readonly mustChangePassword: boolean;
+  /** The doer's `users.is_restricted` carry (the IDCHAIN delivery seam): the
+   *  session row hands the flag to the viewer projection (viewer.ts — riding
+   *  only when true, the impersonatorUserId precedent) so the explore page's
+   *  doer slice renders it onto the search requester and a restricted session
+   *  doer reads `searchRepositories`' restricted arc (repo_list.go:661-703)
+   *  exactly like the API's own `viewerOf` requesters. Upstream's session
+   *  doer IS the users row — every doer field rides (services/auth/
+   *  session.go). */
+  readonly restricted: boolean;
 }
 
 export type SessionVerification =
@@ -545,6 +553,7 @@ export async function verifySession(
       username: row.user.username,
       isAdmin: row.user.isAdmin,
       mustChangePassword: row.user.mustChangePassword,
+      restricted: row.user.restricted,
     },
     setCookie,
     remember: row.session.remember,
@@ -815,6 +824,7 @@ export async function lookupValidSession(
     username: row.user.username,
     isAdmin: row.user.isAdmin,
     mustChangePassword: row.user.mustChangePassword,
+    restricted: row.user.restricted,
     sessionId: row.session.id,
     impersonatorUserId: row.session.impersonatorUserId,
   };

@@ -31,6 +31,15 @@ export type Viewer =
        *  target's, verbatim upstream. Optional: unarmed viewer literals
        *  stay byte-identical. */
       readonly impersonatorUserId?: number | null;
+      /** The doer's `users.is_restricted` carry (the IDCHAIN delivery seam —
+       *  SPEC-0010's session/viewer surfaces): rides ONLY when true (absent
+       *  reads false, upstream's zero value), so unarmed viewer literals stay
+       *  the exact pre-restricted shape — exact-shape consumers (goldens,
+       *  toEqual viewer pins) never see the key (the impersonatorUserId
+       *  precedent). Consumer: explore's doer slice renders it onto the
+       *  search requester's restricted arc (repo_list.go:661-703); no page
+       *  chrome reads it. */
+      readonly restricted?: boolean;
     };
 
 /** The viewer plus the session cookie directive the RESPONSE must carry
@@ -79,18 +88,22 @@ export async function resolveViewer(
       setCookie: verification.clearCookie ? clearSessionSetCookie() : null,
     };
   }
-  const { id, username, isAdmin } = verification.user;
+  const { id, username, isAdmin, restricted } = verification.user;
   return {
     // The impersonation backup rides ONLY when set (absent == not
     // impersonating): unarmed viewers stay the exact pre-impersonation
     // shape, so exact-shape consumers (goldens, toEqual assertions) never
-    // see the new key (the first-run suite's viewer pins).
+    // see the new key (the first-run suite's viewer pins). The restricted
+    // carry follows the same discipline: it rides ONLY when true (absent
+    // reads false, upstream's zero value) — the IDCHAIN delivery seam that
+    // lets the explore doer slice apply the restricted composition.
     viewer: {
       kind: "user",
       id,
       username,
       isAdmin,
       ...(verification.impersonatorUserId !== null ? { impersonatorUserId: verification.impersonatorUserId } : {}),
+      ...(restricted === true ? { restricted: true } : {}),
     },
     // ALWAYS a full directive (§2.7): the rotation arm's raw id:secret is
     // wrapped here so consumers attach setCookie as-is (the double-wrap the

@@ -84,6 +84,7 @@ import {
   sweepExpiredSessions,
   verifySession,
 } from "./session";
+import { resolveViewer } from "./viewer";
 import { runA11y } from "./__tests__/a11y";
 import loginGolden from "./session-goldens/login.html?raw";
 
@@ -2227,5 +2228,73 @@ describe("the MUST-CHANGE password gate (web.go:197-206)", () => {
     // An optional directive rides both failure shapes (the forced-logout rule).
     const withCookie = mustChangePasswordArm(req("/dashboard", "git/2.45"), true, sessionSetCookie("x:y", false));
     expect(withCookie?.headers.get("set-cookie")).toContain(SESSION_COOKIE_NAME);
+  });
+});
+
+describe("the restricted carry's session→viewer delivery (the IDCHAIN seam)", () => {
+  /** Flip `users.is_restricted` on (the admin-edit arm's write; the seed
+   *  helper has no restricted option). */
+  async function flagRestricted(userId: number): Promise<void> {
+    await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.id, userId)).run();
+  }
+
+  it("verifySession returns the doer's users.is_restricted on SessionUser — true on a flagged row, false on the unflagged default", async () => {
+    const flagged = await seedUser({ username: "FlaggedUser" });
+    await flagRestricted(flagged.id);
+    const cookie = await mintSession(env.DB, flagged.id, { now: new Date(T) });
+    const result = await verifySession(env.DB, cookie, { now: new Date(T + 1000) });
+    expect(result.outcome).toBe("authenticated");
+    if (result.outcome !== "authenticated") return;
+    expect(result.user.restricted).toBe(true);
+
+    // The unflagged twin — the schema default (upstream's zero value) reads
+    // false, the composition's non-restricted arm.
+    const plain = await seedUser({ username: "PlainUser" });
+    const plainCookie = await mintSession(env.DB, plain.id, { now: new Date(T) });
+    const plainResult = await verifySession(env.DB, plainCookie, { now: new Date(T + 1000) });
+    expect(plainResult.outcome).toBe("authenticated");
+    if (plainResult.outcome !== "authenticated") return;
+    expect(plainResult.user.restricted).toBe(false);
+  });
+
+  it("lookupValidSession carries the flag too (the OAuth2 login consumers' SessionUser shape)", async () => {
+    const flagged = await seedUser({ username: "FlaggedLookup" });
+    await flagRestricted(flagged.id);
+    const cookie = await mintSession(env.DB, flagged.id, { now: new Date(T) });
+    const valid = await lookupValidSession(env.DB, cookie, { now: new Date(T + 1000) });
+    expect(valid?.restricted).toBe(true);
+  });
+
+  it("resolveViewer projects restricted ONLY when true — a flagged doer's viewer carries it, an unflagged one keeps the exact pre-restricted shape", async () => {
+    // resolveViewer takes no `now` option (it verifies at real time), so the
+    // mints here are unpinned — a T-pinned cookie would resolve anonymous.
+    const flagged = await seedUser({ username: "FlaggedViewer" });
+    await flagRestricted(flagged.id);
+    const flaggedCookie = await mintSession(env.DB, flagged.id);
+    const flaggedResolution = await resolveViewer(
+      env,
+      new Request("https://test.local/", { headers: { cookie: `${SESSION_COOKIE_NAME}=${flaggedCookie}` } }),
+    );
+    expect(flaggedResolution.viewer).toEqual({
+      kind: "user",
+      id: flagged.id,
+      username: "FlaggedViewer",
+      isAdmin: false,
+      restricted: true,
+    });
+
+    // The additive-for-goldens negative: the key never rides when false (the
+    // impersonatorUserId precedent — first-run's exact-shape viewer pins
+    // stay byte-identical, and an unarmed viewer literal stays assignable).
+    const plain = await seedUser({ username: "PlainViewer" });
+    const plainCookie = await mintSession(env.DB, plain.id);
+    const plainResolution = await resolveViewer(
+      env,
+      new Request("https://test.local/", { headers: { cookie: `${SESSION_COOKIE_NAME}=${plainCookie}` } }),
+    );
+    expect(plainResolution.viewer).toEqual({ kind: "user", id: plain.id, username: "PlainViewer", isAdmin: false });
+    if (plainResolution.viewer.kind === "user") {
+      expect("restricted" in plainResolution.viewer).toBe(false);
+    }
   });
 });

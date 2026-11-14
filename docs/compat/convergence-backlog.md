@@ -183,19 +183,28 @@ SPEC's no-outbound-TCP premise corrected in specs/email-outbound.md
   the granted rows survive; absent flag reads false, upstream's zero value
   — both polarities pinned).
   ESCALATED (the seam's delivery leg — outside the closing unit's ownership
-  grant, recorded per the stop rule): the UI session chain drops
-  `users.is_restricted` at every hop — `ui/session.ts`'s `SessionUser`
-  (:363; built at verifySession :543 and lookupValidSession :814, both with
-  the full row in hand), `ui/viewer.ts`'s `Viewer` user arm +
-  `resolveViewer` (:82-94), and `explore.tsx`'s `exploreDoer` (:140) — so a
-  restricted session doer's /explore/repos reads the NON-restricted
-  composition and sees limited-owner-public / private-org-public rows
-  upstream would hide (the leak polarity). Close: thread the flag
-  SessionUser → Viewer → ExploreDoer (the `impersonatorUserId` precedent is
-  the additive pattern; the viewer projection is that file's owner to relax
-  — SPEC-0010's session/viewer surfaces, exact-shape golden pins live
-  there). Until delivered, `ExploreDoer` without the flag reads
-  non-restricted — pinned as such in the filters battery.
+  grant, recorded per the stop rule) — (CLOSED 2026-11-14, IDCHAIN-SEAM3)
+  the UI session chain dropped `users.is_restricted` at every hop —
+  `ui/session.ts`'s `SessionUser` (built at verifySession and
+  lookupValidSession, both with the full row in hand), `ui/viewer.ts`'s
+  `Viewer` user arm + `resolveViewer`, and `explore.tsx`'s `exploreDoer` —
+  so a restricted session doer's /explore/repos read the NON-restricted
+  composition and saw limited-owner-public / private-org-public rows
+  upstream would hide (the leak polarity). CLOSED per the recorded recipe,
+  additively: `SessionUser.restricted` (required, both construction sites
+  render the row column), `Viewer.restricted?` riding ONLY when true (the
+  `impersonatorUserId` conditional-spread precedent — unarmed viewers keep
+  the exact pre-restricted shape, exact-shape consumers never see the key),
+  and `exploreDoer` rendering `restricted: viewer.restricted === true` into
+  `searchExploreRepos` (the c6b9763 receiving arm). Pins: the END-TO-END
+  restricted-doer arm in explore.matrix.test.ts (a restricted session's
+  real-cookie /explore/repos hides the limited-owner public and the member's
+  private-org public while the own row and the non-restricted control's rows
+  survive — the leak polarity's close, riding the filters battery's
+  both-polarities service pin) and the session battery's carry pins
+  (verifySession/lookupValidSession return the row flag; resolveViewer
+  projects it only-when-true with the exact-shape negative). The filters
+  battery's absent-flag=false arm remains the API-level both-polarity pin.
 - The probe battery's blip-era fixture rows (the next cleanup-audit run
   sweeps them).
 

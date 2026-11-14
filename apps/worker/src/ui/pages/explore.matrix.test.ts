@@ -57,12 +57,13 @@
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../../db/schema";
+import { orgMembers, repositories, users } from "../../db/schema";
+import { OrgService } from "../../services/orgs/orgs";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { T0, uiEnv } from "../__tests__/harness";
@@ -74,14 +75,23 @@ const PAGINATION_COUNT = 21; // page size 20 → exactly one row spills to page 
 interface Explore92Fixture {
   ownerCookie: string;
   adminCookie: string;
+  restrCookie: string;
 }
 
 let fixture: Explore92Fixture | null = null;
 
 /** A row-only repository (the wave-9 posture: the explore lists read D1
  *  only, no engine content), idempotent by slug. `visibility` defaults to
- *  public — the private variant feeds the scope ladder's admin arm. */
-async function ensureRowRepo(ownerId: number, slug: string, visibility: "public" | "private" = "public"): Promise<string> {
+ *  public — the private variant feeds the scope ladder's admin arm.
+ *  `ownerNamespace` is the href half (`/{namespace}/{slug}`) and the
+ *  search's own-rows arm key; it defaults to the file's owner and is set to
+ *  the org's lower name for the org-owned restricted-arm row. */
+async function ensureRowRepo(
+  ownerId: number,
+  slug: string,
+  visibility: "public" | "private" = "public",
+  ownerNamespace = "explore92owner",
+): Promise<string> {
   const db = drizzle(env.DB);
   const existing = await db
     .select({ id: repositories.id })
@@ -93,7 +103,7 @@ async function ensureRowRepo(ownerId: number, slug: string, visibility: "public"
   await db.insert(repositories).values({
     id,
     storageKey: id,
-    ownerNamespace: "explore92owner",
+    ownerNamespace,
     ownerId,
     slug,
     visibility,
@@ -108,8 +118,11 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
 
   // The owner (mints the signed-in arms' session), a PRIVATE-visibility user
   // (the badge + location + pinned "Joined on" row), a LIMITED one (the
-  // badge's negative arm, no location), and a SITE ADMIN (the repos scope's
-  // admin tier — owns nothing here).
+  // badge's negative arm, no location — and the restricted arm's
+  // limited-profile owner), a SITE ADMIN (the repos scope's admin tier —
+  // owns nothing here), and the RESTRICTED doer (the IDCHAIN delivery arm —
+  // limited visibility keeps its own public row anonymous-invisible so the
+  // unfiltered anonymous counts below stay exact).
   for (const extra of [
     { username: "explore92owner", visibility: "public" as const, location: null, createdAt: null, isAdmin: false },
     {
@@ -121,6 +134,7 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
     },
     { username: "explore92limited", visibility: "limited" as const, location: null, createdAt: null, isAdmin: false },
     { username: "explore92admin", visibility: "public" as const, location: null, createdAt: null, isAdmin: true },
+    { username: "explore92restr", visibility: "limited" as const, location: null, createdAt: null, isAdmin: false },
   ]) {
     const existing = await db
       .select({ id: users.id })
@@ -171,6 +185,22 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
     .get();
   if (admin === undefined) throw new Error("explore92 admin row missing");
   const adminId = admin.id;
+  const restr = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "explore92restr"))
+    .get();
+  if (restr === undefined) throw new Error("explore92restr row missing");
+  // The restricted doer's flag (the users.is_restricted column — the row the
+  // session chain must carry to the explore surface; idempotent re-arm).
+  await db.update(users).set({ restricted: true }).where(eq(users.id, restr.id));
+  const restrId = restr.id;
+  const limited = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "explore92limited"))
+    .get();
+  if (limited === undefined) throw new Error("explore92limited row missing");
 
   // The repos: r01..r21 (the pager block; the r-prefix keeps them
   // slug-ordered ahead of solo) + the solo row whose repo_settings carries
@@ -186,9 +216,49 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
   // old repo_settings existence guard was the retired store's idiom).
   await db.update(repositories).set({ description: "the solo settings description line" }).where(eq(repositories.id, soloId));
 
+  // The IDCHAIN restricted-arm rows — every one ANONYMOUS-invisible (a
+  // limited-profile owner's public, a private org's public, a limited
+  // owner's own public), which is why the unfiltered anonymous counts stay
+  // exact. `limpub` is the signed-in non-restricted arm's KEEP (repo_list.go
+  // :651-658's [Private]-only owner limit) and the restricted composition's
+  // DROP (:697-699's [Private, Limited] replacement); `pubinpriv` rides the
+  // member arm-5 (publicInPrivateOrgCondition) the restricted arc SKIPS
+  // (:694-700's else); `restown` is the restricted doer's surviving edge
+  // (arm 4 — the own rows are unrestricted).
+  await ensureRowRepo(limited.id, "explore92-limpub", "public", "explore92limited");
+  await ensureRowRepo(restrId, "explore92-restown", "public", "explore92restr");
+  // The private org: createOrg seeds the owner-role membership for
+  // explore92owner (the NON-restricted control reads pubinpriv through it —
+  // publicInPrivateOrgCondition joins org_members on the requester id), the
+  // visibility flips to private so only the member arm can surface it.
+  const existingOrg = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "explore92shh"))
+    .get();
+  const shhId =
+    existingOrg?.id ?? (await new OrgService(env.DB).createOrg({ name: "explore92shh", ownerId: owner.id })).id;
+  await db.update(users).set({ visibility: "private" }).where(eq(users.id, shhId));
+  await ensureRowRepo(shhId, "explore92-pubinpriv", "public", "explore92shh");
+  const existingMembership = await db
+    .select({ orgId: orgMembers.orgId })
+    .from(orgMembers)
+    .where(and(eq(orgMembers.orgId, shhId), eq(orgMembers.userId, restrId)))
+    .get();
+  if (existingMembership === undefined) {
+    await db.insert(orgMembers).values({
+      orgId: shhId,
+      userId: restrId,
+      isPublic: false,
+      role: "member",
+      createdAt: new Date(),
+    });
+  }
+
   fixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
     adminCookie: await mintSession(env.DB, adminId),
+    restrCookie: await mintSession(env.DB, restrId),
   };
   return fixture;
 }
@@ -570,11 +640,15 @@ describe("/explore/users — the explicit newest sort and the case-insensitive q
 
 describe("/explore/users — the unfiltered and beyond-end pager grammar", () => {
   it("paginates the unfiltered listing 20-per-page with NO q on the pager hrefs (the keyword-omission arm)", async () => {
-    // This file's world holds 25 active users (owner/hidden/limited/admin +
-    // u01..u21 — the two migration-placeholder principals are prohibited and
-    // gated out), all named explore92*: page 1 carries the 20 highest ids
-    // (newest default) and spills five. ExplorePagination sets q only when
-    // non-empty — so the unfiltered Older href is the bare ?page= form.
+    // This file's world holds 26 active users (owner/hidden/limited/admin/
+    // restr + u01..u21 — the two migration-placeholder principals are
+    // prohibited and gated out, and the org row is type-gated out), all
+    // named explore92*: page 1 carries the 20 highest ids (newest default)
+    // and spills six. restr seeds with the NAMED block (a lower id than the
+    // whole u-block), so it lands on page 2 among the named rows — every
+    // count below is unchanged by its addition (its href never matches the
+    // u-needle). ExplorePagination sets q only when non-empty — so the
+    // unfiltered Older href is the bare ?page= form.
     const page1 = await fetchUi("/explore/users");
     expect(page1.status).toBe(200);
     const page1Html = await page1.text();
@@ -607,5 +681,57 @@ describe("/explore/users — the unfiltered and beyond-end pager grammar", () =>
     expect(html).toContain("<span class=\"navigation_label\">Newer</span>");
     expect(html).not.toContain("<span class=\"navigation_label\">Older</span>");
     expect(html).not.toContain('href="/explore92-u01"');
+  });
+});
+
+// --- the IDCHAIN delivery seam: the RESTRICTED session doer's explore scope ---
+//
+// The service arm (repository-search-filters.test.ts's restricted describe)
+// pins `searchExploreRepos` both ways on a hand-built ExploreDoer; THIS pin
+// closes the delivery leg end-to-end: the flag rides the REAL chain
+// (users.is_restricted → verifySession's SessionUser → resolveViewer's
+// Viewer → exploreDoer's ExploreDoer → the restricted composition) through
+// the mounted route with a minted session cookie. Upstream, a RESTRICTED
+// doer skips arm 1 (repo_list.go:665-674) and arm 5 (:694-700's else), so
+// the rows a signed-in non-restricted doer keeps through the explore page —
+// a limited-profile owner's public (the [Private]-only owner limit) and a
+// private org's public (publicInPrivateOrgCondition's member join) — HIDE;
+// before the seam delivered the flag, both LEAKED to a restricted session.
+
+describe("/explore/repos — the restricted session doer's scope (the IDCHAIN delivery seam, end-to-end)", () => {
+  it("hides the limited-owner public and the member's private-org public from a restricted session doer; the own row and the non-restricted control's rows survive", async () => {
+    const { restrCookie, ownerCookie } = await ensureExplore92Fixtures();
+
+    // limpub — a limited-profile owner's public repo: the non-restricted
+    // signed-in composition keeps it, the restricted replacement arm
+    // ([Private, Limited]) drops it. This is the leak polarity the
+    // undelivered flag produced.
+    const restrLimpub = await fetchUi("/explore/repos?q=explore92-limpub", withCookie(restrCookie));
+    expect(restrLimpub.status).toBe(200);
+    expect(await restrLimpub.text()).toContain("No matching results found.");
+
+    // pubinpriv — a private org's public repo the doer is a MEMBER of: arm 5
+    // is skipped for a restricted doer even though the membership row exists.
+    const restrPubinpriv = await fetchUi("/explore/repos?q=explore92-pubinpriv", withCookie(restrCookie));
+    expect(restrPubinpriv.status).toBe(200);
+    expect(await restrPubinpriv.text()).toContain("No matching results found.");
+
+    // The restricted doer's OWN public row survives (arm 4 — the own rows are
+    // unrestricted): proves the session authenticated into the restricted
+    // composition, not a blanket deny.
+    const restrOwn = await fetchUi("/explore/repos?q=explore92-restown", withCookie(restrCookie));
+    expect(restrOwn.status).toBe(200);
+    expect(await restrOwn.text()).toContain('href="/explore92restr/explore92-restown"');
+
+    // The NON-restricted control (the org's owner — public profile, plain
+    // session) keeps BOTH rows on the same edges: the drops above are the
+    // restricted composition, not the fixture or the keyword.
+    const controlLimpub = await fetchUi("/explore/repos?q=explore92-limpub", withCookie(ownerCookie));
+    expect(controlLimpub.status).toBe(200);
+    expect(await controlLimpub.text()).toContain('href="/explore92limited/explore92-limpub"');
+
+    const controlPubinpriv = await fetchUi("/explore/repos?q=explore92-pubinpriv", withCookie(ownerCookie));
+    expect(controlPubinpriv.status).toBe(200);
+    expect(await controlPubinpriv.text()).toContain('href="/explore92shh/explore92-pubinpriv"');
   });
 });

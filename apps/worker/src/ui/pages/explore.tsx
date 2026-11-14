@@ -136,9 +136,15 @@ export function parseExploreKeyword(raw: string | null): string {
   return (raw ?? "").trim();
 }
 
-/** The doer slice the search service takes (null = anonymous). */
+/** The doer slice the search service takes (null = anonymous). The
+ *  restricted carry rides the session chain's flag (viewer.ts — the IDCHAIN
+ *  delivery seam): `=== true` so an unarmed viewer reads false, upstream's
+ *  zero value, and the search's restricted arc (repo_list.go:661-703)
+ *  applies to the session doer exactly like the API's own requesters. */
 function exploreDoer(viewer: Viewer): ExploreDoer | null {
-  return viewer.kind === "user" ? { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin } : null;
+  return viewer.kind === "user"
+    ? { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin, restricted: viewer.restricted === true }
+    : null;
 }
 
 // ---------------------------------------------------------------------------
