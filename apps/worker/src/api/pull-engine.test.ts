@@ -2251,8 +2251,16 @@ describe("the PR-head sync round-trip — a second push moves refs/pull/N/head a
     const pushCommentRows = (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, prRow!.issueId)).all()).filter(
       (r) => r.type === CommentType.PullRequestPush,
     );
-    expect(pushCommentRows).toHaveLength(1);
-    expect(JSON.parse(pushCommentRows[0]!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [append.tip] });
+    // Two rows since TAILS2's github-flow create arm: the CREATE's first
+    // push comment (upstream pull.go:145 — the PR's own commits, the base
+    // as old) + the SYNC PUSH's comment (the pushed delta). Upstream writes
+    // both; the create row's commit_ids carry the original feature tip.
+    expect(pushCommentRows).toHaveLength(2);
+    const createRow = pushCommentRows.find((r) => JSON.parse(r.content ?? "{}").commit_ids?.[0] !== append.tip);
+    const pushRow = pushCommentRows.find((r) => JSON.parse(r.content ?? "{}").commit_ids?.[0] === append.tip);
+    expect(createRow).toBeDefined();
+    expect(pushRow).toBeDefined();
+    expect(JSON.parse(pushRow!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [append.tip] });
 
     // The re-arm fires: the GET observes checking, runs the read-only check,
     // CASes mergeable — and the merge then consumes the moved ref.
