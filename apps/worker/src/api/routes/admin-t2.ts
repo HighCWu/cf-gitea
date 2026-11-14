@@ -20,9 +20,10 @@ import { newSalt, newPasswordRecord } from "../../auth/password";
 import { isComplexEnough, isPwned, PASSWORD_PWNED_ERROR_TEXT, type PwnedResult } from "../../auth/password-policy";
 import { configuredPasswordHashAlgo, resolvePasswordPolicy } from "../config";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
-import { AuditActions, auditEventInsert, emitAudit } from "../../services/audit";
+import { AuditActions, auditClientIp, auditEventInsert, emitAudit } from "../../services/audit";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
+import { actorCredentialOf } from "../../services/oauth2/audit-arms";
 import { enqueueRegisterNotifyMail } from "../../services/mail/register-notify";
 import { deleteUserCascade, emitUserColumnAuditRows } from "../../services/user-accounts";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -559,7 +560,7 @@ async function insertCreatedUser(
   d1: D1Database,
   form: CreateUserOption,
   now: Date,
-  audit: { actorId: number; actorName: string },
+  audit: { actorId: number; actorName: string; actorCredential?: string | null; ipAddress?: string | null },
   configuredHashSpec: string,
 ): Promise<TargetRow> {
   const lower = form.username.toLowerCase();
@@ -611,10 +612,12 @@ async function insertCreatedUser(
         action: AuditActions.UserCreate,
         actorId: audit.actorId,
         actorName: audit.actorName,
+        actorCredential: audit.actorCredential ?? null,
         scopeType: "user",
         scopeId: sql`(select cast(id as text) from users where username_lower = ${lower})`,
         scopeName: form.username,
         origin: "api",
+        ipAddress: audit.ipAddress ?? null,
         vars: { scope: form.username },
         timestamp: now,
       }),
@@ -1062,6 +1065,12 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       {
         actorId: doer.id,
         actorName: (doer.full_name ?? "").trim() !== "" ? (doer.full_name as string) : doer.login,
+        // The audit request context (census B-89's open 3 — the PATCH arm's
+        // same derivation): the calling credential (event.go:123) + the
+        // socket-peer address (common/audit.go:21's RemoteHost pick — NOT
+        // X-Forwarded-For); a bare mount keeps the landed nulls.
+        actorCredential: actorCredentialOf(c.get("auth")),
+        ipAddress: auditClientIp(c.req.raw.headers),
       },
       configuredPasswordHashAlgo(c.env).specification,
     );
@@ -1291,6 +1300,16 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       if (doer?.id === undefined) {
         throw new ApiError(401, "Unauthorized");
       }
+      // The audit request context (census B-89's open 3 — upstream's
+      // SetRequestInfo + GetDoerCredential threading): the calling
+      // credential off the auth snapshot (event.go:123's
+      // GetDoerCredential(doer), derived per request exactly like upstream's
+      // middleware-published request info) and the client address off the
+      // edge's socket-peer header (common/audit.go:21's RemoteHost pick —
+      // NOT X-Forwarded-For). A bare mount (tests/embedding without
+      // resolveAuth) keeps the landed nulls.
+      const auditCredential = actorCredentialOf(c.get("auth"));
+      const auditIp = auditClientIp(c.req.raw.headers);
       await emitUserColumnAuditRows(
         c.env.DB,
         target,
@@ -1300,6 +1319,8 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
           actorName: doer.username ?? doer.login ?? "",
           origin: "api",
           activePosted: form.active,
+          actorCredential: auditCredential,
+          ipAddress: auditIp,
         },
       ).catch((error: unknown) => {
         console.log(`[audit] user update-family rows failed (scope=${target.id}): ${String(error)}`);
@@ -1314,11 +1335,12 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
           action: AuditActions.UserType,
           actorId: doer.id,
           actorName: doer.username ?? doer.login ?? "",
-          actorCredential: null, // the write rode a token
+          actorCredential: auditCredential,
           scopeType: "user",
           scopeId: target.id,
           scopeName: target.username,
           origin: "api",
+          ipAddress: auditIp,
           vars: { scope: target.username, user_type: convertedType === "bot" ? "Bot" : "User" },
         }).catch((error: unknown) => {
           console.log(`[audit] user:type:update row failed (scope=${target.id}): ${String(error)}`);

@@ -447,4 +447,39 @@ describe("emitUserColumnAuditRows — the UpdateUser audit tail (B-89, update.go
       "user:visibility:update",
     ]);
   });
+
+  it("a request-carried context stamps actorCredential + ipAddress on EVERY row; a context without them keeps the landed nulls (census B-89's open 3 — event.go:123 + common/audit.go:21)", async () => {
+    // The PATCH arm's shape: actorCredentialOf(c.get("auth")) + auditClientIp
+    // ride the context; the helper threads both onto each emitted row — the
+    // calling credential (access-token:<id>, GetDoerCredential) and the
+    // socket-peer address (RemoteHost's pick), not just the first row.
+    await emitUserColumnAuditRows(
+      env.DB,
+      BEFORE,
+      { ...BEFORE, isAdmin: true, visibility: "limited", restricted: true },
+      { actorId: 1, actorName: "root", origin: "api", actorCredential: "access-token:77", ipAddress: "203.0.113.9" },
+    );
+    const carried = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+    expect(carried.map((r) => r.action)).toEqual(["user:status:admin", "user:status:restricted", "user:visibility:update"]);
+    for (const row of carried) {
+      expect(row.actorCredential).toBe("access-token:77");
+      expect(row.ipAddress).toBe("203.0.113.9");
+    }
+
+    // The request-less caller (a consumer, a web arm with no header): absent
+    // context fields keep the landed nulls — the AuditEventInput default,
+    // the posture every pre-threading pin asserted.
+    await emitUserColumnAuditRows(
+      env.DB,
+      { ...BEFORE, isAdmin: true, visibility: "limited", restricted: true },
+      BEFORE,
+      { actorId: 1, actorName: "root", origin: "api" },
+    );
+    const bare = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+    expect(bare).toHaveLength(6);
+    for (const row of bare.slice(3)) {
+      expect(row.actorCredential).toBeNull();
+      expect(row.ipAddress).toBeNull();
+    }
+  });
 });

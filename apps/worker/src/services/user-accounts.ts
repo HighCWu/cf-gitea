@@ -899,8 +899,21 @@ export interface UserColumnAuditContext {
   actorName: string;
   /** "api" for the PATCH route, "ui" for a web arm. */
   origin: AuditOrigin;
-  /** The client address; null when the seam has none. */
+  /** The client address (auditClientIp's CF-Connecting-IP pick — upstream
+   *  RemoteHost(req)'s socket peer); null when the seam has none. */
   ipAddress?: string | null;
+  /**
+   * The CALLING credential (upstream `ActorCredential:
+   * GetDoerCredential(doer)` — services/audit/event.go:123, stamped per
+   * RecordAs): "access-token:<id>" for a PAT ride, "oauth2-grant:<grantId>"
+   * for a grant ride — routes derive it with `actorCredentialOf(c.get("auth"))`
+   * (services/oauth2/audit-arms.ts, the established consumer shape at
+   * account-aggregates.ts/oauth2-apps.ts/repo-actions.ts). Absent or null =
+   * a session ride or a request-less caller — the rows keep the landed
+   * nulls (upstream's ExtDoerData-less doer carries the empty credential;
+   * our column renders it null, the AuditEventInput contract).
+   */
+  actorCredential?: string | null;
   /**
    * The `active` FIELD the edit posted (upstream `opts.IsActive`'s value —
    * update.go:111-114); `undefined` = not posted. This is the deviation-6
@@ -960,7 +973,9 @@ export async function emitUserColumnAuditRows(
   const base = {
     actorId: context.actorId,
     actorName: context.actorName,
-    actorCredential: null,
+    // The request-carried credential (event.go:123's GetDoerCredential over
+    // the calling doer); absent = session/request-less — the landed null.
+    actorCredential: context.actorCredential ?? null,
     scopeType: "user",
     scopeId: before.id,
     scopeName: before.username,

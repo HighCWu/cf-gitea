@@ -19,7 +19,7 @@
 
 import { env } from "cloudflare:workers";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
@@ -1367,6 +1367,94 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
       "user:type:update",
     ]);
     expect(rows.map((r) => r.scopeName)).toEqual(["root", "root", "root", "root", "root"]);
+  });
+
+  it("a request-carried arm stamps the calling credential + the socket-peer address on every row; a bare mount keeps the nulls (census B-89's open 3 — event.go:123 + common/audit.go:21)", async () => {
+    // The auth-snapshot mount (account-aggregates.ts's R3-M3 pattern):
+    // production mounts resolveAuth at /api/v1/* and it publishes
+    // c.get("auth"); the arms derive actorCredentialOf(auth) — the
+    // GetDoerCredential rendering ("access-token:<id>" / "oauth2-grant:<id>",
+    // audit_event.go:27) — and auditClientIp(headers) from it. Upstream's IP
+    // pick is RemoteHost's SOCKET peer (httplib/server_request.go:45-53),
+    // never X-Forwarded-For; ours is the edge-stamped CF-Connecting-IP.
+    const { ScopeSet } = await import("../../auth/scopes");
+    const snapshotApp = new OpenAPIHono<ApiEnv>();
+    snapshotApp.onError(giteaErrorHandler);
+    snapshotApp.use("/admin/users/*", async (c, next) => {
+      c.set("auth", {
+        user: {
+          id: adminId,
+          username: "root",
+          usernameLower: "root",
+          email: null,
+          displayName: null,
+          location: null,
+          website: null,
+          description: null,
+          isAdmin: true,
+          status: "active",
+          createdAt: NOW,
+        },
+        token: {
+          id: 77,
+          userId: adminId,
+          name: "caller-pat",
+          prefix: "cfg_caller1",
+          scopes: "all",
+          expiresAt: null,
+          lastUsedAt: null,
+          createdAt: NOW,
+        },
+        scope: ScopeSet.parseLenient("all"),
+        isBasicAuth: false,
+      });
+      await next();
+    });
+    registerAdminT2Routes(snapshotApp, createTokenAuthMiddleware(resolver()));
+    const snapshotSend = (path: string, init?: RequestInit): Promise<Response> =>
+      Promise.resolve(snapshotApp.fetch(new Request(`https://example.com${path}`, init), env));
+
+    // 1. The status flip WITH the header: the family row carries BOTH the
+    // calling credential (the CALLER's token id, not the target's) and the
+    // address.
+    const withIp = await snapshotSend("/admin/users/neighbor", {
+      method: "PATCH",
+      headers: new Headers({ "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.9" }),
+      body: JSON.stringify({ active: false }),
+    });
+    expect(withIp.status).toBe(200);
+    const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:status:active",
+      actorId: adminId,
+      actorCredential: "access-token:77",
+      ipAddress: "203.0.113.9",
+      origin: "api",
+    });
+
+    // 2. The type row WITHOUT the header: the credential still rides (the
+    // snapshot is request-carried), the address degrades to null —
+    // upstream's RemoteHost of an address-less request.
+    const noIp = await snapshotSend("/admin/users/neighbor", jsonPatch({ type: "Bot" }));
+    expect(noIp.status).toBe(200);
+    const rows2 = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+    expect(rows2).toHaveLength(2);
+    expect(rows2[1]).toMatchObject({
+      action: "user:type:update",
+      actorCredential: "access-token:77",
+      ipAddress: null,
+    });
+
+    // 3. The BARE mount (this file's other senders: no resolveAuth snapshot,
+    // no header) keeps the landed nulls — the request-less default
+    // (event.go:84-89's empty address; actorCredentialOf(undefined) = null),
+    // the posture the siblings above implicitly pinned.
+    const bare = await adminSend("/admin/users/neighbor", jsonPatch({ active: true }));
+    expect(bare.status).toBe(200);
+    const rows3 = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+    expect(rows3).toHaveLength(3);
+    expect(rows3[2]).toMatchObject({ action: "user:status:active", actorCredential: null, ipAddress: null });
   });
 });
 

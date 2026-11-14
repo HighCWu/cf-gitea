@@ -472,6 +472,43 @@ export async function emitAudit(db: DrizzleD1Database, event: AuditEventInput): 
 }
 
 // ---------------------------------------------------------------------------
+// The audit request context (census B-89's open 3 — upstream's
+// SetRequestInfo + GetDoerCredential threading)
+// ---------------------------------------------------------------------------
+
+/**
+ * The client-address header the audit rows record. Upstream pick at the pin:
+ * `common.AuditOrigin` → `audit.SetRequestInfo(store, origin,
+ * httplib.RemoteHost(req))` (routers/common/audit.go:21, mounted with origin
+ * "ui" at web.go:297 and "api" at api/v1/api.go:954), and `RemoteHost` is the
+ * host part of `req.RemoteAddr` — the SOCKET peer address, never
+ * X-Forwarded-For (modules/httplib/server_request.go:45-53). The Workers
+ * platform equivalent of that socket peer is the edge-stamped
+ * `CF-Connecting-IP` (Cloudflare derives it from the actual client
+ * connection and strips client-supplied values), so the header — not the
+ * spoofable proxy chain — is our faithful `RemoteAddr`. The auth middleware's
+ * failure limiter already reads the same header (middleware.ts:171).
+ * `buildEvent`'s default for a request-less context stays upstream's: no
+ * address (`getIPAddress` returns "", event.go:84-89) — our null.
+ */
+export const AUDIT_CLIENT_IP_HEADER = "CF-Connecting-IP";
+
+/**
+ * The audit client address from the request headers: the {@link
+ * AUDIT_CLIENT_IP_HEADER} value, trimmed; an absent or empty header yields
+ * null (no address recorded — the request-less default, the column's landed
+ * null). Routes call this at the emit site, exactly how upstream's
+ * SetRequestInfo publishes the address once and `buildEvent` reads it per
+ * record (services/audit/event.go:73).
+ */
+export function auditClientIp(headers: { get(name: string): string | null }): string | null {
+  const raw = headers.get(AUDIT_CLIENT_IP_HEADER);
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+// ---------------------------------------------------------------------------
 // The paged read — upstream FindEvents/EventSearchOptions parity
 // (audit_event.go:161-209), the read the settings audit tabs render from
 // (downstream pages) and the query-per-shape the composite index serves.
