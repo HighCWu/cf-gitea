@@ -74,7 +74,15 @@
 
 import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { ClassifiedPushCommand, DurableGitHandler, EngineCallOptions, PushValidator, PushVerdict, PusherIdentity } from "@cf-gitea/git-engine";
+import type {
+  ClassifiedPushCommand,
+  DurableGitHandler,
+  EngineCallOptions,
+  PushValidator,
+  PushVerdict,
+  PusherIdentity,
+  ValidatePushContext,
+} from "@cf-gitea/git-engine";
 
 import {
   authorizeGitHttp,
@@ -145,6 +153,7 @@ import {
   listRepoRules,
   parseRuleConfig,
   principalAccessOfRow,
+  protectedFilePatterns,
   ruleMatches,
   type ProtectedBranchConfig,
   type ProtectedBranchRow,
@@ -1636,7 +1645,7 @@ async function forwardToEngine(
 function protectedBranchValidator(env: Env, repo: RepositoryRow): PushValidator {
   return async (commands, hookCtx) => {
     try {
-      return await evaluateBranchProtection(env, repo, hookCtx.pusher ?? null, commands);
+      return await evaluateBranchProtection(env, repo, hookCtx.pusher ?? null, commands, hookCtx.changedPaths);
     } catch (error) {
       console.error(
         `[branch-protection] ${repo.ownerNamespace}/${repo.slug}: push evaluation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -1914,25 +1923,34 @@ export async function applyPushTail(
  * can send two commands for one ref — join by position, never by name).
  *
  * Upstream arms, per command (hook_pre_receive.go preReceiveBranch,
- * :123-313), ported at the v1 no-object-inspection scope (SPEC-0013 §6):
- * default-branch deletion refused absolutely (:140-143, before the rule
- * lookup), first-match rule (:149-158), the deletion predicate (:166-171),
- * the force-push refusal (:176-191), then the direct-push predicate with
- * the force variant of the refusal text (:229-267). Messages are upstream's
- * exact texts; the engine renders them as report-status ng lines. Tag refs
- * walk the protected-tag arm instead (preReceiveTag :308-339 — the batch-8
- * wiring, see the tag branch below). The UI/API-merge escape hatch
- * (:236-312) does not exist for us — merges never
+ * :123-313): default-branch deletion refused absolutely (:140-143, before
+ * the rule lookup), first-match rule (:149-158), the deletion predicate
+ * (:166-171), the force-push refusal (:176-191), then the file-pattern
+ * family and the direct-push predicate together (:207-267 —
+ * `directPushVerdict` below, census B-53 remainder (1)). Messages are
+ * upstream's exact texts; the engine renders them as report-status ng
+ * lines. Tag refs walk the protected-tag arm instead (preReceiveTag
+ * :308-339 — the batch-8 wiring, see the tag branch below). The
+ * UI/API-merge escape hatch (:236-312) does not exist for us — merges never
  * traverse receive-pack — so failure is uniformly "reject the command".
  * Upstream's PR-target deletion arm (:144-147, same deletion text) is not
  * ported: it needs the open-PR base-branch universe and is not one of the
- * SPEC-0013 M2 arms.
+ * SPEC-0013 M2 arms. `require_signed_commits` (:193-205) stays SPEC-0013
+ * §6's residue (no signature-verification surface).
+ *
+ * `changedPaths` is the engine's lease-carrying changed-path read
+ * (ValidatePushContext.changedPaths → the DO's `diffReceive`): the pushed
+ * objects are only staged while this hook runs, so the walk upstream's
+ * `GetAffectedFiles` does inside its hook is the engine's to do. It is
+ * called at most once per command, and only for a command whose rule arms a
+ * file pattern an arm will actually read.
  */
 async function evaluateBranchProtection(
   env: Env,
   repo: RepositoryRow,
   pusher: PusherIdentity | null,
   commands: ClassifiedPushCommand[],
+  changedPaths: ValidatePushContext["changedPaths"],
 ): Promise<PushVerdict[]> {
   const db = drizzle(env.DB);
   // The pusher's principal access: the in-process identity resolved at the
@@ -1972,6 +1990,83 @@ async function evaluateBranchProtection(
     return config;
   };
 
+  /**
+   * Upstream steps 4-6 for one non-delete command on a protected branch
+   * (hook_pre_receive.go:207-267), in upstream's order:
+   *
+   *   4. protected file patterns (:210-226) — a changed path matching one
+   *      flips `changedProtectedFiles`, for EVERY pusher;
+   *   5. `canPush = !changedProtectedFiles && CanUser[Force]Push` (:229-234);
+   *   6. not allowed (:237-267): a changed protected file answers its own
+   *      text — so an ALLOWLISTED pusher is refused here too; else a push
+   *      touching only unprotected-pattern files passes (:246-258); else the
+   *      direct-push refusal, force variant included.
+   *
+   * The pattern grammar and the lowercase rule are the merge arm's
+   * (`protectedFilePatterns`, branch-protection.ts — protected_branch.go
+   * getFilePatterns; patch.go:370-402 lowercases each affected path, and the
+   * refusal text carries that LOWERCASED path).
+   *
+   * Failure polarity: an `unresolved` walk (or a receive with no walk at
+   * all) THROWS — the wrapper fails the request closed, upstream's
+   * "Unable to check file protection" PrivateInternalErrorf 500 (:216,
+   * :250). A TRUNCATED walk is our budget, not an upstream arm: it decides
+   * only what its prefix proves (a protected path found is a refusal; an
+   * all-unprotected prefix proves nothing about the tail), and an undecided
+   * protected check refuses the command with the same text.
+   */
+  const directPushVerdict = async (
+    cmd: ClassifiedPushCommand,
+    branch: string,
+    config: ProtectedBranchConfig,
+    isForcePush: boolean,
+  ): Promise<PushVerdict> => {
+    const protectedPatterns = protectedFilePatterns(config.protectedFilePatterns);
+    const unprotectedPatterns = protectedFilePatterns(config.unprotectedFilePatterns);
+
+    let walked: { paths: string[]; truncated: boolean } | null = null;
+    const walk = async (): Promise<{ paths: string[]; truncated: boolean }> => {
+      if (walked !== null) return walked;
+      if (changedPaths === undefined) {
+        throw new Error(`Unable to check file protection for commits from ${cmd.old} to ${cmd.new}: the receive carries no changed-path read`);
+      }
+      const answer = await changedPaths({ ref: cmd.ref, old: cmd.old, new: cmd.new });
+      if (answer.tag !== "ok") {
+        throw new Error(`Unable to check file protection for commits from ${cmd.old} to ${cmd.new}: ${answer.reason}`);
+      }
+      // `git diff --name-only` order (full-path byte order) so the FIRST
+      // protected hit names the file upstream's limit-1 walk names.
+      walked = { paths: [...answer.paths].sort().map((path) => path.toLowerCase()), truncated: answer.truncated };
+      return walked;
+    };
+
+    let protectedFilePath: string | null = null;
+    if (protectedPatterns.length > 0) {
+      const { paths, truncated } = await walk();
+      protectedFilePath = paths.find((path) => protectedPatterns.some((pattern) => pattern.test(path))) ?? null;
+      if (protectedFilePath === null && truncated) {
+        return { reject: `Unable to check file protection for commits from ${cmd.old} to ${cmd.new}` };
+      }
+    }
+
+    const allowlisted = isForcePush ? await canUserForcePush(env.DB, config, access) : await canUserPush(env.DB, config, access);
+    if (protectedFilePath === null && allowlisted) return {};
+
+    if (protectedFilePath !== null) {
+      return { reject: `Branch ${branch} is protected from changing file ${protectedFilePath}` };
+    }
+    if (unprotectedPatterns.length > 0) {
+      const { paths, truncated } = await walk();
+      // `every` over no paths is true, like upstream's loop that never runs
+      // (CheckUnprotectedFiles, patch.go:398-420): a push changing no file
+      // passes the allowance.
+      if (!truncated && paths.every((path) => unprotectedPatterns.some((pattern) => pattern.test(path)))) return {};
+    }
+    return {
+      reject: isForcePush ? `Not allowed to force-push to protected branch ${branch}` : `Not allowed to push to protected branch ${branch}`,
+    };
+  };
+
   return Promise.all(
     commands.map(async (cmd): Promise<PushVerdict> => {
       // Tag refs walk the protected-tag check (upstream preReceiveTag,
@@ -2004,21 +2099,15 @@ async function evaluateBranchProtection(
           return {};
         case "force-push":
           // A force push to a rule without can_force_push refuses outright
-          // (:176-191); with the flag the predicate decides and failure
-          // carries the force variant of the direct-push refusal (:267).
+          // (:176-191) — step 2, BEFORE the file gate; with the flag the
+          // ladder below decides with the force predicate and refusal text.
           if (!config.canForcePush) {
             return { reject: `Branch ${branch} is protected from force push` };
           }
-          if (!(await canUserForcePush(env.DB, config, access))) {
-            return { reject: `Not allowed to force-push to protected branch ${branch}` };
-          }
-          return {};
+          return directPushVerdict(cmd, branch, config, true);
         default:
-          // create / fast-forward — the canPush arm (:229-267)
-          if (!(await canUserPush(env.DB, config, access))) {
-            return { reject: `Not allowed to push to protected branch ${branch}` };
-          }
-          return {};
+          // create / fast-forward
+          return directPushVerdict(cmd, branch, config, false);
       }
     }),
   );

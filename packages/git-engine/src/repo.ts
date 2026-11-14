@@ -29,6 +29,7 @@ import {
   countDivergence,
   deleteApiRef,
   destroy,
+  diffReceive,
   executeMerge,
   finalizeReceive,
   listCommitsRange,
@@ -58,6 +59,8 @@ import {
   type DeleteApiRefInput,
   type DeleteApiRefResult,
   type DestroyResult,
+  type DiffReceiveInput,
+  type DiffReceiveResult,
   type ExecuteMergeInput,
   type ExecuteMergeResult,
   type FinalizeForkImportInput,
@@ -1344,6 +1347,15 @@ export class RepoCell extends DurableObject<Env> {
    * force-push, ancestry over the lease-staged rows — ONE RPC per push. */
   async classifyReceive(input: ClassifyReceiveInput): Promise<ClassifyReceiveResult> {
     return classifyReceive(this.leaseHost(), input);
+  }
+
+  /** The lease-carrying changed-path walk for the Worker receive flow's
+   * `validatePush` hook file-pattern arms (hook_pre_receive.go:210-260 —
+   * census B-53 remainder (1)): the hook asks, this DO walks the
+   * lease-staged rows (re-primed, the classifyReceive posture). ONE RPC per
+   * command whose rule arms a file gate, never per push. */
+  async diffReceive(input: DiffReceiveInput): Promise<DiffReceiveResult> {
+    return diffReceive(this.leaseHost(), input);
   }
 
   // ---- API commit builder (SPEC-0001a §4) + merge surface (SPEC-0001b §4) --

@@ -81,7 +81,8 @@ import {
   resolveAgitBaseTopic,
   splitCommitTitleBody,
 } from "../api/services/agit";
-import { deployKeys, PRFlow, repoCounters, repoRedirects, repoSettings, repositories, issues, pullRequests, releases, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { deployKeys, PRFlow, repoCounters, repoRedirects, repoSettings, repositories, issues, protectedBranches, pullRequests, releases, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { emptyRuleConfig, serializeRuleConfig, type ProtectedBranchConfig } from "../services/branch-protection";
 import { purgeRepoMessage } from "../repos/purge";
 import { IssuesService } from "../issues/service";
 import { RepoService } from "../repos/service";
@@ -3183,4 +3184,249 @@ describe("the lane boundary: rowless (engine-only) repos keep the engine's liter
       expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(0);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// The push-side protected-file family (hook_pre_receive.go:207-267 — census
+// B-53 remainder (1), landed with the engine's lease-carrying
+// `diffReceive`/`changedPaths` seam): upstream steps 4-6 ride the protected
+// branch ladder — the file walk refuses even an ALLOWLISTED pusher, the
+// `unprotected_files_only` allowance lets a non-allowlisted one through, the
+// force refusal still precedes the gate, and a branch-create diffs from its
+// divergence point (GetCommitBranchStart).
+// ---------------------------------------------------------------------------
+
+/** One commit pack over a {path: content} file map — nested paths build real
+ *  subtrees (buildAgitCommitPack fixes the path at file.txt; this battery
+ *  needs controlled ones). workerd-safe, the buildAgitCommitPack shape. */
+async function buildBatteryFilesPack(opts: { files: Record<string, string>; parent?: string; message?: string }): Promise<{ oid: string; pack: Uint8Array }> {
+  const encoder = new TextEncoder();
+  const blobs = new Map<string, { oid: string; body: Uint8Array }>();
+  for (const [path, content] of Object.entries(opts.files)) {
+    const body = encoder.encode(content);
+    const oid = await batterySha1Hex(concatBatteryU8([encoder.encode(`blob ${body.length}\0`), body]));
+    blobs.set(path, { oid, body });
+  }
+  const dirs = new Set<string>();
+  for (const path of blobs.keys()) {
+    const segments = path.split("/");
+    for (let i = 1; i < segments.length; i++) dirs.add(segments.slice(0, i).join("/") + "/");
+  }
+  const treeOids = new Map<string, string>();
+  const buildTreeBody = (prefix: string): Uint8Array => {
+    const entries: { name: string; mode: string; oidHex: string }[] = [];
+    for (const [path, blob] of blobs) {
+      if (!path.startsWith(prefix)) continue;
+      const rest = path.slice(prefix.length);
+      if (rest.includes("/")) continue;
+      entries.push({ name: rest, mode: "100644", oidHex: blob.oid });
+    }
+    for (const dir of dirs) {
+      if (!dir.startsWith(prefix) || dir === prefix) continue;
+      // `dir` carries its trailing '/': strip it before the depth test (a
+      // bare "Secret/" is a DIRECT child, not a deeper path)
+      const rest = dir.slice(prefix.length);
+      const bare = rest.endsWith("/") ? rest.slice(0, -1) : rest;
+      if (bare.includes("/")) continue;
+      entries.push({ name: bare, mode: "40000", oidHex: treeOids.get(dir)! });
+    }
+    // git tree order: names byte-compared, directories as name + '/'
+    const keyOf = (entry: { name: string; mode: string }): string => entry.name + (entry.mode === "40000" ? "/" : "");
+    entries.sort((a, b) => {
+      const ka = keyOf(a);
+      const kb = keyOf(b);
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    const chunks: Uint8Array[] = [];
+    for (const entry of entries) {
+      chunks.push(encoder.encode(`${entry.mode} ${entry.name}\0`));
+      chunks.push(batteryRawOid(entry.oidHex));
+    }
+    return concatBatteryU8(chunks);
+  };
+  const treeShaOf = async (body: Uint8Array): Promise<string> => batterySha1Hex(concatBatteryU8([encoder.encode(`tree ${body.length}\0`), body]));
+  const objects: { type: number; body: Uint8Array }[] = [];
+  for (const blob of blobs.values()) objects.push({ type: 3, body: blob.body });
+  // bottom-up: a subtree's oid exists before its parent's body builds
+  const deepestFirst = [...dirs].sort((a, b) => b.split("/").length - a.split("/").length);
+  for (const dir of deepestFirst) {
+    const body = buildTreeBody(dir);
+    const sha = await treeShaOf(body);
+    treeOids.set(dir, sha);
+    objects.push({ type: 2, body });
+  }
+  const rootBody = buildTreeBody("");
+  const rootSha = await treeShaOf(rootBody);
+  objects.push({ type: 2, body: rootBody });
+  const parentLines = opts.parent !== undefined ? `parent ${opts.parent}\n` : "";
+  const commitBody = encoder.encode(
+    `tree ${rootSha}\n` +
+      parentLines +
+      `author Battery Tester <battery@example.com> 1700000200 +0000\n` +
+      `committer Battery Tester <battery@example.com> 1700000200 +0000\n\n` +
+      (opts.message ?? "battery files commit") +
+      `\n`,
+  );
+  const commitSha = await batterySha1Hex(concatBatteryU8([encoder.encode(`commit ${commitBody.length}\0`), commitBody]));
+  objects.push({ type: 1, body: commitBody });
+  const chunks: Uint8Array[] = [encoder.encode("PACK"), batteryBe32(2), batteryBe32(objects.length)];
+  for (const object of objects) {
+    chunks.push(batteryObjectHeader(object.type, object.body.length));
+    chunks.push(await batteryDeflate(object.body));
+  }
+  chunks.push(await batterySha1Bytes(concatBatteryU8(chunks)));
+  return { oid: commitSha, pack: concatBatteryU8(chunks) };
+}
+
+/** Seed one protected-branch rule row (the branch-protection-push.test.ts
+ *  shape: the full config through the landed serializer). */
+async function seedFileRule(repoId: string, ruleName: string, config: Partial<ProtectedBranchConfig>): Promise<void> {
+  await drizzle(env.DB)
+    .insert(protectedBranches)
+    .values({
+      repoId,
+      ruleName,
+      priority: 0,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), ...config }),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .run();
+}
+
+/** One plain receive (report-status + side-band, NO push-options section —
+ *  the file battery sends no options, and advertising the capability would
+ *  make the gate's section parse read the pack as the options section). */
+async function pushFileBattery(engineName: string, token: string, command: { old?: string; oid: string; ref: string }, pack: Uint8Array): Promise<string> {
+  const response = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+    body: buildAgitPushBody([command], { pack, caps: "report-status side-band-64k" }),
+  });
+  expect(response.status).toBe(200);
+  return parseAgitResponse(await response.arrayBuffer()).report;
+}
+
+async function batteryRefTip(engineName: string, ref: string): Promise<string | undefined> {
+  return (await env.REPO.getByName(engineName).listRefs()).refs.find((r) => r.name === ref)?.target;
+}
+
+describe("the push-side protected-file family (hook_pre_receive.go:207-267 — census B-53 remainder (1))", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM protected_branches").run();
+  });
+
+  it("a changed protected file refuses even a pusher the rule allows, with the LOWERCASED path; a public-file push lands", async () => {
+    const { repoId, engineName, token, tip } = await seedTailRepo("protfileallow");
+    // can_push with the whitelist off: every writer passes CanUserPush — the
+    // file gate is the ONLY thing that can refuse this pusher (:229-234:
+    // canPush = !changedProtectedFiles && CanUserPush).
+    await seedFileRule(repoId, "main", { canPush: true, protectedFilePatterns: "SECRET/**" });
+
+    const secret = await buildBatteryFilesPack({ files: { "Secret/Token.txt": "rot13\n" }, parent: tip, message: "touch a protected file" });
+    const refused = await pushFileBattery(engineName, token, { old: tip, oid: secret.oid, ref: "refs/heads/main" }, secret.pack);
+    // The column lowercases at compile and the walk lowercases each path
+    // (patch.go:370-402) — the refusal names the lowercased path.
+    expect(refused).toContain("ng refs/heads/main Branch main is protected from changing file secret/token.txt");
+    expect(await batteryRefTip(engineName, "refs/heads/main")).toBe(tip);
+
+    const open = await buildBatteryFilesPack({ files: { "docs/public.md": "fine\n" }, parent: tip, message: "touch a public file" });
+    const landed = await pushFileBattery(engineName, token, { old: tip, oid: open.oid, ref: "refs/heads/main" }, open.pack);
+    expect(landed).toContain("ok refs/heads/main\n");
+    expect(await batteryRefTip(engineName, "refs/heads/main")).toBe(open.oid);
+  });
+
+  it("the unprotected_files_only allowance passes a pusher the rule does NOT allow; an outside file and a protected file each refuse with their own text", async () => {
+    const { repoId, engineName, token, tip } = await seedTailRepo("protfileunprot");
+    // can_push unset: CanUserPush is false for everyone — only the
+    // allowance (:246-258) can let a push through.
+    await seedFileRule(repoId, "main", { protectedFilePatterns: "secret/**", unprotectedFilePatterns: "docs/**" });
+
+    const docsOnly = await buildBatteryFilesPack({ files: { "docs/a.md": "free\n" }, parent: tip, message: "docs only" });
+    // The tree is replaced wholesale, so the seed commit's own file counts as
+    // a changed (deleted) path outside docs/** — the allowance must NOT pass.
+    const mixed = await pushFileBattery(engineName, token, { old: tip, oid: docsOnly.oid, ref: "refs/heads/main" }, docsOnly.pack);
+    expect(mixed).toContain("ng refs/heads/main Not allowed to push to protected branch main");
+    expect(await batteryRefTip(engineName, "refs/heads/main")).toBe(tip);
+
+    // A protected file under the same non-allowed pusher: the file text
+    // wins over the direct-push refusal (:240-243 precedes :246).
+    const leak = await buildBatteryFilesPack({ files: { "secret/leak.txt": "leak\n" }, parent: tip, message: "leak" });
+    const fileText = await pushFileBattery(engineName, token, { old: tip, oid: leak.oid, ref: "refs/heads/main" }, leak.pack);
+    expect(fileText).toContain("ng refs/heads/main Branch main is protected from changing file secret/leak.txt");
+  });
+
+  it("the allowance passes when EVERY changed path is unprotected", async () => {
+    const { repoId, engineName, token } = await seedTailRepo("protfileevery");
+    // A docs-only base lands first on an unruled branch, so the next push's
+    // diff is docs-only on both sides.
+    const base = await buildBatteryFilesPack({ files: { "docs/a.md": "one\n" }, message: "docs base" });
+    const staged = await pushFileBattery(engineName, token, { oid: base.oid, ref: "refs/heads/docs" }, base.pack);
+    expect(staged).toContain("ok refs/heads/docs\n");
+
+    await seedFileRule(repoId, "docs", { protectedFilePatterns: "secret/**", unprotectedFilePatterns: "docs/**" });
+    const next = await buildBatteryFilesPack({ files: { "docs/a.md": "one\n", "docs/b.md": "two\n" }, parent: base.oid, message: "docs follow-up" });
+    const allowed = await pushFileBattery(engineName, token, { old: base.oid, oid: next.oid, ref: "refs/heads/docs" }, next.pack);
+    expect(allowed).toContain("ok refs/heads/docs\n");
+    expect(await batteryRefTip(engineName, "refs/heads/docs")).toBe(next.oid);
+  });
+
+  it("a branch CREATE diffs from its divergence point (GetCommitBranchStart), not from the root", async () => {
+    const { repoId, engineName, token, tip } = await seedTailRepo("protfilecreate");
+    // main (unruled) already carries a file under the protected pattern.
+    const base = await buildBatteryFilesPack({ files: { "secret/base.txt": "base\n" }, parent: tip, message: "main carries a secret" });
+    const onMain = await pushFileBattery(engineName, token, { old: tip, oid: base.oid, ref: "refs/heads/main" }, base.pack);
+    expect(onMain).toContain("ok refs/heads/main\n");
+
+    await seedFileRule(repoId, "release/**", { canPush: true, protectedFilePatterns: "secret/**" });
+
+    // The new branch adds a second secret. A root-based diff would name
+    // secret/base.txt first (path order); the divergence base is main's tip,
+    // so ONLY the new file is a change.
+    const leak = await buildBatteryFilesPack({
+      files: { "secret/base.txt": "base\n", "secret/leak.txt": "leak\n" },
+      parent: base.oid,
+      message: "release adds a secret",
+    });
+    const refused = await pushFileBattery(engineName, token, { oid: leak.oid, ref: "refs/heads/release/1" }, leak.pack);
+    expect(refused).toContain("ng refs/heads/release/1 Branch release/1 is protected from changing file secret/leak.txt");
+    expect(await batteryRefTip(engineName, "refs/heads/release/1")).toBeUndefined();
+
+    // Inherited-but-unchanged secrets do not refuse the create.
+    const clean = await buildBatteryFilesPack({
+      files: { "secret/base.txt": "base\n", "docs/ok.md": "ok\n" },
+      parent: base.oid,
+      message: "release adds docs",
+    });
+    const landed = await pushFileBattery(engineName, token, { oid: clean.oid, ref: "refs/heads/release/2" }, clean.pack);
+    expect(landed).toContain("ok refs/heads/release/2\n");
+    expect(await batteryRefTip(engineName, "refs/heads/release/2")).toBe(clean.oid);
+  });
+
+  it("a force push meets the outright refusal BEFORE the file gate, then the gate with the force predicate", async () => {
+    const { repoId, engineName, token, tip } = await seedTailRepo("protfileforce");
+    await seedFileRule(repoId, "main", { canPush: true, protectedFilePatterns: "secret/**" });
+
+    // can_force_push unset: step 2's refusal (:176-191), no walk needed —
+    // even though this rewrite WOULD trip the file gate.
+    const rewrite = await buildBatteryFilesPack({ files: { "secret/rewritten.txt": "rewritten\n" }, message: "unrelated rewrite" });
+    const outright = await pushFileBattery(engineName, token, { old: tip, oid: rewrite.oid, ref: "refs/heads/main" }, rewrite.pack);
+    expect(outright).toContain("ng refs/heads/main Branch main is protected from force push");
+
+    await drizzle(env.DB)
+      .update(protectedBranches)
+      .set({ rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true, canForcePush: true, protectedFilePatterns: "secret/**" }) })
+      .where(eq(protectedBranches.repoId, repoId));
+
+    // can_force_push set and the predicate holds: the file gate refuses.
+    const gated = await pushFileBattery(engineName, token, { old: tip, oid: rewrite.oid, ref: "refs/heads/main" }, rewrite.pack);
+    expect(gated).toContain("ng refs/heads/main Branch main is protected from changing file secret/rewritten.txt");
+    expect(await batteryRefTip(engineName, "refs/heads/main")).toBe(tip);
+
+    // The same rule, a rewrite outside the patterns: the force push lands.
+    const open = await buildBatteryFilesPack({ files: { "docs/rewrite.md": "open\n" }, message: "unrelated open rewrite" });
+    const landed = await pushFileBattery(engineName, token, { old: tip, oid: open.oid, ref: "refs/heads/main" }, open.pack);
+    expect(landed).toContain("ok refs/heads/main\n");
+    expect(await batteryRefTip(engineName, "refs/heads/main")).toBe(open.oid);
+  });
 });

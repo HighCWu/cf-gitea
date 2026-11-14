@@ -40,14 +40,14 @@ import {
   CommandResult,
   PushCommand,
 } from "./git/protocol";
-import { ObjType, hashObject, parseCommit } from "./git/objects";
+import { ObjType, hashObject, isTreeMode, parseCommit, parseTree, type TreeEntry } from "./git/objects";
 import { ZERO_OID, isOid, toHex } from "./git/util";
 import { isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
 import type { PackState } from "./git/packstore";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
 import { serializeCommit, serializeTag, personLine } from "./commit/serialize";
-import { mergeBase as graphMergeBase, listCommitsRange as graphListCommitsRange, countDivergence as graphCountDivergence, resolveCommitish } from "./merge/graph";
+import { mergeBase as graphMergeBase, listCommitsRange as graphListCommitsRange, countDivergence as graphCountDivergence, peelToCommitOid, resolveCommitish } from "./merge/graph";
 import { checkMergeability as classifyMergeability, executeMerge as runExecuteMerge } from "./merge/engine";
 import { rebaseOnto as runRebaseOnto } from "./merge/rebase";
 import type {
@@ -615,6 +615,213 @@ export async function classifyReceive(host: LeaseHost, input: ClassifyReceiveInp
     }
   }
   return { tag: "ok", kinds };
+}
+
+/** Changed paths one {@link diffReceive} answer may carry before reporting
+ * truncation (the caller's file gate fails closed on a truncated walk that
+ * found no decisive path). */
+export const DIFF_RECEIVE_MAX_PATHS = 10_000;
+/** Tree objects one {@link diffReceive} walk may load (bounds a push that
+ * rewrites an enormous directory fan-out). */
+export const DIFF_RECEIVE_MAX_TREE_LOADS = 50_000;
+/** Other-branch tips the branch-create arm examines for the divergence
+ * point (HEAD's branch first). */
+export const DIFF_RECEIVE_MAX_BRANCH_TIPS = 32;
+
+/** One command's changed-path question for the Worker-side `validatePush`
+ * hook's file-pattern arms. */
+export interface DiffReceiveInput {
+  leaseToken: string;
+  /** the command's full ref name — the branch-create arm excludes it from the
+   * "other branches" containment set */
+  ref: string;
+  /** all-zeros for a created ref (the divergence-point walk) */
+  old: string;
+  next: string;
+}
+
+export type DiffReceiveOk = {
+  tag: "ok";
+  /** changed paths, repo-relative, case preserved, tree order */
+  paths: string[];
+  /** a budget ran out before the walk finished: `paths` is a PREFIX */
+  truncated: boolean;
+};
+export type DiffReceiveResult =
+  | DiffReceiveOk
+  | { tag: "lease_mismatch" }
+  /** the walk could not answer (missing object, no divergence point, graph
+   * budget exhausted) — never a "no changes" answer */
+  | { tag: "unresolved"; reason: string };
+
+/**
+ * The changed paths of one receive command, for the Worker-side
+ * `validatePush` hook's file-pattern arms (upstream's pre-receive
+ * protected-file gate, routers/private/hook_pre_receive.go:210-260 —
+ * `GetAffectedFiles`, modules/git/diff.go:299-335). The hook stays
+ * policy-only: it asks, the DO walks the lease-staged rows (re-primed here,
+ * the {@link classifyReceive} posture — the backend cache is in-memory and
+ * this instance may have been recycled since the rows landed). Pure reads.
+ *
+ * Two arms, upstream's:
+ *
+ * - an UPDATE (`old` non-zero) is `git diff --name-only <old> <new>`: the
+ *   direct two-tree comparison, no merge base (a force push diffs its two
+ *   tips exactly like a fast-forward);
+ * - a CREATE (`old` all-zeros) first finds the divergence point
+ *   (`GetCommitBranchStart`, modules/git/repo_commit.go:441-470: walk
+ *   `git log <new>` and take the first commit another branch contains) —
+ *   ported as the newest merge base of the new tip against the OTHER branch
+ *   tips (newest committer time, the order `git log` walks; ties by the
+ *   smaller oid). No divergence point is upstream's own error
+ *   ("cannot find the start commit of %s", diff.go:306-308): a root/unrelated
+ *   branch create cannot be checked and the caller fails closed.
+ *
+ * The comparison is by oid+mode per path, descending only into subtrees
+ * whose oids differ. NO rename detection: upstream's porcelain `git diff`
+ * pairs renames and lists the destination only; this walk lists BOTH sides
+ * of a rename (the engine's diff semantics everywhere — readDiff has none
+ * either). The consequence is one-directional: a rename AWAY from a
+ * protected path is listed here and not upstream, so the caller's gate is
+ * stricter on that edge, never looser.
+ */
+export async function diffReceive(host: LeaseHost, input: DiffReceiveInput): Promise<DiffReceiveResult> {
+  const { store } = host;
+  const lease = store.getLease(input.leaseToken);
+  if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
+    return { tag: "lease_mismatch" };
+  }
+  const payload = parseLeasePayload(lease.payload);
+  if (payload.packName && payload.stagingKey) store.packs.primePack(payload.packName, payload.stagingKey);
+
+  const treeOf = async (commitOid: string): Promise<string | null> => {
+    const obj = await store.get(commitOid);
+    return obj?.type === "commit" ? parseCommit(obj.data).tree : null;
+  };
+
+  const nextCommit = await peelToCommitOid(store, input.next);
+  const nextTree = nextCommit === null ? null : await treeOf(nextCommit);
+  if (nextCommit === null || nextTree === null) {
+    return { tag: "unresolved", reason: `cannot resolve the pushed commit ${input.next}` };
+  }
+
+  let baseTree: string | null;
+  if (input.old === ZERO_OID) {
+    // HEAD's branch first, so the common "new branch off the default
+    // branch" resolves inside the tip cap on a many-branch repository.
+    const head = store.head();
+    const tips = store
+      .refs()
+      .filter((r) => r.name.startsWith("refs/heads/") && r.name !== input.ref)
+      .sort((a, b) => (a.name === head ? -1 : b.name === head ? 1 : 0))
+      .slice(0, DIFF_RECEIVE_MAX_BRANCH_TIPS);
+    let best: { oid: string; time: number } | null = null;
+    let exhausted = false;
+    for (const tip of tips) {
+      const answer = await graphMergeBase(store, nextCommit, tip.oid);
+      if (answer.exhausted) exhausted = true;
+      if (answer.value === null) continue;
+      const obj = await store.get(answer.value);
+      if (obj?.type !== "commit") continue;
+      const time = parseCommit(obj.data).committer.time;
+      if (best === null || time > best.time || (time === best.time && answer.value < best.oid)) {
+        best = { oid: answer.value, time };
+      }
+    }
+    if (best === null) {
+      return {
+        tag: "unresolved",
+        reason: exhausted
+          ? `the divergence walk for ${nextCommit} exhausted its budget`
+          : `cannot find the start commit of ${nextCommit}`,
+      };
+    }
+    baseTree = await treeOf(best.oid);
+    if (baseTree === null) return { tag: "unresolved", reason: `cannot resolve the start commit ${best.oid}` };
+  } else {
+    const oldCommit = await peelToCommitOid(store, input.old);
+    baseTree = oldCommit === null ? null : await treeOf(oldCommit);
+    if (baseTree === null) return { tag: "unresolved", reason: `cannot resolve the old commit ${input.old}` };
+  }
+
+  const paths = new Set<string>();
+  const budget = { trees: DIFF_RECEIVE_MAX_TREE_LOADS, truncated: false };
+  await diffTreePaths(store, baseTree, nextTree, "", paths, budget);
+  return { tag: "ok", paths: [...paths], truncated: budget.truncated };
+}
+
+/** The simultaneous two-tree walk behind {@link diffReceive}: every path
+ * whose (oid, mode) differs between the sides, files under an added/removed
+ * subtree included. Identical subtrees are skipped without a load. */
+async function diffTreePaths(
+  store: GitStore,
+  oldTree: string | null,
+  newTree: string | null,
+  prefix: string,
+  out: Set<string>,
+  budget: { trees: number; truncated: boolean }
+): Promise<void> {
+  if (budget.truncated || oldTree === newTree) return;
+  const load = async (oid: string | null): Promise<TreeEntry[]> => {
+    if (oid === null) return [];
+    if (budget.trees <= 0) {
+      budget.truncated = true;
+      return [];
+    }
+    budget.trees -= 1;
+    const obj = await store.get(oid);
+    if (obj?.type !== "tree") {
+      // a tree the walk cannot read is an UNKNOWN set of paths, never an
+      // empty one — the answer degrades to truncated (callers fail closed)
+      budget.truncated = true;
+      return [];
+    }
+    return parseTree(obj.data);
+  };
+  const oldEntries = new Map((await load(oldTree)).map((e) => [e.name, e]));
+  const newEntries = await load(newTree);
+  if (budget.truncated) return;
+
+  const emit = (path: string): void => {
+    if (out.has(path)) return;
+    if (out.size >= DIFF_RECEIVE_MAX_PATHS) {
+      budget.truncated = true;
+      return;
+    }
+    out.add(path);
+  };
+  /** One side of an entry: a subtree contributes every file beneath it, a
+   * blob/symlink/gitlink contributes its own path. */
+  const side = async (entry: TreeEntry, isOld: boolean): Promise<void> => {
+    const path = prefix + entry.name;
+    if (isTreeMode(entry.mode)) {
+      await diffTreePaths(store, isOld ? entry.oid : null, isOld ? null : entry.oid, `${path}/`, out, budget);
+    } else {
+      emit(path);
+    }
+  };
+
+  for (const n of newEntries) {
+    if (budget.truncated) return;
+    const o = oldEntries.get(n.name);
+    oldEntries.delete(n.name);
+    if (o === undefined) {
+      await side(n, false);
+    } else if (o.oid === n.oid && o.mode === n.mode) {
+      continue;
+    } else if (isTreeMode(o.mode) && isTreeMode(n.mode)) {
+      await diffTreePaths(store, o.oid, n.oid, `${prefix}${n.name}/`, out, budget);
+    } else {
+      // content, mode or type change: each side lists what it holds (a
+      // file↔directory swap lists the file path and the directory's files)
+      await side(o, true);
+      await side(n, false);
+    }
+  }
+  for (const o of oldEntries.values()) {
+    if (budget.truncated) return;
+    await side(o, true);
+  }
 }
 
 /**

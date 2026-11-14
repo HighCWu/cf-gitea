@@ -80,6 +80,8 @@ export type {
   CommitApiChangeInput,
   CommitApiChangeResult,
   DestroyResult,
+  DiffReceiveInput,
+  DiffReceiveResult,
   FinalizedPack,
   FinalizeReceiveInput,
   FinalizeReceiveResult,
@@ -265,7 +267,9 @@ export interface PushEvent {
  * command plus the engine-side classification (SPEC-0013 M2). create/delete
  * are wire facts; fast-forward vs force-push is ancestry, classified by the
  * engine over the lease-staged rows (one batched `classifyReceive` RPC per
- * push) — the hook never walks objects.
+ * push) — the hook never walks objects ITSELF. A policy that needs the
+ * pushed content (the protected-file arms) asks the engine through
+ * `ValidatePushContext.changedPaths`, and the DO does the walk.
  */
 export interface ClassifiedPushCommand {
   ref: string;
@@ -283,6 +287,19 @@ export interface PushVerdict {
 }
 
 /**
+ * The answer of `ValidatePushContext.changedPaths`. `ok` carries the changed
+ * paths (repo-relative, case preserved); `truncated: true` means a walk
+ * budget ran out and `paths` is only a PREFIX. `unresolved` means the walk
+ * could not answer at all (a missing object, no divergence point for a
+ * created branch, a lost lease) — it is NEVER "nothing changed". A policy
+ * must fail closed on `unresolved`, and on `truncated` unless the prefix
+ * already decided it.
+ */
+export type ChangedPathsVerdict =
+  | { tag: "ok"; paths: string[]; truncated: boolean }
+  | { tag: "unresolved"; reason: string };
+
+/**
  * The per-call context of a `validatePush` invocation. `pusher` is the
  * embedding Worker's authenticated identity for this receive — the same
  * in-process channel as `PushEvent.pusherId` (never derivable from client
@@ -291,11 +308,21 @@ export interface PushVerdict {
  * (gitprotocol-pack push-options section) when the push sent any — the
  * policy hook's view of the same data `PushEvent.pushOptions` surfaces
  * after apply.
+ *
+ * `changedPaths` is the lease-carrying changed-path read (upstream's
+ * pre-receive `GetAffectedFiles`, hook_pre_receive.go:210-260): the files one
+ * command changes, walked DO-side over the lease-staged rows (the
+ * `diffReceive` RPC — an update diffs its two tips, a create diffs from its
+ * divergence point). One RPC per call, so a policy asks only for the
+ * commands whose rule needs it. The receive flow always supplies it; it is
+ * optional in the type for hand-built contexts, and a policy whose file arm
+ * is armed must treat its absence as `unresolved`.
  */
 export interface ValidatePushContext {
   repo: string;
   pusher?: PusherIdentity;
   pushOptions?: string[];
+  changedPaths?: (command: { ref: string; old: string; new: string }) => Promise<ChangedPathsVerdict>;
 }
 
 /**
@@ -1315,6 +1342,20 @@ async function receivePack<E extends Env>(
         repo,
         ...(pusher !== undefined ? { pusher } : {}),
         ...(push.pushOptions.length > 0 ? { pushOptions: push.pushOptions } : {}),
+        // The lease-carrying changed-path read: the hook asks, the DO walks
+        // the staged rows under THIS receive's lease. A lost lease surfaces
+        // as `unresolved` (the push is dead regardless; the policy fails
+        // closed and finalize reports the lease mismatch).
+        changedPaths: async (command) => {
+          const res = await stub.diffReceive({
+            leaseToken: begin.leaseToken,
+            ref: command.ref,
+            old: command.old,
+            next: command.new,
+          });
+          if (res.tag === "ok") return { tag: "ok", paths: res.paths, truncated: res.truncated };
+          return { tag: "unresolved", reason: res.tag === "lease_mismatch" ? "receive lease lost" : res.reason };
+        },
       });
       hookRejects = verdictRejects(verdicts, push.commands.length);
     }

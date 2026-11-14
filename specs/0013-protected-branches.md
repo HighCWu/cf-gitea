@@ -493,9 +493,10 @@ commit (`pull-reviews.ts`, migration 0018).
   the `unprotected_files_only` allowance (`:248-260`) compounds it. (As-built,
   census B-53 2026-11-13: the MERGE-side half ENFORCES now —
   `MergeBlockedByProtectedFiles` over the merge-time walk, `services/branch-protection.ts`
-  `mergeBlockedByProtectedFiles`; the pre-receive PUSH-side family
-  (`hook_pre_receive.go:210-260`, the `unprotected_files_only` allowance included)
-  stays this list's residue.)
+  `mergeBlockedByProtectedFiles`. As-built 2026-11-14: the pre-receive PUSH-side
+  family (`hook_pre_receive.go:207-267`, the `unprotected_files_only` allowance
+  included) ENFORCES too — see "As-built — the push-side file-pattern family"
+  below; this bullet is no longer a deferral.)
 - **`require_signed_commits`** — no commit-signature verification surface exists.
 - **`block_on_codeowner_reviews`** — no CODEOWNERS surface. (As-built, census
   B-53 2026-11-13: LANDED — `services/codeowners.ts` ports the parser, owner
@@ -1084,3 +1085,67 @@ service wrapper (services/repository/branch.go:416-496):
   rule-named admin refusal (flash redirect, refs + rule unchanged), the
   onto-protected-name refusal (:461-468 — the bypass this port closes), and
   the wildcard refusal with the pattern never rewritten.
+
+## As-built — the push-side file-pattern family (2026-11-14, the B52R2 unit)
+
+The §6 bullet above retires: the pre-receive protected-file gate and the
+`unprotected_files_only` allowance enforce on every D1-resolved receive.
+
+The seam (the M2 posture, amended): `hook_pre_receive` walks `GetAffectedFiles`
+INSIDE its hook — the pushed objects exist only as the receive's staged pack in
+our flow, so the Worker-side `validatePush` hook cannot do that walk itself. It
+now doesn't have to: the hook context carries `changedPaths` (mod.ts, the
+receive flow's closure over `begin.leaseToken`), a lease-carrying call into the
+NEW `diffReceive` DO RPC (control-plane.ts, repo.ts delegate — the
+`classifyReceive` posture: lease validation, staged-pack re-prime, pure reads).
+The hook still never walks objects ITSELF; it asks, the DO walks (the posture
+line updated in NOTICE.md 2026-11-14). Receives composed without the hook
+(mirror/import/passthrough) carry no closure — unreachable there by
+construction.
+
+The DO walk, upstream arm for arm:
+
+- an UPDATE is `git diff --name-only <old> <new>` — the direct two-tree
+  comparison (a force push diffs its two tips exactly like a fast-forward),
+  by oid+mode per path, descending only into subtrees whose oids differ;
+- a CREATE first finds the divergence point (`GetCommitBranchStart`,
+  repo_commit.go:441-470 — the first commit in `git log <new>` another branch
+  contains), ported as the newest merge base of the new tip against the other
+  branch tips (HEAD's branch first, 32-tip cap; the pick rule is newest
+  committer time, the order `git log` walks). No divergence point is
+  upstream's own "cannot find the start commit of %s" (diff.go:306-308) —
+  the RPC answers `unresolved` and the caller fails closed.
+
+Budgets: 10k changed paths, 50k tree loads per walk (a budget hit sets
+`truncated: true` — the answer is a PREFIX, never silently short); the
+divergence/merge-base walks ride the landed `MERGE_BASE_MAX_VISITS`. A tree
+the walk cannot read is `truncated`, never an empty answer.
+
+The gate ladder (`git-http/gate.ts` `directPushVerdict`, upstream's order):
+step 4 (protected patterns over the lowercased paths — the refusal names the
+lowercased path, patch.go:370-402) → step 5 (`canPush = !changed && the
+predicate` — an allowlisted pusher IS refused here) → step 6 (the file text;
+else the allowance — `every` over the changed paths against the unprotected
+patterns, an empty diff passing like upstream's loop that never runs; else
+the direct-push refusal with the force variant). The force-push outright
+refusal (`:176-191`) stays step 2, before any walk. The deleted arm never
+walks. Failure polarity: an `unresolved` walk (or a context without the
+closure while a pattern arms the gate) throws — the wrapper fails the request
+closed, upstream's "Unable to check file protection" 500 (:216/:250); a
+TRUNCATED walk decides only what its prefix proves, and an undecided
+protected check refuses the command with that same text (our budget, not an
+upstream arm). Recorded adaptation: NO rename detection (the engine diff
+semantics everywhere — readDiff has none either): a rename away from a
+protected path is listed here where upstream's porcelain pairs it, so the
+gate is stricter on that edge, never looser.
+
+Verified by `gate.test.ts`'s protected-file battery (5 end-to-end pins over
+real staged packs: the allowlisted-pusher refusal with the lowercased path +
+its public-file control, the allowance matrix for a non-allowed pusher with
+the file-text precedence, the every-changed-path-unprotected pass, the
+branch-create divergence walk (the refusal names only the branch's own new
+secret, not the inherited one) + its inherited-secret control, and the
+force-push ordering (outright refusal before the gate, the gate over an
+allowlisted force pusher, the landing control)) + the pre-existing
+`branch-protection-push.test.ts` 7 pins staying green (the ladder's
+no-pattern arms are byte-identical).
