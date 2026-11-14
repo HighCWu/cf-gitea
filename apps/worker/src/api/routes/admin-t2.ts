@@ -684,10 +684,15 @@ const adminCreateUserRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
  * (update.go:265–267) — an empty/absent password leaves the stored record
  * untouched (optional.FromNonDefault semantics). `active`, `admin`,
  * `description`, `email`, `full_name`, `location`, `prohibit_login`,
- * `visibility`, `website` map onto landed columns; the account-flag set
- * without columns (`allow_create_organization`, `allow_git_hook`,
- * `allow_import_local`, `max_repo_creation`, `restricted`) is accepted and
- * ignored.
+ * `restricted`, `visibility`, `website` map onto landed columns —
+ * `restricted` writes `users.is_restricted` PRESENCE-gated exactly like
+ * upstream (the API binds `IsRestricted: optional.FromPtr(form.Restricted)`,
+ * admin/user.go:247 → `optional.FromPtr`: a present field writes ANY value,
+ * an absent field never touches the column; update.go:135-139's
+ * `if opts.IsRestricted.Has()` — no last-admin/actual-change guard, unlike
+ * IsAdmin and Visibility). The still-columnless account-flag set
+ * (`allow_create_organization`, `allow_git_hook`, `allow_import_local`,
+ * `max_repo_creation`) is accepted and ignored.
  */
 const editUserOptionSchema = z.object({
   active: z.boolean().optional().openapi({ description: "Whether the user account is active" }),
@@ -1216,6 +1221,12 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (form.email !== undefined) patch.email = form.email;
     if (form.visibility !== undefined) patch.visibility = form.visibility;
     if (form.admin !== undefined) patch.isAdmin = form.admin;
+    // IsRestricted (update.go:135-139): PRESENCE-gated only — the API binds
+    // optional.FromPtr(form.Restricted) (admin/user.go:247), so a present
+    // field writes ANY value and an absent field never touches the column.
+    // The formerly accepted-and-ignored posture is cured here (B-89's OPEN
+    // half 2): the write arms the helper's UserRestricted row below.
+    if (form.restricted !== undefined) patch.restricted = form.restricted;
     // Deviation 6: the active/prohibit_login pair folds into one status
     // column — either "off" signal lands 'prohibited', an explicit-on lands
     // 'active', absence leaves the row untouched.
@@ -1240,9 +1251,9 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       // status fold's driver rule: only an `active` post emits
       // user:status:active — upstream's prohibit_login write rides
       // UpdateAuth, whose tail (:281-293) records no prohibit row. The
-      // restricted arm cannot fire here yet: the PATCH still
-      // accepts-and-ignores the field (deviation 1), so after.restricted is
-      // always the old value. Failure posture = upstream writeEvent
+      // restricted arm is LIVE: `restricted` writes the column above
+      // (update.go:135-139's presence gate), so a flip emits
+      // user:status:restricted (:210-212). Failure posture = upstream writeEvent
       // (audit/event.go:129-133): a failed audit INSERT logs and never
       // errorizes the successful write.
       const doer = c.get("authUser");

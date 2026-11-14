@@ -1228,34 +1228,72 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(rows).toHaveLength(1);
   });
 
-  it("accepts restricted without a write and without a row (the deviation-1 accepted-and-ignored set; the emit arm fires when a write site lands the column)", async () => {
+  it("writes is_restricted presence-gated and emits user:status:restricted on a flip; the same-value post is silent (B-89's OPEN half 2 cured: update.go:135-139's write arms :210-212)", async () => {
+    // A PRESENT field writes ANY value (the API binds
+    // optional.FromPtr(form.Restricted), admin/user.go:247 — no
+    // last-admin/actual-change guard, unlike IsAdmin and Visibility): true
+    // flips the column and fires the tail's UserRestricted row
+    // (update.go:210-212).
     const res = await adminSend("/admin/users/neighbor", jsonPatch({ restricted: true }));
     expect(res.status).toBe(200);
-    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
-    expect(row.restricted).toBe(false); // the pre-existing accepted-and-ignore posture
-    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+    const flipped = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(flipped.restricted).toBe(true);
+    expect(((await res.json<Record<string, unknown>>())).restricted).toBe(true);
+    let rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:status:restricted",
+      actorId: adminId,
+      scopeType: "user",
+      scopeId: String(neighborId),
+      scopeName: "neighbor",
+      origin: "api",
+      message: "Changed restricted status of user neighbor to true.",
+    });
+
+    // The false post rides the same presence gate and emits its row.
+    const back = await adminSend("/admin/users/neighbor", jsonPatch({ restricted: false }));
+    expect(back.status).toBe(200);
+    const cleared = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
+    expect(cleared.restricted).toBe(false);
+    rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({
+      action: "user:status:restricted",
+      message: "Changed restricted status of user neighbor to false.",
+    });
+
+    // An ABSENT field never touches the column (optional.FromPtr(nil) =
+    // Has() false, update.go:135's guard) — an unrelated patch emits
+    // nothing even from the column-bearing row.
+    const other = await adminSend("/admin/users/neighbor", jsonPatch({ location: "Lisbon" }));
+    expect(other.status).toBe(200);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(2);
   });
 
   it("a combined patch emits the family in upstream order BEFORE the type row (B-89, update.go:204-218's fixed order)", async () => {
     // root with a second admin beside it: admin:false passes the last-admin
     // guard AND the Bot conversion's effective-admin check (the 1105 test's
-    // fold), so ONE patch carries all four family/type diffs at once.
+    // fold), so ONE patch carries all five family/type diffs at once —
+    // restricted included (the :210-212 arm is live since the column write
+    // landed).
     await drizzle(env.DB)
       .insert(users)
       .values({ username: "root2", usernameLower: "root2", isAdmin: true, status: "active", createdAt: NOW });
     const res = await adminSend(
       "/admin/users/root",
-      jsonPatch({ active: false, admin: false, visibility: "private", type: "Bot" }),
+      jsonPatch({ active: false, admin: false, restricted: true, visibility: "private", type: "Bot" }),
     );
     expect(res.status).toBe(200);
     const rows = await drizzle(env.DB).select().from(auditEvents).all();
     expect(rows.map((r) => r.action)).toEqual([
       "user:status:active",
       "user:status:admin",
+      "user:status:restricted",
       "user:visibility:update",
       "user:type:update",
     ]);
-    expect(rows.map((r) => r.scopeName)).toEqual(["root", "root", "root", "root"]);
+    expect(rows.map((r) => r.scopeName)).toEqual(["root", "root", "root", "root", "root"]);
   });
 });
 

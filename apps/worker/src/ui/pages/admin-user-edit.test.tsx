@@ -38,9 +38,12 @@
  *     notices — upstream's arms are real, users.go:526-527, ADR-0008
  *     re-opens them; hand-crafted POSTs store nothing) beside the
  *     RESTRICTED ARM's real store (the users.is_restricted column landed —
- *     users.go:523 binds `IsRestricted: optional.Some(form.Restricted)`
- *     always-applied like IsAdmin; the checkbox renders the row's flag and
- *     the submit stores both directions), the type
+     *     users.go:523 binds `IsRestricted: optional.Some(form.Restricted)`
+     *     always-applied like IsAdmin; the checkbox renders the row's flag and
+     *     the submit stores both directions), the UpdateUser audit tail
+     *     (B-89's web arm — the family emits with origin "ui" at the
+     *     users.go:511-548 UpdateUser position, upstream's fixed order with
+     *     the type row last, the unchanged round-trip's silence), the type
  *     arms (the REAL user↔bot conversion since B-72, the admin/org refusal
  *     arms, the effective-admin fold, the bot password-skip; junk at the
  *     bind), the reset-2FA arm, the bind arms (silent flagged
@@ -65,7 +68,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { loginSources, repositories, twoFactor, userRedirects, users } from "../../db/schema";
+import { auditEvents, loginSources, repositories, twoFactor, userRedirects, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -100,6 +103,7 @@ const FIXTURE_TABLES = [
   "user_redirects",
   "org_members",
   "teams",
+  "audit_event", // B-89's web-arm battery reads it — the password arm's rows must not leak across tests
   "users",
 ];
 
@@ -754,6 +758,69 @@ describe("the submit — the restricted arm (users.go:523, the users.is_restrict
     await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.id, seeded.aliceId));
     expect(await submit(seeded, aliceForm({}, ["active"]))).toEqual({ outcome: "updated" });
     expect((await rowOf(seeded.aliceId)).restricted).toBe(false);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Census B-89's WEB arm — the UpdateUser audit tail (services/user/update.go:
+// 204-218) adopted at the same faithful point as the API arm (admin-t2.ts):
+// right after the ONE column UPDATE, BEFORE the type emit — upstream's fixed
+// family order active → admin → restricted → visibility, then the tail's
+// LAST member (:216-218's user:type:update). Origin "ui"; the actor is the
+// editing doer; scopeName carries the pre-rename in-memory username (the
+// landed UserType row's posture). Upstream's web arm always posts every
+// audited field (optional.Some binds, users.go:511-524) — the family rows
+// fire only on an ACTUAL before/after diff (the helper's `!=` guards).
+// -----------------------------------------------------------------------------
+
+describe("the submit — the UpdateUser audit tail (B-89's web arm, origin ui)", () => {
+  it("a restricted flip emits user:status:restricted with the rendered message (update.go:210-212)", async () => {
+    const seeded = await seedEdit();
+    expect(await submit(seeded, aliceForm({}, ["active", "restricted"]))).toEqual({ outcome: "updated" });
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:status:restricted",
+      actorId: seeded.adminId, // the editing doer
+      // actorName rides the seam's landed posture (the password arm's, the
+      // B-72 type row's: the submit receives only the doer ID, so the
+      // snapshot names the TARGET row).
+      actorName: "edit-alice",
+      scopeType: "user",
+      scopeId: String(seeded.aliceId),
+      scopeName: "edit-alice",
+      origin: "ui",
+      message: "Changed restricted status of user edit-alice to true.",
+    });
+  });
+
+  it("an active-driven flip emits user:status:active; the family order rides restricted → visibility BEFORE the type row (update.go:204-218's order)", async () => {
+    const seeded = await seedEdit();
+    // active unchecked (the flip driver) + restricted checked + visibility
+    // limited + the Bot conversion — admin unchecked so the conversion's
+    // effective-admin fold passes. One patch carries three family diffs and
+    // the type diff; status itself stays out of the way (activePosted=false
+    // IS the posted driver, so the :204-206 arm fires it).
+    const outcome = await submit(seeded, aliceForm({ user_type: "Bot", visibility: "1" }, ["restricted"]));
+    expect(outcome).toEqual({ outcome: "updated" });
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual([
+      "user:status:active",
+      "user:status:restricted",
+      "user:visibility:update",
+      "user:type:update",
+    ]);
+    expect(rows[0]).toMatchObject({ origin: "ui", message: "Changed activation status of user edit-alice to false." });
+    expect(rows[2]).toMatchObject({
+      action: "user:visibility:update",
+      message: "Changed visibility of user edit-alice from public to limited.",
+    });
+  });
+
+  it("an unchanged round-trip emits NOTHING (the helper's actual-change guards — upstream's `!=` arms)", async () => {
+    const seeded = await seedEdit();
+    expect(await submit(seeded, aliceForm())).toEqual({ outcome: "updated" });
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
   });
 });
 

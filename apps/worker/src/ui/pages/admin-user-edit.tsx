@@ -170,7 +170,9 @@
  * REAL since the is_restricted column landed, stored in the column patch
  * like admin) → the email arm (org / duplicate) → the
  * UpdateUser position
- * (the type arms, the last-admin guard, then ONE column UPDATE) → the
+ * (the type arms, the last-admin guard, then ONE column UPDATE, then the
+ * shared UpdateUser audit tail — B-89's family emits with origin "ui", the
+ * type row last) → the
  * reset-2FA arm → the 303 onto `adminUserLink(targetId)` (upstream's
  * Flash success + redirect; the no-flash reduction drops the banner —
  * admin.users.update_profile_success has no renderable analog). Upstream
@@ -273,7 +275,7 @@ import {
 } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError } from "../../services/orgs/orgs";
 import { findLoginSources, type LoginSourceRow } from "../../services/auth-sources/store";
-import { validateNewPassword } from "../../services/user-accounts";
+import { emitUserColumnAuditRows, validateNewPassword } from "../../services/user-accounts";
 import { newPasswordRecord } from "../../auth/password";
 import { DEFAULT_PASSWORD_POLICY, type PasswordPolicy } from "../../auth/password-policy";
 import type { UiContext } from "../ui-context";
@@ -746,6 +748,35 @@ export async function submitAdminUserEdit(
   const typeChanged = parsedUserType !== null && parsedUserType !== user.type;
   if (typeChanged) patch.type = parsedUserType;
   await db.update(users).set(patch).where(eq(users.id, user.id));
+  // UpdateUser's audit tail (B-89, services/user/update.go:204-218 — the
+  // shared service block upstream runs after EVERY UpdateUser commit,
+  // :200's UpdateUserCols; both admin edit arms emit through it upstream,
+  // this web arm at users.go:511-548's opts): one row per ACTUALLY-changed
+  // audited column against the pre-UPDATE `user` snapshot (:68), in
+  // upstream's fixed order active → admin → restricted → visibility; the
+  // type emit below is the tail's LAST member (:216-218) and stays after
+  // it. `after` is the write's own intent (upstream compares the mutated
+  // in-memory struct — not a re-read). The status fold's driver rule (the
+  // UserColumnAuditContext doc): the web form ALWAYS posts `active` (the
+  // rendered checkbox, upstream's `IsActive: optional.Some(form.Active)`,
+  // users.go:514), so the posted value rides as `activePosted` — only an
+  // active-driven status flip emits user:status:active; a prohibit-only
+  // flip stays silent (upstream's prohibit_login write rides UpdateAuth,
+  // whose tail :281-293 records no prohibit row). Failure posture =
+  // upstream writeEvent (audit/event.go:129-133): a failed audit INSERT
+  // logs and never errorizes the successful write.
+  await emitUserColumnAuditRows(
+    d1,
+    user,
+    { ...user, ...patch },
+    // actorId is the editing doer; actorName carries this seam's landed
+    // actor-name posture (the password arm's, reused by B-72's type row:
+    // the submit receives only the doer ID, so the snapshot names the
+    // TARGET row — same shape the type emit below carries).
+    { actorId: doerId, actorName: user.username, origin: "ui", activePosted: form.active },
+  ).catch((error: unknown) => {
+    console.error(`admin-edit: user update-family audit rows failed (scope=${user.id}): ${String(error)}`);
+  });
   if (typeChanged) {
     // UpdateUser's type-change audit (update.go:217 — the shared service
     // tail, the API arm's twin): actor the doer, scope the edited row,
