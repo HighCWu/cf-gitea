@@ -61,10 +61,10 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
@@ -790,6 +790,10 @@ describe("the submit — the UpdateUser audit tail (B-89's web arm, origin ui)",
       scopeId: String(seeded.aliceId),
       scopeName: "edit-alice",
       origin: "ui",
+      // The request-less direct submit keeps the landed nulls (AUDITCTX:
+      // ipAddress null; credential null — the session ride).
+      ipAddress: null,
+      actorCredential: null,
       message: "Changed restricted status of user edit-alice to true.",
     });
   });
@@ -1063,5 +1067,93 @@ describe("POST /-/admin/users/{id}/edit — the route resolves the deploy-config
     // landed default "pbkdf2$50000$50" (the env→knob resolution ran).
     expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
     expect(await verifyPassword("A-Fresh-Password!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// AUDITCTX's web arm — the route threads the carried request into the edit
+// arm's audit rows (the admin-t2.test.ts auth-snapshot pin's ui twin): the
+// submitted Request's CF-Connecting-IP is the rows' ipAddress through
+// auditClientIp (services/audit.ts — the socket-peer pick), and the
+// credential stays null on EVERY row (the edit rides the admin's session —
+// the recorded divergence). The request-less direct submits above keep the
+// landed nulls.
+// -----------------------------------------------------------------------------
+
+describe("POST /-/admin/users/{id}/edit — the route threads the audit request context (AUDITCTX's web arm)", () => {
+  it("a password + restricted POST with CF-Connecting-IP stamps BOTH rows with the address; the credential stays null (the session ride)", async () => {
+    const seeded = await seedEdit();
+    const cookie = await mintSession(env.DB, seeded.adminId);
+    const context = createExecutionContext();
+    const res = await routeApp.fetch(
+      new Request(`https://test.local/-/admin/users/${seeded.aliceId}/edit`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://test.local",
+          cookie: `${SESSION_COOKIE_NAME}=${cookie}`,
+          "CF-Connecting-IP": "203.0.113.9",
+        },
+        body: aliceForm({ password: "A-Fresh-Password!" }, ["active", "restricted"]).toString(),
+      }),
+      env,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(res.status).toBe(303);
+
+    // The rows emit detached (`void emitAudit`) — poll, the
+    // middleware-wire.test.ts posture for fire-and-forget rows.
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+      expect(rows.map((r) => r.action)).toEqual(["user:password", "user:status:restricted"]);
+      for (const row of rows) {
+        expect(row.ipAddress).toBe("203.0.113.9");
+        expect(row.actorCredential).toBeNull();
+      }
+    });
+  });
+
+  it("the type conversion's user:type:update row carries the address; a header-less POST keeps the null (the request-less default)", async () => {
+    const seeded = await seedEdit();
+    const cookie = await mintSession(env.DB, seeded.adminId);
+    const post = async (overrides: Record<string, string>, withIp: boolean): Promise<Response> => {
+      const context = createExecutionContext();
+      const res = await routeApp.fetch(
+        new Request(`https://test.local/-/admin/users/${seeded.aliceId}/edit`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: "https://test.local",
+            cookie: `${SESSION_COOKIE_NAME}=${cookie}`,
+            ...(withIp ? { "CF-Connecting-IP": "198.51.100.7" } : {}),
+          },
+          body: aliceForm(overrides, ["active"]).toString(),
+        }),
+        env,
+        context,
+      );
+      await waitOnExecutionContext(context);
+      return res;
+    };
+
+    // 1. The Bot conversion WITH the header: the type row (no password on
+    // the post, so the bot-skip never engages) carries the address.
+    expect((await post({ user_type: "Bot" }, true)).status).toBe(303);
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ action: "user:type:update", ipAddress: "198.51.100.7", actorCredential: null });
+    });
+
+    // 2. The visibility flip WITHOUT the header: the family row's address
+    // degrades to null — auditClientIp's absent-header arm (upstream's
+    // RemoteHost of an address-less request).
+    expect((await post({ visibility: "1" }, false)).status).toBe(303);
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+      expect(rows).toHaveLength(2);
+      expect(rows[1]).toMatchObject({ action: "user:visibility:update", ipAddress: null, actorCredential: null });
+    });
   });
 });

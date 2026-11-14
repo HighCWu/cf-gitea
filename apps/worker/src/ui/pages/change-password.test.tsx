@@ -27,17 +27,17 @@
  */
 
 import { env } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
 import { renderToString } from "hono/jsx/dom/server";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { userSignInPassword } from "../../auth/password-auth";
 import { newPasswordRecord, verifyPassword } from "../../auth/password";
 import { changeOwnPassword } from "../../services/user-accounts";
-import { users } from "../../db/schema";
+import { auditEvents, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -242,6 +242,39 @@ describe("POST /user/settings/change_password", () => {
     expect(await lookupValidSession(env.DB, cookie)).not.toBeNull();
   });
 
+  it("the user:password row stamps the request's CF-Connecting-IP; the credential stays null (AUDITCTX — the applyPasswordReset arm's ui submit, the session ride)", async () => {
+    const alice = await seedUser("Alice", { password: TEMP_PASSWORD });
+    await flagMustChange(alice.id);
+    const cookie = await mintSession(env.DB, alice.id, { remember: false });
+
+    const res = await request("/user/settings/change_password", {
+      ...form({ password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+        cookie: sessionSetCookie(cookie, false),
+        "CF-Connecting-IP": "203.0.113.9",
+      },
+    });
+    expect(res.status).toBe(303);
+
+    // The row emits detached (`void emitAudit`) — poll, the
+    // middleware-wire.test.ts posture for fire-and-forget rows.
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "user:password",
+        actorId: alice.id,
+        actorCredential: null,
+        scopeType: "user",
+        scopeId: String(alice.id),
+        origin: "ui",
+        ipAddress: "203.0.113.9",
+      });
+    });
+  });
+
   it("the apply stores under the CONFIGURED spec: PASSWORD_HASH_ALGO=pbkdf2_v1 arms the route's SetPassword target to pbkdf2$10000$50 (B-87's route-glue half — the shared UpdateAuth arm reads the deploy config, update.go:256-264 + security.go:175)", async () => {
     const alice = await seedUser("Alice", { password: TEMP_PASSWORD });
     await flagMustChange(alice.id);
@@ -410,5 +443,36 @@ describe("the settings-tab arm's mcp clear (account.go:78 — changeOwnPassword)
     // rehash-on-login under the DEFAULT spec and rewrite the row).
     expect(await verifyPassword(NEW_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
     expect(await verifyPassword(TEMP_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
+  });
+
+  it("the user:password row stamps the request's CF-Connecting-IP; the credential stays null (AUDITCTX — the changeOwnPassword arm's ui submit, the session ride)", async () => {
+    const alice = await seedUser("Alice", { password: TEMP_PASSWORD }); // NOT flagged — the settings tree is reachable
+
+    const res = await request("/user/settings/account", {
+      ...form({ old_password: TEMP_PASSWORD, password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+        cookie: await loginAs(alice),
+        "CF-Connecting-IP": "198.51.100.7",
+      },
+    });
+    expect(res.status).toBe(303);
+
+    // The row emits detached (`void emitAudit`) — poll, the
+    // middleware-wire.test.ts posture for fire-and-forget rows.
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).orderBy(asc(auditEvents.id)).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "user:password",
+        actorId: alice.id,
+        actorCredential: null,
+        scopeType: "user",
+        scopeId: String(alice.id),
+        origin: "ui",
+        ipAddress: "198.51.100.7",
+      });
+    });
   });
 });

@@ -1378,6 +1378,10 @@ import {
   renderUserSettingsAccountPage,
 } from "./pages/user-settings-account";
 import { applyPasswordReset, changeOwnPassword } from "../services/user-accounts";
+// AUDITCTX: the two UpdateAuth web arms derive their audit rows' ipAddress
+// at the emit site (services/audit.ts's CF-Connecting-IP pick — upstream's
+// socket-peer RemoteHost).
+import { auditClientIp } from "../services/audit";
 // Census B-87: the password-knob readers over the deploy config (SPEC-0002
 // §6.5) — the two UpdateAuth web arms + the admin-create arm thread the
 // resolved policy (and the configured hash spec) into the ladders.
@@ -12102,6 +12106,9 @@ async function userSettingsAccountPasswordSubmit(c: Context<{ Bindings: Env }>):
   const outcome = await changeOwnPassword(c.env.DB, p.viewer.id, form, {
     policy: resolvePasswordPolicy(c.env),
     configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+    // The user:password row's client address (the auditClientIp derivation;
+    // the credential stays null — the arm rides the session).
+    ipAddress: auditClientIp(c.req.raw.headers),
   });
   if (outcome.outcome === "changed") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/account" } }));
@@ -12167,6 +12174,9 @@ async function userSettingsChangePasswordSubmit(c: Context<{ Bindings: Env }>): 
     {
       policy: resolvePasswordPolicy(c.env),
       configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+      // The user:password row's client address (the auditClientIp derivation;
+      // the credential stays null — the arm rides the session).
+      ipAddress: auditClientIp(c.req.raw.headers),
     },
   );
   if (outcome.outcome === "changed") {
@@ -14511,10 +14521,20 @@ async function adminUserEditSubmit(c: Context<{ Bindings: Env }>, userId: number
   // hash spec) — the resolved policy gates the password arm's ladder and
   // the configured hash spec is SetPassword's target; unset stays
   // upstream's default (the landed pbkdf2 arm).
-  const outcome = await submitAdminUserEdit(c.env.DB, userId, doerId, form, {
-    policy: resolvePasswordPolicy(c.env),
-    configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
-  });
+  // The carried request feeds the edit arm's audit rows' ipAddress (the
+  // auditClientIp derivation inside the submit; the credential stays null —
+  // the edit rides the admin's session).
+  const outcome = await submitAdminUserEdit(
+    c.env.DB,
+    userId,
+    doerId,
+    form,
+    {
+      policy: resolvePasswordPolicy(c.env),
+      configuredHashSpec: configuredPasswordHashAlgo(c.env).specification,
+    },
+    c.req.raw,
+  );
   if (outcome.outcome === "unknown-target") {
     return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
   }

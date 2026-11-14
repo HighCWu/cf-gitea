@@ -445,6 +445,20 @@ export interface PasswordArmOptions {
   policy?: PasswordPolicy;
   fetchImpl?: typeof fetch;
   configuredHashSpec?: string;
+  /**
+   * The audit client address for the arms' user:password row (the
+   * user-accounts audit tail's ipAddress column, upstream
+   * `audit.SetRequestInfo(store, origin, RemoteHost(req))` —
+   * routers/common/audit.go:21): callers WITH a request derive it at the
+   * emit site as `auditClientIp(c.req.raw.headers)` (services/audit.ts —
+   * the CF-Connecting-IP pick, upstream's socket-peer RemoteAddr), matching
+   * the landed AUDITCTX route-side shape. Absent or null = a request-less
+   * caller — the row keeps the landed null (the request-less default,
+   * upstream's empty address). The credential stays null on these rows:
+   * both web arms ride a SESSION (upstream's ExtDoerData-less doer — the
+   * recorded divergence), so no actorCredential option exists here.
+   */
+  ipAddress?: string | null;
 }
 
 export interface ChangePasswordForm {
@@ -527,12 +541,14 @@ export async function changeOwnPassword(
     action: AuditActions.UserPassword,
     actorId: userId,
     actorName: row.username,
-    actorCredential: null,
+    actorCredential: null, // the change rode a session (the recorded divergence)
     scopeType: "user",
     scopeId: userId,
     scopeName: row.username,
     origin: "ui",
-    ipAddress: null,
+    // The caller's request-derived address (PasswordArmOptions.ipAddress —
+    // auditClientIp at the route); absent = the request-less null.
+    ipAddress: options?.ipAddress ?? null,
     vars: { scope: row.username },
   }).catch((error: unknown) => {
     console.error(`change-password: audit row failed: ${String(error)}`);
@@ -868,12 +884,14 @@ export async function applyPasswordReset(
     action: AuditActions.UserPassword,
     actorId: userId,
     actorName: row.username,
-    actorCredential: null,
+    actorCredential: null, // a session (must-change) or a reset CODE (apply) — no doer token
     scopeType: "user",
     scopeId: userId,
     scopeName: row.username,
     origin: "ui",
-    ipAddress: null,
+    // The caller's request-derived address (PasswordArmOptions.ipAddress —
+    // auditClientIp at the route); absent = the request-less null.
+    ipAddress: options?.ipAddress ?? null,
     vars: { scope: row.username },
   }).catch((error: unknown) => {
     console.error(`reset-password: audit row failed: ${String(error)}`);

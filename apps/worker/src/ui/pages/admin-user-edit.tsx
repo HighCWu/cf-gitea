@@ -275,6 +275,7 @@ import {
 } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError } from "../../services/orgs/orgs";
 import { findLoginSources, type LoginSourceRow } from "../../services/auth-sources/store";
+import { auditClientIp } from "../../services/audit";
 import { emitUserColumnAuditRows, validateNewPassword } from "../../services/user-accounts";
 import { newPasswordRecord } from "../../auth/password";
 import { DEFAULT_PASSWORD_POLICY, type PasswordPolicy } from "../../auth/password-policy";
@@ -581,7 +582,15 @@ function visibilityFromString(raw: string): "public" | "limited" | "private" {
  * POST /-/admin/users/{userid}/edit (admin.EditUserPost, users.go:413-557)
  * over the landed seams — the module header carries the ladder and every
  * reduction. The caller supplies the §2.8-guarded, prologue-gated doer id
- * (`doerId`) for the skip-self prohibit guard.
+ * (`doerId`) for the skip-self prohibit guard. `request` is the raw Request
+ * the route holds (ui/index.ts's adminUserEditSubmit passes `c.req.raw`);
+ * its headers feed the audit rows' ipAddress through {@link auditClientIp}
+ * (the AUDITCTX route-side derivation — the CF-Connecting-IP socket-peer
+ * pick). Omitted (the direct-submit tests' posture) = the request-less
+ * default: the rows keep the null address. The credential stays null on
+ * every row either way — the edit rides the admin's SESSION (upstream's
+ * ExtDoerData-less doer; the AuditEventInput contract's recorded
+ * divergence).
  */
 export async function submitAdminUserEdit(
   d1: D1Database,
@@ -589,10 +598,15 @@ export async function submitAdminUserEdit(
   doerId: number,
   form: AdminUserEditForm,
   knobs?: AdminUserEditKnobs,
+  request?: Request,
 ): Promise<AdminUserEditOutcome> {
   const db = drizzle(d1);
   const user = await db.select().from(users).where(eq(users.id, targetId)).get();
   if (user === undefined) return { outcome: "unknown-target" };
+  // The audit client address, derived ONCE from the carried request (the
+  // SetRequestInfo-once posture — absent/empty header = null, the column's
+  // request-less default; never a sentinel string).
+  const auditIp = request === undefined ? null : auditClientIp(request.headers);
 
   // --- the bind phase (web.Bind's AdminEditUserForm validation; a miss
   // re-renders at 200 with the flagged fields and NO banner — the silent
@@ -673,12 +687,12 @@ export async function submitAdminUserEdit(
       action: AuditActions.UserPassword,
       actorId: doerId,
       actorName: user.username,
-      actorCredential: null,
+      actorCredential: null, // the edit rode a session (the recorded divergence)
       scopeType: "user",
       scopeId: user.id,
       scopeName: user.username,
       origin: "ui",
-      ipAddress: null,
+      ipAddress: auditIp,
       vars: { scope: user.username },
     }).catch((error: unknown) => {
       console.error(`admin-edit: audit row failed: ${String(error)}`);
@@ -772,8 +786,16 @@ export async function submitAdminUserEdit(
     // actorId is the editing doer; actorName carries this seam's landed
     // actor-name posture (the password arm's, reused by B-72's type row:
     // the submit receives only the doer ID, so the snapshot names the
-    // TARGET row — same shape the type emit below carries).
-    { actorId: doerId, actorName: user.username, origin: "ui", activePosted: form.active },
+    // TARGET row — same shape the type emit below carries). ipAddress is
+    // the carried request's auditClientIp pick (null request-less);
+    // actorCredential stays absent = null — the edit rides a session.
+    {
+      actorId: doerId,
+      actorName: user.username,
+      origin: "ui",
+      ipAddress: auditIp,
+      activePosted: form.active,
+    },
   ).catch((error: unknown) => {
     console.error(`admin-edit: user update-family audit rows failed (scope=${user.id}): ${String(error)}`);
   });
@@ -792,7 +814,7 @@ export async function submitAdminUserEdit(
       scopeId: user.id,
       scopeName: user.username,
       origin: "ui",
-      ipAddress: null,
+      ipAddress: auditIp,
       vars: { scope: user.username, user_type: parsedUserType === "bot" ? "Bot" : "User" },
     }).catch((error: unknown) => {
       console.error(`admin-edit: audit row failed: ${String(error)}`);

@@ -30,7 +30,7 @@ import { TokenService } from "./token-service";
 import { authUserFromRow, userSignInPassword } from "./password-auth";
 import { getTwoFactorByUid, validateAndConsumeTotp } from "./two-factor";
 import { hasCredentialsForUser } from "../web/webauthn-store";
-import { AuditActions, emitAudit } from "../services/audit";
+import { AuditActions, auditClientIp, emitAudit } from "../services/audit";
 import { oauth2FeatureEnabled, resolveOAuth2AccessTokenCredential, type ResolvedOAuth2Credential } from "../services/oauth2/token";
 
 /** Message used for every bad/expired/revoked credential (api.go:862–875). */
@@ -305,6 +305,14 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
           // basic.go:182's audit row rides the generic 401 (the
           // "invalid provided OTP" text stays OFF the wire — api.go:867's
           // generic fallback swallows every non-ErrUserAuthMessage error).
+          // The row's address is the auditClientIp derivation, NOT the
+          // limiter's `ip` above: that value is the RATE-LIMIT bucket key,
+          // whose "unknown" sentinel is a legitimate identity for an
+          // unaddressable client — but an audit row's ipAddress is a client
+          // ADDRESS or null (the AuditEventInput contract; upstream's
+          // RemoteHost is always the socket peer), so an absent header
+          // records null here, never the sentinel string. Same header,
+          // distinct semantics, derivations kept separate on purpose.
           void emitAudit(drizzle(c.env.DB), {
             action: AuditActions.UserAuthenticationFailTwoFactor,
             actorId: outcome.userId,
@@ -314,7 +322,7 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
             scopeId: outcome.userId,
             scopeName: outcome.username,
             origin: "api",
-            ipAddress: ip,
+            ipAddress: auditClientIp(c.req.raw.headers),
             vars: { scope: outcome.username },
           }).catch((error: unknown) => {
             console.error(`basic-auth: audit row failed: ${String(error)}`);
