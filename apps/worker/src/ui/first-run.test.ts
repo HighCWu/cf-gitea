@@ -42,6 +42,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { verifyPassword } from "../auth/password";
 import { sessions, userRedirects, users } from "../db/schema";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { firstRunRouter } from "./first-run";
@@ -80,18 +81,24 @@ const fakeAssets: UiAssetsFetcher = {
 type UiTestEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
 
 /** Route-level request with a REAL execution context (the session.test.ts
- *  pattern): any `waitUntil` side-effect is awaited before assertions.
- *  `allowSignup` toggles the env var the way the deployment's `vars` block
- *  would. */
+ *  pattern): any `waitUntil` side-effect is awaited before the response
+ *  returns. `allowSignup` toggles the env var the way the deployment's `vars`
+ *  block would; `passwordHashAlgo` arms PASSWORD_HASH_ALGO the same way
+ *  (census B-87's route-glue half — the install caller threads
+ *  configuredPasswordHashAlgo(c.env).specification). */
 async function request(
   path: string,
   init?: RequestInit,
-  options?: { allowSignup?: string },
+  options?: { allowSignup?: string; passwordHashAlgo?: string },
 ): Promise<Response> {
-  const testEnv: Omit<UiTestEnv, "ALLOW_SIGNUP"> & { ALLOW_SIGNUP?: string } = {
+  const testEnv: Omit<UiTestEnv, "ALLOW_SIGNUP" | "PASSWORD_HASH_ALGO"> & {
+    ALLOW_SIGNUP?: string;
+    PASSWORD_HASH_ALGO?: string;
+  } = {
     ...env,
     ASSETS: fakeAssets,
     ALLOW_SIGNUP: options?.allowSignup,
+    PASSWORD_HASH_ALGO: options?.passwordHashAlgo,
   };
   const context = createExecutionContext();
   const response = await app.fetch(new Request(`https://test.local${path}`, init), testEnv, context);
@@ -198,6 +205,47 @@ describe("POST /install — the one-shot admin init", () => {
     const cookieValue = directive.split(";")[0]?.split("=").slice(1).join("=") ?? "";
     const resolution = await resolveViewer(env, new Request("https://test.local/", { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` } }));
     expect(resolution.viewer).toEqual({ kind: "user", id: admin.id, username: "Root", isAdmin: true });
+  });
+
+  it("stores the bootstrap admin's password under the CONFIGURED spec (PASSWORD_HASH_ALGO=pbkdf2_v1 -> pbkdf2$10000$50) — the record verifies on the install's auto-login and the follow-up sign-in (B-87's route-glue half)", async () => {
+    expect(await initWindowOpen(env.DB)).toBe(true);
+
+    const res = await request(
+      "/install",
+      form({ admin_name: "Root", email: "root@example.com", admin_passwd: "Bootstrap-1a", retype: "Bootstrap-1a" }),
+      { passwordHashAlgo: "pbkdf2_v1" },
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+
+    // Exactly one user row — the bootstrap admin — stored under the DEALIASED
+    // configured spec, NOT the landed default (the service-level store pins
+    // live in user-accounts.test.ts; THIS is the route's env-resolution half,
+    // first-run.ts threads configuredPasswordHashAlgo(c.env).specification).
+    expect(await userCount()).toBe(1);
+    const admin = (await adminRows())[0]!;
+    expect(admin.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(await verifyPassword("Bootstrap-1a", admin.passwd, admin.salt, admin.passwdHashAlgo)).toBe(true);
+
+    // The install's auto-login minted the admin's session…
+    expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(1);
+    // …and the SAME password signs in through the real POST /login under the
+    // armed env: the stored record verifies at the sign-in ladder and the row
+    // stays put (already at the configured spec — no rehash rewrite).
+    const login = await request(
+      "/login",
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ user_name: "Root", password: "Bootstrap-1a" }).toString(),
+      },
+      { passwordHashAlgo: "pbkdf2_v1" },
+    );
+    expect(login.status).toBe(303);
+    const after = (await adminRows())[0]!;
+    expect(after.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(after.passwd).toBe(admin.passwd);
+    expect(after.salt).toBe(admin.salt);
   });
 
   it("the window closes after the first admin: GET /install 303s and POST re-renders the verdict", async () => {

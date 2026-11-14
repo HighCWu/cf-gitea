@@ -35,7 +35,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { userSignInPassword } from "../../auth/password-auth";
-import { newPasswordRecord } from "../../auth/password";
+import { newPasswordRecord, verifyPassword } from "../../auth/password";
 import { changeOwnPassword } from "../../services/user-accounts";
 import { users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
@@ -242,6 +242,37 @@ describe("POST /user/settings/change_password", () => {
     expect(await lookupValidSession(env.DB, cookie)).not.toBeNull();
   });
 
+  it("the apply stores under the CONFIGURED spec: PASSWORD_HASH_ALGO=pbkdf2_v1 arms the route's SetPassword target to pbkdf2$10000$50 (B-87's route-glue half — the shared UpdateAuth arm reads the deploy config, update.go:256-264 + security.go:175)", async () => {
+    const alice = await seedUser("Alice", { password: TEMP_PASSWORD });
+    await flagMustChange(alice.id);
+
+    // The knob slice rides the harness env (the session.test.ts pattern —
+    // app.fetch passes this object to the handlers).
+    const specEnv = testEnv as Omit<Env, "PASSWORD_HASH_ALGO"> & { PASSWORD_HASH_ALGO?: string };
+    specEnv.PASSWORD_HASH_ALGO = "pbkdf2_v1";
+    try {
+      const res = await request("/user/settings/change_password", {
+        ...form({ password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN, cookie: await loginAs(alice) },
+      });
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/");
+    } finally {
+      delete specEnv.PASSWORD_HASH_ALGO;
+    }
+
+    const row = await userRow(alice.id);
+    // The stored record is under the DEALIASED configured spec — NOT the
+    // landed default (the service-level store pins live in
+    // user-accounts.test.ts; THIS is the route's env-resolution half).
+    expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(row.mustChangePassword).toBe(false);
+    // Verify through the STORED algo only (a plain userSignInPassword would
+    // rehash-on-login under the DEFAULT spec and rewrite the row).
+    expect(await verifyPassword(NEW_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+    expect(await verifyPassword(TEMP_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
+  });
+
   it("the retype mismatch re-renders at 200 with the match message, password + flag UNTOUCHED (password.go:292-296)", async () => {
     const alice = await seedUser("Alice", { password: TEMP_PASSWORD });
     await flagMustChange(alice.id);
@@ -355,5 +386,29 @@ describe("the settings-tab arm's mcp clear (account.go:78 — changeOwnPassword)
     const before = await userRow(alice.id);
     expect(before.mustChangePassword).toBe(true);
     expect(await userSignInPassword(env.DB, "alice", TEMP_PASSWORD)).toMatchObject({ ok: true });
+  });
+
+  it("the settings route stores under the CONFIGURED spec: an UNFLAGGED session's POST /user/settings/account under PASSWORD_HASH_ALGO=pbkdf2_v1 writes pbkdf2$10000$50 (B-87's route-glue half — the changeOwnPassword caller threads the env-resolved spec, account.go:78's UpdateAuth reads the settings)", async () => {
+    const alice = await seedUser("Alice", { password: TEMP_PASSWORD }); // NOT flagged — the settings tree is reachable
+
+    const specEnv = testEnv as Omit<Env, "PASSWORD_HASH_ALGO"> & { PASSWORD_HASH_ALGO?: string };
+    specEnv.PASSWORD_HASH_ALGO = "pbkdf2_v1";
+    try {
+      const res = await request("/user/settings/account", {
+        ...form({ old_password: TEMP_PASSWORD, password: NEW_PASSWORD, retype: NEW_PASSWORD }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN, cookie: await loginAs(alice) },
+      });
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/user/settings/account");
+    } finally {
+      delete specEnv.PASSWORD_HASH_ALGO;
+    }
+
+    const row = await userRow(alice.id);
+    expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    // Verify through the STORED algo (a plain userSignInPassword would
+    // rehash-on-login under the DEFAULT spec and rewrite the row).
+    expect(await verifyPassword(NEW_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
+    expect(await verifyPassword(TEMP_PASSWORD, row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
   });
 });

@@ -39,7 +39,7 @@ import { newPasswordRecord } from "../auth/password";
 import { createCredential } from "../web/webauthn-store";
 import { encodeCoseKey } from "../web/webauthn-ceremony";
 import { RepoService } from "../repos/service";
-import { users } from "../db/schema";
+import { authFailures, users } from "../db/schema";
 import { GIT_TOTP_PLAINTEXT_401 } from "./acl";
 import { requireSignInViewEnabled } from "../api/config";
 
@@ -467,5 +467,81 @@ describe("the flagged-doer must-change gate (optSignInFromAnyOrigin over the git
     expect(res.status).toBe(401);
     expect(res.headers.get("www-authenticate")).toBe(CHALLENGE);
     expect(new TextDecoder().decode(await res.arrayBuffer())).toBe(UNAUTHORIZED_BODY);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// THE SHARED KNOB over the git chain (basic.go:139-141 — census B-87's
+// route-glue half, the GLUE unit e4212fe): with EnableBasicAuth OFF the Basic
+// PASSWORD method is NOT APPLICABLE — `return nil, nil` — the chain ends
+// UNSIGNED and the request proceeds ANONYMOUS (the matrix's row-1 decide: a
+// public read serves, a protected route answers its OWN challenge). NEVER the
+// failed-credential arm: upstream never tests the pair, so the failure limiter
+// records nothing either (the discriminator — a credential-failure challenge
+// rides limiterRecordFailureFailOpen, acl.ts's generic-miss arm). Basic-carried
+// TOKENS verify BEFORE the gate (basic.go:134-137's VerifyAuthToken arm — the
+// gate sits after the access-token arm, mirroring the API chain's ordering,
+// middleware-wire.test.ts's knob battery) and stay unaffected. The knob-ON
+// posture is every describe above (the default var is "true" — the generated
+// Env literal).
+// -----------------------------------------------------------------------------
+
+describe("ENABLE_BASIC_AUTHENTICATION=off — the git chain's anonymous proceed (basic.go:139-141)", () => {
+  // The knob slice rides the test env (the REQUIRE_SIGNIN_VIEW pattern — the
+  // vitest plugin injects wrangler VARS and SELF.fetch shares this object).
+  const basicAuthEnv = env as Omit<Env, "ENABLE_BASIC_AUTHENTICATION"> & {
+    ENABLE_BASIC_AUTHENTICATION?: string;
+  };
+  afterEach(() => {
+    basicAuthEnv.ENABLE_BASIC_AUTHENTICATION = "true";
+  });
+
+  const failureRows = async (): Promise<number> => (await drizzle(env.DB).select().from(authFailures).all()).length;
+
+  it("knob OFF + a VALID Basic PASSWORD pair on a PUBLIC repo read → anonymous SERVE (the 200 advert), never the challenge, no failure-limiter row", async () => {
+    basicAuthEnv.ENABLE_BASIC_AUTHENTICATION = "false";
+    const alice = await seedUserWithPassword("Alice");
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "openpull", isPrivate: false });
+
+    const res = await infoRefs("alice", "openpull", "git-upload-pack", {
+      authorization: basicHeader("Alice", alice.password),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    // The identity never establishes (the arm never ran — a VALID pair, yet
+    // the request was served anonymous) and no credential test happened, so
+    // the limiter stays empty.
+    expect(await failureRows()).toBe(0);
+  });
+
+  it("knob OFF + a VALID Basic PASSWORD pair on a PRIVATE repo read → the matrix's OWN anonymous challenge 401 — never the failed-credential arm (no limiter row for a pair that would have authenticated)", async () => {
+    basicAuthEnv.ENABLE_BASIC_AUTHENTICATION = "false";
+    const alice = await seedUserWithPassword("Alice");
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "locked", isPrivate: true });
+
+    const res = await infoRefs("alice", "locked", "git-upload-pack", {
+      authorization: basicHeader("Alice", alice.password),
+    });
+    // The anonymous decide's challenge — the exact bytes the row-1 anonymous
+    // arm answers (githttp.go:146-159's !IsSigned site), NOT a credential
+    // verdict: the VALID pair proves the ladder never ran, and the empty
+    // limiter proves the generic-miss record never fired either.
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe(UNAUTHORIZED_BODY);
+    expect(await failureRows()).toBe(0);
+  });
+
+  it("knob OFF + a Basic-carried TOKEN still authenticates (the token arm precedes the gate, basic.go:134-137) — the PRIVATE read serves", async () => {
+    basicAuthEnv.ENABLE_BASIC_AUTHENTICATION = "false";
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "tokenpull", isPrivate: true });
+    const pat = await mintFor(alice.id, "pat", "all");
+
+    const res = await infoRefs("alice", "tokenpull", "git-upload-pack", {
+      authorization: basicHeader("Alice", pat.plaintext),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
   });
 });

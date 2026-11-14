@@ -57,9 +57,10 @@
  * at seed time — never hardcoded.
  */
 
-import { env } from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { Hono } from "hono";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
@@ -68,6 +69,8 @@ import { loginSources, repositories, twoFactor, userRedirects, users } from "../
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
+import { uiRouter, type UiAssetsFetcher } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { adminUserLink } from "./admin-users-avatar";
 import {
   ADMIN_USERS_LIST_LINK,
@@ -936,5 +939,62 @@ describe("the submit — the password arm's deploy-config knobs (B-87's consumpt
     const edited = await submitKnobs(seeded, aliceForm({ password: "Fresh-1a" }), {});
     expect(edited).toEqual({ outcome: "updated" });
     expect((await rowOf(seeded.aliceId)).passwdHashAlgo).toBe("pbkdf2$50000$50");
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Census B-87's ROUTE-GLUE half (the GLUE unit e4212fe + this pins unit): the
+// route handler resolves AdminUserEditKnobs from the REQUEST env —
+// ui/index.ts's adminUserEditSubmit threads {policy: resolvePasswordPolicy(c.env),
+// configuredHashSpec: configuredPasswordHashAlgo(c.env).specification}. The
+// service-level knob pins live in the describe above (submitKnobs drives the
+// resolved shape); THIS pin exercises the REAL route (POST
+// /-/admin/users/{id}/edit, the change-password.test.tsx harness posture)
+// under the ARMED env var, so the env→knob resolution is the observable.
+// -----------------------------------------------------------------------------
+
+/** The locally-mounted production registration (uiRouter alone — the admin
+ *  prologue rides the signed-admin session cookie). */
+const routeApp = new Hono<{ Bindings: Env }>();
+routeApp.route("/", uiRouter);
+
+const routeManifest: UiManifest = {
+  "web_src/js/iife.ts": { file: "js/iife.abcd1234.js" },
+  "web_src/js/index.ts": { file: "js/index.deadbeef.js", css: ["css/index.1111aaaa.css"] },
+  "web_src/js/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
+  "web_src/css/themes/theme-gitea-light.css": { file: "css/theme-gitea-light.4444dddd.css" },
+};
+const routeAssets: UiAssetsFetcher = {
+  fetch: () => Promise.resolve(new Response(JSON.stringify(routeManifest), { status: 200 })),
+};
+
+describe("POST /-/admin/users/{id}/edit — the route resolves the deploy-config knobs (B-87's route-glue half)", () => {
+  it("PASSWORD_HASH_ALGO=pbkdf2_v1 arms the submit's SetPassword: the admin-edited password stores pbkdf2$10000$50 through the REAL route", async () => {
+    const seeded = await seedEdit();
+    const cookie = await mintSession(env.DB, seeded.adminId);
+
+    const context = createExecutionContext();
+    const res = await routeApp.fetch(
+      new Request(`https://test.local/-/admin/users/${seeded.aliceId}/edit`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://test.local",
+          cookie: `${SESSION_COOKIE_NAME}=${cookie}`,
+        },
+        body: aliceForm({ password: "A-Fresh-Password!" }).toString(),
+      }),
+      { ...env, ASSETS: routeAssets, PASSWORD_HASH_ALGO: "pbkdf2_v1" },
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(adminUserLink(seeded.aliceId));
+    const row = await rowOf(seeded.aliceId);
+    // The stored record is under the DEALIASED configured spec — NOT the
+    // landed default "pbkdf2$50000$50" (the env→knob resolution ran).
+    expect(row.passwdHashAlgo).toBe("pbkdf2$10000$50");
+    expect(await verifyPassword("A-Fresh-Password!", row.passwd, row.salt, row.passwdHashAlgo)).toBe(true);
   });
 });

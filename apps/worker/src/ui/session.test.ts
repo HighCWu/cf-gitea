@@ -54,7 +54,7 @@ import {
 } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
 import { TokenService } from "../auth/token-service";
-import { newPasswordRecord } from "../auth/password";
+import { newPasswordRecord, verifyPassword } from "../auth/password";
 import { auditEvents, authFailures, emailAddresses, repositories, sessions, users } from "../db/schema";
 import {
   WEBAUTHN_CHALLENGE_COOKIE_NAME,
@@ -609,6 +609,61 @@ describe("ENABLE_PASSWORD_SIGNIN_FORM — the session-router gate (auth.go:293-2
       } finally {
         delete knobEnv.ENABLE_PASSWORD_SIGNIN_FORM;
       }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// Census B-87's ROUTE-GLUE half (the GLUE unit e4212fe + this pins unit): the
+// POST /login sign-in ladder reads the deploy config exactly like upstream
+// (authenticate.go's UserSignIn runs under the loaded settings) — the login
+// handler threads `configuredPasswordHashAlgo(c.env).specification`, so the
+// rehash-on-login compares against AND rewrites under the CONFIGURED algo.
+// PASSWORD_HASH_ALGO=pbkdf2_v1 dealiases to "pbkdf2$10000$50" (the route-level
+// fixture spec — admin-t2.test.ts's SPECTHREAD battery): executable and
+// DISTINCT from the landed default "pbkdf2$50000$50", so the stored
+// passwd_hash_algo is the observable through the REAL route (the service-level
+// arms live in password-auth.test.ts's rehash battery).
+// ---------------------------------------------------------------------------------
+
+describe("PASSWORD_HASH_ALGO — POST /login's rehash-on-login rides the configured spec (B-87's route-glue half)", () => {
+  // The generated Env types the var as its literal default (""); the knob
+  // slice Omit-and-rewidens it so tests can arm "pbkdf2_v1" and unset
+  // (the ENABLE_PASSWORD_SIGNIN_FORM slice's pattern above).
+  const specEnv = testEnv as Omit<UiTestEnv, "PASSWORD_HASH_ALGO"> & {
+    PASSWORD_HASH_ALGO?: string;
+  };
+
+  it("a user stored under the DEFAULT spec logs in under PASSWORD_HASH_ALGO=pbkdf2_v1 and the rehash row migrates to pbkdf2$10000$50; the second login is idempotent", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const pw = await seedPassword(alice); // the pre-threading shape: the DEFAULT spec
+    const before = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).get())!;
+    expect(before.passwdHashAlgo).not.toBe("pbkdf2$10000$50");
+
+    specEnv.PASSWORD_HASH_ALGO = "pbkdf2_v1";
+    try {
+      // First login: the verified sign-in's rehash rewrites the row under
+      // the CONFIGURED spec — through the real route (session.ts threads
+      // configuredPasswordHashAlgo(c.env).specification).
+      const first = await request("/login", form({ user_name: alice.username, password: pw }));
+      expect(first.status).toBe(303);
+      const migrated = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).get())!;
+      expect(migrated.passwdHashAlgo).toBe("pbkdf2$10000$50");
+      expect(migrated.passwd).not.toBe(before.passwd); // the digest WAS rewritten
+      expect(migrated.salt).toMatch(/^[0-9a-f]{32}$/);
+      // The migrated row verifies the SAME password under the NEW algo.
+      expect(await verifyPassword(pw, migrated.passwd, migrated.salt, migrated.passwdHashAlgo)).toBe(true);
+
+      // Second login: the row is NOW at the configured spec — idempotent
+      // (no further rehash: passwd + salt byte-stable, algo unchanged).
+      const second = await request("/login", form({ user_name: alice.username, password: pw }));
+      expect(second.status).toBe(303);
+      const stable = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).get())!;
+      expect(stable.passwdHashAlgo).toBe("pbkdf2$10000$50");
+      expect(stable.passwd).toBe(migrated.passwd);
+      expect(stable.salt).toBe(migrated.salt);
+    } finally {
+      delete specEnv.PASSWORD_HASH_ALGO;
     }
   });
 });
