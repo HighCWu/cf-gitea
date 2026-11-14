@@ -31,6 +31,7 @@ import { packageVersions, packages, users, webhookDeliveries, webhooks } from ".
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 import { asciiBytes, buildTar, concatBytes, gzipCompress } from "../../services/packages/distro-common";
+import { xzEncodeStored } from "../../services/packages/xz-encode";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -198,7 +199,10 @@ describe("debian upload → index → download", () => {
     expect(packagesText).toContain("Filename: pool/stable/main/hello_1.0_amd64.deb");
     expect(packagesText).toContain(`Size: ${deb.byteLength}`);
     expect(packagesText).toMatch(/^SHA256: [0-9a-f]{64}$/m);
-    expect(packagesText).not.toContain("MD5sum:"); // the documented reduction
+    // PKGTAILS2 (6c59822) retired the no-MD5 reduction — md5.ts landed and
+    // the upload arm computes the digest, so the paragraph carries it like
+    // upstream's (debian.go:168's MD5sum line).
+    expect(packagesText).toMatch(/^MD5sum: [0-9a-f]{32}$/m);
     expect(packagesText).toContain("Description: a test package");
     expect(packagesText).toContain(" long description folded line");
     expect(packagesText).toContain("Depends: libc6 (>= 2.14), bash");
@@ -395,7 +399,7 @@ describe("debian validation and gates", () => {
     expect(await bad.text()).toBe("invalid distribution or component");
   });
 
-  it("rejects a control-less archive and an .xz control with 400", async () => {
+  it("rejects a control-less archive, parses a real .xz control, propagates a corrupt one, and keeps .zst 400", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const garbage = asciiBytes("not an ar archive at all, just noise padded out");
@@ -403,9 +407,27 @@ describe("debian validation and gates", () => {
     expect(missing.status).toBe(400);
     expect(await missing.text()).toBe("control file is missing");
 
+    // PKGTAILS2 wired the .xz control member (metadata.go:119-125's xz
+    // Reader, the 32 MiB decoded bound): a REAL control.tar.xz parses and
+    // uploads clean.
     const controlTar = buildTar([{ name: "./control", mode: 0o644, data: asciiBytes(HELLO_CONTROL) }], true);
+    const realXz = concatBytes(
+      asciiBytes("!<arch>\n"),
+      arMember("debian-binary", asciiBytes("2.0\n")),
+      arMember("control.tar.xz", xzEncodeStored(controlTar)),
+    );
+    const accepted = await uploadDeb("alice", "stable", "main", realXz, authHeaders(writer));
+    expect(accepted.status).toBe(201);
+
+    // A CORRUPT .xz member propagates the reader error (metadata.go:127-130
+    // returns it — the deb PUT's generic error arm), never a silent parse.
     const fakeXz = concatBytes(asciiBytes("!<arch>\n"), arMember("debian-binary", asciiBytes("2.0\n")), arMember("control.tar.xz", controlTar));
-    const unsupported = await uploadDeb("alice", "stable", "main", fakeXz, authHeaders(writer));
+    const corrupt = await uploadDeb("alice", "stable", "main", fakeXz, authHeaders(writer));
+    expect(corrupt.status).toBe(500);
+
+    // .zst stays the recorded reduction (the default arm's own message).
+    const fakeZst = concatBytes(asciiBytes("!<arch>\n"), arMember("debian-binary", asciiBytes("2.0\n")), arMember("control.tar.zst", controlTar));
+    const unsupported = await uploadDeb("alice", "stable", "main", fakeZst, authHeaders(writer));
     expect(unsupported.status).toBe(400);
     expect(await unsupported.text()).toBe("unsupported compression algorithm");
   });

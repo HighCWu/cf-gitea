@@ -465,8 +465,10 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(active[0]?.attrs.href).toBe("/-/admin/users");
     // The page's only heading is the section header carrying the total; a
     // lone heading can neither skip a level (R2) nor double the h1 (R1).
+    // Since ADMIN88's CTA fold (565f814) the create button rides the
+    // heading's row — the extractor's text join concatenates its name.
     const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
-    expect(headings.map((el) => accessibleName(el))).toEqual(["User Account Management (Total: 4)"]);
+    expect(headings.map((el) => accessibleName(el))).toEqual(["User Account Management (Total: 4)Create User Account"]);
   });
 
   it("admin-users: the users table's header cells are named — and all ten carry scope (the closed gap's membership arm)", () => {
