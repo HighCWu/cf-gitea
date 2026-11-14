@@ -4278,7 +4278,16 @@ const branchProtectionSteps = (ctx) => [
     run: async () => {
       const user = await api("/admin/users", {
         method: "POST",
-        body: { username: ctx.member, email: `${ctx.member}@probes.cf-gitea.invalid`, visibility: "private", must_change_password: false },
+        // PWD-4's ladder requires a password on create — the probe carries
+        // one (the v1.5.8 fw-user-create fix's twin; this arm was missed in
+        // that harness pass, caught by the v1.5.10 freeze probes).
+        body: {
+          username: ctx.member,
+          email: `${ctx.member}@probes.cf-gitea.invalid`,
+          visibility: "private",
+          password: `Probe-${crypto.randomUUID()}`,
+          must_change_password: false,
+        },
       });
       if (user.status === 201) ctx.memberCreated = true; // mark on the observable write
       expect(user.status === 201, `user status ${user.status} (expected 201 — an ADMIN PAT is required): ${user.text.slice(0, 160)}`);
