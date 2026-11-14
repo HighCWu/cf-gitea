@@ -3427,6 +3427,58 @@ describe("the agit create arm end-to-end (refs/for → PR + refs/pull/N/head)", 
       expect(issue!.content).toBe("and the body line");
     });
   });
+
+  it("the create arm lands the FIRST type-29 push comment (the base..head create shape; an empty head adds none)", async () => {
+    const { engineName, ownerId, token, tip } = await seedTailRepo("agitcreatecomment");
+    // Upstream's create pin (services/pull/pull.go:145, BOTH flows):
+    // CreatePushPullComment with oldRef = the BASE BRANCH REF — resolved to
+    // the base tip, never ZERO_OID (comment.go:107-113) — and isForcePush =
+    // the literal false. The proposal here is parented on main's tip, so the
+    // normal walk (comment.go:43-45: rev-list --reverse -n limit
+    // baseTip..headTip) is exactly the PR's own commit, oldest-first.
+    const proposal = await buildAgitCommitPack({ message: "created proposal\n", parent: tip, file: "create content\n" });
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: proposal.oid, ref: "refs/for/main/create-comment" }], {
+        pack: proposal.pack,
+        pushOptions: ["topic=create-comment"],
+      }),
+    });
+    expect(push.status).toBe(200);
+    const pr = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
+    const rows = await drizzle(env.DB)
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, pr.issueId), eq(comments.type, CommentType.PullRequestPush)))
+      .all();
+    expect(rows).toHaveLength(1); // ONE row — no force marker pair at create
+    expect(JSON.parse(rows[0]!.content ?? "")).toEqual({ is_force_push: false, commit_ids: [proposal.oid] });
+    // The doer is issue.Poster (pull.go:145) — the agit flow's poster IS the
+    // pusher.
+    expect(rows[0]!.posterId).toBe(ownerId);
+
+    // The EMPTY create: a head AT the base tip adds nothing beyond the base
+    // → upstream's shouldCreate=false (comment.go:44-45) — the PR row still
+    // exists (upstream creates the PR either way) but NO comment.
+    const empty = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildAgitPushBody([{ oid: tip, ref: "refs/for/main/create-empty" }], { pushOptions: ["topic=create-empty"] }),
+    });
+    expect(empty.status).toBe(200);
+    expect(parseAgitResponse(await empty.arrayBuffer()).report).toContain("ok refs/for/main/create-empty\n");
+    const prs = await drizzle(env.DB).select().from(pullRequests).all();
+    expect(prs).toHaveLength(2);
+    const emptyPr = prs.find((p) => p.id !== pr.id)!;
+    expect(emptyPr.headSha).toBe(tip);
+    const emptyRows = await drizzle(env.DB)
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, emptyPr.issueId), eq(comments.type, CommentType.PullRequestPush)))
+      .all();
+    expect(emptyRows).toHaveLength(0);
+  });
 });
 
 describe("the agit update arm (the same proposal moves refs/pull/N/head)", () => {
@@ -3519,10 +3571,12 @@ describe("the agit update arm (the same proposal moves refs/pull/N/head)", () =>
   it("the re-push lands the type-29 push comment (normal walk + force-option reconcile) and settles the check immediately", async () => {
     const { engineName, token, ownerId } = await seedTailRepo("agitpushcomment");
     const { first, issueId, prId } = await seedProposal(engineName, token, "topic-p");
-    // The create arm writes no type-29 row here — upstream's create-arm
-    // first comment rides NewPullRequest (pull.go:145, both flows) and is
-    // the recorded remainder; the UPDATE arm owns the family (agit.go:296).
-    expect(await type29Rows(issueId)).toHaveLength(0);
+    // The create arm writes the FIRST type-29 row at create (NewPullRequest's
+    // shared pin, pull.go:145 — the create describe pins its exact shape);
+    // the UPDATE arm owns the family from here on (agit.go:296).
+    const createRows = await type29Rows(issueId);
+    expect(createRows).toHaveLength(1);
+    expect(JSON.parse(createRows[0]!.content ?? "")).toEqual({ is_force_push: false, commit_ids: [first.oid] });
 
     // Normal fast-forward: the capped old..new walk, non-empty → ONE comment
     // carrying the pushed commits, posted by the agit pusher (comment.go's
@@ -3530,9 +3584,9 @@ describe("the agit update arm (the same proposal moves refs/pull/N/head)", () =>
     const second = await buildAgitCommitPack({ message: "proposal follow-up\n", parent: first.oid, file: "agit content v2\n" });
     expect(await pushAgit(engineName, token, [{ oid: second.oid, ref: "refs/for/main/topic-p" }], second.pack, [])).toContain("ok refs/for/main/topic-p\n");
     let rows = await type29Rows(issueId);
-    expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0]!.content ?? "")).toEqual({ is_force_push: false, commit_ids: [second.oid] });
-    expect(rows[0]!.posterId).toBe(ownerId);
+    expect(rows).toHaveLength(2); // the create row + this update's row
+    expect(JSON.parse(rows[1]!.content ?? "")).toEqual({ is_force_push: false, commit_ids: [second.oid] });
+    expect(rows[1]!.posterId).toBe(ownerId);
 
     // StartPullRequestCheckImmediately's queue work (agit.go:279): the
     // re-arm wrote status=checking (markChecking) and the tail's inline
@@ -3543,10 +3597,11 @@ describe("the agit update arm (the same proposal moves refs/pull/N/head)", () =>
 
     // Force update to an UNRELATED tip under the option: upstream's
     // isForcePush is the OPTION VALUE (agit.go:297 — not the shared path's
-    // ancestry derivation), so the force arm runs: the old non-force
-    // comment reconciles away (its ids are not in the force list) and the
-    // boundary marker lands; the unrelated tip's merge base is empty → an
-    // empty walk → ONLY the marker row survives.
+    // ancestry derivation), so the force arm runs: BOTH old non-force
+    // comments (the create row and the update row) reconcile away — none of
+    // their ids survive the force list — and the boundary marker lands; the
+    // unrelated tip's merge base is empty → an empty walk → ONLY the marker
+    // row survives.
     const rewritten = await buildAgitCommitPack({ message: "rewritten proposal\n", file: "rewritten root\n" });
     expect(await pushAgit(engineName, token, [{ oid: rewritten.oid, ref: "refs/for/main/topic-p" }], rewritten.pack, ["force-push"])).toContain("ok refs/for/main/topic-p\n");
     rows = await type29Rows(issueId);
@@ -3612,9 +3667,10 @@ describe("the agit update arm (the same proposal moves refs/pull/N/head)", () =>
     expect(dismissals[0]!.content).toBe("New commits pushed, approval review dismissed automatically according to repository settings");
     expect(dismissals[0]!.reviewId).toBe(review.id);
     const issueAfter = (await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get())!;
-    // TWO bumps: the type-29 push comment (CreatePushPullComment lands it on
-    // every applied update) AND the type-32 dismissal — upstream's
-    // CreateComment bumps num_comments for both.
+    // TWO bumps over issueBefore — the create arm's first type-29 bump is
+    // ALREADY INSIDE issueBefore (it reads post-create): this update's
+    // type-29 (agit.go:296) AND the type-32 dismissal — upstream's
+    // CreateComment bumps num_comments for each.
     expect(issueAfter.numComments).toBe(issueBefore.numComments + 2);
   });
 });

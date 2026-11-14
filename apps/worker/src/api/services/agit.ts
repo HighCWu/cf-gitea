@@ -82,8 +82,13 @@
  * Upstream's create arm has NO immediate check either way (NewPullRequest,
  * pull.go:100-193, starts none for either flow — the fresh row waits for
  * its first consumer, our landed §3.4 lazy posture), and it writes the
- * FIRST type-29 comment at create (pull.go:145, both flows) — that
- * create-arm first comment is the one recorded remainder.
+ * FIRST type-29 comment at create (pull.go:145, both flows — landed here
+ * as `createAgitFirstPushComment`, the agit create tail's opening leg).
+ * The recorded remainder is now only the github-flow create's own first
+ * comment: upstream derives BOTH flows through the same NewPullRequest
+ * pin, ours runs through IssuesService.createPullRequest, which does not
+ * yet write the row (the shared walk+insert shape to port lives in this
+ * module's `createAgitFirstPushComment`/`newestLimitedAgitCommitIds`).
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -1187,7 +1192,17 @@ export async function applyAgitCreateTail(
       await db.update(issues).set({ content: derivedBody }).where(eq(issues.id, entry.issueId)).run();
     }
 
-    // 2. The opened webhook + action row — the create route's emission shape
+    // 2. The FIRST type-29 push comment — upstream lands it inside
+    // NewPullRequest for BOTH flows (services/pull/pull.go:145), i.e.
+    // BEFORE the opened notification rides out of the tx; ours opens this
+    // tail for the same order. Log-and-continue (the lane's recorded
+    // degradation posture: upstream's walk failure fails the whole create —
+    // the tx rollback + RemoveRef cleanup, pull.go:147-160 — ours keeps the
+    // applied push, like every tail leg).
+    const log = (message: string) => console.error(`[agit] ${repo.ownerNamespace}/${repo.slug}: ${message}`);
+    await createAgitFirstPushComment(env, engineRepo, entry, pusherRow, log);
+
+    // 3. The opened webhook + action row — the create route's emission shape
     // (the PullRequestPayload wrapper, "payload"-mode PR render, the pusher
     // as sender), refetched post-fill so the payload carries the derived
     // title.
@@ -1232,6 +1247,61 @@ export async function applyAgitCreateTail(
         error instanceof Error ? error.message : String(error)
       }`,
     );
+  }
+}
+
+/**
+ * The CREATE arm's FIRST type-29 push comment — upstream's NewPullRequest
+ * creates it for BOTH flows with one call (services/pull/pull.go:145):
+ * `CreatePushPullComment(ctx, issue.Poster, pr, git.BranchPrefix+pr.BaseBranch,
+ * pr.GetGitHeadRefName(), false)`. The create shape derived at that pin:
+ *
+ *   - oldRef is the BASE BRANCH REF (`refs/heads/<base>`, modules/git/ref.go
+ *     BranchPrefix) — never empty, never ZERO_OID — so CreatePushPullComment
+ *     resolves it to the base branch's live tip (comment.go:107-113);
+ *     newRef is `refs/pull/N/head`, moved moments earlier by
+ *     UpdateRefForAgit/PushToBaseRepo. (The doer is `issue.Poster` — the agit
+ *     flow's poster IS the pusher, planCreate's posterId.)
+ *   - isForcePush is the LITERAL false: the force arm never runs at create —
+ *     no merge-base walk, no `{is_force_push, [old, new]}` marker comment,
+ *     no old-comment reconcile (comment.go:24-45's force branch).
+ *   - The walk is the normal-push shape over the resolved tips:
+ *     `rev-list --reverse -n limit baseTip..headTip` (comment.go:43-45 over
+ *     GetCommitIDsBetweenReverse, modules/git/compare.go:48-55) — the PR's
+ *     own commits, oldest-first, capped at the newest
+ *     MAX_PUSH_COMMITS_IN_COMMENT — and an EMPTY walk (a head that adds
+ *     nothing beyond its base) creates NO comment (shouldCreate=false,
+ *     comment.go:44-45).
+ *   - NO `PullRequestPushCommits` mail: the create pin fires none — the
+ *     notify rides only the shared push path (pull.go:406-411, the update
+ *     callers). The landed update arm's mail arm is deliberately absent
+ *     here.
+ *
+ * Upstream's comment failure FAILS the whole NewPullRequest (pull.go:145-147
+ * → the RemoveRef cleanup at :155-160); the lane's recorded posture keeps
+ * the applied push and logs (module header) — the same degradation the
+ * update arm's `createAgitPushComment` documents. Never throws.
+ */
+async function createAgitFirstPushComment(
+  env: AgitEnv,
+  engineRepo: string,
+  entry: Extract<AgitPlanEntry, { kind: "create" }>,
+  pusherRow: UserRow,
+  log: (message: string) => void,
+): Promise<void> {
+  try {
+    const cell = env.REPO.getByName(engineRepo);
+    const commitIds = await newestLimitedAgitCommitIds(cell, branchRef(entry.baseBranch), entry.new, log);
+    if (commitIds.length === 0) return; // upstream shouldCreate=false — nothing beyond the base
+    await new IssuesService(env.DB).addComment({
+      issueId: entry.issueId,
+      type: CommentType.PullRequestPush,
+      posterId: pusherRow.id,
+      content: JSON.stringify({ is_force_push: false, commit_ids: commitIds } satisfies PushActionContent),
+      now: new Date(),
+    });
+  } catch (error) {
+    log(`the create arm's first push comment failed (the push stands): ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
