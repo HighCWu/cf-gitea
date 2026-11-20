@@ -12588,7 +12588,7 @@ async function userSettingsApplicationsRegenerate(c: Context<{ Bindings: Env }>)
   const p = await userSettingsTabPrologue(c, true);
   if (!p.ok) return p.response;
   const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
-  const outcome = await regenerateTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0);
+  const outcome = await regenerateTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0, p.viewer.impersonatorUserId ?? null);
   if (outcome.outcome === "regenerated") {
     const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin);
     data.newToken = outcome.plaintext;
