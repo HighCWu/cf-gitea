@@ -1,8 +1,10 @@
 /**
  * The B-65 receivers' per-arm battery (services/mail/notify.ts's three
- * census arms, behavior pin fc4936884584):
+ * census arms, behavior pin 099abf5db4):
  *
- *   - `notifyNewRelease` (notify.go:191-203 → mail_release.go:33-119): the
+ *   - `notifyNewRelease` (notify.go:191-203 — the 191 head carries the
+ *     ignored `_doer` param since 53aafd7ee1, arm body unchanged — →
+ *     mail_release.go:33-119): the
  *     draft/prerelease skip, the release-watch pool (include_releases gate +
  *     the custom-watch set feeding the on-mention allowance), the
  *     publisher / on-mention / releases-unit DeleteFunc, the mailable
@@ -250,7 +252,8 @@ beforeEach(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// notifyNewRelease — the NewRelease arm (notify.go:191-203)
+// notifyNewRelease — the NewRelease arm (notify.go:191-203; the 191 head's
+// `_doer` param is receiver-ignored, body byte-identical across the repin)
 // ---------------------------------------------------------------------------
 
 describe("notifyNewRelease — the NewRelease receiver (notify.go:191-203)", () => {

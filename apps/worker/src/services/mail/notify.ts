@@ -2090,9 +2090,12 @@ export async function notifyPullReviewDismiss(
 // exactly like the participant fan-out arms above.
 // ---------------------------------------------------------------------------
 
-/** The `NewRelease` arm's input (notify.go:191: `rel *repo_model.Release` —
- *  the release row the write service just landed, plus its publisher the
- *  emit site already holds). */
+/** The `NewRelease` arm's input (notify.go:191 at the new pin reads
+ *  `NewRelease(ctx, _doer *user_model.User, rel *repo_model.Release)` —
+ *  53aafd7ee1 threaded the doer through the dispatcher
+ *  (services/notify/notify.go NewRelease) and the mailer receiver IGNORES
+ *  it; `rel` stays the arm's only input, plus its publisher the emit site
+ *  already holds). */
 export interface NotifyNewReleaseInput {
   /** The release row (upstream `rel`; `rel.RepoID`/`rel.ID`/`TagName`/
    *  `Title`/`Note`/`PublisherID` + the draft/prerelease flags are the used
@@ -2103,7 +2106,8 @@ export interface NotifyNewReleaseInput {
 }
 
 /**
- * The `NewRelease` arm's mail (notify.go:191-203 → MailNewRelease,
+ * The `NewRelease` arm's mail (notify.go:191-203 — the 191 head gained the
+ * ignored `_doer` param in 53aafd7ee1, body unchanged — → MailNewRelease,
  * mail_release.go:33-119): mail the RELEASE-watch watchers of the repo.
  * Receiver-side skips, upstream's order: draft/prerelease (:194-197), then
  * the watcher pool, the mailable prefilter, the three-way DeleteFunc
