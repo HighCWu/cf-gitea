@@ -55,7 +55,7 @@ import {
 import { totpCode } from "../auth/totp";
 import { TokenService } from "../auth/token-service";
 import { newPasswordRecord, verifyPassword } from "../auth/password";
-import { auditEvents, authFailures, emailAddresses, repositories, sessions, users } from "../db/schema";
+import { auditEvents, authFailures, emailAddresses, repositories, sessions, userSettingsKv, users } from "../db/schema";
 import {
   WEBAUTHN_CHALLENGE_COOKIE_NAME,
   WEBAUTHN_COOKIE_NAME,
@@ -264,6 +264,7 @@ beforeEach(async () => {
     "two_factor",
     "webauthn_credentials",
     "audit_event",
+    "user_settings_kv",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
@@ -2065,6 +2066,158 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     expect(res.status).toBe(500);
     // the clear directive's shape (a constant, pinned once here)
     expect(clearTwofaSetCookie()).toBe(`${TWOFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+  });
+
+  // --- c144668e59 + c54ec52f0f: the failure arms' audit row + the
+  // --- per-account failed-TOTP-attempt limiter (2fa.go:86-94/:163-168 at
+  // --- the pin; twofactor.go:143-190).
+
+  it("a wrong passcode emits user:authentication:fail:twofactor (actor = scope = the ticket's user, c144668e59)", async () => {
+    const alice = await seedUser();
+    const { pat } = await seedEnrolled(alice);
+    const ticket = await gateTicket(alice, pat);
+
+    const wrong = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: "000000" }).toString(),
+    });
+    expect(wrong.status).toBe(200);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual(["user:authentication:fail:twofactor"]);
+    expect(rows[0]!.actorId).toBe(alice.id);
+    expect(rows[0]!.actorName).toBe(alice.username);
+    expect(rows[0]!.actorCredential).toBeNull(); // a session-less pre-sign-in write
+    expect(rows[0]!.scopeType).toBe("user");
+    expect(rows[0]!.scopeName).toBe(alice.username);
+    expect(rows[0]!.origin).toBe("ui");
+    expect(rows[0]!.message).toBe(`Failed two-factor authentication for user ${alice.username}.`);
+  });
+
+  it("a wrong scratch token emits the row; the scratch arm NEVER touches the attempt counter", async () => {
+    const alice = await seedUser();
+    const { pat } = await seedEnrolled(alice);
+    const ticket = await gateTicket(alice, pat);
+
+    for (let i = 0; i < 3; i++) {
+      const wrong = await request("/user/two_factor/scratch", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://test.local" },
+        body: new URLSearchParams({ token: "AAAAAAAAAA" }).toString(),
+      });
+      expect(wrong.status).toBe(200);
+    }
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((r) => r.action))).toEqual(new Set(["user:authentication:fail:twofactor"]));
+    // the counter row never appeared — scratch stays usable while TOTP is
+    // locked (twofactor.go:143-190's recovery path)
+    const counter = await drizzle(env.DB).select().from(userSettingsKv).all();
+    expect(counter).toHaveLength(0);
+  });
+
+  it("5 wrong passcodes lock the gate: the 6th answers too-many-attempts, a CORRECT passcode stays refused, success clears", async () => {
+    const alice = await seedUser();
+    const { pat, secret } = await seedEnrolled(alice);
+    const wrong = await totpCode(secret, Date.now() / 1000 + 3600); // an hour away — outside every ±1 window
+    const post = (passcode: string, ticket: string): Promise<Response> =>
+      request("/user/two_factor", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://test.local" },
+        body: new URLSearchParams({ passcode }).toString(),
+      });
+
+    const ticket = await gateTicket(alice, pat);
+    for (let i = 0; i < 5; i++) {
+      const res = await post(wrong, ticket);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Your passcode is incorrect");
+      expect(html).not.toContain("Too many incorrect passcodes");
+    }
+    const sixth = await post(wrong, ticket);
+    expect(sixth.status).toBe(200);
+    const sixthHtml = await sixth.text(); // read once — the body is single-use
+    expect(sixthHtml).toContain("Too many incorrect passcodes. Try again later or use your scratch code.");
+    expect(sixthHtml).not.toContain("Your passcode is incorrect");
+
+    // a CORRECT passcode is refused while locked (upstream's locked check
+    // arm) — the lock holds until 15 min after the LAST failure, regardless
+    // of the code's validity or a fresh ticket
+    const lockedTicket = await gateTicket(alice, pat);
+    const locked = await post(await totpCode(secret, Date.now() / 1000), lockedTicket);
+    expect(locked.status).toBe(200);
+    expect(await locked.text()).toContain("Too many incorrect passcodes");
+
+    // the audit trail: 5 invalid + the too-many arm + the locked-correct arm
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(7);
+    expect(new Set(rows.map((r) => r.action))).toEqual(new Set(["user:authentication:fail:twofactor"]));
+  });
+
+  it("a success CLEARS the counter (upstream's cache.Remove): from 3 failures a correct passcode mints, then a full window of 5 refits", async () => {
+    const alice = await seedUser();
+    const { pat, secret } = await seedEnrolled(alice);
+    const wrong = await totpCode(secret, Date.now() / 1000 + 3600);
+    const post = (passcode: string, ticket: string): Promise<Response> =>
+      request("/user/two_factor", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://test.local" },
+        body: new URLSearchParams({ passcode }).toString(),
+      });
+
+    const ticket = await gateTicket(alice, pat);
+    for (let i = 0; i < 3; i++) {
+      const res = await post(wrong, ticket);
+      expect(res.status).toBe(200);
+    }
+    // the correct passcode mints THROUGH the 3-failure counter and clears it
+    const ok = await post(await totpCode(secret, Date.now() / 1000), ticket);
+    expect(ok.status).toBe(303);
+    const counter = await drizzle(env.DB).select().from(userSettingsKv).all();
+    expect(counter).toHaveLength(0);
+
+    // a fresh gate: a FULL window of 5 wrong passcodes answers
+    // passcode_incorrect (a leftover count of 3 would have locked at the
+    // third) and only the 6th hits the too-many arm
+    const freshTicket = await gateTicket(alice, pat);
+    for (let i = 0; i < 5; i++) {
+      const res = await post(wrong, freshTicket);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Your passcode is incorrect");
+      expect(html).not.toContain("Too many incorrect passcodes");
+    }
+    const sixth = await post(wrong, freshTicket);
+    expect(sixth.status).toBe(200);
+    expect(await sixth.text()).toContain("Too many incorrect passcodes");
+  });
+
+  it("an empty passcode answers invalid WITHOUT consuming an attempt (twofactor.go:150-153)", async () => {
+    const alice = await seedUser();
+    const { pat, secret } = await seedEnrolled(alice);
+    const ticket = await gateTicket(alice, pat);
+
+    for (let i = 0; i < 5; i++) {
+      const res = await request("/user/two_factor", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://test.local" },
+        body: new URLSearchParams({ passcode: "" }).toString(),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("Your passcode is incorrect");
+    }
+    // the counter is untouched — a wrong passcode still answers on its own
+    // merit, never the locked arm
+    const wrong = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: await totpCode(secret, Date.now() / 1000 + 3600) }).toString(),
+    });
+    expect(wrong.status).toBe(200);
+    const html = await wrong.text();
+    expect(html).toContain("Your passcode is incorrect");
+    expect(html).not.toContain("Too many incorrect passcodes");
   });
 });
 

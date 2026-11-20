@@ -102,9 +102,12 @@ beforeEach(async () => {
 
 describe("tokenScopeCategories (GetAccessTokenCategories' sorted order)", () => {
   it("sorts the landed category set and strips admin for non-admin viewers", () => {
+    // commitstatus joined the category table at the pin (da7b81d407 — the
+    // tenth scope category; the generate form's radio table renders it).
     expect(tokenScopeCategories(true)).toEqual([
       "activitypub",
       "admin",
+      "commitstatus",
       "issue",
       "misc",
       "notification",
@@ -115,6 +118,7 @@ describe("tokenScopeCategories (GetAccessTokenCategories' sorted order)", () => 
     ]);
     expect(tokenScopeCategories(false)).toEqual([
       "activitypub",
+      "commitstatus",
       "issue",
       "misc",
       "notification",
@@ -326,13 +330,50 @@ describe("regenerateTokenFromForm (F10 — upstream RegenerateAccessToken, appli
     expect((await new TokenService(env.DB).verify((created as { plaintext: string }).plaintext))?.token.id).toBe(row.id);
   });
 
-  it("renders the row's Regenerate form (access_tokens.tmpl:51-56 — the button the dialog reduces to)", async () => {
+  it("renders the row's Regenerate form (access_tokens.tmpl:51-54 at the pin — the button the dialog reduces to)", async () => {
     await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "read:user" }, NOW);
     const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW);
     const html = renderUserSettingsApplicationsPage(ctx, data);
     expect(html).toContain('action="/user/settings/applications/regenerate"');
     expect(html).toContain(`name="id" value="${data.tokens[0]!.token.id}"`);
     expect(html).toContain("Regenerate");
+  });
+});
+
+// --- the regenerate audit (365cb2bd5e — applications.go:182 at the pin) -----
+
+describe("the regenerate audit arm (365cb2bd5e — audit.Record(UserAccessTokenRegenerate, owner, \"token\", t.Name))", () => {
+  it("a hit emits user:accesstoken:regenerate with actor = scope = the owner", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "write:repository" }, NOW);
+    const row = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    expect((await regenerateTokenFromForm(env.DB, aliceId, row.id)).outcome).toBe("regenerated");
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual(["user:accesstoken:add", "user:accesstoken:regenerate"]);
+    const regen = rows[1]!;
+    expect(regen.actorId).toBe(aliceId); // doer = owner on the settings arm
+    expect(regen.actorName).toBe("alice");
+    expect(regen.actorCredential).toBeNull(); // the write rode a session
+    expect(regen.scopeType).toBe("user");
+    expect(regen.scopeId).toBe(String(aliceId));
+    expect(regen.scopeName).toBe("alice");
+    expect(regen.origin).toBe("ui");
+    expect(regen.message).toBe("Regenerated access token ci of user alice.");
+    expect(JSON.parse(regen.metadata ?? "null")).toEqual({ token: "ci" });
+  });
+
+  it("a missing regenerate emits nothing (the stale-form arm)", async () => {
+    expect(await regenerateTokenFromForm(env.DB, aliceId, 424242)).toEqual({ outcome: "missing" });
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("an impersonated regenerate carries the admin's id (the record-seam pair, event.go:124)", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "read:user" }, NOW);
+    const row = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    expect((await regenerateTokenFromForm(env.DB, aliceId, row.id, 4244)).outcome).toBe("regenerated");
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(2);
+    expect(rows[1]!.action).toBe("user:accesstoken:regenerate");
+    expect(rows[1]!.impersonatorId).toBe(4244);
   });
 });
 

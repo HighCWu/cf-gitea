@@ -186,7 +186,7 @@ import {
   webAuthnPendingSetCookie,
 } from "../web/webauthn-ceremony";
 import { hasCredentialsForUser } from "../web/webauthn-store";
-import { sessions, users } from "../db/schema";
+import { sessions, userSettingsKv, users } from "../db/schema";
 import { readUrlEncodedForm } from "./forms";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import { locale } from "./locale";
@@ -610,7 +610,7 @@ export async function rotateSession(
  * The mint is also upstream's LAST-LOGIN instant (P3-7): the same batched
  * transaction bumps `users.last_login_at` — upstream sets `LastLoginUnix` on
  * every sign-in path via `UpdateOptions{SetLastLogin: true}`
- * (services/user/update.go:61,193-196 over models/user/user.go:235-237's
+ * (services/user/update.go:65,197-200 at the pin over models/user/user.go:241-243's
  * `SetLastLogin()`): the form sign-in (handleSignInFull,
  * routers/web/auth/auth.go:427-430), the first-user auto-admin
  * (handleUserCreated, :713-717 — our first-run mint), account activation
@@ -676,9 +676,10 @@ export type ImpersonateOutcome = "impersonating" | "already-impersonating" | "no
  * Upstream additionally backs up `KeyUserHasTwoFactorAuth` and sets it true
  * for the impersonated stretch (impersonate.go:22-24, 37 — the target's
  * 2FA is never re-prompted); our §2.2 sessions carry no 2FA key, so the
- * backup is the single id. The bot-target guard (users.go:569-571,
- * IsTypeBot → JSONError) is a DOCUMENTED DEAD ARM: our users.type is the
- * SPEC-0002 two-value enum with no bot value, so no row can trip it.
+ * backup is the single id. The bot-target guard (users.go:578-580 at the
+ * pin, IsTypeBot → JSONError) is LIVE since B-72: users.type carries 'bot',
+ * so a bot target trips it (the write seam admin-users-impersonate.ts
+ * refuses first — the guard backs the seam).
  */
 export async function impersonateSessionUser(
   d1: D1Database,
@@ -878,7 +879,7 @@ export async function sweepExpiredSessions(d1: D1Database, now?: Date): Promise<
 //     outer mux, OUTSIDE webRoutes' middleware, and never see the gate.
 //   - the flag clears through ANY own-password change carrying upstream's
 //     MustChangePassword=Some(false) UpdateAuth (account.go:78 /
-//     password.go:206/300 — services/user-accounts.ts
+//     password.go:211/305 — services/user-accounts.ts
 //     changeOwnPassword/applyPasswordReset here).
 // ---------------------------------------------------------------------------
 
@@ -1611,14 +1612,21 @@ async function renderScratchFailure(c: RouteContext, error: string): Promise<Res
   return c.html(renderTwofaScratchPage({ ctx: assembled.ctx, error }), 200);
 }
 
-/** POST /user/two_factor (upstream TwoFactorPost, 2fa.go:45-92): verify AND
- *  consume the passcode (the replay guard), then mint — upstream's
+/** POST /user/two_factor (upstream TwoFactorPost, 2fa.go:47-96 at the pin):
+ *  verify AND consume the passcode (the replay guard), then mint — upstream's
  *  handleSignIn (KeyUserHasTwoFactorAuth omitted, the module header) — and
  *  land on the ticket's validated redirect (consumeAuthRedirectLink's
  *  carried target). The ticket dies with the mint — AND the webauthn
  *  carriers with it (upstream's session regeneration wipes twofaUid AND
  *  webauthnAssertion together; whichever flow completed first cleared the
- *  whole pre-auth state — the dual-carrier note at the login gate). */
+ *  whole pre-auth state — the dual-carrier note at the login gate).
+ *  c54ec52f0f: the consume is TRI-STATE — an empty passcode answers Invalid
+ *  without consuming an attempt (twofactor.go:150-153), a locked counter
+ *  answers TooManyAttempts before any validation (the reserve-first helper),
+ *  and the failure arm splits its message on the result (2fa.go:93's Iif).
+ *  c144668e59: the failure arm records the
+ *  user:authentication:fail:twofactor audit row + the fail2ban-matched
+ *  log line (2fa.go:87-91). */
 async function twofaSubmit(c: RouteContext): Promise<Response> {
   const g = await gateTicket(c);
   if ("response" in g) return g.response;
@@ -1628,10 +1636,18 @@ async function twofaSubmit(c: RouteContext): Promise<Response> {
   const form = await readUrlEncodedForm(c.req.raw);
   const passcode = form.get("passcode") ?? "";
   const now = new Date();
-  if (await validateAndConsumeTotp(c.env.DB, row, passcode, { now })) {
-    // Upstream records audit UserAuthenticationFailTwoFactor on the FAILURE
-    // arm (2fa.go:87-89) — unregistered in the audit registry, not emitted
-    // (the account-link unload precedent).
+  let tfaResult: "valid" | "invalid" | "too-many";
+  if (passcode === "") {
+    tfaResult = "invalid"; // no attempt consumed (twofactor.go:150-153)
+  } else if (!(await reserveTotpAttempt(c.env.DB, g.ticket.userId, now))) {
+    tfaResult = "too-many";
+  } else if (await validateAndConsumeTotp(c.env.DB, row, passcode, { now })) {
+    tfaResult = "valid";
+  } else {
+    tfaResult = "invalid";
+  }
+  if (tfaResult === "valid") {
+    await clearTotpAttempts(c.env.DB, g.ticket.userId); // upstream's cache.Remove on success
     const cookieValue = await mintSession(c.env.DB, g.ticket.userId, { now, remember: g.ticket.remember });
     await retirePresentedSession(c.env.DB, c.req.raw, g.ticket.userId);
     return seeOtherCookies(safeRedirectTarget(g.ticket.redirectTo), [
@@ -1641,19 +1657,37 @@ async function twofaSubmit(c: RouteContext): Promise<Response> {
       webAuthnClearCookie("assert"),
     ]);
   }
-  return renderGateFailure(c, twofaLocale.passcode_incorrect);
+  // The failure arm (2fa.go:86-94 at the pin): the audit row + the warn
+  // line (upstream's GetUserByID err==nil guard — a vanished user skips
+  // both; the read rides the failure branch only), then the
+  // too-many/incorrect message split.
+  const subject = await drizzle(c.env.DB)
+    .select({ id: users.id, username: users.username })
+    .from(users)
+    .where(eq(users.id, g.ticket.userId))
+    .get();
+  if (subject !== undefined) {
+    await emitTwofaFailureAudit(c.env.DB, subject, c.req.raw);
+    console.warn(
+      `Failed authentication attempt for ${subject.username} from ${clientIp(c.req.raw)}: invalid two-factor passcode`,
+    );
+  }
+  return renderGateFailure(c, tfaResult === "too-many" ? TOTP_TOO_MANY_ATTEMPTS : twofaLocale.passcode_incorrect);
 }
 
 /** POST /user/two_factor/scratch (upstream TwoFactorScratchPost,
- *  2fa.go:112-164): verify the scratch code, BURN it (regenerate), mint,
+ *  2fa.go:115-168 at the pin): verify the scratch code, BURN it (regenerate), mint,
  *  and land on /user/settings/security (upstream's redirect — the flash
  *  dropped per the module header) — UNLESS the parked target is the
  *  link flow's re-dance continuation (scratchRedirectTarget below): the
  *  scratch code is a valid second factor, and upstream runs
- *  completePendingLinks through this very arm (2fa.go:149) before its
+ *  completePendingLinks through this very arm (2fa.go:152) before its
  *  settings/security redirect — here the link completion IS the dance
  *  resume, so stranding the scratch user on settings/security would leave
- *  the link half-done. */
+ *  the link half-done. c144668e59: the wrong-scratch arm records the
+ *  user:authentication:fail:twofactor audit row (2fa.go:163-168) — and the
+ *  scratch arm NEVER touches the TOTP attempt counter (twofactor.go:143-190:
+ *  scratch stays usable while TOTP is locked, the recovery path). */
 async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
   const g = await gateTicket(c);
   if ("response" in g) return g.response;
@@ -1673,6 +1707,16 @@ async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
       webAuthnClearCookie("pending"),
       webAuthnClearCookie("assert"),
     ]);
+  }
+  // The wrong-scratch audit (upstream's GetUserByID err==nil guard — a
+  // vanished user skips the row; no log line upstream, audit only).
+  const subject = await drizzle(c.env.DB)
+    .select({ id: users.id, username: users.username })
+    .from(users)
+    .where(eq(users.id, g.ticket.userId))
+    .get();
+  if (subject !== undefined) {
+    await emitTwofaFailureAudit(c.env.DB, subject, c.req.raw);
   }
   return renderScratchFailure(c, twofaLocale.scratch_token_incorrect);
 }
@@ -1732,7 +1776,7 @@ sessionRouter.post("/user/two_factor/scratch", (c) => twofaScratchSubmit(c));
 // The forgot-REQUEST arm is LIVE when a mailer is configured
 // (MAIL_ENABLED="true" — the MailService!=nil posture): the GET renders the
 // IsResetRequest form, the POST runs ForgotPasswdPost's ladder
-// (password.go:53-106) — the email lookup (non-individuals fold into
+// (password.go:54-107) — the email lookup (non-individuals fold into
 // not-exist, :66-68), the non-local refusal flash (:81-85), the 180 s
 // resend throttle (:87-91), the time-limit code mint + the reset mail over
 // the landed outbox (services/mail/reset-notify.ts — upstream
@@ -1741,10 +1785,10 @@ sessionRouter.post("/user/two_factor/scratch", (c) => twofaScratchSubmit(c));
 // known account alike (:69-74 vs :103-105 — identical Data, byte-identical
 // response; NO existence oracle, NO redirect). Without a mailer the
 // disabled twins stay upstream-faithful: the GET renders the
-// reset-disabled state (password.go:40-45's IsResetDisable) and the POST is
+// reset-disabled state (password.go:41-46's IsResetDisable) and the POST is
 // the :53-57 NotFound. The reset-COMPLETE arm is live: the HMAC time-limit
 // code (auth/reset-code.ts) verifies, the 2FA arms run
-// (password.go:170-204's order — TOTP passcode/scratch BEFORE the apply,
+// (password.go:172-209's order — TOTP passcode/scratch BEFORE the apply,
 // the WebAuthn-only park AFTER it), then the UpdateAuth ladder
 // (services/user-accounts.ts applyPasswordReset) and the auto sign-in
 // (handleSignIn — mint + cookie + the "/" redirect).
@@ -1766,7 +1810,7 @@ async function forgotPasswordPage(c: RouteContext): Promise<Response> {
 }
 
 /**
- * Upstream `ctx.NotFound(nil)` on the wire (password.go:53-57 →
+ * Upstream `ctx.NotFound()` on the wire (password.go:54-58 →
  * notFoundInternal, services/context/context_response.go:130-155): the
  * response negotiates on the request's Accept — ANY Accept part containing
  * "text/html" renders the status/404 page, everything else (the non-browser
@@ -1786,7 +1830,7 @@ function forgotPasswordNotFound(env: Env, req: Request): Response | Promise<Resp
   return renderNotFoundShellResponse(env, req);
 }
 
-/** The IsResetSent render (password.go:69-74's not-exist arm and :103-105's
+/** The IsResetSent render (password.go:70-75's not-exist arm and :104-106's
  *  success arm carry IDENTICAL Data — Email from the SUBMISSION, the friendly
  *  lives; the bytes match, which IS the anti-enumeration posture). */
 function forgotPasswordSentResponse(
@@ -1800,7 +1844,7 @@ function forgotPasswordSentResponse(
   );
 }
 
-/** POST /user/forgot_password — ForgotPasswdPost (password.go:53-106).
+/** POST /user/forgot_password — ForgotPasswdPost (password.go:54-107).
  *  Without a mailer: upstream NotFound (the disabled twin — the form never
  *  renders, so this is the non-browser-client arm). With one: the lookup →
  *  non-local refusal → resend throttle → mint + mail + audit → the sent
@@ -1825,12 +1869,12 @@ async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
   const params = await readUrlEncodedForm(c.req.raw);
   const email = params.get("email") ?? "";
 
-  // password.go:62-68 — the lookup; ORGS fold into not-exist (the silent
+  // password.go:63-69 — the lookup; ORGS fold into not-exist (the silent
   // arm), as does an empty submission (GetUserByEmail's len==0 arm).
   const user = await lookupUserByEmail(c.env.DB, email);
   if (user === null || user.type !== "user") return forgotPasswordSentResponse(c, assembled.ctx, email);
 
-  // password.go:81-85 — the non-local refusal: Err_Email + the
+  // password.go:82-86 — the non-local refusal: Err_Email + the
   // non_local_account flash, the form re-rendered with the submission
   // prefilled (RenderWithErrDeprecated re-renders tplForgotPassword).
   if (await resetAccountIsExternalOnly(c.env.DB, user.id)) {
@@ -1845,16 +1889,16 @@ async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
     );
   }
 
-  // password.go:87-91 — the resend throttle: the limited arm re-renders the
+  // password.go:88-92 — the resend throttle: the limited arm re-renders the
   // FORM with no message (IsResetRequest stays in Data upstream, so the
   // template's dead ResendLimited branch never wins the chain).
   if (await resetMailResendLimited(c.env.DB, user.id, new Date())) {
     return c.html(renderForgotPasswordPage(assembled.ctx, { state: "request", email }), 200);
   }
 
-  // password.go:93-97 — the code mint (user.go:952-963, the SAME HMAC
+  // password.go:94-98 — the code mint (user.go:968-979, the SAME HMAC
   // machinery the reset-COMPLETE arm verifies) + the reset mail, then the
-  // audit row. The hash data binds the ROW's passwd|rands (user.go:948-950 —
+  // audit row. The hash data binds the ROW's passwd|rands (user.go:964-966 —
   // a successful reset invalidates the code de facto), so the FULL row is
   // read here; a row vanished since the lookup answers the sent render (the
   // not-exist arm's bytes). SendAsync is fire-and-forget upstream: an
@@ -1889,8 +1933,153 @@ async function forgotPasswordSubmit(c: RouteContext): Promise<Response> {
   return forgotPasswordSentResponse(c, assembled.ctx, email);
 }
 
+// ---------------------------------------------------------------------------
+// c54ec52f0f — the per-account failed-TOTP-attempt limiter
+// ---------------------------------------------------------------------------
+
+/** "auth.twofa_too_many_attempts" (locale_en-US.json:410 — c54ec52f0f's new
+ *  key): the too-many message split (password.go:202-203's Iif at the pin,
+ *  2fa.go:93). twofa.tsx's locale object predates the key — the string
+ *  lives here until that module's owner adopts it (HANDOFF note). */
+const TOTP_TOO_MANY_ATTEMPTS = "Too many incorrect passcodes. Try again later or use your scratch code.";
+
 /**
- * password.go:144-146 — the reset wrong-user refusal (B-83): a signed-in
+ * ValidateAndConsumeTOTP's per-account failed-attempt limiter
+ * (twofactor.go:143-190): 5 failed attempts (totpMaxAttempts, :55) refuse
+ * TOTP until 15 minutes after the LAST failure (totpAttemptsTTL, :56 —
+ * renewed by every failure); a success clears the counter; the locked arm
+ * extends nothing; empty passcodes never consume an attempt (:150-153, the
+ * password-only Basic posture); the scratch and WebAuthn arms never touch
+ * the counter (the recovery path stays usable while locked).
+ *
+ * PLATFORM (the cache → D1 adaptation): upstream rides the shared cache
+ * behind a globallock spanning check+validate+count ("With Redis, both are
+ * shared across instances"). Workers has neither; the counter lives in
+ * user_settings_kv (upstream's OWN user_setting store port — a D1 row is
+ * shared across isolates the same way) under the fixed lowercase key below
+ * (upstream's `twofa_attempts_<uid>` — the uid rides the row's user_id),
+ * and the lock's guarantee is carried by the RESERVE: a single conditional
+ * UPDATE (`count < 5 OR expired`) whose matched-rows verdict IS the check,
+ * so concurrent racers cannot widen the limit — a 6th attempt's reserve
+ * matches zero rows and is refused before any validation, exactly
+ * upstream's locked check arm. Value shape `<epoch>:<count>` (the epoch is
+ * fixed-width 10 digits — the window slide is the row's own TTL). Only
+ * wrong/replayed passcodes hold their slot (a success clears; the
+ * locked-at-arm does not write — upstream's blocked branch has no Put). A
+ * mid-attempt D1 failure may hold a reserved slot (logged) — upstream's
+ * "server errors do not count" narrows to that disclosed rare path.
+ *
+ * SHARED HOME (HANDOFF): two-factor.ts is the upstream-faithful home — the
+ * helper is where EVERY TOTP surface adopts the limiter — but that file is
+ * outside this unit's ownership, so it lives here (the session.ts auth
+ * arms) until its owner lifts it. Until then the API-Basic arm
+ * (middleware.ts, basic.go:185's TooManyAttempts 401 text) and the git twin
+ * (git-http/acl.ts) still run unlimited — recorded in the census re-grade.
+ */
+const TOTP_ATTEMPTS_KEY = "twofa_totp_attempts"; // userSettingKey is lowercase-validated (setting.go:116-124)
+const TOTP_MAX_ATTEMPTS = 5; // twofactor.go:55 totpMaxAttempts
+const TOTP_ATTEMPTS_TTL_SECONDS = 15 * 60; // twofactor.go:56 totpAttemptsTTL
+
+/**
+ * Reserve one attempt slot: true = proceed to validation, false = the
+ * counter is locked (TooManyAttempts). The reserve IS the check — the
+ * conditional UPDATE only matches a live window with headroom, so the
+ * verdict cannot race.
+ */
+async function reserveTotpAttempt(d1: D1Database, userId: number, now: Date): Promise<boolean> {
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const cutoff = nowSec - TOTP_ATTEMPTS_TTL_SECONDS;
+  const nowText = String(nowSec); // TEXT-bound: a numeric param renders REAL ("….0") in the concat
+  const freshValue = `${nowText}:1`; // <epoch10>:<count>
+  const db = drizzle(d1);
+  const epoch = userSettingsKv.settingValue;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const reserved = await db
+      .update(userSettingsKv)
+      .set({
+        settingValue: sql`case when cast(substr(${epoch}, 1, 10) as integer) <= ${cutoff}
+          then ${freshValue}
+          else ${nowText} || ':' || (cast(substr(${epoch}, 12) as integer) + 1) end`,
+      })
+      .where(
+        and(
+          eq(userSettingsKv.userId, userId),
+          eq(userSettingsKv.settingKey, TOTP_ATTEMPTS_KEY),
+          sql`(cast(substr(${epoch}, 1, 10) as integer) <= ${cutoff} or cast(substr(${epoch}, 12) as integer) < ${TOTP_MAX_ATTEMPTS})`,
+        ),
+      )
+      .returning({ id: userSettingsKv.id });
+    if (reserved.length > 0) return true;
+    // Zero rows: locked, expired-unwritten, or no row yet. One read tells
+    // which; a racer flipping state between the UPDATE and the read loops
+    // the retry (upstream's lock acquisition retried under contention).
+    const existing = await db
+      .select({ settingValue: userSettingsKv.settingValue })
+      .from(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, userId), eq(userSettingsKv.settingKey, TOTP_ATTEMPTS_KEY)))
+      .get();
+    if (existing === undefined) {
+      const inserted = await db
+        .insert(userSettingsKv)
+        .values({ userId, settingKey: TOTP_ATTEMPTS_KEY, settingValue: `${nowSec}:1` })
+        .onConflictDoNothing()
+        .returning({ id: userSettingsKv.id });
+      if (inserted.length > 0) return true; // the fresh counter is the reserve
+      continue; // a racer inserted first — retry the reserve
+    }
+    const [epochStr, countStr] = existing.settingValue.split(":");
+    const seenEpoch = Number.parseInt(epochStr ?? "", 10);
+    const seenCount = Number.parseInt(countStr ?? "", 10);
+    if (Number.isFinite(seenEpoch) && Number.isFinite(seenCount) && nowSec - seenEpoch < TOTP_ATTEMPTS_TTL_SECONDS && seenCount >= TOTP_MAX_ATTEMPTS) {
+      return false; // LOCKED — upstream's attempts >= totpMaxAttempts arm
+    }
+    // Expired window or unparseable value (upstream's Atoi error → 0, the
+    // fail-open posture): the next UPDATE iteration resets it.
+  }
+  console.error(`session: totp attempt reserve raced twice for user ${userId} — refusing (fail-closed)`);
+  return false;
+}
+
+/** The success arm — upstream's cache.Remove (twofactor.go:180). */
+async function clearTotpAttempts(d1: D1Database, userId: number): Promise<void> {
+  await drizzle(d1)
+    .delete(userSettingsKv)
+    .where(and(eq(userSettingsKv.userId, userId), eq(userSettingsKv.settingKey, TOTP_ATTEMPTS_KEY)))
+    .run();
+}
+
+/**
+ * The failed-TOTP/failed-scratch audit row — `audit.RecordAs(ctx, u,
+ * UserAuthenticationFailTwoFactor, u)` (password.go:183 wrong scratch /
+ * :199 wrong passcode at the pin; 2fa.go:87-91 gate / :163-168 scratch —
+ * c144668e59's authentication-events sweep). The request is pre-sign-in, so
+ * actor = scope = the reset/gate target — the only principal both sides can
+ * name; a session-less write carries no credential; the caller's request
+ * address rides along. Best-effort: an audit row never fails the auth arm
+ * (the writeEvent posture, event.go:136-140). The registry id landed with
+ * ACTIONS2/ADMINUSER2's append (audit.ts).
+ */
+async function emitTwofaFailureAudit(d1: D1Database, subject: { id: number; username: string }, req: Request): Promise<void> {
+  try {
+    await emitAudit(drizzle(d1), {
+      action: AuditActions.UserAuthenticationFailTwoFactor,
+      actorId: subject.id,
+      actorName: subject.username,
+      actorCredential: null,
+      scopeType: "user",
+      scopeId: subject.id,
+      scopeName: subject.username,
+      origin: "ui",
+      ipAddress: auditClientIp(req.headers),
+      vars: { scope: subject.username },
+    });
+  } catch (error) {
+    console.error(`session: unable to record the twofa-failure audit row: ${String(error)}`);
+  }
+}
+
+/**
+ * password.go:144-147 — the reset wrong-user refusal (B-83): a signed-in
  * viewer opening ANOTHER account's reset link gets upstream's
  * reset_password_wrong_user flash and the reset does NOT apply
  * (commonResetPassword's `ctx.Doer != nil && u.ID != ctx.Doer.ID` guard).
@@ -1922,7 +2111,7 @@ async function resetWrongUserRefusal(
 }
 
 /** GET /user/reset_password?code=… — the code verifies BEFORE the form
- *  renders (commonResetPassword, password.go:110-160): a valid code renders
+ *  renders (commonResetPassword, password.go:111-161): a valid code renders
  *  the password form (with the passcode field when TOTP-enrolled), an
  *  invalid/expired one renders the invalid-code message
  *  ("auth.invalid_code"). The MUST-CHANGE gate prologue rides first. */
@@ -1937,7 +2126,7 @@ async function resetPasswordPage(c: RouteContext): Promise<Response> {
   if (code !== "") {
     const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
     if (user !== null) {
-      // password.go:131-146's order — the enrollment read precedes the
+      // password.go:132-147's order — the enrollment read precedes the
       // wrong-user refusal (has_two_factor stays in the refusal render's
       // Data); the GET refusal renders the page WITH the flash (ResetPasswd
       // continues past the guard), reset obviously not applied.
@@ -1956,7 +2145,7 @@ async function resetPasswordPage(c: RouteContext): Promise<Response> {
 }
 
 /** POST /user/reset_password — the reset-complete arm (ResetPasswdPost,
- *  password.go:164-265). The MUST-CHANGE gate prologue rides first —
+ *  password.go:166-272 at the pin). The MUST-CHANGE gate prologue rides first —
  *  upstream's middleware precedes the handler. */
 async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   // §2.8 layer 2 — a non-GET UI write.
@@ -1968,8 +2157,12 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
   const action = new URL(c.req.url).pathname; // upstream's {{.Link}} — the POST's own path
-  const invalid = (code: string, message: string): Response =>
-    c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: message, twoFactor: false, action }), 200);
+  // The failure re-render keeps the passcode field when the target is
+  // TOTP-enrolled — commonResetPassword sets has_two_factor for every
+  // render past the code verify (password.go:122-124), so the POST's
+  // RenderWithErrDeprecated re-renders carry it too.
+  const invalid = (code: string, message: string, twoFactor = false): Response =>
+    c.html(renderResetPasswordPage({ ctx: assembled.ctx, code, error: message, twoFactor, action }), 200);
 
   const params = await readUrlEncodedForm(c.req.raw);
   const code = params.get("code") ?? "";
@@ -1981,7 +2174,7 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   const user = await verifyUserTimeLimitCode(c.env.DB, "reset_password", code);
   if (user === null) return invalid(code, passwordResetLocale.invalid_code);
 
-  // password.go:131-146's order — the enrollment READ precedes the
+  // password.go:132-147's order — the enrollment READ precedes the
   // wrong-user refusal (has_two_factor stays in the refusal render's Data);
   // a refused POST stops here, so the CONSUME below never runs
   // (commonResetPassword returns before ResetPasswdPost's twofa arms) and
@@ -1995,24 +2188,42 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
     );
   }
 
-  // password.go:170-204 — the TOTP arms (the form carries the passcode
+  // password.go:172-209 — the TOTP arms (the form carries the passcode
   // field only when the account is enrolled): a scratch code OR a live
-  // passcode, consumed atomically.
+  // passcode, consumed atomically. The failure arms record the
+  // user:authentication:fail:twofactor audit row (c144668e59 — :183 wrong
+  // scratch, :199 wrong passcode) and render upstream's twofa_* flash
+  // (RenderWithErrDeprecated, :186/:204) with the passcode field kept;
+  // the TOTP arm rides the per-account attempt limiter (c54ec52f0f —
+  // reserve-first, the helper's header) with the too-many message split
+  // (:203-204's Iif). The scratch arm never touches the counter.
   if (twofa !== null) {
     const scratch = params.get("scratch_code") ?? "";
     const passcode = params.get("passcode") ?? "";
-    const ok =
-      scratch !== ""
-        ? await verifyScratchToken(twofa, scratch)
-        : await validateAndConsumeTotp(c.env.DB, twofa, passcode);
-    if (!ok) {
-      return invalid(code, passwordResetLocale.invalid_code);
+    const now = new Date();
+    let failure: string | null = null;
+    if (scratch !== "") {
+      if (!(await verifyScratchToken(twofa, scratch))) {
+        failure = twofaLocale.scratch_token_incorrect;
+      }
+    } else if (passcode === "") {
+      failure = twofaLocale.passcode_incorrect; // no attempt consumed (twofactor.go:150-153)
+    } else if (!(await reserveTotpAttempt(c.env.DB, user.id, now))) {
+      failure = TOTP_TOO_MANY_ATTEMPTS;
+    } else if (await validateAndConsumeTotp(c.env.DB, twofa, passcode, { now })) {
+      await clearTotpAttempts(c.env.DB, user.id); // the success arm's cache.Remove
+    } else {
+      failure = twofaLocale.passcode_incorrect;
+    }
+    if (failure !== null) {
+      await emitTwofaFailureAudit(c.env.DB, user, c.req.raw);
+      return invalid(code, failure, true);
     }
   }
 
   // Census B-87 bridge: upstream ResetPasswdPost's apply is UpdateAuth under
-  // the LOADED SETTINGS (password.go:203-207 -> update.go:256-264 ->
-  // SetPassword, models/user/user.go:411-420) — the resolved policy gates
+  // the LOADED SETTINGS (password.go:209-215 -> update.go:256-264 ->
+  // SetPassword, models/user/user.go:417-426) — the resolved policy gates
   // the ladder and the configured PASSWORD_HASH_ALGO is the hash target;
   // unset stays upstream's pbkdf2 default (the shared idiom: the POST /login
   // arm above and ui/index.ts's change arms).
@@ -2027,7 +2238,7 @@ async function resetPasswordSubmit(c: RouteContext): Promise<Response> {
   });
   if (outcome.outcome !== "changed") return invalid(code, outcome.message);
 
-  // password.go:246-258 — the WebAuthn-only user finishes on its own page:
+  // password.go:251-263 — the WebAuthn-only user finishes on its own page:
   // the reset APPLIED first (UpdateAuth precedes handleTwoFactorRequired),
   // then the park — the same pending carrier the login park arms.
   if (twofa === null && (await hasCredentialsForUser(c.env.DB, user.id))) {

@@ -23,19 +23,19 @@
  *     audit row, and the /user/recover_account route alias (web.go:761-762 —
  *     the mail link's path, the form's {{.Link}} action);
  *   - the reset link verifies BEFORE the form renders (commonResetPassword,
- *     password.go:110-160) over the HMAC time-limit code
- *     (models/user/user.go:920-973 at our auth/reset-code.ts port): bad
+ *     password.go:111-161) over the HMAC time-limit code
+ *     (models/user/user.go:936-989 at our auth/reset-code.ts port): bad
  *     signature / expired window / unknown-user tail all collapse into the
  *     invalid-code re-render at 200;
- *   - the POST ladder (ResetPasswdPost, password.go:164-265): the TOTP
+ *   - the POST ladder (ResetPasswdPost, password.go:166-272): the TOTP
  *     passcode/scratch arms BEFORE the apply, the UpdateAuth validation
- *     re-check (services/user/update.go:247-265 — no old-password check: a
+ *     re-check (services/user/update.go:256-274 — no old-password check: a
  *     valid code IS the credential), the passwd/rands-bound code's DE FACTO
- *     one-time invalidation (user.go:948-950 — the hash data no longer
+ *     one-time invalidation (user.go:964-966 — the hash data no longer
  *     recomputes after SetPassword), then the sign-in state (handleSignIn,
  *     auth.go:632 — mint + cookie + "/") or the WebAuthn-only park
- *     (password.go:246-258);
- *   - the wrong-user refusal (B-83, commonResetPassword password.go:144-146):
+ *     (password.go:251-263);
+ *   - the wrong-user refusal (B-83, commonResetPassword password.go:144-147):
  *     a signed-in viewer on ANOTHER account's link gets the
  *     reset_password_wrong_user flash and the reset does NOT apply — the GET
  *     renders the page WITH the flash, the POST stops BEFORE the TOTP
@@ -82,6 +82,7 @@ import {
   resetWrongUserMessage,
   ResetPasswordPage,
 } from "./password-reset";
+import { twofaLocale } from "./twofa";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -166,6 +167,7 @@ beforeEach(async () => {
     "audit_event",
     "external_login_user",
     "login_source",
+    "user_settings_kv",
     "users",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
@@ -354,7 +356,7 @@ describe("GET/POST /user/forgot_password (password.go:40-57)", () => {
 // (commonResetPassword, password.go:110-160)
 // -----------------------------------------------------------------------------
 
-describe("GET /user/reset_password?code=… — the validation arms (user.go:920-973)", () => {
+describe("GET /user/reset_password?code=… — the validation arms (user.go:936-989)", () => {
   it("a VALID code renders the recovery form, error-free, with the code echoed back", async () => {
     const alice = await seedUser("Alice", "alice@example.com");
     const code = await mintCode(alice);
@@ -544,7 +546,7 @@ describe("POST /user/reset_password — the apply ladder", () => {
     expect(await verifyPassword(oldPw, row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
   });
 
-  it("a missing / invalid code on POST → the invalid-code re-render (password.go:171-176's commonResetPassword miss)", async () => {
+  it("a missing / invalid code on POST → the invalid-code re-render (password.go:173-177's commonResetPassword miss)", async () => {
     await seedUser("Alice", "alice@example.com");
 
     const noCode = await request("/user/reset_password", form({ password: NEW_PASSWORD, retype: NEW_PASSWORD }));
@@ -600,18 +602,21 @@ describe("POST /user/reset_password — the apply ladder", () => {
 });
 
 // -----------------------------------------------------------------------------
-// The 2FA arms of the ladder (password.go:170-204 — BEFORE the apply)
+// The 2FA arms of the ladder (password.go:172-209 at the pin — BEFORE the apply)
 // -----------------------------------------------------------------------------
 
 describe("POST /user/reset_password — the TOTP/scratch arms", () => {
-  it("TOTP-enrolled + NO passcode → the invalid-code re-render, password untouched (twofa_passcode_incorrect's arm)", async () => {
+  it("TOTP-enrolled + NO passcode → the twofa_passcode_incorrect re-render WITH the passcode field, password untouched (twofactor.go:150-153 — no attempt consumed)", async () => {
     const alice = await seedUser("Alice", "alice@example.com");
     await seedTotp(alice);
     const code = await mintCode(alice);
 
     const res = await request("/user/reset_password", form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD }));
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain(passwordResetLocale.invalid_code);
+    const html = await res.text();
+    expect(html).toContain(twofaLocale.passcode_incorrect); // upstream's flash, NOT invalid_code
+    expect(html).not.toContain(passwordResetLocale.invalid_code);
+    expect(html).toContain('name="passcode"'); // has_two_factor stays in the re-render's Data (password.go:122-124)
     expect((await userRow(alice.id)).passwd).toBe("");
   });
 
@@ -628,7 +633,7 @@ describe("POST /user/reset_password — the TOTP/scratch arms", () => {
     expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
   });
 
-  it("the SCRATCH code arm: a valid scratch token replaces the passcode (password.go:171-181's FormBool arm)", async () => {
+  it("the SCRATCH code arm: a valid scratch token replaces the passcode (password.go:176-186's FormBool arm)", async () => {
     const alice = await seedUser("Alice", "alice@example.com");
     const { scratchToken } = await seedTotp(alice);
     const code = await mintCode(alice);
@@ -641,7 +646,7 @@ describe("POST /user/reset_password — the TOTP/scratch arms", () => {
     expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
   });
 
-  it("a WRONG scratch token → the invalid-code re-render, password untouched", async () => {
+  it("a WRONG scratch token → the twofa_scratch_token_incorrect re-render WITH the passcode field, password untouched", async () => {
     const alice = await seedUser("Alice", "alice@example.com");
     await seedTotp(alice);
     const code = await mintCode(alice);
@@ -651,13 +656,184 @@ describe("POST /user/reset_password — the TOTP/scratch arms", () => {
       form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, scratch_code: "AAAAAAAAAAAA" }),
     );
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain(passwordResetLocale.invalid_code);
+    const html = await res.text();
+    expect(html).toContain(twofaLocale.scratch_token_incorrect); // upstream's flash, NOT invalid_code
+    expect(html).toContain('name="passcode"');
     expect((await userRow(alice.id)).passwd).toBe("");
   });
 });
 
 // -----------------------------------------------------------------------------
-// The WebAuthn-only park (password.go:246-258 — the apply PRECEDES the park)
+// c144668e59 — the failure arms record user:authentication:fail:twofactor
+// -----------------------------------------------------------------------------
+
+describe("the reset TOTP/scratch failure arms' audit row (c144668e59 — password.go:183/:199)", () => {
+  it("a wrong scratch token emits the row: actor = scope = the reset target, session-less", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    await seedTotp(alice);
+    const code = await mintCode(alice);
+
+    const res = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, scratch_code: "AAAAAAAAAAAA" }),
+    );
+    expect(res.status).toBe(200);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual(["user:authentication:fail:twofactor"]);
+    expect(rows[0]!.actorId).toBe(alice.id);
+    expect(rows[0]!.actorName).toBe("Alice");
+    expect(rows[0]!.actorCredential).toBeNull();
+    expect(rows[0]!.scopeType).toBe("user");
+    expect(rows[0]!.scopeName).toBe("Alice");
+    expect(rows[0]!.origin).toBe("ui");
+    expect(rows[0]!.message).toBe("Failed two-factor authentication for user Alice.");
+  });
+
+  it("a wrong passcode emits the row; the scratch arm NEVER touches the attempt counter", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const { secret } = await seedTotp(alice);
+    const code = await mintCode(alice);
+    const wrong = await totpCode(secret, Date.now() / 1000 + 3600); // an hour away — outside every ±1 window
+
+    const res = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: wrong }),
+    );
+    expect(res.status).toBe(200);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual(["user:authentication:fail:twofactor"]);
+    // the scratch verify after a TOTP failure leaves the counter alone —
+    // the wrong-scratch POST below cannot lock the account
+    const scratch = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, scratch_code: "AAAAAAAAAAAA" }),
+    );
+    expect(scratch.status).toBe(200);
+    expect(await scratch.text()).toContain(twofaLocale.scratch_token_incorrect);
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(2); // both failures, no counter writes
+  });
+});
+
+// -----------------------------------------------------------------------------
+// c54ec52f0f — the per-account failed-TOTP-attempt limiter (twofactor.go:143-190)
+// -----------------------------------------------------------------------------
+
+describe("the reset TOTP arm's attempt limiter (c54ec52f0f)", () => {
+  const TOO_MANY = "Too many incorrect passcodes. Try again later or use your scratch code.";
+
+  it("5 wrong passcodes each answer passcode_incorrect; the 6th answers too-many-attempts, nothing applied", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const { secret } = await seedTotp(alice);
+    const code = await mintCode(alice);
+    const wrong = async () => totpCode(secret, Date.now() / 1000 + 3600);
+
+    for (let i = 0; i < 5; i++) {
+      const res = await request(
+        "/user/reset_password",
+        form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: await wrong() }),
+      );
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain(twofaLocale.passcode_incorrect);
+    }
+    const sixth = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: await wrong() }),
+    );
+    expect(sixth.status).toBe(200);
+    const sixthHtml = await sixth.text(); // read once — the body is single-use
+    expect(sixthHtml).toContain(TOO_MANY);
+    expect(sixthHtml).not.toContain(twofaLocale.passcode_incorrect);
+    expect((await userRow(alice.id)).passwd).toBe("");
+    // the too-many arm records the audit row too (password.go:199 fires for
+    // every non-valid result) — 6 rows
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(6);
+    expect(new Set(rows.map((r) => r.action))).toEqual(new Set(["user:authentication:fail:twofactor"]));
+  });
+
+  it("a CORRECT passcode is refused while locked (upstream refuses TOTP until 15 min after the last failure); the scratch code stays usable", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const enrollment = await seedTotp(alice);
+    const { secret } = enrollment;
+    const code = await mintCode(alice);
+    const wrong = await totpCode(secret, Date.now() / 1000 + 3600);
+
+    for (let i = 0; i < 5; i++) {
+      await request("/user/reset_password", form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: wrong }));
+    }
+    // the correct passcode is NOW refused — the counter, not the code
+    const locked = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: await totpCode(secret, Date.now() / 1000) }),
+    );
+    expect(locked.status).toBe(200);
+    expect(await locked.text()).toContain(TOO_MANY);
+    expect((await userRow(alice.id)).passwd).toBe("");
+
+    // the scratch code is the recovery path — it never touches the counter
+    // and the reset APPLIES through it while TOTP is locked
+    const scratch = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, scratch_code: enrollment.scratchToken }),
+    );
+    expect(scratch.status).toBe(303);
+    expect(await userSignInPassword(env.DB, "alice", NEW_PASSWORD)).toMatchObject({ ok: true });
+  });
+
+  it("a successful reset clears the counter (upstream's cache.Remove)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const { secret } = await seedTotp(alice);
+    const code = await mintCode(alice);
+    const wrong = await totpCode(secret, Date.now() / 1000 + 3600);
+
+    for (let i = 0; i < 3; i++) {
+      await request("/user/reset_password", form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: wrong }));
+    }
+    const applied = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: await totpCode(secret, Date.now() / 1000) }),
+    );
+    expect(applied.status).toBe(303); // the reset applies and clears the counter
+
+    // the passwd-bound code is one-time — a FRESH link, then a full window
+    // of failures must fit BEFORE the too-many arm (the clear happened)
+    const fresh = await mintCode(alice);
+    for (let i = 0; i < 5; i++) {
+      const res = await request(
+        "/user/reset_password",
+        form({ code: fresh, password: "another staple 42", retype: "another staple 42", passcode: wrong }),
+      );
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain(twofaLocale.passcode_incorrect);
+    }
+    expect((await userRow(alice.id)).passwdHashAlgo).toBeDefined();
+  });
+
+  it("an empty passcode never consumes an attempt (twofactor.go:150-153)", async () => {
+    const alice = await seedUser("Alice", "alice@example.com");
+    const { secret } = await seedTotp(alice);
+    const code = await mintCode(alice);
+
+    for (let i = 0; i < 5; i++) {
+      const res = await request("/user/reset_password", form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD }));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain(twofaLocale.passcode_incorrect);
+    }
+    // the counter is untouched — a WRONG passcode still validates (and fails
+    // on its own merit), never the locked arm
+    const wrong = await request(
+      "/user/reset_password",
+      form({ code, password: NEW_PASSWORD, retype: NEW_PASSWORD, passcode: await totpCode(secret, Date.now() / 1000 + 3600) }),
+    );
+    expect(wrong.status).toBe(200);
+    const wrongHtml = await wrong.text(); // read once — the body is single-use
+    expect(wrongHtml).toContain(twofaLocale.passcode_incorrect);
+    expect(wrongHtml).not.toContain(TOO_MANY);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The WebAuthn-only park (password.go:251-263 at the pin — the apply PRECEDES the park)
 // -----------------------------------------------------------------------------
 
 describe("POST /user/reset_password — the WebAuthn-only park", () => {

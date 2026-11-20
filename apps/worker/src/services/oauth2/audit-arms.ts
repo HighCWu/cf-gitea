@@ -123,8 +123,9 @@ export async function resolveImpersonatorRef(
   return { id, name: null };
 }
 
-/** The OAuth2-application verbs (oauth2_common.go's recordAudit call sites:
- *  :77 add, :143 update, :170 secret, :189 remove, :220 revoke). */
+/** The OAuth2-application verbs (oauth2_common.go's recordAudit call sites
+ *  at the 099abf5db4 pin: :78 add, :136 update, :159 secret, :178 remove,
+ *  :209 revoke). */
 export type OAuth2ApplicationAuditVerb = "add" | "update" | "secret" | "remove" | "revoke";
 
 /** The owner row projection the scope selection needs (ScopeFromUser's half,

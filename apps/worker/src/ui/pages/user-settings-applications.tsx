@@ -22,7 +22,7 @@
  *                `createTokenFromForm`. `outcome: "created"` re-renders the
  *                FULL page with `data.newToken` set — upstream renders only
  *                the tplAccessTokens PANEL fragment with NewTokenValue
- *                (applications.go:154-158, the form's data-fetch-sync JS
+ *                (applications.go:137-142, the form's data-fetch-sync JS
  *                swaps it in); with no fetch-action plumbing the full-page
  *                re-render is the honest no-JS analog (the plaintext renders
  *                exactly once — SPEC-0002 §3 never stores it). An
@@ -37,7 +37,7 @@
  *                303 convention where upstream's JS intercepts). A "missing"
  *                outcome (a stale form id) 303s silently — upstream's
  *                flash-error arm carries the Go error string
- *                ("GetAccessTokenByID: …", applications.go:170-173), which
+ *                ("GetAccessTokenByID: …", applications.go:155-162), which
  *                has no renderable analog.
  *   POST /user/settings/applications/regenerate → the sameOriginGuard + the
  *                signed-in gate (web.go:695's group), `readUrlEncodedForm`,
@@ -45,16 +45,19 @@
  *                same single `id` field),
  *                `regenerateTokenFromForm`; the hit re-renders the FULL page
  *                with `data.newToken` set — upstream flashes the success +
- *                the fresh value and JSONRedirects (RegenerateAccessToken,
- *                applications.go:176-185 — `Flash.Success(generate_token_
- *                success)` + `Flash.Info(t.Token)`); the no-JS shell's
+ *                the fresh value and JSONRedirects("") (RegenerateAccessToken,
+ *                applications.go:176-187 at the pin — `Flash.Success(generate_
+ *                token_success)` + `Flash.Info(t.Token)`); the no-JS shell's
  *                once-only carrier is the create arm's full-page re-render
  *                (the same posture). A "missing" outcome (a stale form id)
  *                303s silently — upstream ServerErrors it (unreachable from
- *                the rendered buttons). THE AUDIT: upstream's
- *                RegenerateAccessToken records NO audit row — the
- *                regenerate arm stays audit-free (the v1.5.2 F3 family
- *                covers add/remove only, applications.go:133/:162).
+ *                the rendered buttons). THE AUDIT (365cb2bd5e): upstream's
+ *                RegenerateAccessToken records `user:accesstoken:regenerate`
+ *                (applications.go:182 — `audit.Record(ctx,
+ *                UserAccessTokenRegenerate, owner, "token", t.Name)`, doer =
+ *                owner on the settings arm); ours emits the same row through
+ *                audit-arms.ts's "regenerate" verb (the admin bot-token twin
+ *                landed first — pages/admin-user-detail.tsx).
  *
  * Upstream's settings navbar (user/settings/navbar.tmpl) is the SHARED
  * components/settings-nav UserSettingsNavbar (the wave-114 swap) with this
@@ -74,7 +77,7 @@
  *     Upstream's revoke POSTs `/user/settings/applications/oauth2/
  *     {ApplicationID}/revoke/{GrantID}` (grants_oauth2.tmpl:22; web.go:688
  *     RevokeOAuth2Grant); the handler 404-shells a missing/foreign grant
- *     (oauth2_common.go:196-207 — grants belong to individual users; the
+ *     (oauth2_common.go:185-196 at the pin — grants belong to individual users; the
  *     org/admin twins refuse) and 303s home on success. NO empty-list arm:
  *     the description line always renders (upstream-exact; the org/admin
  *     pages' "No applications yet" line is THEIR store's convention, the
@@ -89,7 +92,7 @@
  *     the details' open arm is upstream-exact (`{{if .application_name}}` —
  *     the kept submitted name only, applications_oauth2_list.tmpl:51). The
  *     create ANSWER is upstream's AddApp shape: the shared edit page
- *     rendered with the plaintext client secret (oauth2_common.go:79-87);
+ *     rendered with the plaintext client secret (oauth2_common.go:80-88 at the pin);
  *     the bind-error arm re-renders THIS page with the negative line + the
  *     kept submission (upstream flashes + redirects to the list — the
  *     no-flash posture).
@@ -97,7 +100,7 @@
  * The builtin lock arm (applications_oauth2_list.tmpl:18-21) renders never
  * on THIS page: the builtin rows are uid=0 and the list is uid-scoped to the
  * doer (upstream doesn't pass BuiltinApplications here either — only the
- * admin Applications handler does, applications.go:182-204 has no such key).
+ * admin Applications handler does, applications.go:189-211 at the pin has no such key).
  * The list rows' secret stays blank (app.go's hide-on-list arm — the landed
  * toApiOAuth2Application's "" arg); the plaintext exists only on the edit
  * page after create/regenerate (the secret-shown-once posture, the shared
@@ -121,7 +124,7 @@
  *
  *   list     `TokenService.list(userId, 1, TOKENS_LIST_LIMIT)` — upstream's
  *            web panel is db.Find with NO pagination
- *            (NewAccessTokensPanel, applications.go:40-58); the 500-row cap
+ *            (NewAccessTokensPanel, applications.go:47-65); the 500-row cap
  *            is the render bound (the settings-collaboration cap note).
  *            HasUsed/HasRecentActivity are upstream's AfterLoad pair
  *            (access_token.go:38-39) over created/last_used_at; the 24 h
@@ -167,8 +170,10 @@
  *   is API-only (routes/oauth2-apps.ts) with no web UI surface — this brief
  *   pins the PAT panel (access_tokens.tmpl). [RETIRED W5 — the halves render
  *   above.]
- * - The Regenerate button + dialog (access_tokens.tmpl:51-56, 115-125) are
- *   UNRENDERED: upstream RegenerateAccessToken (applications.go:176-185)
+ * - The Regenerate button + dialog (access_tokens.tmpl:51-54, 113-121 at
+ *   the pin) are
+ *   UNRENDERED: upstream RegenerateAccessToken (applications.go:176-187 at
+ *   the pin)
  *   has no landed analog — TokenService carries mint/revoke only; a
  *   rendered button would post a dead route. [RETIRED v1.5.2 F10 — the
  *   button renders above posting /user/settings/applications/regenerate;
@@ -177,15 +182,18 @@
  * - The copy button beside the new token (access_tokens.tmpl:11,
  *   data-clipboard-target) is the bundle's clipboard JS — the no-JS shape
  *   renders the bare `<code id="new-access-token-value">`.
- * - The delete confirm dialog (access_tokens.tmpl:104-113) is not
+ * - The delete confirm dialog (access_tokens.tmpl:102-111 at the pin) is not
  *   reproduced — the plain form POST (the hooks-list reduction, wave 4).
- * - The `IsBot` arms (access_tokens.tmpl:17, 51, 115 — bot tokens,
- *   no-delete, no-regenerate) render never: cf-gitea has no bot users.
+ * - The `IsBot` arms (access_tokens.tmpl:17 — bot tokens) render never on
+ *   THIS page: the panel is doer-scoped and a bot cannot sign in, so no
+ *   session doer is ever a bot (users.type carries 'bot' since B-72 — the
+ *   admin twin's token panel is where the arms render; the trailing
+ *   buttons' own IsBot gates were dropped upstream in 365cb2bd5e).
  * - The generate form renders as plain radios (upstream's `gt-checkbox`
  *   labels) — the Fomantic styling is the bundle's CSS, the DOM is the
  *   same inputs; the details element is native HTML (no JS needed).
  * - The scope table lists GetAccessTokenCategories' SORTED order
- *   (applications.go:199-205 — slices.Sort), minus "admin" for non-admin
+ *   (access_token_scope.go:212-218 at the pin — slices.Sort), minus "admin" for non-admin
  *   viewers (NewAccessTokensPanel's SliceRemoveAll).
  * - generate_token_name_duplicate renders without upstream's <strong>
  *   wrapper (the plain-text error line; the locale's HTML tags stripped).
@@ -310,13 +318,13 @@ export type CreateTokenOutcome =
 export type RevokeTokenOutcome = "deleted" | "missing";
 
 /** The web panel lists ALL tokens (NewAccessTokensPanel's db.Find,
- *  applications.go:42-48 — no pagination); this cap is the render bound
+ *  applications.go:47-65 — no pagination); this cap is the render bound
  *  (the settings-collaboration cap note). */
 export const TOKENS_LIST_LIMIT = 500;
 
-/** GetAccessTokenCategories (applications.go:199-205): the scope categories
+/** GetAccessTokenCategories (access_token_scope.go:212-218 at the pin): the scope categories
  *  in SORTED order — minus "admin" when the owner is not a site admin
- *  (NewAccessTokensPanel's SliceRemoveAll, applications.go:55). */
+ *  (NewAccessTokensPanel's SliceRemoveAll, applications.go:61). */
 export function tokenScopeCategories(isAdmin: boolean): string[] {
   const sorted = [...SCOPE_CATEGORIES].sort();
   return isAdmin ? sorted : sorted.filter((category) => category !== "admin");
@@ -362,7 +370,7 @@ export interface UserSettingsApplicationsPageData {
  *  landed gate read the mounted handler passes
  *  (`oauth2FeatureEnabled(c.env)`) — false skips the OAuth2 reads entirely
  *  (upstream's loadApplicationsData reads Applications/Grants only when
- *  setting.OAuth2.Enabled, applications.go:189-203).
+ *  setting.OAuth2.Enabled, applications.go:196-210 at the pin).
  */
 export async function loadUserSettingsApplicationsPageData(
   d1: D1Database,
@@ -508,7 +516,7 @@ function mintErrorToOutcome(error: unknown, name: string): CreateTokenOutcome {
   throw error;
 }
 
-/** The revoke — upstream DeleteAccessToken (applications.go:167-174) over
+/** The revoke — upstream DeleteAccessToken (applications.go:155-167) over
  *  the landed owner-scoped `TokenService.revoke`: the row loads first (the
  *  audit name — upstream's GetAccessTokenByID arm, applications.go:169-173;
  *  a miss answers "missing" with NO audit — the stale-form arm), then the
@@ -548,23 +556,32 @@ export async function revokeTokenFromForm(
 export type RegenerateTokenOutcome = { outcome: "regenerated"; plaintext: string } | { outcome: "missing" };
 
 /**
- * The regenerate — upstream RegenerateAccessToken (applications.go:176-185)
- * over models/auth/access_token.go:64-78: the (id, uid) load (a miss is the
- * "missing" stale-form outcome — upstream ServerErrors it, unreachable from
- * the rendered buttons), then `setNewTokenValue`'s fresh value: a new
- * `cfg_` token whose public prefix replaces the row's lookup key
- * (`token_hash, token_salt, token_last_eight` upstream — cf-gitea's shape
- * keeps the digest under `sha256Digest` and folds the salt into it; the
- * unique `pat_prefix_uq` prefix plays the last-eight lookup role and its
- * collision retries exactly like the mint's, SPEC-0002 §4.5). The name,
- * scopes, created stamp and last-used history ride untouched (upstream
- * updates ONLY the three credential columns, `NoAutoTime` — no updated_unix
- * bump; this table carries no updated column). NO audit row: upstream's
- * RegenerateAccessToken records none (applications.go:176-185).
+ * The regenerate — upstream RegenerateAccessToken (applications.go:176-187
+ * at the pin) over models/auth/access_token.go:64-78: the (id, uid) load (a
+ * miss is the "missing" stale-form outcome — upstream ServerErrors it,
+ * unreachable from the rendered buttons), then `setNewTokenValue`'s fresh
+ * value: a new `cfg_` token whose public prefix replaces the row's lookup
+ * key (`token_hash, token_salt, token_last_eight` upstream — cf-gitea's
+ * shape keeps the digest under `sha256Digest` and folds the salt into it;
+ * the unique `pat_prefix_uq` prefix plays the last-eight lookup role and
+ * its collision retries exactly like the mint's, SPEC-0002 §4.5). The
+ * name, scopes, created stamp and last-used history ride untouched
+ * (upstream updates ONLY the three credential columns, `NoAutoTime` — no
+ * updated_unix bump; this table carries no updated column). THE AUDIT
+ * (365cb2bd5e): `audit.Record(ctx, UserAccessTokenRegenerate, owner,
+ * "token", t.Name)` (applications.go:182) — the actor is the DOER (on this
+ * settings arm doer = owner; the admin bot twin threads the admin through
+ * `actor`); the write rides a session, so no credential, and the
+ * impersonator pair rides the record seam like the add/remove twins.
  */
-export async function regenerateTokenFromForm(d1: D1Database, userId: number, id: number): Promise<RegenerateTokenOutcome> {
+export async function regenerateTokenFromForm(
+  d1: D1Database,
+  userId: number,
+  id: number,
+  impersonatorUserId?: number | null,
+): Promise<RegenerateTokenOutcome> {
   const existing = await drizzle(d1)
-    .select({ id: personalAccessTokens.id })
+    .select({ id: personalAccessTokens.id, name: personalAccessTokens.name })
     .from(personalAccessTokens)
     .where(and(eq(personalAccessTokens.id, id), eq(personalAccessTokens.userId, userId)))
     .get();
@@ -588,6 +605,18 @@ export async function regenerateTokenFromForm(d1: D1Database, userId: number, id
       if (updated.length === 0) {
         return { outcome: "missing" }; // the row vanished mid-regenerate
       }
+      // audit.Record(ctx, UserAccessTokenRegenerate, owner, "token", t.Name)
+      // (applications.go:182 at the pin — after the write, before the flash).
+      // The settings write rides a session: no actor credential; actor =
+      // scope = the token's owner (doer = owner on this arm; the
+      // impersonator rides the record seam — the create twin's note).
+      await emitAccessTokenAudit(d1, {
+        userId,
+        tokenName: existing.name,
+        verb: "regenerate",
+        origin: "ui",
+        impersonatorUserId,
+      });
       return { outcome: "regenerated", plaintext: fresh.value };
     } catch (error) {
       lastError = error; // a prefix collision — draw a fresh value and retry
@@ -708,12 +737,14 @@ export function UserSettingsApplicationsPage(props: { ctx: UiContext; data: User
                       </div>
                     </div>
                     <div class="item-trailing">
-                      {/* access_tokens.tmpl:51-56 — the Regenerate button (the
-                          v1.5.2 F10 arm; the confirm dialog reduces to the
-                          plain form POST, the desc text the aria label — the
-                          delete reduction's convention). The IsBot gate
-                          (tmpl:51) renders never — cf-gitea has no bot
-                          users (the module header). */}
+                      {/* access_tokens.tmpl:51-54 at the pin — the Regenerate
+                          button is UNCONDITIONAL since 365cb2bd5e (the former
+                          `{{if not $.IsBot}}` wrap is history); the no-JS
+                          form POST reduction (upstream's data-modal-confirm
+                          link-action + #regenerate-token dialog, :113-121,
+                          drop — the confirm modal's house reduction, the
+                          delete twin's convention; upstream renders
+                          octicon-sync, the admin twin's documented stand-in). */}
                       <form
                         method="post"
                         action="/user/settings/applications/regenerate"
