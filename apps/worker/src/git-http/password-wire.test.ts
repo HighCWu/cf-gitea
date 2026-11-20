@@ -29,7 +29,7 @@
 import { SELF, env } from "cloudflare:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
@@ -39,7 +39,7 @@ import { newPasswordRecord } from "../auth/password";
 import { createCredential } from "../web/webauthn-store";
 import { encodeCoseKey } from "../web/webauthn-ceremony";
 import { RepoService } from "../repos/service";
-import { authFailures, users } from "../db/schema";
+import { auditEvents, authFailures, userSettingsKv, users } from "../db/schema";
 import { GIT_TOTP_PLAINTEXT_401 } from "./acl";
 import { requireSignInViewEnabled } from "../api/config";
 
@@ -65,6 +65,7 @@ beforeEach(async () => {
     "sessions",
     "personal_access_tokens",
     "auth_failures",
+    "user_settings_kv", // the OTP lock ladder writes the attempt counter (c54ec52f0f)
     "two_factor",
     "webauthn_credentials",
     "audit_event",
@@ -289,6 +290,152 @@ describe("the TOTP-enrollment 401 with the verbatim upstream message (githttp.go
     expect(res.status).toBe(401);
     expect(new TextDecoder().decode(await res.arrayBuffer())).toBe(UPSTREAM_TOTP_PLAINTEXT);
     expect(res.headers.get("www-authenticate")).toBeNull();
+  });
+});
+
+// -----------------------------------------------------------------------------
+// THE OTP LOCK LADDER over the git chain (c54ec52f0f's per-account
+// failed-attempt limiter — twofactor.go:143-190 shared through
+// basic.go:169-193's validateTOTP, the reserve-first D1 counter in
+// auth/totp-attempts.ts): 5 wrong passcodes lock TOTP until 15 min after the
+// LAST failure (renewed per failure), a success clears, the locked check
+// precedes validation, an absent passcode never consumes.
+//
+// THE LOCK WIRE: upstream's TooManyAttempts ErrUserAuthMessage
+// (basic.go:186) is an auth-method ERROR; Group.Verify returns the first
+// error (group.go:78) and the web chain's handler answers
+// `ctx.HTTPError(401, "Failed to authenticate user")` (web.go:160-163) —
+// upstream's git wire folds the lock into the SAME error class as a wrong
+// OTP, with no distinct body. The landed family renders every Basic miss as
+// the Basic challenge (SPEC-0002's recorded shape, pinned above), so the
+// lock rides the SAME challenge here: the behavioral lift is the consumed
+// slot + the audit row (basic.go:182's RecordAs precedes the :186 branch,
+// ORIGIN "ui" — the git mounts ride the web mid list's
+// AuditOrigin(OriginUI), web.go:300/:1753, not the API chain's OriginAPI,
+// api.go:971). The family-wide "Failed to authenticate user" error-body gap
+// is recorded for the auth-chain owner (CENSUS note, not this arm's flip).
+// -----------------------------------------------------------------------------
+
+describe("the OTP lock ladder over the git chain (c54ec52f0f's limiter)", () => {
+  const counterValue = async (): Promise<string | undefined> =>
+    (await drizzle(env.DB).select({ settingValue: userSettingsKv.settingValue }).from(userSettingsKv).all())[0]
+      ?.settingValue;
+
+  it("5 wrong OTPs challenge each time; the 6th (locked) takes the SAME challenge — upstream folds the lock into the uniform auth-error class — and the audit rows ride every arm with origin ui", async () => {
+    const alice = await seedUserWithPassword("Alice");
+    await seedTotp(alice.id);
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "otpladder", isPrivate: true });
+    // a per-test IP: the ladder's failed attempts share ONE limiter bucket
+    // (threshold 20) — distinct keys keep the file's batteries independent.
+    const headers = {
+      authorization: basicHeader("Alice", alice.password),
+      "x-gitea-otp": "000000",
+      "cf-connecting-ip": "198.51.100.201",
+    };
+
+    for (let i = 0; i < 5; i++) {
+      const res = await infoRefs("alice", "otpladder", "git-upload-pack", headers);
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate")).toBe(CHALLENGE);
+      expect(new TextDecoder().decode(await res.arrayBuffer())).toBe(UNAUTHORIZED_BODY);
+    }
+    expect((await counterValue())?.endsWith(":5")).toBe(true);
+
+    const sixth = await infoRefs("alice", "otpladder", "git-upload-pack", headers);
+    expect(sixth.status).toBe(401);
+    expect(sixth.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect(new TextDecoder().decode(await sixth.arrayBuffer())).toBe(UNAUTHORIZED_BODY);
+    // the locked arm consumed nothing (upstream's blocked branch has no Put)
+    expect((await counterValue())?.endsWith(":5")).toBe(true);
+
+    // the audit trail: 5 invalid arms + the locked arm, all
+    // user:authentication:fail:twofactor at the WEB origin (the fixture's
+    // repository:create row filtered out)
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).all();
+      const twofaRows = rows.filter((r) => r.action === "user:authentication:fail:twofactor");
+      expect(twofaRows).toHaveLength(6);
+      expect(new Set(rows.map((r) => r.action))).toEqual(new Set(["repository:create", "user:authentication:fail:twofactor"]));
+      expect(twofaRows[5]).toMatchObject({ actorId: alice.id, origin: "ui", ipAddress: "198.51.100.201" });
+    });
+  });
+
+  it("a CORRECT OTP stays refused while locked — the challenge (identity never establishes), never the verbatim enrollment plaintext", async () => {
+    const alice = await seedUserWithPassword("Alice");
+    const { secret } = await seedTotp(alice.id);
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "lockedok", isPrivate: true });
+    const base = { authorization: basicHeader("Alice", alice.password), "cf-connecting-ip": "198.51.100.202" };
+
+    for (let i = 0; i < 5; i++) {
+      await infoRefs("alice", "lockedok", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+    }
+    // UNLOCKED, a correct OTP on this private read establishes identity and
+    // answers the verbatim plaintext WITHOUT the challenge header (the test
+    // above) — LOCKED, identity never establishes and the generic challenge
+    // answers instead: the lock changes the arm, not just the count.
+    const locked = await infoRefs("alice", "lockedok", "git-upload-pack", {
+      ...base,
+      "x-gitea-otp": await totpCode(secret, Date.now() / 1000),
+    });
+    expect(locked.status).toBe(401);
+    expect(locked.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect(new TextDecoder().decode(await locked.arrayBuffer())).toBe(UNAUTHORIZED_BODY);
+  });
+
+  it("every failure RENEWS the window (totpAttemptsTTL slides to the LAST failure — twofactor.go:56)", async () => {
+    const alice = await seedUserWithPassword("Alice");
+    await seedTotp(alice.id);
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "renew", isPrivate: true });
+    const base = { authorization: basicHeader("Alice", alice.password), "cf-connecting-ip": "198.51.100.203" };
+
+    await infoRefs("alice", "renew", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+    await infoRefs("alice", "renew", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+
+    // Backdate the counter near expiry (10 s left) with 4 slots spent: a
+    // stale-window reset would restart at 1 and the ladder would never lock.
+    const staleEpoch = Math.floor(Date.now() / 1000) - (15 * 60 - 10);
+    await drizzle(env.DB).update(userSettingsKv).set({ settingValue: `${staleEpoch}:4` }).run();
+
+    const third = await infoRefs("alice", "renew", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+    expect(third.status).toBe(401);
+    expect(third.headers.get("www-authenticate")).toBe(CHALLENGE); // headroom 1 — the generic miss
+
+    const renewed = (await counterValue()) ?? "";
+    const [epochStr, countStr] = renewed.split(":");
+    expect(countStr).toBe("5");
+    expect(Number.parseInt(epochStr ?? "", 10)).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) - 5);
+  });
+
+  it("a success CLEARS the counter (cache.Remove): 4 failures + a valid OTP on the anon-exempt public read → 200, then a full fresh ladder refits", async () => {
+    const alice = await seedUserWithPassword("Alice");
+    const { secret } = await seedTotp(alice.id);
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "clears", isPrivate: false });
+    const base = { authorization: basicHeader("Alice", alice.password), "cf-connecting-ip": "198.51.100.204" };
+
+    for (let i = 0; i < 4; i++) {
+      const res = await infoRefs("alice", "clears", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+      expect(res.status).toBe(401);
+    }
+    const ok = await infoRefs("alice", "clears", "git-upload-pack", {
+      ...base,
+      "x-gitea-otp": await totpCode(secret, Date.now() / 1000),
+    });
+    expect(ok.status).toBe(200); // the exemption: a public read skips the enrollment gate
+    expect(ok.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    expect(await drizzle(env.DB).select().from(userSettingsKv).all()).toHaveLength(0);
+
+    // a FULL fresh window: 5 wrong OTPs answer the generic miss each time (a
+    // leftover count of 4 would have locked at the first) — the 6th finds
+    // count 5 locked and consumes nothing
+    for (let i = 0; i < 5; i++) {
+      const res = await infoRefs("alice", "clears", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate")).toBe(CHALLENGE);
+    }
+    expect((await counterValue())?.endsWith(":5")).toBe(true);
+    const sixth = await infoRefs("alice", "clears", "git-upload-pack", { ...base, "x-gitea-otp": "000000" });
+    expect(sixth.status).toBe(401);
+    expect((await counterValue())?.endsWith(":5")).toBe(true); // the locked arm extends nothing
   });
 });
 

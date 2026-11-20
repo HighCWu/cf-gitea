@@ -28,13 +28,23 @@ import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./f
 import { requiredScopeNames, type ScopeCategory, ScopeSet, type ScopeLevel, SCOPE_ALL } from "./scopes";
 import { TokenService } from "./token-service";
 import { authUserFromRow, userSignInPassword } from "./password-auth";
-import { getTwoFactorByUid, validateAndConsumeTotp } from "./two-factor";
+import { getTwoFactorByUid } from "./two-factor";
+import { consumeTotpWithAttemptLimit, emitTwofaFailureAudit } from "./totp-attempts";
 import { hasCredentialsForUser } from "../web/webauthn-store";
-import { AuditActions, auditClientIp, emitAudit } from "../services/audit";
 import { oauth2FeatureEnabled, resolveOAuth2AccessTokenCredential, type ResolvedOAuth2Credential } from "../services/oauth2/token";
 
 /** Message used for every bad/expired/revoked credential (api.go:862–875). */
 const INVALID_CREDENTIAL_MESSAGE = "invalid username, password or token";
+
+/**
+ * The OTP lock's wire body — basic.go:186's `ErrUserAuthMessage("too many
+ * failed OTP attempts, try again later")` VERBATIM: api.go:884 renders an
+ * ErrAsUserAuthMessage message through ctx.APIError(401, msg), so this is
+ * the ONE OTP text that reaches the API wire (the per-account lock arm of
+ * c54ec52f0f's ValidateAndConsumeTOTP limiter — the invalid-OTP text next
+ * to it (:188) stays OFF the wire, api.go:884's fallback).
+ */
+const TOO_MANY_OTP_ATTEMPTS_MESSAGE = "too many failed OTP attempts, try again later";
 
 /** Unpinned by SPEC-0002 §2.7 (only status + Retry-After are specified). */
 const RATE_LIMITED_MESSAGE = "too many authentication failures, retry later";
@@ -301,32 +311,33 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
         if (outcome.kind === "unsupported-hash") {
           console.error(`basic-auth: ${outcome.message}`);
         }
-        if (outcome.kind === "totp-fail") {
-          // basic.go:182's audit row rides the generic 401 (the
-          // "invalid provided OTP" text stays OFF the wire — api.go:867's
-          // generic fallback swallows every non-ErrUserAuthMessage error).
-          // The row's address is the auditClientIp derivation, NOT the
-          // limiter's `ip` above: that value is the RATE-LIMIT bucket key,
-          // whose "unknown" sentinel is a legitimate identity for an
-          // unaddressable client — but an audit row's ipAddress is a client
-          // ADDRESS or null (the AuditEventInput contract; upstream's
-          // RemoteHost is always the socket peer), so an absent header
-          // records null here, never the sentinel string. Same header,
-          // distinct semantics, derivations kept separate on purpose.
-          void emitAudit(drizzle(c.env.DB), {
-            action: AuditActions.UserAuthenticationFailTwoFactor,
-            actorId: outcome.userId,
-            actorName: outcome.username,
-            actorCredential: null,
-            scopeType: "user",
-            scopeId: outcome.userId,
-            scopeName: outcome.username,
-            origin: "api",
-            ipAddress: auditClientIp(c.req.raw.headers),
-            vars: { scope: outcome.username },
-          }).catch((error: unknown) => {
-            console.error(`basic-auth: audit row failed: ${String(error)}`);
-          });
+        if (outcome.kind === "totp-fail" || outcome.kind === "totp-locked") {
+          // basic.go:182's audit row rides the failure 401 for EVERY
+          // non-valid result — upstream's RecordAs sits BEFORE the
+          // TooManyAttempts split (basic.go:182-188), so the locked arm
+          // records too. The "invalid provided OTP" text stays OFF the
+          // wire (api.go:884's generic fallback swallows every
+          // non-ErrUserAuthMessage error). The row's address is the
+          // auditClientIp derivation, NOT the limiter's `ip` above: that
+          // value is the RATE-LIMIT bucket key, whose "unknown" sentinel is
+          // a legitimate identity for an unaddressable client — but an
+          // audit row's ipAddress is a client ADDRESS or null (the
+          // AuditEventInput contract; upstream's RemoteHost is always the
+          // socket peer), so an absent header records null here, never the
+          // sentinel string. Same header, distinct semantics, derivations
+          // kept separate on purpose. (The emitter — the shared
+          // totp-attempts.ts family shape — is itself best-effort.)
+          void emitTwofaFailureAudit(c.env.DB, { id: outcome.userId, username: outcome.username }, c.req.raw, "api");
+        }
+        if (outcome.kind === "totp-locked") {
+          // basic.go:186's ErrUserAuthMessage IS the wire body (api.go:884
+          // renders ErrAsUserAuthMessage verbatim through ctx.APIError) —
+          // the ONE OTP text that surfaces on the API. The IP limiter still
+          // records the attempt: a locked account's try remains a failed
+          // credential on the wire (the 401 must not depend on the limiter
+          // backend's health).
+          await limiterRecordFailureFailOpen(limiter, ip, now);
+          return apiErrorResponse(c, 401, TOO_MANY_OTP_ATTEMPTS_MESSAGE);
         }
       }
       // The 401 must not depend on the limiter backend's health.
@@ -451,12 +462,17 @@ function runBackground(c: Context<AuthEnv>, promise: Promise<void>): Promise<voi
  * `unsupported-hash` (whose message goes to the log, never the wire) render
  * the generic 401; `webauthn-enrolled` carries the wire message;
  * `totp-fail` carries the audit-row coordinates (basic.go:182) and renders
- * the generic 401.
+ * the generic 401; `totp-locked` (c54ec52f0f's limiter — the per-account
+ * failed-attempt counter upstream's ValidateAndConsumeTOTP spans) carries
+ * the same audit coordinates and renders basic.go:186's ErrUserAuthMessage
+ * VERBATIM (api.go:884 renders ErrAsUserAuthMessage messages — the ONE OTP
+ * text that reaches the API wire).
  */
 export type BasicPasswordOutcome =
   | { kind: "ok"; user: typeof users.$inferSelect }
   | { kind: "webauthn-enrolled" }
   | { kind: "totp-fail"; userId: number; username: string }
+  | { kind: "totp-locked"; userId: number; username: string }
   | { kind: "unsupported-hash"; message: string }
   | { kind: "failed" };
 
@@ -473,6 +489,13 @@ export type BasicPasswordOutcome =
  * PasswordSignInOptions.configuredHashSpec): the sign-in's rehash-on-login
  * compares against AND rewrites under the configured spec. Omitted, the
  * landed pbkdf2 default stands.
+ *
+ * c54ec52f0f's lift: the passcode validates under the per-account
+ * failed-attempt limiter — the shared `consumeTotpWithAttemptLimit`
+ * tri-state (the ValidateAndConsumeTOTP mirror: empty passcode never
+ * consumes, 5 failures lock for 15 min renewed per failure, success
+ * clears). The locked verdict splits `totp-locked` out of `totp-fail` so
+ * each surface renders its own TooManyAttempts shape.
  */
 export async function basicPasswordArm(
   db: D1Database,
@@ -497,12 +520,17 @@ export async function basicPasswordArm(
     return { kind: "webauthn-enrolled" };
   }
 
-  // basic.go:158-160 + validateTOTP (:169-187) — TOTP-enrolled → the
-  // X-Gitea-OTP passcode, consumed atomically.
+  // basic.go:158-160 + validateTOTP (:169-193) — TOTP-enrolled → the
+  // X-Gitea-OTP passcode, consumed atomically UNDER the failed-attempt
+  // limiter (the tri-state splits the locked arm out before any
+  // validation, exactly upstream's attempts >= totpMaxAttempts check).
   const twofa = await getTwoFactorByUid(db, user.id);
   if (twofa !== null) {
-    const ok = await validateAndConsumeTotp(db, twofa, otpPasscode, { now });
-    if (!ok) {
+    const result = await consumeTotpWithAttemptLimit(db, twofa, otpPasscode, now);
+    if (result === "too-many") {
+      return { kind: "totp-locked", userId: user.id, username: user.username };
+    }
+    if (result === "invalid") {
       return { kind: "totp-fail", userId: user.id, username: user.username };
     }
   }

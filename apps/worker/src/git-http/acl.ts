@@ -49,8 +49,8 @@ import { ScopeSet, SCOPE_ALL } from "../auth/scopes";
 import { authUserFromRow } from "../auth/password-auth";
 import { basicPasswordArm } from "../auth/middleware";
 import { hasTwoFactorByUid } from "../auth/two-factor";
+import { emitTwofaFailureAudit } from "../auth/totp-attempts";
 import { mustChangePasswordArm, userMustChangePassword } from "../ui/must-change-password";
-import { AuditActions, emitAudit } from "../services/audit";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import {
   DEPLOY_TOKEN_PREFIX,
@@ -267,7 +267,9 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
       // EnableBasicAuth → the full password sign-in, WebAuthn-enrolled
       // hard-reject folded into the generic failure (identity never
       // establishes → the challenge, githttp.go:146-159's !IsSigned arm),
-      // TOTP passcode consumed atomically from X-Gitea-OTP. Every miss →
+      // TOTP passcode consumed atomically from X-Gitea-OTP UNDER the
+      // per-account failed-attempt limiter (c54ec52f0f — the shared
+      // ValidateAndConsumeTOTP tri-state; the lock arm below). Every miss →
       // the same 401 challenge.
       if (parsed?.basicAuth !== undefined && parsed?.basicAuth !== null) {
         // THE KNOB (basic.go:139-141, census B-87 — the same gate the API
@@ -352,24 +354,38 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
         if (outcome.kind === "unsupported-hash") {
           console.error(`git-http basic-auth: ${outcome.message}`);
         }
-        if (outcome.kind === "totp-fail") {
-          // basic.go:182's audit row (shared validateTOTP — the git chain
-          // records it the same as the API chain).
-          void emitAudit(drizzle(env.DB), {
-            action: AuditActions.UserAuthenticationFailTwoFactor,
-            actorId: outcome.userId,
-            actorName: outcome.username,
-            actorCredential: null,
-            scopeType: "user",
-            scopeId: outcome.userId,
-            scopeName: outcome.username,
-            origin: "api",
-            ipAddress: ip,
-            vars: { scope: outcome.username },
-          }).catch((error: unknown) => {
-            console.error(`git-http basic-auth: audit row failed: ${String(error)}`);
-          });
+        if (outcome.kind === "totp-fail" || outcome.kind === "totp-locked") {
+          // basic.go:182's audit row — the shared validateTOTP runs in BOTH
+          // chains, and upstream's RecordAs sits BEFORE the
+          // TooManyAttempts split (basic.go:182-188), so the locked arm
+          // records too. ORIGIN: the git family mounts inside the WEB
+          // routes (web.go:1753 addOwnerRepoGitHTTPRouters → the global web
+          // mid list carries common.AuditOrigin(OriginUI) at web.go:300,
+          // BEFORE webAuth.MiddlewareHandler at :304) — upstream's row here
+          // carries OriginUI, not the API chain's OriginAPI (api.go:971 is
+          // the v1 router only). ADDRESS: the shared emitter's
+          // auditClientIp derivation — a client address or null, never the
+          // limiter bucket key's "unknown" sentinel (the AuditEventInput
+          // contract; middleware-wire.test.ts pins the same separation on
+          // the API twin). Best-effort: the emitter never fails the arm.
+          void emitTwofaFailureAudit(env.DB, { id: outcome.userId, username: outcome.username }, req, "ui");
         }
+        // THE LOCK WIRE (c54ec52f0f's lift): upstream's TooManyAttempts
+        // ErrUserAuthMessage (basic.go:186) is an auth-method ERROR, and
+        // the web chain folds every such error into ONE arm — Group.Verify
+        // returns the first error (group.go:78) and webAuth's handler
+        // answers `ctx.HTTPError(401, "Failed to authenticate user")`
+        // (web.go:160-163) with NO WWW-Authenticate. The LANDED family
+        // convention renders every Basic miss as the Basic challenge (the
+        // SPEC-0002 recorded shape password-wire.test.ts pins — the
+        // wrong-password/WebAuthn/wrong-OTP arms all ride it), and
+        // upstream's own git wire draws NO distinction between a wrong OTP
+        // and a locked one (both are the same error class, same body). So
+        // the lock rides the SAME challenge below: the limiter's behavioral
+        // effect is the consumed slot + the audit row above, and the
+        // family-wide error-body gap ("Failed to authenticate user" for
+        // every Basic auth error, challenge instead) is NOT this arm's to
+        // flip — recorded for the auth-chain owner (CENSUS note).
       }
       // Unknown/revoked/expired/malformed credential → 401 challenge
       // (identity not established; §2.4 edge 4.14). Upstream answers the

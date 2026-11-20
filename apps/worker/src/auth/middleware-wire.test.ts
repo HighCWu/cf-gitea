@@ -34,7 +34,7 @@ import type { AuthEnv, AuthInfo } from "./auth-context";
 import { resolveAuth, requireScope, requireToken } from "./middleware";
 import { createCredential } from "../web/webauthn-store";
 import { encodeCoseKey } from "../web/webauthn-ceremony";
-import { auditEvents, authFailures, users } from "../db/schema";
+import { auditEvents, authFailures, userSettingsKv, users } from "../db/schema";
 
 beforeAll(applyAuthD1Migrations);
 
@@ -45,6 +45,7 @@ beforeEach(async () => {
   for (const table of [
     "personal_access_tokens",
     "auth_failures",
+    "user_settings_kv", // the OTP lock ladder writes the attempt counter (c54ec52f0f)
     "users",
     "two_factor",
     "webauthn_credentials",
@@ -357,6 +358,155 @@ describe("the TOTP ladder on the wire (X-Gitea-OTP)", () => {
       // NOT the limiter bucket key's "unknown" sentinel string.
       expect(rows[0]?.ipAddress).toBeNull();
     });
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The OTP LOCK LADDER (c54ec52f0f's per-account failed-attempt limiter over
+// the API Basic arm — twofactor.go:143-190 shared through basic.go:169-193's
+// validateTOTP; the counter lives in user_settings_kv, the reserve-first D1
+// adaptation in auth/totp-attempts.ts): 5 wrong passcodes (totpMaxAttempts,
+// :55) lock TOTP until 15 min after the LAST failure (totpAttemptsTTL, :56 —
+// renewed by every failure); a success clears (cache.Remove, :184); the
+// locked arm answers BEFORE any validation (:162-166) and — basic.go:182's
+// RecordAs sitting ahead of the :186 branch — still records the audit row.
+// The lock body is basic.go:186's ErrUserAuthMessage VERBATIM (api.go:884
+// renders ErrAsUserAuthMessage through ctx.APIError) — the one OTP text on
+// the API wire.
+// -----------------------------------------------------------------------------
+
+const TOO_MANY_OTP = { message: "too many failed OTP attempts, try again later", url: SWAGGER_URL };
+
+describe("the OTP lock ladder on the wire (c54ec52f0f's limiter over the Basic arm)", () => {
+  /** The counter row (value shape `<epoch10>:<count>` — totp-attempts.ts). */
+  const counterRow = async (): Promise<{ settingValue: string } | undefined> =>
+    (await drizzle(env.DB).select({ settingValue: userSettingsKv.settingValue }).from(userSettingsKv).all())[0];
+
+  it("5 wrong OTPs lock the ladder: the 6th answers basic.go:186's message verbatim + the audit row rides the locked arm too", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    await seedTotp(alice);
+    // a per-test IP: the ladder's failed attempts share ONE limiter bucket
+    // (threshold 20) — distinct keys keep the file's batteries independent.
+    const headers = { Authorization: basicHeader("Alice", pw), "X-Gitea-OTP": "000000", "CF-Connecting-IP": "203.0.113.201" };
+
+    for (let i = 0; i < 5; i++) {
+      const res = await call("/_whoami", { headers });
+      expect(res.status).toBe(401);
+      // the invalid-OTP text stays OFF the wire — the generic fallback only
+      expect(await res.json()).toEqual(GENERIC_401);
+    }
+    // the counter holds the 5 reserved slots
+    expect((await counterRow())?.settingValue?.endsWith(":5")).toBe(true);
+
+    const sixth = await call("/_whoami", { headers });
+    expect(sixth.status).toBe(401);
+    expect(await sixth.json()).toEqual(TOO_MANY_OTP);
+
+    // the audit trail: 5 invalid arms + the locked arm (upstream's RecordAs
+    // precedes the TooManyAttempts split, basic.go:182-188) — the locked
+    // row carries the same coordinates (origin api, address null on the
+    // header-less rig).
+    await vi.waitFor(async () => {
+      const rows = await drizzle(env.DB).select().from(auditEvents).all();
+      expect(rows).toHaveLength(6);
+      expect(new Set(rows.map((r) => r.action))).toEqual(new Set(["user:authentication:fail:twofactor"]));
+      expect(rows[5]).toMatchObject({ actorId: alice.id, origin: "api", ipAddress: "203.0.113.201" });
+    });
+  });
+
+  it("a CORRECT OTP stays refused while locked (the locked check precedes validation — twofactor.go:162-166) and writes nothing", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    const { secret } = await seedTotp(alice);
+    const base = { Authorization: basicHeader("Alice", pw), "CF-Connecting-IP": "203.0.113.202" };
+
+    for (let i = 0; i < 5; i++) {
+      await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+    }
+    const before = (await counterRow())?.settingValue;
+    expect(before?.endsWith(":5")).toBe(true);
+
+    const locked = await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": await totpCode(secret, Date.now() / 1000) } });
+    expect(locked.status).toBe(401);
+    expect(await locked.json()).toEqual(TOO_MANY_OTP);
+    // the locked arm extends nothing (upstream's blocked branch has no Put)
+    expect((await counterRow())?.settingValue).toBe(before);
+  });
+
+  it("every failure RENEWS the window (totpAttemptsTTL slides to the LAST failure — :56)", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    await seedTotp(alice);
+    const base = { Authorization: basicHeader("Alice", pw), "CF-Connecting-IP": "203.0.113.203" };
+
+    await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+    await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+
+    // Backdate the counter near expiry (10 s left) with 4 slots spent: if
+    // the window did NOT renew per failure, the NEXT failure would find a
+    // stale window and reset instead of locking at 5.
+    const staleEpoch = Math.floor(Date.now() / 1000) - (15 * 60 - 10);
+    await drizzle(env.DB)
+      .update(userSettingsKv)
+      .set({ settingValue: `${staleEpoch}:4` })
+      .run();
+
+    const third = await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+    expect(third.status).toBe(401);
+    expect(await third.json()).toEqual(GENERIC_401); // headroom 1 → still the generic arm
+
+    const renewed = (await counterRow())?.settingValue ?? "";
+    const [epochStr, countStr] = renewed.split(":");
+    expect(countStr).toBe("5");
+    // the epoch SLID to the last failure — never the backdated one
+    expect(Number.parseInt(epochStr ?? "", 10)).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) - 5);
+
+    // and the renewed count of 5 locks the NEXT attempt
+    const fourth = await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+    expect(fourth.status).toBe(401);
+    expect(await fourth.json()).toEqual(TOO_MANY_OTP);
+  });
+
+  it("a success CLEARS the counter (cache.Remove, twofactor.go:184): from 4 failures a valid OTP authenticates and a fresh full ladder refits", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    const { secret } = await seedTotp(alice);
+    const base = { Authorization: basicHeader("Alice", pw), "CF-Connecting-IP": "203.0.113.204" };
+
+    for (let i = 0; i < 4; i++) {
+      await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+    }
+    const ok = await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": await totpCode(secret, Date.now() / 1000) } });
+    expect(ok.status).toBe(200);
+    expect((await ok.json<{ user: string | null }>()).user).toBe("Alice");
+    expect(await drizzle(env.DB).select().from(userSettingsKv).all()).toHaveLength(0);
+
+    // a FULL window of 5 wrong OTPs answers the generic arm each time (a
+    // leftover count of 4 would have locked at the first) — only the 6th
+    // hits the locked arm
+    for (let i = 0; i < 5; i++) {
+      const res = await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual(GENERIC_401);
+    }
+    const sixth = await call("/_whoami", { headers: { ...base, "X-Gitea-OTP": "000000" } });
+    expect(sixth.status).toBe(401);
+    expect(await sixth.json()).toEqual(TOO_MANY_OTP);
+  });
+
+  it("an ABSENT OTP never consumes an attempt (twofactor.go:150-153's password-only Basic posture): the counter stays empty", async () => {
+    const alice = await seedUser("Alice");
+    const pw = await seedPassword(alice);
+    await seedTotp(alice);
+    const headers = { Authorization: basicHeader("Alice", pw), "CF-Connecting-IP": "203.0.113.205" };
+
+    for (let i = 0; i < 6; i++) {
+      const res = await call("/_whoami", { headers });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual(GENERIC_401);
+    }
+    expect(await drizzle(env.DB).select().from(userSettingsKv).all()).toHaveLength(0);
   });
 });
 
