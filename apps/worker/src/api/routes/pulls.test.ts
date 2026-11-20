@@ -227,7 +227,7 @@ async function seedPullRequest(repoId: string, posterId: number): Promise<{ issu
 // ---------------------------------------------------------------------------
 
 describe("POST /repos/{owner}/{repo}/pulls: the NewPullRequest blocked arm", () => {
-  it("403s \"user is blocked\" when the poster is blocked by the repo owner (pull.go:64-65 via pull.go:547)", async () => {
+  it("403s the creation_blocked_by_owner text when the poster is blocked by the repo owner (pull.go:66-68 via APIErrorAuto — 640cd615c4's translatable wrap)", async () => {
     const recluse = await seedUser("recluse");
     await seedRepo(recluse.id, "recluse", "blocked");
     await seedEngineBranches("recluse", "blocked", ["feature"]);
@@ -238,15 +238,21 @@ describe("POST /repos/{owner}/{repo}/pulls: the NewPullRequest blocked arm", () 
       body: JSON.stringify({ title: "blocked PR", head: "feature", base: "main" }),
     });
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await res.json()).toEqual({
+      message: "Cannot create an issue or pull request because you are blocked by the repository owner.",
+      url: ERROR_URL,
+    });
     expect(await db().select().from(issues).all()).toHaveLength(0);
     expect(await db().select().from(pullRequests).all()).toHaveLength(0);
   });
 
-  it("201s once no blocking row relates the pair (the arm lifts with the block)", async () => {
+  it("201s once no blocking row relates the pair (the arm lifts with the block; the write collaborator row satisfies the 640cd615c4 creation gate)", async () => {
     const recluse = await seedUser("recluse");
-    await seedRepo(recluse.id, "recluse", "blocked");
+    const repoId = await seedRepo(recluse.id, "recluse", "blocked");
     await seedEngineBranches("recluse", "blocked", ["feature"]);
+    // The creation gate (NewPullRequest's basePerm.CanWrite(TypePullRequests)
+    // fallback, services/pull/pull.go:81-90) admits a write collaborator.
+    await env.DB.prepare("INSERT INTO repo_collaborators (repo_id, user_id, mode, created_at, updated_at) VALUES (?, 1, 'write', 0, 0)").bind(repoId).run();
     await block(recluse.id, 1);
     await env.DB.prepare("DELETE FROM user_blocking").run();
     const res = await router()("/repos/recluse/blocked/pulls", {
@@ -254,8 +260,126 @@ describe("POST /repos/{owner}/{repo}/pulls: the NewPullRequest blocked arm", () 
       headers: authHeaders,
       body: JSON.stringify({ title: "open again", head: "feature", base: "main" }),
     });
+
     expect(res.status).toBe(201);
     expect(await db().select().from(pullRequests).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /repos/{owner}/{repo}/pulls + POST /pulls/{index}/merge: the
+// 640cd615c4 / 2a5c34c379 / b1c5fedd17-window create+schedule gates
+// ---------------------------------------------------------------------------
+
+describe("the window's create + schedule gates", () => {
+  it("403s the MustHeadRepoCodeWriter text for a same-repo create by a non-writer (NewPullRequest's basePerm fallback, services/pull/pull.go:81-90 — 640cd615c4 replaced the read-access collaborator gate)", async () => {
+    const recluse = await seedUser("recluse");
+    await seedRepo(recluse.id, "recluse", "gated");
+    await seedEngineBranches("recluse", "gated", ["feature"]);
+    const res = await router()("/repos/recluse/gated/pulls", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "drive-by", head: "feature", base: "main" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "user must have write access to the head repository's code",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(issues).all()).toHaveLength(0);
+  });
+
+  it("403s the creation_blocked_by_assignee text when a requested assignee blocks the poster (NewPullRequest's second blocked arm, services/pull/pull.go:69-71)", async () => {
+    const repoId = await seedRepo(1, "cf-gitea-stub", "assigneeblocked");
+    await seedEngineBranches("cf-gitea-stub", "assigneeblocked", ["feature"]);
+    const alice = await seedUser("alice");
+    await block(alice.id, 1);
+    const res = await router()("/repos/cf-gitea-stub/assigneeblocked/pulls", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "with assignee", head: "feature", base: "main", assignees: ["alice"] }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "Cannot create an issue or pull request because you are blocked by an assignee.",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(issues).all()).toHaveLength(0);
+    expect(repoId).toBeTruthy();
+  });
+
+  it("422s the create when base and head share no history (2a5c34c379: parseCompareInfo parses base...head and a null merge base answers the 422, routers/api/v1/repo/pull.go:417-420)", async () => {
+    await seedRepo(1, "cf-gitea-stub", "nohistory");
+    const rootTip = await seedEngineBranches("cf-gitea-stub", "nohistory", []);
+    // An unrelated root on its own branch (the contents API cannot create
+    // disjoint roots — putApiObjects + ref CAS).
+    const cell = env.REPO.getByName("cf-gitea-stub/nohistory");
+    const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000009, tz: "+0000" };
+    const readme = new TextEncoder().encode("# isle\n");
+    const readmeOid = await gitObjectOid("blob", readme);
+    const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readmeOid }]);
+    const root = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "isle root\n" });
+    const put = await cell.putApiObjects([
+      { oid: readmeOid, type: "blob", data: readme },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: root.oid, type: "commit", data: root.data },
+    ]);
+    expect(put.tag).toBe("ok");
+    const landed = await cell.commitApiChange({ ref: branchRef("isle"), expectedOldOid: ZERO_OID, newOid: root.oid });
+    expect(landed.tag).toBe("committed");
+    expect(rootTip).toBeTruthy();
+    const res = await router()("/repos/cf-gitea-stub/nohistory/pulls", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "unrelated", head: "isle", base: "main" }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      message: "Invalid PullRequest: base and head have no common history",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(pullRequests).all()).toHaveLength(0);
+  });
+
+  it("schedules a CONFLICTED PR through MWCS — b1c5fedd17's Auto type waits out conflicts (check.go:169), the row lands with a 201", async () => {
+    const slug = "mwcsconflict";
+    await seedRepo(1, "cf-gitea-stub", slug);
+    const rootTip = await seedEngineBranches("cf-gitea-stub", slug, ["feature"]);
+    // Reuse the diverged-conflict shape (both sides rewrite README.md).
+    const cell = env.REPO.getByName(`cf-gitea-stub/${slug}`);
+    const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000010, tz: "+0000" };
+    const land = async (ref: string, body: string, message: string): Promise<void> => {
+      const readme = new TextEncoder().encode(body);
+      const readmeOid = await gitObjectOid("blob", readme);
+      const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readmeOid }]);
+      const commit = serializeCommit({ tree: tree.oid, parents: [rootTip], author: person, committer: person, message });
+      const put = await cell.putApiObjects([
+        { oid: readmeOid, type: "blob", data: readme },
+        { oid: tree.oid, type: "tree", data: tree.data },
+        { oid: commit.oid, type: "commit", data: commit.data },
+      ]);
+      expect(put.tag).toBe("ok");
+      const landed = await cell.commitApiChange({ ref, expectedOldOid: rootTip, newOid: commit.oid });
+      expect(landed.tag).toBe("committed");
+    };
+    await land(branchRef("feature"), `# ${slug} (feature side)\n`, "feature conflict\n");
+    await land(branchRef("main"), `# ${slug} (main side)\n`, "main conflict\n");
+    const create = await router()(`/repos/cf-gitea-stub/${slug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "conflicted schedule", head: "feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const index = (await create.json<{ number: number }>()).number;
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge", merge_when_checks_succeed: true }),
+    });
+    expect(res.status).toBe(201);
+    const row = (await db().select().from(pullRequests).all())[0]!;
+    expect(row.status).toBe(PRStatus.Conflict);
+    expect(await db().select().from(pullAutoMerges).all()).toHaveLength(1);
   });
 });
 
@@ -299,8 +423,10 @@ describe("POST /repos/{owner}/{repo}/pulls: the equal-tips arms (the string gate
     const rendered = await res.json<Record<string, unknown>>();
     expect(rendered.title).toBe("the empty pr");
     expect(rendered.head).toMatchObject({ label: "main-mirror", ref: "refs/pull/1/head", sha: tip });
-    // The row: zero-diff semantics — headSha IS the base tip, mergeBase
-    // stays null (same-repo creates carry none; the lazy check computes it).
+    // The row: zero-diff semantics — headSha IS the base tip. Since the
+    // 2a5c34c379 window the create computes and STORES the merge base for
+    // same-repo heads too (upstream's CreatePullRequest always carried
+    // pr.MergeBase from parseCompareInfo; the null case now 422s).
     const rows = await db().select().from(pullRequests).all();
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
@@ -309,7 +435,7 @@ describe("POST /repos/{owner}/{repo}/pulls: the equal-tips arms (the string gate
       headBranch: "main-mirror",
       baseBranch: "main",
       headSha: tip,
-      mergeBase: null,
+      mergeBase: tip,
     });
     // The refs/pull/1/head CAS write landed at the shared tip.
     const refNames = (await env.REPO.getByName("cf-gitea-stub/emptypr").listRefs()).refs.map((ref) => ref.name);
@@ -714,7 +840,7 @@ describe("POST /repos/{owner}/{repo}/pulls: the cross-repo (fork head) create ar
     expect(rendered.title).toBe("fork PR");
     // head.sha is the fork tip cache; the fork is PUBLIC and the doer reads
     // it, so the converter renders the head repo per upstream's gate
-    // (services/pulls.ts headBranchInfo — convert/pull.go:197-199
+    // (services/pulls.ts headBranchInfo — convert/pull.go:210-212
     // HasAnyUnitAccessOrPublicAccess; the old hidden -1 shape was the
     // pre-fork-render divergence, flipped by the wave-34 render port)
     expect(rendered.head).toMatchObject({ label: "feature", ref: "refs/pull/1/head", sha: featureTip, repo_id: Number(forkId) });
@@ -965,6 +1091,10 @@ describe("POST /pulls/{index}/merge: the schedule / manual / dependency arms", (
     expect(rows[0]).toMatchObject({ issueId, doerId: 1, mergeStyle: "merge", deleteBranchAfterMerge: false });
     const commentRows = await db().select().from(comments).all();
     expect(commentRows.some((row) => row.type === CommentType.PRScheduledToAutoMerge)).toBe(true);
+    // The type-34 comment's CONTENT is the merge style (b1c5fedd17 —
+    // ScheduleAutoMerge passes string(style) into CreateAutoMergeComment,
+    // services/automerge/automerge.go:76).
+    expect(commentRows.find((row) => row.type === CommentType.PRScheduledToAutoMerge)!.content).toBe("merge");
     // The PR is NOT merged by the schedule call.
     expect((await db().select().from(pullRequests).all())[0]).toMatchObject({ hasMerged: false });
     // A standing row conflicts: IsErrAlreadyScheduledToAutoMerge's 409, the
@@ -982,7 +1112,7 @@ describe("POST /pulls/{index}/merge: the schedule / manual / dependency arms", (
     expect(await db().select().from(pullAutoMerges).all()).toHaveLength(1);
   });
 
-  it("refuses to schedule a deps-blocked PR: the final CheckPullMergeable arm precedes ScheduleAutoMerge (check.go:219-223) — 405 pr_close_blocked, no row", async () => {
+  it("refuses to schedule a deps-blocked PR: the final CheckPullMergeable arm precedes ScheduleAutoMerge (check.go:214-216) — 422 'is blocked by an open dependency' (the b1c5fedd17-window APIErrorAuto mapping), no row", async () => {
     const slug = "mwcsdeps";
     const { repoId, index, issueId } = await seedMergeablePr(slug);
     // An OPEN blocker issue in the same repo — IssueNoDependenciesLeft's
@@ -1001,9 +1131,9 @@ describe("POST /pulls/{index}/merge: the schedule / manual / dependency arms", (
       headers: authHeaders,
       body: JSON.stringify({ do: "merge", merge_when_checks_succeed: true }),
     });
-    expect(res.status).toBe(405);
+    expect(res.status).toBe(422);
     expect(await res.json()).toEqual({
-      message: "You need to close all issues that are blocking this pull request before you can merge it.",
+      message: "is blocked by an open dependency",
       url: ERROR_URL,
     });
     expect(await db().select().from(pullAutoMerges).all()).toHaveLength(0);

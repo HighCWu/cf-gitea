@@ -23,6 +23,23 @@
  *              tick after its last status flips (upstream is notify-driven;
  *              the interval is the landed adaptation — "crons enqueue,
  *              consumers work", AGENTS.md).
+ *
+ *   The notify-driven RECHECK arms (services/automerge/notify.go at the new
+ *   pin) are subsumed by that re-probe: a review on any verdict
+ *   (0c1ebb630e — not only approvals), a cleared review request
+ *   (0c1ebb630e's PullRequestReviewRequest arm), a dismissal, a green
+ *   commit status and a writer retarget (b1c5fedd17's
+ *   PullRequestChangeTargetBranch) each only HASTEN a check the next tick
+ *   performs anyway — nothing sticks, which is exactly what 0c1ebb630e's
+ *   block_on_official_review_requests fix wanted. The eager CANCEL arms are
+ *   the real behavioral deltas: closing a PR ("closed") and adding a WIP
+ *   prefix ("work_in_progress") REMOVE the schedule with a reason-attributed
+ *   type-35 comment (notify.go:83-101's disableIssueAutoMerge), and a
+ *   non-writer retarget or push cancels too (DisableAutoMergeIfNotWriter,
+ *   pull.go:398-409). The reason mechanic lives in
+ *   removeScheduledAutoMerge below; the firing-point wiring stays handoff
+ *   PULL2-AUTOCANCEL (the issues/pull write paths — upstream fires from the
+ *   notify dispatcher at the mutation sites).
  *   CANCEL     web POST /pulls/{index}/cancel_auto_merge (pull.go:1251-1290):
  *              the landed cancel arm — pages/pull-merge-box.tsx
  *              cancelAutoMergeFromWeb — deletes the row and creates the
@@ -336,13 +353,24 @@ export async function deleteScheduledAutoMerge(d1: D1Database, issueId: number):
   return rows.length > 0;
 }
 
-/** `RemoveScheduledAutoMerge` (services/automerge/automerge.go:110-120): the
- *  delete + the type-35 comment ONLY when a row existed. */
+/** `RemoveScheduledAutoMerge` — moved upstream in b1c5fedd17 from
+ *  services/automerge/automerge.go:91-100 to services/pull/pull.go:386-396,
+ *  and now carries the auto-cancel REASON: the delete happens first and the
+ *  type-35 comment (CreateAutoMergeComment,
+ *  models/issues/comment.go:1272, content = the reason) is created ONLY
+ *  when a row existed (`n == 0 → return nil`, pull.go:390-392). The
+ *  explicit-cancel arm passes "" (services/automerge/automerge.go:106);
+ *  the notify-family arms pass reasons — `disableIssueAutoMerge` fires
+ *  "closed" on IssueChangeStatus and "work_in_progress" on IssueChangeTitle
+ *  (services/automerge/notify.go:83-101 at the new pin, b1c5fedd17), and
+ *  DisableAutoMergeIfNotWriter (pull.go:398-409) passes the
+ *  pushed/retargeted-by-non-writer reasons from the pull update paths. */
 export async function removeScheduledAutoMerge(
   d1: D1Database,
   issue: IssueRow,
   doerId: number,
   now: Date,
+  reason = "",
 ): Promise<boolean> {
   const deleted = await deleteScheduledAutoMerge(d1, issue.id);
   if (!deleted) return false;
@@ -350,21 +378,31 @@ export async function removeScheduledAutoMerge(
     issueId: issue.id,
     posterId: doerId,
     type: CommentType.PRUnscheduledToAutoMerge,
-    content: "",
+    content: reason,
     now,
   });
   return true;
 }
 
-/** `CreateAutoMergeComment`'s scheduled half (comment.go:1257-1273): the
- *  bare type-34 system comment (empty content — upstream's CreateComment
- *  with no message). */
-export async function createScheduledAutoMergeComment(d1: D1Database, issueId: number, doerId: number, now: Date): Promise<void> {
+/** `CreateAutoMergeComment`'s scheduled half (models/issues/comment.go:1272-
+ *  1291 at the pin): the type-34 system comment whose CONTENT carries the
+ *  merge style string — b1c5fedd17 added the content parameter and the
+ *  schedule transaction passes `string(style)` (services/automerge/
+ *  automerge.go:76). The UNSCHEDULED half carries the auto-cancel reason:
+ *  the explicit-cancel arms pass "" (automerge.go:106, our shape — the
+ *  route arm below still calls it bare), while the reason-bearing arms
+ *  ("closed"/"work_in_progress"/"base_changed"/"pushed_by_non_writer")
+ *  ride the notify family's disableIssueAutoMerge + DisableAutoMergeIfNotWriter.
+ *  The REASON MECHANIC has landed here (removeScheduledAutoMerge's optional
+ *  `reason`); the WIRING — firing it from the issue close arm, the
+ *  WIP-title arm and the non-writer retarget/push arms — stays handoff
+ *  PULL2-AUTOCANCEL (issues/pull siblings' write paths). */
+export async function createScheduledAutoMergeComment(d1: D1Database, issueId: number, doerId: number, now: Date, style: string): Promise<void> {
   await new IssuesService(d1).addComment({
     issueId,
     posterId: doerId,
     type: CommentType.PRScheduledToAutoMerge,
-    content: "",
+    content: style,
     now,
   });
 }

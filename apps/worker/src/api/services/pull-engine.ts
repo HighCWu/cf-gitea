@@ -63,7 +63,18 @@ import { PullReviewsService } from "./pull-reviews";
 import { commitMessageMerge, getDefaultMergeMessageParts, squashMergeCommitMessages } from "../../ui/pages/pull-merge-box";
 import { canWriteRepository } from "./repo-access";
 
-/** `PullRequestStatus` mapping (§2.4; unrelated has no upstream row → Empty). */
+/**
+ * `PullRequestStatusUnrelated` (models/issues/pull.go:118 — the eighth
+ * iota value, added by b1c5fedd17 as its own status instead of Empty).
+ * Declared here until the db/schema.ts PRStatus enum lands the constant
+ * (handoff to the schema owner: `Unrelated: 7` after `Ancestor: 6` —
+ * upstream's xorm stores the raw int, no migration, and neither do we);
+ * the merge box imports this constant so both sides agree until then.
+ */
+export const PR_STATUS_UNRELATED = 7;
+
+/** `PullRequestStatus` mapping (§2.4; unrelated carries its own status since
+ *  b1c5fedd17 — previously it collapsed into Empty). */
 export function statusFromMergeability(status: MergeabilityStatus): number {
   switch (status) {
     case "mergeable":
@@ -73,8 +84,9 @@ export function statusFromMergeability(status: MergeabilityStatus): number {
     case "ancestor":
       return PRStatus.Ancestor;
     case "empty":
-    case "unrelated":
       return PRStatus.Empty;
+    case "unrelated":
+      return PR_STATUS_UNRELATED;
     case "error":
       return PRStatus.Error;
   }
@@ -85,16 +97,17 @@ export function statusFromMergeability(status: MergeabilityStatus): number {
  * upstream's field is a NON-NULLABLE bool (structs/pull.go:65; swagger
  * "type": "boolean", v1-swagger.generated.json:33120-33124) and the model
  * method answers `status != Checking && status != Conflict && status !=
- * Error && !IsWorkInProgress` (models/issues/pull.go:751-756) — so checking
- * renders FALSE (not null: the board's "mergeable: null while checking"
- * premise predates this pin), conflict/error render false, and
- * ancestor/empty/unrelated pass the filter and render TRUE (only the three
- * statuses above are excluded — the pin's exact filter). Merged rows carry
- * their last status through the merge (upstream's MarkAsMerged keeps
- * pr.Status, services/pull/merge.go:366; our merge write sets Mergeable,
- * executeMerge below), so they render true like upstream. `wip` is
- * `HasWorkInProgressPrefix(issue.title)` (models/issues/pull.go:652-658 —
- * the title-prefix check is the whole gate).
+ * Error && status != Unrelated && !IsWorkInProgress` (models/issues/pull.go:
+ * 767-775 — b1c5fedd17 added Unrelated to the exclusion set) — so checking/
+ * conflict/error render FALSE (not null: the board's "mergeable: null while
+ * checking" premise predates this pin), and UNRELATED renders false too
+ * since this window, while ancestor/empty pass the filter and render TRUE
+ * (only the four statuses above are excluded — the pin's exact filter).
+ * Merged rows carry their last status through the merge (upstream's
+ * MarkAsMerged keeps pr.Status, services/pull/merge.go:366; our merge write
+ * sets Mergeable, executeMerge below), so they render true like upstream.
+ * `wip` is `HasWorkInProgressPrefix(issue.title)` (models/issues/pull.go:
+ * 668-674 — the title-prefix check is the whole gate).
  */
 export function mergeableOfRow(pr: PullRequestRow, wip: boolean): boolean {
   if (wip) return false;
@@ -102,6 +115,8 @@ export function mergeableOfRow(pr: PullRequestRow, wip: boolean): boolean {
     case PRStatus.Checking:
     case PRStatus.Conflict:
     case PRStatus.Error:
+      return false;
+    case PR_STATUS_UNRELATED:
       return false;
     default:
       return true;
@@ -244,7 +259,7 @@ export async function pullRequestDiff(
  * The merge-time git view the branch-protection gate's B-53 arms read —
  * `pullGateGitInputs` threads into `PullBranchProtectionInput.git`. Both
  * pieces come from ONE base repo (the PR's base; upstream's gate reads
- * `pr.BaseRepo` throughout, services/issue/pull.go:148-251):
+ * `pr.BaseRepo` throughout, services/issue/pull.go:128-206):
  *
  * - `changedFiles` — `GetFilesChangedBetween(mergeBase, headRef)`
  *   (modules/git/repo_compare.go:84: `diff-tree --name-only --root -r`,
@@ -252,15 +267,15 @@ export async function pullRequestDiff(
  *   services/issue/pull.go:148). Ours is the PR diff range's path list
  *   (pullRequestDiffForEnv — the same mergeBase..head walk); `complete` is
  *   false on the engine's file budget (`truncated`) AND on a null merge
- *   base (the unrelated-histories Empty state, where upstream's
- *   git.MergeBase errors and the codeowner gate fails closed, :161-165).
+ *   base (the unrelated-histories state, where upstream's
+ *   git.MergeBase errors and the codeowner gate fails closed, :137-166).
  *   A failed walk answers null — the gate's fail-closed carrier.
- * - `codeownerRules` — the CODEOWNERS parse (services/issue/pull.go:53-110,
+ * - `codeownerRules` — the CODEOWNERS parse (services/issue/pull.go:47-126,
  *   ported in services/codeowners.ts): a FORK base repo short-circuits to
- *   no rules BEFORE any read (:62-64); otherwise the candidate paths are
- *   probed at the LIVE base-branch tip (GetBranchCommit, :69-70 — not the
+ *   no rules BEFORE any read (:53-55); otherwise the candidate paths are
+ *   probed at the LIVE base-branch tip (GetBranchCommit, :66-67 — not the
  *   stored merge base) with the first found file winning; a missing tip or
- *   an over-size file answers null (fail closed, :70-79).
+ *   an over-size file answers null (fail closed, :69-84).
  *
  * Callers thread this lazily — only when a rule arms one of the arms
  * (upstream returns before any walk when the arms are disarmed), so a
@@ -300,7 +315,7 @@ export async function pullGateGitInputsFromReads(
     }
     // A null merge base (unrelated histories → the Empty state) leaves the
     // walk incomplete: upstream's git.MergeBase errors there and the
-    // codeowner gate fails closed (services/issue/pull.go:161-165 →
+    // codeowner gate fails closed (services/issue/pull.go:152-166 →
     // :171-175).
     if (mergeBase === null) return { paths: [], complete: false };
     const diff = await reads.readDiff(headCommit.oid, mergeBase);
@@ -308,7 +323,7 @@ export async function pullGateGitInputsFromReads(
   })().catch((): null => null);
 
   const codeownerRules = isFork
-    ? [] // :62-64 — a fork base repo has no codeowner rules, before any read
+    ? [] // :53-55 — a fork base repo has no codeowner rules, before any read
     : await (async (): Promise<CodeOwnerRule[] | null> => {
         const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
         if (baseTip === null) return null; // GetBranchCommit error — fail closed
@@ -570,22 +585,24 @@ export async function mergePullRequest(
   opts: MergePullOptions,
 ): Promise<{ commitOid: string | null }> {
   // The open-dependency gate — CheckPullMergeable's FINAL arm (services/pull/
-  // check.go:218-223): IssueNoDependenciesLeft (models/issues/dependency.go:
+  // check.go:214-216): IssueNoDependenciesLeft (models/issues/dependency.go:
   // 190-199 — only `issue_id = this` edges joined to an OPEN dependency_id
   // block; being the blocker never does) must answer true before any merge
   // work starts. Upstream's Manually check type returns BEFORE the gate
-  // (check.go:160-165), so the manually-merged mark skips it here too. Error
-  // mapping: the error class is check.go:48's ErrDependenciesLeft ("is
-  // blocked by an open dependency"); upstream's merge API has NO arm for it —
-  // it falls to APIErrorInternal → a 500 for a user-input condition
-  // (routers/api/v1/repo/pull.go:928-946), the web merge box answers the
-  // pr_close_blocked flash (pull.go:1088-1089), and upstream's issue-close
+  // (check.go:160-163), so the manually-merged mark skips it here too. Error
+  // mapping: the error class is check.go:46's ErrDependenciesLeft — since
+  // b1c5fedd17 it wraps util.ErrUnprocessableContent and the API ladder's
+  // fallthrough renders user-mapped errors (APIErrorInternal → apiErrorAuto →
+  // ErrorUnwrapForUser, services/context/api.go:120-123), so a deps-blocked
+  // merge answers 422 "is blocked by an open dependency" upstream. This core
+  // gate throws that exact status + message (the route pre-gates with the
+  // same answer, so both layers agree); the web merge box translates the
+  // message back to the pr_close_blocked flash (pull.go:1050-1051's web arm,
+  // mergeEngineErrorMessage's dedicated branch), and upstream's issue-close
   // API maps the same condition to 412 Precondition Failed (issue.go:645-648,
-  // :983-986). We answer 405 with the locale text verbatim — the route's
-  // errorForUser-faithful divergence (routes/pulls.ts, the same class as the
-  // sibling not-mergeable conditions), so the two layers agree verbatim.
+  // :983-986).
   if (opts.style !== "manually-merged" && !(await issueNoDependenciesLeft(c.env.DB, issue.id))) {
-    throw new ApiError(405, "You need to close all issues that are blocking this pull request before you can merge it.");
+    throw new ApiError(422, "is blocked by an open dependency");
   }
 
   const cell = engineCell(c.env, pair.repo);
@@ -680,8 +697,8 @@ export async function mergePullRequest(
     } else if (opts.deleteBranchAfterMerge) {
       // FORK HEAD: upstream's DeleteBranchAfterMerge operates on pr.HeadRepo,
       // not the base (services/repository/branch.go:812-822 — LoadHeadRepo →
-      // GetRepositoryByID, models/issues/pull.go:232-251; a nil head repo —
-      // "Forked repository has already been deleted" (:817-820) — fails the
+      // GetRepositoryByID, models/issues/pull.go:244-263; a nil head repo —
+      // "Forked repository has already been deleted" (:833-836) — fails the
       // delete with repo.branch.deletion_failed and the merge caller ignores
       // it). The SAME guard ladder runs against the HEAD repo's state and the
       // doer's permission THERE: CanDeleteBranch (branch.go:551-557) resolves
@@ -753,7 +770,7 @@ export async function mergePullRequest(
     // else propagates — DependenciesLeftError first (issue_update.go:62-72's
     // open-dependency arm, our 412 gate): reachable here through the
     // manually-merged style (CheckPullMergeable skips the deps arm for it,
-    // check.go:161-165, so the engine's pre-gate above never fired) and
+    // check.go:160-163, so the engine's pre-gate above never fired) and
     // through a dependency added between the pre-gate and this close. A
     // blocked close writes nothing (the gate sits before the CAS batch) and
     // the PR update below never runs — the mark lands NOTHING, exactly

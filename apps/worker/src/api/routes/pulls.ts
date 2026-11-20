@@ -90,7 +90,7 @@ import {
 import { changedFileListSchema, commitListSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { ActionType, recordAction, type ActionDraft } from "../services/activity-feeds";
-import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
+import { isUserBlockedBy } from "../services/blocks";
 import { collaboratorModeOf } from "../services/repo-collaborators";
 import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, hasWorkInProgressPrefix, issueErrorToApiError, issueNoDependenciesLeft, addIssueAssignees, resolveCreateAssigneeUsers } from "../services/issues";
 import { assertPullsUnit } from "../services/issue-unit-gates";
@@ -186,7 +186,7 @@ import { requestedReviewersOf } from "./pull-reviews";
  * upstream shape WITHOUT the base/head branch-existence check (an engine
  * read) and GET resolves `mergeable` through pr.Mergeable(ctx) semantics
  * (pull-engine.ts mergeableOfRow — a still-checking row renders FALSE, the
- * pin's non-nullable bool: structs/pull.go:65, models/issues/pull.go:751-756),
+ * pin's non-nullable bool: structs/pull.go:65, models/issues/pull.go:767-775),
  * `base.sha: ""` and `head.sha` from the pull_requests cache. The PATCH
  * `base` retarget is LIVE: the gate (skip on merged/empty/same-base,
  * pull.go:748), the branch-existence 404, ChangeTargetBranch's mapped
@@ -593,7 +593,7 @@ async function emitPullAssignWebhook(
   // doer (IssueChangeAssignee → ToPayloadPullRequest, notifier.go:182) —
   // payload mode, not the API-response "single" render. The diff-stat trio
   // rides the same conversion (the single converter's GetDiffShortStat block
-  // runs on EVERY single AND payload render, convert/pull.go:230-254; the
+  // runs on EVERY single AND payload render, convert/pull.go:245-269; the
   // omit arms — no merge base, truncated walk, engine failure :247-250 —
   // stay omitted).
   const diffStats = await pullRequestDiffShortStat(c, found, pair.pullRequest);
@@ -1105,36 +1105,75 @@ export function registerPullRoutes(
 
       let issue: IssueRow;
       let pr: PullRequestRow;
-      // NewPullRequest's blocked arm (services/pull/pull.go:64-65 via
-      // repoCreatePullRequest's `errors.Is(err, user_model.ErrBlockedUser)`
-      // → 403 `err.Error()`, pull.go:547): the POSTER blocked by the repo
-      // owner — OR by any REQUESTED ASSIGNEE (the condition's second half,
-      // upstream `||` order: owner first) — refuses before any row is
-      // written. The assignee half is REACHABLE now the create resolves
-      // form.assignee(s) above. The isUserBlockedBy site-admin
-      // short-circuit is upstream's `blockee.IsAdmin`.
+      // NewPullRequest's blocked arm (services/pull/pull.go:66-70 via
+      // repoCreatePullRequest's APIErrorAuto → 403, pull.go:532-535 at the
+      // 640cd615c4 shape): the POSTER blocked by the repo owner — OR by any
+      // REQUESTED ASSIGNEE (the condition's second half, upstream `||`
+      // order: owner first) — refuses before any row is written.
+      // 640cd615c4 split the two answers into translatable wraps over the
+      // SAME ErrBlockedUser PermissionDenied error: owner-block renders
+      // repo.creation_blocked_by_owner, assignee-block
+      // repo.creation_blocked_by_assignee — both stay 403 with the locale
+      // message as the body. The isUserBlockedBy site-admin short-circuit is
+      // upstream's `blockee.IsAdmin`.
       if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, found.repo.ownerId ?? -1)) {
-        throw new ApiError(403, BLOCKED_USER_MESSAGE);
+        throw new ApiError(403, "Cannot create an issue or pull request because you are blocked by the repository owner.");
       }
       for (const user of createAssignees) {
         if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, user.id)) {
-          throw new ApiError(403, BLOCKED_USER_MESSAGE);
+          throw new ApiError(403, "Cannot create an issue or pull request because you are blocked by an assignee.");
         }
       }
 
-      // The cross-repo create compare (GetCompareInfo, upstream pull.go:520
+      // NewPullRequest's creation gate (services/pull/pull.go:74-90 at
+      // 640cd615c4): the PR unit's CreationRestriction option is checked
+      // FIRST (CheckCreationRestriction, services/issue/creation.go:14-28 —
+      // the zero/default arm admits any READER; the Member/Writer arms are
+      // the new "Restrict to collaborators" repo-unit option, NOT yet carried
+      // by our repo settings — handoff REPIN-REPO-SETTINGS), then the
+      // fallback ladder: a writer of the base repo's pull-requests unit (or
+      // the AGit flow — unreachable on this API route) creates directly;
+      // everyone else must hold the HEAD repo's code WRITE
+      // (issues_model.Errors().MustHeadRepoCodeWriter → 403 with its exact
+      // message through APIErrorAuto, pull.go:532-535). This replaces the
+      // pre-640cd615c4 read-access collaborator gate (HasAccessToRepoCodeUnit
+      // → ErrMustCollaborator) upstream deleted.
+      if (!(await canWriteRepository(c, found))) {
+        if (headPair.repo.id === found.repo.id) {
+          throw new ApiError(403, "user must have write access to the head repository's code");
+        }
+        const headAccess = await principalAccessOf(c.env.DB, headPair.repo, requester);
+        if (!headAccess.write) {
+          throw new ApiError(403, "user must have write access to the head repository's code");
+        }
+      }
+
+      // The cross-repo create compare (GetCompareInfo, upstream pull.go:516
       // stores the result as pr.MergeBase): the merge base computes IN THE
       // HEAD CELL — the fork holds the base's full history (SPEC-0001b §5.2;
       // services/git/compare.go:73-89 runs the same computation in the head
       // repo after fetching the base commit into it) — and the head closure
       // is carried into the BASE cell so refs/pull/N/head's landing, the lazy
       // mergeability check, the diff range and the merge execution all resolve
-      // there (commitApiChange refuses an oid the cell lacks). Runs only for
-      // cross-repo heads and after every validation: the carries are engine
-      // writes, so a 403/409/404 request moves no bytes.
-      let mergeBaseOid: string | null = null;
+      // there (commitApiChange refuses an oid the cell lacks). Runs for EVERY
+      // head since 2a5c34c379: the create compare parses `base...head` and a
+      // NULL merge base answers the 422
+      // "Invalid PullRequest: base and head have no common history"
+      // (pull.go:417-420) — unrelated histories can no longer open a PR
+      // (the PullRequestStatusUnrelated status only arises for rows whose
+      // branches diverge AFTER creation). The carries are engine writes, so a
+      // 403/409/404/422 request moves no bytes.
+      let mergeBaseOid: string | null;
       if (headPair.repo.id !== found.repo.id) {
         mergeBaseOid = await crossRepoCreateMergeBase(c, found, headPair, baseBranch, baseTip.oid, headTip.oid);
+      } else {
+        const mb = await reads.mergeBase(baseTip.oid, headTip.oid);
+        mergeBaseOid = mb !== null && mb.tag === "ok" ? mb.base : null;
+      }
+      if (mergeBaseOid === null) {
+        throw new ApiError(422, "Invalid PullRequest: base and head have no common history");
+      }
+      if (headPair.repo.id !== found.repo.id) {
         await carryForkHeadIntoBase(c, found, headPair, head.headBranch, headTip.oid);
       }
       try {
@@ -1235,7 +1274,7 @@ export function registerPullRoutes(
       // The review_request payloads share ONE ToPayloadPullRequest render
       // (upstream re-converts per notifier call, notifier.go:793-815 — the
       // shared render is the cheaper adapter; the payload mode carries the
-      // head repo past the doer's visibility, convert/pull.go:33-37).
+      // head repo past the doer's visibility, convert/pull.go:46-50).
       let reviewPayloadRender: Awaited<ReturnType<typeof toApiPullRequest>> | null = null;
       let reviewRepositoryRender: ReturnType<typeof toApiRepository> | null = null;
       if (codeOwnerRequests.length > 0 || createReviewers.length > 0 || createTeamReviewers.length > 0) {
@@ -1310,9 +1349,9 @@ export function registerPullRoutes(
       // payload is a SEPARATE conversion — ToPayloadPullRequest (notifier.go:368).
       // The split mirrors that: the API response keeps the doer-gated "single"
       // render, the opened payload gets its own "payload" render (head.repo
-      // reaches the receivers regardless of the doer, convert/pull.go:33-37).
+      // reaches the receivers regardless of the doer, convert/pull.go:46-50).
       // BOTH conversions fill the diff-stat trio — the single converter's
-      // GetDiffShortStat block is NOT gated on isPayload (convert/pull.go:230-254),
+      // GetDiffShortStat block is NOT gated on isPayload (convert/pull.go:245-269),
       // and the fresh PR's merge base is servable: NewPullRequest resolves
       // pr.MergeBase synchronously at create (services/pull/pull.go:96 →
       // checkPullRequestBranchMergeable, patch.go:83-91 / merge_tree.go:107).
@@ -1339,7 +1378,7 @@ export function registerPullRoutes(
         await emitPullAssignWebhook(c, found, issue, "assigned", { added_assignees: [toApiUser(viewerOf(c), user)] });
       }
       // Upstream's create 201 renders the converter's LoadRequestedReviewers
-      // (pull.go:558 → convert/pull.go:124) — the review requests created
+      // (pull.go:558 → convert/pull.go:137) — the review requests created
       // above render in the response, the same consult the GET rides.
       return c.json({ ...rendered, requested_reviewers: await requestedReviewersOf(c.env.DB, issue.id, viewer) }, 201);
     },
@@ -1352,10 +1391,10 @@ export function registerPullRoutes(
   // read-only engine check and CAS-writes the row) and renders the real
   // mergeable/base.sha pair. The REVIEW-CONSULT (the pull-reviews wave):
   // `requested_reviewers` renders from the review-REQUEST rows
-  // (services/convert/pull.go:124 LoadRequestedReviewers) instead of the
+  // (services/convert/pull.go:137 LoadRequestedReviewers) instead of the
   // converter's `[]` default, and the diff-stat trio
   // (`additions`/`deletions`/`changed_files`) from the GetDiffShortStat port
-  // (pullRequestDiffShortStat over convert/pull.go:245-254 — upstream's
+  // (pullRequestDiffShortStat over convert/pull.go:260-269 — upstream's
   // single converter fills the stats on EVERY single render; the omit arms —
   // no merge base, truncated engine walk, engine failure — mirror its error
   // log :247-250). The same trio mounts on the create 201 body + its opened
@@ -1395,7 +1434,7 @@ export function registerPullRoutes(
       // The diff-stat trio resolves AT MOST ONCE per PATCH, lazily on the
       // first render that needs it: upstream recomputes GetDiffShortStat per
       // conversion — the single converter fills the trio on EVERY single AND
-      // payload render (convert/pull.go:230-254), the edit route's 201 body
+      // payload render (convert/pull.go:245-269), the edit route's 201 body
       // (:799) and its notifiers' payloads (IssueChangeTitle webhook/notifier.go:225,
       // IssueChangeContent :397, IssueChangeStatus :260) included — and the
       // shared memo is the cheaper adapter. The laziness keeps the engine
@@ -1865,6 +1904,10 @@ export function registerPullRoutes(
         404: notFoundResponse,
         405: { description: "empty" },
         409: errorResponse,
+        // The deps-blocked merge (ErrDependenciesLeft's ErrUnprocessableContent
+        // wrap → apiErrorAuto, check.go:46 + services/context/api.go:120-123 —
+        // the b1c5fedd17-window 422 fix).
+        422: errorResponse,
         423: repoArchivedResponse,
       },
     }),
@@ -1896,21 +1939,21 @@ export function registerPullRoutes(
       // CheckPullMergeable (405 family): merged, the manual-mark style gate,
       // WIP, not-mergeable — the same order the Auto check type (the schedule
       // arm below) runs at the pin, only the branch-protection failure
-      // skipped (check.go:184-186); the full General re-check runs at consume
-      // time (automerge.go:214-216).
+      // skipped (check.go:181-184); the full General re-check runs at consume
+      // time (automerge.go:227).
       if (pullRequest.hasMerged) {
         throw new ApiError(405, "The PR is already merged");
       }
       // The manual mark, hoisted once: the Do value is its own check TYPE
-      // (pull.go:923-928 — Manually overrides the MWCS Auto choice), so the
+      // (pull.go:884-892 — Manually overrides the MWCS Auto choice), so the
       // arms below skip or serve it by this flag, never by re-comparing the
       // narrowed union.
       const manualMark = form.do === "manually-merged";
       // The manual mark's style gate — MergedManually's FIRST gate
-      // (merge.go:755-759): IsMergeStyleAllowed(ManuallyMerged) = the PR
+      // (merge.go:759-761): IsMergeStyleAllowed(ManuallyMerged) = the PR
       // unit's AllowManualMerge, the zero value FALSE upstream's
       // DefaultPullRequestsConfig never sets (repo_unit.go:139-155). The API
-      // answers the refusal through APIErrorAuto (pull.go:953-960):
+      // answers the refusal through APIErrorAuto (pull.go:918-922):
       // ErrInvalidMergeStyle unwraps to ErrInvalidArgument (merge.go:231-233)
       // → 400 with the error's own text; our repo id is the stored string,
       // rendered verbatim in the same bracket shape.
@@ -1930,7 +1973,7 @@ export function registerPullRoutes(
         }
       }
       // The Manually check type early-returns BEFORE the WIP arm
-      // (check.go:161-165 — merged/closed/permission only), so a WIP title
+      // (check.go:160-163 — merged/closed/permission only), so a WIP title
       // never blocks the mark.
       if (!manualMark && hasWorkInProgressPrefix(issue.title)) {
         throw new ApiError(405, "Work in progress PRs cannot be merged");
@@ -1946,71 +1989,91 @@ export function registerPullRoutes(
         throw new ApiError(405, "The PR is already merged");
       }
       // An ANCESTOR PR (head already contained in base) is upstream the
-      // PullRequestStatusAncestor STATUS (issues/pull.go:106), not HasMerged:
-      // IsStatusMergeable is false for it (issues/pull.go:446-448), so
-      // CheckPullMergeable raises ErrNotMergeableState at the
-      // `!IsStatusMergeable() && !IsEmpty()` arm (check.go:171-173) and the
-      // API route answers it 405 "Please try again later" (api pull.go:938-
-      // 939). The arm sits BEFORE the deps gate (check.go:171 < :219), so the
-      // ancestor answer wins over the deps text; the MWCS schedule arm below
-      // carries the same condition for its own gate.
+      // PullRequestStatusAncestor STATUS (issues/pull.go:117), not HasMerged:
+      // IsStatusMergeable is false for it (issues/pull.go:456-459 — the
+      // Mergeable||Empty pair), so CheckPullMergeable raises
+      // ErrNotMergeableState at the `!IsStatusMergeable() && (type != Auto ||
+      // !IsFilesConflicted() && !IsChecking())` arm (check.go:169) and
+      // the API route answers it 405 "Please try again later" (api
+      // pull.go:904-905). The arm sits BEFORE the deps gate (check.go:169 <
+      // :214-216), so the ancestor answer wins over the deps text; the MWCS
+      // schedule arm below carries the same condition for its own gate.
       if (!manualMark && checked.status === PRStatus.Ancestor) {
         throw new ApiError(405, "Please try again later");
       }
 
       // The STATE arm precedes the deps gate below — upstream's
-      // CheckPullMergeable order (check.go:171-173 < :219-223): a conflicted
-      // (or otherwise non-mergeable) PR answers ErrNotMergeableState's 405
-      // "Please try again later" (pull.go:938-939) even with open
-      // dependencies, NOT the deps text. Empty keeps upstream's carve-out
-      // (`!pr.IsEmpty()`, check.go:171-173): it passes here and either
-      // schedules through the MWCS arm below (its inner gate admits it) or
-      // falls to the direct path's trailing gate, which rejects it.
-      if (!manualMark && checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
+      // CheckPullMergeable order (check.go:169 < :214-216): a non-mergeable
+      // PR answers ErrNotMergeableState's 405 "Please try again later"
+      // (pull.go:904-905) even with open dependencies, NOT the deps text.
+      // The arm is Check-TYPE aware since b1c5fedd17: the Auto type (MWCS)
+      // WAITS OUT conflicted and checking rows — `!IsStatusMergeable() &&
+      // (type != Auto || !IsFilesConflicted() && !IsChecking())`, with
+      // IsFilesConflicted = status == Conflict (models/issues/pull.go:
+      // 692-695) — so a conflicted MWCS request reaches the schedule arm
+      // below. Empty keeps its carve-out — since this window it lives
+      // INSIDE IsStatusMergeable (models/issues/pull.go:456-459:
+      // Mergeable||Empty): it passes here and either schedules through the
+      // MWCS arm below (its inner gate admits it) or falls to the direct
+      // path's trailing gate, which rejects it.
+      const autoType = form.merge_when_checks_succeed === true;
+      if (
+        !manualMark &&
+        checked.status !== PRStatus.Mergeable &&
+        checked.status !== PRStatus.Empty &&
+        !(autoType && (checked.status === PRStatus.Conflict || checked.status === PRStatus.Checking))
+      ) {
         throw new ApiError(405, "Please try again later");
       }
 
       // The open-dependency gate — CheckPullMergeable's FINAL arm
-      // (check.go:219-223), never bypassed by force_merge (the deps check
+      // (check.go:214-216), never bypassed by force_merge (the deps check
       // sits outside the protection-failure escape) and NEVER skipped for the
-      // Auto type (only the branch-protection failure is, check.go:184-186) —
-      // so it runs AFTER the state arm above (check.go:171-173 < :219-223 —
-      // a conflicted PR's merge attempt answers the state 405, not this text)
-      // and BEFORE the schedule arm below, exactly like the upstream
+      // Auto type (only the branch-protection failure is, check.go:180-185) —
+      // so it runs AFTER the state arm above (check.go:169 < :214-216 —
+      // a conflicted PR's merge attempt answers the state 405, not this
+      // text) and BEFORE the schedule arm below, exactly like the upstream
       // handlers' single CheckPullMergeable call that precedes
-      // ScheduleAutoMerge (api pull.go:929/994; web pull.go:1056/1135). The
-      // manually-merged mark never reaches it (check.go:162-165 — the route's
-      // manual arm above already gated the style). The engine re-runs the
-      // same gate at its core (api/services/pull-engine.ts), so the direct
-      // merge path answers it twice-identically. Deliberate DIVERGENCE
-      // documented: upstream's API ladder has NO ErrDependenciesLeft arm (the
-      // error falls to APIErrorInternal → a 500 for a user-input condition,
-      // routers/api/v1/repo/pull.go:928-946 at the pin and on main); the 405
-      // with the locale text is our errorForUser-faithful choice — the same
-      // class as every sibling not-mergeable condition here and the
-      // Terraform-422 precedent (SPEC-0016) — carrying the web flash's exact
-      // string (repo.issues.dependency.pr_close_blocked, pull.go:1088-1090).
+      // ScheduleAutoMerge (api pull.go:895/961; web pull.go:1040/1100). The
+      // manually-merged mark never reaches it (check.go:160-163 — the
+      // route's manual arm above already gated the style). The engine
+      // re-runs the same gate at its core (api/services/pull-engine.ts), so
+      // the direct merge path answers it twice-identically. The b1c5fedd17
+      // window RETIRED this port's old divergence: ErrDependenciesLeft is
+      // now `util.ErrorWrap(util.ErrUnprocessableContent, ...)` (check.go:
+      // 46) and the API ladder's fallthrough renders user-mapped errors
+      // (APIErrorInternal → apiErrorAuto → ErrorUnwrapForUser,
+      // services/context/api.go:120-123) — so a deps-blocked merge answers
+      // 422 "is blocked by an open dependency" upstream, and this gate
+      // carries that exact status + message instead of the pre-window 405
+      // with the web flash string.
       if (!manualMark && !(await issueNoDependenciesLeft(c.env.DB, issue.id))) {
-        throw new ApiError(405, "You need to close all issues that are blocking this pull request before you can merge it.");
+        throw new ApiError(422, "is blocked by an open dependency");
       }
 
-      // THE SCHEDULE ARM (api pull.go:994-1007): merge_when_checks_succeed
+      // THE SCHEDULE ARM (api pull.go:955-968): merge_when_checks_succeed
       // schedules the auto merge — success → the bare 201 Created
       // (ctx.Status, EMPTY body), a standing row → the 409 carrying
       // ErrAlreadyScheduledToAutoMerge's text (models/pull/automerge.go:43-
-      // 45). NO delete-first: that reset is the WEB handler's shape (web
-      // pull.go:1136); the API keeps the row and conflicts (automerge.go:55-
-      // 61's exists-check → the model error). The Auto-type state gate is
-      // CheckPullMergeable's `!pr.IsStatusMergeable() && !pr.IsEmpty()`
-      // (check.go:171-173) — an Empty PR schedules too. The type-34 comment
-      // (CreateAutoMergeComment's scheduled half) and the first check
-      // enqueue (StartAutoMergeCheckByPullHead, automerge.go:100-103)
-      // complete the upstream service's transaction tail. The manual mark
-      // never reaches it: upstream returns at the mark (pull.go:951-960)
-      // before the schedule branch, so Manually overrides MWCS when both
-      // flags ride one body.
+      // 45, through APIErrorAuto's ErrAlreadyExist mapping — same 409 the
+      // pre-window explicit arm answered). NO delete-first on EITHER handler
+      // since b1c5fedd17 (the web reset is gone too). The Auto-type state
+      // gate is CheckPullMergeable's conflict-waiting arm (check.go:169):
+      // `!IsStatusMergeable() && (type != Auto || !IsFilesConflicted() &&
+      // !IsChecking())` — an Empty PR schedules too, and CONFLICTED/CHECKING
+      // rows schedule as well (auto merge waits them out). The type-34
+      // comment (CreateAutoMergeComment's scheduled half — now carrying the
+      // style string, automerge.go:76) and the first check enqueue
+      // (StartPullRequestCheckOnView, automerge.go:81) complete the
+      // upstream service's transaction tail. The manual mark never reaches
+      // it: upstream returns at the mark (pull.go:917-921) before the
+      // schedule branch, so Manually overrides MWCS when both flags ride one
+      // body.
       if (!manualMark && form.merge_when_checks_succeed === true) {
-        if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
+        // The state arm above already admitted Conflict/Checking for the
+        // Auto type; this inner restatement is the same predicate narrowed
+        // to the arm (Error/Ancestor/Unrelated were refused there).
+        if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty && checked.status !== PRStatus.Conflict && checked.status !== PRStatus.Checking) {
           throw new ApiError(405, "Please try again later");
         }
         const message = await composeMergeMessage(c, found, issue, checked, {
@@ -2030,7 +2093,9 @@ export function registerPullRoutes(
         if (scheduled === null) {
           throw new ApiError(409, `pull request is already scheduled to auto merge when checks succeed [pull_id: ${String(issue.id)}]`);
         }
-        await createScheduledAutoMergeComment(c.env.DB, issue.id, requester.id ?? 0, now);
+        // The type-34 comment's content is the STYLE string (b1c5fedd17 —
+        // automerge.go:76 passes string(style) into CreateAutoMergeComment).
+        await createScheduledAutoMergeComment(c.env.DB, issue.id, requester.id ?? 0, now, form.do);
         if (c.env.REPO_TASKS !== undefined) {
           try {
             await c.env.REPO_TASKS.send({ kind: "auto-merge-check", issueId: issue.id });
@@ -2048,9 +2113,9 @@ export function registerPullRoutes(
       // SPEC-0013 §3.3 — CheckPullBranchProtections (merge.go:694–742) after
       // the mergeable precondition, with the commits-behind count the check
       // surfaced. "Manually merged" skips the checks entirely
-      // (check.go:162–165). A failure answers 405 with the upstream message
+      // (check.go:160-163). A failure answers 405 with the upstream message
       // text VERBATIM; `force_merge` clears it only through
-      // CanBypassBranchProtection (check.go:192–207).
+      // CanBypassBranchProtection (check.go:185-203).
       if (rule !== null && !manualMark) {
         const ruleConfig = parseRuleConfig(rule.rules);
         // The B-53 arms' merge-time git view (census B-53) — threaded only
@@ -2083,9 +2148,9 @@ export function registerPullRoutes(
 
       // The composed commit message (findings F2): a trimmed
       // merge_title_field wins, else the style's default; a non-empty
-      // merge_message_field appends (pull.go:966-986, merge.go:112-148 —
+      // merge_message_field appends (pull.go:928-953, merge.go:112-148 —
       // composeMergeMessage). manually-merged skips it: upstream returns at
-      // pull.go:945-951 before composing and the mark touches no commit.
+      // pull.go:918-925 before composing and the mark touches no commit.
       const message = manualMark
         ? ""
         : await composeMergeMessage(c, found, issue, checked, {
@@ -2118,7 +2183,7 @@ export function registerPullRoutes(
       const merged = await findPullRequestByIndex(c.env.DB, found.repo.id, checked.index);
       if (merged !== null) {
         // The merge notifier's ToPayloadPullRequest carries the diff-stat trio
-        // like every payload conversion (convert/pull.go:230-254 is not gated
+        // like every payload conversion (convert/pull.go:245-269 is not gated
         // on isPayload); the omit arms (:247-250) stay omitted — the checked
         // row's persisted merge base serves the pre-merge contribution.
         const diffStats = await pullRequestDiffShortStat(c, found, merged.pullRequest);

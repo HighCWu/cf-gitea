@@ -1053,10 +1053,10 @@ describe("the web write arms", () => {
     expect(rows.some((row) => row.type === CommentType.MergePull)).toBe(true);
   });
 
-  it("refuses the merge for a non-write viewer (the update_not_allowed flash)", async () => {
+  it("refuses the merge for a non-write viewer (the no_merge_access flash — b1c5fedd17 moved the ErrNoPermissionToMerge flash from update_not_allowed to no_merge_access, pull.go:1036-1037)", async () => {
     const ctx = await writeCtx("conflicted", bob);
     const result = await mergePullRequestFromWeb(ctx, mergeFormOf());
-    expect(result).toEqual({ outcome: "error", message: "You are not allowed to update branch" });
+    expect(result).toEqual({ outcome: "error", message: "You are not authorized to merge this pull request." });
   });
 
   it("maps CheckPullMergeable's refusal arms to their flash texts", async () => {
@@ -1076,10 +1076,9 @@ describe("the web write arms", () => {
       outcome: "error",
       message: "You cannot use this merge option for this pull request.",
     });
-    expect(await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf({ merge_when_checks_succeed: "true" }))).toEqual({
-      outcome: "error",
-      message: "This pull request is not ready to be merged. Check review status and status checks.",
-    });
+    // The MWCS arm is NOT refused on a conflicted row since b1c5fedd17 — the
+    // Auto type waits the conflict out (check.go:169); that outcome is pinned
+    // by the dedicated schedule test below.
   });
 
   it("marks a manually-merged PR from an ancestor commit id", async () => {
@@ -1105,8 +1104,11 @@ describe("the web write arms", () => {
     expect(result).toEqual({ outcome: "error", message: "commit ID must be a commit ID on the target branch" });
   });
 
-  it("answers the not-scheduled 404 for cancel_auto_merge", async () => {
-    expect(await cancelAutoMergeFromWeb(await writeCtx("fresh", alice))).toEqual({ outcome: "not-found" });
+  it("answers the not-scheduled miss with the auto_merge_not_scheduled error (b1c5fedd17: ErrAutoMergeNotScheduled through JSONErrorAuto, pull.go:1213-1215 — no longer the bare 404)", async () => {
+    expect(await cancelAutoMergeFromWeb(await writeCtx("fresh", alice))).toEqual({
+      outcome: "error",
+      message: "Auto-merge is not enabled for this pull request.",
+    });
   });
 
   it("schedules the auto merge when checks must succeed: row, type-34 comment, redirect", async () => {
@@ -1125,8 +1127,15 @@ describe("the web write arms", () => {
     expect(scheduled!.mergeMessage).toContain("feat: amgreen");
     // The PR itself is NOT merged by the schedule arm.
     expect(found.pullRequest.hasMerged).toBe(false);
-    // The type-34 system comment (CreateAutoMergeComment's scheduled half).
-    const after = (await d1().select().from(comments).all()).filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length;
+    // The type-34 system comment (CreateAutoMergeComment's scheduled half),
+    // whose CONTENT carries the style string (b1c5fedd17 — ScheduleAutoMerge
+    // passes string(style), services/automerge/automerge.go:76).
+    const scheduledRows = (await d1().select().from(comments).all()).filter(
+      (row) => row.type === CommentType.PRScheduledToAutoMerge && row.issueId === found.issue.id,
+    );
+    expect(scheduledRows).toHaveLength(1);
+    expect(scheduledRows[0]!.content).toBe("squash");
+    const after = scheduledRows.length;
     expect(after).toBe(before + 1);
   });
 
@@ -1151,29 +1160,33 @@ describe("the web write arms", () => {
     expect(html).toContain("Cancel auto merge");
   });
 
-  it("re-scheduling resets the single row (the handler's delete-first)", async () => {
+  it("re-scheduling keeps the standing row and answers the already-enabled error (b1c5fedd17 removed the web delete-first: pull.go:1101-1103)", async () => {
     const index = await writeIndex("amgreen");
-    await mergePullRequestFromWeb(await writeCtx("amgreen", alice), mergeFormOf({ do: "merge", merge_when_checks_succeed: "true" }));
     const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
-    const scheduled = await getScheduledAutoMerge(env.DB, found.issue.id);
-    expect(scheduled!.mergeStyle).toBe("merge");
-    const commentsRows = await d1().select().from(comments).where(eq(comments.issueId, found.issue.id)).all();
-    expect(commentsRows.filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length).toBe(2);
+    // The standing row is the SQUASH schedule the first submit landed; a
+    // second MWCS submit with a different style no longer resets it — the
+    // flash carries the already-enabled text and the row survives verbatim.
+    const before = (await d1().select().from(comments).all()).filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length;
+    const again = await mergePullRequestFromWeb(await writeCtx("amgreen", alice), mergeFormOf({ do: "merge", merge_when_checks_succeed: "true" }));
+    expect(again).toEqual({ outcome: "error", message: "Auto-merge is already enabled for this pull request." });
+    expect((await getScheduledAutoMerge(env.DB, found.issue.id))!.mergeStyle).toBe("squash");
+    const after = (await d1().select().from(comments).all()).filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length;
+    expect(after).toBe(before);
   });
 
-  it("refuses the schedule for a WIP PR and a conflicted PR (no row lands)", async () => {
+  it("refuses the schedule for a WIP PR but WAITS OUT a conflict (b1c5fedd17: the Auto type tolerates conflicted rows, check.go:169)", async () => {
     await seedWritePr("amwip", { title: "WIP: amwip", headBranch: "feature" }, { headSha: featureOid });
     const wip = await mergePullRequestFromWeb(await writeCtx("amwip", alice), mergeFormOf({ merge_when_checks_succeed: "true" }));
     expect(wip).toEqual({ outcome: "error", message: "This pull request cannot be merged because it is marked as being a work in progress." });
+    const wipFound = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("amwip")))!;
+    expect(await getScheduledAutoMerge(env.DB, wipFound.issue.id)).toBeNull();
+    // The conflicted fixture schedules — auto merge waits the conflict out.
+    const conflictIndex = await writeIndex("conflicted");
     const conflict = await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf({ merge_when_checks_succeed: "true" }));
-    expect(conflict).toEqual({
-      outcome: "error",
-      message: "This pull request is not ready to be merged. Check review status and status checks.",
-    });
-    for (const name of ["amwip", "conflicted"]) {
-      const found = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex(name)))!;
-      expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
-    }
+    expect(conflict).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${conflictIndex}` });
+    const conflictFound = (await findPullRequestByIndex(env.DB, writeRepoId, conflictIndex))!;
+    expect(conflictFound.pullRequest.status).toBe(PRStatus.Conflict);
+    expect(await getScheduledAutoMerge(env.DB, conflictFound.issue.id)).not.toBeNull();
   });
 
   it("renders the MWCS-hidden true + the button suffix when the merge cannot happen now", async () => {
@@ -1221,25 +1234,31 @@ describe("the web write arms", () => {
     expect(html).toContain("Create merge commit (When checks succeed)");
   });
 
-  it("cancels the schedule: scheduler redirect + row gone + type-35; the permissionless 403 twin", async () => {
+  it("cancels the schedule: the poster carve-out, the scheduler redirect, row gone, type-35; the permissionless 403 twin (b1c5fedd17: IsPoster may cancel — automerge.go:99)", async () => {
     const index = await writeIndex("amgreen");
     const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
-    // bob holds no write on alice's repo → the permission-denied error text.
-    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", bob))).toEqual({
+    // cara is neither the scheduler, the poster, nor a writer on alice's
+    // repo → the permission-denied error text.
+    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", cara))).toEqual({
       outcome: "error",
       message: "user has no permission to cancel the scheduled auto merge",
     });
     expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
-    // The scheduler cancels: redirect, row gone, the type-35 comment.
-    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", alice))).toEqual({
+    // amgreen's POSTER is bob (seedWritePr's default) — the new IsPoster
+    // carve-out lets the poster cancel the scheduler's row without write.
+    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", bob))).toEqual({
       outcome: "redirect",
       location: `/alice/wrepo/pulls/${index}`,
     });
     expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
     const rows = await d1().select().from(comments).where(eq(comments.issueId, found.issue.id)).all();
     expect(rows.some((row) => row.type === CommentType.PRUnscheduledToAutoMerge)).toBe(true);
-    // The second cancel finds no row → the upstream NotFound arm.
-    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", alice))).toEqual({ outcome: "not-found" });
+    // The second cancel finds no row → the auto_merge_not_scheduled error
+    // (pull.go:1213-1215; the bare 404 is gone since b1c5fedd17).
+    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", bob))).toEqual({
+      outcome: "error",
+      message: "Auto-merge is not enabled for this pull request.",
+    });
   });
 
   it("updates the head branch by merge: redirect, moved ref, checking row", async () => {
@@ -1753,6 +1772,43 @@ describe("the squash message-body prefill (CommitMessageMerge composition)", () 
     );
     await d1().delete(pullReviews).where(inArray(pullReviews.reviewerId, [105, 106]));
     await d1().delete(users).where(inArray(users.id, [105, 106]));
+  });
+
+  it("caps the Reviewed-by lines at DefaultMergeMessageMaxApprovers (10) EXACTLY — 8465bed994 fixed the pre-write break from `>` to `>=` (models/issues/pull.go:392-394; the old `>` wrote 11 under a cap of 10)", async () => {
+    // Nine more approvers beyond the fixture's two: 11 candidates total, so
+    // the pre-write break decides whether 10 or 11 lines render. Rows are
+    // removed after the pin (the sibling tests read the two-approver fixture).
+    const extra = Array.from({ length: 9 }, (_, i) => ({
+      id: 201 + i,
+      username: `capuser${i}`,
+      usernameLower: `capuser${i}`,
+      displayName: `Cap User ${i}`,
+      email: `cap${i}@sqrepo.invalid`,
+      createdAt: new Date((T0 + 100 + i) * 1000),
+    }));
+    // Per-row inserts: the users table carries 26 columns, so one 9-row
+    // multi-insert breaches D1's 100-bind cap (observed: "too many SQL
+    // variables at offset 892").
+    for (const u of extra) {
+      await d1().insert(users).values(u);
+    }
+    for (const [i, u] of extra.entries()) {
+      await d1().insert(pullReviews).values({
+        type: ReviewType.Approve,
+        reviewerId: u.id,
+        issueId: sqIssueId,
+        official: true,
+        createdAt: new Date((T0 + 100 + i) * 1000),
+        updatedAt: new Date((T0 + 100 + i) * 1000),
+      });
+    }
+    const lines = await reviewedByLines(env.DB, sqIssueId);
+    const entries = lines.split("\n").filter((line) => line !== "");
+    expect(entries).toHaveLength(10); // the FIXED cap: exactly maxApprovers
+    expect(entries[0]).toBe("Reviewed-by: Cara Null <>"); // the fixture's first approver
+    expect(entries[9]).toBe("Reviewed-by: Cap User 7 <cap7@sqrepo.invalid>"); // the 10th in (createdUnix, id) order
+    await d1().delete(pullReviews).where(inArray(pullReviews.reviewerId, extra.map((u) => u.id)));
+    await d1().delete(users).where(inArray(users.id, extra.map((u) => u.id)));
   });
 
   it("swaps the body alongside the title on the default-style switch", async () => {

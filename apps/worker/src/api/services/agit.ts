@@ -10,15 +10,17 @@
  * rewritten refs back through the proc-receive protocol (cmd/hook.go
  * runHookProcReceive): the client's `refs/for/...` command is reported ok/ng
  * against the ORIGINAL ref name while the real write lands on
- * `refs/pull/<index>/head` (`UpdateRefForAgit`, services/pull/pull.go:586;
- * `GetGitHeadRefName`, models/issues/pull.go:406). The permission gates live
+ * `refs/pull/<index>/head` (`UpdateRefForAgit`, services/pull/pull.go:625;
+ * `GetGitHeadRefName`, models/issues/pull.go:417). The permission gates live
  * inside the create arm: the blocked-by-owner check
- * (`NewPullRequest`, services/pull/pull.go:66-68 → the hook's UserMsg
- * "Cannot create pull request because you are blocked by the repository
- * owner.", routers/private/hook_proc_receive.go:37-39) and the AGit flow's
- * collaborator-gate SKIP (`canCreate := poster.IsAdmin || Flow == AGit`,
- * pull.go:71 — any pusher who passed write auth may propose; the protected
- * branch itself is not consulted, that is the point of proposing).
+ * (`NewPullRequest`, services/pull/pull.go:66-70 → the hook's UserMsg,
+ * now the repo.creation_blocked_by_owner translation "Cannot create an
+ * issue or pull request because you are blocked by the repository owner."
+ * through PrivateUserErrorAuto since 640cd615c4's translatable wrap) and
+ * the AGit flow's creation-gate SKIP (`canCreateInBaseRepo :=
+ * basePerm.CanWrite(TypePullRequests) || Flow == AGit`, pull.go:81 — any
+ * pusher who passed write auth may propose; the protected branch itself is
+ * not consulted, that is the point of proposing).
  *
  * OUR adaptation — the vendored engine (packages/git-engine) has no
  * proc-receive capability and its receive flow is reject-only
@@ -300,7 +302,11 @@ export const AGIT_NG = {
   noTopic: "topic-branch is not set",
   sameCommit: "new commit is same with old commit",
   forcePush: "request `force-push` push option",
-  blocked: "Cannot create pull request because you are blocked by the repository owner.",
+  // 640cd615c4 wrapped NewPullRequest's ErrBlockedUser with the
+  // repo.creation_blocked_by_owner translation — the hook's
+  // PrivateUserErrorAuto renders the locale text, so the ng line carries the
+  // new wording (services/pull/pull.go:66-68).
+  blocked: "Cannot create an issue or pull request because you are blocked by the repository owner.",
 } as const;
 
 /** The planner's engine cell face — the generated `Env.REPO` stub satisfies
@@ -518,10 +524,11 @@ async function planCreate(
   headBranch: string,
   baseBranch: string,
 ): Promise<AgitPlanEntry> {
-  // The blocked gate FIRST (NewPullRequest, services/pull/pull.go:66-68; the
-  // AGit flow skips the collaborator gate entirely, pull.go:71 — `canCreate :=
-  // poster.IsAdmin || Flow == AGit`). Upstream's exact UserMsg is the ng text
-  // (hook_proc_receive.go:37-39).
+  // The blocked gate FIRST (NewPullRequest, services/pull/pull.go:66-70; the
+  // AGit flow skips the base-writer creation gate entirely, pull.go:81 —
+  // `canCreateInBaseRepo := basePerm.CanWrite(TypePullRequests) || Flow ==
+  // AGit`, 640cd615c4's shape). Upstream's exact UserMsg is the ng text
+  // (PrivateUserErrorAuto over the creation_blocked_by_owner wrap).
   if (repo.ownerId !== null && (await isUserBlockedBy(env.DB, { id: pusherRow.id, isAdmin: pusherRow.isAdmin }, repo.ownerId))) {
     return { kind: "reject", originalRef: cmd.ref, message: AGIT_NG.blocked };
   }

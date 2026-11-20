@@ -82,6 +82,14 @@
  *     ReviewRequest — `comment != nil` → notifier); TEAM-request add
  *     notifies, TEAM-request removal is SILENT (:44–47 — `!isAdd` returns
  *     before the notifier).
+ *   - the window gates (fc49..099ab): create-review comments need a path and
+ *     a positive line or 422 (884884308d, pull_review.go:494-500); a locked
+ *     PR refuses review content without the write right, 403 "cannot
+ *     comment on a locked issue" (5ee660e437, isIssueLockedForDoer); a
+ *     reviewer blocked by the poster or repo owner is refused 403 unless
+ *     repo admin (or official-reviewer for a poster-only block) —
+ *     checkReviewerNotBlocked, 8d14c9af20; diff_hunk renders from the FIRST
+ *     hunk through the end (ce7364e215's patch2diff rewrite).
  *
  * Webhook events (services/webhook/notifier.go): submitted reviews fire
  * `pull_request_review_approved` / `_rejected` / `_comment` per type —
@@ -153,6 +161,7 @@ import { emitIssueEvent } from "../../services/issue-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { embeddedUserSchema } from "../models/issue";
+import type { User } from "../models/user";
 import { parseListOptions } from "../pagination";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { collaboratorModeOf } from "../services/repo-collaborators";
@@ -177,6 +186,9 @@ import {
 } from "../services/repository";
 import { engineReads } from "../services/engine";
 import { pullRequestDiff, pullRequestDiffShortStat } from "../services/pull-engine";
+import { canWriteRepository } from "../services/repo-access";
+import { isUserBlockedBy } from "../services/blocks";
+import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 // The write cores (§14.6's extraction — specs/email-outbound.md): submitReview
 // + the reviewer-request pair live in the service (the IssuesService(d1,
 // mailEnv) seam; this route passes `c.env` at the write arms). The read
@@ -498,15 +510,20 @@ async function toApiReview(
 }
 
 /**
- * patch2diff (services/convert/pull_review.go:129–135): the stored hunks
- * render as their LAST hunk only. Created code comments carry the
- * GetCodeCommentPatch port below (a single-hunk cut); patch null on
- * degenerate rows renders "" as before.
+ * patch2diff (services/convert/pull_review.go:133-140 at the pin —
+ * ce7364e215 replaced the split/len==2 shape): the stored hunks render from
+ * the FIRST "\n@@" through the END of the patch (a multi-hunk patch used to
+ * answer "" — len(split) was 3+). The upstream port also re-encodes the
+ * bytes through charset.ToUTF8 with rune-error replacement; that half is
+ * N/A here — a D1 TEXT column hands back valid UTF-8 strings by
+ * construction, so there are no bytes left to repair. Created code comments
+ * carry the GetCodeCommentPatch port below (a single-hunk cut); patch null
+ * on degenerate rows renders "" as before.
  */
 function patchToDiffHunk(patch: string | null): string {
   if (patch === null) return "";
-  const split = patch.split("\n@@");
-  return split.length === 2 ? `@@${split[1]}` : "";
+  const idx = patch.indexOf("\n@@");
+  return idx === -1 ? "" : patch.slice(idx + 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -767,7 +784,7 @@ async function emitReviewSubmitted(
   }
   // The diff-stat trio rides the same conversion (the single converter's
   // GetDiffShortStat block runs on EVERY single AND payload render,
-  // convert/pull.go:230-254; the omit arms — no merge base, truncated walk,
+  // convert/pull.go:245-269; the omit arms — no merge base, truncated walk,
   // engine failure :247-250 — stay omitted).
   const diffStats = await pullRequestDiffShortStat(c, found, pullRequest);
   await emitIssueEvent(c, {
@@ -799,7 +816,7 @@ async function emitReviewSubmitted(
 
 // ---------------------------------------------------------------------------
 // Read consult for routes/pulls.ts: the PR's requested reviewers
-// (convert/pull.go:124 LoadRequestedReviewers — the user REQUEST rows).
+// (convert/pull.go:137 LoadRequestedReviewers — the user REQUEST rows).
 // ---------------------------------------------------------------------------
 
 export async function requestedReviewersOf(
@@ -860,6 +877,42 @@ function numCommentsBump(db: ReturnType<typeof drizzle>, issueId: number, now: D
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// checkReviewerNotBlocked — 8d14c9af20 (services/pull/review.go:186-201 at
+// the pin): a reviewer blocked by the issue POSTER or the repo OWNER may not
+// create or submit review content. Upstream mounts it INSIDE CreateCodeComment
+// and SubmitReview, so every write path (API create/submit/reply + the web
+// arms) inherits it; our two write handlers (create carries the code-comment
+// loop AND the submit call) mount it once before their first write. The
+// ladder: not blocked by either → pass; repo admin
+// (access_model.IsUserRepoAdmin) → pass; blocked ONLY by the poster → an
+// official reviewer for the base branch still passes ("the author's block
+// must not keep official reviewers from requesting changes"); everything
+// else answers ErrBlockedUser — a PermissionDenied error, wrapped
+// translatable ("repo.issues.comment.blocked_user") — through APIErrorAuto →
+// 403 with the locale text.
+// ---------------------------------------------------------------------------
+async function checkReviewerNotBlocked(
+  db: D1Database,
+  repo: RepositoryWithOwner["repo"],
+  issue: IssueRow,
+  baseBranch: string,
+  doer: User,
+): Promise<void> {
+  const blockee = { id: doer.id ?? 0, isAdmin: doer.is_admin === true };
+  const blockedByPoster = issue.posterId !== null && (await isUserBlockedBy(db, blockee, issue.posterId));
+  const blockedByOwner = await isUserBlockedBy(db, blockee, repo.ownerId ?? -1);
+  if (!blockedByPoster && !blockedByOwner) return;
+  const access = await principalAccessOf(db, repo, doer);
+  if (access.admin) return;
+  if (!blockedByOwner) {
+    const rule = await findRule(db, repo.id, baseBranch);
+    const config = rule === null ? null : parseRuleConfig(rule.rules);
+    if (await isUserOfficialReviewer(db, config, access)) return;
+  }
+  throw new ApiError(403, "Cannot create or edit comment because you are blocked by the poster or repository owner.");
+}
 
 export function registerPullReviewRoutes(
   app: OpenAPIHono<ApiEnv>,
@@ -950,9 +1003,32 @@ export function registerPullReviewRoutes(
       const form = c.req.valid("json");
       const doer = c.get("authUser");
       const doerId = doer.id ?? 0; // requireAuth guarantees the id
+
+      // 884884308d: every review comment carries a path and a positive line —
+      // the create arm refuses the degenerate body BEFORE any read
+      // (pull_review.go:494-500 at the pin).
+      for (const comment of form.comments ?? []) {
+        if (comment.path === "" || ((comment.new_position ?? 0) <= 0 && (comment.old_position ?? 0) <= 0)) {
+          throw new ApiError(422, "review comments require a path and a positive new_position or old_position");
+        }
+      }
+
       const isPoster = issue.posterId !== null && issue.posterId === doerId;
 
       const reviewType = preparePullReviewType(form.event ?? "", form.body ?? "", isPoster);
+
+      // 5ee660e437: a locked PR refuses review content from doers without
+      // the write right (isIssueLockedForDoer, pull_review.go:502-506 at the
+      // pin; our repo-write predicate is the same one the issue-comment
+      // arm's locked gate uses).
+      if (issue.isLocked && !(await canWriteRepository(c, found))) {
+        throw new ApiError(403, "cannot comment on a locked issue");
+      }
+      // 8d14c9af20: the blocked-reviewer gate rides CreateCodeComment +
+      // SubmitReview upstream (services/pull/review.go:186-201 + :299-302) —
+      // this handler's ONLY two write arms — so one gate before the
+      // code-comment loop covers both.
+      await checkReviewerNotBlocked(c.env.DB, found.repo, issue, pullRequest.baseBranch, doer);
 
       // Empty commit_id defaults to the head ref tip (pull_review.go:521–536).
       let commitId = form.commit_id ?? "";
@@ -1105,6 +1181,15 @@ export function registerPullReviewRoutes(
         // pull_review.go:643–646.
         throw new ApiError(422, "review stay pending");
       }
+
+      // 5ee660e437: the locked gate rides the handler (pull_review.go:631-635
+      // at the pin), after the type resolution like the create arm.
+      if (issue.isLocked && !(await canWriteRepository(c, found))) {
+        throw new ApiError(403, "cannot comment on a locked issue");
+      }
+      // 8d14c9af20: the blocked-reviewer gate rides SubmitReview
+      // (services/pull/review.go:299-302) — here, before the submit call.
+      await checkReviewerNotBlocked(c.env.DB, found.repo, issue, pullRequest.baseBranch, doer);
 
       const head = await engineReads(c.env, found.repo).readCommit(pullHeadRefName(issue.index));
       const submitted = await new PullReviewsService(c.env.DB, c.env).submitReview(found, {
@@ -1513,7 +1598,7 @@ export function registerPullReviewRoutes(
     // payloads (add user/team, remove user) render the head repo regardless
     // of the doer's visibility. The diff-stat trio rides the same conversion
     // (the single converter's GetDiffShortStat block runs on EVERY single
-    // AND payload render, convert/pull.go:230-254; the omit arms — no merge
+    // AND payload render, convert/pull.go:245-269; the omit arms — no merge
     // base, truncated walk, engine failure :247-250 — stay omitted); the one
     // resolution feeds every payload below (upstream recomputes per
     // conversion — the shared render is the cheaper adapter).

@@ -3834,8 +3834,12 @@ describe("the agit blocked gate (NewPullRequest's IsUserBlockedBy arm)", () => {
       body: buildAgitPushBody([{ oid, ref: "refs/for/main/topic-b" }], { pack, pushOptions: ["topic=topic-b"] }),
     });
     expect(push.status).toBe(200);
+    // 640cd615c4 wrapped NewPullRequest's ErrBlockedUser with the
+    // repo.creation_blocked_by_owner translation — the hook's ng line
+    // carries the new wording (services/pull/pull.go:66-70 via
+    // PrivateUserErrorAuto; the AGIT_NG.blocked port).
     expect(parseAgitResponse(await push.arrayBuffer()).report).toContain(
-      "ng refs/for/main/topic-b Cannot create pull request because you are blocked by the repository owner.",
+      "ng refs/for/main/topic-b Cannot create an issue or pull request because you are blocked by the repository owner.",
     );
     expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(issues).all()).toHaveLength(0);

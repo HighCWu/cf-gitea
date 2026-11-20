@@ -43,7 +43,8 @@ import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerPullRoutes } from "./routes/pulls";
-import { mergePullRequest, pullGateGitInputs } from "./services/pull-engine";
+import { mergePullRequest, pullGateGitInputs, mergeableOfRow, PR_STATUS_UNRELATED, statusFromMergeability } from "./services/pull-engine";
+import type { PullRequestRow } from "../issues/service";
 import { engineReads, refTipMap, ZERO_OID } from "./services/engine";
 import { findPullRequestByIndex } from "./services/pulls";
 import type { Context } from "hono";
@@ -193,7 +194,7 @@ describe("POST /repos/{owner}/{repo}/pulls — engine validation + refs/pull/N/h
     expect(res.status).toBe(201);
     const pr: Record<string, unknown> = await res.json();
     expect(pr.number).toBe(1);
-    expect(pr.mergeable).toBe(false); // checking renders FALSE — pr.Mergeable(ctx), models/issues/pull.go:751-756 (non-nullable bool)
+    expect(pr.mergeable).toBe(false); // checking renders FALSE — pr.Mergeable(ctx), models/issues/pull.go:767-775 (non-nullable bool)
     expect(((pr.head as Record<string, unknown>).ref) as string).toBe("refs/pull/1/head");
     expect(((pr.head as Record<string, unknown>).sha) as string).not.toBe("");
 
@@ -346,8 +347,8 @@ describe("merge gating — conflict, WIP, schedule", () => {
     const wipRendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
     expect(wipRendered.draft).toBe(true);
     // WIP → mergeable FALSE even when the row checks mergeable — the
-    // IsWorkInProgress arm of pr.Mergeable (models/issues/pull.go:751-756,
-    // title prefix :652-658).
+    // IsWorkInProgress arm of pr.Mergeable (models/issues/pull.go:767-775,
+    // title prefix :668-674).
     expect(wipRendered.mergeable).toBe(false);
     const merge = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
     expect(merge.status).toBe(405);
@@ -398,7 +399,7 @@ describe("merge gating — conflict, WIP, schedule", () => {
     // tick — "skipped-status-checks", the row deterministically STAYS (the
     // schedule's whole point: wait for checks). The direct merge below then
     // rides force_merge (upstream's DoForceMerge clears the status gate —
-    // merge.go:707-713; the deps check is never bypassed, check.go:219-223,
+    // merge.go:707-713; the deps check is never bypassed, check.go:214-216,
     // and this PR carries no dependencies).
     const statusRule = emptyRuleConfig();
     statusRule.enableStatusCheck = true;
@@ -450,23 +451,44 @@ describe("merge gating — conflict, WIP, schedule", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The status mapping — b1c5fedd17's PullRequestStatusUnrelated (models/
+// issues/pull.go:118): the engine's "unrelated" outcome stores its OWN status
+// (7) instead of collapsing into Empty, Mergeable(ctx) excludes it
+// (:767-775), and IsStatusMergeable admits Mergeable||Empty (:456-459).
+// ---------------------------------------------------------------------------
+
+describe("the PR status mapping at the unrelated-status pin", () => {
+  it("maps the engine's unrelated outcome to the new status 7 (PR_STATUS_UNRELATED) and renders mergeable FALSE", () => {
+    expect(statusFromMergeability("unrelated")).toBe(PR_STATUS_UNRELATED);
+    expect(PR_STATUS_UNRELATED).toBe(7); // upstream PullRequestStatusUnrelated (models/issues/pull.go:118)
+    expect(statusFromMergeability("empty")).toBe(PRStatus.Empty);
+    expect(statusFromMergeability("mergeable")).toBe(PRStatus.Mergeable);
+    const row = { status: statusFromMergeability("unrelated"), hasMerged: false } as PullRequestRow;
+    expect(mergeableOfRow(row, false)).toBe(false);
+    const emptyRow = { status: PRStatus.Empty, hasMerged: false } as PullRequestRow;
+    expect(mergeableOfRow(emptyRow, false)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The open-dependency merge gate — CheckPullMergeable's FINAL arm (services/
-// pull/check.go:218-223): IssueNoDependenciesLeft must answer true, with the
-// Manually check type returning BEFORE the gate (check.go:160-165). The gate
+// pull/check.go:214-216): IssueNoDependenciesLeft must answer true, with the
+// Manually check type returning BEFORE the gate (check.go:160-163). The gate
 // lives in the CORE (mergePullRequest) so the API route, the web merge box
-// and the auto-merge consumer all inherit it. Error mapping: upstream's merge
-// API has NO ErrDependenciesLeft arm — it falls to APIErrorInternal → 500
-// (routers/api/v1/repo/pull.go:928-946); the web box answers the
-// pr_close_blocked flash (pull.go:1088-1089) and the issue-close API maps the
-// same condition to 412 (issue.go:645-648). We answer 405 + the locale text
-// verbatim (the route's errorForUser-faithful divergence).
+// and the auto-merge consumer all inherit it. Error mapping: since b1c5fedd17
+// ErrDependenciesLeft wraps util.ErrUnprocessableContent and the API
+// fallthrough renders user-mapped errors (APIErrorInternal → apiErrorAuto →
+// ErrorUnwrapForUser), so upstream answers 422 "is blocked by an open
+// dependency"; the web box maps the same message back to the pr_close_blocked
+// flash (pull.go:1050-1051) and the issue-close API maps the same condition
+// to 412 (issue.go:645-648). We answer 422 + the error's own text verbatim.
 //
 // Its OWN seeded repo (apisuite/pulls-deps, the clock block's rationale):
 // the unblocked arms MERGE, and merges grow main's closure — the fork arms'
 // base-fetch walk budget.
 // ---------------------------------------------------------------------------
 
-describe("the open-dependency merge gate (check.go:218-223)", () => {
+describe("the open-dependency merge gate (check.go:214-216)", () => {
   const DEPS_SLUG = "pulls-deps";
   const DEPS_REPO = `/repos/${OWNER}/${DEPS_SLUG}`;
 
@@ -521,8 +543,8 @@ describe("the open-dependency merge gate (check.go:218-223)", () => {
     const blockerId = await seedBlocker(repoRow.id, found.issue.id);
 
     const refused = await send(`${DEPS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
-    expect(refused.status).toBe(405);
-    expect((await jsonBody(refused)).message).toBe("You need to close all issues that are blocking this pull request before you can merge it.");
+    expect(refused.status).toBe(422);
+    expect((await jsonBody(refused)).message).toBe("is blocked by an open dependency");
     expect((await jsonBody(await get(`${DEPS_REPO}/pulls/${index}`))).merged).toBe(false);
 
     await closeBlocker(blockerId);
@@ -567,8 +589,8 @@ describe("the open-dependency merge gate (check.go:218-223)", () => {
       (error: unknown): unknown => error,
     );
     expect(refused).toBeInstanceOf(ApiError);
-    expect((refused as ApiError).status).toBe(405);
-    expect((refused as ApiError).message).toBe("You need to close all issues that are blocking this pull request before you can merge it.");
+    expect((refused as ApiError).status).toBe(422);
+    expect((refused as ApiError).message).toBe("is blocked by an open dependency");
 
     // The Manually check type returns BEFORE the deps gate upstream — the
     // ENGINE's pre-gate skips too, so the refusal fires at the LANDING's
@@ -1864,7 +1886,7 @@ describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap a
 
     // The empty-range row (Ancestor/Empty after the lazy check) renders
     // mergeable TRUE — pr.Mergeable excludes only Checking/Conflict/Error
-    // (models/issues/pull.go:751-756); ancestor/empty pass the filter.
+    // (models/issues/pull.go:767-775); ancestor/empty pass the filter.
     const emptyRendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
     expect(emptyRendered.mergeable).toBe(true);
 
@@ -2264,8 +2286,9 @@ describe("the PR-head sync round-trip — a second push moves refs/pull/N/head a
     const pushCommentRows = (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, prRow!.issueId)).all()).filter(
       (r) => r.type === CommentType.PullRequestPush,
     );
-    const createRow = pushCommentRows.find((r) => JSON.parse(r.content ?? "{}").commit_ids?.[0] !== append.tip);
-    const pushRow = pushCommentRows.find((r) => JSON.parse(r.content ?? "{}").commit_ids?.[0] === append.tip);
+    const pushBodyOf = (r: (typeof pushCommentRows)[number]): { commit_ids?: string[] } => JSON.parse(r.content ?? "{}") as { commit_ids?: string[] };
+    const createRow = pushCommentRows.find((r) => pushBodyOf(r).commit_ids?.[0] !== append.tip);
+    const pushRow = pushCommentRows.find((r) => pushBodyOf(r).commit_ids?.[0] === append.tip);
     expect(createRow).toBeDefined();
     expect(pushRow).toBeDefined();
     expect(JSON.parse(pushRow!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [append.tip] });
@@ -2280,7 +2303,7 @@ describe("the PR-head sync round-trip — a second push moves refs/pull/N/head a
     // A merged row renders mergeable TRUE — upstream keeps pr.Status through
     // the merge (MarkAsMerged passes pr.Status, services/pull/merge.go:366)
     // and pr.Mergeable consults only the status trio + WIP
-    // (models/issues/pull.go:751-756), so the merged GET renders true.
+    // (models/issues/pull.go:767-775), so the merged GET renders true.
     const mergedRendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
     expect(mergedRendered.merged).toBe(true);
     expect(mergedRendered.mergeable).toBe(true);

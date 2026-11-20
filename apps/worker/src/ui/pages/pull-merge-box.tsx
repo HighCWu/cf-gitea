@@ -286,9 +286,9 @@ import {
   contextMatchesRequired,
   createScheduledAutoMergeComment,
   getScheduledAutoMerge,
+  insertScheduledAutoMergeRow,
   mergeRequiredContextsCommitStatus,
   removeScheduledAutoMerge,
-  scheduleAutoMergeRow,
 } from "../../services/pull-automerge";
 import { PRFlow, PRStatus, comments, issues, pullRequests, pullReviews, ReviewType, users, type CommitStatusRow } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
@@ -379,7 +379,8 @@ export const pullMergeWriteLocale = {
   no_merge_wip: "This pull request cannot be merged because it is marked as being a work in progress.", // "repo.pulls.no_merge_wip"
   no_merge_not_ready: "This pull request is not ready to be merged. Check review status and status checks.", // "repo.pulls.no_merge_not_ready"
   dependencies_left: "You need to close all issues that are blocking this pull request before you can merge it.", // "repo.issues.dependency.pr_close_blocked"
-  update_not_allowed: "You are not allowed to update branch", // "repo.pulls.update_not_allowed" (ErrNoPermissionToMerge's arm)
+  no_merge_access: "You are not authorized to merge this pull request.", // "repo.pulls.no_merge_access" (ErrNoPermissionToMerge's arm — b1c5fedd17 moved the merge flash here from update_not_allowed)
+  update_not_allowed: "You are not allowed to update branch", // "repo.pulls.update_not_allowed" (the update-branch arm's CheckUserAllowedToUpdate flash, pull.go:961)
   invalid_merge_option: "You cannot use this merge option for this pull request.", // "repo.pulls.invalid_merge_option"
   wrong_commit_id: "commit ID must be a commit ID on the target branch", // "repo.pulls.wrong_commit_id"
   merge_conflict: "Merge Failed: There was a conflict while merging. Hint: Try a different strategy.", // "repo.pulls.merge_conflict"
@@ -395,7 +396,13 @@ export const pullMergeWriteLocale = {
   // renders between the fragments (the TimeSince seam).
   auto_merge_has_pending_schedule_prefix: "scheduled this pull request to auto merge when all checks succeed",
   auto_merge_has_pending_schedule_suffix: ".",
-  cancel_permission_denied: "user has no permission to cancel the scheduled auto merge", // pull.go:1278's HTTPError text
+  cancel_permission_denied: "user has no permission to cancel the scheduled auto merge", // CancelScheduledAutoMerge's PermissionDenied text (services/automerge/automerge.go:105)
+  // b1c5fedd17 rework: the web schedule arm no longer resets a standing row —
+  // re-scheduling answers the already-enabled flash (pull.go:1101-1103), and
+  // the cancel arm's not-scheduled miss is the JSONError text (pull.go:1214-
+  // 1215 over services/automerge/automerge.go:87's ErrAutoMergeNotScheduled).
+  auto_merge_already_enabled: "Auto-merge is already enabled for this pull request.", // "repo.pulls.auto_merge_already_enabled"
+  auto_merge_not_scheduled: "Auto-merge is not enabled for this pull request.", // "repo.pulls.auto_merge_not_scheduled"
 } as const;
 
 /** The conflicted-files list cap (pull_merge_box.go:112-115): > 10 keeps 10
@@ -1080,7 +1087,7 @@ export function gitSigString(user: { displayName: string | null; username: strin
   return `${sig.name} <${sig.email}>`;
 }
 
-/** `pr.GetApprovers` (models/issues/pull.go:351-384) — the "Reviewed-by: "
+/** `pr.GetApprovers` (models/issues/pull.go:363-396) — the "Reviewed-by: "
  *  lines for the PR's official approvers: FindLatestReviews' rows (official-
  *  only APPROVE reviews, the DefaultMergeMessageOfficialApproversOnly
  *  default; NOT dismissed-filtered — toCond touches dismissed only when
@@ -1088,8 +1095,9 @@ export function gitSigString(user: { displayName: string | null; username: strin
  *  max(id) … GroupBy reviewer_id)`) read in Asc("created_unix"), Asc("id")
  *  order (:147-150), so each reviewer's position is their LATEST review's
  *  timestamp (first-review order drifts once re-reviews shuffle). The
- *  `reviewersWritten > maxReviewers` PRE-write break kept bug-for-bug
- *  (10 writes 11 upstream).
+ *  `reviewersWritten >= maxReviewers` PRE-write break writes exactly
+ *  maxApprovers approvers (upstream 8465bed994 fixed the old `>` off-by-one
+ *  that wrote 11 under a cap of 10 — the pin carries the fix).
  *
  *  Shared seam: exported for the API merge's compose arm
  *  (api/services/pull-engine.ts — upstream's GetDefaultMergeMessage body
@@ -1121,7 +1129,9 @@ export async function reviewedByLines(d1: D1Database, issueId: number): Promise<
   let out = "";
   let reviewersWritten = 0;
   for (const review of ordered) {
-    if (reviewersWritten > MERGE_MESSAGE_MAX_APPROVERS) break; // the pre-write cap quirk
+    // The PRE-write `>=` break (models/issues/pull.go:390-392): exactly
+    // maxApprovers reviewers (8465bed994 fixed the old `>` off-by-one).
+    if (reviewersWritten >= MERGE_MESSAGE_MAX_APPROVERS) break;
     const reviewer = byId.get(review.reviewerId);
     if (reviewer === undefined) continue; // LoadReviewer's vanished-row arm
     out += `Reviewed-by: ${gitSigString(reviewer)}\n`;
@@ -2434,6 +2444,10 @@ function mergeEngineErrorMessage(message: string): string {
     return pullMergeWriteLocale.merge_out_of_date;
   }
   if (message.startsWith("The merge commit")) return pullMergeWriteLocale.wrong_commit_id;
+  // The engine's deps gate (check.go:214-216's ErrDependenciesLeft — 422
+  // "is blocked by an open dependency" since b1c5fedd17) maps back to the
+  // web handler's pr_close_blocked flash (pull.go:1050-1051).
+  if (message === "is blocked by an open dependency") return pullMergeWriteLocale.dependencies_left;
   return message;
 }
 
@@ -2504,8 +2518,9 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
   const rule = await findRule(db, ctx.repo.id, ctx.pr.baseBranch);
   const access = await principalAccessOf(db, pair.repo, doer);
   if (!(access.write && (rule === null || (await isUserMergeWhitelisted(db, parseRuleConfig(rule.rules), access))))) {
-    // ErrNoPermissionToMerge's flash (pull.go:1077).
-    return { outcome: "error", message: pullMergeWriteLocale.update_not_allowed };
+    // ErrNoPermissionToMerge's flash — b1c5fedd17 moved it from
+    // update_not_allowed to no_merge_access (pull.go:1036-1037).
+    return { outcome: "error", message: pullMergeWriteLocale.no_merge_access };
   }
   // The manual short-circuit (check.go:162-165): manually-merged skips the
   // WIP / mergeable-state / protection checks entirely (the MWCS branch never
@@ -2521,31 +2536,43 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
     if (checked.hasMerged) {
       return { outcome: "error", message: pullMergeWriteLocale.has_merged };
     }
-    // Ancestor is NOT IsStatusMergeable (models/issues/pull.go:446-448) —
-    // CheckPullMergeable answers it ErrNotMergeableState, whose flash is the
-    // not-ready text (pull.go:1082-1088), NOT ErrHasMerged's has_merged.
+    // Ancestor is NOT IsStatusMergeable (models/issues/pull.go:456-459 —
+    // the Mergeable||Empty pair; Unrelated is excluded from Mergeable(ctx),
+    // :767-775) — CheckPullMergeable answers it ErrNotMergeableState, whose
+    // flash is the not-ready text (pull.go:1048-1049), NOT ErrHasMerged's
+    // has_merged.
     if (checked.status === PRStatus.Ancestor) {
       return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
     }
-    // THE SCHEDULE ARM (pull.go:1135-1149): merge_when_checks_succeed
-    // schedules instead of merging — the Auto check type's one relaxation is
-    // the branch-protection failure (check.go:184-186), so only the arms
-    // above (merged/closed/permission/WIP) plus the mergeable state gate it;
-    // an Empty PR schedules too (check.go:172's `&& !pr.IsEmpty()`). The
-    // upstream handler deletes any existing schedule first (the re-schedule
-    // reset), inserts the row + the type-34 comment (ScheduleAutoMerge's
-    // transaction, services/automerge/automerge.go:84-99), flashes the
-    // newly-scheduled text and redirects — the flash rides our bare 303 (the
-    // reloaded box renders the pending message + the cancel button).
+    // THE SCHEDULE ARM (pull.go:1099-1112): merge_when_checks_succeed
+    // schedules instead of merging — the Auto check type relaxes the
+    // mergeable-state gate (b1c5fedd17, check.go:170-172: `!IsStatusMergeable()
+    // && (type != Auto || !IsFilesConflicted() && !IsChecking())` — Auto WAITS
+    // OUT conflicts and checking; IsStatusMergeable itself is now
+    // Mergeable||Empty, models/issues/pull.go:456-459) and skips the
+    // branch-protection failure (check.go:184-186), so the arms above
+    // (merged/closed/permission/WIP) plus the state gate below admit
+    // Mergeable/Empty/Conflict/Checking rows. The upstream handler no longer
+    // deletes a standing schedule first (the re-schedule reset is gone): a
+    // standing row answers the auto_merge_already_enabled JSONError
+    // (pull.go:1101-1103) — our insert answers null → the same error outcome.
+    // The insert + the type-34 comment (ScheduleAutoMerge's transaction,
+    // services/automerge/automerge.go:66-84) and the enabled flash riding the
+    // redirect (the reloaded box renders the pending message + the cancel
+    // button) complete the arm.
     // The Auto CheckPullMergeable call at pull.go:1056 runs the FULL ladder
-    // before this branch — its FINAL deps arm (check.go:219-223) included —
+    // before this branch — its FINAL deps arm (check.go:214-216) included —
     // so a deps-blocked PR refuses to schedule with the pr_close_blocked
-    // flash (pull.go:1088-1090):
+    // flash (pull.go:1050-1051):
     if (!(await issueNoDependenciesLeft(db, ctx.issue.id))) {
       return { outcome: "error", message: pullMergeWriteLocale.dependencies_left };
     }
     if (form.mergeWhenChecksSucceed) {
-      if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
+      // The Auto-type state gate (check.go:170-172): conflicted and
+      // checking rows schedule too — auto merge waits them out; Error /
+      // Ancestor / Unrelated / ManuallyMerged stay refused with the
+      // not-ready flash.
+      if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty && checked.status !== PRStatus.Conflict && checked.status !== PRStatus.Checking) {
         return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
       }
       const message = await composeMergeMessage(api, pair, ctx.issue, checked, {
@@ -2554,7 +2581,7 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
         mergeMessageField: form.mergeMessageField,
       });
       const now = new Date();
-      await scheduleAutoMergeRow(db, {
+      const scheduledRow = await insertScheduledAutoMergeRow(db, {
         issueId: ctx.issue.id,
         doerId: ctx.viewer.id,
         sha: checked.headSha ?? "",
@@ -2562,7 +2589,14 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
         message,
         deleteBranchAfterMerge: form.deleteBranchAfterMerge,
       }, now);
-      await createScheduledAutoMergeComment(db, ctx.issue.id, ctx.viewer.id, now);
+      if (scheduledRow === null) {
+        // The standing-row miss — upstream's IsErrAlreadyScheduledToAutoMerge
+        // arm answers the already-enabled flash (pull.go:1101-1103).
+        return { outcome: "error", message: pullMergeWriteLocale.auto_merge_already_enabled };
+      }
+      // The type-34 comment's content is the STYLE string (b1c5fedd17 —
+      // automerge.go:76 passes string(style) into CreateAutoMergeComment).
+      await createScheduledAutoMergeComment(db, ctx.issue.id, ctx.viewer.id, now, form.do);
       // The FIRST check (StartAutoMergeCheckByPullHead, automerge.go:100-103)
       // — best-effort on the standing queue; the cron producer re-probes
       // every tick regardless, so an unbound queue only delays a green merge.
@@ -2713,16 +2747,18 @@ async function runMergeLanding(
   return { outcome: "redirect", location: input.issueLink };
 }
 
-// --- POST /pulls/{index}/cancel_auto_merge (web.go:1666 → pull.go:1251-1290) --
+// --- POST /pulls/{index}/cancel_auto_merge (web.go:1666 → pull.go:1195-1225) --
 
 /**
- * The cancel arm, real since migration 0059's `pull_auto_merges` landed:
- * GetScheduledMergeByPullID's `!exist` → NotFound; the scheduler-canceler
- * mismatch runs IsUserAllowedToMerge (the doer may cancel their own
- * schedule; a non-scheduler needs the merge right — pull.go:1270-1281, the
- * 403 mapped to the error outcome with the handler's own text); then
- * RemoveScheduledAutoMerge — the row delete + the type-35 comment — and the
- * redirect (the canceled_schedule flash rides it).
+ * The cancel arm, real since migration 0059's `pull_auto_merges` landed.
+ * b1c5fedd17 moved the gate into the service (CancelScheduledAutoMerge,
+ * services/automerge/automerge.go:89-108): the not-scheduled miss is the
+ * ErrAutoMergeNotScheduled JSONError text (pull.go:1213-1215); the
+ * scheduler-canceler mismatch runs IsUserAllowedToMerge — the doer may
+ * cancel their own schedule, the issue POSTER may cancel any schedule (the
+ * new IsPoster carve-out, automerge.go:99), others need the merge right;
+ * then RemoveScheduledAutoMerge — the row delete + the type-35 comment —
+ * and the redirect (the canceled_schedule flash rides it).
  */
 export async function cancelAutoMergeFromWeb(ctx: PullMergeBoxWriteContext): Promise<PullMergeBoxWriteOutcome> {
   const prologue = await writePrologue(ctx);
@@ -2730,13 +2766,21 @@ export async function cancelAutoMergeFromWeb(ctx: PullMergeBoxWriteContext): Pro
   const { pair, issueLink } = prologue;
   const db = ctx.c.env.DB;
   const scheduled = await getScheduledAutoMerge(db, ctx.issue.id);
-  if (scheduled === null) return { outcome: "not-found" }; // pull.go:1263-1265
-  if (ctx.viewer.id !== scheduled.doerId) {
+  // b1c5fedd17: the not-scheduled miss is no longer the bare 404 — the web
+  // arm answers ErrAutoMergeNotScheduled with the auto_merge_not_scheduled
+  // JSONError (pull.go:1213-1215 over services/automerge/automerge.go:87).
+  if (scheduled === null) return { outcome: "error", message: pullMergeWriteLocale.auto_merge_not_scheduled };
+  // The cancel right: the SCHEDULER, the issue POSTER, or merge permission —
+  // upstream's `doer.ID != autoMerge.DoerID && !pull.Issue.IsPoster(doer.ID)`
+  // gate (services/automerge/automerge.go:99; the poster carve-out is new in
+  // b1c5fedd17). Non-entitled answers keep the service's PermissionDenied
+  // text through JSONErrorAuto (pull.go:1216-1218).
+  if (ctx.viewer.id !== scheduled.doerId && ctx.issue.posterId !== ctx.viewer.id) {
     const access = await principalAccessOf(db, pair.repo, await doerProjection(ctx));
     const rule = await findRule(db, ctx.repo.id, ctx.pr.baseBranch);
     const allowed = access.write && (rule === null || (await isUserMergeWhitelisted(db, parseRuleConfig(rule.rules), access)));
     if (!allowed) {
-      return { outcome: "error", message: pullMergeWriteLocale.cancel_permission_denied }; // pull.go:1278's HTTPError text
+      return { outcome: "error", message: pullMergeWriteLocale.cancel_permission_denied };
     }
   }
   await removeScheduledAutoMerge(db, ctx.issue, ctx.viewer.id, new Date());

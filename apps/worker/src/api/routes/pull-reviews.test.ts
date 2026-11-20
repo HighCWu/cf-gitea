@@ -27,7 +27,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { comments, emailOutbox, issues, pullReviews, repositories, teamMembers, teams, webhookDeliveries, webhooks } from "../../db/schema";
+import { comments, emailOutbox, issues, pullReviews, repositories, teamMembers, teams, userBlocking, webhookDeliveries, webhooks } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "../services/engine";
@@ -361,6 +361,123 @@ describe("POST /repos/{owner}/{repo}/pulls/{index}/reviews (repoCreatePullReview
     const res = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "hi" }) }));
     expect(res.status).toBe(200);
     expect((await jsonBody(res)).commit_id).toBe(tip);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The review window gates (fc49..099ab): the create-comment validation
+// (884884308d), the locked-PR refusal (5ee660e437), the blocked-reviewer
+// gate (8d14c9af20's checkReviewerNotBlocked), and the patch2diff
+// first-hunk rewrite (ce7364e215).
+// ---------------------------------------------------------------------------
+
+describe("the review window gates (884884308d / 5ee660e437 / 8d14c9af20 / ce7364e215)", () => {
+  async function block(blockerId: number, blockeeId: number): Promise<void> {
+    await db().insert(userBlocking).values({ blockerId, blockeeId, createdAt: new Date(0) });
+  }
+
+  it("422s a review comment without a path or a positive line BEFORE any read lands (884884308d, pull_review.go:494-500)", async () => {
+    const run = router();
+    const repoId = await seedRepo();
+    const pr = await seedPull(repoId);
+    const noPath = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, {
+      method: "POST",
+      body: JSON.stringify({ event: "COMMENT", body: "note", comments: [{ path: "", body: "hmm", new_position: 3 }] }),
+    }));
+    expect(noPath.status).toBe(422);
+    expect((await jsonBody(noPath)).message).toBe("review comments require a path and a positive new_position or old_position");
+    const noLine = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, {
+      method: "POST",
+      body: JSON.stringify({ event: "COMMENT", body: "note", comments: [{ path: "src/a.go", body: "hmm" }] }),
+    }));
+    expect(noLine.status).toBe(422);
+    expect((await jsonBody(noLine)).message).toBe("review comments require a path and a positive new_position or old_position");
+    // The refusal precedes every write — no review rows, no code comments.
+    expect(await reviewRows(pr.issueId)).toHaveLength(0);
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+  });
+
+  it("403s review content on a LOCKED PR for a doer without the write right; the site admin passes (5ee660e437, isIssueLockedForDoer)", async () => {
+    const run = router();
+    const repoId = await seedRepo();
+    const pr = await seedPull(repoId);
+    await db().update(issues).set({ isLocked: true }).where(eq(issues.id, pr.issueId));
+    const locked = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "locked out" }) }));
+    expect(locked.status).toBe(403);
+    expect((await jsonBody(locked)).message).toBe("cannot comment on a locked issue");
+    expect(await reviewRows(pr.issueId)).toHaveLength(0);
+    const keeper = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(ADMIN_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "keeper" }) }));
+    expect(keeper.status).toBe(200);
+  });
+
+  it("403s a reviewer blocked by the POSTER on create AND submit; the site-admin reviewer never blocks (8d14c9af20, checkReviewerNotBlocked)", async () => {
+    const run = router();
+    const repoId = await seedRepo();
+    const pr = await seedPull(repoId);
+    // The pending review exists from BEFORE the block; the submit still refuses.
+    const pending = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "PENDING", body: "wip" }) }));
+    expect(pending.status).toBe(200);
+    const pendingId = (await jsonBody(pending)).id as number;
+    await block(2, 1); // bob (the issue poster) blocks the doer
+    const created = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "blocked" }) }));
+    expect(created.status).toBe(403);
+    expect((await jsonBody(created)).message).toBe("Cannot create or edit comment because you are blocked by the poster or repository owner.");
+    const submitted = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews/${String(pendingId)}`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "still blocked" }) }));
+    expect(submitted.status).toBe(403);
+    expect((await jsonBody(submitted)).message).toBe("Cannot create or edit comment because you are blocked by the poster or repository owner.");
+    // The block does not touch the site admin (IsUserBlockedBy's blockee.
+    // IsAdmin short-circuit) — chief reviews normally.
+    await block(2, 3);
+    const chief = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(ADMIN_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "admin unblocked" }) }));
+    expect(chief.status).toBe(200);
+  });
+
+  it("403s a reviewer blocked by the repo OWNER — the owner block has no official-reviewer bypass (8d14c9af20's owner arm)", async () => {
+    const run = router();
+    const repoId = await seedRepo();
+    await db().update(repositories).set({ ownerId: 4 }).where(eq(repositories.id, repoId)); // alice owns the repo
+    const pr = await seedPull(repoId);
+    await block(4, 1); // alice (the repo owner) blocks the doer
+    const res = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "owner-blocked" }) }));
+    expect(res.status).toBe(403);
+    expect((await jsonBody(res)).message).toBe("Cannot create or edit comment because you are blocked by the poster or repository owner.");
+  });
+
+  it("renders diff_hunk from the FIRST \\n@@ through the end (ce7364e215's patch2diff — the old split/len==2 shape answered \"\" on multi-hunk patches)", async () => {
+    const run = router();
+    const repoId = await seedRepo();
+    const pr = await seedPull(repoId);
+    const created = (await jsonBody(
+      await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`, authed(DOER_TOKEN, { method: "POST", body: JSON.stringify({ event: "COMMENT", body: "carrier" }) })),
+    )) as { id: number };
+    // The real fix shape: a HEADERED multi-hunk patch (git's full diff
+    // format) — the old code split into 3+ pieces and answered ""; the new
+    // first-index slice renders BOTH hunks.
+    const headered = "diff --git a/f b/f\nindex 0001..0002 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,4 @@\n ctx\n+new\n ctx2\n@@ -9,3 +10,4 @@\n later\n+added\n ctx3\n";
+    // An @@-starting patch has its first "\n@@" at the SECOND hunk boundary
+    // — the slice renders hunk 2 onward (upstream's exact Index semantics).
+    const bare = "@@ -1,3 +1,4 @@\n ctx\n+new\n ctx2\n@@ -9,3 +10,4 @@\n later\n+added\n ctx3\n";
+    const insert = (patchText: string, reviewId: number): Promise<unknown> =>
+      db().insert(comments).values({
+        type: CommentType.Code,
+        posterId: 1,
+        issueId: pr.issueId,
+        line: 1,
+        treePath: "src/a.go",
+        content: "multi-hunk",
+        commitSha: "abc123",
+        oldRef: "abc123",
+        patch: patchText,
+        reviewId,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      });
+    await insert(headered, created.id);
+    await insert(bare, created.id);
+    const list = await jsonArray(await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews/${String(created.id)}/comments`));
+    expect(list).toHaveLength(2);
+    expect(list[0]!.diff_hunk).toBe("@@ -1,3 +1,4 @@\n ctx\n+new\n ctx2\n@@ -9,3 +10,4 @@\n later\n+added\n ctx3\n");
+    expect(list[1]!.diff_hunk).toBe("@@ -9,3 +10,4 @@\n later\n+added\n ctx3\n");
   });
 });
 

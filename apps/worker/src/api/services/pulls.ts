@@ -45,7 +45,7 @@ import {
  * through the git repo and computes mergeability asynchronously
  * (services/convert/pull.go:151–273):
  *   - `mergeable` renders from the row's status through `pr.Mergeable(ctx)`
- *     semantics (models/issues/pull.go:751-756): checking/conflict/error →
+ *     semantics (models/issues/pull.go:767-775): checking/conflict/error →
  *     false, WIP-title → false, everything else (mergeable/ancestor/empty)
  *     → true — the field is a non-nullable bool at this pin (structs/pull.go:65;
  *     swagger :33120-33124), never null,
@@ -56,7 +56,7 @@ import {
  *   - `additions`/`deletions`/`changed_files` render from
  *     `extras.diffStats` (the single-render routes resolve the
  *     GetDiffShortStat port — services/pull-engine.ts
- *     pullRequestDiffShortStat over convert/pull.go:245-254: the index GET,
+ *     pullRequestDiffShortStat over convert/pull.go:260-269: the index GET,
  *     the create 201 + its opened payload, the edit 201 + its payload
  *     renders + the assign/merge/label payloads, the by-basehead GET — every
  *     toAPIPullRequest conversion, single AND payload, fills it upstream);
@@ -508,7 +508,7 @@ async function headBranchInfo(
  * (pullRequestDiffShortStat — the `additions`/`deletions`/`changed_files`
  * trio of structs/pull.go:51-55, omitempty pointers upstream renders on
  * every single AND payload conversion, never on a list —
- * convert/pull.go:230-254, :488-492).
+ * convert/pull.go:245-269, :488-492).
  * List rendering keeps the "" base default and no diffStats to stay D1-only.
  *
  * `preloaded` (optional) is the list route's page-scoped
@@ -576,7 +576,7 @@ export async function toApiPullRequest(
     user: apiIssue.user,
     title: issue.title,
     body: issue.content ?? "",
-    // The GetDiffShortStat trio (convert/pull.go:245-254): rendered only when
+    // The GetDiffShortStat trio (convert/pull.go:260-269): rendered only when
     // the caller resolved a stat — the omit arm mirrors upstream's error log
     // (nil fields, structs/pull.go:51-55 omitempty) and the list guard keeps
     // lists clean (:488-492 panics if a list carries them).
@@ -604,7 +604,7 @@ export async function toApiPullRequest(
     diff_url: `${htmlUrl}.diff`,
     patch_url: `${htmlUrl}.patch`,
     // Mergeability render — upstream's pr.Mergeable(ctx) (models/issues/
-    // pull.go:751-756; the field is a non-nullable bool, structs/pull.go:65):
+    // pull.go:767-775; the field is a non-nullable bool, structs/pull.go:65):
     // checking/conflict/error → false, WIP-title → false, everything else
     // (mergeable/ancestor/empty, merged rows carrying their last status) →
     // true. The single route resolves the row lazily
@@ -829,7 +829,7 @@ export type CodeOwnerReviewRequest = { kind: "user"; user: UserRow } | { kind: "
  * B-53 landed pieces. The ladder:
  *
  *  1. WIP skip (:258–260 — IsWorkInProgress is the title-prefix probe,
- *     models/issues/pull.go:751-756).
+ *     models/issues/pull.go:767-775).
  *  2. `getCodeOwnerRules` (:37–84): a FORK base repo has no rules BEFORE any
  *     read (:46–48); the base-branch tip read (:50–52) and the CODEOWNERS
  *     discovery (:82–85) run on the caller's engine reads. Unlike the merge

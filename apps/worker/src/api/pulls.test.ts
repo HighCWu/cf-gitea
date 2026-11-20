@@ -6,7 +6,7 @@
  * indexes interleave with issue indexes), the ToPullRequest field fidelity
  * (url/html_url on the /pulls/ path, head.ref = refs/pull/N/head, mergeable
  * FALSE on a checking row per the pin's non-nullable bool
- * (models/issues/pull.go:751-756), the merged trio only when merged, WIP
+ * (models/issues/pull.go:767-775), the merged trio only when merged, WIP
  * draft),
  * the upstream list quirks (absent/garbage state lists BOTH states; sort
  * falls back silently), POST's head==base 422 and duplicate-target 409
@@ -59,6 +59,7 @@ beforeEach(async () => {
     "labels",
     "repo_counters",
     "repo_settings",
+    "repo_collaborators",
     "repositories",
     "users",
   ]) {
@@ -118,7 +119,11 @@ async function seedUser(username: string): Promise<{ id: number; usernameLower: 
   return { id: user.id, usernameLower: user.usernameLower };
 }
 
-async function seedRepo(ownerNamespace: string, slug: string, options: { archived?: boolean } = {}): Promise<string> {
+async function seedRepo(
+  ownerNamespace: string,
+  slug: string,
+  options: { archived?: boolean; stubWrite?: boolean } = {},
+): Promise<string> {
   const id = String(repoSeq++);
   await db().insert(repositories).values({
     id,
@@ -132,6 +137,14 @@ async function seedRepo(ownerNamespace: string, slug: string, options: { archive
     createdAt: new Date("2026-02-03T04:05:06Z"),
   });
   await service().ensureRepoCounters(id);
+  // The 640cd615c4 creation gate (services/pull/pull.go:81-90) refuses a
+  // same-repo PR create from a doer without base-pulls-unit write — the
+  // suite's route-created PRs ride the stub as a WRITE COLLABORATOR (the
+  // routes/pulls.test.ts precedent) unless a test pins the non-writer
+  // posture itself (stubWrite: false).
+  if (options.stubWrite !== false) {
+    await env.DB.prepare("INSERT INTO repo_collaborators (repo_id, user_id, mode, created_at, updated_at) VALUES (?, 1, 'write', 0, 0)").bind(id).run();
+  }
   return id;
 }
 
@@ -360,7 +373,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
     // The converter fills the diff-stat trio on the create 201 like every
-    // single render (pull.go:558 → convert/pull.go:230-254) — the equal-tips
+    // single render (pull.go:558 → convert/pull.go:245-269) — the equal-tips
     // create's range is empty, so the trio renders ZEROS (0/0/0), not an
     // omit: merge-base(tip, tip) resolves (merge/graph.ts:115), the empty
     // diff is not truncated. Only review_comments stays unset (no producer).
@@ -381,8 +394,12 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
       merged_at: null,
       merge_commit_sha: null,
       merged_by: null,
-      mergeable: false, // a checking row renders FALSE — pr.Mergeable(ctx), models/issues/pull.go:751-756 (non-nullable bool, structs/pull.go:65)
-      merge_base: "",
+      mergeable: false, // a checking row renders FALSE — pr.Mergeable(ctx), models/issues/pull.go:767-775 (non-nullable bool, structs/pull.go:65)
+      // Since 2a5c34c379 the create resolves and STORES the merge base for
+      // same-repo heads too (upstream's CreatePullRequest always carried
+      // pr.MergeBase from parseCompareInfo) — feature branches off the root,
+      // so the merge base IS the seeded main tip.
+      merge_base: featureTip,
       allow_maintainer_edit: true,
       labels: [],
       requested_reviewers: [],
@@ -750,13 +767,18 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     expect(await notAssignable.json()).toEqual({ message: "User Recluse cannot be assigned to this issue", url: ERROR_URL });
     await db().update(repositories).set({ visibility: "public" }).where(eq(repositories.id, repoId));
 
-    // The blocked-assignee half of NewPullRequest's arm (pull.go:64-65): the
-    // poster blocked by a REQUESTED assignee answers 403 pre-write.
+    // The blocked-assignee half of NewPullRequest's arm (pull.go:69-71): the
+    // poster blocked by a REQUESTED assignee answers 403 pre-write — the
+    // 640cd615c4 translatable wrap's assignee text (the split from the shared
+    // "user is blocked" body).
     const blocker = await seedUser("Blocker");
     await db().insert(userBlocking).values({ blockerId: blocker.id, blockeeId: 1, note: "", createdAt: new Date() });
     const blocked = await createPull("/repos/cf-gitea-stub/people-b/pulls", { title: "x", head: "f4", base: "main", assignees: ["Blocker"] });
     expect(blocked.status).toBe(403);
-    expect(await blocked.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await blocked.json()).toEqual({
+      message: "Cannot create an issue or pull request because you are blocked by an assignee.",
+      url: ERROR_URL,
+    });
 
     // No arm above wrote a row.
     const rows = await prRowByRepo(repoId);
@@ -991,7 +1013,7 @@ describe("POST create — the auto codeowner review-request arm (PullRequestCode
     expect(payloads[1]?.action).toBe("opened");
   });
 
-  it("fails the create on the unrelated-histories pair when rules exist (git.MergeBase's NotExist error, merge.go:27-29 — the create answers 500, the committed-prefix wart keeps the row, no requests land)", async () => {
+  it("422s the create on the unrelated-histories pair when rules exist (2a5c34c379: a null merge base answers 'Invalid PullRequest: base and head have no common history' BEFORE any row — the old MergeBase-500 wart is gone, pull.go:417-420)", async () => {
     await seedUser("Alice");
     const repoId = await seedRepo("alice", "co-auto-d");
     const tip = await seedEngineBranches("alice", "co-auto-d", ["feature"]);
@@ -1013,12 +1035,16 @@ describe("POST create — the auto codeowner review-request arm (PullRequestCode
     expect(land.tag).toBe("committed");
 
     const res = await createPull("/repos/alice/co-auto-d/pulls", { title: "unrelated", head: "orphan", base: "main" });
-    expect(res.status).toBe(500);
-    // The committed-prefix wart (the explicit reviewer arms' documented
-    // posture — upstream's tx rolls the PR back, ours keeps the row).
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      message: "Invalid PullRequest: base and head have no common history",
+      url: ERROR_URL,
+    });
+    // The 422 fires in the compare step, BEFORE the create transaction —
+    // the committed-prefix wart (the row surviving a refused create) is gone.
     const rows = await prRowByRepo(repoId);
-    expect(rows).toHaveLength(1);
-    const requests = await db().select().from(pullReviews).where(eq(pullReviews.issueId, rows[0]!.issueId)).all();
+    expect(rows).toHaveLength(0);
+    const requests = await db().select().from(pullReviews).all();
     expect(requests).toHaveLength(0);
   });
 
@@ -1095,7 +1121,7 @@ describe("POST create — the auto codeowner review-request arm (PullRequestCode
 describe("POST /repos/{owner}/{repo}/merge-upstream (repoMergeUpstream)", () => {
   it("403s a non-writer with reqRepoWriter's text, 423s an archived repo before the gate (api.go:1314's middleware order)", async () => {
     await seedUser("Alice");
-    await seedRepo("alice", "mu-gates");
+    await seedRepo("alice", "mu-gates", { stubWrite: false }); // pins the NON-writer posture
     // The stub doer (id 1) holds no grant on Alice's public repo — the write
     // gate answers upstream's reqRepoWriter 403 (api.go:392-400).
     const writeGate = await router()("/repos/alice/mu-gates/merge-upstream", {
@@ -1283,7 +1309,7 @@ describe("GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest)", () => {
     expect(garbage.status).toBe(404);
   });
 
-  it("renders the GetDiffShortStat trio (convert/pull.go:245-254) summed over the real range diff", async () => {
+  it("renders the GetDiffShortStat trio (convert/pull.go:260-269) summed over the real range diff", async () => {
     const owner = await seedUser("Alice");
     await seedRepo(owner.usernameLower, "diffstat-a");
     const tip = await seedEngineBranches(owner.usernameLower, "diffstat-a", ["feature"]);
@@ -1322,7 +1348,7 @@ describe("GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest)", () => {
   });
 
 
-  it("omits the trio for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:247-250)", async () => {
+  it("omits the trio for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:262-265)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "diffstat-c");
     await seedPull(repoId, "no refs yet");
@@ -1386,7 +1412,7 @@ describe("PATCH /repos/{owner}/{repo}/pulls/{index} (repoEditPullRequest)", () =
     expect(payloads[0]?.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
   });
 
-  it("omits the trio on the edit arms for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:247-250)", async () => {
+  it("omits the trio on the edit arms for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:262-265)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "diffstat-g");
     await seedPull(repoId, "no refs yet", { posterId: 1 });
@@ -1479,7 +1505,7 @@ describe("PATCH /repos/{owner}/{repo}/pulls/{index} (repoEditPullRequest)", () =
   it("403s non-poster non-owner editors and 404s missing PRs; 422s bind failures", async () => {
     const alice = await seedUser("Alice");
     const bob = await seedUser("Bob");
-    const repoId = await seedRepo(alice.usernameLower, "visible");
+    const repoId = await seedRepo(alice.usernameLower, "visible", { stubWrite: false }); // the editor must stay a non-writer
     await seedPull(repoId, "bobs pr", { posterId: bob.id });
 
     const forbidden = await patchPull("/repos/alice/visible/pulls/1", { title: "hijack" });
@@ -1538,7 +1564,7 @@ describe("PATCH /repos/{owner}/{repo}/pulls/{index} (repoEditPullRequest)", () =
     await seedEngineBranches(owner.usernameLower, "retarget-b", ["feature", "release", "f2", "f3"]);
     await createPull("/repos/Alice/retarget-b/pulls", { title: "pr one", head: "feature", base: "main" });
 
-    // Branch probe FIRST (pull.go:751-756): 404 with the exact render.
+    // Branch probe FIRST (routers/api/v1/repo/pull.go:726-730): 404 with the exact render.
     const unknown = await patchPull("/repos/alice/retarget-b/pulls/1", { base: "ghost" });
     expect(unknown.status).toBe(404);
     expect(await unknown.json()).toEqual({ message: "new base 'ghost' not exist", url: ERROR_URL });
@@ -1650,7 +1676,7 @@ describe("GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBas
 // payload-side trio mounts (the merge notifier's ToPayloadPullRequest,
 // webhook/notifier.go:715; IssueChangeAssignee's, :182 — the single
 // converter's GetDiffShortStat block is not gated on isPayload,
-// convert/pull.go:230-254).
+// convert/pull.go:245-269).
 // ---------------------------------------------------------------------------
 
 describe("the pull webhook payloads' diff-stat trio (merge + assign)", () => {
@@ -1843,10 +1869,10 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     // Six distinct head ids on one page, one per grant arm:
     //  H1 Carol's PUBLIC fork — plain grant miss (verdict null), renders
     //     pull-only;
-    const pubForkId = await seedRepo(carol.usernameLower, "pubfork");
+    const pubForkId = await seedRepo(carol.usernameLower, "pubfork", { stubWrite: false }); // the STRANGER fork stays stub-unwritable (H1 pins pull-only)
     await db().update(repositories).set({ ownerId: carol.id }).where(eq(repositories.id, pubForkId));
     //  H2 Carol's PRIVATE fork, no grant — the no-access arm (hidden);
-    const hiddenForkId = await seedRepo(carol.usernameLower, "hiddenfork");
+    const hiddenForkId = await seedRepo(carol.usernameLower, "hiddenfork", { stubWrite: false }); // the NO-access private fork stays hidden (H2)
     await db().update(repositories).set({ ownerId: carol.id, visibility: "private" }).where(eq(repositories.id, hiddenForkId));
     //  H3 an org-owned private fork the stub reaches through a WRITE team
     //     row (the team + coverage arms) — renders push;

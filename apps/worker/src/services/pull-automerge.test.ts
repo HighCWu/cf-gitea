@@ -51,6 +51,7 @@ import {
   getScheduledAutoMerge,
   handleAutoMergeCheck,
   isPullCommitStatusPass,
+  removeScheduledAutoMerge,
   scheduleAutoMergeRow,
 } from "./pull-automerge";
 
@@ -290,6 +291,41 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     await d1().update(pullRequests).set({ status: PRStatus.Conflict }).where(eq(pullRequests.id, conflicted.pullRequest.id));
     expect(await handleAutoMergeCheck(env, conflicted.issue.id)).toBe("skipped-not-mergeable");
     expect(await getScheduledAutoMerge(env.DB, conflicted.issue.id)).not.toBeNull();
+  });
+
+  it("removeScheduledAutoMerge carries the auto-cancel reason into the type-35 comment (pull.go:386-396 — the notify-family disableIssueAutoMerge shape, notify.go:83-101)", async () => {
+    const index = await seedScheduledPr("reasonpr", "merge");
+    const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    const now = new Date((T0 + 130) * 1000);
+
+    // The reason-bearing cancel ("closed" — the IssueChangeStatus arm's
+    // reason; "work_in_progress" rides the same mechanic): the row goes and
+    // the type-35 comment's CONTENT is the reason (CreateAutoMergeComment).
+    expect(await removeScheduledAutoMerge(env.DB, found.issue, alice.id, now, "closed")).toBe(true);
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+    const unscheduled = await d1()
+      .select({ content: comments.content })
+      .from(comments)
+      .where(eq(comments.issueId, found.issue.id));
+    expect(unscheduled.filter((row) => row.content === "closed")).toHaveLength(1);
+
+    // The n == 0 arm (pull.go:390-392): no schedule left → silent no-op,
+    // no second comment.
+    expect(await removeScheduledAutoMerge(env.DB, found.issue, alice.id, now, "closed")).toBe(false);
+    expect((await d1().select({ content: comments.content }).from(comments).where(eq(comments.issueId, found.issue.id))).filter(
+      (row) => row.content === "closed",
+    )).toHaveLength(1);
+
+    // The explicit-cancel arm passes "" (automerge.go:106) — the bare shape
+    // the cancel route still calls.
+    const bareIndex = await seedScheduledPr("reasonbare", "merge");
+    const bare = (await findPullRequestByIndex(env.DB, repoId, bareIndex))!;
+    expect(await removeScheduledAutoMerge(env.DB, bare.issue, alice.id, now)).toBe(true);
+    const bareComments = await d1()
+      .select({ type: comments.type, content: comments.content })
+      .from(comments)
+      .where(eq(comments.issueId, bare.issue.id));
+    expect(bareComments.some((row) => row.type === CommentType.PRUnscheduledToAutoMerge && row.content === "")).toBe(true);
   });
 
   it("skips on a missing head branch without consuming the row", async () => {
