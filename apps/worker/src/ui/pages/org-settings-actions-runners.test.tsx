@@ -31,6 +31,7 @@ import {
   ACTION_STATUS_SUCCESS,
 } from "../../services/actions/model";
 import { actionRunnerTokens, actionRunners, actionTasks, orgMembers, users } from "../../db/schema";
+import { findAuditEvents } from "../../services/audit";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import { locale } from "../locale";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -693,6 +694,37 @@ describe("the mounted org runners routes (the census C7 org mount: the minted-se
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(RUNNERS_URL);
     expect(await drizzle(env.DB).select().from(actionRunners).where(eq(actionRunners.id, runner.id))).toHaveLength(0);
+  });
+
+  it("the three write POSTs land their org-slice audit rows (the ACTIONS2 wiring: action id + session actor + org scope, only after the write)", async () => {
+    // The emit sites in order — runners.go:278 (token), :356 (the disabled
+    // flip), :312 (the remove) — each riding after its successful write,
+    // before the redirect (the handler wiring of services/actions/
+    // audit-arms.ts; the helper-level row shapes live in audit-arms.test.ts).
+    await env.DB.prepare("DELETE FROM audit_event").run(); // isolate the emission window (earlier pins' rows persist — audit_event is not in the file-level wipe list)
+    const runner = await seedRunner({ name: "audited", ownerId: world.coalitionId });
+    await postRoute(`${RUNNERS_URL}/reset_registration_token`, 1, {});
+    await postRoute(`${RUNNERS_URL}/${runner.id}/update-runner`, 1, { disabled: "true" });
+    await postRoute(`${RUNNERS_URL}/${runner.id}/delete`, 1, {});
+    const rows = await findAuditEvents(drizzle(env.DB), { scopeType: "organization", scopeId: world.coalitionId, sort: "timestamp_asc" });
+    expect(rows.map((row) => [row.action, row.actorId, row.actorName])).toEqual([
+      ["organization:runner:token", 1, "alice"],
+      ["organization:runner:update", 1, "alice"],
+      ["organization:runner:remove", 1, "alice"],
+    ]);
+    expect(rows[0]!.scopeName).toBe("coalition");
+    expect(rows[0]!.metadata).toBeNull(); // the bare issuance row
+    expect(rows[1]!.message).toBe("Updated Actions runner audited of organization coalition.");
+    expect(rows[1]!.metadata).toBe('{"disabled":true,"runner":"audited"}'); // Go's sorted-key order, the disabled bool metadata-only
+    expect(rows[2]!.message).toBe("Removed Actions runner audited from organization coalition.");
+    // The no-write arms never emit: a rival org's URL 404s through the
+    // prologue, a foreign id 404s at the find, the missing-param 400 fires
+    // after the find — the table keeps exactly the three rows above.
+    await expectNotFoundShell(await postRoute("/org/rivals/settings/actions/runners/reset_registration_token", 1, {}));
+    await expectNotFoundShell(await postRoute(`${RUNNERS_URL}/999999/delete`, 1, {}));
+    const late = await seedRunner({ name: "late", ownerId: world.coalitionId });
+    expect((await postRoute(`${RUNNERS_URL}/${late.id}/update-runner`, 1, {})).status).toBe(400);
+    expect(await findAuditEvents(drizzle(env.DB), { scopeType: "organization", scopeId: world.coalitionId })).toHaveLength(3);
   });
 
   it("the edit GET renders the runner page through the mount", async () => {

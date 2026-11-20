@@ -718,7 +718,7 @@ import {
   renameProtectedRuleName,
   renameRefusedByProtection,
 } from "../services/branch-protection";
-import { actionRuns, renamedBranches, repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
+import { actionRuns, actionVariables, renamedBranches, repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
@@ -786,7 +786,17 @@ import {
   type RerunActionRunRequest,
 } from "./pages/repo-actions-view";
 import { approveRun } from "../services/actions/approve";
-import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../services/actions/audit-arms";
+import {
+  emitOrgRunnerRemoveAudit,
+  emitOrgRunnerTokenAudit,
+  emitOrgRunnerUpdateAudit,
+  emitOrgVariableAddAudit,
+  emitOrgVariableRemoveAudit,
+  emitOrgVariableUpdateAudit,
+  emitWorkflowDispatchAudit,
+  emitWorkflowToggleAudit,
+  type OrgActionsAuditArm,
+} from "../services/actions/audit-arms";
 import { toggleRepoActionsWorkflow } from "../services/actions/config";
 import { deleteRun } from "../services/actions/retention";
 import { switchSchedulesToDefaultBranch } from "../services/actions/schedule";
@@ -1068,6 +1078,7 @@ import {
 // module's org cond/find/writes over the M1a runner/token store).
 import {
   deleteOrgActionsRunner,
+  findOrgScopedRunner,
   loadOrgActionsRunnerEditPageData,
   loadOrgActionsRunnersPageData,
   parseOrgActionsRunnerDescriptionForm,
@@ -13625,16 +13636,56 @@ async function orgActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<R
   return respond(c.html(renderOrgActionsVariablesPage(ctx, data), 200));
 }
 
+/** The ORG-slice audit arms' shared carrier (the ACTIONS2 handoff — the 6
+ *  emit helpers of services/actions/audit-arms.ts over the org runner/
+ *  variable writes): the org-settings prologue's owner-viewer as the actor
+ *  snapshot and the route's org row as the scope, with the web arms' field
+ *  conventions (origin "ui", the connecting IP, the impersonator id behind
+ *  an impersonated session — migration 0058). Upstream emits at the shared
+ *  web handlers (runners.go:278/:312/:356) and the variables service
+ *  (variables.go:24/:38/:47) AFTER the successful write and BEFORE the
+ *  redirect/flash arms; the emits swallow internally — an audit row never
+ *  errorizes the write it describes. */
+function orgActionsAuditBase(c: Context<{ Bindings: Env }>, viewer: Extract<Viewer, { kind: "user" }>, org: OrgRecord): OrgActionsAuditArm {
+  return {
+    org: { id: org.id, username: org.username },
+    actor: { id: viewer.id, username: viewer.username },
+    origin: "ui",
+    ipAddress: c.req.header("cf-connecting-ip") ?? null,
+    impersonatorUserId: viewer.impersonatorUserId ?? null,
+  };
+}
+
+/** The id-scoped variable row lookup the audit-name snapshots share with the
+ *  write helpers' own resolve (findActionsVariable's org arm: id + owner pin
+ *  + the empty repoId). */
+async function findOrgActionsVariableRow(c: Context<{ Bindings: Env }>, org: OrgRecord, variableId: number) {
+  return (
+    await drizzle(c.env.DB)
+      .select()
+      .from(actionVariables)
+      .where(and(eq(actionVariables.id, variableId), eq(actionVariables.ownerId, org.id), eq(actionVariables.repoId, "")))
+      .limit(1)
+  )[0];
+}
+
 async function orgActionsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { ctx, org, respond } = resolved;
+  const { ctx, org, viewer, respond } = resolved;
   if (resolved.route.family !== "org-actions-variables-new") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
   const form = parseOrgActionsVariableForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await applyOrgActionsVariableCreate(c.env.DB, org.id, form);
   if (outcome.outcome === "saved") {
+    // CreateVariable's arm (variables.go:24): the STORED name — the service
+    // validated the raw form name and uppercases it (normalizedName).
+    await emitOrgVariableAddAudit(c.env.DB, {
+      ...orgActionsAuditBase(c, viewer, org),
+      variable: form.name.toUpperCase(),
+    });
     return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/variables` } }));
   }
   const data = await loadOrgActionsVariablesPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
@@ -13650,11 +13701,23 @@ async function orgActionsVariablesEdit(c: Context<{ Bindings: Env }>, variableId
   if (guard !== null) return guard;
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { ctx, org, respond } = resolved;
+  const { ctx, org, viewer, respond } = resolved;
   if (resolved.route.family !== "org-actions-variables-edit") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
   const form = parseOrgActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const existing = await findOrgActionsVariableRow(c, org, variableId); // the name snapshot (pre-rename)
   const outcome = await applyOrgActionsVariableUpdate(c.env.DB, org.id, variableId, form);
   if (outcome.outcome === "saved") {
+    // UpdateVariableNameData's arm (variables.go:38-42 — `if updated` is the
+    // id-keyed UPDATE's matched-row arm; our "saved" outcome is that gate):
+    // the FINAL stored name — an empty form name rides the zero-value
+    // fallback (keeps the stored name), else the UPPERCASE rename. On
+    // "saved" the pre-find row always exists (the helper re-resolves the
+    // same predicate and would answer "missing").
+    await emitOrgVariableUpdateAudit(c.env.DB, {
+      ...orgActionsAuditBase(c, viewer, org),
+      variable: form.name === "" ? (existing?.name ?? "") : form.name.toUpperCase(),
+    });
     return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/variables` } }));
   }
   if (outcome.outcome === "missing") {
@@ -13672,10 +13735,18 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
   if (guard !== null) return guard;
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { ctx, org, respond } = resolved;
+  const { ctx, org, viewer, respond } = resolved;
   if (resolved.route.family !== "org-actions-variables-delete") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
+  const existing = await findOrgActionsVariableRow(c, org, variableId); // the deleted row's stored name (upstream's GetVariable before DeleteVariable)
   const outcome = await deleteOrgActionsVariable(c.env.DB, org.id, variableId);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  // DeleteVariable's arm (variables.go:47): every delete path records —
+  // after the delete, before the redirect.
+  await emitOrgVariableRemoveAudit(c.env.DB, {
+    ...orgActionsAuditBase(c, viewer, org),
+    variable: existing?.name ?? "",
+  });
   return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/variables` } }));
 }
 
@@ -13844,15 +13915,18 @@ async function orgPackagesCargoIndexArm(c: Context<{ Bindings: Env }>, arm: "ini
  * (ResetRunnerRegistrationToken, runners.go:275-290): NewRunnerToken at the
  * org scope, then the plain 303 back onto the list URL (upstream's
  * JSONRedirect — the no-session-flash 303 reduction, the repo twin's
- * convention). */
+ * convention). The audit tail rides after the mint (:278) — no metadata
+ * pairs, the bare token-issuance row. */
 async function orgActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { org, respond } = resolved;
+  const { ctx, org, viewer, respond } = resolved;
   if (resolved.route.family !== "org-actions-runners-token-reset") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
   await resetOrgActionsRunnerToken(c.env.DB, org.id);
+  await emitOrgRunnerTokenAudit(c.env.DB, orgActionsAuditBase(c, viewer, org));
   return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners` } }));
 }
 
@@ -13874,7 +13948,9 @@ async function orgActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId:
 /** POST /org/{org}/settings/actions/runners/{id} (RunnersEditPost,
  * runners.go:219-254): the description overwrite; "updated" 303s back onto
  * the LIST URL (upstream's Redirect(redirectTo) with the flash line not
- * rendered — the no-session-flash reduction); "missing" is the 404 shell. */
+ * rendered — the no-session-flash reduction); "missing" is the 404 shell.
+ * NO audit row by fidelity: upstream's description arm emits none — only
+ * the disabled flip's RunnerUpdatePost (:356) records. */
 async function orgActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
@@ -13890,39 +13966,57 @@ async function orgActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerI
 
 /** POST /org/{org}/settings/actions/runners/{id}/update-runner
  * (RunnerUpdatePost, runners.go:328-369): the required `disabled` flip —
- * an absent param answers upstream's exact 400 ("missing 'disabled'
- * parameter"); "updated" 303s back onto the EDIT page (upstream's
- * JSONRedirect("") stays-on-page arm, the no-JS reduction); "missing" is
- * the 404 shell. */
+ * upstream's arm order is find → NotFound → the missing-param 400
+ * ("missing 'disabled' parameter") → SetRunnerDisabled; "updated" 303s back
+ * onto the EDIT page (upstream's JSONRedirect("") stays-on-page arm, the
+ * no-JS reduction); "missing" is the 404 shell. The audit tail (:356) rides
+ * after the flip with the found runner's name — the disabled bool is
+ * metadata-only. */
 async function orgActionsRunnerUpdate(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { ctx, org, respond } = resolved;
+  const { ctx, org, viewer, respond } = resolved;
   if (resolved.route.family !== "org-actions-runners-update") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
   const form = parseOrgActionsRunnerDisabledForm(await readUrlEncodedForm(c.req.raw));
+  const runner = await findOrgScopedRunner(c.env.DB, org.id, runnerId); // upstream's findActionsRunner arm — also the audit name snapshot
+  if (runner === null) return respond(c.html(renderNotFound(ctx), 404));
   if (form.disabled === null) {
     return respond(new Response("missing 'disabled' parameter\n", { status: 400, headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" } }));
   }
   const outcome = await setOrgActionsRunnerDisabled(c.env.DB, org.id, runnerId, form.disabled);
-  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404)); // the find→set race
+  await emitOrgRunnerUpdateAudit(c.env.DB, {
+    ...orgActionsAuditBase(c, viewer, org),
+    runner: { id: runner.id, name: runner.name },
+    disabled: form.disabled,
+  });
   return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners/${runnerId}` } }));
 }
 
 /** POST /org/{org}/settings/actions/runners/{id}/delete
  * (RunnerDeletePost, runners.go:292-326): the scope-guarded hard delete —
  * "deleted" 303s onto the list URL; "missing" is the 404 shell (upstream's
- * findActionsRunner NotFound arm deletes nothing). */
+ * findActionsRunner NotFound arm deletes nothing). The audit tail (:312)
+ * rides after the delete with the found runner's name snapshot. */
 async function orgActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { ctx, org, respond } = resolved;
+  const { ctx, org, viewer, respond } = resolved;
   if (resolved.route.family !== "org-actions-runners-delete") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
+  const runner = await findOrgScopedRunner(c.env.DB, org.id, runnerId); // upstream's findActionsRunner arm — also the audit name snapshot
+  if (runner === null) return respond(c.html(renderNotFound(ctx), 404));
   const outcome = await deleteOrgActionsRunner(c.env.DB, org.id, runnerId);
-  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404)); // the find→delete race
+  await emitOrgRunnerRemoveAudit(c.env.DB, {
+    ...orgActionsAuditBase(c, viewer, org),
+    runner: { id: runner.id, name: runner.name },
+  });
   return respond(new Response(null, { status: 303, headers: { location: `/org/${org.username}/settings/actions/runners` } }));
 }
 

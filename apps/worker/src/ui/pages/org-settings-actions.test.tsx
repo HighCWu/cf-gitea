@@ -34,6 +34,7 @@ import {
   repoScope,
 } from "../../api/services/secrets-variables";
 import { actionVariables, orgMembers, secrets, users } from "../../db/schema";
+import { findAuditEvents } from "../../services/audit";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import { locale } from "../locale";
 import { uiRouter, type UiAssetsFetcher } from "../index";
@@ -864,6 +865,35 @@ describe("the mounted org actions routes (window-2b: the minted-session route-le
     expect(after.id).toBe(row.id);
     expect(await decryptInstanceSecretData(env.DB, after.data)).toBe("new-value");
     expect(after.description).toBe("new description");
+  });
+
+  it("the three variable POSTs land their org-slice audit rows (the ACTIONS2 wiring: the stored names, the session actor, only after the write)", async () => {
+    // The emit sites in order — variables.go:24 (add), :38 (the `if updated`
+    // gate — our "saved" outcome), :47 (remove) — each riding after its
+    // successful write, before the 303 (the handler wiring of services/
+    // actions/audit-arms.ts; helper-level row shapes live in
+    // audit-arms.test.ts).
+    await env.DB.prepare("DELETE FROM audit_event").run(); // isolate the emission window (earlier pins' rows persist — audit_event is not in the file-level wipe list)
+    await postRoute("/org/coalition/settings/actions/variables/new", 1, { name: "audit_var", data: "first", description: "" });
+    const row = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
+    expect(row.name).toBe("AUDIT_VAR"); // the service's UPPERCASE arm
+    await postRoute(`/org/coalition/settings/actions/variables/${row.id}/edit`, 1, { name: "", data: "second", description: "" }); // the empty-name zero-value fallback
+    await postRoute(`/org/coalition/settings/actions/variables/${row.id}/delete`, 1, {});
+    const rows = await findAuditEvents(drizzle(env.DB), { scopeType: "organization", scopeId: world.coalitionId, sort: "timestamp_asc" });
+    expect(rows.map((row) => [row.action, row.actorId, row.actorName])).toEqual([
+      ["organization:variable:add", 1, "alice"],
+      ["organization:variable:update", 1, "alice"],
+      ["organization:variable:remove", 1, "alice"],
+    ]);
+    expect(rows[0]!.scopeName).toBe("coalition");
+    expect(rows[0]!.message).toBe("Added variable AUDIT_VAR to organization coalition."); // the STORED name, not the raw form text
+    expect(rows[1]!.message).toBe("Updated variable AUDIT_VAR of organization coalition."); // the fallback keeps the stored name
+    expect(rows[2]!.message).toBe("Removed variable AUDIT_VAR from organization coalition.");
+    // The no-write arms never emit: an invalid-name POST re-renders without
+    // writing, a stale id 404-shells — the table keeps exactly three rows.
+    await postRoute("/org/coalition/settings/actions/variables/new", 1, { name: "BAD-NAME", data: "v", description: "" });
+    await expectNotFoundShell(await postRoute(`/org/coalition/settings/actions/variables/${row.id}/delete`, 1, {}));
+    expect(await findAuditEvents(drizzle(env.DB), { scopeType: "organization", scopeId: world.coalitionId })).toHaveLength(3);
   });
 
   it("the variable edit and delete arms answer the 404 shell for a stale and a foreign-org id (the findActionsVariable NotFound fidelity)", async () => {
