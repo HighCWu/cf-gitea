@@ -20,6 +20,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
+import { TokenService } from "../auth/token-service";
 import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
 import { actionRunAttempts, actionRunJobs, actionRuns, comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, PRStatus, pullRequests, repositories, repoSettings, repoTransfer, repoUnits, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
@@ -262,6 +263,12 @@ describe("handlesUiRoute", () => {
     "/octo/hello/issues/5/times/9/delete", // F4 — four segments
     "/octo/hello/pulls/5/times/9/delete",
     "/octo/hello/_cherrypick/abcdef0/main", // F5 — the underscore literal
+    // the re-pin's canonical owner sub-routes (the 1d8474ee1f refactor)
+    // + the terraform discovery static (the 5d9bfa1e14 registry)
+    "/-/ownername.rss/alice", // web.go:886's canonical feed paths share
+    "/-/ownername.atom/alice", // the landed user-feed families
+    "/.well-known/terraform.json", // web.go:530's service-discovery static
+    "/-/admin/users/5/access_tokens/regenerate", // web.go:793's regenerate tail
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
@@ -304,6 +311,11 @@ describe("handlesUiRoute", () => {
     "/octo/hello/issues/7/unpin/3", // F3 — the index-first phantom
     "/octo/hello/issues/5/times/9", // F4 — the length-3 phantom (no /delete)
     "/octo/hello/cherrypick/abcdef0/main", // F5 — the bare literal is not an editor_action
+    // the re-pin's canonical avatar/keys/gpg variants — the surfaces are
+    // not in this slice (the .keys/.gpg refusal convention)
+    "/-/ownername.png/alice",
+    "/-/ownername.keys/alice",
+    "/-/ownername.gpg/alice",
     // NOTE: /octo/hello/settings/keys and /explore/repos/sitemap-1.xml left
     // this table — window-2d (b54f709) and window-2e-A (84996c6) claimed
     // them; the claim pins live in the parse table below (the wiki
@@ -659,6 +671,33 @@ describe("parseUiRoute", () => {
     ["/octo/hello/_upload/main", { family: "file-upload", owner: "octo", repo: "hello", refSuffix: "main" }],
     ["/octo/hello/_diffpatch/main", { family: "editor-patch", owner: "octo", repo: "hello", refSuffix: "main" }],
     ["/octo/hello/_new", null], // the bare tail requirement holds for the aliases too
+    // the re-pin's canonical owner sub-routes (web.go:881-889 — the
+    // 1d8474ee1f refactor): the feed pair shares the landed user-feed
+    // families; the png/keys/gpg variants stay unclaimed (the avatar/SSH/
+    // GPG surfaces are not in this slice), and UsernamePreRoute keeps the
+    // legacy suffix forms working upstream (the existing suffix claims).
+    ["/-/ownername.rss/alice", { family: "user-feed-rss", owner: "alice" }],
+    ["/-/ownername.atom/alice", { family: "user-feed-atom", owner: "alice" }],
+    ["/-/ownername.rss/OCTO", { family: "user-feed-rss", owner: "OCTO" }], // request casing preserved
+    ["/-/ownername.rss/alice/extra", null],
+    // the bare/near shapes ride the PRE-EXISTING repo-home fallback (owner
+    // "-" / owner ".well-known" rows → the 404 shell at resolution — the
+    // same observable as upstream's unregistered paths; the boundary the
+    // exact literals above sharpen)
+    ["/-/ownername.rss", { family: "home", owner: "-", repo: "ownername.rss", refSuffix: null }],
+    ["/-/ownername.png/alice", null],
+    ["/-/ownername.keys/alice", null],
+    ["/-/ownername.gpg/alice", null],
+    // the packages service-discovery static (web.go:530 — the 5d9bfa1e14
+    // terraform module registry): the exact literal only; sibling literals
+    // keep the pre-existing repo-home fallback (404 shell at resolution).
+    ["/.well-known/terraform.json", { family: "well-known-terraform-discovery" }],
+    ["/.well-known/terraform.json/extra", null],
+    ["/.well-known/other.json", { family: "home", owner: ".well-known", repo: "other.json", refSuffix: null }],
+    // the admin bot-token regenerate tail (web.go:793 — POST-only
+    // admin.RegenerateBotToken, 365cb2bd5e): digits-only {userid} parity.
+    ["/-/admin/users/5/access_tokens/regenerate", { family: "admin-user-bot-token-regenerate", adminUserId: 5 }],
+    ["/-/admin/users/x/access_tokens/regenerate", null], // junk {userid} stays engine-404
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {
@@ -3075,5 +3114,115 @@ describe("the run-viewer write quartet (web.go:1588, 1590, 1597-1598 — the rer
     expect(stored.latestAttemptId).toBe(seeded.attemptId);
     const jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, seeded.runId));
     expect(jobs.every((job) => job.status !== ACTION_STATUS_WAITING)).toBe(true);
+  });
+});
+
+// --- the re-pin's route arms (fc49368845 -> 099abf5db4) ----------------------
+
+describe("GET /.well-known/terraform.json (web.go:530 — the 5d9bfa1e14 registry)", () => {
+  it("serves the one-line service-discovery JSON; PACKAGES_ENABLED=false answers the route-unregistered 404", async () => {
+    const res = await fetchUi("/.well-known/terraform.json");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(await res.json()).toEqual({ "modules.v1": "/api/packages/-/terraform/modules/" });
+
+    const off = await fetchUi("/.well-known/terraform.json", { ...uiEnv, PACKAGES_ENABLED: "false" });
+    expect(off.status).toBe(404);
+    expect(await off.text()).toContain("<title>Page Not Found - cf-gitea</title>");
+  });
+});
+
+describe("GET /-/ownername.rss|atom/{owner} (web.go:886-887 — the 1d8474ee1f canonical feeds)", () => {
+  it("serves the same channels as the legacy suffix paths; an unknown owner 404-shells", async () => {
+    await seedVerifiedUser({ username: "FeedOwner" });
+    const rss = await fetchUi("/-/ownername.rss/FeedOwner");
+    expect(rss.status).toBe(200);
+    expect(rss.headers.get("content-type")).toBe("application/rss+xml;charset=utf-8");
+    expect(await rss.text()).toContain("<rss");
+    const atom = await fetchUi("/-/ownername.atom/FeedOwner");
+    expect(atom.status).toBe(200);
+    expect(atom.headers.get("content-type")).toBe("application/atom+xml;charset=utf-8");
+    const ghost = await fetchUi("/-/ownername.rss/who-is-this");
+    expect(ghost.status).toBe(404);
+    expect(await ghost.text()).toContain("<title>Page Not Found - cf-gitea</title>");
+  });
+});
+
+describe("POST /-/admin/users/{id}/access_tokens/regenerate (web.go:793 — the 365cb2bd5e arm)", () => {
+  async function fetchAdminUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function adminCookie(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  it("regenerates a bot token for a site admin, re-rendering with the fresh plaintext; the GET twin 405s", async () => {
+    const admin = await seedVerifiedUser({ username: "regen-admin", isAdmin: true });
+    const bot = await seedVerifiedUser({ username: "regen-bot", type: "bot" });
+    const minted = await new TokenService(env.DB).mint({ userId: bot.id, name: "ci", scopes: "all" });
+    const cookie = await adminCookie(admin.id);
+
+    const twin = await fetchAdminUi("/-/admin/users/" + bot.id + "/access_tokens/regenerate", { method: "GET" });
+    expect(twin.status).toBe(405);
+    expect(twin.headers.get("allow")).toBe("POST");
+
+    const res = await fetchAdminUi("/-/admin/users/" + bot.id + "/access_tokens/regenerate", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local", cookie },
+      body: new URLSearchParams({ id: String(minted.id) }).toString(),
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('id="new-access-token-value"');
+    expect(html).not.toContain(minted.plaintext); // the old value is dead
+
+    // the stored row verifies against the fresh value only — regenerateTokenFromForm
+    // replaced the prefix/digest (the same seam the settings arm pins)
+    const resolved = await fetchAdminUi("/-/admin/users/" + bot.id, { headers: { cookie } });
+    expect(resolved.status).toBe(200);
+  });
+
+  it("a non-bot target answers the 400 refusal; a non-admin POST 404-shells", async () => {
+    const admin = await seedVerifiedUser({ username: "regen-admin-2", isAdmin: true });
+    const plain = await seedVerifiedUser({ username: "regen-plain" });
+    const cookie = await adminCookie(admin.id);
+
+    const refused = await fetchAdminUi("/-/admin/users/" + plain.id + "/access_tokens/regenerate", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local", cookie },
+      body: new URLSearchParams({ id: "7" }).toString(),
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.headers.get("content-type")).toContain("application/json");
+
+    const bystander = await seedVerifiedUser({ username: "regen-bystander" });
+    const shell = await fetchAdminUi("/-/admin/users/" + plain.id + "/access_tokens/regenerate", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://test.local",
+        cookie: await adminCookie(bystander.id),
+      },
+      body: new URLSearchParams({ id: "7" }).toString(),
+    });
+    expect(shell.status).toBe(404);
+    expect(await shell.text()).toContain("<title>Page Not Found - cf-gitea</title>");
+  });
+
+  it("a stale form id 303s silently back onto the detail page (the delete arm's convention)", async () => {
+    const admin = await seedVerifiedUser({ username: "regen-admin-3", isAdmin: true });
+    const bot = await seedVerifiedUser({ username: "regen-bot-3", type: "bot" });
+    const res = await fetchAdminUi("/-/admin/users/" + bot.id + "/access_tokens/regenerate", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://test.local",
+        cookie: await adminCookie(admin.id),
+      },
+      body: new URLSearchParams({ id: "424242" }).toString(),
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/-/admin/users/" + bot.id);
   });
 });

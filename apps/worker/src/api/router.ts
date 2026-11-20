@@ -122,7 +122,8 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
 
   // The require-sign-in-view instance flag's API arm (SPEC-0003 §2.4 row 6,
   // census B-34 — upstream mounts verifyAuthWithOptionsAPI's SignInRequired
-  // over the whole group, api.go:961 + :905-910): anonymous calls answer
+  // over the whole group, api.go:978 + :922-927 at the 099abf5db4 pin; the
+  // pre-repin cites :961 + :905-910): anonymous calls answer
   // upstream's exact raw 403 {message} body. Off by default; a no-op when
   // resolveAuth never ran (the scope-gate's standalone posture).
   app.use("*", requireSignInViewApiGate());
@@ -131,7 +132,8 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   const optionalAuth = createOptionalTokenAuthMiddleware(options.auth ?? createStubAuthResolver());
   registerVersionRoute(app);
   // Miscellaneous (no scope required), upstream's misc group: the API-docs
-  // redirect (api.go:1001-1005 — "The route is here but no in API routes
+  // redirect (api.go:1019-1023 at the 099abf5db4 pin, pre-repin
+  // :1001-1005 — "The route is here but no in API routes
   // because it renders a web page"). Plain registration outside the
   // generated OpenAPI document — the vendored swagger carries no such path
   // (routes/swagger-redirect.ts, census B-80).

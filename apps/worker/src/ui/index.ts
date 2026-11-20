@@ -3264,12 +3264,22 @@ export interface OwnerHomeRoute {
 }
 
 /** Window-2e: the user/org feed envelopes (pages/user-feed-xml.ts —
- *  upstream UsernameSubRoute's .rss/.atom suffix dispatch serves ORGS too,
- *  profile.go:33). */
+ *  upstream serves ORGS too, profile.go's OwnerProfile feed dispatch
+ *  relocated into the UsernamePreRoute rewrite at 1d8474ee1f: the legacy
+ *  `/{owner}.rss|.atom` paths and the canonical `/-/ownername.rss|atom/
+ *  {owner}` paths both land here, web.go:881-887). */
 export interface UserFeedRoute {
   family: "user-feed-rss" | "user-feed-atom";
   /** The owner segment with the suffix stripped. */
   owner: string;
+}
+
+/** The packages service-discovery static (SPEC terraform module registry —
+ *  upstream web.go:530's `m.Get("/terraform.json", packagesEnabled,
+ *  tfmodule.ServiceDiscovery)` in the /.well-known group): a one-line JSON
+ *  doc pointing at the terraform module API. */
+export interface WellKnownTerraformDiscoveryRoute {
+  family: "well-known-terraform-discovery";
 }
 
 /** Window-2e C1: the global inbox pages (pages/global-inbox.tsx). */
@@ -3895,9 +3905,13 @@ export interface AdminRoute {
     // upstream, the GET twins 405): getTargetBot's gate serves BOTS ONLY
     // (the admin.users.bot_token_only refusal on a non-bot target) — the
     // detail page's BotAccessTokens panel (view.tmpl:28-29,
-    // pages/admin-user-detail.tsx) is the forms' only source.
+    // pages/admin-user-detail.tsx) is the forms' only source. The re-pin
+    // adds the regenerate tail (web.go:793 — admin.RegenerateBotToken,
+    // 365cb2bd5e: the shared panel template grew a per-row regenerate
+    // button, access_tokens.tmpl:51).
     | "admin-user-bot-token"
-    | "admin-user-bot-token-delete";
+    | "admin-user-bot-token-delete"
+    | "admin-user-bot-token-regenerate";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -4341,6 +4355,7 @@ export type ParsedUiRoute =
   | UserFeedRoute
   | IssueAuxRoute
   | GlobalInboxRoute
+  | WellKnownTerraformDiscoveryRoute
   | WikiRoute
   | FileEditorRoute
   | EditorForkRoute
@@ -4758,8 +4773,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "notifications" && tail[1] === "actions") {
       return { family: "user-settings-notifications-actions", id: null };
     }
-    // The repos tab (web.go:734 — GET only; the unadopted POST is
-    // structurally absent in the R2/DO-behind-D1 model, the module header).
+    // The repos tab (web.go:734 — GET only; the unadopted POST the old pin
+    // carried at /repos/unadopted was REMOVED upstream by 1554b6c939's
+    // adopt-feature removal, so the GET-only claim is now exact parity).
     if (tail.length === 1 && tail[0] === "repos") return { family: "user-settings-repos", id: null };
     // The orgs tab is SINGULAR on the wire (web.go:740 m.Get("/organization",
     // …) serves the plural template — the module's premise correction).
@@ -4913,6 +4929,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       /^\d+$/.test(tail[1] as string)
     ) {
       return { family: "admin-user-bot-token-delete", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    // The re-pin's regenerate tail (web.go:793 — POST-only
+    // admin.RegenerateBotToken, 365cb2bd5e; the shared token panel template
+    // grew the per-row regenerate button at the same commit). The same
+    // digits-only {userid} parity; the GET twin answers chi's 405.
+    if (
+      tail.length === 4 &&
+      tail[0] === "users" &&
+      tail[2] === "access_tokens" &&
+      tail[3] === "regenerate" &&
+      /^\d+$/.test(tail[1] as string)
+    ) {
+      return { family: "admin-user-bot-token-regenerate", adminUserId: Number.parseInt(tail[1] as string, 10) };
     }
     // The census B-71 org-removal pair (web.go:824-825 — POST-only upstream,
     // the GET twins answer chi's 405): the remove-all literal and the per-org
@@ -5574,8 +5603,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return { family: raw[1] === "issues" ? "global-issues" : raw[1] === "pulls" ? "global-pulls" : "global-milestones" };
     }
     if (TOP_LEVEL_EXCLUDED.has(owner.toLowerCase())) return null;
-    // Window-2e: the feed suffixes (pages/user-feed-xml.ts — upstream
-    // UsernameSubRoute's .rss/.atom dispatch, web.go:910-912 → profile.go).
+    // Window-2e: the feed suffixes (pages/user-feed-xml.ts — upstream's
+    // UsernamePreRoute suffix rewrite, web.go:881-887; the 1d8474ee1f
+    // refactor replaced fc49368845's UsernameSubRoute dispatch, web.go
+    // :910-912 → profile.go, with the pre-routing rewrite onto the
+    // /-/ownername.* routes — the legacy single-segment paths survive).
     // The lowercase rule matches the landed .keys/.gpg refusal convention.
     const lowerOwner = owner.toLowerCase();
     if (lowerOwner.endsWith(".rss")) return { family: "user-feed-rss", owner: owner.slice(0, -4) };
@@ -5592,6 +5624,31 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (repo.endsWith(".git")) repo = repo.slice(0, -4);
   if (repo === "") return null;
+
+  // The re-pin's canonical owner sub-routes (web.go:881-889 — the
+  // 1d8474ee1f refactor registered explicit `/-/ownername.{ext}/{username}`
+  // paths and left UsernamePreRoute rewriting the legacy `/{owner}.{ext}`
+  // single-segment forms onto them). The feed variants share the landed
+  // user-feed families (the same handlers the suffix claims serve); the
+  // png/keys/gpg variants stay unclaimed — the avatar/SSH/GPG surfaces are
+  // not in this slice (the .keys/.gpg refusal convention above).
+  if (raw.length === 4 && raw[1] === "-" && (raw[2] === "ownername.rss" || raw[2] === "ownername.atom")) {
+    let feedOwner: string;
+    try {
+      feedOwner = decodeURIComponent(raw[3] as string);
+    } catch {
+      return null;
+    }
+    return { family: raw[2] === "ownername.rss" ? "user-feed-rss" : "user-feed-atom", owner: feedOwner };
+  }
+  // The packages service-discovery static (web.go:530 — packagesEnabled,
+  // tfmodule.ServiceDiscovery; landed with the 5d9bfa1e14 terraform module
+  // registry). The exact literal beside the wave-9 statics; the
+  // packagesEnabled gate rides the handler (upstream leaves the route
+  // unregistered when packages are off — the same observable 404).
+  if (raw.length === 3 && raw[1] === ".well-known" && raw[2] === "terraform.json") {
+    return { family: "well-known-terraform-discovery" };
+  }
 
   // The wave-23 org repositories family (pages/org-repos.tsx — upstream's
   // `/{username}/-/repositories`, web.go:1107's `/{username}/-` group's
@@ -6608,8 +6665,10 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     return { family: "milestone-detail", owner, repo, id };
   }
-  // Wave-13: the compare family (pages/compare.tsx — upstream web.go:1307-
-  // 1315). The bare URL and the full ParseCompareRouterParam tail grammar:
+  // Wave-13: the compare family (pages/compare.tsx — upstream web.go:
+  // 1282-1284; the aa073fb1be re-pin flattened fc49368845's /compare/*
+  // PathGroup into plain GET/POST routes). The bare URL and the full
+  // ParseCompareRouterParam tail grammar:
   // the FIRST `...` splits the decoded suffix (strings.Cut parity), else the
   // first `..` (the two-dot DirectComparison arm — the feeds module's
   // parseCompareBaseHead semantics, landed here for the page), else the
@@ -6653,9 +6712,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return null;
     }
     if (suffix === "") return bare;
-    // Window-2e B2: the .diff/.patch byte feeds (web.go:1309-1310) — claim
-    // the suffixed tails BEFORE the page family returns (they would
-    // otherwise fall into the single-ref family and 404 at resolution).
+    // Window-2e B2: the .diff/.patch byte feeds (web.go:1283's GET
+    // /compare/* at the re-pin — the aa073fb1be flatten dissolved the
+    // dedicated MatchPath routes into the ONE GET route, the download now
+    // dispatched in-handler when the suffixed head ref does not resolve;
+    // the module's handler owes that resolve-first posture, the compare
+    // module's handoff) — claim the suffixed tails BEFORE the page family
+    // returns (they would otherwise fall into the single-ref family and
+    // 404 at resolution).
     if (suffix.endsWith(".diff")) {
       return { family: "compare-feed", owner, repo, ext: "diff", segment: suffix.slice(0, -5) };
     }
@@ -12499,8 +12563,9 @@ async function userSettingsApplicationsDelete(c: Context<{ Bindings: Env }>): Pr
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
 }
 
-/** POST /user/settings/applications/regenerate (web.go:695's group →
- *  RegenerateAccessToken, applications.go:176-185): the same single-`id`
+/** POST /user/settings/applications/regenerate (web.go:665's group →
+ *  ApplicationsRegenerateToken — fc49368845's RegenerateAccessToken
+ *  renamed by 365cb2bd5e, applications.go:176-185): the same single-`id`
  *  body; the hit re-renders the FULL page with data.newToken — the once-only
  *  carrier (upstream flashes Success + Info(t.Token) + JSONRedirects; the
  *  create arm's no-flash posture). A "missing" outcome (a stale form id)
@@ -16457,6 +16522,28 @@ function exploreRoot(): Response {
   return new Response(null, { status: 303, headers: { location: "/explore/repos" } });
 }
 
+/** GET /.well-known/terraform.json (web.go:530 — packagesEnabled,
+ *  tfmodule.ServiceDiscovery, api/packages/terraform_module.go:68-70): the
+ *  one-line service-discovery doc pointing terraform CLI clients at the
+ *  module API (the /api/packages PROTOCOL mount; the worker serves no
+ *  AppSubURL, so the path is root-relative verbatim). The packagesEnabled
+ *  gate answers the packages-off posture — upstream leaves the route
+ *  unregistered, the same observable 404 (the admin packages page's
+ *  ctx.packagesEnabled shell). */
+async function wellKnownTerraformDiscovery(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "well-known-terraform-discovery") return respond(await c.notFound()); // drift guard
+  if (ctx.packagesEnabled === false) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    new Response(JSON.stringify({ "modules.v1": "/api/packages/-/terraform/modules/" }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
 /** GET /explore/repos (pages/explore.tsx — the repo search page; anonymous
  *  sees public rows, a session viewer gains their own private repos — the
  *  upstream `Private: ctx.Doer != nil` scope in the search service seam). */
@@ -20361,6 +20448,19 @@ uiRouter.get("/explore/organizations", (c) => exploreOrganizationsPage(c));
 // The SPEC-0019 M2 code search page (upstream web.go:558's literal; the
 // exact 3-segment literal beside its siblings — the navbar's fourth tab).
 uiRouter.get("/explore/code", (c) => exploreCodePage(c));
+// The re-pin's canonical owner sub-routes (web.go:881-889 — the
+// 1d8474ee1f refactor): the feed pair shares the landed user-feed handler
+// (the parser claims both the canonical paths and the legacy suffix forms
+// onto the same families); the png/keys/gpg variants stay engine-404 (the
+// avatar/SSH/GPG surfaces are not in this slice). Registered with the
+// wave-9 statics so the literals beat the dynamic owner/repo pairs — the
+// wave-9 RegExpRouter note.
+uiRouter.get("/-/ownername.rss/:owner", (c) => userFeedRoute(c));
+uiRouter.get("/-/ownername.atom/:owner", (c) => userFeedRoute(c));
+// The packages service-discovery static (web.go:530's /.well-known group
+// literal — packagesEnabled, tfmodule.ServiceDiscovery, the 5d9bfa1e14
+// terraform module registry). Static block placement per the wave-9 rule.
+uiRouter.get("/.well-known/terraform.json", (c) => wellKnownTerraformDiscovery(c));
 // The swagger viewer (upstream web.go:303-305's /api/swagger — session
 // middleware but NO reqSignIn, public) + the two spec JSON arms
 // (web.go:1794-1797, bare). STATIC block: a later static LOSES to the
@@ -20863,6 +20963,40 @@ async function adminUserBotTokenDeleteSubmit(c: Context<{ Bindings: Env }>, user
   return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
 }
 
+/** POST /-/admin/users/{userid}/access_tokens/regenerate (web.go:793 —
+ *  admin.RegenerateBotToken, 365cb2bd5e's users.go:391-395: getTargetBot's
+ *  gate + user_setting.RegenerateAccessToken; the shared token panel
+ *  template grew the per-row regenerate button at the same commit,
+ *  access_tokens.tmpl:51's data-url). The delete arm's gate (the pair's
+ *  own lookup — the miss 500s plain, a non-bot target the 400 refusal)
+ *  + the settings regenerate arm's write (regenerateTokenFromForm scoped
+ *  to the BOT's id — upstream's (id, owner.ID)) + the mint arm's render
+ *  carrying the fresh plaintext. A stale form id rides the delete arm's
+ *  silent 303 (upstream ServerErrors the miss — unreachable from the
+ *  rendered buttons). */
+async function adminUserBotTokenRegenerateSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const target = await drizzle(c.env.DB).select({ id: users.id, type: users.type }).from(users).where(eq(users.id, userId)).get();
+  if (target === undefined) return p.respond(new Response("Internal Server Error", { status: 500 })); // getTargetBot's miss
+  if (target.type !== "bot") return p.respond(adminBotTokenRefusal());
+  const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await regenerateTokenFromForm(c.env.DB, userId, form.id ?? 0);
+  if (outcome.outcome === "missing") return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
+  const fresh = await loadAdminUserDetail(c.env.DB, userId);
+  const data =
+    fresh === null
+      ? null
+      : withBotTokenMintOutcome({ ...fresh, oauth2Enabled: oauth2FeatureEnabled(c.env) }, {
+          outcome: "created",
+          plaintext: outcome.plaintext,
+        });
+  if (data === null) return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  return p.respond(c.html(renderAdminUserDetailPage(p.ctx, data), 200));
+}
+
 // POST-only upstream; the GET twins answer chi's 405 (the B-71 convention).
 uiRouter.post("/-/admin/users/:userid{\\d+}/access_tokens", (c) => adminUserBotTokenSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.get("/-/admin/users/:userid{\\d+}/access_tokens", () => methodNotAllowed("POST"));
@@ -20870,6 +21004,12 @@ uiRouter.post("/-/admin/users/:userid{\\d+}/access_tokens/delete", (c) =>
   adminUserBotTokenDeleteSubmit(c, Number.parseInt(c.req.param("userid"), 10)),
 );
 uiRouter.get("/-/admin/users/:userid{\\d+}/access_tokens/delete", () => methodNotAllowed("POST"));
+// The re-pin's regenerate tail (web.go:793 — POST-only; the GET twin
+// answers chi's 405 — the pair's convention above).
+uiRouter.post("/-/admin/users/:userid{\\d+}/access_tokens/regenerate", (c) =>
+  adminUserBotTokenRegenerateSubmit(c, Number.parseInt(c.req.param("userid"), 10)),
+);
+uiRouter.get("/-/admin/users/:userid{\\d+}/access_tokens/regenerate", () => methodNotAllowed("POST"));
 // --- end BOTWEB region -------------------------------------------------------
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
@@ -21204,9 +21344,11 @@ uiRouter.get("/:owner/:repo/pulls/:index/commits", (c) => uiPage(c));
 	uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/comments", (c) => pullReviewCodeComment(c));
 	uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/comments", () => methodNotAllowed("POST"));
 	// Wave-13 compare family (parseUiRoute claims exactly these shapes; the
-	// bare URL is GET-only — upstream registers `m.Get("/compare")` outside
-	// the POST path group, so a POST answers chi's 405 — and the form always
-	// posts to the basehead URL). The POST runs the §2.8 sameOriginGuard.
+	// bare URL is GET-only — upstream registers `m.Get("/compare")` without
+	// a POST twin (web.go:1282-1284 at the re-pin; the aa073fb1be flatten
+	// replaced fc49368845's PathGroup), so a POST answers chi's 405 — and
+	// the form always posts to the basehead URL). The POST runs the §2.8
+	// sameOriginGuard.
 	uiRouter.get("/:owner/:repo/compare", (c) => comparePage(c));
 	uiRouter.post("/:owner/:repo/compare", () => methodNotAllowed("GET"));
 	uiRouter.get("/:owner/:repo/compare/*", (c) => comparePage(c));
