@@ -1,7 +1,7 @@
 /**
  * The profile WATCHING tab, `/{username}?tab=watching` — pages wave-124: the
  * watched-repositories list behind the overview header's DisableStars anchor
- * (routers/web/user/profile.go:220-246's `case "watching"`:
+ * (routers/web/user/profile.go:203-229's `case "watching"`:
  * `SearchRepository{WatchedByID: ctx.ContextUser.ID, Collaborate:
  * optional.Some(false), Private: ctx.IsSigned, Actor: ctx.Doer}` — the
  * USER→repos watch direction; the repo→users direction is social-lists.ts
@@ -11,14 +11,14 @@
  *
  * ## Upstream condition (cited at the pin)
  *
- * profile.go's watching case differs from stars (:191-219) in exactly one
+ * profile.go's watching case differs from stars (:174-201) in exactly one
  * option: `WatchedByID` instead of `StarredByID` — and it does NOT set
- * `ShowRepoOwnerOnList` (:193 sets it for stars only). `WatchedByID`
+ * `ShowRepoOwnerOnList` (:176 sets it for stars only). `WatchedByID`
  * restricts to `id IN (SELECT repo_id FROM watch WHERE user_id = …)`
- * (models/repo/repo_list.go:401-403). `Collaborate: optional.Some(false)`
+ * (models/repo/repo_list.go:397-400). `Collaborate: optional.Some(false)`
  * is inert here: it only applies when `opts.OwnerID > 0`
- * (repo_list.go:405-411) and the watching arm sets no OwnerID. The
- * visibility arm is `SearchRepositoryCondition` (repo_list.go:365-398):
+ * (repo_list.go:402-409) and the watching arm sets no OwnerID. The
+ * visibility arm is `SearchRepositoryCondition` (repo_list.go:363-400):
  * `Private = ctx.IsSigned` — an anonymous doer is forced public-only
  * (public rows AND non-limited/private owners), a signed-in non-admin sees
  * additionally the private rows AccessibleRepositoryCondition grants (own +
@@ -27,6 +27,18 @@
  * listReposStarredByUser and loadUserProfileData). Keyword/sort/language and
  * the archived/fork/mirror/template/private filters (:227-239) are not
  * landed — the profile page renders no search box (the org-home reduction).
+ *
+ * RE-PIN 099abf5db4 (REPIN-WATCH 2026-11-20, window fc49368845..099abf5db4):
+ * the window reshapes SearchRepositoryCondition's Private branch —
+ * 6782d0a37d dropped the `opts.Actor.ID == opts.OwnerID` skip (the
+ * accessibility arm now gates the owner too) and 03fc2bdcc8 turned the
+ * unitType parameter into a real repo_unit EXISTS gate. Both are inert on
+ * this page: the watching case sets no OwnerID (the accessibility arm
+ * already applied for every non-admin at the old pin, since Actor.ID != 0)
+ * and passes unit.TypeInvalid (no unit cond). The cite refreshes above ride
+ * the window's line shifts (the LowerNames removal −2, the branch collapse
+ * −3 — models/repo/watch.go's Watch.Mode rows the query reads are
+ * line-stable at watch.go:38-51, the WatchedByID subquery itself unchanged).
  *
  * ## DOM contract (templates/user/profile.tmpl's `{{else}}` branch +
  *  shared/repo/list.tmpl + base/paginate.tmpl at the pin)
@@ -252,7 +264,7 @@ export function EyeIcon() {
 }
 
 /**
- * Load the watching tab (profile.go:220-246's arm — §3.2, the landed
+ * Load the watching tab (profile.go:203-229's arm — §3.2, the landed
  * lister, never a self-fetch): the visible watched listing over
  * `listWatchedRepositories` (the doer login resolved per the visibility
  * section), one batched description read for the page's rows (the org-home

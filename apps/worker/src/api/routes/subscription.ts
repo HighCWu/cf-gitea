@@ -41,6 +41,18 @@ import { isWatchingRepo, unwatchRepo, watchRepo } from "../services/repo-watcher
  * (POST /action/watch|participate|ignore and /action/watch/options,
  * routers/web/repo/watch.go) — the store primitive
  * (`watchRepoWithOptions`) is landed; the routes ride the UI window.
+ *
+ * RE-PIN 099abf5db4 (REPIN-WATCH 2026-11-20, window fc49368845..099abf5db4):
+ * 5671c5192d folded this trio's declared 403/404s into a single
+ * `default: error` swagger response (annotation-only, wire-identical — our
+ * `responses` blocks keep the explicit statuses, the admin-t2
+ * documented-superset convention) and added the missing post-error `return`
+ * to the same file's watched-listings handlers (our throw-style handlers
+ * have no fall-through to fix). models/repo/watch.go's only window change is
+ * 6a8eec1cc3's `UNIQUE(watch) INDEX` annotation on Watch.RepoID —
+ * schema-only, and our composite PK (repo_id, user_id) already indexes
+ * repo_id as its leading column; every watch.go line anchor above is
+ * unchanged (the edit is a 1:1 line swap at :42).
  */
 
 const notFoundResponse = {

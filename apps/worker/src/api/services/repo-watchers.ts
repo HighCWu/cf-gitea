@@ -33,6 +33,15 @@
  * Deliberately NOT the `issue_subscriptions` table: upstream keeps them
  * separate too (`issue_watch` vs `watch`).
  *
+ * RE-PIN 099abf5db4 (REPIN-WATCH 2026-11-20, window fc49368845..099abf5db4):
+ * the window's only models/repo/watch.go change is 6a8eec1cc3's
+ * `UNIQUE(watch) INDEX` annotation on Watch.RepoID (:42, a 1:1 line swap —
+ * every anchor above stays line-exact) feeding the dashboard/table-index
+ * perf work. Schema-only upstream; the port needs NO migration — our
+ * composite PK (repo_id, user_id) already indexes repo_id as its leading
+ * column, which is the access path upstream's new index provides (their PK
+ * index leads on user_id, ours deliberately leads on repo_id).
+ *
  * Semantics mirrored (routers/api/v1/user/watch.go): watch/unwatch are
  * idempotent, and `WatchInfo.created_at` renders the REPOSITORY's created
  * timestamp (upstream `ctx.Repo.Repository.CreatedUnix`), not the watch

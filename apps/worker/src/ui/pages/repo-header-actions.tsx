@@ -10,12 +10,14 @@
  * the three watch modes over services/repo-watchers.ts's
  * watchRepoWithOptions (the WatchOptions setter, models/repo/watch.go:
  * 189-206 — landed with migration 0053's mode columns): "watch" →
- * WatchModeNormal + every event toggle (watch.go:22-25), "participate" →
- * WatchModeNone (watch.go:27-29 — the row's absence, watchRepoByMode's
- * DELETE arm :146-148), "ignore" → WatchModeDont (watch.go:18-20); the
+ * WatchModeNormal + every event toggle (web/repo/watch.go:24-25; the mode
+ * consts models/repo/watch.go:20-25), "participate" →
+ * WatchModeNone (web/repo/watch.go:22-23 — the row's absence,
+ * watchRepoByMode's DELETE arm models/repo/watch.go:149-151), "ignore" →
+ * WatchModeDont (web/repo/watch.go:20-21); the
  * custom form (/action/watch/options + the watch_options_modal, the shell's
  * RepoWatchOptionsModal) → WatchModeCustom with the form's three FormBool
- * event toggles (watch.go:50-60), answering ctx.JSONRedirect("") — the
+ * event toggles (web/repo/watch.go:49-60), answering ctx.JSONRedirect("") — the
  * fetch-action JS reloads the page on the empty redirect
  * (fetch-action.ts:74-79).
  *
@@ -143,10 +145,17 @@ export async function repoStarActionResponse(
  * POST /{owner}/{repo}/action/{watch|participate|ignore} (repo.ActionWatch,
  * routers/web/repo/watch.go:16-47): every arm rides the landed
  * watchRepoWithOptions with upstream's exact WatchOptions — watch →
- * WatchModeNormal + all three event toggles (:22-25), participate →
- * WatchModeNone (:27-29, the row's absence), ignore → WatchModeDont (:18-20)
+ * WatchModeNormal + all three event toggles (:24-25), participate →
+ * WatchModeNone (:22-23, the row's absence), ignore → WatchModeDont (:20-21)
  * — then the fragment over the re-read pair (GetWatch + the repository row,
  * :33-46). Idempotent by construction (watchRepoByMode's same-mode no-op).
+ *
+ * RE-PIN 099abf5db4 (REPIN-WATCH 2026-11-20): the window's only change to
+ * this upstream body is b3422c0920's ServerError → ServerErrorAuto swap at
+ * :37-39/:44-46 (the error-system cleanup — same 500-page arm, a 1:1 line
+ * swap, every anchor line-stable across the window). The mode-arm cites
+ * above were refreshed to the pin-exact lines while here (pre-existing
+ * imprecision, not window drift).
  */
 export async function repoWatchActionResponse(
   d1: D1Database,

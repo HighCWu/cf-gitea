@@ -23,8 +23,25 @@ import { toApiUser } from "../services/user";
  * Tier-2 social listings (SPEC-0004 appendix A rows repoListStargazers,
  * repoListSubscribers, userListStarred, userCurrentListSubscriptions,
  * userListSubscriptions, userCurrentListFollowing — upstream repo/star.go
- * ListStargazers, repo/subscribe.go Subscribers + GetWatchedRepos variants,
+ * ListStargazers, repo/subscribe.go Subscribers, routers/api/v1/user/watch.go
+ * GetWatchedRepos + GetMyWatchedRepos (the /users/{username}/subscriptions +
+ * /user/subscriptions mounts, api.go:1109/1215 at 099abf5db4),
  * follower.go ListMyFollowing).
+ *
+ * RE-PIN 099abf5db4 (REPIN-WATCH 2026-11-20, window fc49368845..099abf5db4):
+ * the watch routes' only deltas are annotation/wire-neutral here —
+ * 5671c5192d folded their declared 404s into a single `default: error`
+ * swagger response (our `responses` blocks keep the explicit statuses — the
+ * admin-t2 documented-superset convention) and added the missing post-error
+ * `return` (our throw-style ApiError has no fall-through); db9d2944d8 loads
+ * repo attributes before convert so watched repos render their primary
+ * language — ours serializes through the shared toApiRepository arm, where
+ * `language` stays "" under the SPEC-0005 engine-stats deferral (serializer
+ * arm = REPIN-REPO's file, handoff recorded). 6782d0a37d's owner-skip
+ * removal never touched this listing: WatchedReposOptions.ToConds
+ * (models/repo/user_repo.go:82-99, unchanged in the window) already gated
+ * IncludePrivate through AccessibleRepositoryCondition, and the route sets
+ * no RepoOwnerID.
  *
  * Auth (upstream registration):
  *   - the repo listings ride `repoAssignment()` — anonymous reads on public
@@ -238,7 +255,8 @@ export function registerSocialT2Routes(
     return c.json(items.map((pair) => toApiRepository(viewer, pair)), 200);
   });
 
-  // GET /user/subscriptions — GetMyWatchedRepos (user/subscribe.go).
+  // GET /user/subscriptions — GetMyWatchedRepos (routers/api/v1/user/watch.go,
+  // mounted api.go:1215 at 099abf5db4).
   app.openapi(userCurrentListSubscriptionsRoute(requireAuth), async (c) => {
     const doer = await requireDoerRow(c.env.DB, c.get("authUser"));
     const listOptions = parseListOptions(new URL(c.req.url));
@@ -253,7 +271,8 @@ export function registerSocialT2Routes(
     return c.json(items.map((pair) => toApiRepository(viewer, pair)), 200);
   });
 
-  // GET /users/{username}/subscriptions — GetWatchedRepos: same visibility
+  // GET /users/{username}/subscriptions — GetWatchedRepos (routers/api/v1/
+  // user/watch.go, mounted api.go:1109 at 099abf5db4): same visibility
   // anchor as the starred variant (the requesting doer sees public + own).
   app.openapi(userListSubscriptionsRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");

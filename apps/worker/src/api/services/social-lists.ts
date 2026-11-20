@@ -10,8 +10,9 @@ import { WatchMode } from "./repo-watchers";
  * rows: repoListStargazers / repoListSubscribers / userListStarred /
  * userCurrentListSubscriptions / userListSubscriptions — upstream
  * routers/api/v1/repo/star.go ListStargazers, repo/subscribe.go Subscribers,
- * user/star.go GetStarredRepos, repo/subscribe.go MySubscriptions plus the
- * /users variant).
+ * user/star.go GetStarredRepos, routers/api/v1/user/watch.go
+ * GetMyWatchedRepos (/user/subscriptions) + GetWatchedRepos
+ * (/users/{username}/subscriptions)).
  *
  * Pure reads over the migrated `stars` / `repo_watchers` tables (0008) — the
  * same stores services/stars.ts and services/repo-watchers.ts write; Drizzle
@@ -84,13 +85,25 @@ export async function listRepoSubscribers(
 }
 
 /**
- * GetWatchedRepos (models/repo/user_repo.go:81-113) — the repositories one
- * user watches, newest-repo order not modeled: the same numeric-id ordering the
+ * GetWatchedRepos (models/repo/user_repo.go:82-114 — ToConds :82-100,
+ * GetWatchedRepos :112-114) — the repositories one user watches,
+ * newest-repo order not modeled: the same numeric-id ordering the
  * starred list uses (`CAST(id AS INTEGER)` — the text-id convention). The
  * visibility predicate mirrors services/stars.ts listStarredRepositories:
  * public rows plus rows owned by the REQUESTING doer; the admin arm drops
  * the filter entirely. Mode-aware: ToConds' `watch.mode <> WatchModeDont`
- * (user_repo.go:100-101) — an ignored repo leaves the watched list.
+ * (user_repo.go:97-99) — an ignored repo leaves the watched list.
+ *
+ * RE-PIN 099abf5db4 (REPIN-WATCH 2026-11-20): models/repo/user_repo.go is
+ * UNTOUCHED in the window fc49368845..099abf5db4 — this arm's upstream
+ * semantics are byte-stable (the route-side deltas — 5671c5192d's missing
+ * `return`, db9d2944d8's attribute pre-load, the swagger fold — live in
+ * routers/api/v1/user/watch.go and are noted on routes/social-t2.ts).
+ * 6782d0a37d/03fc2bdcc8's repo_list.go accessibility changes do not reach
+ * this listing: the route builds WatchedReposOptions (no RepoOwnerID,
+ * unit.TypeInvalid-equivalent — ToConds always applied
+ * AccessibleRepositoryCondition for IncludePrivate), never
+ * SearchRepositoryCondition.
  */
 export async function listWatchedRepositories(
   d1: D1Database,
