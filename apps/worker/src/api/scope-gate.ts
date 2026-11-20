@@ -16,6 +16,20 @@
  *     of the main /repos group (api.go:1554) does NOT apply to them;
  *   - /repos/{owner}/{repo}/notifications is its own sibling group gated
  *     `notification` (api.go:1686-1690);
+ *   - RE-PIN 099abf5db4 (da7b81d407): the statuses family moved OUT of the
+ *     repo-scoped /repos group onto a top-level group gated commitstatus-ONLY
+ *     (api.go:1568-1583): `/repos/{o}/{r}/statuses/{sha}` (GET+POST combo) and
+ *     the commits PathGroup's GET arms `/commits/{ref}/status|statuses`. The
+ *     `commitstatus` category is new in the grammar (auth/scopes.ts, same
+ *     commit), and the repository scopes SUBSUME it (read:repository ⇒
+ *     read:commitstatus; write:repository ⇒ write:commitstatus), so the
+ *     resulting polarity is: a repository token still passes the family
+ *     (GET at read:repository; POST needs write:repository — read:repository
+ *     lacks the write:commitstatus bit), while a commitstatus-only token
+ *     passes the family and NOTHING else under /repos; the PathGroup arms are
+ *     GET-only upstream, so a write to `/commits/{ref}/status` falls through
+ *     to the repo-scope group (write:repository) — row order + the methods
+ *     filter below encode exactly that;
  *   - /users/{username}/orgs is a sibling of the two other /users groups and
  *     is gated `user` AND `organization` (api.go:1718-1721), while every
  *     other /users path is gated plain `user` (api.go:1049-1096);
@@ -84,7 +98,7 @@ interface ScopeGroupRow {
  * fallback rows; nested additions encode BOTH categories in one row.
  */
 const SCOPE_GROUP_ROWS: readonly ScopeGroupRow[] = [
-  // --- /repos tree (three sibling chi groups over one URL space) ------------
+  // --- /repos tree (four sibling chi groups over one URL space) ------------
   { pattern: /^\/repos\/issues(?:\/|$)/, categories: ["issue"], cite: "api.go:1692-1693 (/repos/issues/search)" },
   {
     pattern: /^\/repos\/[^/]+\/[^/]+\/(?:issues|labels|milestones|projects)(?:\/|$)/,
@@ -96,7 +110,25 @@ const SCOPE_GROUP_ROWS: readonly ScopeGroupRow[] = [
     categories: ["notification"],
     cite: "api.go:1686-1690 (repo notifications sibling group)",
   },
-  { pattern: /^\/repos(?:\/|$)/, categories: ["repository"], cite: "api.go:1234-1554 (repo group)" },
+  {
+    // da7b81d407 / api.go:1568-1583 — the statuses combo moved OUT of the
+    // repo-scoped group; exactly one {sha} segment (chi `{sha}`), anchored so
+    // `/statuses` bare or deeper paths stay on the repository row.
+    pattern: /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/,
+    categories: ["commitstatus"],
+    cite: "api.go:1574-1576 (statuses combo, top-level commitstatus-scope group)",
+  },
+  {
+    // The commits PathGroup's GET arms (api.go:1580-1583) — `<ref:*>` spans
+    // slashes upstream, hence the multi-segment ref; GET/HEAD only, so a
+    // write to `/commits/{ref}/status` falls to the repository row below,
+    // exactly like upstream's unmatched-method fall-through.
+    pattern: /^\/repos\/[^/]+\/[^/]+\/commits\/.+\/status(?:es)?$/,
+    categories: ["commitstatus"],
+    methods: ["GET", "HEAD"],
+    cite: "api.go:1578-1582 (commits PathGroup: GET <ref>/status|statuses arms)",
+  },
+  { pattern: /^\/repos(?:\/|$)/, categories: ["repository"], cite: "api.go:1254-1566 (repo group; statuses moved out, da7b81d407)" },
   { pattern: /^\/repositories(?:\/|$)/, categories: ["repository"], cite: "api.go:1231-1232 (GET /repositories/{id})" },
 
   // --- /users + /user trees -------------------------------------------------

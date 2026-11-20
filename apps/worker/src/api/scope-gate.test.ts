@@ -21,7 +21,14 @@
  *     repo-scope gate of the main /repos group does not apply there;
  *   - token CRUD keeps its user-category arm (auth/router.ts's own
  *     requireScope("user"), api.go:1060-1071): read:user passes, a
- *     repository-scoped token 403s with required=[read:user].
+ *     repository-scoped token 403s with required=[read:user];
+ *   - the statuses family is commitstatus-ONLY (re-pin 099abf5db4,
+ *     da7b81d407, api.go:1568-1583): a write:commitstatus token reads and
+ *     writes it but nothing else under /repos; read:commitstatus fails the
+ *     POST (method-derived level); read:repository still reads the family
+ *     (repository bits SUBSUME commitstatus — access_token_scope.go) but
+ *     cannot write it; the commits PathGroup arms are GET-only, so a write
+ *     to /commits/{ref}/status falls to the repository row.
  */
 
 import { SELF, applyD1Migrations } from "cloudflare:test";
@@ -151,6 +158,117 @@ describe("tree-wide token-scope gates (auth-parity H1)", () => {
     const repo = await SELF.fetch(base, { headers: { authorization: basicTokenHeader(issueToken) } });
     expect(repo.status).toBe(403);
     expect(await repo.json()).toEqual(scopeForbidden("read:repository", "read:issue"));
+  });
+
+  it("the statuses family is commitstatus-only: write:commitstatus reads and writes it, repo metadata 403s", async () => {
+    const seeded = await seedOwnerWithRepo("cspin");
+    const csToken = (await mintFor(seeded.id, "cs", "write:commitstatus")).plaintext;
+    const base = `${ORIGIN}/api/v1/repos/${seeded.username.toLowerCase()}/cspin`;
+    const sha = "b".repeat(40);
+
+    // GET /statuses/{sha} (unknown sha → the documented empty list, 200).
+    const listed = await SELF.fetch(`${base}/statuses/${sha}`, {
+      headers: { authorization: basicTokenHeader(csToken) },
+    });
+    expect(listed.status).toBe(200);
+
+    // POST /statuses/{sha} — the write level of the same category (201; the
+    // well-formed unknown sha is stored, the documented deviation).
+    const created = await SELF.fetch(`${base}/statuses/${sha}`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(csToken), "content-type": "application/json" },
+      body: JSON.stringify({ state: "success", context: "ci/scope-gate" }),
+    });
+    expect(created.status).toBe(201);
+
+    // The commits PathGroup GET arms answer under the same category.
+    const byRefStatuses = await SELF.fetch(`${base}/commits/${sha}/statuses`, {
+      headers: { authorization: basicTokenHeader(csToken) },
+    });
+    expect(byRefStatuses.status).toBe(200);
+    const byRefStatus = await SELF.fetch(`${base}/commits/${sha}/status`, {
+      headers: { authorization: basicTokenHeader(csToken) },
+    });
+    expect(byRefStatus.status).toBe(200);
+
+    // …while repo metadata (every other /repos path) stays repository-gated —
+    // the family's whole point (api.go:1568 "outside /repos so tokens need
+    // only the commitstatus scope").
+    const repo = await SELF.fetch(base, { headers: { authorization: basicTokenHeader(csToken) } });
+    expect(repo.status).toBe(403);
+    expect(await repo.json()).toEqual(scopeForbidden("read:repository", "write:commitstatus"));
+  });
+
+  it("a read:commitstatus token passes the GET arms but 403s the POST with required=[write:commitstatus]", async () => {
+    const seeded = await seedOwnerWithRepo("csro");
+    const csRead = (await mintFor(seeded.id, "cs-ro", "read:commitstatus")).plaintext;
+    const base = `${ORIGIN}/api/v1/repos/${seeded.username.toLowerCase()}/csro`;
+    const sha = "c".repeat(40);
+
+    const listed = await SELF.fetch(`${base}/statuses/${sha}`, {
+      headers: { authorization: basicTokenHeader(csRead) },
+    });
+    expect(listed.status).toBe(200);
+
+    const created = await SELF.fetch(`${base}/statuses/${sha}`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(csRead), "content-type": "application/json" },
+      body: JSON.stringify({ state: "success" }),
+    });
+    expect(created.status).toBe(403);
+    expect(await created.json()).toEqual(scopeForbidden("write:commitstatus", "read:commitstatus"));
+  });
+
+  it("repository scopes subsume commitstatus: read:repository reads the family but cannot write it", async () => {
+    const seeded = await seedOwnerWithRepo("reposub");
+    const readToken = (await mintFor(seeded.id, "ro-reposub", "read:repository")).plaintext;
+    const base = `${ORIGIN}/api/v1/repos/${seeded.username.toLowerCase()}/reposub`;
+    const sha = "d".repeat(40);
+
+    const listed = await SELF.fetch(`${base}/statuses/${sha}`, {
+      headers: { authorization: basicTokenHeader(readToken) },
+    });
+    expect(listed.status).toBe(200);
+    const combined = await SELF.fetch(`${base}/commits/${sha}/status`, {
+      headers: { authorization: basicTokenHeader(readToken) },
+    });
+    expect(combined.status).toBe(200);
+
+    // read:repository carries the read:commitstatus bit but NOT the
+    // write:commitstatus bit (access_token_scope.go's bitmap) — the POST
+    // fails the commitstatus gate even though the repo gate would pass it.
+    const created = await SELF.fetch(`${base}/statuses/${sha}`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(readToken), "content-type": "application/json" },
+      body: JSON.stringify({ state: "success" }),
+    });
+    expect(created.status).toBe(403);
+    expect(await created.json()).toEqual(scopeForbidden("write:commitstatus", "read:repository"));
+  });
+
+  it("the commits PathGroup arms are GET-only: a write there answers the repository gate", async () => {
+    const seeded = await seedOwnerWithRepo("pathgrp");
+    const csToken = (await mintFor(seeded.id, "cs-pathgrp", "write:commitstatus")).plaintext;
+    const base = `${ORIGIN}/api/v1/repos/${seeded.username.toLowerCase()}/pathgrp`;
+    const sha = "e".repeat(40);
+
+    // POST /commits/{ref}/status — no commitstatus row matches a write here;
+    // the path falls to the repository row (upstream's unmatched-method
+    // fall-through out of the PathGroup).
+    const posted = await SELF.fetch(`${base}/commits/${sha}/status`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(csToken), "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(posted.status).toBe(403);
+    expect(await posted.json()).toEqual(scopeForbidden("write:repository", "write:commitstatus"));
+
+    // A non-status commits path (GetSingleCommit's shape) stays repository-gated.
+    const single = await SELF.fetch(`${base}/commits/${sha}`, {
+      headers: { authorization: basicTokenHeader(csToken) },
+    });
+    expect(single.status).toBe(403);
+    expect(await single.json()).toEqual(scopeForbidden("read:repository", "write:commitstatus"));
   });
 
   it("token CRUD keeps its user-category arm: read:user passes, read:repository 403s with required=[read:user]", async () => {

@@ -2,12 +2,13 @@
  * Access-token scope grammar — SPEC-0002 §2.4.
  *
  * Faithful port of upstream `gitea/models/auth/access_token_scope.go` at the
- * vendored pin (v29.0.0-dev-208-gfc493688): the exact scope strings, the
- * write⇒read implication baked into the bitmap, the normalization order, and
- * the `all` literal collapse all match upstream byte-for-byte.
+ * vendored pin (099abf5db4 — including da7b81d407's commitstatus category):
+ * the exact scope strings, the write⇒read implication baked into the bitmap,
+ * the cross-category repository⇒commitstatus implication, the normalization
+ * order, and the `all` literal collapse all match upstream byte-for-byte.
  *
  * Upstream stores the scope as a ≤64-bit bitmap. The frozen grammar uses
- * 19 bits (1 public-only + 9 categories × read/write); we use plain numbers
+ * 21 bits (1 public-only + 10 categories × read/write); we use plain numbers
  * (32-bit bitwise ops), which leaves headroom up to 15 categories. If a
  * future SPEC grows the category set beyond that, switch to BigInt here —
  * no caller-visible change.
@@ -23,6 +24,7 @@ export const SCOPE_CATEGORIES = [
   "issue",
   "repository",
   "user",
+  "commitstatus",
 ] as const;
 
 export type ScopeCategory = (typeof SCOPE_CATEGORIES)[number];
@@ -45,7 +47,19 @@ const writeBits = (categoryIndex: number): number => (1 << (2 + 2 * categoryInde
 
 const categoryBits = (category: ScopeCategory): { read: number; write: number } => {
   const index = SCOPE_CATEGORIES.indexOf(category);
-  return { read: readBits(index), write: writeBits(index) };
+  const bits = { read: readBits(index), write: writeBits(index) };
+  // Upstream da7b81d407 (access_token_scope.go bitmap definition, repo block):
+  // the repository scope bits INCLUDE the commitstatus scope bits —
+  // read:repository ⇒ read:commitstatus and write:repository ⇒
+  // write:commitstatus — so a repository-scoped token keeps passing the
+  // commit-status family, which since the route-table re-pin (api.go:1568-1583)
+  // is gated commitstatus-ONLY (a commitstatus token reaches nothing else).
+  if (category === "repository") {
+    const commitStatus = categoryBits("commitstatus");
+    bits.read |= commitStatus.read;
+    bits.write |= commitStatus.write;
+  }
+  return bits;
 };
 
 /** All grantable permission scopes (upstream `accessTokenScopeAllBits`). */
@@ -77,8 +91,16 @@ const allScopesInNormalizeOrder: readonly string[] = [
   ...SCOPE_CATEGORIES.flatMap((category) => [`write:${category}`, `read:${category}`] as const),
 ];
 
-const ALL_SCOPE_LITERAL =
-  SCOPE_CATEGORIES.map((category) => `write:${category}`).join(",");
+/**
+ * The `all` collapse literal — upstream `toScope`'s exact ReplaceAll argument
+ * (access_token_scope.go:323-327). `commitstatus` is deliberately NOT in it:
+ * its bits are subsumed by `write:repository`, so the normalization walk below
+ * never emits `write:commitstatus` once the full chain is present — a
+ * ten-write literal could never match and the `all` collapse would break.
+ */
+const ALL_SCOPE_LITERAL = SCOPE_CATEGORIES.filter((category) => category !== "commitstatus")
+  .map((category) => `write:${category}`)
+  .join(",");
 
 /** Error thrown for unknown scope strings; message matches upstream verbatim. */
 export class InvalidScopeError extends Error {

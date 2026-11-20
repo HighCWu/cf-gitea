@@ -20,7 +20,7 @@ import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 
 /**
- * The five RUNTIME-ONLY admin ops the remaining-API inventory batches as
+ * The two RUNTIME-ONLY admin ops the remaining-API inventory batches as
  * `wave-api-admin-degenerate` (docs/compat/api-remaining-inventory.md,
  * Batch 11) — every op here is DEGENERATE-BUT-HONEST: the answered shapes are
  * exactly what upstream gives when the backing substrate is absent, and the
@@ -65,45 +65,31 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *             exactly like an unknown op", admin-monitor.tsx
  *             RUNNABLE_CRON_ARMS); extending run capability extends BOTH
  *             this map and the monitor's set (its extension rule says so).
- *   unadopted GET  /admin/unadopted                (adminUnadoptedList)
- *             POST /admin/unadopted/{owner}/{repo} (adminAdoptRepository)
- *             DELETE …/{owner}/{repo}              (adminDeleteUnadoptedRepository)
- *             — upstream scans the server's git-root filesystem for repo
- *               directories with no `repository` row
- *               (gitea/routers/api/v1/admin/adopt.go over
- *               repo_service.ListUnadoptedRepositories). cf-gitea has NO
- *               filesystem: every repository that exists is a `repositories`
- *               registry row created through the API, so the unadopted set is
- *               structurally empty. The list answers the always-empty
- *               StringSlice (the landed honest-empty convention,
- *               orgListTeamActivityFeeds — routes/org-teams.ts), and adopt /
- *               delete answer upstream's own not-found arm: EVERY branch of
- *               both upstream handlers (unknown owner → APIErrorNotFound();
- *               adopted (`has`) → APIErrorNotFound(); not on disk
- *               (`!exist`) → APIErrorNotFound()) converges on the same
- *               `404 {"message":"not found"}` body (adopt.go — all six arms,
- *               both handlers), and all six are reachable-or-forced here:
- *               the two 204 arms require an on-disk unadopted directory,
- *               which no cf-gitea code path can produce. The unconditional
- *               404 is not a stub of upstream's answer — it IS upstream's
- *               answer for every request our storage model admits.
+ *
+ *             REMOVED SURFACE (re-pin 099abf5db4): the unadopted trio this
+ *             module used to carry (GET /admin/unadopted,
+ *             POST/DELETE /admin/unadopted/{owner}/{repo}) is GONE — upstream
+ *             1554b6c939 removed the whole repository-adopt feature
+ *             (#40181): `routers/api/v1/admin/adopt.go` is deleted, api.go
+ *             registers no unadopted route, and the web pages went with it.
+ *             Serving arms upstream no longer registers would be a surface
+ *             upstream itself refuses, so the routes were dropped instead of
+ *             kept degenerate; requests now take the plain routing 404, which
+ *             is exactly what upstream answers at the pin.
  *
  * Auth wiring mirrors the /admin group verbatim (api.go:1824-, the
  * admin-t2.ts seams): reqToken → the shared requireAuth middleware (runtime
  * 401 `token is required` — the contract declares no 401s in this tag, so the
  * code stays undeclared per the admin-t2 convention); reqSiteAdmin → the
  * local requireSiteAdmin copy below (403 `user should be the site admin` —
- * contract-declared on the ops whose swagger comments list it). Two
- * response-set honesty notes carried in scripts/check-openapi.mjs
+ * contract-declared on the ops whose swagger comments list it). The one
+ * response-set honesty note carried in scripts/check-openapi.mjs
  * RUNTIME_ONLY_RESPONSES:
  *   - POST /admin/cron/{task}: upstream's OWN swagger comment documents only
  *     {204,404} (admin/cron.go PostCronTask) while the group's reqSiteAdmin
  *     403s non-admins before the handler runs — its sibling ListCronTasks
  *     DOES declare the 403, so the omission is a doc-comment gap upstream
  *     sends anyway; we declare the 403.
- *   - DELETE /admin/unadopted/{owner}/{repo}: upstream documents {204,403}
- *     but its handler answers APIErrorNotFound() for every miss (adopt.go);
- *     in cf-gitea that miss is EVERY call, so the 404 is declared.
  *
  * Degenerate-value notes (the Cron render): an arm with no `cron_state` row
  * (nothing recorded yet — a fresh deployment) renders Go's zero values —
@@ -149,9 +135,6 @@ const cronSchema = z.object({
 
 /** `#/responses/CronList` — plain `Cron[]`. */
 const cronListSchema = z.array(cronSchema);
-
-/** `#/responses/StringSlice` — plain `string[]`. */
-const stringSliceSchema = z.array(z.string());
 
 // ---------------------------------------------------------------------------
 // The cron registry — the arm census (CRON_ARMS, services/cron-state.ts) for
@@ -349,75 +332,6 @@ const adminCronRunRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const adminUnadoptedListRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
-  createRoute({
-    method: "get",
-    path: "/admin/unadopted",
-    middleware: [requireAuth, requireSiteAdmin()],
-    tags: ["admin"],
-    summary: "List unadopted repositories",
-    operationId: "adminUnadoptedList",
-    request: {
-      query: z.object({
-        page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
-        limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
-        query: z
-          .string()
-          .optional()
-          .openapi({ description: "glob pattern of repositories to search for, in the form owner or owner/repo" }),
-      }),
-    },
-    responses: {
-      200: { description: "StringSlice", content: { "application/json": { schema: stringSliceSchema } } },
-      403: forbiddenResponse,
-    },
-  });
-
-const adminAdoptRepositoryRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
-  createRoute({
-    method: "post",
-    path: "/admin/unadopted/{owner}/{repo}",
-    middleware: [requireAuth, requireSiteAdmin()],
-    tags: ["admin"],
-    summary: "Adopt unadopted files as a repository",
-    operationId: "adminAdoptRepository",
-    request: {
-      params: z.object({
-        owner: z.string().min(1).openapi({ description: "owner of the repo" }),
-        repo: z.string().min(1).openapi({ description: "name of the repo" }),
-      }),
-    },
-    responses: {
-      204: { description: "empty" },
-      403: forbiddenResponse,
-      404: notFoundResponse,
-    },
-  });
-
-const adminDeleteUnadoptedRepositoryRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
-  createRoute({
-    method: "delete",
-    path: "/admin/unadopted/{owner}/{repo}",
-    middleware: [requireAuth, requireSiteAdmin()],
-    tags: ["admin"],
-    summary: "Delete unadopted files",
-    operationId: "adminDeleteUnadoptedRepository",
-    request: {
-      params: z.object({
-        owner: z.string().min(1).openapi({ description: "owner of the repo" }),
-        repo: z.string().min(1).openapi({ description: "name of the repo" }),
-      }),
-    },
-    responses: {
-      204: { description: "empty" },
-      403: forbiddenResponse,
-      // Runtime-only (check-openapi.mjs RUNTIME_ONLY_RESPONSES): upstream's
-      // handler 404s every miss (adopt.go) though its swagger documents only
-      // {204,403}; in cf-gitea the miss is every call (module header).
-      404: notFoundResponse,
-    },
-  });
-
 // ---------------------------------------------------------------------------
 // Registration — handlers
 // ---------------------------------------------------------------------------
@@ -459,29 +373,5 @@ export function registerAdminDegenerateRoutes(app: OpenAPIHono<ApiEnv>, requireA
       });
     }
     return c.body(null, 204);
-  });
-
-  // GET /admin/unadopted — always-empty (the honest-empty convention): no
-  // filesystem exists, so the unadopted set is structurally empty for every
-  // page and every glob. Upstream's own Page==0-defaulting rides
-  // parseListOptions (page >= 1 always).
-  app.openapi(adminUnadoptedListRoute(requireAuth), (c) => {
-    const options = parseListOptions(new URL(c.req.url));
-    setPaginationHeaders(c, 0, options);
-    return c.json([] as string[], 200);
-  });
-
-  // POST/DELETE /admin/unadopted/{owner}/{repo} — the unconditional not-found
-  // arm (module header: every upstream branch converges on this body, and
-  // the two 204 branches require an on-disk unadopted directory that no
-  // cf-gitea code path can produce).
-  const unadoptedMiss = (): ApiError => new ApiError(404, "not found");
-
-  app.openapi(adminAdoptRepositoryRoute(requireAuth), () => {
-    throw unadoptedMiss();
-  });
-
-  app.openapi(adminDeleteUnadoptedRepositoryRoute(requireAuth), () => {
-    throw unadoptedMiss();
   });
 }

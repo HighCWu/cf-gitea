@@ -1,13 +1,17 @@
 /**
- * The five RUNTIME-ONLY admin ops (routes/admin-degenerate.ts — the
+ * The two RUNTIME-ONLY admin ops (routes/admin-degenerate.ts — the
  * inventory's `wave-api-admin-degenerate` batch): adminCronList/adminCronRun
  * (GET/POST /admin/cron) over the scheduled dispatcher's arm census
  * (CRON_ARMS — the cron_state store's registry) with the runnable-producer
- * run gate, and the unadopted-repository trio (GET /admin/unadopted,
- * POST/DELETE /admin/unadopted/{owner}/{repo}) over the structurally-empty
- * unadopted set. Per-arm contract verification: every declared response code
- * of every op is exercised, including the two RUNTIME_ONLY_RESPONSES-documented
- * codes (the cron-run 403 and the unadopted-delete 404).
+ * run gate. Per-arm contract verification: every declared response code of
+ * every op is exercised, including the RUNTIME_ONLY_RESPONSES-documented
+ * cron-run 403.
+ *
+ * The unadopted-repository trio this battery used to pin (GET
+ * /admin/unadopted, POST/DELETE /admin/unadopted/{owner}/{repo}) is GONE:
+ * upstream 1554b6c939 removed the whole adopt feature (#40181), so the routes
+ * were deleted from the module (REPIN handoff — requests now take the plain
+ * routing 404, upstream's own answer at the pin).
  *
  * Standalone mount per the tier2-extras.test.ts convention (the routes ARE
  * registered in router.ts by the orchestrator after this batch). The stub
@@ -187,9 +191,6 @@ describe("admin gating", () => {
       ["/admin/cron", authed(undefined, TOKEN_NEIGHBOR)],
       ["/admin/cron/update_mirrors", authed({ method: "POST" }, TOKEN_NEIGHBOR)],
       ["/admin/cron/no-such-task", authed({ method: "POST" }, TOKEN_NEIGHBOR)],
-      ["/admin/unadopted", authed(undefined, TOKEN_NEIGHBOR)],
-      ["/admin/unadopted/neighbor/whatever", authed({ method: "POST" }, TOKEN_NEIGHBOR)],
-      ["/admin/unadopted/neighbor/whatever", authed({ method: "DELETE" }, TOKEN_NEIGHBOR)],
     ];
     for (const [path, init] of checks) {
       const res = await adminSend(path, init);
@@ -441,88 +442,6 @@ describe("adminCronRun (POST /admin/cron/{task})", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// adminUnadoptedList — GET /admin/unadopted (adopt.go ListUnadoptedRepositories
-// over the structurally-empty set — the honest-empty convention)
-// ---------------------------------------------------------------------------
-
-describe("adminUnadoptedList (GET /admin/unadopted)", () => {
-  it("answers the always-empty StringSlice with total 0", async () => {
-    const res = await adminSend("/admin/unadopted", authed());
-    expect(res.status).toBe(200);
-    expect(res.headers.get("X-Total-Count")).toBe("0");
-    const empty: unknown[] = await res.json();
-    expect(empty).toEqual([]);
-  });
-
-  it("stays empty for any glob and even with registered repositories", async () => {
-    await seedRepo(1, "cf-gitea-stub", "registered", "7403");
-    for (const query of ["", "?query=cf-gitea-stub/*", "?query=registered&page=3"]) {
-      const res = await adminSend(`/admin/unadopted${query}`, authed());
-      expect(res.status, query).toBe(200);
-      expect(res.headers.get("X-Total-Count"), query).toBe("0");
-      const list: unknown[] = await res.json();
-      expect(list, query).toEqual([]);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// adminAdoptRepository — POST /admin/unadopted/{owner}/{repo} (adopt.go: every
-// arm converges on APIErrorNotFound(); the 204 arm needs an on-disk unadopted
-// directory, which no cf-gitea code path can produce)
-// ---------------------------------------------------------------------------
-
-describe("adminAdoptRepository (POST /admin/unadopted/{owner}/{repo})", () => {
-  it("404s an unknown owner", async () => {
-    const res = await adminSend("/admin/unadopted/ghost/repo", authed({ method: "POST" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
-  });
-
-  it("404s a known owner with no such repo (nothing is on disk to adopt)", async () => {
-    const res = await adminSend("/admin/unadopted/neighbor/repo", authed({ method: "POST" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
-  });
-
-  it("404s an already-registered (adopted) repository", async () => {
-    await seedRepo(1, "cf-gitea-stub", "adopted", "7404");
-    const res = await adminSend("/admin/unadopted/cf-gitea-stub/adopted", authed({ method: "POST" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// adminDeleteUnadoptedRepository — DELETE /admin/unadopted/{owner}/{repo}
-// (adopt.go: same convergence; the 404 is the RUNTIME_ONLY_RESPONSES entry —
-// the contract documents {204,403} only)
-// ---------------------------------------------------------------------------
-
-describe("adminDeleteUnadoptedRepository (DELETE /admin/unadopted/{owner}/{repo})", () => {
-  it("404s an unknown owner", async () => {
-    const res = await adminSend("/admin/unadopted/ghost/repo", authed({ method: "DELETE" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
-  });
-
-  it("404s a known owner with no such repo (no unadopted files exist)", async () => {
-    const res = await adminSend("/admin/unadopted/neighbor/repo", authed({ method: "DELETE" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
-  });
-
-  it("404s an already-registered repository", async () => {
-    await seedRepo(neighborId, "neighbor", "kept", "7405");
-    const res = await adminSend("/admin/unadopted/neighbor/kept", authed({ method: "DELETE" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
-  });
-});
+// The unadopted trio's describes were removed with the surface itself —
+// upstream 1554b6c939 deleted the adopt feature, so /admin/unadopted is no
+// longer served here (module header); its arms are unrecoverable 404s.

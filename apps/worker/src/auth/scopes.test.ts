@@ -25,6 +25,7 @@ describe("GetAccessTokenCategories equivalent", () => {
     expect(sortedCategories).toEqual([
       "activitypub",
       "admin",
+      "commitstatus",
       "issue",
       "misc",
       "notification",
@@ -54,6 +55,13 @@ describe("normalizeScope (upstream Normalize table)", () => {
       "write:activitypub,write:admin,write:misc,write:notification,write:organization,write:package,write:issue,write:repository,write:user,public-only",
       "public-only,all",
     ],
+    // Upstream da7b81d407's added normalize cases: the repository bits
+    // subsume the commitstatus bits, so a redundant write:commitstatus
+    // vanishes under write:repository — but read:repository + an independent
+    // write:commitstatus keeps both entries (the walk can't skip the write
+    // bit the read scope lacks).
+    ["write:repository,write:commitstatus", "write:repository"],
+    ["read:repository,write:commitstatus", "read:repository,write:commitstatus"],
   ];
 
   for (const category of SCOPE_CATEGORIES) {
@@ -117,6 +125,36 @@ describe("ScopeSet.has (upstream HasScope table)", () => {
 
   it("throws on an invalid required scope (fail closed)", () => {
     expect(() => ScopeSet.parse("all").has("banana")).toThrow(InvalidScopeError);
+  });
+});
+
+describe("repository⇒commitstatus implication (da7b81d407's bitmap)", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["read:repository", "read:commitstatus", true],
+    ["write:repository", "read:commitstatus", true],
+    ["write:repository", "write:commitstatus", true],
+    ["read:repository", "write:commitstatus", false],
+    ["read:commitstatus", "read:commitstatus", true],
+    ["write:commitstatus", "read:commitstatus", true],
+    ["read:commitstatus", "write:commitstatus", false],
+    ["write:commitstatus", "read:repository", false],
+    ["write:commitstatus", "write:repository", false],
+    ["read:commitstatus", "read:repository", false],
+    ["all", "read:commitstatus", true],
+    ["all", "write:commitstatus", true],
+  ];
+  for (const [scope, required, expected] of cases) {
+    it(`hasScope(${JSON.stringify(scope)}, ${JSON.stringify(required)}) === ${expected}`, () => {
+      expect(ScopeSet.parse(scope).has(required)).toBe(expected);
+    });
+  }
+
+  it("write:repository normalizes without a redundant commitstatus entry; the reverse pair keeps both", () => {
+    expect(ScopeSet.parse("write:repository,write:commitstatus").toString()).toBe("write:repository");
+    expect(ScopeSet.parse("read:repository,write:commitstatus").toString()).toBe("read:repository,write:commitstatus");
+    expect(ScopeSet.parse("read:repository").toString()).toBe("read:repository");
+    expect(ScopeSet.parse("read:commitstatus").toString()).toBe("read:commitstatus");
+    expect(ScopeSet.parse("all").toString()).toBe("all");
   });
 });
 
