@@ -395,7 +395,7 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
       async (req: FetchTaskRequest, c) => {
         const runner = runnerOf(c);
         // The served request's AbortSignal is the Workers analog of upstream's
-        // request context (task.go:123-128): pickTask releases the claim when
+        // request context (task.go:131-134): pickTask releases the claim when
         // the client hung up while the payload was assembling.
         const result = await fetchTask(c.env, c.env.DB, runner, req.tasksVersion, appUrlOf(c), c.req.raw.signal);
         return {

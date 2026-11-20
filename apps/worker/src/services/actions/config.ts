@@ -382,7 +382,7 @@ export async function applyRepoTokenPermissionsForm(d1: D1Database, repoId: stri
 // DisabledScopedWorkflows map's mutators (repo_unit_actions.go:111-131),
 // the effective-source reads they predicate on (models/actions/
 // scoped_workflow.go:84-151) and the workflow-list pages' toggle arm
-// (routers/web/repo/actions/view.go:1324-1375). The source-repo id is the
+// (routers/web/repo/actions/view.go:1320-1371). The source-repo id is the
 // TEXT repositories.id space (the schema's own TEXT adaptation,
 // schema.ts:3931 — upstream's map[int64][]string keys ride JSON string
 // keys either way).
@@ -392,7 +392,7 @@ export async function applyRepoTokenPermissionsForm(d1: D1Database, repoId: stri
  *  (shared by the toggle and dispatch arms): upstream parses FormInt64 —
  *  absent/junk → 0 and a literal "0" both mean the repo-level arm, and any
  *  NEGATIVE parse is repo-level too (`isScoped := scopedWorkflowSourceRepoID
- *  > 0`, workflow.go:79) — while our source ids are TEXT. "" and "0" and a
+ *  > 0`, workflow.go:80) — while our source ids are TEXT. "" and "0" and a
  *  leading "-" reduce to the repo-level ""; every other nonempty value
  *  rides verbatim as a source-id candidate (a bogus one is policed
  *  downstream: the dispatch's effective-source gate answers not-found, the
@@ -481,8 +481,8 @@ function scopedWorkflowOptedOut(cfg: Pick<RepoActionsConfig, "disabledScopedWork
 
 /** IsScopedWorkflowOptedOut (:117-127) — the store read with upstream's
  *  cheap early-out: an unflagged consumer answers false without touching the
- *  sources table. This is the DISPATCH (workflow.go:84-99) and RERUN
- *  (view.go:929-936) disabled check's scoped arm. */
+ *  sources table. This is the DISPATCH (workflow.go:85-100) and RERUN
+ *  (view.go:925-932) disabled check's scoped arm. */
 export async function isScopedWorkflowOptedOut(d1: D1Database, cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, consumerOwnerId: number, sourceRepoId: string, workflowId: string): Promise<boolean> {
   if (!isScopedWorkflowDisabled(cfg, sourceRepoId, workflowId)) {
     return false;
@@ -490,9 +490,9 @@ export async function isScopedWorkflowOptedOut(d1: D1Database, cfg: Pick<RepoAct
   return scopedWorkflowOptedOut(cfg, await effectiveSourcesFor(d1, consumerOwnerId, sourceRepoId), sourceRepoId, workflowId);
 }
 
-// --- the workflow-list pages' toggle arm (view.go:1324-1375) --------------
+// --- the workflow-list pages' toggle arm (view.go:1320-1371) --------------
 
-/** The disableOrEnableWorkflowFile body (view.go:1324-1375) minus the wire
+/** The disableOrEnableWorkflowFile body (view.go:1320-1371) minus the wire
  *  (the handler owns the form parse, the JSONError/JSONRedirect answers and
  *  the RecordWorkflowToggle emit — the landed actions-workflow-toggle
  *  handler's shape): load the config, branch scoped vs repo-level, persist.

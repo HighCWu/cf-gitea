@@ -481,8 +481,8 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     expect(payload.repository.owner.login).toBe("Bob");
     // exactly ONE arm renders (both are omitempty pointers, hook.go:469-475).
     expect(Object.keys(payload.changes.owner.from)).toEqual(["user"]);
-    expect(payload.changes.owner.from.user.id).toBe(alice.id);
-    expect(payload.changes.owner.from.user.login).toBe("Alice");
+    expect(payload.changes.owner.from.user!.id).toBe(alice.id);
+    expect(payload.changes.owner.from.user!.login).toBe("Alice");
 
     // The feed's actionNotifier twin: ActionTransferRepo (8) with the old
     // full name as content (feed/notifier.go:167-177, display-case
@@ -528,8 +528,8 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     const payload = JSON.parse(rows.find((r) => r.hookId === repoHookId)!.payloadContent) as TransferredPayload;
     expect(payload.action).toBe("transferred");
     expect(Object.keys(payload.changes.owner.from)).toEqual(["organization"]);
-    expect(payload.changes.owner.from.organization.id).toBe(orgId);
-    expect(payload.changes.owner.from.organization.login).toBe("acme");
+    expect(payload.changes.owner.from.organization!.id).toBe(orgId);
+    expect(payload.changes.owner.from.organization!.login).toBe("acme");
     expect(payload.organization.login).toBe("Bob"); // the NEW owner
     expect(payload.sender.login).toBe("Bob"); // the accepting doer (fallback render)
     const transferred = await drizzle(env.DB).select().from(actions).where(eq(actions.opType, ActionType.TransferRepo)).all();
@@ -565,7 +565,7 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     expect(rows.map((r) => r.hookId)).toEqual([repoHookId]);
     const payload = JSON.parse(rows[0]!.payloadContent) as TransferredPayload;
     expect(payload.action).toBe("transferred");
-    expect(payload.changes.owner.from.user.login).toBe("Alice");
+    expect(payload.changes.owner.from.user!.login).toBe("Alice");
   });
 });
 

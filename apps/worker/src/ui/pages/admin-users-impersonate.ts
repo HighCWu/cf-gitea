@@ -1,6 +1,6 @@
 /**
  * The admin user IMPERSONATE write arm (census gap #18's sanctioned
- * follow-up — upstream's admin users group, web.go:818):
+ * follow-up — upstream's admin users group, web.go:787):
  *
  *   POST /-/admin/users/{userid}/impersonate   (admin.ImpersonateUser)
  *
@@ -14,13 +14,13 @@
  * like upstream's SignOut, routers/web/auth/auth.go:469-478 — NO
  * unimpersonate route exists at the pin).
  *
- * ## Upstream behavior at the pin (users.go:563-581)
+ * ## Upstream behavior at the pin (users.go:572-590)
  *
  *   - GetUserByID first: an unknown {userid} answers JSONError("unable to
  *     get user") — 400 — NOT the avatar pair's prepareUserInfo list
- *     redirect (impersonate does its own lookup, users.go:565-568).
+ *     redirect (impersonate does its own lookup, users.go:574-577).
  *   - The bot guard (u.IsTypeBot → JSONError impersonate_bot_not_allowed,
- *     users.go:569-571) is LIVE since B-72 (the users.type 'bot' value
+ *     users.go:578-580) is LIVE since B-72 (the users.type 'bot' value
  *     landed): a bot target answers 400 JSONError with the en-US locale
  *     string ("Bot accounts are non-interactive and cannot be
  *     impersonated.") — the same buildJsonErrorMap shape as the
@@ -29,12 +29,12 @@
  *     (view.tmpl:9) — admin-user-detail.tsx carries that gate.
  *   - The session flip errors "already impersonating a user"
  *     (impersonate.go:16-18) → ctx.ServerError → the 500 page
- *     (users.go:575-577): the port answers the app's plain-text 500
+ *     (users.go:584-586): the port answers the app's plain-text 500
  *     posture — an error status, never a silent redirect (the refusal is
  *     the point: a second impersonate over a live one would destroy the
  *     first admin's only backup).
  *   - Success: JSONRedirect(setting.AppSubURL + "/user/settings")
- *     (users.go:580) — the no-JS family reduction answers 303 See Other
+ *     (users.go:589) — the no-JS family reduction answers 303 See Other
  *     (base.go:157's default; the avatar pair's posture).
  *
  * ## The arm's dependencies (all landed, imported not duplicated)
@@ -120,22 +120,22 @@ import { AuditActions, emitAudit } from "../../services/audit";
 import { impersonateSessionUser } from "../session";
 
 /** The success redirect — upstream
- *  `setting.AppSubURL + "/user/settings"` (users.go:580; AppSubURL is ""
+ *  `setting.AppSubURL + "/user/settings"` (users.go:589; AppSubURL is ""
  *  at our single-host posture). */
 export const IMPERSONATE_SUCCESS_REDIRECT = "/user/settings";
 
-/** The unknown-target JSONError body — users.go:566-568's LITERAL string
+/** The unknown-target JSONError body — users.go:575-577's LITERAL string
  *  under context.go:276-278's shape (`buildJsonErrorMap`: a string message
  *  renders `"renderFormat":"text"`); the wiring answers it 400 (the
  *  org-settings-actions-general json-outcome convention). */
 export const IMPERSONATE_UNKNOWN_USER_ERROR = { errorMessage: "unable to get user", renderFormat: "text" } as const;
 
-/** The refusal's plain-text body — users.go:575-577's ServerError first
+/** The refusal's plain-text body — users.go:584-586's ServerError first
  *  argument, answered 500 (upstream renders the 500 page; the app's
  *  plain-text error posture carries the same status). */
 export const IMPERSONATE_REFUSED_BODY = "unable to impersonate user";
 
-/** The bot-refusal JSONError body — users.go:569-571's
+/** The bot-refusal JSONError body — users.go:578-580's
  *  `ctx.JSONError(ctx.Tr("admin.users.impersonate_bot_not_allowed"))`
  *  rendered at the pin's en-US locale (locale_en-US.json:3095), under
  *  context.go:276-278's buildJsonErrorMap shape — the unknown-user arm's
@@ -155,7 +155,7 @@ export type AdminUserImpersonateOutcome =
 
 /** The target slice the arm needs (any users row passes upstream's
  *  GetUserByID — orgs included; a BOT row refuses at the guard below —
- *  users.go:569-571, live since B-72). `username` + `type` feed the audit
+ *  users.go:578-580, live since B-72). `username` + `type` feed the audit
  *  row's scope snapshot (upstream ScopeFromUser's shape: an org target
  *  scopes as `organization`, refs.go:44-50). */
 export interface AdminImpersonateTarget {
@@ -165,7 +165,7 @@ export interface AdminImpersonateTarget {
 }
 
 /**
- * GetUserByID's lookup (users.go:565-568): the users row by id, or `null`
+ * GetUserByID's lookup (users.go:574-577): the users row by id, or `null`
  * for the unknown-id miss — the caller answers the 400 JSONError, never a
  * 404 and never the avatar pair's list redirect.
  */
@@ -180,7 +180,7 @@ export async function loadAdminImpersonateTarget(d1: D1Database, userId: number)
 
 /**
  * POST /-/admin/users/{userid}/impersonate (admin.ImpersonateUser,
- * users.go:563-581) over the D1 session store: the target lookup, then the
+ * users.go:572-590) over the D1 session store: the target lookup, then the
  * guarded in-place flip (session.ts `impersonateSessionUser` — the admin
  * backup + the user_id move, race-free against a concurrent second
  * impersonate). The caller supplies the §2.4-verified session
@@ -196,7 +196,7 @@ export async function adminUserImpersonate(
 ): Promise<AdminUserImpersonateOutcome> {
   const target = await loadAdminImpersonateTarget(d1, targetUserId);
   if (target === null) return { outcome: "unknown-user" };
-  // Upstream's bot guard (users.go:569-571) — LIVE since B-72: a bot
+  // Upstream's bot guard (users.go:578-580) — LIVE since B-72: a bot
   // target refuses BEFORE the flip (bots are non-interactive; a session
   // flip onto one would be a sign-in-shaped backdoor past their
   // no-password posture). The wiring maps the outcome to the 400

@@ -3,7 +3,7 @@
  * ported from routers/api/actions/runner/runner.go:220-359,
  * models/actions/task.go:447-647 (UpdateTaskByState / StopTask),
  * task_step.go (applyState / validateReportedSteps / updateReportedSteps)
- * and models/actions/run_job.go:642-687 (AggregateJobStatus / the
+ * and models/actions/run_job.go:624-669 (AggregateJobStatus / the
  * attempt-run status mirror).
  *
  * THE COMPLETION-PATH EMITTER (the M3 rewire): updateTask's tail carries the
@@ -104,7 +104,7 @@ export function statusFromResult(result: number): number {
 }
 
 /**
- * AggregateJobStatus (run_job.go:642-687) minus the fail-fast matrix arm
+ * AggregateJobStatus (run_job.go:624-669) minus the fail-fast matrix arm
  * (matrix expansion is M3 — `GetFailFast` reads the deferred matrix payload
  * no v1 row carries; the arm's guard `IsMatrixSiblingOf` can never fire).
  */
@@ -145,7 +145,7 @@ export function aggregateJobStatus(jobs: Array<Pick<RunJobRow, "status" | "conti
 }
 
 /**
- * refreshRunStatus (run_job.go:567-600): recompute the attempt's aggregate
+ * refreshRunStatus (run_job.go:549-582): recompute the attempt's aggregate
  * from its jobs; the latest attempt propagates to the run (status + started/
  * stopped mirrors, UpdateRunAttempt's rules). The M1b substitute for the
  * emitter's run-status leg (module header).
@@ -257,7 +257,7 @@ export async function refreshRunStatus(
   }
 }
 
-/** hasWaitingJobsToPick (run_job.go:449-455) — only bump when waiting work
+/** hasWaitingJobsToPick (run_job.go:447-453) — only bump when waiting work
  *  remains. Exported for the sweeps' cancel/stop arms, whose job-status
  *  writes carry the same UpdateRunJob hook upstream. */
 export async function hasWaitingJobsToPick(d1: D1, repoId: string): Promise<boolean> {
@@ -669,7 +669,7 @@ export async function updateTask(
   // the WorkflowRunStatusUpdate receiver arms on them.
   await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId, bindings);
   if (!preJobWasDone && isDoneStatus(task.status)) {
-    // Only bump when waiting work remains (run_job.go:513-527). The emitter
+    // Only bump when waiting work remains (run_job.go:495-509). The emitter
     // below carries its own wake arm for the jobs IT flips (a needs-wake
     // bumps again, exactly upstream's double UpdateRunJob hook).
     if (await hasWaitingJobsToPick(d1, job.repoId)) {
@@ -818,11 +818,11 @@ async function finalizeStrandedTasksOfJob(d1: D1, task: TaskRow, effective: numb
  * gone; the terminal arm stops the task, job, and its steps outright and
  * carries the three piggybacks upstream's model hooks hang on that path:
  * the tasks_version wake when waiting siblings remain (StopTask →
- * UpdateRunJob → run_job.go:511-530), the ephemeral-runner auto-delete
+ * UpdateRunJob → run_job.go:493-512), the ephemeral-runner auto-delete
  * (StopTask → UpdateTask → task.go:452-464), and — when the caller supplies
  * the storage env, as the sweeps do — the dead task's log transfer
  * (clear_tasks.go:177-187). `env` is optional because upstream's other
- * StopTask callers (cancelOneJob, run_job.go:818-829) do NOT transfer logs;
+ * StopTask callers (cancelOneJob, run_job.go:800-811) do NOT transfer logs;
  * only the sweeps do.
  */
 export async function stopTask(d1: D1, taskId: number, status: number, env?: Env): Promise<void> {
@@ -886,7 +886,7 @@ export async function stopTask(d1: D1, taskId: number, status: number, env?: Env
   const jobRows = await db.select().from(actionRunJobs).where(eq(actionRunJobs.id, task.jobId)).limit(1);
   const job = jobRows[0];
   if (job !== undefined) {
-    // Piggyback (run_job.go:511-530): the job's terminal status leaves
+    // Piggyback (run_job.go:493-512): the job's terminal status leaves
     // waiting siblings pickable — bump so idle runners whose tasksVersion
     // equals latestVersion re-poll; only when waiting work remains.
     if (await hasWaitingJobsToPick(d1, job.repoId)) {

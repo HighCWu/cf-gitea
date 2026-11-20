@@ -10,7 +10,7 @@
  *
  *   1. the awaiting-approval skip (approve.go:36-38 — IsAwaitingApproval,
  *      run.go:84-86): a run that does not await approval is a silent no-op
- *      (the web handler still answers JSONOK — view.go:1057-1066's shape),
+ *      (the web handler still answers JSONOK — view.go:1053-1062's shape),
  *   2. the flag flip (approve.go:39-43): need_approval=false +
  *      approved_by=doer — THE two columns the run-viewer's "Approve" arm
  *      exists to write,
@@ -35,7 +35,7 @@
  *      emitter stage established — the dispatch wake
  *      (hasWaitingJobsToPick → increaseTaskVersion, the UpdateRunJob
  *      hook's bump arm) + the re-aggregate (refreshRunStatus,
- *      run_job.go:567-600).
+ *      run_job.go:549-582).
  */
 
 import { and, asc, eq } from "drizzle-orm";
@@ -73,7 +73,7 @@ export function isAwaitingApproval(run: Pick<RunRow, "needApproval" | "status">)
   return run.needApproval && !isDoneStatus(run.status);
 }
 
-/** GetLatestAttemptJobsByRun (run_job.go:264-274): the latest attempt's
+/** GetLatestAttemptJobsByRun (run_job.go:262-272): the latest attempt's
  *  jobs, id ASC; the legacy arm matches run_attempt_id = 0 rows. */
 async function latestAttemptJobsOfRun(d1: D1, run: RunRow): Promise<RunJobRow[]> {
   return drizzle(d1)
@@ -85,7 +85,7 @@ async function latestAttemptJobsOfRun(d1: D1, run: RunRow): Promise<RunJobRow[]>
 
 /**
  * ApproveRuns (approve.go:25-187) at the v1 store's stage, single-run (the
- * web handler passes one id — view.go:1061's `[]int64{run.ID}`): the
+ * web handler passes one id — view.go:241's `[]int64{run.ID}`): the
  * awaiting-approval skip is a `approved: false` no-op, the flip writes the
  * two columns, the needs-less BLOCKED jobs release to WAITING through the
  * CAS update, and the wake + re-aggregate tails fire only when something
@@ -144,8 +144,8 @@ export async function approveRun(d1: D1, repoId: string, run: RunRow, doerId: nu
   }
 
   // approve.go:153-163's v1 substitute: the dispatch wake fires when
-  // waiting work remains (run_job.go:504-527's hook-bump arm), the
-  // aggregate re-aggregates (run_job.go:567-600). Nothing released — a
+  // waiting work remains (run_job.go:486-509's hook-bump arm), the
+  // aggregate re-aggregates (run_job.go:549-582). Nothing released — a
   // blocked attempt or an empty job list — and the run's columns are the
   // only change; the status write is skipped (the API port's shape).
   if (released > 0) {

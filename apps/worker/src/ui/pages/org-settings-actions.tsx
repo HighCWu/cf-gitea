@@ -78,7 +78,7 @@
  *   POST /org/{org}/settings/actions/variables/{id}/delete → the path id +
  *            `deleteOrgActionsVariable` (upstream VariableDelete).
  *            "deleted" 303s back; "missing" is the same NotFound arm
- *            (variables.go:186-191).
+ *            (variables.go:143-148).
  *
  * `GET /org/{org}/settings/actions` itself is upstream's LocationRedirect onto
  * ./actions/general (web.go:1055) — the general tab is NOT this module's
@@ -441,7 +441,7 @@ export async function applyOrgActionsVariableUpdate(
 /**
  * The delete — upstream VariableDelete (variables.go:179-200): resolve the
  * row within the ORG's scope (a foreign, stale or junk id answers
- * `"missing"`, upstream's ctx.NotFound(nil), variables.go:186-191), then the
+ * `"missing"`, upstream's ctx.NotFound(nil), variables.go:143-148), then the
  * landed name-keyed `deleteVariableRow` on the row's stored name.
  */
 export async function deleteOrgActionsVariable(d1: D1Database, orgId: number, variableId: number | null): Promise<"deleted" | "missing"> {

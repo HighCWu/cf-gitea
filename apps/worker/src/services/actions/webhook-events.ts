@@ -15,7 +15,7 @@
  *     (:68 NotifyWorkflowRunStatusUpdate, :57 WithReload) reached from:
  *     run creation (services/actions/run.go:56 —
  *     NotifyWorkflowJobsAndRunsStatusUpdate after PrepareRunAndInsert's
- *     inserts), the first job claim (services/actions/task.go:118-120 — the
+ *     inserts), the first job claim (services/actions/task.go:120-126 — the
  *     run leg only when run.Started was zero), the completion cascade
  *     (services/actions/job_emitter.go:131 — when a run's last job settles),
  *     cancellation (services/actions/cancel.go:54), the invalid-workflow
@@ -36,7 +36,7 @@
  *
  *   - workflow_job — the webhookNotifier's WorkflowJobStatusUpdate
  *     (services/webhook/notifier.go:1003-1037): fired per job status change
- *     (task.go:116 claim, runner.go:266 finish, job_emitter.go's cascade via
+ *     (task.go:120 claim, runner.go:266 finish, job_emitter.go's cascade via
  *     notify.go:111/:126, cancel.go:52) with WorkflowJobPayload
  *     (hook.go:704): action = ToRunActionsStatus(run, job.Status).action
  *     (convert.go:451-454 — the needApproval "waiting" arm included), with

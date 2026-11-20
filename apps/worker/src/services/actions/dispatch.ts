@@ -9,7 +9,7 @@
  * buildRunnerTask assembles the full claim payload (context, secrets/vars
  * reads, needs) except where a stage is explicitly deferred:
  *   - workflow_payload: the `if: always()` claim-time rewrite LANDED (the
- *     M3 P-tier row, task.go:176-186 via runnerWorkflowPayload) — the M1a
+ *     M3 P-tier row, services/actions/task.go:181-212 via runnerWorkflowPayload) — the M1a
  *     verbatim-bytes stage is retired; a payload that no longer parses
  *     throws and the claim releases (task.go's assembly-failure posture);
  *   - gitea_runtime_token / actions_id_token_request_*: omitted — they ride
@@ -18,7 +18,7 @@
  *     workflow payload via actionslib — the S/E tier's model rows);
  *     runner-REPORTED steps arrive through M1b's UpdateTask.
  *
- * The claim path's OWN commit-status post (task.go:113-115, the U14
+ * The claim path's OWN commit-status post (task.go:120, the U14
  * ledgered residual) LANDED: pickTask posts the claimed job's RUNNING
  * status right after payload assembly — before the disconnect check and
  * before any runner report — via the landed createWorkflowCommitStatus
@@ -36,6 +36,7 @@ import {
   actionTaskOutputs,
   actionTasks,
   actionVariables,
+  repoUnits,
   secrets as actionSecrets,
 } from "../../db/schema";
 import { findRule } from "../branch-protection";
@@ -49,20 +50,24 @@ import {
   releaseTaskForRunner,
   scanAndClaimWaitingJobs,
   statusToResult,
+  updateRepoRunsNumbers,
   type RunJobRow,
   type RunnerRow,
   type RunRow,
   type RepoRecord,
+  type ScanClaimCancelled,
   type TaskRow,
   type TaskWithToken,
 } from "./model";
-import { refreshRunStatus } from "./update";
+import { hasWaitingJobsToPick, refreshRunStatus } from "./update";
 import { decryptInstanceSecretData } from "../instance-key";
 import { emitWorkflowJobStatus, emitWorkflowRunStatus } from "./webhook-events";
 import { taskAllowsOidcToken } from "./oidc";
 import { createAuthorizationToken, oidcIssuer, signActionsClaims } from "./secrets";
 import {
+  checkJobsOfRun,
   commitStatusEventAndCommit,
+  createCommitStatusForRunJobs,
   createWorkflowCommitStatus,
   runnerWorkflowPayload,
   toCommitStatus,
@@ -91,7 +96,7 @@ function asBytes(value: unknown): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// The pick limiter (services/actions/task.go:31-53)
+// The pick limiter (services/actions/task.go:31-45)
 // ---------------------------------------------------------------------------
 
 /** MAX_CONCURRENT_TASK_PICKS (modules/setting/actions.go:18,45,55). */
@@ -123,10 +128,10 @@ function releasePickSlot(): void {
 }
 
 /**
- * TryPickTask (task.go:41-53): bounded pick; throttled=true answers WITHOUT
+ * TryPickTask (task.go:47-59): bounded pick; throttled=true answers WITHOUT
  * touching the DB so the caller echoes the runner's stale tasks_version and
  * the runner retries on its next poll (runner.go:202-207). `signal` is the
- * served request's AbortSignal — pickTask's disconnect check (task.go:123-128).
+ * served request's AbortSignal — pickTask's disconnect check (task.go:131-134).
  */
 export async function tryPickTask(
   env: Env,
@@ -150,7 +155,7 @@ export async function tryPickTask(
  * FetchTask (runner.go:168-217) minus the wire codec: returns the response
  * message's contents. The runner's served tasksVersion is advisory — the
  * server always attempts a pick on mismatch. `signal` rides to pickTask's
- * disconnect check (task.go:123-128).
+ * disconnect check (task.go:131-134).
  */
 export async function fetchTask(
   env: Env,
@@ -190,7 +195,7 @@ export async function fetchTask(
 }
 
 // ---------------------------------------------------------------------------
-// PickTask (services/actions/task.go:66-131)
+// PickTask (services/actions/task.go:70-138 at the 099abf5db4 pin)
 // ---------------------------------------------------------------------------
 
 async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, signal?: AbortSignal | null): Promise<Task | null> {
@@ -212,7 +217,7 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
         return null;
       }
       // The task finished — remove the runner; the NEXT poll errors
-      // ("runner has been removed", task.go:77-95).
+      // ("runner has been removed", task.go:81-97).
       await db.delete(actionRunners).where(eq(actionRunners.id, runner.id));
       throw new Error("runner has been removed");
     }
@@ -222,10 +227,51 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
   if (claimed === null) {
     return null;
   }
+  // PickTask's post-scan tail (task.go:100-103, #40106):
+  // notifyAndEmitFinishedJobs(context.WithoutCancel(ctx), cancelledJobs) —
+  // the claim-time cancellations (Actions-disabled repos) are committed even
+  // if the runner went away, and they settle the affected runs BEFORE the
+  // pick answer: the run aggregates refreshed at the CAS (claimJobForRunner),
+  // then NotifyWorkflowJobsAndRunsStatusUpdate (notify.go:16-53: the run
+  // webhook + repo counters per run; the cancelled jobs' commit statuses +
+  // job webhooks per run group), then EmitJobsIfReadyByJobs (notify.go:50-53
+  // → job_emitter.go:41-52: a done job wakes its run's next ready jobs).
+  if (claimed.cancelledJobs.length > 0) {
+    const runIds = [...new Set(claimed.cancelledJobs.map((j) => j.runId))];
+    for (const runId of runIds) {
+      const runRows = await drizzle(d1).select().from(actionRuns).where(eq(actionRuns.id, runId)).limit(1);
+      const run = runRows[0];
+      if (run === undefined) continue;
+      await emitWorkflowRunStatus(env, { origin: appUrl }, run.repoId, run.id);
+      await updateRepoRunsNumbers(d1, run.repoId);
+      const cancelledOfRun = claimed.cancelledJobs.filter((j) => j.runId === runId);
+      const repo = await getRepoById(d1, run.repoId);
+      await createCommitStatusForRunJobs(
+        d1,
+        {
+          run,
+          repoOwnerNamespace: repo?.ownerNamespace ?? "",
+          repoSlug: repo?.slug ?? "",
+          eventPayloadJson: run.eventPayload,
+          appUrl,
+        },
+        cancelledOfRun,
+      );
+      for (const job of cancelledOfRun) {
+        await emitWorkflowJobStatus(env, { origin: appUrl }, run.repoId, job.id);
+      }
+      await checkJobsOfRun(d1, runId, { bindings: env, origin: appUrl });
+    }
+  }
+  const claimedTask = "task" in claimed ? claimed.task : null;
+  if (claimedTask === null) {
+    // every candidate was cancelled or lost — no task for this runner
+    return null;
+  }
 
   try {
-    const assembled = await buildRunnerTask(env, d1, claimed, appUrl);
-    // The claim path's own status post (task.go:115): upstream calls
+    const assembled = await buildRunnerTask(env, d1, claimedTask, appUrl);
+    // The claim path's own status post (task.go:120): upstream calls
     // CreateCommitStatusForRunJobs(ctx, job.Run, job) right here — after
     // payload assembly, BEFORE the ctx.Err() disconnect check — so the
     // claimed RUNNING job has its commit status the moment it is picked,
@@ -233,24 +279,24 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
     // identical pending context and createWorkflowCommitStatus's
     // identical-state short-circuit absorbs the duplicate.
     await postClaimCommitStatus(d1, assembled.ctx, appUrl);
-    // The claim emissions (GAPS #7, task.go:113-120): after the commit
+    // The claim emissions (GAPS #7, task.go:121-126): after the commit
     // status, the claimed job's workflow_job event ("in_progress") and —
     // on the FIRST pick-up of the run (run.started still null, upstream's
     // job.Run.Started.IsZero() read before UpdateRunJob's refresh) — the
     // run's workflow_run event ("in_progress"). The run aggregate refresh
-    // rides UpdateRunJob's tail upstream (run_job.go:593-600); our claim
+    // rides UpdateRunJob's tail upstream (run_job.go:575-582); our claim
     // path had skipped it, so the refresh here is what makes the payload's
     // status read RUNNING instead of the stale WAITING row.
-    await refreshRunStatus(d1, claimed.job.repoId, claimed.job.runId, claimed.job.runAttemptId);
+    await refreshRunStatus(d1, claimedTask.job.repoId, claimedTask.job.runId, claimedTask.job.runAttemptId);
     // env IS the bindings view here (DB + REPO + the optional queue
     // producer) — the pick route always holds it.
-    await emitWorkflowJobStatus(env, { origin: appUrl }, claimed.job.repoId, claimed.job.id);
-    const runStartedRows = await drizzle(d1).select().from(actionRuns).where(eq(actionRuns.id, claimed.job.runId)).limit(1);
+    await emitWorkflowJobStatus(env, { origin: appUrl }, claimedTask.job.repoId, claimedTask.job.id);
+    const runStartedRows = await drizzle(d1).select().from(actionRuns).where(eq(actionRuns.id, claimedTask.job.runId)).limit(1);
     const runStarted = runStartedRows[0];
     if (runStarted !== undefined && runStarted.started !== null) {
-      await emitWorkflowRunStatus(env, { origin: appUrl }, claimed.job.repoId, claimed.job.runId);
+      await emitWorkflowRunStatus(env, { origin: appUrl }, claimedTask.job.repoId, claimedTask.job.runId);
     }
-    // The disconnect check (task.go:123-128): the job was claimed and its
+    // The disconnect check (task.go:131-134): the job was claimed and its
     // payload assembled, but if the request died meanwhile the response can
     // no longer reach the runner — release the claim so another poll picks
     // the job up. Upstream reads ctx.Err(); the Workers analog is the served
@@ -258,14 +304,14 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
     // answer-shape is null rather than a thrown error for the same reason:
     // there is no runner left to deliver one to.
     if (signal?.aborted) {
-      await releaseTaskForRunner(d1, claimed, claimed.job);
+      await releaseTaskForRunner(d1, claimedTask, claimedTask.job);
       return null;
     }
     return assembled.task;
   } catch (err) {
     // The job was claimed but the payload failed: release the claim so the
-    // job returns to the waiting queue (task.go:108-112, ReleaseTaskForRunner).
-    await releaseTaskForRunner(d1, claimed, claimed.job);
+    // job returns to the waiting queue (task.go:109-113, ReleaseTaskForRunner).
+    await releaseTaskForRunner(d1, claimedTask, claimedTask.job);
     throw err;
   }
 }
@@ -277,21 +323,71 @@ interface ClaimedTask extends TaskWithToken {
 }
 
 /**
- * CreateTaskForRunner (task.go:265-331 + claimJobForRunner task.go:333-414):
- * scan waiting jobs oldest-first, label-match, then claim via the
- * conditional UPDATE — `task_id = 0 AND status = waiting` — one row or move
- * on (errJobAlreadyClaimed).
+ * CreateTaskForRunner (models/actions/task.go:262-321 + claimJobForRunner task.go:323-414
+ * at the 099abf5db4 pin): scan waiting jobs oldest-first, label-match, then
+ * claim via the conditional UPDATE — `task_id = 0 AND status = waiting` —
+ * one row or move on (errJobAlreadyClaimed). #40106 reshaped the return:
+ * `(task, cancelledJobs, err)` — candidates whose repo has its Actions unit
+ * disabled are CANCELLED at claim time (every runner scope), the scan moves
+ * on, and the cancelled rows ride back for the emission tail
+ * (notifyAndEmitFinishedJobs — PickTask's post-scan call, task.go:100-103).
  */
-async function createTaskForRunner(d1: D1, runner: RunnerRow): Promise<ClaimedTask | null> {
+async function createTaskForRunner(d1: D1, runner: RunnerRow): Promise<{ task: ClaimedTask; cancelledJobs: RunJobRow[] } | { cancelledJobs: RunJobRow[] } | null> {
   return scanAndClaimWaitingJobs(d1, runner, (job) => claimJobForRunner(d1, runner, job));
 }
 
+/**
+ * claimJobForRunner (task.go:320-414): the claim attempt inside its own
+ * transaction upstream. #40106 prepends the Actions-unit gate (task.go:333-341):
+ * the job's repo WITHOUT an enabled Actions unit cancels the job instead —
+ * the CAS mirrors UpdateRunJob's claim-cancel exactly (`task_id = 0 AND
+ * status = waiting`, cols `status`/`stopped` — task.go:338), the
+ * aggregate settles through refreshRunStatus and the queue wake rides
+ * UpdateRunJob's tail (hasWaitingJobsToPick → increaseTaskVersion,
+ * run_job.go:500-508). A cancelled candidate answers
+ * {@link ScanClaimCancelled}; null stays the lost-race marker.
+ */
 async function claimJobForRunner(
   d1: D1,
   runner: RunnerRow,
   job: RunJobRow,
-): Promise<ClaimedTask | null> {
+): Promise<ClaimedTask | ScanClaimCancelled | null> {
   const db = drizzle(d1);
+
+  // The Actions-unit gate (task.go:336-340, #40106): LoadUnits + UnitEnabled
+  // reduced to the repo_units actions-row probe (schedule.ts's landed
+  // UnitEnabled reduction — the unit row IS the truth; upstream's global
+  // DISABLED_REPO_UNITS setting only shapes which unit rows get created, and
+  // this deployment carries no such var). Repo/owner/global runners all pass
+  // through here: #40106's point — repo-level and instance-level runners
+  // picked up disabled repos' waiting jobs; only owner-level runners were
+  // filtered in SQL before.
+  const unitRows = await db
+    .select({ repoId: repoUnits.repoId })
+    .from(repoUnits)
+    .where(and(eq(repoUnits.repoId, job.repoId), eq(repoUnits.type, "actions")))
+    .limit(1);
+  if (unitRows.length === 0) {
+    const now = new Date();
+    const cancelledRows = await db
+      .update(actionRunJobs)
+      .set({ status: 3 /* ACTION_STATUS_CANCELLED */, stopped: now })
+      .where(and(eq(actionRunJobs.id, job.id), eq(actionRunJobs.taskId, 0), eq(actionRunJobs.status, 5) /* ACTION_STATUS_WAITING */))
+      .returning({ id: actionRunJobs.id });
+    if (cancelledRows.length !== 1) {
+      // lost the race to a concurrent writer — the scan moves on
+      return null;
+    }
+    // UpdateRunJob's piggyback (run_job.go:493-512): the run aggregate
+    // refreshes on every job-row status write, and the version bumps while
+    // waiting work remains (idle runners re-poll).
+    await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId);
+    if (await hasWaitingJobsToPick(d1, job.repoId)) {
+      await increaseTaskVersion(d1, job.ownerId, job.repoId);
+    }
+    return { cancelledJob: { ...job, status: 3, stopped: now } };
+  }
+
   const now = new Date();
   const salted = await generateSaltedToken();
 
@@ -361,7 +457,7 @@ async function claimJobForRunner(
 }
 
 // ---------------------------------------------------------------------------
-// buildRunnerTask (services/actions/task.go:135-260)
+// buildRunnerTask (services/actions/task.go:136-261)
 // ---------------------------------------------------------------------------
 
 interface ClaimContext {
@@ -377,7 +473,7 @@ interface ClaimContext {
  * releases the claim. The DB rows re-read here (fresh post-CAS truth) ride
  * back as the ClaimContext so the caller's status post sees the claimed
  * job exactly upstream's PickTask sees `job` out of buildRunnerTask
- * (task.go:105-116).
+ * (task.go:106-117).
  */
 async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: string): Promise<{ task: Task; ctx: ClaimContext }> {
   const db = drizzle(d1);
@@ -405,7 +501,7 @@ async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: s
   return {
     task: {
       id: claimed.id,
-      // task.go:176-186 (runnerWorkflowPayload): the job `if:` forced to the
+      // services/actions/task.go:181-212 (runnerWorkflowPayload): the job `if:` forced to the
       // literal `always()` — "as Gitea has decided it and a runner must not
       // re-evaluate it" (SPEC-0012 §2.3 + the M3 P-tier row). The M1a stage
       // served the stored bytes verbatim (the module header's resolved note).
@@ -421,7 +517,7 @@ async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: s
 }
 
 /**
- * CreateCommitStatusForRunJobs at the claim site (task.go:115 via
+ * CreateCommitStatusForRunJobs at the claim site (task.go:120 via
  * commit_status.go:31-72 → createCommitStatus): the claimed job's RUNNING
  * status gets its commit status row the moment it is picked. The mapping
  * rides trigger.ts's shared tables (toCommitStatus / toCommitStatusDescription
@@ -597,7 +693,7 @@ async function generateTaskContext(env: Env, d1: D1, appUrl: string, ctx: ClaimC
     // additional contexts (context.go:118)
     gitea_default_actions_url: appUrl,
 
-    // task-scoped additions (task.go:199-212)
+    // task-scoped additions (services/actions/task.go:236-247)
     token: task.token,
     gitea_runtime_token: await createAuthorizationToken(env, task.id, run.id, job.id),
     // The OIDC request pair rides the job's stored token_permissions JSON

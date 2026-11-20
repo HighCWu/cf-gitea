@@ -786,7 +786,7 @@ describe("insertTriggeredRun (InsertRun rows + index + statuses)", () => {
   it("a CANCELLING job's status re-post rides the pending family at 'Canceling' (the cancel emitter's free mapping)", async () => {
     await seedRepo();
     // The cancel path's post shape (createCommitStatusesForJobsByRun over
-    // stopTask's graceful handshake, job_emitter.go:135-151): the claimed job
+    // stopTask's graceful handshake, job_emitter.go:134-150): the claimed job
     // still holds CANCELLING when its status re-posts; the empty-base emitter
     // lands a root-relative target (run.Link()'s own shape minus subpath).
     await createCommitStatusForRunJobs(
@@ -978,7 +978,7 @@ jobs:
     const thirdJobs = byRun.filter((j) => j.runId === third.run.id);
     expect(thirdJobs.every((j) => j.status === ACTION_STATUS_WAITING)).toBe(true);
     // the cancelled runs settled to cancelled aggregates (the
-    // UpdateRunJob refresh piggyback, run_job.go:542)
+    // UpdateRunJob refresh piggyback, run_job.go:524)
     const runRows = await db().select().from(actionRuns);
     expect(runRows.find((r) => r.id === first.run.id)?.status).toBe(ACTION_STATUS_CANCELLED);
     expect(runRows.find((r) => r.id === blocker.run.id)?.status).toBe(ACTION_STATUS_CANCELLED);
@@ -1616,7 +1616,7 @@ jobs:
     expect(byId["explicit-always"]).toBe(ACTION_STATUS_WAITING);
   });
 
-  it("aggregateJobStatus pins the precedence (run_job.go:509-554)", () => {
+  it("aggregateJobStatus pins the precedence (run_job.go:491-536)", () => {
     expect(aggregateJobStatus([])).toBe(0); // ACTION_STATUS_UNKNOWN — "it shouldn't happen" (v1 never aggregates an empty set)
     expect(aggregateJobStatus([{ status: ACTION_STATUS_SKIPPED, continueOnError: false }])).toBe(ACTION_STATUS_SKIPPED);
     expect(
@@ -2785,7 +2785,7 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(specs.map((s) => s.spec)).toEqual(["30 12 * * *"]);
 
     // The OLD default's live schedule run cancelled; the NEW default's
-    // stands (CancelPreviousJobs filters by the old ref, run_job.go:713).
+    // stands (CancelPreviousJobs filters by the old ref, run_job.go:695).
     const jobStatusOf = async (jobId: number): Promise<number> =>
       (await db().select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)))[0]!.status;
     expect(await jobStatusOf(liveOnMain.jobId)).toBe(ACTION_STATUS_CANCELLED);

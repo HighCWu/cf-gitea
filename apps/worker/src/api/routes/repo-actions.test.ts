@@ -5,14 +5,14 @@
  * orchestrator after this batch — the file header's HANDOFF).
  *
  * Per-op pins, upstream-exact at fc493688:
- *   - ActionsListRepositoryWorkflows (action.go:859-896): the ActionWorkflow
+ *   - ActionsListRepositoryWorkflows (action.go:787-824): the ActionWorkflow
  *     wire (yaml name, state over the ActionsConfig list, the commit-author
  *     timestamps, the url/html_url/badge_url shapes, Go-zero deleted_at),
  *     the first-existing-dir walk (the .github/workflows fallback repo), the
  *     no-workflow-dir 200/0 arm (workflows.go:92-95), the 401/403 gates.
- *   - ActionsGetWorkflow (action.go:898-930): 200 shape + the 404
+ *   - ActionsGetWorkflow (action.go:826-858): 200 shape + the 404
  *     `workflow "x" not found` text (APIErrorAuto's ErrorUnwrapForUser).
- *   - ActionsListWorkflowRuns (action.go:932-1036): the run wire
+ *   - ActionsListWorkflowRuns (action.go:844-948): the run wire
  *     (ActionWorkflowRun, convert.go:276-348 — explicit-null
  *     previous_attempt_url, queued/completed+conclusion statuses, actor /
  *     repository renders, pull_requests []), the no-runs git-lookup
@@ -20,26 +20,26 @@
  *     (status/actor/branch/event/head_sha, the 400 invalid-status and the
  *     404 user-not-exist texts, shared/action.go:100-123 + :151-163) and the
  *     pagination headers. The scoped filter carries BOTH conds
- *     (workflow_repo_id + is_scoped_run, shared/action.go:142-145 +
+ *     (workflow_repo_id + is_scoped_run, shared/action.go:140-143 +
  *     run_list.go:105-109 — the R1-F6 fix; the TEXT id rides
  *     scopedSourceRepoParam verbatim, and a scoped query skips the
- *     git-lookup fallback, repo/action.go:1034-1041).
- *   - ActionsDisableWorkflow / ActionsEnableWorkflow (action.go:1038-1104
- *     + workflow.go:30-52): the 204s, the store readback through the LANDED
+ *     git-lookup fallback, repo/action.go:701-708).
+ *   - ActionsDisableWorkflow / ActionsEnableWorkflow (action.go:926-992
+ *     + workflow.go:31-53): the 204s, the store readback through the LANDED
  *     ActionsConfig (append-if-absent / SliceRemoveAll, no duplicate on
  *     re-disable), the state flip on the workflow wire, the 404s.
- *   - ActionsDispatchWorkflow (action.go:1106-1178 + workflow.go:64-190):
+ *   - ActionsDispatchWorkflow (action.go:984-1056 + workflow.go:65-191):
  *     the 204 / return_run_details 200 RunDetails (FormBool's parse set,
  *     base_form.go:61-67 — the R1-F8 fix), the run row through the shared
  *     producer legs (insertTriggeredRunSplit — the R1-F4 fix: waiting run +
  *     attempt + combos, the always-filled content-source skeleton
- *     workflow.go:136-137 pre-insert, the R1-F5 pin), the inputs merge
+ *     workflow.go:137-138 pre-insert, the R1-F5 pin), the inputs merge
  *     (defaults, provided values, the boolean coercion), the 422 ladder
  *     (Ref: Required binder text, has-no-workflow_dispatch, invalid
  *     workflow), the 404s (ref miss, workflow miss, the scoped
  *     effective-source gate), the 403 disabled check ordering.
- *   - THE SCOPED DISPATCH TWIN (the v1.5.4 K14 wave — action.go:1120-1123's
- *     query param + workflow.go:237-268's scoped arm): a non-empty
+ *   - THE SCOPED DISPATCH TWIN (the v1.5.4 K14 wave — action.go:48-51's
+ *     query param + workflow.go:239-270's scoped arm): a non-empty
  *     scoped_workflow_source_repo_id (the TEXT source id verbatim, ""/"0" =
  *     repo-level — the WEB arm's recorded adaptation) dispatches the SOURCE
  *     repo's default-branch .gitea/scoped_workflows content: the effective-
@@ -49,24 +49,24 @@
  *     (is_scoped_run/workflow_repo_id/workflow_commit_sha — the SOURCE sha
  *     beside the consumer ref's commit_sha). The scoped opt-out (the
  *     WEB-side toggle's store) 403s the dispatch; a REQUIRED workflow
- *     ignores the opt-out (workflow.go:89-92's conjunction).
+ *     ignores the opt-out (workflow.go:90-93's conjunction).
  *   - THE API TOGGLE'S SCOPED ABSENCE (the pin's decision — LAND NOTHING):
  *     upstream's enable/disable swagger declares owner/repo/workflow_id
- *     only (action.go:1047-1084/:1194-1230) and the handlers never read the
- *     param (:1081/:1230 — the scoped mutators are the WEB handler's
- *     view.go:1338-1361 branch); the API toggle ignores a passed param —
+ *     only (action.go:931-968/:1194-1230) and the handlers never read the
+ *     param (:1015/:1230 — the scoped mutators are the WEB handler's
+ *     view.go:1334-1357 branch); the API toggle ignores a passed param —
  *     the CONSUMER's repo-level workflow flips, the scoped opt-out map
  *     stays untouched, and a REQUIRED scoped registration refuses nothing
  *     on the API (the web-only JSONError never arms here).
- *   - getWorkflowJob (action.go:1702-1752): the ActionWorkflowJob wire
+ *   - getWorkflowJob (action.go:1480-1528): the ActionWorkflowJob wire
  *     (convert.go:545-590), the repo-mismatch 404 "not found", the junk-id
  *     404.
  *   - downloadActionsRunJobLogs (actions_run.go:15-51 + common/actions.go:
  *     98-132): the 200 attachment (text/plain; charset=utf-8, the
  *     FileNameJoinFields filename, the chunk bytes verbatim, the sealed-R2
  *     arm), the 404 ladder (repo-miss text, job not started, logs expired).
- *   - The audit arms (v1.5.4 — RecordWorkflowToggle, workflow.go:49; the
- *     dispatch's RecordAs tail, workflow.go:192-193, both through
+ *   - The audit arms (v1.5.4 — RecordWorkflowToggle, workflow.go:50; the
+ *     dispatch's RecordAs tail, workflow.go:194-195, both through
  *     services/actions/audit-arms.ts): each successful write emits its row —
  *     origin "api", the requester as actor, the "access-token:<id>"
  *     credential (the rig's resolveAuth stand-in carries the token row), the
@@ -521,7 +521,7 @@ const FALLBACK = `/repos/${OWNER}/actions-fallback`;
 const EMPTY = `/repos/${OWNER}/actions-empty`;
 
 // ---------------------------------------------------------------------------
-// ActionsListRepositoryWorkflows (action.go:859-896)
+// ActionsListRepositoryWorkflows (action.go:787-824)
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/workflows (ActionsListRepositoryWorkflows)", () => {
@@ -579,7 +579,7 @@ describe("GET /repos/{owner}/{repo}/actions/workflows (ActionsListRepositoryWork
 });
 
 // ---------------------------------------------------------------------------
-// ActionsGetWorkflow (action.go:898-930)
+// ActionsGetWorkflow (action.go:826-858)
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/workflows/{workflow_id} (ActionsGetWorkflow)", () => {
@@ -610,7 +610,7 @@ describe("GET /repos/{owner}/{repo}/actions/workflows/{workflow_id} (ActionsGetW
 });
 
 // ---------------------------------------------------------------------------
-// ActionsDisableWorkflow / ActionsEnableWorkflow (action.go:1038-1104)
+// ActionsDisableWorkflow / ActionsEnableWorkflow (action.go:926-992)
 // ---------------------------------------------------------------------------
 
 describe("PUT .../disable + .../enable (the LANDED ActionsConfig store)", () => {
@@ -664,10 +664,10 @@ describe("PUT .../disable + .../enable (the LANDED ActionsConfig store)", () => 
 // ---------------------------------------------------------------------------
 // The API toggle's scoped ABSENCE (the pin's decision — upstream's
 // enable/disable API surface carries NO scoped param: the swagger declares
-// owner/repo/workflow_id only, action.go:1047-1084/:1194-1230, and the
-// handlers never read the param — :1081/:1230 call the repo-level-only
-// actions_service.EnableOrDisableWorkflow, workflow.go:30-52; the scoped
-// mutators + the required-refusal are the WEB handler's view.go:1338-1361
+// owner/repo/workflow_id only, action.go:931-968/:1194-1230, and the
+// handlers never read the param — :1015/:1230 call the repo-level-only
+// actions_service.EnableOrDisableWorkflow, workflow.go:31-53; the scoped
+// mutators + the required-refusal are the WEB handler's view.go:1334-1357
 // branch). LAND NOTHING on the toggle — pin the ignored-param behavior.
 // ---------------------------------------------------------------------------
 
@@ -687,7 +687,7 @@ describe("PUT .../disable + .../enable ignore scoped_workflow_source_repo_id (th
 
   it("a scoped param on the disable wire toggles the CONSUMER's repo-level workflow; the opt-out map stays empty", async () => {
     // the registration marks ci.yml REQUIRED — the WEB disable would refuse
-    // (view.go:1338-1344's scoped_required_cannot_disable JSONError); the
+    // (view.go:1334-1340's scoped_required_cannot_disable JSONError); the
     // API never consults the registration.
     await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, { "ci.yml": { required: true, patterns: ["*"] } });
     const res = await put(
@@ -709,7 +709,7 @@ describe("PUT .../disable + .../enable ignore scoped_workflow_source_repo_id (th
 });
 
 // ---------------------------------------------------------------------------
-// ActionsListWorkflowRuns (action.go:932-1036)
+// ActionsListWorkflowRuns (action.go:844-948)
 // ---------------------------------------------------------------------------
 
 /** The three run rows the runs suite shares (inserted once, in order). */
@@ -738,7 +738,7 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
 
   it("404s a workflow that has no runs AND no file; 200/0 when the file exists", async () => {
     // notify.yml exists in the tree but has no runs yet — the git-lookup
-    // fallthrough answers an EMPTY list (action.go:1022-1031).
+    // fallthrough answers an EMPTY list (action.go:906-915).
     const exists = await get(`${SUITE}/actions/workflows/notify.yml/runs`, "alice-token");
     expect(exists.status).toBe(200);
     expect(await exists.json()).toEqual({ total_count: 0, workflow_runs: [] });
@@ -864,7 +864,7 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
     expect((await sha.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runAId]);
   });
 
-  it("the scoped filter selects on BOTH conds: workflow_repo_id + is_scoped_run (shared/action.go:142-145 + run_list.go:105-109, the R1-F6 fix)", async () => {
+  it("the scoped filter selects on BOTH conds: workflow_repo_id + is_scoped_run (shared/action.go:140-143 + run_list.go:105-109, the R1-F6 fix)", async () => {
     const db = drizzle(env.DB);
     // A repo-level run and a scoped twin of one workflow id: the query id
     // rides scopedSourceRepoParam verbatim (the store id space is TEXT
@@ -905,7 +905,7 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
 
     // The rows go; then the probe gate: a SCOPED query over an empty set
     // skips the git-lookup fallback (upstream arms it only on the repo-level
-    // spelling, repo/action.go:1034-1041) — 200/0, not the workflow 404
+    // spelling, repo/action.go:701-708) — 200/0, not the workflow 404
     // (scoped-filter.yml exists in no tree); a repo-level query over the
     // same empty set still 404s through the fallback.
     await db.delete(actionRuns).where(eq(actionRuns.workflowId, "scoped-filter.yml"));
@@ -950,7 +950,7 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
 });
 
 // ---------------------------------------------------------------------------
-// ActionsDispatchWorkflow (action.go:1106-1178 + workflow.go:64-190)
+// ActionsDispatchWorkflow (action.go:984-1056 + workflow.go:65-191)
 // ---------------------------------------------------------------------------
 
 describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)", () => {
@@ -1017,7 +1017,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect(dispatched?.triggerUserId).toBe(ALICE_ID);
     const payload = JSON.parse(dispatched?.eventPayload ?? "{}") as { inputs: Record<string, string> };
     // dispatchEventInputs renders CoerceToString over every input
-    // (workflow.go:210-216) — the booleans stringify ("false"/"true").
+    // (workflow.go:212-218) — the booleans stringify ("false"/"true").
     expect(payload.inputs).toEqual({ greeting: "hello", flag: "false" });
 
     const jobRows = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, dispatched?.id ?? 0)).all();
@@ -1031,7 +1031,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     // The producer legs' always-filled content-source pin (the R1-F4/F5
     // fix): the repo-level skeleton carries the source PRE-INSERT —
     // WorkflowRepoID = this repo, WorkflowCommitSHA = the run commit
-    // (workflow.go:136-137) — no bare-insert "" residue.
+    // (workflow.go:137-138) — no bare-insert "" residue.
     expect(dispatched?.workflowRepoId).toBe(SUITE_REPO_ID);
     expect(dispatched?.workflowCommitSha).toBe(TIP_MAIN);
     expect(dispatched?.isScopedRun).toBe(false);
@@ -1092,7 +1092,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect((await noRef.json<{ message: string }>()).message).toBe("Ref: Required");
 
     // notify.yml parses but declares only `on: push` — the
-    // has-no-workflow_dispatch arm (workflow.go:141-146).
+    // has-no-workflow_dispatch arm (workflow.go:142-147).
     const noTrigger = await post(`${SUITE}/actions/workflows/notify.yml/dispatches`, { ref: "main" }, "alice-token");
     expect(noTrigger.status).toBe(422);
     expect((await noTrigger.json<{ message: string }>()).message).toBe(
@@ -1115,7 +1115,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
 
     // A non-registered source id rides the scoped arm's first gate —
     // IsScopedWorkflowSourceEffective's miss answers the not-found text
-    // (workflow.go:241-249; the formerly recorded "scoped reduction" 404 is
+    // (workflow.go:243-251; the formerly recorded "scoped reduction" 404 is
     // superseded by the landed twin).
     const scoped = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?scoped_workflow_source_repo_id=1");
     expect(scoped.status).toBe(404);
@@ -1128,15 +1128,15 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect(res.status).toBe(403);
     expect((await res.json<{ message: string }>()).message).toBe("workflow is disabled");
     // A missing ref on a disabled workflow STILL answers the disabled 403
-    // (the check's order — workflow.go:83-98 precedes the ref arms).
+    // (the check's order — workflow.go:85-100 precedes the ref arms).
     const noRef = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nonexistent-branch" }, "alice-token");
     expect(noRef.status).toBe(403);
     expect((await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token")).status).toBe(204);
   });
 
   // -------------------------------------------------------------------------
-  // The SCOPED DISPATCH TWIN (action.go:1120-1123's query param +
-  // workflow.go:237-268's scoped arm — the K14 landing; the WEB arm's TEXT
+  // The SCOPED DISPATCH TWIN (action.go:48-51's query param +
+  // workflow.go:239-270's scoped arm — the K14 landing; the WEB arm's TEXT
   // adaptation rides verbatim: ""/"0" = repo-level, otherwise the source
   // repo's TEXT id through config.ts's scopedSourceRepoParam).
   // -------------------------------------------------------------------------
@@ -1148,7 +1148,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
       (a, b) => b.index - a.index,
     )[0];
     expect(latest?.isScopedRun).toBe(false);
-    // The repo-level skeleton fills the trio PRE-INSERT (workflow.go:136-137
+    // The repo-level skeleton fills the trio PRE-INSERT (workflow.go:137-138
     // — WorkflowRepoID = this repo, WorkflowCommitSHA = the run commit; the
     // R1-F5 pin over the former bare-insert "" residue).
     expect(latest?.workflowRepoId).toBe(SUITE_REPO_ID);
@@ -1170,7 +1170,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     const latest = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.workflowId, "ci.yml")).all()).sort(
       (a, b) => b.index - a.index,
     )[0];
-    // the content-source parity columns (workflow.go:139-142/:260-263), set
+    // the content-source parity columns (workflow.go:140-143/:262-264), set
     // PRE-INSERT through the shared insert's trio input (the R1-F5 fix —
     // no post-insert UPDATE remains): is_scoped_run + the SOURCE repo row +
     // the SOURCE default-branch sha, beside the consumer ref's own
@@ -1228,7 +1228,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect(optedOut.status).toBe(403);
     expect((await optedOut.json<{ message: string }>()).message).toBe("workflow is disabled");
     // the check's order: a missing ref STILL answers the opt-out 403
-    // (workflow.go:84-99 precedes the ref arms).
+    // (workflow.go:85-100 precedes the ref arms).
     const noRef = await post(
       `${SUITE}/actions/workflows/ci.yml/dispatches`,
       { ref: "nonexistent-branch" },
@@ -1239,7 +1239,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
 
     // IsScopedWorkflowOptedOut's conjunction: flagged disabled AND not
     // required — a REQUIRED workflow dispatches through the stranded flag
-    // (workflow.go:89-92).
+    // (workflow.go:90-93).
     await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, { "ci.yml": { required: true, patterns: ["*"] } });
     const required = await post(
       `${SUITE}/actions/workflows/ci.yml/dispatches`,
@@ -1277,7 +1277,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
 });
 
 // ---------------------------------------------------------------------------
-// getWorkflowJob (action.go:1702-1752)
+// getWorkflowJob (action.go:1480-1528)
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id} (getWorkflowJob)", () => {
@@ -1557,13 +1557,13 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsR
 });
 
 // ---------------------------------------------------------------------------
-// The audit arms (v1.5.4 — workflow.go:49 / :192-193 through
+// The audit arms (v1.5.4 — workflow.go:50 / :192-193 through
 // services/actions/audit-arms.ts): each successful write emits its row,
 // origin "api", the requester as actor, the access-token credential; a
 // failed write emits nothing.
 // ---------------------------------------------------------------------------
 
-describe("the audit arms (workflow.go:49/:192-193 — the API twins)", () => {
+describe("the audit arms (workflow.go:50/:192-193 — the API twins)", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM audit_event").run();
   });

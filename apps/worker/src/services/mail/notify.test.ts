@@ -2317,7 +2317,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
     });
   }
 
-  it("createReleaseWithGitTag: a draft mails nothing; the published create lands new-release rows (the release.go:198 emit after the row + assets)", async () => {
+  it("createReleaseWithGitTag: a draft mails nothing; the published create lands new-release rows (the release.go:229 emit after the row + assets)", async () => {
     const { repo, owner } = await seedEngineRepo("520", "emit-create");
     await db().insert(repoWatchers).values({ repoId: "520", userId: 20 });
     const pair = { repo, owner };
@@ -2339,6 +2339,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
       note: "",
       isDraft: true,
       isPrerelease: false,
+      makeLatest: "",
     });
     expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
     // The PUBLISHED arm: the tag lands, the fill lands, the mail lands.
@@ -2356,6 +2357,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
       note: "",
       isDraft: false,
       isPrerelease: false,
+      makeLatest: "",
     });
     expect(published.tagCreated).toBe(true);
     const rows = await db().select().from(emailOutbox).all();
@@ -2366,7 +2368,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
     expect(rows[0]!.fromDisplayName).toBe("doer"); // from = the PUBLISHER row, never the write doer
   });
 
-  it("editRelease: publish-from-draft lands the fresh tag AND the mail; a tag-riding edit mails nothing (the release.go:361-367 isTagCreated arm)", async () => {
+  it("editRelease: publish-from-draft lands the fresh tag AND the mail; a tag-riding edit mails nothing (the release.go:385-391 oldDraft arm)", async () => {
     const { repo, owner } = await seedEngineRepo("521", "emit-edit");
     await db().insert(repoWatchers).values({ repoId: "521", userId: 20 });
     const pair = { repo, owner };
@@ -2384,6 +2386,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
       note: "",
       isDraft: true,
       isPrerelease: false,
+      makeLatest: "",
     });
     expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
     // The publish edit: isDraft false + a FRESH tag → the mail fires, with
@@ -2396,7 +2399,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
       requestHost: "mail.example",
       d1: env.DB,
       row: draft.row,
-      patch: { isDraft: false, now: new Date(1_700_000_500_000) },
+      patch: { isDraft: false, makeLatest: "", now: new Date(1_700_000_500_000) },
     });
     expect(published.tagCreated).toBe(true);
     expect(published.row?.isDraft).toBe(false);
@@ -2413,7 +2416,7 @@ describe("the B-65 emit wirings — releases publish arms + the actions settle t
       requestHost: "mail.example",
       d1: env.DB,
       row: published.row!,
-      patch: { title: "renamed", now: new Date(1_700_000_600_000) },
+      patch: { title: "renamed", makeLatest: "", now: new Date(1_700_000_600_000) },
     });
     rows = await db().select().from(emailOutbox).all();
     expect(rows).toHaveLength(1);

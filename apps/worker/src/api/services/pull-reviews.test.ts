@@ -307,6 +307,34 @@ describe("PullReviewsService.submitReview", () => {
     expect(await currentPendingReview(env.DB, issue.id, DOER)).toBeNull();
   });
 
+  it("a PENDING submit lands the row but skips the type-22 entry and mentions (884884308d — review.go:548-550/:335-337)", async () => {
+    const repoId = await seedRepo(OWNER);
+    const { issue } = await seedPull(repoId);
+    const found = await foundOf(repoId);
+    const carrierBefore = (await db().select().from(issueUsers).all()).map((row) => row.userId).sort((a, b) => a - b);
+
+    const review = await bare().submitReview(found, {
+      doerId: DOER,
+      doerRow: await userRow(DOER),
+      issue,
+      baseBranch: "main",
+      reviewType: ReviewType.Pending,
+      content: "a draft mentioning @alice",
+      commitId: "abc123",
+    });
+
+    expect(review.type).toBe(ReviewType.Pending);
+    expect(await reviewRows(issue.id)).toHaveLength(1);
+    // No type-22 timeline entry (the model's early Commit arm) and the
+    // issue's num_comments stays untouched.
+    expect(await commentRows(issue.id)).toHaveLength(0);
+    expect((await db().select().from(issues).where(eq(issues.id, issue.id)).get())!.numComments).toBe(0);
+    // The mentions resolution never ran (the service's early return) — an
+    // @mention content leaves the issue_users carrier byte-equal to the
+    // seedPull baseline.
+    expect((await db().select().from(issueUsers).all()).map((row) => row.userId).sort((a, b) => a - b)).toEqual(carrierBefore);
+  });
+
   it("approve clears outstanding REQUEST rows, dismisses previous decisions, recomputes official fresh", async () => {
     const repoId = await seedRepo(OWNER);
     const { issue } = await seedPull(repoId);

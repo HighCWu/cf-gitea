@@ -4,10 +4,10 @@
  * riding behind the orchestrator's index.ts ownership; the mount recipe
  * lives in the module header).
  *
- * Coverage (upstream at the pin: web.go:820-821's routes,
+ * Coverage (upstream at the pin: web.go:789-790's routes,
  * admin/users.go:684-712's handlers over the shared AvatarForm):
  *
- *   - THE UPLOAD ARM (users.go:684-702): a valid multipart `avatar` part
+ *   - THE UPLOAD ARM (users.go:693-711): a valid multipart `avatar` part
  *     lands the R2 object at `avatars/u_<id>` (byte-identical under-cap
  *     store, typed PNG) and flips `users.use_custom_avatar`; the redirect
  *     is the target's admin page (`/-/admin/users/{id}`).
@@ -17,10 +17,10 @@
  *     the target's avatar from a form that cannot express the choice).
  *   - THE PARSE-ERROR ARM: a non-image upload 303s silently (upstream's
  *     flash-error arm, users.go:692-693 — the flash drops), stores nothing.
- *   - THE UNKNOWN-TARGET ARM (prepareUserInfo, users.go:269-278): both
+ *   - THE UNKNOWN-TARGET ARM (prepareUserInfo, users.go:268-277): both
  *     arms redirect to the LIST (`/-/admin/users`), never a 404, and never
  *     read the body / touch the bucket.
- *   - THE DELETE ARM (users.go:701-712): marker + object both die; a
+ *   - THE DELETE ARM (users.go:710-721): marker + object both die; a
  *     missing object deletes nothing and still succeeds (the API arm's
  *     tolerance); the redirect is unconditional.
  *   - THE ORG-TARGET ARM: any users row passes (orgs ARE users rows,
@@ -125,7 +125,7 @@ async function marker(userId: number): Promise<boolean> {
 
 // --- the upload arm ----------------------------------------------------------
 
-describe("adminUserAvatarUpload (upstream admin.AvatarPost, users.go:684-702)", () => {
+describe("adminUserAvatarUpload (upstream admin.AvatarPost, users.go:693-711)", () => {
   it("stores the PNG verbatim at avatars/u_<id>, flips the marker, 303s onto the admin page", async () => {
     const { targetId } = await seedUsers();
 
@@ -216,7 +216,7 @@ describe("adminUserAvatarUpload (upstream admin.AvatarPost, users.go:684-702)", 
 
 // --- the delete arm ----------------------------------------------------------
 
-describe("adminUserAvatarDelete (upstream admin.DeleteAvatar, users.go:701-712)", () => {
+describe("adminUserAvatarDelete (upstream admin.DeleteAvatar, users.go:710-721)", () => {
   it("clears the marker and the object, 303ing onto the admin page", async () => {
     const { targetId } = await seedUsers();
     await adminUserAvatarUpload(env.REPO_PACKS, env.DB, targetId, avatarPostBody(new Blob([PNG_1X1], { type: "image/png" })));
@@ -249,7 +249,7 @@ describe("adminUserAvatarDelete (upstream admin.DeleteAvatar, users.go:701-712)"
 
 // --- the lookup the arms share ----------------------------------------------
 
-describe("loadAdminAvatarUser (prepareUserInfo, users.go:269-278)", () => {
+describe("loadAdminAvatarUser (prepareUserInfo, users.go:268-277)", () => {
   it("resolves an existing users row by id and nulls the miss", async () => {
     const { targetId } = await seedUsers();
 

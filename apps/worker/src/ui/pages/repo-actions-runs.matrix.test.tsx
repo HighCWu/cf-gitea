@@ -325,7 +325,7 @@ async function loadData(
 
 // --- the pure helpers --------------------------------------------------------
 
-describe("aggregateJobStatus (run_job.go:642-688's precedence table)", () => {
+describe("aggregateJobStatus (run_job.go:624-670's precedence table)", () => {
   const job = (status: number, continueOnError = false): { status: number; continueOnError: boolean } => ({ status, continueOnError });
 
   it("answers unknown on no jobs and keeps the terminal arms exact", () => {

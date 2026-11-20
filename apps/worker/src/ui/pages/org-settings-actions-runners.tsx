@@ -25,10 +25,10 @@
  *     (runners.go:158-216 — the runner plus its paged recent tasks, pageSize
  *     30), `RunnersEditPost` (runners.go:219-254, the description overwrite
  *     → Redirect onto the list), `ResetRunnerRegistrationToken`
- *     (runners.go:275-290 — NewRunnerToken(orgID, 0) + JSONRedirect),
+ *     (runners.go:273-288 — NewRunnerToken(orgID, 0) + JSONRedirect),
  *     `RunnerDeletePost` (runners.go:292-326), `RunnerUpdatePost`
- *     (runners.go:328-369 — the required `disabled` param flip),
- *     `findActionsRunner`'s ORG arm (runners.go:432-460 — IDs + OwnerID
+ *     (runners.go:330-371 — the required `disabled` param flip),
+ *     `findActionsRunner`'s ORG arm (runners.go:434-462 — IDs + OwnerID
  *     pinned, NO WithAvailable: a global or foreign runner is the
  *     ctx.NotFound arm).
  *   - `models/actions/runner.go` — the org arm of `FindRunnerOptions.ToConds`
@@ -98,9 +98,9 @@
  *   twin's local copy was forced by a dirty shared nav at its writing and its
  *   fold-back is that module's reported follow-up).
  * - The edit page's Title is upstream's exact "Edit Runner"
- *   (actions.runners.edit_runner, runners.go:160); the list page's Title is
- *   "Actions" (actions.actions, runners.go:105) — both over the org's
- *   pageClasses above.
+ *   (actions.runners.edit_runner, runners.go:167); the list page's Title is
+ *   "Runners" (actions.runners, runners.go:103-103 — #40336's re-point from
+ *   actions.actions) — both over the org's pageClasses above.
  * - BelongsToOwnerName at this scope: an org runner shows the org's username
  *   tooltip (Owner.Name); a global runner has none (the attribute omits).
  *   Repo-scoped rows cannot appear (the cond), so no repo-name read rides
@@ -142,7 +142,7 @@ import { OrgHeader } from "./org-home";
 // ---------------------------------------------------------------------------
 
 export const orgSettingsRunnersLocale = {
-  edit_runner: "Edit Runner", // "actions.runners.edit_runner" (the edit page's Title, runners.go:160)
+  edit_runner: "Edit Runner", // "actions.runners.edit_runner" (the edit page's Title, runners.go:167)
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -275,7 +275,7 @@ export function runnerEditableInOrg(runner: Pick<RunnerRow, "ownerId">, orgId: n
 }
 
 /**
- * findActionsRunner's ORG arm (runners.go:432-460): resolve the runner within
+ * findActionsRunner's ORG arm (runners.go:434-462): resolve the runner within
  * THIS org's scope — only `owner_id = orgId` rows resolve (a global or
  * foreign runner is a NotFound upstream, the "missing" outcome here). Note
  * the org arm pins OwnerID WITHOUT WithAvailable, so a global runner is NOT
@@ -293,7 +293,7 @@ export async function findOrgScopedRunner(d1: D1Database, orgId: number, runnerI
   return rows[0] ?? null;
 }
 
-/** ResetRunnerRegistrationToken (runners.go:275-290): NewRunnerToken at the
+/** ResetRunnerRegistrationToken (runners.go:273-288): NewRunnerToken at the
  *  ORG scope — the deactivate+insert batch mints the fresh active token and
  *  answers its RAW string (the value that renders next GET). */
 export async function resetOrgActionsRunnerToken(d1: D1Database, orgId: number): Promise<string> {
@@ -332,7 +332,7 @@ export async function updateOrgActionsRunnerDescription(
   return "updated";
 }
 
-/** RunnerUpdatePost (runners.go:328-369): the required `disabled` flip
+/** RunnerUpdatePost (runners.go:330-371): the required `disabled` flip
  *  (SetRunnerDisabled). "missing" for a foreign/stale/global id; the caller
  *  answers 400 when the param is absent (the missing-parameter arm). */
 export async function setOrgActionsRunnerDisabled(
@@ -495,13 +495,15 @@ export function renderOrgActionsRunnersPage(ctx: UiContext, data: OrgActionsRunn
 
 /** The runners list page (§2.4.1 discriminator: `organization settings
  *  actions` — org/settings/actions.tmpl:1; upstream's Title is
- *  `actions.actions`, runners.go:105). */
+ *  `actions.runners` = "Runners" — #40336 re-pointed the shared Runners
+ *  handler's Title from `actions.actions` to `actions.runners`,
+ *  runners.go:103-103, so browser tabs name the active sidebar label). */
 export function OrgActionsRunnersPage(props: { ctx: UiContext; data: OrgActionsRunnersPageData }) {
   const { ctx, data } = props;
   const orgLink = `/org/${data.org.username}`;
   const base = `${orgLink}/settings/actions/runners`;
   return (
-    <BaseLayout ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="organization settings actions">
+    <BaseLayout ctx={ctx} title={"Runners" /* "actions.runners" (the page Title, runners.go:103-103 — #40336) */} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
         <OrgSettingsNavbar orgLink={orgLink} active="runners" oauth2Enabled={data.oauth2Enabled} />
@@ -549,7 +551,7 @@ export function OrgActionsRunnersPage(props: { ctx: UiContext; data: OrgActionsR
               </form>
             </div>
             {/* AllowBulkActions is admin-only — no toolbar at org scope
-                (runners.go:147; the module header). */}
+                (runners.go:3; the module header). */}
             {data.runners.length > 0 ? (
               <div class="ui attached table segment">
                 <table class="ui very basic table unstackable">

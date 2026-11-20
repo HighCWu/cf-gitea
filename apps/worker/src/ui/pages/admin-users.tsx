@@ -11,22 +11,22 @@
  * ## Upstream surface (at the pin)
  *
  * `templates/admin/user/list.tmpl` (147 lines) served by `admin.Users`
- * (routers/web/admin/users.go:59-125) through the shared
+ * (routers/web/admin/users.go:59-124) through the shared
  * `explore.RenderUserSearch` (routers/web/explore/user.go:35-122 — the same
  * helper the explore users page rides), route `GET /-/admin/users`
- * (web.go:806-819's `/users` group `m.Get("")`), behind
+ * (web.go:782-796's `/users` group `m.Get("")`), behind
  * `verifyAuthWithOptionsWeb(&VerifyOptions{SignInRequired: true,
- * AdminRequired: true})` (web.go:779) — anonymous → the login redirect, a
+ * AdminRequired: true})` (web.go:746) — anonymous → the login redirect, a
  * signed-in non-admin → the 404 shell. That gate is the ROUTE stage's posture
  * (the module trusts its inputs like every landed load function).
  *
- * The handler's data pull (users.go:59-125): Title + PageIsAdminUsers, the
+ * The handler's data pull (users.go:59-124): Title + PageIsAdminUsers, the
  * five `status_filter[key]` query arms read verbatim (is_active / is_admin /
  * is_restricted / is_2fa_enabled / is_prohibit_login, users.go:63-69), `sort`
  * defaulting to `UserSearchDefaultAdminSort` = "alphabetically"
- * (users.go:49,71), the `user_type` filter (users.go:74-79 — unfiltered lists
+ * (users.go:49,71), the `user_type` filter (users.go:73-78 — unfiltered lists
  * UserTypeIndividual + UserReserved + Bot + RemoteUser, i.e. NEVER
- * organizations), the auth-source filter inputs (users.go:87-108 — rendered
+ * organizations), the auth-source filter inputs (users.go:86-107 — rendered
  * only `{{if .HasAuthSources}}`, list.tmpl:51), then RenderUserSearch with
  * `SearchByEmail: true` and page size `setting.UI.Admin.UserPagingNum` = 50
  * (modules/setting/ui.go:138). RenderUserSearch maps the web sort vocabulary
@@ -168,7 +168,7 @@
  *
  * Route table (`index.ts`), beside the landed adminPagePrologue pair
  * (session resolveUiSession → anonymous login-303 → non-admin 404 shell,
- * web.go:779's exact posture):
+ * web.go:746's exact posture):
  *
  *   GET /-/admin/users   adminPagePrologue(c) → loadAdminUsersData(c.env.DB,
  *                        c.req.raw's URL searchParams) →
@@ -186,7 +186,7 @@
  * already is). The sibling pages mount in the same block:
  * `tail[0] === "orgs"` → admin-orgs, `tail[0] === "repos"` → admin-repos.
  * Upstream's static `/users` literal already shadows the `/{username}` parse
- * the same way (web.go:806's group registers before web.go:1102's owner
+ * the same way (web.go:782's group registers before web.go:1069's owner
  * routes; a user named "users" is create-time reserved besides).
  *
  * The family navbar below (AdminFamilyNav) is the WHOLE admin family's ONE
@@ -498,7 +498,7 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
             explicit `false` renders the else-arm's PLAIN Webhooks item
             (navbar.tmpl:63-67) while the Applications item
             (:68-72's `{{if .EnableOAuth2}}` arm) does not render — the
-            mounted route 403s on the same flag (web.go:896's group wrap),
+            mounted route 403s on the same flag (web.go:763's group wrap),
             so the nav never links onto the forbidden page. */}
         {props.oauth2Enabled !== false ? (
           <details class="item" open={openAttr(integrationsOpen)}>
@@ -713,7 +713,7 @@ export function parseAdminUserSort(raw: string | null): AdminUserSort {
   }
 }
 
-/** The query parse (users.go:59-79's shape). `status_filter[key]` is read
+/** The query parse (users.go:59-78's shape). `status_filter[key]` is read
  *  verbatim — the bracket name is the upstream wire format. */
 export function parseAdminUsersListParams(params: URLSearchParams): AdminUsersListParams {
   const statusFilter = {} as Record<AdminUserStatusFilterKey, AdminUserStatusFilterValue>;
@@ -779,7 +779,7 @@ export interface AdminUsersData {
 /**
  * The list load — `admin.Users` → `RenderUserSearch` over the landed columns:
  * the individual + bot family (upstream's unfiltered list kinds minus the
- * D1-absent reserved/remote values — orgs never surface, users.go:74-75),
+ * D1-absent reserved/remote values — orgs never surface, users.go:73-74),
  * the admin-actor keyword triple (username/full name/email — SearchByEmail,
  * the API twin's exact instr() predicate), the five status filters (the
  * header's mapping) + the user_type arm, the sort, one page of 50.
@@ -790,7 +790,7 @@ export interface AdminUsersData {
 export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminUsersData> {
   const params = parseAdminUsersListParams(search);
   // Upstream's unfiltered web list carries EVERY listable account kind
-  // (users.go:74-75: Individual + UserReserved + Bot + RemoteUser — "an
+  // (users.go:73-74: Individual + UserReserved + Bot + RemoteUser — "an
   // administrator needs to list every account kind"; orgs never surface).
   // The reserved/remote types have no D1 enum members, so the base is the
   // individual + bot family (B-72 handoff 5 — bot rows are listable, the
@@ -824,7 +824,7 @@ export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams
   if (statusFilter.is_restricted === "1" || statusFilter.is_2fa_enabled === "1") {
     conditions.push(sql`0 = 1`);
   }
-  // The user_type filter (users.go:74-79): the posted type parses through
+  // The user_type filter (users.go:73-78): the posted type parses through
   // convert.UserTypeFromString — "User" narrows to Individuals, "Bot" to
   // bots (live since B-72), junk/absent stays unfiltered (the parser
   // absorbs junk to ""). Organizations are never listable here.

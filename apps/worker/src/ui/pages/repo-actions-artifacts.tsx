@@ -20,7 +20,7 @@
  *     document 302s to the repo-scoped preview page.
  *   - The panel-side tails the run viewer's Vue app links —
  *     `GET+DELETE /actions/runs/{run}/artifacts/{artifact_name}`
- *     (view.go:1201-1282 download/delete) — are NOT this module: the download
+ *     (view.go:1197-1278 download/delete) — are NOT this module: the download
  *     composes the legacy zip and the delete answers JSONOK, both needing
  *     their own route arms; REPORTED for the orchestrator's wiring window.
  *
@@ -584,7 +584,7 @@ export function encodeContentDispositionAttachment(filename: string): string {
   return encodeContentDisposition("attachment", filename);
 }
 
-/** insertArtifactPreviewHelperScript (view_artifact.go:261-306): the sandbox
+/** insertArtifactPreviewHelperScript (view_artifact.go:262-306): the sandbox
  *  helper rides the first structural insertion point — after <head>, else
  *  before <body> (wrapped in a synthesized head), else after <html>, else
  *  prepended. The tag search is case-insensitive over the head buffer, byte

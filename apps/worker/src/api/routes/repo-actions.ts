@@ -65,8 +65,8 @@ import { serveSetHeaders } from "../../web/attachments-serving";
  * The repo-level Actions extras — the board's P1-9 row (residuals v1.3.2 row
  * 9): the `/actions/workflows` family (list / get / runs / disable / enable /
  * dispatch, routers/api/v1/api.go:1255-1262, handlers
- * routers/api/v1/repo/action.go:859-1238) plus the `/actions/jobs` pair
- * (getWorkflowJob, action.go:1702-1752; downloadActionsRunJobLogs,
+ * routers/api/v1/repo/action.go:787-1166) plus the `/actions/jobs` pair
+ * (getWorkflowJob, action.go:1480-1528; downloadActionsRunJobLogs,
  * routers/api/v1/repo/actions_run.go:15-51 over
  * routers/common/actions.go:98-132). Eight operations over the LANDED
  * actions stores: the git-tree workflow reader rides the engine reads (the
@@ -130,13 +130,13 @@ import { serveSetHeaders } from "../../web/attachments-serving";
  *   - ActionWorkflowJob (:202-224): urls per toActionWorkflowJob
  *     (convert.go:569-590); steps render from the LANDED action_task_steps
  *     rows (runner-reported, M1b); runner_id/runner_name only when an
- *     effective task exists (EffectiveTaskID, run_job.go:158-163).
- *   - RunDetails (:258-262) — the dispatch's return_run_details=true body.
+ *     effective task exists (EffectiveTaskID, run_job.go:156-161).
+ *   - RunDetails (:257-261) — the dispatch's return_run_details=true body.
  *
  * P1-11 EXTENSION (the runs deep family — the board's row 11, P1-7's
  * remainder slice 4 of 5; 14 ops under the /actions group's RUNS half,
- * routers/api/v1/api.go:1348-1379, handlers repo/action.go:786-858 tasks +
- * :1239-1814 runs + repo/actions_run.go:57-268): this file is the actions
+ * routers/api/v1/api.go:1348-1379, handlers repo/action.go:754-818 tasks +
+ * :1159-1734 runs + repo/actions_run.go:57-268): this file is the actions
  * family's repo-scope home, so the runs-deep arms ride here instead of a
  * sibling file — the existing registration carries them. Per op:
  *
@@ -173,7 +173,7 @@ import { serveSetHeaders } from "../../web/attachments-serving";
  * reasons map to the API codes the web handler uses — InvalidArgument →
  * 400, AlreadyExist → 409); the claimed-job cancel arm rides
  * services/actions/update.ts's stopTask (the StopTask port — upstream's
- * cancelOneJob claimed arm, run_job.go:818-829, with NO log transfer, the
+ * cancelOneJob claimed arm, run_job.go:800-811, with NO log transfer, the
  * docstring's own note); artifacts render through
  * api/services/actions-artifacts.ts's toApiArtifact (the P1-10 seam).
  *
@@ -196,7 +196,7 @@ import { serveSetHeaders } from "../../web/attachments-serving";
  *     42-96): the zip composes STORE-method entries in memory (log bytes
  *     are already buffered by the landed job-logs arm — upstream deflates;
  *     the archive contract is "a zip", the method unpinned).
- *   - getArtifactsOfRun resolves NO run row upstream (action.go:1755-1812
+ *   - getArtifactsOfRun resolves NO run row upstream (action.go:1531-1588
  *     filters RepoID+RunID directly) — an unknown run id answers 200/0,
  *     pinned; the repo scoping rides the rows' repoId check (the service
  *     read is run-scoped only).
@@ -217,7 +217,7 @@ import { serveSetHeaders } from "../../web/attachments-serving";
  * in either implementation (no body, no binding); runs declares
  * {200,400,403,404}; disable/enable {204,403,404} of
  * {204,400,403,404,422} (+ a dead 409 on enable — EnableOrDisableWorkflow
- * has no conflict path, workflow.go:30-52); dispatch
+ * has no conflict path, workflow.go:31-53); dispatch
  * {200,204,403,404,422} of {200,204,400,403,404,422} — the 400 is dead (the
  * Go binder's failures are 422s, api.go:838-847); jobs pair {200,404} of
  * {200,400,404} — the 400s are dead (PathParamInt64 junk parses to 0 and
@@ -242,37 +242,37 @@ import { serveSetHeaders } from "../../web/attachments-serving";
  *     max+1 reduction surfaced has no producer left.
  *   - THE SCOPED DISPATCH TWIN (the v1.5.4 K14 wave — upstream carries the
  *     param on the API dispatch ONLY): the dispatch's
- *     `scoped_workflow_source_repo_id` (action.go:1120-1123, `in: query`;
- *     the handler read :1147 threading the shared DispatchActionWorkflow,
- *     workflow.go:64-268) resolves the SOURCE repo's default-branch
+ *     `scoped_workflow_source_repo_id` (action.go:48-51, `in: query`;
+ *     the handler read :1075 threading the shared DispatchActionWorkflow,
+ *     workflow.go:66-270) resolves the SOURCE repo's default-branch
  *     `.gitea/scoped_workflows` content through services/actions/config.ts's
  *     effective-source/opt-out reads — the same seams the WEB dispatch
  *     producer rides (services/actions/workflow-dispatch.ts) — and records
  *     the run's content-source columns (workflow_repo_id /
- *     workflow_commit_sha / is_scoped_run, workflow.go:139-142/:260-263).
+ *     workflow_commit_sha / is_scoped_run, workflow.go:140-143/:262-264).
  *     The param rides the TEXT repositories.id space verbatim through
  *     config.ts's scopedSourceRepoParam (""/"0" = repo-level) — the WEB
  *     arm's recorded adaptation (SPEC-0013 §6's divergence note; upstream's
  *     FormInt64 junk→0 has no TEXT twin). The API TOGGLE carries NO scoped
  *     arm: upstream's enable/disable swagger declares owner/repo/
- *     workflow_id only (action.go:1047-1084/:1194-1230) and the handlers
- *     never read the param (:1081/:1230 — the shared
+ *     workflow_id only (action.go:931-968/:1194-1230) and the handlers
+ *     never read the param (:1015/:1230 — the shared
  *     actions_service.EnableOrDisableWorkflow is repo-level only,
- *     workflow.go:30-52; the scoped mutators are the WEB handler's
- *     view.go:1338-1361 branch) — a scoped param on the API toggle wire is
+ *     workflow.go:31-53; the scoped mutators are the WEB handler's
+ *     view.go:1334-1357 branch) — a scoped param on the API toggle wire is
  *     ignored exactly as upstream's chi binder drops it.
- *   - The dispatch's form-urlencoded inputs arm (action.go:1148-1153) is not
+ *   - The dispatch's form-urlencoded inputs arm (action.go:1016-1021) is not
  *     ported — the contract's body is JSON; upstream's chi binder accepts
  *     both, our zod route declares JSON.
  *   - The binder's Required 422 renders the Go field name — "Ref: Required"
  *     (api.go:842's `%s: %s` rendering; the secrets family's "Data:
  *     Required" pin); the handler's own `opt.Ref == ""` 422
- *     ("ref is required parameter", action.go:1141-1144) is dead for JSON
+ *     ("ref is required parameter", action.go:1009-1012) is dead for JSON
  *     bodies (the binder's Required rejects empty strings) and is not
  *     separately reachable.
  *   - The enable/disable/dispatch audit arms (the v1.5.4 cycle —
- *     RecordWorkflowToggle, workflow.go:49; the dispatch's RecordAs tail,
- *     workflow.go:192-193) emit through services/actions/audit-arms.ts AFTER
+ *     RecordWorkflowToggle, workflow.go:50; the dispatch's RecordAs tail,
+ *     workflow.go:194-195) emit through services/actions/audit-arms.ts AFTER
  *     each write succeeds, origin "api" (api.go:954's AuditOrigin(OriginAPI)
  *     marks the whole /api/v1 router) with the requester as actor and the
  *     CALLING credential (the auditActorOf house shape — "access-token:<id>"
@@ -497,7 +497,7 @@ export const actionWorkflowJobSchema = z.object({
 
 export type ActionWorkflowJobWire = z.infer<typeof actionWorkflowJobSchema>;
 
-/** `RunDetails` (:258-262). */
+/** `RunDetails` (:257-261). */
 export const runDetailsSchema = z.object({
   workflow_run_id: z.number().int().openapi({ format: "int64" }),
   run_url: z.string(),
@@ -1060,8 +1060,8 @@ export function statusFilterToInternal(status: string): number[] | null {
  *  true set {1,t,T,TRUE,true,True} plus the case-insensitive "on" — a parse
  *  error stays false upstream's way (absent/junk and the 0-armed false
  *  spellings all answer false). Both query booleans of this family read
- *  through it upstream: exclude_pull_requests (shared/action.go:164) and
- *  return_run_details (action.go:1181 — ?=1 yields the RunDetails 200, the
+ *  through it upstream: exclude_pull_requests (shared/action.go:162) and
+ *  return_run_details (action.go:870 — ?=1 yields the RunDetails 200, the
  *  R1-F8 fix over the former exact-"true" parse). */
 function formBool(url: URL, key: string): boolean {
   const raw = url.searchParams.get(key);
@@ -1071,7 +1071,7 @@ function formBool(url: URL, key: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// The dispatch service (DispatchActionWorkflow, workflow.go:64-190, M3-free)
+// The dispatch service (DispatchActionWorkflow, workflow.go:65-191, M3-free)
 // ---------------------------------------------------------------------------
 
 export type DispatchOutcome =
@@ -1151,10 +1151,10 @@ export function parseDispatchWorkflow(content: string): DispatchWorkflowParse {
     });
   }
 
-  // WorkflowDispatchConfig (actionslib model/workflow.go:139-178): the `on:`
+  // WorkflowDispatchConfig (actionslib model/workflow.go:140-179): the `on:`
   // mapping's workflow_dispatch entry, its inputs in DECLARATION order. A
   // workflow without the trigger parses fine — the CALLER answers the
-  // has-no-workflow_dispatch 422 (workflow.go:141-146).
+  // has-no-workflow_dispatch 422 (workflow.go:142-147).
   const dispatchInputs: ParsedDispatchInput[] = [];
   const on: unknown = root.get("on");
   let entry: unknown = null;
@@ -1197,7 +1197,7 @@ function parseYamlBool(s: string): boolean {
   return s === "true" || s === "True" || s === "TRUE";
 }
 
-/** coerceDispatchInputTypes (workflow.go:192-198): the boolean-typed inputs
+/** coerceDispatchInputTypes (workflow.go:200-218): the boolean-typed inputs
  *  parse their string values (the event payload carries real booleans). */
 function coerceDispatchInputTypes(dispatchInputs: readonly ParsedDispatchInput[], inputs: Map<string, unknown>): void {
   for (const cfg of dispatchInputs) {
@@ -1209,7 +1209,7 @@ function coerceDispatchInputTypes(dispatchInputs: readonly ParsedDispatchInput[]
   }
 }
 
-/** dispatchEventInputs (workflow.go:210-216): exprparser.CoerceToString's
+/** dispatchEventInputs (workflow.go:212-218): exprparser.CoerceToString's
  *  scalar arms — booleans render lowercase, numbers plain, strings as-is. */
 function dispatchEventInputs(inputs: Map<string, unknown>): Record<string, string> {
   const eventInputs: Record<string, string> = {};
@@ -1221,7 +1221,7 @@ function dispatchEventInputs(inputs: Map<string, unknown>): Record<string, strin
 }
 
 /**
- * DispatchActionWorkflow (workflow.go:64-190, repo-level + :237-268 scoped
+ * DispatchActionWorkflow (workflow.go:65-191, repo-level + :238-269 scoped
  * arms) — the M3-free port: the disabled check, the ref resolution, the
  * workflow-content read, the light validation, the dispatch-config gate,
  * the inputs merge and the insertTriggeredRunSplit producer legs (the
@@ -1264,11 +1264,11 @@ export async function dispatchActionWorkflow(input: {
     return { outcome: "not-found", message: `ref "${ref}" doesn't exist` };
   }
 
-  // The disabled check runs FIRST (workflow.go:83-98) — the repo-level arm
+  // The disabled check runs FIRST (workflow.go:84-99) — the repo-level arm
   // against the request id exactly as upstream compares cfg.DisabledWorkflows
   // entries; the scoped arm reads the opt-out store instead
   // (IsScopedWorkflowOptedOut — flagged disabled AND not required,
-  // workflow.go:89-92's isScoped branch).
+  // workflow.go:90-93's isScoped branch).
   const cfg = await loadRepoActionsConfig(d1, pair.repo.id);
   if (isScoped) {
     if (await isScopedWorkflowOptedOut(d1, cfg, pair.owner.id, scopedSourceRepoId, workflowId)) {
@@ -1278,7 +1278,7 @@ export async function dispatchActionWorkflow(input: {
     return { outcome: "forbidden", message: "workflow is disabled" };
   }
 
-  // The ref resolution (workflow.go:101-120): refs/tags/* → tag,
+  // The ref resolution (workflow.go:102-121): refs/tags/* → tag,
   // refs/heads/* → branch, anything else AS A BRANCH — a bare name that
   // only exists as a tag misses (upstream's own spoof test: ref "spoof"
   // against refs/tags/refs/heads/spoof answers 404,
@@ -1303,10 +1303,10 @@ export async function dispatchActionWorkflow(input: {
     return { outcome: "not-found", message: `ref "${ref}" doesn't exist` };
   }
 
-  // resolveDispatchWorkflowContent (workflow.go:222-268): the repo-level arm
+  // resolveDispatchWorkflowContent (workflow.go:224-270): the repo-level arm
   // reads the workflow file at the TARGET commit (a miss is the not-found
   // arm); the scoped arm reads the SOURCE repo's default branch instead —
-  // the run's commit stays the consumer ref's (workflow.go:135) while the
+  // the run's commit stays the consumer ref's (workflow.go:136) while the
   // CONTENT source rides the scoped resolution below.
   let content: string;
   let scopedSource: { repoId: string; sha: string } | null = null;
@@ -1331,8 +1331,8 @@ export async function dispatchActionWorkflow(input: {
     content = new TextDecoder().decode(blob.data);
   }
 
-  // ValidateWorkflowStatic + ReadWorkflow (workflow.go:127-140) — the light
-  // YAML check; then the dispatch-config gate (workflow.go:141-146).
+  // ValidateWorkflowStatic + ReadWorkflow (workflow.go:128-141) — the light
+  // YAML check; then the dispatch-config gate (workflow.go:142-147).
   let parsed: DispatchWorkflowParse;
   try {
     parsed = parseDispatchWorkflow(content);
@@ -1347,7 +1347,7 @@ export async function dispatchActionWorkflow(input: {
     };
   }
 
-  // The inputs merge (the handler's processInputs closure, action.go:1154-1163
+  // The inputs merge (the handler's processInputs closure, action.go:1016-1025
   // — the JSON arm): provided values, else the declared defaults.
   const inputsWithDefaults = new Map<string, unknown>();
   for (const cfgInput of parsed.dispatchInputs) {
@@ -1356,7 +1356,7 @@ export async function dispatchActionWorkflow(input: {
   }
   coerceDispatchInputTypes(parsed.dispatchInputs, inputsWithDefaults);
 
-  // The payload (WorkflowDispatchPayload, workflow.go:174-193): the API arm
+  // The payload (WorkflowDispatchPayload, workflow.go:175-194): the API arm
   // keeps the full repository/sender objects — the web arm's {}-shape
   // reduction is services/actions/workflow-dispatch.ts's documented split.
   const settings = await loadRepoSettings(d1, pair.repo.id);
@@ -1369,7 +1369,7 @@ export async function dispatchActionWorkflow(input: {
     sender: senderRow === null ? null : apiUserFromRow(senderRow, { origin, requester: null }),
   });
 
-  // PrepareRunAndInsert (workflow.go:189 → run.go:63-217) through the shared
+  // PrepareRunAndInsert (workflow.go:190 → run.go:63-217) through the shared
   // producer legs — the same insert the web dispatch and the push/schedule
   // family take (the R1-F4 fix; the bare insertActionRun shape is retired):
   // the E5 model split (matrix combos + job names), the E2 run-name
@@ -1395,8 +1395,8 @@ export async function dispatchActionWorkflow(input: {
       ref: refName,
       commitSha: runTargetCommit.oid,
       // The content-source skeleton, set PRE-INSERT exactly as upstream sets
-      // it on the run (the R1-F5 pin — workflow.go:136-137's repo-level
-      // fields, :260-263's scoped overrides): the repo-level default is this
+      // it on the run (the R1-F5 pin — workflow.go:137-138's repo-level
+      // fields, :262-264's scoped overrides): the repo-level default is this
       // repo at the run commit (undefined → the shared insert's defaults),
       // the scoped arm carries the SOURCE pair verbatim. No post-insert
       // compensation UPDATE remains on either arm.
@@ -1423,18 +1423,18 @@ export async function dispatchActionWorkflow(input: {
 }
 
 /**
- * resolveScopedDispatchContent (workflow.go:237-268) — the API twin of the
+ * resolveScopedDispatchContent (workflow.go:239-270) — the API twin of the
  * service arm's private resolver (services/actions/workflow-dispatch.ts):
  *   1. the source must be EFFECTIVE for the consumer's owner
  *      (IsScopedWorkflowSourceEffective — a miss answers the not-found arm,
- *      :241-249's actions.workflow.not_found);
- *   2. the source repo row (GetRepositoryByID, :251-254 — the miss is the
+ *      :242-250's actions.workflow.not_found);
+ *   2. the source repo row (GetRepositoryByID, :252-255 — the miss is the
  *      ServerError class, a thrown Error into the 500 handler);
  *   3. the source's DEFAULT-BRANCH HEAD + the SCOPED_WORKFLOW_DIRS walk
  *      with the entry-name match (LoadParsedScopedWorkflows'
  *      ListScopedWorkflows half; an unresolvable source HEAD is the
  *      GetBranchExisting error arm — the ServerError class; a missing
- *      workflow answers not-found, :260-267).
+ *      workflow answers not-found, :262-268).
  * Returns the content plus the (repo, commit) the run records.
  */
 async function resolveScopedDispatchContent(
@@ -1449,7 +1449,7 @@ async function resolveScopedDispatchContent(
     return { outcome: notFound, content: "", sourceRepoId, sourceSha: "" };
   }
 
-  // GetRepositoryByID (:251-254) — the row miss is upstream's ServerError
+  // GetRepositoryByID (:252-255) — the row miss is upstream's ServerError
   // class (the error propagates un-translated into the 500 handler).
   const sourceRows = await drizzle(d1)
     .select({ id: repositories.id, ownerNamespace: repositories.ownerNamespace, slug: repositories.slug, defaultBranch: repositories.defaultBranch })
@@ -1487,7 +1487,7 @@ async function resolveScopedDispatchContent(
     (entry) => entry.type === "blob" && (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml")) && entry.name === wanted,
   )?.name;
   if (dir === null || entryName === undefined) {
-    // the parsed set has no such EntryName (:260-267's not-found)
+    // the parsed set has no such EntryName (:262-268's not-found)
     return { outcome: notFound, content: "", sourceRepoId, sourceSha: sourceHead.oid };
   }
   const blob = await sourceReads.readBlob(sourceRef, `${dir}/${entryName}`);
@@ -1740,7 +1740,7 @@ async function runAttemptByNumber(
   return attempt;
 }
 
-/** GetLatestAttemptJobsByRun (run_job.go:264-274): the latest attempt's jobs,
+/** GetLatestAttemptJobsByRun (run_job.go:262-272): the latest attempt's jobs,
  *  id ASC; the legacy arm matches run_attempt_id = 0 rows. */
 async function latestAttemptJobsOfRun(d1: D1Database, run: RunRow): Promise<RunJobRow[]> {
   return drizzle(d1)
@@ -1815,7 +1815,7 @@ async function actionTaskWire(
   };
 }
 
-// --- the cancel port (services/actions/cancel.go + run_job.go:769-829) -----
+// --- the cancel port (services/actions/cancel.go + run_job.go:751-811) -----
 
 /** CancelJobs at v1 (the rerun service header's same unread-column verdict):
  *  the `always()`-condition exemption (cancel.go:79-90) needs the job YAML
@@ -1828,11 +1828,11 @@ async function cancelRunJobs(d1: D1Database, jobs: RunJobRow[], force: boolean):
   let cancelled = 0;
   for (const job of jobs) {
     if (isDoneStatus(job.status)) {
-      continue; // cancelOneJob's done arm (run_job.go:806-808)
+      continue; // cancelOneJob's done arm (run_job.go:779-781)
     }
     if (job.taskId === 0) {
       // cancelOneJob's no-task arm behind the task_id = 0 claim CAS
-      // (run_job.go:810-819).
+      // (run_job.go:792-801).
       const updated = await db
         .update(actionRunJobs)
         .set({ status: STATUS_CANCELLED, stopped: now, updated: now })
@@ -1841,7 +1841,7 @@ async function cancelRunJobs(d1: D1Database, jobs: RunJobRow[], force: boolean):
       if (updated.length > 0) cancelled += 1;
       continue;
     }
-    // cancelOneJob's claimed arm (run_job.go:820-829): StopTask with
+    // cancelOneJob's claimed arm (run_job.go:802-811): StopTask with
     // CANCELLING unless force; the landed stopTask port negotiates the
     // runner handshake and does NOT transfer logs (its docstring notes
     // upstream's cancelOneJob caller — the sweeps transfer, cancel does not).
@@ -1851,7 +1851,7 @@ async function cancelRunJobs(d1: D1Database, jobs: RunJobRow[], force: boolean):
   return cancelled;
 }
 
-/** SettleRunAfterCancel (run_job.go:796-801) — refreshRunStatus with the
+/** SettleRunAfterCancel (run_job.go:778-783) — refreshRunStatus with the
  *  CANCELLED noJobsStatus. The landed refreshRunStatus has no noJobsStatus
  *  parameter and aggregates ALL of a run's job rows (the rerun service's
  *  HANDOFF note), so the attempt-scoped settle lives here (the UI view
@@ -1859,7 +1859,7 @@ async function cancelRunJobs(d1: D1Database, jobs: RunJobRow[], force: boolean):
  *  jobs (an empty family carries the CANCELLED fallback), the run mirrors. */
 async function settleRunAfterCancel(d1: D1Database, run: RunRow): Promise<void> {
   if (isDoneStatus(run.status)) {
-    return; // run_job.go:797-799
+    return; // run_job.go:779-781
   }
   const db = drizzle(d1);
   const now = new Date();
@@ -1874,7 +1874,7 @@ async function settleRunAfterCancel(d1: D1Database, run: RunRow): Promise<void> 
     .where(
       run.latestAttemptId > 0
         ? and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, run.latestAttemptId))
-        : eq(actionRunJobs.runId, run.id), // the legacy fallback, run_job.go:574-601
+        : eq(actionRunJobs.runId, run.id), // the legacy fallback, run_job.go:556-583
     )
     .all();
   const next = jobCols.length === 0 ? STATUS_CANCELLED : aggregateJobStatus(jobCols);
@@ -1906,7 +1906,7 @@ async function settleRunAfterCancel(d1: D1Database, run: RunRow): Promise<void> 
 }
 
 /** cancelRun's re-load + settle (cancel.go:44-68): upstream's job-update path
- *  refreshes the aggregate through UpdateRunJob's hook (run_job.go:504-527) —
+ *  refreshes the aggregate through UpdateRunJob's hook (run_job.go:486-509) —
  *  a hook the direct writes here don't fire, so the refresh runs explicitly
  *  after ANY cancelled job; the no-update path settles with the CANCELLED
  *  noJobsStatus instead. */
@@ -1954,7 +1954,7 @@ async function approveRun(d1: D1Database, run: RunRow, doerId: number): Promise<
     released += updated.length;
   }
   if (released > 0) {
-    // UpdateRunJob's done-arm bump (run_job.go:504-527) — the wake fires
+    // UpdateRunJob's done-arm bump (run_job.go:486-509) — the wake fires
     // when waiting work remains.
     if (await hasWaitingJobsToPick(d1, run.repoId)) {
       await increaseTaskVersion(d1, run.ownerId, run.repoId);
@@ -2299,7 +2299,7 @@ export function registerRepoActionsRoutes(
       const url = new URL(c.req.url);
 
       // The status filter parses BEFORE anything else answers (shared/
-      // action.go:151-156 — the invalid value is a 400 regardless of data).
+      // action.go:149-154 — the invalid value is a 400 regardless of data).
       const statuses: number[] = [];
       for (const value of url.searchParams.getAll("status")) {
         const values = statusFilterToInternal(value);
@@ -2324,8 +2324,8 @@ export function registerRepoActionsRoutes(
         triggerUserId = row.id;
       }
 
-      // The scoped filter (repo/action.go:1025-1026's probe +
-      // shared/action.go:142-145's ListRuns, applied by
+      // The scoped filter (repo/action.go:50-51's probe +
+      // shared/action.go:140-143's ListRuns, applied by
       // models/actions/run_list.go:105-109): the is_scoped_run half applies
       // on EVERY spelling (upstream sets `opts.IsScopedRun =
       // optional.Some(workflowSourceRepoID > 0)` whenever workflowID is
@@ -2356,7 +2356,7 @@ export function registerRepoActionsRoutes(
       // the landed like()-over-path-spelled-rows bridge is retired.
       const workflowMatch = eq(actionRuns.workflowId, workflowId);
 
-      // The existence probe (repo/action.go:1027-1042): BOTH scoped conds
+      // The existence probe (repo/action.go:694-709): BOTH scoped conds
       // ride it too (upstream's FindRunOptions carries the pair); existing
       // runs prove the workflow valid — historical files list without a git
       // lookup; a never-run REPO-LEVEL workflow falls back to the tree walk
@@ -2449,7 +2449,7 @@ export function registerRepoActionsRoutes(
       await requireActionsWriter(c, pair);
       const workflowId = c.req.valid("param").workflow_id;
       const reads = engineReads(c.env, { ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug });
-      // EnableOrDisableWorkflow (workflow.go:30-35): the workflow lookup
+      // EnableOrDisableWorkflow (workflow.go:31-36): the workflow lookup
       // first — a miss is the 404.
       const found = await findWorkflowEntry(reads, pair, workflowId);
       if (found === null) {
@@ -2464,7 +2464,7 @@ export function registerRepoActionsRoutes(
       if (saved === "missing") {
         throw new Error("ActionsDisableWorkflow: UpdateRepoUnitConfig missed the actions unit row");
       }
-      // RecordWorkflowToggle (workflow.go:49 — after UpdateRepoUnitConfig,
+      // RecordWorkflowToggle (workflow.go:50 — after UpdateRepoUnitConfig,
       // before the wire answer): the API twin's disable arm.
       const actor = auditActorOf(c.get("authUser"), c.get("auth"));
       await emitWorkflowToggleAudit(c.env.DB, {
@@ -2517,7 +2517,7 @@ export function registerRepoActionsRoutes(
       if (saved === "missing") {
         throw new Error("ActionsEnableWorkflow: UpdateRepoUnitConfig missed the actions unit row");
       }
-      // RecordWorkflowToggle (workflow.go:49): the API twin's enable arm.
+      // RecordWorkflowToggle (workflow.go:50): the API twin's enable arm.
       const actor = auditActorOf(c.get("authUser"), c.get("auth"));
       await emitWorkflowToggleAudit(c.env.DB, {
         repo: pair.repo,
@@ -2580,7 +2580,7 @@ export function registerRepoActionsRoutes(
       const url = new URL(c.req.url);
       // The scoped source param rides RAW — dispatchActionWorkflow normalizes
       // through scopedSourceRepoParam (the TEXT source id verbatim; ""/"0"
-      // and any leading "-" = the repo-level arm, workflow.go:79's
+      // and any leading "-" = the repo-level arm, workflow.go:80's
       // isScoped := > 0; the module header's THE SCOPED DISPATCH TWIN note).
       const scopedRaw = url.searchParams.get("scoped_workflow_source_repo_id") ?? "";
 
@@ -2614,7 +2614,7 @@ export function registerRepoActionsRoutes(
         throw new ApiError(422, outcome.message);
       }
 
-      // DispatchActionWorkflow's audit tail (workflow.go:192-193 — RecordAs
+      // DispatchActionWorkflow's audit tail (workflow.go:194-195 — RecordAs
       // after PrepareRunAndInsert, before the run-id answer): the RAW ref
       // rides the row, NOT the RefName-normalized branch ref the run stores.
       const actor = auditActorOf(c.get("authUser"), c.get("auth"));
@@ -2629,8 +2629,8 @@ export function registerRepoActionsRoutes(
         ipAddress: c.req.header("cf-connecting-ip") ?? null,
       });
 
-      // FormBool (base_form.go): absent/false → 204 (action.go:1168-1171);
-      // true → the RunDetails body (action.go:1173-1178).
+      // FormBool (base_form.go): absent/false → 204 (action.go:46-49);
+      // true → the RunDetails body (action.go:483-488).
       if (!formBool(url, "return_run_details")) {
         return c.body(null, 204);
       }
@@ -2675,7 +2675,7 @@ export function registerRepoActionsRoutes(
       const jobRows = await db.select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)).limit(1);
       const job = jobRows[0];
       // !has || job.RepoID != ctx.Repo.Repository.ID → APIErrorNotFound's
-      // bare "not found" body (action.go:1725-1728, api.go:137-142).
+      // bare "not found" body (action.go:660-663, api.go:137-142).
       if (job === undefined || job.repoId !== pair.repo.id) {
         throw new ApiError(404, "not found");
       }
@@ -2715,7 +2715,7 @@ export function registerRepoActionsRoutes(
       await requireActionsReader(c, pair);
       const jobId = parsePathId(c.req.valid("param").job_id);
       const db = drizzle(c.env.DB);
-      // GetRunJobByRepoAndID (run_job.go:218-228) — repo-scoped; the miss is
+      // GetRunJobByRepoAndID (run_job.go:216-226) — repo-scoped; the miss is
       // APIErrorAuto's 404 with the wrapped not-exist text.
       const jobRows = await db.select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)).limit(1);
       const job = jobRows[0];
@@ -2728,7 +2728,7 @@ export function registerRepoActionsRoutes(
       if (run === undefined) {
         throw new Error(`DownloadActionsRunJobLogs: LoadRun ${job.runId} failed`);
       }
-      // EffectiveTaskID (run_job.go:158-163): TaskID > 0 else SourceTaskID;
+      // EffectiveTaskID (run_job.go:156-161): TaskID > 0 else SourceTaskID;
       // zero → "job not started" (not-exist → 404).
       const taskID = job.taskId > 0 ? job.taskId : job.sourceTaskId;
       if (taskID === 0) {
@@ -2778,8 +2778,8 @@ export function registerRepoActionsRoutes(
   // -------------------------------------------------------------------------
 
   // GET /repos/{owner}/{repo}/actions/tasks (ListActionTasks,
-  // action.go:786-858) — the repo's task census, PK-ordered, WITH the
-  // pagination headers (the handler sets Link + TotalCount, :848-850).
+  // action.go:754-818) — the repo's task census, PK-ordered, WITH the
+  // pagination headers (the handler sets Link + TotalCount, :808-810).
   app.openapi(
     createRoute({
       method: "get",
@@ -2823,7 +2823,7 @@ export function registerRepoActionsRoutes(
   );
 
   // GET /repos/{owner}/{repo}/actions/runs/{run} (GetWorkflowRun,
-  // action.go:1283-1306) — the run wire over the latest attempt.
+  // action.go:1131-1154) — the run wire over the latest attempt.
   app.openapi(
     createRoute({
       method: "get",
@@ -2859,7 +2859,7 @@ export function registerRepoActionsRoutes(
   );
 
   // GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}
-  // (getWorkflowRunAttempt, action.go:1308-1342) — the run wire over the
+  // (getWorkflowRunAttempt, action.go:1148-1182) — the run wire over the
   // GIVEN attempt (its status/timing/trigger actor, and its
   // previous_attempt_url pointer).
   app.openapi(
@@ -2898,7 +2898,7 @@ export function registerRepoActionsRoutes(
   );
 
   // GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}/jobs
-  // (listWorkflowRunAttemptJobs, action.go:1652-1700) — shared.ListJobs at
+  // (listWorkflowRunAttemptJobs, action.go:1432-1480) — shared.ListJobs at
   // (0, repoID, runID, Some(attempt.ID)).
   app.openapi(
     createRoute({
@@ -2942,7 +2942,7 @@ export function registerRepoActionsRoutes(
   );
 
   // DELETE /repos/{owner}/{repo}/actions/runs/{run} (deleteActionRun,
-  // action.go:1812-1849) — reqToken + reqRepoWriter; a not-done run answers
+  // action.go:1584-1621) — reqToken + reqRepoWriter; a not-done run answers
   // the 400; DeleteRun cascades rows + storage.
   app.openapi(
     createRoute({
@@ -2966,7 +2966,7 @@ export function registerRepoActionsRoutes(
       await requireActionsWriter(c, pair);
       const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
       if (!isDoneStatus(run.status)) {
-        throw new ApiError(400, "this workflow run is not done"); // action.go:1828-1831
+        throw new ApiError(400, "this workflow run is not done"); // action.go:48-51
       }
       await deleteRunRows(c.env.DB, c.env, run);
       return c.body(null, 204);
@@ -2974,7 +2974,7 @@ export function registerRepoActionsRoutes(
   );
 
   // POST /repos/{owner}/{repo}/actions/runs/{run}/rerun (rerunWorkflowRun,
-  // action.go:1344-1422) — reqToken + reqRepoWriter; rides the LANDED rerun
+  // action.go:1182-1260) — reqToken + reqRepoWriter; rides the LANDED rerun
   // service; 201 carries the run wire over the NEW attempt.
   app.openapi(
     createRoute({
@@ -3020,7 +3020,7 @@ export function registerRepoActionsRoutes(
   );
 
   // POST /repos/{owner}/{repo}/actions/runs/{run}/rerun-failed-jobs
-  // (rerunFailedWorkflowRun, action.go:1424-1476) — the failed/cancelled
+  // (rerunFailedWorkflowRun, action.go:1258-1310) — the failed/cancelled
   // filter (the landed GetFailedJobsForRerun port); an empty set is the 400;
   // success answers the bare 201.
   app.openapi(
@@ -3049,7 +3049,7 @@ export function registerRepoActionsRoutes(
       const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
       const failedJobs = getFailedJobsForRerun(jobs);
       if (failedJobs.length === 0) {
-        throw new ApiError(400, "this workflow run has no failed jobs to re-run"); // action.go:1453-1456
+        throw new ApiError(400, "this workflow run has no failed jobs to re-run"); // action.go:1279-1282
       }
       const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, failedJobs, { bindings: c.env, origin: new URL(c.req.url).origin });
       if (!result.ok) throw rerunRejectionToApiError(result);
@@ -3176,7 +3176,7 @@ export function registerRepoActionsRoutes(
   );
 
   // GET /repos/{owner}/{repo}/actions/runs/{run}/jobs (listWorkflowRunJobs,
-  // action.go:1598-1650) — the runID<=0 400 (the junk parse lands 0), the
+  // action.go:1390-1442) — the runID<=0 400 (the junk parse lands 0), the
   // run 404, then shared.ListJobs at Some(run.LatestAttemptID); the sort/
   // order 422s and the invalid-status 400 are the declared arms.
   app.openapi(
@@ -3211,7 +3211,7 @@ export function registerRepoActionsRoutes(
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
       await requireActionsReader(c, pair);
       // The junk-id parse lands 0 and answers the binder's arm
-      // (action.go:1609-1612 — "runID must be a positive integer").
+      // (action.go:52-55 — "runID must be a positive integer").
       const runId = parsePathId(c.req.valid("param").run);
       if (runId <= 0) {
         throw new ApiError(400, "runID must be a positive integer");
@@ -3224,7 +3224,7 @@ export function registerRepoActionsRoutes(
   );
 
   // POST /repos/{owner}/{repo}/actions/runs/{run}/jobs/{job_id}/rerun
-  // (rerunWorkflowJob, action.go:1478-1556) — the job must belong to the
+  // (rerunWorkflowJob, action.go:1302-1380) — the job must belong to the
   // run's latest attempt (the "workflow job not found" 404); 201 carries the
   // NEW attempt's job row (matched by attempt_job_id).
   app.openapi(
@@ -3257,12 +3257,12 @@ export function registerRepoActionsRoutes(
       const jobId = parsePathId(c.req.valid("param").job_id);
       const targetJob = jobs.find((job) => job.id === jobId);
       if (targetJob === undefined) {
-        throw new ApiError(404, "workflow job not found"); // APIErrorNotFound, action.go:1506-1508
+        throw new ApiError(404, "workflow job not found"); // APIErrorNotFound, action.go:1322-1324
       }
       const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, [targetJob], { bindings: c.env, origin: new URL(c.req.url).origin });
       if (!result.ok) throw rerunRejectionToApiError(result);
       // The new attempt's row for the target job's AttemptJobID — the
-      // legacy rows' backfilled identity re-read (action.go:1523-1535).
+      // legacy rows' backfilled identity re-read (action.go:1331-1343).
       let attemptJobId = targetJob.attemptJobId;
       if (attemptJobId === 0) {
         const reloaded = await drizzle(c.env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.id, targetJob.id)).limit(1);
@@ -3304,7 +3304,7 @@ export function registerRepoActionsRoutes(
       const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
       const entries: LogZipEntry[] = [];
       for (const job of jobs) {
-        // EffectiveTaskID (run_job.go:158-163); a job without a task, or
+        // EffectiveTaskID (run_job.go:156-161); a job without a task, or
         // whose logs expired, is SKIPPED (common/actions.go:52-54) — the
         // 404 fires only when NO entry composes.
         const taskID = job.taskId > 0 ? job.taskId : job.sourceTaskId;
@@ -3348,7 +3348,7 @@ export function registerRepoActionsRoutes(
   );
 
   // GET /repos/{owner}/{repo}/actions/runs/{run}/artifacts
-  // (getArtifactsOfRun, action.go:1755-1812) — NO run resolution upstream
+  // (getArtifactsOfRun, action.go:1531-1588) — NO run resolution upstream
   // (the RepoID+RunID filter answers an unknown run with 200/0); the
   // finalized-v4 filter + the name filter + the silent page clamp; NO
   // pagination headers.
@@ -3406,7 +3406,7 @@ export function registerRepoActionsRoutes(
 // ---------------------------------------------------------------------------
 
 /** The rerun service's rejection → the API error (the web handler's
- *  handleWorkflowRerunError mapping, view.go:1018-1028: AlreadyExist → 409,
+ *  handleWorkflowRerunError mapping, view.go:1014-1024: AlreadyExist → 409,
  *  InvalidArgument → 400; the internal misuses are the 500 class). */
 function rerunRejectionToApiError(result: Extract<RerunResult, { ok: false }>): ApiError {
   switch (result.reason) {

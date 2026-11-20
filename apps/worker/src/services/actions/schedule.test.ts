@@ -427,10 +427,10 @@ describe("cleanRepoScheduleTasks (the §D7 wiring)", () => {
     // A push run on the same repo — NEVER the clean's target.
     const push = await seedRunWithJob({ triggerEvent: "push", ref: "refs/heads/main", runStatus: ACTION_STATUS_RUNNING, jobStatus: ACTION_STATUS_WAITING });
     // A schedule run on a NON-default branch — CancelPreviousJobs' ref
-    // filter keeps it (run_job.go:713).
+    // filter keeps it (run_job.go:695).
     const otherRef = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/feature", runStatus: ACTION_STATUS_WAITING, jobStatus: ACTION_STATUS_WAITING });
     // A DONE schedule run on the default branch — outside the live-status
-    // set (run_job.go:716-719).
+    // set (run_job.go:698-701).
     const done = await seedRunWithJob({ triggerEvent: "schedule", ref: "refs/heads/main", runStatus: ACTION_STATUS_SUCCESS, jobStatus: ACTION_STATUS_SUCCESS });
 
     const cancelled = await cleanRepoScheduleTasks(env.DB, CLEAN_REPO);

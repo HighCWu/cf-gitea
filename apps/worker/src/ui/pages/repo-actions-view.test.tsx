@@ -455,7 +455,7 @@ describe("the mount page (GET — the view.tmpl + view_component.tmpl shell)", (
     expect(html).toContain(`data-locale-graph-reset-view="${repoActionsViewLocale.graphResetView}"`);
     // The page shell: .page-content.repository over the repo header; the
     // strip rides the header with the Actions anchor active (upstream
-    // view.go:206 arms PageIsActions) and NOT the Code anchor.
+    // view.go:204 arms PageIsActions) and NOT the Code anchor.
     expect(html).toContain("page-content repository");
     expect(html).toContain('class="active item" href="/alice/demo/actions"');
     expect(html).not.toContain('class="active item" href="/alice/demo"');
@@ -479,7 +479,7 @@ describe("the mount page (GET — the view.tmpl + view_component.tmpl shell)", (
     const jobHtml = await jobRes.text();
     expect(jobHtml).toContain(`data-actions-view-url="/alice/demo/actions/runs/${run.id}/jobs/${jobId}"`);
     expect(jobHtml).toContain(`data-job-id="${jobId}"`);
-    // The tab title joins the job name first (view.go:299-306).
+    // The tab title joins the job name first (view.go:297-304).
     expect(jobHtml).toContain("<title>build (1) - Fix the login bug - .github/workflows/ci.yml - alice/demo</title>");
 
     // A junk attempt segment parses to PathParamInt64's 0 → the bare run URL
@@ -520,7 +520,7 @@ describe("the mount page (GET — the view.tmpl + view_component.tmpl shell)", (
     }
   });
 
-  it("the legacy index URL 302s onto the canonical id URL on GET (view.go:123-128)", async () => {
+  it("the legacy index URL 302s onto the canonical id URL on GET (view.go:121-126)", async () => {
     const { run } = await seedRun(5);
     const res = await getRoute("/alice/demo/actions/runs/5", 1);
     expect(res.status).toBe(302);
@@ -559,7 +559,7 @@ describe("the mount page (GET — the view.tmpl + view_component.tmpl shell)", (
   });
 });
 
-// --- the ViewResponse JSON (POST — the view.go:291-417 contract) -----------------
+// --- the ViewResponse JSON (POST — the view.go:287-413 contract) -----------------
 
 describe("the ViewResponse JSON (POST — pinned against view.go's field list)", () => {
   it("answers the full summary shape for a waiting run with two jobs", async () => {
@@ -820,7 +820,7 @@ describe("the ViewResponse JSON (POST — pinned against view.go's field list)",
     expect(tagBody.state.run.commit.branch.link).toBe(`/alice/demo/src/tag/v1%212%28x%29`);
   });
 
-  // --- the arm-3 lookup (view.go:436-453 — the ⑲A7 row) ----------------------
+  // --- the arm-3 lookup (view.go:432-449 — the ⑲A7 row) ----------------------
 
   /** Seed one PR row pair (the join the arm-3 lookup rides). */
   async function seedPr(opts: {
@@ -857,7 +857,7 @@ describe("the ViewResponse JSON (POST — pinned against view.go's field list)",
     });
   }
 
-  it("a push run on a branch with exactly ONE open PR surfaces the Back-to-PR link (view.go:436-453, the ⑲A7 row)", async () => {
+  it("a push run on a branch with exactly ONE open PR surfaces the Back-to-PR link (view.go:432-449, the ⑲A7 row)", async () => {
     await enableActions();
     await seedPr({ index: 5, headBranch: "feature" });
     const seeded = await seedRun(1, { ref: "refs/heads/feature" });
@@ -1122,7 +1122,7 @@ async function rerun(
   return rerunActionRun(env.DB, repo, stored, attempt, jobs, 1, request);
 }
 
-describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — view.go:952-1016)", () => {
+describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — view.go:948-1012)", () => {
   beforeEach(async () => {
     await enableActions();
   });
@@ -1156,7 +1156,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     ]);
   });
 
-  it("rerun-failed on a fully successful run 400s the no-failed-jobs locale (view.go:1002-1008)", async () => {
+  it("rerun-failed on a fully successful run 400s the no-failed-jobs locale (view.go:998-1004)", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
     await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
 
@@ -1201,7 +1201,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     expect(await getArtifactAttemptIds(env.DB, newTest)).toEqual([run.latestAttemptId, seeded.attempt.id]);
   });
 
-  it("a not-done run answers the not_done locale (checkRunRerunAllowed, view.go:921-925)", async () => {
+  it("a not-done run answers the not_done locale (checkRunRerunAllowed, view.go:917-921)", async () => {
     const { run } = await seedRun(1);
     const outcome = await rerun(run.id, { kind: "run" });
     expect(outcome).toEqual({
@@ -1211,7 +1211,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     });
   });
 
-  it("a disabled workflow answers the disabled locale (checkRunRerunAllowed, view.go:926-941)", async () => {
+  it("a disabled workflow answers the disabled locale (checkRunRerunAllowed, view.go:922-937)", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
     await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
     await saveRepoActionsConfig(env.DB, repo.id, {
@@ -1226,7 +1226,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     });
   });
 
-  it("a SCOPED run consults the opt-out store instead of the repo-level map (checkRunRerunAllowed's scoped twin, view.go:929-936 — the R1-F10 gate)", async () => {
+  it("a SCOPED run consults the opt-out store instead of the repo-level map (checkRunRerunAllowed's scoped twin, view.go:925-932 — the R1-F10 gate)", async () => {
     const store = scopedWorkflowSourcesStore(env.DB);
     const SRC_ID = "repo-scoped-src";
     await store.removeSource(0, SRC_ID); // defensive: the sources table outlives the beforeEach wipe
@@ -1257,7 +1257,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     expect(attempts).toHaveLength(1); // nothing written
 
     // REQUIRED in the registration → the stale flag is dead
-    // (IsScopedWorkflowOptedOut's conjunction, workflow.go:89-92) — the
+    // (IsScopedWorkflowOptedOut's conjunction, workflow.go:90-93) — the
     // rerun proceeds to attempt 2.
     await store.setSourceConfigs(0, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
     const allowed = await rerun(seeded.run.id, { kind: "run" });
@@ -1267,11 +1267,11 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
   });
 
   // R1-F9's web twin — the gate's owner argument is the RESOLVED repo's
-  // CURRENT owner (view.go:930 `ctx.Repo.Repository.OwnerID`; rerun.go:93's
+  // CURRENT owner (view.go:926 `ctx.Repo.Repository.OwnerID`; rerun.go:93's
   // repo.OwnerID is the same currency), not the run row's frozen ownerId:
   // after a transfer the scoped gate consults the NEW owner's registrations
   // (the service twin pins the same currency in services/actions/rerun.test.ts).
-  it("after a transfer the scoped gate reads the NEW owner's registrations (view.go:930 — the current-owner currency)", async () => {
+  it("after a transfer the scoped gate reads the NEW owner's registrations (view.go:926 — the current-owner currency)", async () => {
     const store = scopedWorkflowSourcesStore(env.DB);
     const SRC_ID = "repo-scoped-src-xfer";
     await env.DB.prepare(
@@ -1289,7 +1289,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     // rescues it: a run.ownerId read would scan owner 1 — no registration —
     // and answer the refusal; the current-owner read finds bob's required
     // row and the rerun proceeds (IsScopedWorkflowOptedOut's conjunction,
-    // workflow.go:89-92).
+    // workflow.go:90-93).
     await saveRepoActionsConfig(env.DB, repo.id, {
       ...parseRepoActionsConfig(null),
       disabledScopedWorkflows: { [SRC_ID]: [WORKFLOW_ID] },
@@ -1319,14 +1319,14 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     await store.removeSource(1, SRC_ID);
   });
 
-  it("the job rerun: a foreign job 404-shells, the run's own job succeeds (view.go:970-974)", async () => {
+  it("the job rerun: a foreign job 404-shells, the run's own job succeeds (view.go:966-970)", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }, { jobId: "side" }] });
     await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
     const jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, seeded.run.id));
     const buildJob = jobs.find((job) => job.jobId === "build")!;
 
     // The foreign-job probe FIRST: upstream answers not-done before the job
-    // lookup (view.go:962's gate precedes :970), so once a rerun flips the
+    // lookup (view.go:207's gate precedes :968), so once a rerun flips the
     // run back to waiting, the 404 arm is unreachable.
     const foreign = await rerun(seeded.run.id, { kind: "job", jobId: 999999 });
     expect(foreign).toEqual({ kind: "not-found" });
@@ -1335,7 +1335,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     expect(okOutcome).toMatchObject({ kind: "json", status: 200 });
   });
 
-  it("a historical attempt URL answers the 404 shell (checkLatestAttempt, view.go:944-950)", async () => {
+  it("a historical attempt URL answers the 404 shell (checkLatestAttempt, view.go:940-946)", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
     await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
     await rerun(seeded.run.id, { kind: "run" }); // attempt 2 exists now
@@ -1345,7 +1345,7 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
     expect(outcome).toEqual({ kind: "not-found" });
   });
 
-  it("the conflict maps 409 {message} (handleWorkflowRerunError's AlreadyExist arm, view.go:1018-1022)", async () => {
+  it("the conflict maps 409 {message} (handleWorkflowRerunError's AlreadyExist arm, view.go:1014-1018)", async () => {
     const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
     await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
     await drizzle(env.DB)
@@ -1418,7 +1418,7 @@ describe("the builder + formatter units (the census's byte-shape golden source)"
       attemptRaw: "",
       jobRaw: String(seeded.jobRows[0]!.id + 500), // not among the resolved jobs
     });
-    expect(outcome.outcome).toBe("not-found"); // view.go:735-737's arm
+    expect(outcome.outcome).toBe("not-found"); // view.go:731-733's arm
   });
 
   it("insertActionRun ellipsizes the title (the store-side Title arm rides the response title)", () => {
@@ -1541,7 +1541,7 @@ describe("the C3 arms — FullSteps (modules/actions/task_state.go)", () => {
   });
 });
 
-describe("the C3 arms — convertToViewModel over the M1b log store (view.go:835-917)", () => {
+describe("the C3 arms — convertToViewModel over the M1b log store (view.go:831-913)", () => {
   /** The M1b seeding idioms (ingest.test.ts's claimTask + the service
    *  writers): a runner, a claimed task, the job flipped onto it. */
   async function claimTask(seeded: Awaited<ReturnType<typeof seedRun>>, jobOrdinal = 0): Promise<{ taskId: number; runnerId: number }> {
@@ -2174,7 +2174,7 @@ describe("the C4 arms — the preview page module (pages/repo-actions-artifacts.
     expect(png.headers.get("content-type")).toBe("image/png");
   });
 
-  it("the helper-script injection rides the first structural tag (view_artifact.go:261-306)", () => {
+  it("the helper-script injection rides the first structural tag (view_artifact.go:262-306)", () => {
     const src = "/assets/js/external-render-helper.abc123.js";
     // After <head>.
     const withHead = new TextEncoder().encode("<html><head><title>t</title></head><body></body></html>");

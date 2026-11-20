@@ -686,7 +686,7 @@ describe("the log line format", () => {
 // ---------------------------------------------------------------------------
 
 describe("aggregateJobStatus + stopTask", () => {
-  it("aggregates exactly upstream's table (run_job.go:642-687)", () => {
+  it("aggregates exactly upstream's table (run_job.go:624-669)", () => {
     const j = (status: number, continueOnError = false) => ({ status, continueOnError });
     expect(aggregateJobStatus([])).toBe(0);
     expect(aggregateJobStatus([j(1)])).toBe(1);

@@ -8,35 +8,35 @@
  * mounts them (the HANDOFF arg the header documents).
  *
  * Per-op pins, upstream-exact at fc493688:
- *   - ListActionTasks (action.go:786-858): the ActionTask wire (ToActionTask
+ *   - ListActionTasks (action.go:754-818): the ActionTask wire (ToActionTask
  *     convert.go:248-274 — the raw Status.String name, PrettyRef head_branch,
  *     the job's commit sha, MakeAbsoluteURL(run.Link()) url, the Go-zero
  *     run_started_at), the `workflow_runs` envelope key (ActionTaskResponse's
  *     own struct, :41-46), the Link/X-Total-Count headers, the reader 403
  *     with the admin bypass.
- *   - GetWorkflowRun (action.go:1283-1306): the run wire over the latest
+ *   - GetWorkflowRun (action.go:1131-1154): the run wire over the latest
  *     attempt (explicit-null previous_attempt_url at attempt 1), the 404
  *     `run with id N: resource does not exist` (GetRunByRepoAndID's wrap,
  *     run.go:293 + APIErrorAuto), junk-id → the same 404.
- *   - getWorkflowRunAttempt (action.go:1308-1342): the wire over the GIVEN
+ *   - getWorkflowRunAttempt (action.go:1148-1182): the wire over the GIVEN
  *     attempt (its status/times, its previous_attempt_url pointer), the 404
  *     `run attempt N for run M: resource does not exist` (run_attempt.go:95).
- *   - listWorkflowRunAttemptJobs (action.go:1652-1700): only THAT attempt's
+ *   - listWorkflowRunAttemptJobs (action.go:1432-1480): only THAT attempt's
  *     jobs; the sort/order 422 texts (the contract omits them — the landed
  *     org-jobs deviation, runtime-only) and the invalid-status 400.
- *   - deleteActionRun (action.go:1812-1849 + cleanup.go:168-256): the 204,
+ *   - deleteActionRun (action.go:1584-1621 + cleanup.go:168-256): the 204,
  *     the row cascade (run/attempts/jobs/tasks/steps/outputs/summaries/
  *     artifacts gone) + the storage deletions (sealed log + artifact object
  *     gone from R2), the not-done 400 text, the ladder (anonymous 401 AFTER
  *     the reader gates, plain-reader 403, the miss 404).
  *   - rerunWorkflowRun / rerunFailedWorkflowRun / rerunWorkflowJob
- *     (action.go:1344-1556) over the LANDED rerun service: the 201 run wire
+ *     (action.go:1182-1394) over the LANDED rerun service: the 201 run wire
  *     at run_attempt=2, the not-done 400, the disabled-workflow 400 text,
  *     the failed/cancelled filter with the pass-through split, the
  *     no-failed-jobs 400 text, the single-job 404 "workflow job not found",
  *     the new attempt's job wire (the attempt_job_id backfill arm).
  *   - cancelWorkflowRun / forceCancelWorkflowRun (actions_run.go:57-131 over
- *     cancel.go:26-90 + run_job.go:769-829): the done-run 409 text, the
+ *     cancel.go:26-90 + run_job.go:751-811): the done-run 409 text, the
  *     unclaimed CAS arm, the StopTask handshake (a cancelling-capable runner
  *     holds CANCELLING under cancel, force marks CANCELLED at once), the
  *     rendered post-cancellation run wire.
@@ -44,8 +44,8 @@
  *     the awaiting run's release (needs-less blocked job → waiting, the flag
  *     flip + approver stamp), the idempotent double-approve 200, the
  *     never-awaiting 409 text.
- *   - listWorkflowRunJobs (action.go:1598-1650): the junk-run 400 "runID
- *     must be a positive integer" (the binder arm, :1609-1612), the 422
+ *   - listWorkflowRunJobs (action.go:1390-1442): the junk-run 400 "runID
+ *     must be a positive integer" (the binder arm, :1501-1504), the 422
  *     sort/order texts (utils/sort.go:31-39), the invalid-status 400, the
  *     latest-attempt scoping + desc order.
  *   - getWorkflowRunLogs (actions_run.go:218-268 over common/actions.go:
@@ -53,7 +53,7 @@
  *     entries, byte parity), the expired/absent skip arm, the empty-archive
  *     404 "logs not found", the reqToken 401 (api.go:1367 — token only, no
  *     writer).
- *   - getArtifactsOfRun (action.go:1755-1812): the ToActionArtifact render,
+ *   - getArtifactsOfRun (action.go:1531-1588): the ToActionArtifact render,
  *     the name filter, the NO-run-resolution quirk (an unknown run id answers
  *     200/0), the repo scoping over the rows, the silent page clamp with NO
  *     pagination headers.
@@ -536,7 +536,7 @@ async function zipEntriesOf(res: Response): Promise<Array<{ name: string; data: 
 }
 
 // ---------------------------------------------------------------------------
-// ListActionTasks (action.go:786-858)
+// ListActionTasks (action.go:754-818)
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/tasks (ListActionTasks)", () => {
@@ -558,7 +558,7 @@ describe("GET /repos/{owner}/{repo}/actions/tasks (ListActionTasks)", () => {
     expect(body.total_count).toBe(1);
     const task = body.workflow_runs[0]!;
     expect(task.id).toBe(taskId);
-    expect(task.name).toBe("build"); // t.Job.Name (convert.go:261)
+    expect(task.name).toBe("build"); // t.Job.Name (convert.go:262)
     expect(task.head_branch).toBe("main"); // PrettyRef of refs/heads/main
     expect(task.head_sha).toBe(sha40(0xb000 + 1)); // the JOB's commit sha (convert.go:263)
     expect(task.run_number).toBe(run.index);
@@ -618,7 +618,7 @@ describe("GET /repos/{owner}/{repo}/actions/tasks (ListActionTasks)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// GetWorkflowRun / getWorkflowRunAttempt (action.go:1283-1342)
+// GetWorkflowRun / getWorkflowRunAttempt (action.go:1131-1190)
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/runs/{run} (GetWorkflowRun)", () => {
@@ -778,7 +778,7 @@ describe("GET …/runs/{run}/attempts/{attempt}/jobs (listWorkflowRunAttemptJobs
 });
 
 // ---------------------------------------------------------------------------
-// deleteActionRun (action.go:1812-1849 + cleanup.go:168-256)
+// deleteActionRun (action.go:1584-1621 + cleanup.go:168-256)
 // ---------------------------------------------------------------------------
 
 describe("DELETE /repos/{owner}/{repo}/actions/runs/{run} (deleteActionRun)", () => {
@@ -840,7 +840,7 @@ describe("DELETE /repos/{owner}/{repo}/actions/runs/{run} (deleteActionRun)", ()
 });
 
 // ---------------------------------------------------------------------------
-// The rerun trio (action.go:1344-1556 over services/actions/rerun.ts)
+// The rerun trio (action.go:1182-1394 over services/actions/rerun.ts)
 // ---------------------------------------------------------------------------
 
 describe("POST …/runs/{run}/rerun (rerunWorkflowRun)", () => {
@@ -1091,7 +1091,7 @@ describe("POST …/runs/{run}/approve (approveWorkflowRun)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// listWorkflowRunJobs (action.go:1598-1650)
+// listWorkflowRunJobs (action.go:1390-1442)
 // ---------------------------------------------------------------------------
 
 describe("GET …/runs/{run}/jobs (listWorkflowRunJobs)", () => {
@@ -1209,7 +1209,7 @@ describe("GET …/runs/{run}/logs (getWorkflowRunLogs)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// getArtifactsOfRun (action.go:1755-1812)
+// getArtifactsOfRun (action.go:1531-1588)
 // ---------------------------------------------------------------------------
 
 describe("GET …/runs/{run}/artifacts (getArtifactsOfRun)", () => {

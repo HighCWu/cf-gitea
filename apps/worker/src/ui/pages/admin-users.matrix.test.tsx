@@ -58,7 +58,7 @@ const manifest: UiManifest = {
   "web_src/js/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
 };
 
-/** The signed-in site admin — the route stage's gate (web.go:779) is the
+/** The signed-in site admin — the route stage's gate (web.go:746) is the
  *  wiring wave's posture; the module trusts its inputs. */
 const viewer: Viewer = { kind: "user", id: 1, username: "root", isAdmin: true };
 const ctx: UiContext = { viewer, origin: ORIGIN, assets: shellAssetsFromManifest(manifest) };
@@ -166,7 +166,7 @@ describe("loadAdminUsersData — the gates", () => {
     expect((await load("status_filter[is_2fa_enabled]=0")).total).toBe(4);
   });
 
-  it("user_type=User narrows to the individuals; user_type=Bot lists the bots (users.go:74-79, live since B-72)", async () => {
+  it("user_type=User narrows to the individuals; user_type=Bot lists the bots (users.go:73-78, live since B-72)", async () => {
     await seedBaseFixtures();
     await insertUser({ username: "ci-robot", type: "bot" });
     expect((await load("user_type=User")).items.map((row) => row.username).sort()).toEqual(["alice", "bob", "carol", "root"]);

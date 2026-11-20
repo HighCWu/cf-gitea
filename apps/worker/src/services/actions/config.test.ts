@@ -8,7 +8,7 @@
  * tree, and the collaborative-owner add/remove arms.
  *
  * Upstream pin fc4936884584a41931906553d96c2601d750e6ef:
- * models/repo/repo_unit_actions.go + repo_unit.go:261-311,368-370 +
+ * models/repo/repo_unit_actions.go + repo_unit.go:262-311,368-370 +
  * routers/web/repo/setting/actions.go:103-191 + models/actions/config.go
  * (the module header carries the full cite set).
  */
@@ -322,7 +322,7 @@ describe("the repo_units.config column", () => {
 
 // --- the scoped-workflow opt-out arms (the C10 half-stage) -----------------------
 // repo_unit_actions.go:111-131's trio, models/actions/scoped_workflow.go's
-// effective/required/opted-out reads and view.go:1324-1375's toggle arm,
+// effective/required/opted-out reads and view.go:1320-1371's toggle arm,
 // over the landed action_scoped_workflow_source store.
 
 const SRC_ID = "src-repo"; // the source repo's TEXT id (the map key shape)
@@ -436,14 +436,14 @@ describe("scopedSourceRepoParam (FormInt64's zero semantics — the TEXT adaptat
   it("reduces \"\"/\"0\" and any NEGATIVE spelling to the repo-level arm; other values ride verbatim", () => {
     expect(scopedSourceRepoParam("")).toBe(""); // absent
     expect(scopedSourceRepoParam("0")).toBe(""); // FormInt64's zero
-    expect(scopedSourceRepoParam("-5")).toBe(""); // upstream isScoped := > 0 (workflow.go:79) — negative = repo-level
+    expect(scopedSourceRepoParam("-5")).toBe(""); // upstream isScoped := > 0 (workflow.go:80) — negative = repo-level
     expect(scopedSourceRepoParam("-0")).toBe("");
     expect(scopedSourceRepoParam("123")).toBe("123"); // a source-id candidate
     expect(scopedSourceRepoParam("junk")).toBe("junk"); // the recorded TEXT divergence (policed downstream)
   });
 });
 
-describe("toggleRepoActionsWorkflow (view.go:1324-1375's disableOrEnableWorkflowFile body)", () => {
+describe("toggleRepoActionsWorkflow (view.go:1320-1371's disableOrEnableWorkflowFile body)", () => {
   it("the scoped arm writes the SCOPED array, never the repo-level one (disable, then enable deletes the key)", async () => {
     await enableActions();
     expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: SRC_ID })).toBe("saved");

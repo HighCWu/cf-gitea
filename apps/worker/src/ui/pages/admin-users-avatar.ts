@@ -1,6 +1,6 @@
 /**
  * The admin user AVATAR write arms (census gap #18, the avatar half —
- * upstream's admin users group, web.go:818-821):
+ * upstream's admin users group, web.go:787-790):
  *
  *   POST /-/admin/users/{userid}/avatar         (admin.AvatarPost)
  *   POST /-/admin/users/{userid}/avatar/delete  (admin.DeleteAvatar)
@@ -11,12 +11,12 @@
  * settings pages post (forms.AvatarForm — Source string + `avatar`
  * multipart.FileHeader + Gravatar email, forms/user_form.go:182-187); the
  * admin handler is the user-settings one retargeted by userid
- * (users.go:684-702 delegate to the shared user_setting.UpdateAvatarSetting,
+ * (users.go:693-711 delegate to the shared user_setting.UpdateAvatarSetting,
  * routers/web/user/setting/profile.go:126-169).
  *
  * ## Upstream behavior at the pin
  *
- *   - prepareUserInfo (users.go:269-278) runs FIRST on both arms: an
+ *   - prepareUserInfo (users.go:268-277) runs FIRST on both arms: an
  *     unknown {userid} REDIRECTS to `/-/admin/users` (the list) — not a
  *     404. Any users row passes: orgs ARE users rows upstream too
  *     (SPEC-0007's one id space), so an org id gets its avatar set exactly
@@ -47,8 +47,8 @@
  *
  * ## Sibling arms of the pin (NOT built here)
  *
- * web.go:818-821 also carries `POST /{userid}/impersonate`
- * (admin.ImpersonateUser, users.go:563-581) — STOPPED at adjudication: the
+ * web.go:787-790 also carries `POST /{userid}/impersonate`
+ * (admin.ImpersonateUser, users.go:572-590) — STOPPED at adjudication: the
  * honest port flips the live session's principal while remembering the
  * admin (upstream's in-session `impersonatorData` backup,
  * services/auth/impersonate.go:14-44), and our sessions table (schema.ts
@@ -65,7 +65,7 @@
  *
  * In `parseUiRoute`'s `raw[2] === "admin"` tail parse, after the `users`
  * literal (static-before-dynamic — the comment at :4002); the delete route
- * is `/-/admin/users/{userid}/avatar/delete` (web.go:821) — one segment
+ * is `/-/admin/users/{userid}/avatar/delete` (web.go:790) — one segment
  * longer:
  *
  *   if (
@@ -109,12 +109,12 @@ import { deleteAvatar, uploadAvatar } from "../../services/avatars";
 import { readOrgAvatarUpload } from "./org-settings";
 
 /** The pair's success redirect — upstream
- *  `setting.AppSubURL + "/-/admin/users/" + id` (users.go:698, :711). */
+ *  `setting.AppSubURL + "/-/admin/users/" + id` (users.go:707, :720). */
 export function adminUserLink(userId: number): string {
   return `/-/admin/users/${userId}`;
 }
 
-/** prepareUserInfo's unknown-{userid} redirect target (users.go:273) — the
+/** prepareUserInfo's unknown-{userid} redirect target (users.go:272) — the
  *  listing page. */
 export const ADMIN_USERS_LIST_LINK = "/-/admin/users";
 
@@ -125,7 +125,7 @@ export interface AdminAvatarUser {
 }
 
 /**
- * prepareUserInfo's lookup (users.go:269-278): the users row by id, or
+ * prepareUserInfo's lookup (users.go:268-277): the users row by id, or
  * `null` for the unknown-id miss — the caller answers the LIST redirect,
  * never a 404.
  */
@@ -139,7 +139,7 @@ export async function loadAdminAvatarUser(d1: D1Database, userId: number): Promi
 }
 
 /**
- * POST /-/admin/users/{userid}/avatar (admin.AvatarPost, users.go:684-702):
+ * POST /-/admin/users/{userid}/avatar (admin.AvatarPost, users.go:693-711):
  * the multipart read (the org arm's AvatarForm reader — applied / none /
  * error), the store through the landed `uploadAvatar` (`{kind: "user"}` —
  * the users-row marker flip + the `avatars/u_<id>` object), then the
@@ -171,7 +171,7 @@ export async function adminUserAvatarUpload(
 
 /**
  * POST /-/admin/users/{userid}/avatar/delete (admin.DeleteAvatar,
- * users.go:701-712): the landed delete (the marker clears and the object
+ * users.go:710-721): the landed delete (the marker clears and the object
  * dies; a missing object deletes nothing and still succeeds —
  * services/avatars.ts deleteAvatar), then the 303. The unknown-target arm
  * is prepareUserInfo's LIST redirect like the upload's.

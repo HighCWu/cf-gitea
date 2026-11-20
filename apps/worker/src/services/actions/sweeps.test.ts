@@ -249,7 +249,7 @@ describe("stopEndlessTasks", () => {
 });
 
 // ---------------------------------------------------------------------------
-// CancelAbandonedJobs (clear_tasks.go:195-214 + run_job.go:806-829)
+// CancelAbandonedJobs (clear_tasks.go:195-214 + run_job.go:788-811)
 // ---------------------------------------------------------------------------
 
 describe("cancelAbandonedJobs", () => {

@@ -95,6 +95,7 @@ function repoRow(overrides: Partial<RepoRow> = {}): RepoRow {
     templateId: null,
     topics: "[]",
     trustModel: null,
+    latestReleaseId: 0, // migration 0080 — the release-latest pointer (fixtures start date-order)
     ...overrides,
   } satisfies RepoRow;
 }

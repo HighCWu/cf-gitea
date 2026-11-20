@@ -20,6 +20,7 @@ import {
   issueLabels,
   issues,
   labels,
+  pullAutoMerges,
   repoCounters,
   repositories,
   PRStatus,
@@ -46,6 +47,7 @@ const RESET_TABLES = [
   "issues",
   "milestones",
   "labels",
+  "pull_auto_merges",
   "pull_requests",
   "repo_counters",
   "repositories",
@@ -366,7 +368,7 @@ describe("releases (§2.3, §4.11)", () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(ReleaseAlreadyExistError);
-    // The wire text is the R7 flip (routers/api/v1/repo/release.go:289-293 —
+    // The wire text is the R7 flip (routers/api/v1/repo/release.go:281-289 —
     // "Release is has no Tag", sic), folded into errors.ts by the releases
     // wave; the model-error suffix is gone with it.
     expect((caught as ReleaseAlreadyExistError).message).toBe("Release is has no Tag");
@@ -436,7 +438,7 @@ describe("releases (§2.3, §4.11)", () => {
     expect(draft.publishedUnix).toBe(0);
 
     // The PUBLISHED conversion keeps the row's original stamp (upstream
-    // dates a published release by its tag commit, release.go:154 — no
+    // dates a published release by its tag commit, release.go:156 — no
     // re-stamp arm here).
     await svc.createRelease({ repoId, publisherId: 1, tagName: "old-tag-2", isTag: true, title: "", now: new Date("2026-02-01T00:00:00Z") });
     const published = await svc.createRelease({ repoId, publisherId: 1, tagName: "old-tag-2", title: "published now", now: conversionTime });
@@ -1004,5 +1006,84 @@ describe("repo counter bootstrap", () => {
     await expect(service().createIssue({ repoId: "r_missing", title: "x" })).rejects.toThrow();
     const rows = await db().select().from(issues).all();
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe("auto-merge cancel wirings (automerge/notify.go IssueChangeStatus/IssueChangeTitle — RE-PIN b1c5fedd17)", () => {
+  /** A PR with a live schedule row (the funnel arms' shared fixture). */
+  async function seedScheduledPr(repoId: string, title: string) {
+    const { issue } = await service().createPullRequest({
+      repoId,
+      title,
+      headRepoId: repoId,
+      headBranch: "feature",
+      baseBranch: "main",
+    });
+    await db().insert(pullAutoMerges).values({
+      issueId: issue.id,
+      doerId: 42,
+      sha: "a".repeat(40),
+      mergeStyle: "merge",
+      deleteBranchAfterMerge: false,
+      mergeMessage: null,
+      createdUnix: 1000,
+    });
+    return issue;
+  }
+
+  const scheduledRows = (issueId: number) => db().select().from(pullAutoMerges).where(eq(pullAutoMerges.issueId, issueId)).all();
+  const type35Rows = async (issueId: number) =>
+    (await db().select({ type: comments.type, content: comments.content }).from(comments).where(eq(comments.issueId, issueId)).all()).filter(
+      (row) => row.type === CommentType.PRUnscheduledToAutoMerge,
+    );
+
+  it("closeIssue cancels a PR's scheduled auto-merge with the 'closed' reason comment (notify.go:90-93)", async () => {
+    const repoId = await seedRepo();
+    const issue = await seedScheduledPr(repoId, "closable");
+    await service().closeIssue(issue.id, { actorId: 42 });
+    expect(await scheduledRows(issue.id)).toHaveLength(0);
+    const rows = await type35Rows(issue.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.content).toBe("closed");
+  });
+
+  it("the merge close (MergePull comment type) keeps the schedule — no IssueChangeStatus upstream (merge.go:838)", async () => {
+    const repoId = await seedRepo();
+    const issue = await seedScheduledPr(repoId, "merged");
+    await service().closeIssue(issue.id, { actorId: 42, commentType: CommentType.MergePull });
+    expect(await scheduledRows(issue.id)).toHaveLength(1);
+    expect(await type35Rows(issue.id)).toHaveLength(0);
+  });
+
+  it("a plain-issue close never writes a type-35 (the isPull gate)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const issue = await svc.createIssue({ repoId, title: "plain" });
+    await svc.closeIssue(issue.id, { actorId: 42 });
+    expect(await type35Rows(issue.id)).toHaveLength(0);
+  });
+
+  it("changeTitle into WIP cancels with 'work_in_progress'; a normal rename keeps the schedule (notify.go:95-101)", async () => {
+    const repoId = await seedRepo();
+    const issue = await seedScheduledPr(repoId, "renamable");
+    const now = new Date(1000);
+    // normal → normal: no transition, schedule stays, no type-35.
+    await service().changeTitle(issue, "renamed", 42, now);
+    expect(await scheduledRows(issue.id)).toHaveLength(1);
+    expect(await type35Rows(issue.id)).toHaveLength(0);
+    // normal → WIP: the row goes, the reason is the content.
+    await service().changeTitle(issue, "WIP: renaming", 42, now);
+    expect(await scheduledRows(issue.id)).toHaveLength(0);
+    const rows = await type35Rows(issue.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.content).toBe("work_in_progress");
+  });
+
+  it("a WIP→WIP rename is not a transition and keeps the schedule", async () => {
+    const repoId = await seedRepo();
+    const issue = await seedScheduledPr(repoId, "[WIP] already");
+    await service().changeTitle(issue, "WIP: still", 42, new Date(1000));
+    expect(await scheduledRows(issue.id)).toHaveLength(1);
+    expect(await type35Rows(issue.id)).toHaveLength(0);
   });
 });

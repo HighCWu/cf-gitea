@@ -247,7 +247,7 @@ export function isDoneStatus(status: number): boolean {
 }
 
 /**
- * AggregateJobStatus (models/actions/run_job.go:642-688) — the
+ * AggregateJobStatus (models/actions/run_job.go:624-670) — the
  * order-independent job-status fold. The fail-fast matrix arm
  * (hasFailFastMatrixFailure) is v1-inert: our M1a carries no matrix
  * siblings (isMatrixDeferred stays false through the staged inserts), so a
@@ -1012,7 +1012,7 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
 
   // The scoped param's zero-reduction (scopedSourceRepoParam): ""/"0" and any
   // leading "-" are the repo-level arm — upstream's FormInt64 parse with the
-  // isScoped := > 0 arm (actions.go:629, workflow.go:79).
+  // isScoped := > 0 arm (actions.go:629, workflow.go:80).
   const scopedSourceId = scopedSourceRepoParam(query.scopedWorkflowSourceRepoId);
 
   let runRows: RunRow[];

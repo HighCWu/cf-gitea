@@ -81,6 +81,7 @@ import {
 import { aggregateJobStatus, isDoneStatus, isRunningStatus } from "./update";
 import { emitWorkflowJobsAndRunStatus, type ActionsWebhookContext } from "./webhook-events";
 import {
+  boundedConcurrencyGroup,
   buildGithubContext,
   cancelPreviousJobsByRunConcurrency,
   checkJobsOfRun,
@@ -142,8 +143,8 @@ export function getFailedJobsForRerun(jobs: RunJobRow[]): RunJobRow[] {
 
 /** The service's rejection arms, each citing its upstream validate/plan arm.
  *  The web handler maps run-not-done + workflow-disabled through
- *  checkRunRerunAllowed's JSONError (view.go:921-942), the rest through
- *  handleWorkflowRerunError (view.go:1018-1028: AlreadyExist → 409,
+ *  checkRunRerunAllowed's JSONError (view.go:917-938), the rest through
+ *  handleWorkflowRerunError (view.go:1014-1024: AlreadyExist → 409,
  *  InvalidArgument → 400, else ServerError). */
 export type RerunRejection =
   /** validateRerun rerun.go:72-74 — InvalidArgument "this workflow run is not done". */
@@ -157,7 +158,7 @@ export type RerunRejection =
   /** rerun.go:89-102 — the repo-level map (cfg.IsWorkflowDisabled) or the
    *  scoped twin (run.IsScopedRun → IsScopedWorkflowOptedOut over the run's
    *  WorkflowRepoID and the repo's CURRENT owner — rerun.go:93's
-   *  repo.OwnerID, R1-F9; the web twin view.go:929-936). */
+   *  repo.OwnerID, R1-F9; the web twin view.go:925-932). */
   | "workflow-disabled"
   /** rerun.go:104-114 — the latest attempt is already at MAX_RERUN_ATTEMPTS. */
   | "max-attempts"
@@ -207,7 +208,7 @@ async function listRunAttemptsByRunId(d1: D1, runId: number): Promise<RunAttempt
     .then((rows) => rows.reverse());
 }
 
-/** GetRunJobsByRunAndAttemptID (run_job.go:305-311) — id ASC. */
+/** GetRunJobsByRunAndAttemptID (run_job.go:303-309) — id ASC. */
 async function getRunJobsByRunAndAttemptId(
   d1: D1,
   runId: number,
@@ -252,7 +253,7 @@ export async function validateRerun(
   // "a required scoped workflow can never be opted out, so a stale disabled
   // flag must not block rerun" (rerun.go:90-99, the landed
   // isScopedWorkflowOptedOut in config.ts). The web handler's twin gate
-  // (checkRunRerunAllowed, view.go:929-936) funnels through this validation
+  // (checkRunRerunAllowed, view.go:925-932) funnels through this validation
   // — one guard, the same disabled posture as dispatch. The opt-out's owner
   // argument is the RESOLVED repo's CURRENT owner (R1-F9 — rerun.go:93
   // `repo.OwnerID`: validateRerun receives the repo object, not the run's
@@ -441,7 +442,7 @@ function expandRerunJobIds(
 // The exec (execRerunPlan, rerun.go:195-399)
 // ---------------------------------------------------------------------------
 
-/** EffectiveTaskID (run_job.go:158-163) — the pass-through rows' history
+/** EffectiveTaskID (run_job.go:156-161) — the pass-through rows' history
  *  pointer (rerun.go:327). */
 function effectiveTaskId(job: RunJobRow): number {
   return job.taskId > 0 ? job.taskId : job.sourceTaskId;
@@ -548,7 +549,7 @@ export async function rerunWorkflowRunJobs(
       // the single-seam export collapses triggering_actor onto it).
       // workflow_sha reads the row's own content-source column
       // (context.go:115's run.WorkflowCommitSHA): a SCOPED run carries the
-      // SOURCE commit there (workflow.go:260-263's pre-insert trio, the
+      // SOURCE commit there (workflow.go:263-265's pre-insert trio, the
       // landed producers fill it), a repo-level run carries the run commit
       // (the insert path's equation). Legacy rows predating the column keep
       // the ""-default → the run-commit fallback (the trigger insert's
@@ -579,6 +580,11 @@ export async function rerunWorkflowRunJobs(
     } else {
       ({ group: concurrencyGroup, cancel: concurrencyCancel } = evaluateRunConcurrency({}, raw, {}));
     }
+    // EvaluateRunConcurrencyFillModel's tail (concurrency.go:46, #40392) —
+    // rerun.go:218 rides the same fill model, so the bound applies before
+    // the gate reads the group (rerun's job-level fill, rerun.go:313, is
+    // staged here — its bound lands with that stage).
+    concurrencyGroup = await boundedConcurrencyGroup(concurrencyGroup);
   }
   let shouldBlock = false;
   if (concurrencyGroup !== "") {
@@ -742,7 +748,7 @@ export async function rerunWorkflowRunJobs(
   // ('status'); the propagation is run_attempt.go:150-190's UpdateRunAttempt
   // port, scoped to this attempt's rows — update.ts's refreshRunStatus
   // twin aggregates ALL of the run's job rows (v1's one-attempt shape,
-  // run_job.go:552-571's port lost the attempt filter) and is HANDOFFED to
+  // run_job.go:534-553's port lost the attempt filter) and is HANDOFFED to
   // its owner; rerun cannot ride it once attempt 2 rows exist).
   await updateAttemptStatusAndMirrorRun(d1, run, newAttempt, newJobs);
 

@@ -13,7 +13,7 @@
  *   - modules/setting/actions.go:133-135 (ENDLESS_TASK_TIMEOUT 3h,
  *     ABANDONED_JOB_TIMEOUT 24h; ZOMBIE_TASK_TIMEOUT 10m lives in
  *     retention.ts),
- *   - models/actions/run_job.go:806-829 (cancelOneJob — the direct-cancel
+ *   - models/actions/run_job.go:788-811 (cancelOneJob — the direct-cancel
  *     CAS arm the abandoned sweep rides for unclaimed jobs),
  *   - services/actions/cleanup.go:144-165 (CleanupEphemeralRunners — the
  *     pass this module decouples from the retention arming; upstream runs it
@@ -109,14 +109,14 @@ export async function stopEndlessTasks(
 }
 
 // ---------------------------------------------------------------------------
-// CancelAbandonedJobs (clear_tasks.go:195-214 + run_job.go:806-829)
+// CancelAbandonedJobs (clear_tasks.go:195-214 + run_job.go:788-811)
 // ---------------------------------------------------------------------------
 
 /**
  * CancelAbandonedJobs: waiting/blocked/pending jobs unclaimed for the
  * abandoned timeout are cancelled, so a job emitted for a runner label
  * nobody serves cannot hold its run in RUNNING forever. Per-job shape is
- * cancelOneJob (run_job.go:806-829): an unclaimed job (task_id = 0 — every
+ * cancelOneJob (run_job.go:788-811): an unclaimed job (task_id = 0 — every
  * row these statuses reach at v1) cancels outright behind the
  * `task_id = 0` CAS, so a runner claiming in the same instant wins and the
  * cancellation no-ops; a claimed row (defensively — the join of these
@@ -163,7 +163,7 @@ export async function cancelAbandonedJobs(
         continue; // the task row vanished — nothing to cancel
       }
     }
-    // The UpdateRunJob hook's live halves (run_job.go:503-530): the
+    // The UpdateRunJob hook's live halves (run_job.go:485-512): the
     // terminal status wakes idle runners only when pickable work remains,
     // and the run aggregate re-reads its jobs.
     if (await hasWaitingJobsToPick(d1, job.repoId)) {

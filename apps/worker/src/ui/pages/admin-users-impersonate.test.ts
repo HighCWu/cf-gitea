@@ -6,18 +6,18 @@
  * banner exposure through the real pipeline — live in session.test.ts
  * (SPEC-0010 §5, the session owner's suite).
  *
- * Coverage (upstream at the pin: web.go:818's route,
- * admin/users.go:563-581's handler over services/auth/impersonate.go):
+ * Coverage (upstream at the pin: web.go:787's route,
+ * admin/users.go:572-590's handler over services/auth/impersonate.go):
  *
- *   - THE FLIP (users.go:575-580): a live admin session flips IN PLACE —
+ *   - THE FLIP (users.go:584-589): a live admin session flips IN PLACE —
  *     user_id = target ∧ impersonator_user_id = admin, the secret (and so
  *     the presented cookie) untouched, the outcome the /user/settings
  *     redirect's.
  *   - THE ALREADY-IMPERSONATING REFUSAL (impersonate.go:16-18,
- *     users.go:575-577 → ServerError): a second impersonate over a live one
+ *     users.go:584-586 → ServerError): a second impersonate over a live one
  *     refuses WITHOUT overwriting the first admin's backup — the guarded
  *     UPDATE's race property.
- *   - THE UNKNOWN-TARGET ARM (users.go:565-568): JSONError("unable to get
+ *   - THE UNKNOWN-TARGET ARM (users.go:574-577): JSONError("unable to get
  *     user") — the literal body constant — never a 404, never the avatar
  *     pair's list redirect.
  *   - THE SESSION-GONE ARM: a flip keyed on a vanished row (expired /
@@ -26,10 +26,10 @@
  *   - THE ORG-TARGET ARM: any users row passes (orgs ARE users rows,
  *     SPEC-0007 — upstream GetUserByID has no type gate), and its audit
  *     row scopes `organization` (ScopeFromUser, refs.go:44-50).
- *   - THE START AUDIT ROW (users.go:580): emitted after the flip lands —
+ *   - THE START AUDIT ROW (users.go:589): emitted after the flip lands —
  *     actor the admin, scope the target, upstream's rendered message;
  *     the refusal and the unknown-user arms emit nothing.
- *   - THE BOT GUARD, LIVE SINCE B-72 (users.go:569-571): a bot target
+ *   - THE BOT GUARD, LIVE SINCE B-72 (users.go:578-580): a bot target
  *     refuses BEFORE the flip — the bot-refused outcome (the wiring maps
  *     it to the 400 JSONError with the en-US locale string), the session
  *     row untouched, no audit row.
@@ -105,7 +105,7 @@ async function rowIdentity(sessionId: string): Promise<{ userId: number | null; 
 
 // --- the flip ----------------------------------------------------------------
 
-describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581)", () => {
+describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:572-590)", () => {
   it("flips the live session in place: user_id = target, impersonator_user_id = admin, secret untouched", async () => {
     const { adminId, targetId } = await seedUsers();
     const cookieValue = await mintSession(env.DB, adminId);
@@ -181,7 +181,7 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
     const outcome = await adminUserImpersonate(env.DB, { sessionId, adminUserId: secondAdmin }, targetId);
     expect(outcome).toEqual({ outcome: "already-impersonating" });
     expect(await rowIdentity(sessionId)).toEqual({ userId: targetId, impersonatorUserId: adminId });
-    // upstream Records ONLY on the success arm (users.go:575-580): the
+    // upstream Records ONLY on the success arm (users.go:584-589): the
     // refusal emits no second audit row.
     expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(1);
 
@@ -245,7 +245,7 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
     });
   });
 
-  it("refuses a bot target BEFORE the flip (users.go:569-571 — live since B-72): JSONError body constant, no flip, no audit row", async () => {
+  it("refuses a bot target BEFORE the flip (users.go:578-580 — live since B-72): JSONError body constant, no flip, no audit row", async () => {
     const { adminId } = await seedUsers();
     const botId = (
       await drizzle(env.DB)
@@ -316,7 +316,7 @@ describe("exitImpersonationBySecret (upstream ExitImpersonatedUser, impersonate.
 
 // --- the lookup the arm shares ----------------------------------------------
 
-describe("loadAdminImpersonateTarget (GetUserByID, users.go:565-568)", () => {
+describe("loadAdminImpersonateTarget (GetUserByID, users.go:574-577)", () => {
   it("resolves an existing users row by id (+ the audit's username/type slice) and nulls the miss", async () => {
     const { targetId } = await seedUsers();
 

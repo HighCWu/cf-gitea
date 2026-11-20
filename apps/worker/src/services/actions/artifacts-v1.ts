@@ -431,7 +431,7 @@ function base64StdFromHex(hex: string): string {
 }
 
 /** confirmUploadArtifact (artifacts.go:301-320 + mergeChunksForRun,
- *  artifacts_chunks.go:260-296). */
+ *  artifacts_chunks.go:262-296). */
 async function confirmUploadArtifact(c: C): Promise<Response> {
   const bad = validateRunId(c);
   if (bad !== null) return bad;
@@ -449,7 +449,7 @@ async function confirmUploadArtifact(c: C): Promise<Response> {
   return c.json({ message: "success" }, 200);
 }
 
-/** mergeChunksForRun (artifacts_chunks.go:260-296). */
+/** mergeChunksForRun (artifacts_chunks.go:262-296). */
 async function mergeChunksForRun(env: Env, runId: number, runAttemptId: number, artifactName: string): Promise<void> {
   const artifacts = await findReadableArtifacts(env.DB, {
     runId,

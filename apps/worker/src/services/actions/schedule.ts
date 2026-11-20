@@ -193,7 +193,7 @@ function parseCronField(field: string, min: number, max: number, names: Record<s
   return star;
 }
 
-/** getRange (parser.go:260-322) over a boolean set — the errors verbatim. */
+/** getRange (parser.go:262-322) over a boolean set — the errors verbatim. */
 function parseCronRange(expr: string, min: number, max: number, names: Record<string, number> | undefined, bits: boolean[]): boolean {
   const rangeAndStep = expr.split("/");
   if (rangeAndStep.length > 2) throw new Error(`too many slashes: ${expr}`);
@@ -536,7 +536,7 @@ export interface DetectedScheduleWorkflow {
   entryName: string;
   /** The workflow source stored on the row (the consume-time run content). */
   content: string;
-  /** The cron strings (OnSchedule, actionslib model/workflow.go:90-102 — the
+  /** The cron strings (OnSchedule, actionslib model/workflow.go:91-103 — the
    *  cron-keyed entries only). */
   specs: string[];
 }
@@ -678,7 +678,7 @@ export async function deleteScheduleTaskByRepo(d1: D1Database, repoId: string): 
 /**
  * DetectScheduledWorkflows (modules/actions/workflows.go:242-279 — the
  * schedule-carrying workflows of one ref with their OnSchedule cron strings,
- * actionslib model/workflow.go:90-102), over the cell reads. Shared by the
+ * actionslib model/workflow.go:91-103), over the cell reads. Shared by the
  * standalone detect below; trigger.ts's push-fused twin keeps its own inline
  * walk (not refactored there — the push seam's file is not this arm's owner).
  * A workflow whose content fails GetEventsFromContent is logged and skipped
@@ -770,7 +770,7 @@ export async function detectAndHandleSchedules(
 }
 
 /**
- * CancelPreviousJobs (models/actions/run_job.go:706-723) for the schedule
+ * CancelPreviousJobs (models/actions/run_job.go:688-705) for the schedule
  * family: the LIVE runs (running/waiting/blocked/cancelling) with
  * trigger_event = schedule on the given ref, workflow filter EMPTY = every
  * workflow — ToConds skips an empty workflow_id. Their job rows cancel per
@@ -806,7 +806,7 @@ export async function cancelPreviousScheduleJobs(d1: D1Database, repoId: string,
   let cancelled = 0;
   for (const job of jobs) {
     const now = new Date();
-    if (isDoneStatus(job.status)) continue; // cancelOneJob's done arm (run_job.go:806-808)
+    if (isDoneStatus(job.status)) continue; // cancelOneJob's done arm (run_job.go:779-781)
     if (job.taskId === 0) {
       // cancelOneJob's direct arm behind the just-claimed CAS (:810-819) —
       // a runner claiming in the same instant wins and the cancellation
@@ -826,7 +826,7 @@ export async function cancelPreviousScheduleJobs(d1: D1Database, repoId: string,
         continue; // the task row vanished — nothing to cancel
       }
     }
-    // The UpdateRunJob hook's live halves (run_job.go:503-530), per job —
+    // The UpdateRunJob hook's live halves (run_job.go:485-512), per job —
     // the sweeps.ts precedent.
     if (await hasWaitingJobsToPick(d1, job.repoId)) {
       await increaseTaskVersion(d1, job.ownerId, job.repoId);

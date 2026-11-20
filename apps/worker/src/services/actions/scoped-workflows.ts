@@ -168,15 +168,18 @@ function trimSpaces(s: string): string {
 }
 
 /**
- * `ShouldEventCreateCommitStatus` (workflows.go:168-179): whether a run
- * triggered by this `on:` event posts a commit status, so its context can
- * serve as a required check (workflow_dispatch/schedule post none — the
- * settings page's contexts derivation filters on this, scoped_workflows.go:172-175).
- * The upstream TODO travels with the port: the allowlist duplicates the
- * truth in services/actions.getCommitStatusEventNameAndCommitID and the
- * two are kept in sync by hand.
+ * `IsPullRequestCheckEvent` (workflows.go:168-179 — renamed from
+ * `ShouldEventCreateCommitStatus` by #39961): whether a run triggered by this
+ * `on:` event posts a commit status that PULL REQUESTS count, so its context
+ * can serve as a required check (workflow_dispatch now POSTS a status since
+ * #39961 but the allowlist still excludes it — those statuses show in no
+ * PR's checks; schedule posts none — the settings page's contexts derivation
+ * filters on this, scoped_workflows.go:158-164, the use at :161). The upstream
+ * TODO travels with the port: the allowlist duplicates the truth in
+ * services/actions.getCommitStatusEventNameAndCommitID and in
+ * services/pull.GetLatestPullCommitStatuses, kept in sync by hand.
  */
-export function shouldEventCreateCommitStatus(event: string): boolean {
+export function isPullRequestCheckEvent(event: string): boolean {
   switch (event) {
     case "push":
     case "pull_request":
@@ -188,6 +191,12 @@ export function shouldEventCreateCommitStatus(event: string): boolean {
   }
   return false;
 }
+
+/** Compatibility alias for the pre-#39961 name; the settings-page module
+ *  (ui/pages/actions-scoped-workflows.tsx — another unit's file) still
+ *  imports this spelling. HANDOFF: switch its import to isPullRequestCheckEvent
+ *  and drop this alias. */
+export const shouldEventCreateCommitStatus = isPullRequestCheckEvent;
 
 // ---------------------------------------------------------------------------
 // The store row's config + the settings page's view model (models/actions/

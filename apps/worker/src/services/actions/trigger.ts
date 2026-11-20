@@ -175,7 +175,7 @@ import {
   type ServerJobResult,
 } from "./expression-eval";
 import { jobConditionContexts, unavailableContext, validateStaticExpressions } from "./expression-syntax";
-import { handleInvalidWorkflows, type InvalidWorkflowParseError } from "./invalid-workflow";
+import { handleInvalidWorkflows, insertInvalidWorkflowRun, type InvalidWorkflowParseError } from "./invalid-workflow";
 import {
   readRawConcurrencyNode,
   evaluateJobConcurrency,
@@ -246,10 +246,51 @@ export const WORKFLOW_DIRS: readonly string[] = [".gitea/workflows", ".github/wo
  *  util.ReadWithLimit 1024*1024). */
 export const WORKFLOW_FILE_MAX_BYTES = 1024 * 1024;
 
-/** MaxJobNumPerRun (models/actions/run_job.go:29) — the matrix ceiling the
+/** MaxJobNumPerRun (models/actions/run_job.go:28) — the matrix ceiling the
  *  E-tier expansions respect; pinned here because the payload-split cap
- *  derives from it. */
+ *  derives from it. #39942 dropped the "TODO: check this limit when creating
+ *  jobs" line above it: the limit is now CHECKED at run creation (the
+ *  insert's post-parse count + the post-insert row count, run.go:126-128
+ *  and :158-160). */
 export const MAX_JOB_NUM_PER_RUN = 256;
+
+/**
+ * runJobLimitError (reusable_workflow.go:56-60, #39942): the InvalidArgument
+ * carry for a run whose jobs would exceed MAX_JOB_NUM_PER_RUN, wrapped with
+ * the translatable key `actions.runs.invalid_workflow_helper` (the summary
+ * renderer's lookup key). The typed class is the errors.Is(err,
+ * util.ErrInvalidArgument) probe: buildApproveAndInsertRun's catch arm
+ * (notifier_helper.go:434-438) converts exactly this class into an
+ * invalid-workflow run so a rejected push SHOWS as a failed run instead of
+ * vanishing into the logs.
+ */
+export class RunJobLimitError extends Error {
+  /** util.ErrorWrapTranslatable's key ("actions.runs.invalid_workflow_helper"). */
+  readonly translatableKey = "actions.runs.invalid_workflow_helper";
+  constructor() {
+    super(`workflow run exceeds the maximum of ${MAX_JOB_NUM_PER_RUN} jobs`);
+    this.name = "RunJobLimitError";
+  }
+}
+
+/**
+ * checkRunJobLimit (reusable_workflow.go:40-54) at the insert site
+ * (run.go:158-160, #39942): counts the attempt's ACTUAL job rows — inline
+ * reusable-workflow expansions insert rows beyond the parsed job list, so a
+ * parse-time ceiling alone would still let a small file set fan out — and
+ * rejects when the total exceeds MAX_JOB_NUM_PER_RUN. Upstream's transaction
+ * rolls the insert back on the throw; here the caller compensates (the
+ * insert's compensating delete pair) before the error escapes.
+ */
+export async function checkRunJobLimit(d1: D1Database, runId: number, attemptId: number): Promise<void> {
+  const counted = await drizzle(d1)
+    .select({ n: sql<number>`count(*)` })
+    .from(actionRunJobs)
+    .where(and(eq(actionRunJobs.runId, runId), eq(actionRunJobs.runAttemptId, attemptId)));
+  if ((counted[0]?.n ?? 0) > MAX_JOB_NUM_PER_RUN) {
+    throw new RunJobLimitError();
+  }
+}
 
 /** Upstream `setting.UI.FeedMaxCommitNum` — the push payload's commit cap
  *  (push.go:189-191 truncates before notify). */
@@ -1453,6 +1494,27 @@ export function evaluateRunConcurrency(
   return { group, cancel: parseYamlBool(evaluatedScalarText(evaluator, raw.cancelInProgress)) };
 }
 
+/**
+ * boundedConcurrencyGroup (concurrency.go:94-100, #40392): the evaluated
+ * group shares the evaluated-columns' 255-character column bound, so a
+ * longer group stores as its SHA-256 hex (base.EncodeSha256 — lowercase
+ * 64-hex) instead of failing the insert. Grouping stays exact: every entry
+ * of the same group hashes to the same stored value, and 255 runes covers
+ * every group that fits the column anyway. Async because the Workers
+ * SHA-256 is subtle-based (upstream is sync); every storage site already
+ * runs inside async fills. Apply at EVERY evaluated-group storage site —
+ * upstream applies it inside the fill models themselves
+ * (EvaluateRunConcurrencyFillModel concurrency.go:46, EvaluateJobConcurrencyFillModel
+ * concurrency.go:89), which our insert/emitter/rerun call sites port.
+ */
+export async function boundedConcurrencyGroup(group: string): Promise<string> {
+  if ([...group].length > 255) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(group));
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return group;
+}
+
 interface ConcurrencyAttemptScope {
   repoId: string;
   runId: number;
@@ -1511,13 +1573,13 @@ export async function shouldBlockRunByConcurrency(d1: D1Database, scope: Concurr
   );
 }
 
-/** cancelOneJob (models/actions/run_job.go:804-832, force=false): a claimed
+/** cancelOneJob (models/actions/run_job.go:786-814, force=false): a claimed
  *  job goes through StopTask's graceful CANCELLING handshake (update.ts's
  *  port); an unclaimed job CASes straight to cancelled (the task_id=0
  *  guard). Returns the cancelled row, or null when there was nothing to
  *  cancel (done, or a concurrent writer won). The CAS arm piggybacks the
  *  aggregate settle exactly as upstream's UpdateRunJob does
- *  (run_job.go:542 — every job-row status write refreshes the run). */
+ *  (run_job.go:524 — every job-row status write refreshes the run). */
 async function cancelOneJob(d1: D1Database, job: RunJobRow): Promise<RunJobRow | null> {
   if (isDoneStatus(job.status)) return null;
   if (job.taskId === 0) {
@@ -1541,7 +1603,7 @@ async function cancelOneJob(d1: D1Database, job: RunJobRow): Promise<RunJobRow |
   return fresh[0] ?? null;
 }
 
-/** createCommitStatusesForJobsByRun (job_emitter.go:135-151): the affected
+/** createCommitStatusesForJobsByRun (job_emitter.go:134-150): the affected
  *  runs' statuses re-post after a cancel (the emit pass upstream runs
  *  through notifyAndEmitFinishedJobs posts every job's current state). */
 async function createCommitStatusesForJobsByRun(d1: D1Database, runIds: number[]): Promise<void> {
@@ -1647,7 +1709,7 @@ export interface ConcurrencyJobScope {
   concurrencyCancel: boolean;
 }
 
-/** CancelPreviousJobsByJobConcurrency (models/actions/run_job.go:789-816):
+/** CancelPreviousJobsByJobConcurrency (models/actions/run_job.go:771-798):
  *  an evaluated group only; cancel-in-progress clears the group's UNFINISHED
  *  entries, plain concurrency its BLOCKED waiters; the job's own row and its
  *  own attempt are excluded (v1 rows carry no callers, so the ancestor set
@@ -1906,15 +1968,31 @@ export function workflowDisplayName(file: string, content: string): string {
   return displayName;
 }
 
-/** WorkflowStatusContextName (workflows.go:158-161). */
+/** WorkflowStatusContextName (workflows.go:156-162). */
 export function workflowStatusContextName(displayName: string, jobName: string, event: string): string {
   return `${displayName} / ${jobName} (${event})`.trim();
 }
 
-/** ShouldEventCreateCommitStatus (workflows.go:172-178). */
-export function shouldEventCreateCommitStatus(event: string): boolean {
+/** IsPullRequestCheckEvent (workflows.go:168-179 — renamed from
+ *  ShouldEventCreateCommitStatus by #39961): whether a run triggered by this
+ *  `on:` event posts a commit status that PULL REQUESTS count, so its
+ *  context can serve as a required status check. The allowlist text is
+ *  unchanged — the rename narrows the contract: statuses for events outside
+ *  it (now including workflow_dispatch's, since #39961 posts one) exist but
+ *  never appear in a PR's checks (services/pull.GetLatestPullCommitStatuses
+ *  filters on this; that consumer stages with the PR checks surface).
+ *  The upstream TODO travels with the port: the allowlist duplicates the
+ *  truth in services/actions.getCommitStatusEventNameAndCommitID and this
+ *  filter, kept in sync by hand. */
+export function isPullRequestCheckEvent(event: string): boolean {
   return ["push", "pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment", "release"].includes(event);
 }
+
+/** Compatibility alias for the pre-#39961 name; the settings-page module
+ *  (ui/pages/actions-scoped-workflows.tsx — another unit's file) still
+ *  imports this spelling. HANDOFF: switch its import to isPullRequestCheckEvent
+ *  and drop this alias. */
+export const shouldEventCreateCommitStatus = isPullRequestCheckEvent;
 
 // ---------------------------------------------------------------------------
 // Commit statuses (services/actions/commit_status.go)
@@ -1980,11 +2058,19 @@ export function toCommitStatusDescription(job: { status: number; started: Date |
 export const ACTIONS_USER_ID = -2;
 
 /**
- * getCommitStatusEventNameAndCommitID (commit_status.go:74-141) for the wired
+ * getCommitStatusEventNameAndCommitID (commit_status.go:85-141) for the wired
  * family: push reads payload.HeadCommit.ID; pull_request(_target) reads
- * PullRequest.Head.Sha. The release arm (commitID = run.CommitSHA) rides with
- * the release producer; create/delete/events produce no status (upstream's
- * default arm).
+ * PullRequest.Head.Sha; workflow_dispatch posts on the run's own commit with
+ * the event name as the context suffix (commit_status.go:124-127 — the
+ * dispatch arm, #39961: dispatch runs previously posted NO commit status at
+ * all, so the commit showed no sign a workflow ran on it; `schedule` stays
+ * statusless). Dispatch statuses never count for pull requests — they show
+ * in no PR's checks and cannot satisfy or fail required checks even through
+ * broad globs, because the PR-side filter (IsPullRequestCheckEvent's
+ * allowlist, services/pull.GetLatestPullCommitStatuses's consumer) excludes
+ * workflow_dispatch. The release arm (same case body, commitID =
+ * run.CommitSHA) rides with the release producer; create/delete/events
+ * produce no status (upstream's default arm).
  */
 /** A defensive payload read: unparseable JSON or a missing field answers "". */
 function payloadField(eventPayloadJson: string, read: (payload: Record<string, unknown>) => string): string {
@@ -2023,6 +2109,12 @@ export function commitStatusEventAndCommit(run: Pick<RunRow, "event" | "triggerE
         return { event: "", commitId: "" };
       }
       return { event, commitId: headSha };
+    }
+    case "workflow_dispatch": {
+      // commit_status.go:124-127's dispatch arm (#39961): the event string is
+      // the run's own event and the commit is the run's target commit — the
+      // dispatch producer pins CommitSHA to the dispatch ref's head.
+      return { event: run.event, commitId: run.commitSha };
     }
     default:
       return { event: "", commitId: "" };
@@ -2344,16 +2436,16 @@ export interface TriggeredRunInput {
   /** run.WorkflowCommitSHA (run.go:56-59): the commit the workflow CONTENT
    *  was read at — upstream's skeleton always fills it ("repo-level run =
    *  the repo itself['s commit]"; dwf.SourceCommitSHA notifier_helper.go:407,
-   *  workflow.go:137's runTargetCommit, schedule_tasks.go:145's
+   *  workflow.go:138's runTargetCommit, schedule_tasks.go:145's
    *  cron.CommitSHA), while a SCOPED run carries the SOURCE repo's resolved
-   *  commit (workflow.go:266). Undefined → input.commitSha (the repo-level
+   *  commit (workflow.go:268). Undefined → input.commitSha (the repo-level
    *  posture, where the content commit IS the run commit). Feeds
    *  github.workflow_sha (context.go:115) and the workflow_commit_sha
    *  column. */
   workflowSha?: string;
   /** run.WorkflowRepoID: the repo the workflow content came from — the repo
    *  itself for repo-level runs (notifier_helper.go:381), the source repo
-   *  for scoped (workflow.go:265). Undefined → input.repoId. */
+   *  for scoped (workflow.go:268). Undefined → input.repoId. */
   workflowRepoId?: string;
   /** run.IsScopedRun (run.go:61). Undefined → false. */
   isScopedRun?: boolean;
@@ -2490,8 +2582,8 @@ export async function insertTriggeredRunSplit(
           // way upstream's run construction fills it: the repo-level
           // default is this repo at the run commit (notifier_helper.go:381
           // + dwf.SourceCommitSHA), a scoped caller overrides through the
-          // workflowSha/workflowRepoId/isScopedRun inputs (workflow.go:139-142
-          // + :260-263's pre-insert fields — ALL THREE halves ride the
+          // workflowSha/workflowRepoId/isScopedRun inputs (workflow.go:140-143
+          // + :262-264's pre-insert fields — ALL THREE halves ride the
           // insert on both producers; the dispatch arms' post-insert
           // compensation UPDATEs are retired).
           workflowRepoId: input.workflowRepoId ?? input.repoId,
@@ -2555,7 +2647,7 @@ export async function insertTriggeredRunSplit(
         workflowId: input.workflowId,
         // WorkflowCommitSHA = the commit the workflow CONTENT was read at
         // (context.go:115's workflow_sha source; dwf.SourceCommitSHA on the
-        // repo-level family, workflow.go:266's source HEAD when scoped).
+        // repo-level family, workflow.go:268's source HEAD when scoped).
         workflowSha: input.workflowSha ?? input.commitSha,
         eventName: input.triggerEvent,
         eventPayloadJson: input.eventPayloadJson,
@@ -2578,6 +2670,16 @@ export async function insertTriggeredRunSplit(
         combos = parsed.combos;
       } catch (err) {
         await abort(err, "parse workflow"); // abort throws — the loop never proceeds
+      }
+
+      // The parse-count half of the #39942 limit (run.go:126-128): a jobs
+      // mapping larger than MaxJobNumPerRun fails the insert with the
+      // translatable invalid-argument error (the typed throw keeps the class
+      // through the compensate — abort's string-wrap would erase it, and
+      // buildApproveAndInsertRun's conversion keys on the class).
+      if (combos.length > MAX_JOB_NUM_PER_RUN) {
+        await compensate(run.id, index);
+        throw new RunJobLimitError();
       }
 
       // E2 — the run-name render (jobparser.go:103-106 interpolates
@@ -2612,6 +2714,10 @@ export async function insertTriggeredRunSplit(
         let cancel = false;
         try {
           ({ group, cancel } = evaluateRunConcurrency(githubContext, wfRawConcurrency, vars, inputs));
+          // EvaluateRunConcurrencyFillModel's tail (concurrency.go:46, #40392):
+          // the bound applies BEFORE the gate reads the group — the attempt
+          // stores and matches on the bounded value.
+          group = await boundedConcurrencyGroup(group);
         } catch (err) {
           await abort(err, "evaluate concurrency");
         }
@@ -2719,7 +2825,7 @@ export async function insertTriggeredRunSplit(
               // "evaluate job concurrency: %w" rolls the transaction back)
               await abort(evaluated.error, "evaluate job concurrency");
             }
-            concurrencyGroup = evaluated.group;
+            concurrencyGroup = await boundedConcurrencyGroup(evaluated.group); // EvaluateJobConcurrencyFillModel's tail (concurrency.go:89, #40392)
             concurrencyCancel = evaluated.cancel;
             isConcurrencyEvaluated = true;
           }
@@ -2808,6 +2914,18 @@ export async function insertTriggeredRunSplit(
         if (entry.invalidIf !== null) invalidRows.push({ row, key: "if", summary: entry.invalidIf });
         if (entry.invalidRunsOn !== null) invalidRows.push({ row, key: "runs-on", summary: entry.invalidRunsOn });
       }
+
+      // The row-count half of the #39942 limit (run.go:158-160's
+      // checkRunJobLimit — "inline reusable expansions only counted the jobs
+      // inserted before them"): the cap re-counts the STORED rows after the
+      // insert loop, so any expansion path that lands extra rows still hits
+      // the ceiling. Same typed throw + compensate as the parse-count half.
+      try {
+        await checkRunJobLimit(d1, run.id, runAttempt.id);
+      } catch (err) {
+        await compensate(run.id, index);
+        throw err;
+      }
       // upsertJobErrorSummary AFTER the job insert (run.go:282-286)
       for (const { row, key, summary } of invalidRows) {
         await upsertJobErrorSummary(d1, row, key, new Error(summary));
@@ -2850,7 +2968,7 @@ export async function insertTriggeredRunSplit(
       // resolves the dependents of jobs this insert already terminalized;
       // the cancelled runs settle inside cancelOneJob (UpdateRunJob's
       // refresh piggyback) and get their statuses re-posted here
-      // (createCommitStatusesForJobsByRun, job_emitter.go:135-151).
+      // (createCommitStatusesForJobsByRun, job_emitter.go:134-150).
       const needPostCommitEmit = jobRows.some((j) => j.status === ACTION_STATUS_SKIPPED || j.status === ACTION_STATUS_FAILURE);
       if (needPostCommitEmit) {
         await checkJobsOfRun(d1, run.id, webhook);
@@ -2903,7 +3021,7 @@ export async function insertTriggeredRunSplit(
   throw lastError instanceof Error ? lastError : new Error("actions: run index race unresolved");
 }
 
-/** AggregateJobStatus (models/actions/run_job.go:509-554) — the P statuses. */
+/** AggregateJobStatus (models/actions/run_job.go:491-536) — the P statuses. */
 export function aggregateJobStatus(jobs: Array<{ status: number; continueOnError: boolean }>): number {
   const total = jobs.length;
   let allSuccessOrSkipped = total !== 0;
@@ -2960,8 +3078,8 @@ function toAggregateJob(job: RunJobRow): { status: number; continueOnError: bool
  * helper.go:158-160 + resolveCheckNeeds job_emitter.go:…), max-parallel
  * slots, the attempt/run aggregate refresh (models/actions/run_job.go
  * refreshRunStatus :557-595), the task-version wake (UpdateRunJob
- * run_job.go:496-521), and the statuses refresh
- * (createCommitStatusesForJobsByRun :135-151).
+ * run_job.go:478-503), and the statuses refresh
+ * (createCommitStatusesForJobsByRun :134-150).
  *
  * The E-tier arms (evaluateJobIf on a non-empty `if:` — helper.go:123-131,
  * concurrency, deferred matrices, reusable callers) stage: a non-empty bare
@@ -3332,7 +3450,7 @@ export async function checkJobsOfRun(d1: D1Database, runId: number, webhook?: Ac
   // here — nothing was flipped at pass time, so no creation double-fire).
   if (updatedJobIds.length === 0 && cancelledByConcurrency.length === 0) return;
 
-  // The task-version wake (UpdateRunJob run_job.go:496-521): a job returning
+  // The task-version wake (UpdateRunJob run_job.go:478-503): a job returning
   // to waiting, or a terminal job with waiting work remaining.
   const updatedJobs = jobs.filter((j) => updatedJobIds.includes(j.id));
   const wakeWaiting = updatedJobs.some((j) => j.status === ACTION_STATUS_WAITING);
@@ -3349,9 +3467,9 @@ export async function checkJobsOfRun(d1: D1Database, runId: number, webhook?: Ac
     await increaseTaskVersion(d1, run.ownerId, run.repoId);
   }
 
-  // refreshRunStatus (run_job.go:557-582): the attempt aggregates from its
+  // refreshRunStatus (run_job.go:539-564): the attempt aggregates from its
   // jobs and persists its STATUS ONLY (the attempt arm never touches
-  // started/stopped — that lives on the legacy run-row path :584-601, whose
+  // started/stopped — that lives on the legacy run-row path :575-592, whose
   // started/stopped legs port below); the latest attempt propagates to its
   // run.
   const attemptRows = await db.select().from(actionRunAttempts).where(eq(actionRunAttempts.id, run.latestAttemptId)).limit(1);
@@ -3435,7 +3553,7 @@ export async function checkJobsOfRun(d1: D1Database, runId: number, webhook?: Ac
     }
   }
 
-  // createCommitStatusesForJobsByRun (job_emitter.go:135-151): the resolved
+  // createCommitStatusesForJobsByRun (job_emitter.go:134-150): the resolved
   // jobs' statuses re-post. The repo identity was loaded for the E3 gate.
   await createCommitStatusForRunJobs(
     d1,
@@ -3713,7 +3831,10 @@ async function evaluateJobConcurrencyForStoredJob(
   if (evaluated.error !== null) {
     return { outcome: "invalid", message: evaluated.error.message };
   }
-  return { outcome: "ok", group: evaluated.group, cancel: evaluated.cancel };
+  // EvaluateJobConcurrencyFillModel's tail (concurrency.go:89, #40392): the
+  // emitter's re-evaluation is that fill model's needs-finished arm, so the
+  // bound rides here too — the stored group must match the insert path's.
+  return { outcome: "ok", group: await boundedConcurrencyGroup(evaluated.group), cancel: evaluated.cancel };
 }
 
 // ---------------------------------------------------------------------------
@@ -4146,9 +4267,39 @@ async function triggerForEvent(
         readWorkflowRawConcurrency(file.content),
       );
     } catch (err) {
-      // handleWorkflows logs and continues (:357-361)
+      // buildApproveAndInsertRun's #39942 arm (notifier_helper.go:469-475):
+      // an InvalidArgument insert failure — the RunJobLimitError class is our
+      // errors.Is(err, util.ErrInvalidArgument) probe — records an
+      // INVALID-WORKFLOW run (the rejected push shows as a failed run whose
+      // summary carries the error) instead of vanishing into the logs. The
+      // isScopedRun negation stages with the scoped producer (this loop is
+      // the repo-level family only; a scoped source's failures keep the
+      // log-and-continue road).
+      if (err instanceof RunJobLimitError) {
+        await insertInvalidWorkflowRun(
+          env.DB,
+          {
+            title: commit.subject,
+            repoId: repo.id,
+            ownerId: repo.ownerId ?? 0,
+            workflowId: file.entryName,
+            triggerUserId: meta.triggerUserId,
+            ref,
+            commitSha: commit.oid,
+            event,
+            triggerEvent: event,
+            eventPayload: eventPayloadJson,
+            webhook: { bindings: env, origin: appUrl },
+          },
+          err,
+        );
+        continue;
+      }
+      // handleWorkflows logs and continues (:357-361); #40392 widened the
+      // log line to carry the workflow entry and the ref alongside the repo
+      // (notifier_helper.go:399 — "repo %s workflow %s ref %s: %v").
       console.error(
-        `[actions-trigger] ${repo.ownerNamespace}/${repo.slug}: insert ${file.entryName} failed: ` +
+        `[actions-trigger] ${repo.ownerNamespace}/${repo.slug}: workflow ${file.entryName} ref ${ref}: ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
     }

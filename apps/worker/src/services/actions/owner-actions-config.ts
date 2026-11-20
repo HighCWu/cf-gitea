@@ -4,7 +4,9 @@
  * REPO-scope twin's store — this module is the OWNER scope upstream pairs
  * with it).
  *
- * Upstream pin fc4936884584a41931906553d96c2601d750e6ef:
+ * Upstream pin 099abf5db47dd5cf797d8898f6aaa06ccdf77c24 (re-pin wave 1;
+ * behavioral deltas from fc49368845 ride #39998's FromDB change — the
+ * parseOwnerActionsConfig docstring):
  *
  *   - STORE: the generic `user_setting` KV (models/user/setting.go:22-29 —
  *     `Setting{ID, UserID, SettingKey varchar(255), SettingValue text}`,
@@ -18,7 +20,7 @@
  *
  *   - THE KEY: `SettingsKeyActionsConfig = "actions.config"`
  *     (setting_options.go:26). The value is the OwnerActionsConfig JSON
- *     (models/actions/config.go:20-33): TokenPermissionMode,
+ *     (models/actions/config.go:18-28): TokenPermissionMode,
  *     MaxTokenPermissions, AllowedCrossRepoIDs — every field tagged
  *     `omitempty`, so the Go zero config marshals `{}` and a saved default
  *     marshals `{"token_permission_mode":"permissive"}`. ONE row per owner:
@@ -30,7 +32,7 @@
  *
  *   - SERIALIZATION: SetUserSettingJSON / GetUserSettingJSON
  *     (models/user/setting.go:210-232). OwnerActionsConfig implements
- *     ConversionFrom ONLY (config.go:36-37 — no ConversionTo), so the WRITE
+ *     ConversionFrom ONLY (config.go:28-29 — no ConversionTo), so the WRITE
  *     side is Go's plain json.Marshal of the struct: declaration order,
  *     omitempty on all three tagged fields (a "" mode, a nil max, an
  *     empty/nil allowed list serialize nothing), and the embedded
@@ -45,13 +47,16 @@
  *
  *   - THE ABSENT ROW: GetUserSettingJSON with no row reads "" and STILL
  *     runs the type's ConversionFrom.FromDB on the empty bytes
- *     (setting.go:217-223); OwnerActionsConfig.FromDB is the ignored-error
- *     Unmarshal + `EnumValue` mode normalization (config.go:38-45) —
+ *     (setting.go:217-223); OwnerActionsConfig.FromDB is the lenient
+ *     Unmarshal + `EnumValue` mode normalization (config.go:32-37; #39998
+ *     swapped the ignored-error `_ = json.Unmarshal` for db.UnmarshalFromDB,
+ *     whose corrupted-value arm panics in dev — the parse below throws) —
  *     modules/util/util.go:302-310 answers enums[0] for anything invalid,
  *     and permissive is EnumValues[0] (repo_unit_actions.go:23-25). A fresh
  *     owner's loaded config therefore reads mode "permissive", max nil,
  *     allowed nil — the page modules' OWNER_ACTIONS_GENERAL_FRESH_DATA
- *     posture. Junk bytes take the same road (the `_ =` on Unmarshal).
+ *     posture. Junk bytes panic in dev under #39998 (the throw in
+ *     parseOwnerActionsConfig) — they no longer "take the same road".
  *
  *   - THE UPSERT: SetUserSetting → upsertUserSettingValue
  *     (setting.go:186-208) — upstream's portable UPDATE-then-check-then-
@@ -92,7 +97,7 @@ import {
 /** Upstream `SettingsKeyActionsConfig` (models/user/setting_options.go:26). */
 export const SETTINGS_KEY_ACTIONS_CONFIG = "actions.config";
 
-/** The OWNER ActionsConfig (models/actions/config.go:20-33). TS fields are
+/** The OWNER ActionsConfig (models/actions/config.go:18-28). TS fields are
  *  camelCase; `serialize` emits upstream's exact Go-marshal keys. */
 export interface OwnerActionsConfig {
   tokenPermissionMode: ActionsTokenPermissionMode;
@@ -103,13 +108,21 @@ export interface OwnerActionsConfig {
   allowedCrossRepoIds: string[];
 }
 
-/** The FromDB arm (config.go:38-45 over setting.go:210-232): lenient JSON
- *  read — unparseable bytes yield the zero config, never a throw (upstream
- *  ignores the Unmarshal error; an absent row's "" bytes take the same
- *  path) — then the EnumValue mode normalization: anything absent or
- *  invalid becomes "permissive" (util.go:302-310 — invalid answers
- *  enums[0]). The returned mode is therefore always valid — the Go zero
- *  literal's "" never survives a load. */
+/** The FromDB arm (config.go:32-37 at the 099abf5db4 pin, over setting.go's
+ *  GetUserSettingJSON): lenient JSON read — an absent row's "" bytes answer
+ *  true-and-empty (db.UnmarshalFromDB's `len(data) == 0` arm, db/convert.go:88-90) —
+ *  then the EnumValue mode normalization: anything absent or invalid becomes
+ *  "permissive" (util.go:302-310 — invalid answers enums[0]). The returned
+ *  mode is therefore always valid — the Go zero literal's "" never survives
+ *  a load.
+ *
+ *  #39998 changed the corrupted-bytes posture: config.go's FromDB dropped
+ *  its ignored-error `_ = json.Unmarshal` for db.UnmarshalFromDB
+ *  (db/convert.go:88-102), whose parse failure runs setting.PanicInDevOrTesting
+ *  ("UnmarshalFromDB %q failed") — dev/testing PANICS (visible), production
+ *  logs-and-continues with the partial config. The house PanicInDevOrTesting
+ *  posture (secrets-variables.ts's actionsStatusWords precedent) throws: a
+ *  corrupted config is a broken-DB signal, never silently eaten. */
 export function parseOwnerActionsConfig(raw: string | null): OwnerActionsConfig {
   let mode = "";
   let maxTokenPermissions: ActionsTokenPermissions | null = null;
@@ -128,8 +141,13 @@ export function parseOwnerActionsConfig(raw: string | null): OwnerActionsConfig 
         };
       }
       if (Array.isArray(parsed.allowed_cross_repo_ids)) allowedCrossRepoIds = parsed.allowed_cross_repo_ids.map(String);
-    } catch {
-      // upstream's `_ = json.Unmarshal(...)` — junk bytes are the zero config
+    } catch (err) {
+      // db.UnmarshalFromDB's corrupted-value arm (#39998, db/convert.go:93-101):
+      // PanicInDevOrTesting — throw with the upstream message shape instead
+      // of the pre-#39998 silent zero-config.
+      throw new Error(
+        `UnmarshalFromDB ${JSON.stringify(raw)} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
   const tokenPermissionMode: ActionsTokenPermissionMode = ACTIONS_TOKEN_PERMISSION_MODES.includes(mode as ActionsTokenPermissionMode)
@@ -172,7 +190,7 @@ export function serializeOwnerActionsConfig(cfg: OwnerActionsConfig): string {
   return `{${parts.join(",")}}`;
 }
 
-/** GetOwnerActionsConfig (models/actions/config.go:40-47): the row read,
+/** GetOwnerActionsConfig (models/actions/config.go:40-42): the row read,
  *  the absent row answering the default config (the FromDB-on-empty-bytes
  *  chain in the header — mode permissive, max null, allowed empty). */
 export async function getOwnerActionsConfig(d1: D1Database, ownerId: number): Promise<OwnerActionsConfig> {
@@ -184,7 +202,7 @@ export async function getOwnerActionsConfig(d1: D1Database, ownerId: number): Pr
   return parseOwnerActionsConfig(row?.settingValue ?? null);
 }
 
-/** SetOwnerActionsConfig (models/actions/config.go:49-51): the row upsert —
+/** SetOwnerActionsConfig (models/actions/config.go:45-47): the row upsert —
  *  SQLite's ON CONFLICT arbitrating setting.go:186-208's
  *  update-then-insert dance at the (user_id, setting_key) UNIQUE. */
 export async function setOwnerActionsConfig(d1: D1Database, ownerId: number, cfg: OwnerActionsConfig): Promise<void> {

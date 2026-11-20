@@ -29,7 +29,7 @@
  *     official-bundle JS; this module is one shell + one JSON endpoint, not
  *     a UI port).
  *
- *   - The JSON contract (view.go:291-417 ViewResponse + ViewRequest): the
+ *   - The JSON contract (view.go:287-413 ViewResponse + ViewRequest): the
  *     POST twin of the same URL carries `{logCursors:[{step,cursor,expanded}]}`
  *     and answers the full state tree (run/attempts/jobs/commit/pullRequest/
  *     jobSummaries/artifacts + currentJob + logs). The census pins it as one
@@ -64,7 +64,7 @@
  * sit on each helper.
  *
  * The `state.currentJob.steps` + `logs.stepsLog` arms (the census C3 unit,
- * landed over M1b's log store): `convertToViewModel` (view.go:835-917) is
+ * landed over M1b's log store): `convertToViewModel` (view.go:831-913) is
  * ported whole — FullSteps' pre/post synthesis (modules/actions/task_state.go),
  * the cancelling overlay, the waiting→pending wire flip, the per-cursor
  * `validCursor` guards, and the log-expired arm — reading the steps through
@@ -88,7 +88,7 @@
  *   backtick/code and link arms.
  * - `pullRequest` arms 1-3 (a `refs/pull/N/head` ref, a pull_request event
  *   payload, and the push-run open-PR-by-head-branch lookup —
- *   GetUnmergedPullRequestsByHeadInfo, pull_list.go:64-70 at view.go:436-453)
+ *   GetUnmergedPullRequestsByHeadInfo, pull_list.go:64-70 at view.go:432-449)
  *   are ported (arm 3 landed with the ⑲A7 row): exactly ONE open,
  *   unmerged, github-flow PR whose head matches the run's branch surfaces
  *   the Back-to-PR link; the link resolves through the PR's BASE repo
@@ -395,7 +395,7 @@ export async function getLatestRun(d1: D1, repoId: string): Promise<RunRow | nul
   return rows[0] ?? null;
 }
 
-/** GetRunJobByRunAndID (run_job.go:230-240) — the run-scoped job lookup. */
+/** GetRunJobByRunAndID (run_job.go:228-238) — the run-scoped job lookup. */
 export async function getRunJobByRunAndId(d1: D1, runId: number, jobId: number): Promise<RunJobRow | null> {
   const rows = await drizzle(d1)
     .select()
@@ -405,7 +405,7 @@ export async function getRunJobByRunAndId(d1: D1, runId: number, jobId: number):
   return rows[0] ?? null;
 }
 
-/** GetRunJobByRepoAndID (run_job.go:207-217) — the ID-vs-index probe's
+/** GetRunJobByRepoAndID (run_job.go:205-215) — the ID-vs-index probe's
  *  job arm. */
 export async function getRunJobByRepoAndId(d1: D1, repoId: string, jobId: number): Promise<RunJobRow | null> {
   const rows = await drizzle(d1)
@@ -456,7 +456,7 @@ export async function listRunAttemptsByRunId(d1: D1, runId: number): Promise<Run
     .orderBy(desc(actionRunAttempts.attempt));
 }
 
-/** GetRunJobsByRunAndAttemptID (run_job.go:305-311) — id ASC. runAttemptId 0
+/** GetRunJobsByRunAndAttemptID (run_job.go:303-309) — id ASC. runAttemptId 0
  *  addresses the legacy pre-attempt rows (never written in v1). */
 export async function getRunJobsByRunAndAttemptId(d1: D1, runId: number, runAttemptId: number): Promise<RunJobRow[]> {
   return drizzle(d1)
@@ -466,7 +466,7 @@ export async function getRunJobsByRunAndAttemptId(d1: D1, runId: number, runAtte
     .orderBy(asc(actionRunJobs.id));
 }
 
-/** GetLatestAttemptJobsByRun (run_job.go:268-278) — the disambiguation's
+/** GetLatestAttemptJobsByRun (run_job.go:266-276) — the disambiguation's
  *  index-ordinal arm. */
 export async function getLatestAttemptJobsByRun(d1: D1, run: RunRow): Promise<RunJobRow[]> {
   if (run.latestAttemptId > 0) return getRunJobsByRunAndAttemptId(d1, run.id, run.latestAttemptId);
@@ -631,7 +631,7 @@ export async function userAvatarLink(
 // view.go:75-260 + 1097-1160) — the ID-first vs legacy index disambiguation
 // ---------------------------------------------------------------------------
 
-/** MaxJobNumPerRun (run_job.go:29) — job ordinals above it can only be IDs,
+/** MaxJobNumPerRun (run_job.go:28) — job ordinals above it can only be IDs,
  *  so those URLs skip the index interpretation. */
 export const MAX_JOB_NUM_PER_RUN = 256;
 
@@ -693,7 +693,7 @@ export async function resolveRunForView(
   if (runNum <= 0) return { outcome: "not-found" };
 
   if (jobRaw === "") {
-    // Job-less: best-effort ID-first (view.go:98-117).
+    // Job-less: best-effort ID-first (view.go:96-115).
     if (!byIndex) {
       const runById = await getRunByRepoAndId(d1, repoId, runNum);
       if (runById !== null) return { outcome: "run", run: runById };
@@ -708,7 +708,7 @@ export async function resolveRunForView(
   const jobNum = parsePathParamInt64(jobRaw);
   // jobNum cannot be negative through the digits-only parse (upstream's
   // `jobNum < 0` NotFound arm is unreachable here); values ≥ MaxJobNumPerRun
-  // are treated as IDs directly (view.go:135-138).
+  // are treated as IDs directly (view.go:133-136).
   if (jobNum >= MAX_JOB_NUM_PER_RUN) {
     const run = await getRunByRepoAndId(d1, repoId, runNum);
     return run === null ? { outcome: "not-found" } : { outcome: "run", run };
@@ -744,7 +744,7 @@ export async function resolveRunForView(
       location: `${repoLink}/actions/runs/${runByIndex.id}/jobs/${targetJobByIndex.id}`,
     };
   }
-  // Both valid: prefer the ID-based interpretation (view.go:240-244).
+  // Both valid: prefer the ID-based interpretation (view.go:238-242).
   return runById === null ? { outcome: "not-found" } : { outcome: "run", run: runById };
 }
 
@@ -754,13 +754,13 @@ export interface ResolvedRunAttemptJobs {
 }
 
 /**
- * getCurrentRunJobsByPathParam (view.go:1099-1160): resolve the attempt to
+ * getCurrentRunJobsByPathParam (view.go:1094-1157): resolve the attempt to
  * display (explicit path param > the job's own attempt > the latest) and
  * the attempt's jobs. The run-scoped job lookup missing is upstream's
  * ServerError arm (a job URL whose job row vanished between resolution and
  * load — reachable at /runs/{id}/jobs/{foreign-or-stale-≥256}); the port
- * throws into the app's 500 chrome (view.go:1119), same for a missing
- * explicit attempt number (view.go:1133).
+ * throws into the app's 500 chrome (view.go:1116), same for a missing
+ * explicit attempt number (view.go:1130).
  */
 export async function resolveRunAttemptAndJobs(
   d1: D1,
@@ -800,7 +800,7 @@ export async function resolveRunAttemptAndJobs(
   return { attempt, jobs };
 }
 
-/** getRunViewLink (view.go:1090-1095): the latest attempt (or a legacy null)
+/** getRunViewLink (view.go:1088-1093): the latest attempt (or a legacy null)
  *  links the bare run URL; a historical attempt links /attempts/{n}. */
 export function runViewLink(runLink: string, run: RunRow, attempt: RunAttemptRow | null): string {
   if (attempt === null || run.latestAttemptId === attempt.id) return runLink;
@@ -808,7 +808,7 @@ export function runViewLink(runLink: string, run: RunRow, attempt: RunAttemptRow
 }
 
 // ---------------------------------------------------------------------------
-// The ViewResponse contract (view.go:291-530 — the field list the test
+// The ViewResponse contract (view.go:287-526 — the field list the test
 // matrix pins against)
 // ---------------------------------------------------------------------------
 
@@ -859,14 +859,14 @@ export interface ViewArtifactsItem {
   previewLink?: string;
 }
 
-/** ViewJobStep (view.go:401-405) — the currentJob steps' shape. */
+/** ViewJobStep (view.go:399-403) — the currentJob steps' shape. */
 export interface ViewJobStep {
   summary: string;
   duration: string;
   status: string;
 }
 
-/** ViewStepLogLine (view.go:413-417) — timestamp is float seconds (upstream
+/** ViewStepLogLine (view.go:409-413) — timestamp is float seconds (upstream
  *  UnixNano()/1e9). */
 export interface ViewStepLogLine {
   index: number;
@@ -874,7 +874,7 @@ export interface ViewStepLogLine {
   timestamp: number;
 }
 
-/** ViewStepLog (view.go:407-411) — the advanced cursor + the new lines. */
+/** ViewStepLog (view.go:405-409) — the advanced cursor + the new lines. */
 export interface ViewStepLog {
   step: number;
   cursor: number;
@@ -929,7 +929,7 @@ export interface ViewResponse {
 }
 
 // ---------------------------------------------------------------------------
-// The C3 arm: the currentJob steps + the log cursors (view.go:835-917's
+// The C3 arm: the currentJob steps + the log cursors (view.go:831-913's
 // convertToViewModel over FullSteps, modules/actions/task_state.go — the
 // census C3 unit's read arms, riding M1b's log store)
 // ---------------------------------------------------------------------------
@@ -1076,7 +1076,7 @@ function fullStepDurationMs(step: FullStep): number {
 }
 
 /**
- * convertToViewModel (view.go:835-917): the steps list plus the log lines
+ * convertToViewModel (view.go:831-913): the steps list plus the log lines
  * each EXPANDED cursor's step still needs. The cursor protocol: `cursor`
  * counts the step's lines the client already holds; the answer reports
  * `cursor + len(lines)` and the 1-based line indexes — a `validCursor`
@@ -1097,7 +1097,7 @@ export async function convertToViewModel(
     if (task.status === ACTION_STATUS_CANCELLING && status === ACTION_STATUS_RUNNING) {
       status = ACTION_STATUS_CANCELLING;
     }
-    // Waiting renders as "pending" in the steps list (view.go:849's Iif).
+    // Waiting renders as "pending" in the steps list (view.go:845's Iif).
     const wire = status === ACTION_STATUS_WAITING ? 9 : status; // StatusPending
     return {
       summary: v.name,
@@ -1201,7 +1201,7 @@ export async function buildViewResponse(
   const done = isDoneStatusValue(effectiveStatus);
   const isCancelling = effectiveStatus === ACTION_STATUS_CANCELLING;
   // Latest when the run has no attempts (legacy) or the viewed attempt is
-  // the run's latest (view.go:372-373).
+  // the run's latest (view.go:370-371).
   const isLatestAttempt = run.latestAttemptId === 0 || runAttemptId === run.latestAttemptId;
 
   // One users read covers the run's trigger user + every attempt's trigger
@@ -1214,7 +1214,7 @@ export async function buildViewResponse(
   const triggerUser = usersById.get(run.triggerUserId);
   const pusherAvatar = await userAvatarLink(input.env.REPO_PACKS, triggerUser, 16);
 
-  // --- the run block (fillViewRunResponseSummary, view.go:542-707) ----------
+  // --- the run block (fillViewRunResponseSummary, view.go:538-703) ----------
 
   const canCancel = isLatestAttempt && !done && !isCancelling && input.canWriteActions;
   const canApprove =
@@ -1284,7 +1284,7 @@ export async function buildViewResponse(
   );
   const triggeredAt = Math.floor((attempt === null ? run.created : attempt.created).getTime() / 1000);
 
-  // Job summaries — per-step markdown rows grouped per job (view.go:690-707):
+  // Job summaries — per-step markdown rows grouped per job (view.go:686-703):
   // each step renders independently so an unclosed construct cannot bleed
   // into the next; a workflow-level summary (jobId 0) names the workflow.
   const jobSummaries: ViewJobSummaryItem[] = [];
@@ -1341,7 +1341,7 @@ export async function buildViewResponse(
   let current: RunJobRow | undefined;
   if (jobParam > 0) {
     current = jobs.find((job) => job.id === jobParam);
-    if (current === undefined) return { outcome: "not-found" }; // view.go:735-737's NotFound arm
+    if (current === undefined) return { outcome: "not-found" }; // view.go:731-733's NotFound arm
   }
 
   // IsAwaitingApproval reads the RUN's status (run.go:84-86), not the
@@ -1360,7 +1360,7 @@ export async function buildViewResponse(
     }
   }
 
-  // The C3 arm: the effective task (EffectiveTaskID, run_job.go:158-163)
+  // The C3 arm: the effective task (EffectiveTaskID, run_job.go:156-161)
   // feeds FullSteps + the log cursors. No task (a waiting job's taskId 0, or
   // a stale id whose row vanished — upstream's GetTaskByID error arm aside)
   // keeps the empty arrays, view.go's make([]…, 0) shell.
@@ -1404,7 +1404,7 @@ export async function buildViewResponse(
         workflowID: run.workflowId,
         workflowLink,
         // Upstream sets CanViewWorkflowFile = true and re-arms the SCOPED runs
-        // through canViewScopedWorkflowFile (view.go:610-614 — the file link
+        // through canViewScopedWorkflowFile (view.go:606-610 — the file link
         // only when the viewer reads the source repo). The rows now CARRY the
         // parity columns (is_scoped_run/workflow_repo_id land on every
         // producer), but the source-repo readability probe stays a recorded
@@ -1436,7 +1436,7 @@ export async function buildViewResponse(
 }
 
 /** The commit block + the pull-request arm (ViewCommit + the ref summary
- *  pair, view.go:424-494 + 673-684). */
+ *  pair, view.go:420-490 + 673-684). */
 async function resolveRefSummary(
   input: BuildViewResponseInput,
   d1: D1,
@@ -1455,7 +1455,7 @@ async function resolveRefSummary(
     avatarLink: pusherAvatar,
   };
 
-  // viewSummaryBranchFromRun (view.go:436-494): a pull_request payload's
+  // viewSummaryBranchFromRun (view.go:432-490): a pull_request payload's
   // head names "owner:branch"; otherwise the run's own ref (PrettyRef) with
   // the deleted-branch marker from the engine's refs read.
   const prPayload = parsePullRequestEventPayload(run.event, run.eventPayload);
@@ -1492,7 +1492,7 @@ async function resolveRefSummary(
       isDeleted: false,
     };
     if (!isPull && refName.startsWith("refs/heads/")) {
-      // IsBranchExist (view.go:491-493) — one engine refs read answers the
+      // IsBranchExist (view.go:487-489) — one engine refs read answers the
       // deleted-branch marker (the module header's no-cache note).
       const reads = engineReads(input.env, input.repo);
       const refs = await reads.listRefs();
@@ -1508,9 +1508,9 @@ async function resolveRefSummary(
     branch,
   };
 
-  // viewPullRequestFromRun (view.go:424-460): a pull ref names "#N" and
+  // viewPullRequestFromRun (view.go:420-456): a pull ref names "#N" and
   // links the PR page; a pull_request payload's index rides too; arm 3
-  // (view.go:436-453 — the ⑲A7 row) surfaces the ONE open, unmerged
+  // (view.go:432-449 — the ⑲A7 row) surfaces the ONE open, unmerged
   // github-flow PR whose head matches the run's branch, linked through its
   // BASE repo (LoadBaseRepo — a fork-head push names the base repo's page).
   let pullRequest: ViewResponse["state"]["run"]["pullRequest"] | null = null;
@@ -1533,7 +1533,7 @@ async function resolveRefSummary(
  *  unmerged (`has_merged = false`), github-flow (`flow = github`) PR with
  *  `head_repo_id = run.RepoID AND head_branch = branch`, ordered by id,
  *  answers its index + the BASE repo's link. Every other row count, a
- *  missing base repo row, or a query failure answers null (view.go:440-446's
+ *  missing base repo row, or a query failure answers null (view.go:436-442's
  *  log-and-nil arms). */
 async function findOpenPullRequestByHead(
   d1: D1,
@@ -1566,7 +1566,7 @@ async function findOpenPullRequestByHead(
     if (baseRepo === undefined) return null; // LoadBaseRepo's miss → log-and-nil
     return { index: row.index, baseRepoLink: `/${baseRepo.ownerNamespace}/${baseRepo.slug}` };
   } catch {
-    return null; // view.go:444-446's LoadBaseRepo error arm
+    return null; // view.go:440-442's LoadBaseRepo error arm
   }
 }
 
@@ -1616,7 +1616,7 @@ function parsePullRequestEventPayload(event: string, eventPayload: string): PrPa
   let repoLink = "";
   if (headRepo !== null) {
     // head.Repository.Link (relative) with the HTMLURL fallback — the same
-    // pair view.go:483-489 reads.
+    // pair view.go:479-485 reads.
     if (typeof headRepo["owner"] === "object" && headRepo["owner"] !== null) {
       const ownerName = (headRepo["owner"] as Record<string, unknown>)["login"];
       if (typeof headRepo["name"] === "string" && typeof ownerName === "string") {
@@ -1691,7 +1691,7 @@ export function isArtifactPreviewSizeAllowed(size: number): boolean {
  *  The link and the routes must land together (the dead-link rule). */
 const artifactPreviewLinkEnabled = true;
 
-/** pendingNeeds (view.go:889-908): the needs entries whose same-parent jobs
+/** pendingNeeds (view.go:885-904): the needs entries whose same-parent jobs
  *  are missing or unfinished. */
 function pendingNeeds(current: RunJobRow, jobs: RunJobRow[]): string[] {
   const needs = parsedStringArray(current.needs);
@@ -1706,7 +1706,7 @@ function pendingNeeds(current: RunJobRow, jobs: RunJobRow[]): string[] {
   return pending;
 }
 
-/** describePendingJobDetail (view.go:836-884): why a pending/waiting job has
+/** describePendingJobDetail (view.go:832-880): why a pending/waiting job has
  *  not started — a pending job names its unfinished needs; a waiting caller
  *  distinguishes no-runner-online / no-label-match / busy-runner. The
  *  online set rides FindRunnerOptions{IsOnline: true} — last_online inside
@@ -1721,7 +1721,7 @@ async function describePendingJobDetail(d1: D1, current: RunJobRow, jobs: RunJob
     }
     return "";
   }
-  // A caller waits on its called jobs, never on a runner (view.go:860).
+  // A caller waits on its called jobs, never on a runner (view.go:856).
   if (current.status === ACTION_STATUS_WAITING && !current.isReusableCaller) {
     const runners = await drizzle(d1)
       .select()
@@ -1757,7 +1757,7 @@ function parsedStringArray(raw: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// The ViewRequest POST body (view.go:282-290 — the client's refresh polling
+// The ViewRequest POST body (view.go:280-288 — the client's refresh polling
 // arm; the cursors ride the C3 arm's per-step tail requests)
 // ---------------------------------------------------------------------------
 
@@ -1820,14 +1820,14 @@ const TASK_REPORT_TIMEOUT_MS = 60_000;
  *      the unstarted-run shortcut collapse into the same not-done filter on
  *      v1 rows);
  *   2. per job: no task → CAS the job to cancelled (`task_id = 0` guards
- *      the claim race, cancelOneJob run_job.go:804-819); a task → the
+ *      the claim race, cancelOneJob run_job.go:786-801); a task → the
  *      StopTask handshake (runner HasCancellingSupport + the report timeout
  *      decide cancelling vs cancelled, task.go:447-511);
  *   3. settle: re-aggregate the attempt + run from the refreshed jobs
- *      (refreshRunStatus's attempt/run mirror, run_job.go:567-600 — the
+ *      (refreshRunStatus's attempt/run mirror, run_job.go:549-582 — the
  *      M1b substitute arm, re-issued here; dedup note on landing);
  *   4. wake: a landed cancelled job bumps the dispatch counter when waiting
- *      work remains (UpdateRunJob's done-arm bump, run_job.go:504-527).
+ *      work remains (UpdateRunJob's done-arm bump, run_job.go:486-509).
  * The commit-status/notifier legs have no platform analog (module header).
  */
 export async function cancelActionRun(
@@ -1928,12 +1928,12 @@ export async function cancelActionRun(
   return { outcome: "cancelled", cancelledJobs };
 }
 
-/** refreshRunStatus + SettleRunAfterCancel (run_job.go:552-571 + 793-801):
+/** refreshRunStatus + SettleRunAfterCancel (run_job.go:534-553 + 793-801):
  *  recompute the attempt's aggregate from ITS attempt's jobs, mirror it onto
  *  the run (the latest attempt propagates; the started/stopped mirrors follow
  *  UpdateRunAttempt's rules). A settle that finds no jobs carries the
  *  cancelled noJobsStatus — SettleRunAfterCancel's arm. The job load is
- *  attempt-scoped (run_job.go:560's GetRunJobsByRunAndAttemptID) — the
+ *  attempt-scoped (run_job.go:542's GetRunJobsByRunAndAttemptID) — the
  *  runId-scope read this port replaced held only while every run carried
  *  exactly one attempt (the rerun landing's fix; the update.ts twin carries
  *  the same fix on the service side). */
@@ -1946,7 +1946,7 @@ export async function settleRunAfterCancel(d1: D1, run: RunRow, now: Date = new 
           .select(jobCols)
           .from(actionRunJobs)
           .where(and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, run.latestAttemptId)))
-      : await db.select(jobCols).from(actionRunJobs).where(eq(actionRunJobs.runId, run.id)); // the legacy fallback, run_job.go:574-601
+      : await db.select(jobCols).from(actionRunJobs).where(eq(actionRunJobs.runId, run.id)); // the legacy fallback, run_job.go:556-583
 
   if (run.latestAttemptId > 0) {
     const attemptRows = await db
@@ -1994,7 +1994,7 @@ export async function settleRunAfterCancel(d1: D1, run: RunRow, now: Date = new 
 
 // ---------------------------------------------------------------------------
 // The rerun arm (the census C5 remainder — POST runs/{run}/rerun,
-// rerun-failed, jobs/{job}/rerun — actions.Rerun / RerunFailed, view.go:952-1016
+// rerun-failed, jobs/{job}/rerun — actions.Rerun / RerunFailed, view.go:948-1012
 // + web.go:1588, 1597-1598; the mutation itself is services/actions/rerun.ts's
 // RerunWorkflowRunJobs port)
 // ---------------------------------------------------------------------------
@@ -2007,18 +2007,18 @@ export type RerunActionRunRequest =
 
 /** The handler-shaped outcome: the exact upstream web JSON bodies
  *  (JSONRedirect/JSONError — context.go:239-241, 276-278 — and
- *  handleWorkflowRerunError's {"message"} pair, view.go:1018-1028), the
- *  job-level 404 shell (view.go:970-974), or a throw for the ServerError
+ *  handleWorkflowRerunError's {"message"} pair, view.go:1016-1026), the
+ *  job-level 404 shell (view.go:966-972), or a throw for the ServerError
  *  arms (the resolveRunAttemptAndJobs convention). */
 export type RerunActionRunResponse =
   | { kind: "json"; status: number; body: Record<string, unknown> }
   | { kind: "not-found" };
 
 /**
- * actions.Rerun / actions.RerunFailed (view.go:952-1016): the latest-attempt
- * check (checkLatestAttempt, view.go:944-950), the done + workflow-disabled
- * pre-checks (checkRunRerunAllowed, view.go:919-942 — the JSONError shapes),
- * the no-job / no-failed-jobs guards (view.go:965-968, 1002-1008), then the
+ * actions.Rerun / actions.RerunFailed (view.go:948-1012): the latest-attempt
+ * check (checkLatestAttempt, view.go:940-946), the done + workflow-disabled
+ * pre-checks (checkRunRerunAllowed, view.go:915-938 — the JSONError shapes),
+ * the no-job / no-failed-jobs guards (view.go:961-964, 1002-1008), then the
  * service call with the mode's job set. Success answers
  * ctx.JSONRedirect(run.Link()) — {"redirect": "/{owner}/{repo}/actions/runs/{id}"}
  * (run.Link(), run.go:95-98).
@@ -2032,20 +2032,20 @@ export async function rerunActionRun(
   triggerUserId: number,
   request: RerunActionRunRequest,
 ): Promise<RerunActionRunResponse> {
-  // checkLatestAttempt (view.go:944-950): only the run's latest attempt
+  // checkLatestAttempt (view.go:940-946): only the run's latest attempt
   // reruns — a historical attempt URL answers the 404 shell.
   if (attempt !== null && run.latestAttemptId !== attempt.id) {
     return { kind: "not-found" };
   }
 
-  // checkRunRerunAllowed (view.go:919-942) — the JSONError shapes
+  // checkRunRerunAllowed (view.go:915-938) — the JSONError shapes
   // (context.go:276-278's {"errorMessage", "renderFormat": "text"}). The
   // scoped-run twin REPLACES the repo-level disabled read with the opt-out
-  // store over the run's own WorkflowRepoID (view.go:929-936's
+  // store over the run's own WorkflowRepoID (view.go:925-932's
   // `disabled = IsScopedWorkflowOptedOut(...)` — the landed parity columns
   // carry is_scoped_run/workflow_repo_id on every producer row); the owner
   // arg is the RESOLVED repo's CURRENT owner (upstream reads
-  // ctx.Repo.Repository.OwnerID — view.go:930; rerun.go:93's repo.OwnerID
+  // ctx.Repo.Repository.OwnerID — view.go:926; rerun.go:93's repo.OwnerID
   // is the same currency), so after a transfer the gate consults the NEW
   // owner's registrations — the run row's ownerId is the pre-transfer value
   // and misses them (R1-F9). The store's repositories row is the currency
@@ -2075,12 +2075,12 @@ export async function rerunActionRun(
   let jobsToRerun: RunJobRow[];
   if (request.kind === "run") {
     if (jobs.length === 0) {
-      // view.go:965-968 — "actions.runs.no_job".
+      // view.go:961-964 — "actions.runs.no_job".
       return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.noJob, renderFormat: "text" } };
     }
     jobsToRerun = []; // the whole run (rerun.go:39's empty-set meaning)
   } else if (request.kind === "run-failed") {
-    // view.go:1002-1008 — the direct POST on a fully successful run cannot
+    // view.go:998-1004 — the direct POST on a fully successful run cannot
     // re-run everything, so the empty failed set is an error, not a rerun-all.
     const failedJobs = getFailedJobsForRerun(jobs);
     if (failedJobs.length === 0) {
@@ -2088,7 +2088,7 @@ export async function rerunActionRun(
     }
     jobsToRerun = failedJobs;
   } else {
-    // view.go:970-974 — findCurrentJobByPathParam's NotFound arm.
+    // view.go:966-972 — findCurrentJobByPathParam's NotFound arm.
     const currentJob = jobs.find((job) => job.id === request.jobId);
     if (currentJob === undefined) return { kind: "not-found" };
     jobsToRerun = [currentJob];
@@ -2100,7 +2100,7 @@ export async function rerunActionRun(
     const runLink = `/${repo.ownerNamespace}/${repo.slug}/actions/runs/${run.id}`;
     return { kind: "json", status: 200, body: { redirect: runLink } };
   }
-  // handleWorkflowRerunError (view.go:1018-1028): AlreadyExist → 409,
+  // handleWorkflowRerunError (view.go:1016-1026): AlreadyExist → 409,
   // InvalidArgument → 400 — both as bare {"message"} (the frontend's
   // generic `Error {status}` toast arm reads this shape's absence of
   // errorMessage); the NotExist plan arms (latest-attempt-missing,
@@ -2116,7 +2116,7 @@ export async function rerunActionRun(
   }
 }
 
-/** AggregateJobStatus (run_job.go:642-687) minus the fail-fast matrix arm
+/** AggregateJobStatus (run_job.go:624-669) minus the fail-fast matrix arm
  *  (v1 rows carry no deferred matrix payload — the arm's guard can never
  *  fire; the M1b dedup note: services/actions/update.ts aggregateJobStatus
  *  is the same port for the service side). */
@@ -2160,14 +2160,14 @@ function aggregateStatus(jobs: Array<Pick<RunJobRow, "status" | "continueOnError
 // The mount shell render (view.tmpl + view_component.tmpl)
 // ---------------------------------------------------------------------------
 
-/** The mount page's data (view.go:294-326's ctx.Data set). */
+/** The mount page's data (view.go:292-324's ctx.Data set). */
 export interface RepoActionsViewPageData {
   /** The URL's {job} segment as PathParamInt64 (0 on the summary view —
    *  upstream's "it can be 0 when no job" comment). */
   jobId: number;
-  /** data-actions-view-url: the POST twin's URL (view.go:311-324). */
+  /** data-actions-view-url: the POST twin's URL (view.go:309-322). */
   actionsViewUrl: string;
-  /** The browser tab title (view.go:299-306's join). */
+  /** The browser tab title (view.go:297-304's join). */
   title: string;
 }
 
@@ -2245,7 +2245,7 @@ export function RepoActionViewMount(props: { data: RepoActionsViewPageData }) {
 /** The full-document render (view.tmpl: `.page-content.repository` over the
  *  repo header — BaseLayout renders both from ctx.repo — and the mount div;
  *  the strip rides the repo header with the Actions anchor active — upstream
- *  view.go:206 arms PageIsActions on every run-view arm). */
+ *  view.go:204 arms PageIsActions on every run-view arm). */
 export function renderRepoActionsViewPage(ctx: UiContext, data: RepoActionsViewPageData): string {
   return renderPage(
     <BaseLayout ctx={ctx} title={data.title} pageClass="repository" activeTab="actions">
@@ -2254,7 +2254,7 @@ export function renderRepoActionsViewPage(ctx: UiContext, data: RepoActionsViewP
   );
 }
 
-/** The mount page's data (view.go:294-326): the browser-tab title
+/** The mount page's data (view.go:292-324): the browser-tab title
  *  (`job - run - workflow`, the job name riding only when a job arm resolves
  *  one — the lookup miss silently skipped) and the PathParamInt64'd job id.
  *  `actionsViewUrl` is set by the handler from the resolved run link. */
