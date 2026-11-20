@@ -43,7 +43,7 @@ export class IssueNotExistError extends IssueError {
 /**
  * 409 — duplicate `(repo_id, tag_name)` release (§4.11). The message is the
  * upstream API surface's duplicate-create answer "Release is has no Tag"
- * (sic — routers/api/v1/repo/release.go:289-293: `GetRelease` hits an
+ * (sic — routers/api/v1/repo/release.go:281-289: `GetRelease` hits an
  * existing non-tag row → `ctx.APIError(409, "Release is has no Tag")`).
  * Upstream's model error `ErrReleaseAlreadyExist.Error()`
  * ("release tag already exist [tag_name: X]", models/repo/release.go:38-40)
