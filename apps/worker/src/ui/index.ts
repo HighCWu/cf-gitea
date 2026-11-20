@@ -1256,6 +1256,7 @@ import {
   ADMIN_BOT_TOKEN_ONLY_ERROR,
   ADMIN_USERS_LIST_LINK,
   adminUserMintBotToken,
+  adminUserRegenerateBotToken,
   adminUserRevokeBotToken,
   type AdminBotTokenActor,
   loadAdminUserDetail,
@@ -1864,6 +1865,7 @@ import {
   createReleaseFromForm,
   deleteReleaseFromForm,
   editReleaseFromForm,
+  editReleaseMakeLatestPrefill,
   loadEditReleaseData,
   loadNewReleaseData,
   loadReleaseDetailData,
@@ -18174,7 +18176,7 @@ function editReleaseMetaOf(repo: RepoRow, row: { tagName: string; target: string
  * GET /{owner}/{repo}/releases/edit/{tag} (pages/releases.tsx — upstream
  * repo.EditRelease, web.go:1519): the writer-gated form (the write group's
  * releasesWriteGate), the stored values prefilled, the 404 arms first (a
- * missing row, a TAG-ONLY record — release.go:573-576's "pure tag" arm).
+ * missing row, a TAG-ONLY record — release.go:564-567's "pure tag" arm).
  */
 async function releaseEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
@@ -18199,6 +18201,9 @@ async function releaseEditPage(c: Context<{ Bindings: Env }>): Promise<Response>
           content: row.note ?? "",
           draft: row.isDraft,
           prerelease: row.isPrerelease,
+          // The checkbox prefill (ctx.Data["make_latest"], release.go:576 —
+          // LatestReleaseID == rel.ID && rel.CanBeLatest()).
+          makeLatest: editReleaseMakeLatestPrefill(repo, row),
         },
         error: null,
         edit: editReleaseMetaOf(repo, row),
@@ -18524,6 +18529,7 @@ async function releaseNewPage(c: Context<{ Bindings: Env }>): Promise<Response> 
           content: "",
           draft: false,
           prerelease: false,
+          makeLatest: false, // the fresh create form: nothing pinned (new.tmpl:120-127's unchecked box)
         },
         error: null,
       }),
@@ -20979,11 +20985,15 @@ async function adminUserBotTokenRegenerateSubmit(c: Context<{ Bindings: Env }>, 
   if (guard !== null) return guard;
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const target = await drizzle(c.env.DB).select({ id: users.id, type: users.type }).from(users).where(eq(users.id, userId)).get();
-  if (target === undefined) return p.respond(new Response("Internal Server Error", { status: 500 })); // getTargetBot's miss
-  if (target.type !== "bot") return p.respond(adminBotTokenRefusal());
   const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
-  const outcome = await regenerateTokenFromForm(c.env.DB, userId, form.id ?? 0);
+  // ADMINUSER2's audit FOLD (the ADR-0008 gap its report flagged): the seam
+  // (admin-user-detail.tsx's adminUserRegenerateBotToken) carries the
+  // getTargetBot gate + the owner-scoped row pre-read + THE AUDIT EMIT
+  // (applications.go:182's user:accesstoken:regenerate) — the handler now
+  // rides it instead of the seam-free compose (the doer = the admin).
+  const outcome = await adminUserRegenerateBotToken(c.env.DB, adminBotTokenActor(p.ctx.viewer), userId, form.id ?? 0);
+  if (outcome.outcome === "refused") return p.respond(adminBotTokenRefusal());
+  if (outcome.outcome === "unknown-target") return p.respond(new Response("Internal Server Error", { status: 500 }));
   if (outcome.outcome === "missing") return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
   const fresh = await loadAdminUserDetail(c.env.DB, userId);
   const data =
