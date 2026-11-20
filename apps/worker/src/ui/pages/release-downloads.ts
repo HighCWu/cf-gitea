@@ -460,13 +460,13 @@ async function findReleaseById(d1: D1Database, id: number): Promise<ReleaseRow |
 
 /**
  * GET .../releases/download/{vTag}/{fileName} — RedirectDownload (repo.go:
- * 303-347): the EXACT tag-name find (case-sensitive, tag-only records
- * excluded, drafts only for writers — FindReleases' ToConds verbatim), then
- * the release's attachment by exact name; zero releases and the literal
- * `latest` falls to the latest release — GetLatestRelease since a5201dc427
- * (repo.go:324, the pointer-first resolution over the whole Repository row,
- * not the bare GetLatestReleaseByRepoID fallback). Every miss is the 404
- * family.
+ * 293-336 at 099abf5db4): the EXACT tag-name find (case-sensitive, tag-only
+ * records excluded, drafts only for writers — FindReleases' ToConds
+ * verbatim), then the release's attachment by exact name; zero releases and
+ * the literal `latest` falls to the latest release — GetLatestRelease since
+ * a5201dc427 (repo.go:324, the pointer-first resolution over the whole
+ * Repository row, not the bare GetLatestReleaseByRepoID fallback). Every
+ * miss is the 404 family.
  */
 export async function loadReleaseDownload(
   bucket: R2Bucket,
@@ -484,11 +484,11 @@ export async function loadReleaseDownload(
     .where(and(...conditions))
     .limit(2)
     .all();
-  // Upstream acts on `len(releases) == 1` exactly (repo.go:318) — a
+  // Upstream acts on `len(releases) == 1` exactly (repo.go:310) — a
   // duplicated tag row would refuse rather than guess.
   let release: ReleaseRow | null = found.length === 1 ? (found[0] ?? null) : null;
   if (release === null && vTag === "latest") {
-    release = await findLatestRelease(d1, repo); // the alias arm (repo.go:322-326, pointer-first)
+    release = await findLatestRelease(d1, repo); // the alias arm (repo.go:321-326, pointer-first)
   }
   if (release === null) return { kind: "not-found" };
   const asset = await drizzle(d1)

@@ -159,6 +159,32 @@ export function isUsableRepoName(name: string): boolean {
   return ENGINE_REPO_NAME.test(name);
 }
 
+/** Which of upstream's name-reject classes a refused repository name
+ *  belongs to — the split behind our single conflated
+ *  `RepoNameInvalidError` (ROUTESWAP open #1, RE-PIN 099abf5db4). The
+ *  precedence IS upstream's `IsUsableRepoName` + `db.IsUsableName` chain:
+ *  `chars` → ErrNameCharsNotAllowed "name is invalid [%s]: must be valid
+ *  alpha or numeric or dash(-_) or dot characters" (repo.go:82-86's first
+ *  leg, models/db/name.go:58-60); `reserved` → ErrNameReserved "name is
+ *  reserved [name: %s]" (db/name.go:24-26, the exact-match leg); `pattern`
+ *  → ErrNamePatternNotAllowed "name pattern is not allowed [pattern: %s]"
+ *  (db/name.go:48-50, the `*`-pattern leg — our suffix table is all
+ *  suffixes). All three unwrap util.ErrInvalidArgument → the create arm's
+ *  400. `engine` is our recorded EXTRA (the engine-routability alphabet,
+ *  SPEC-0003 §4.4) — no upstream text exists for it. EXPORT + TYPES ONLY:
+ *  no arm consumes it yet, the wire texts stay the conflated port message
+ *  until the routes-family adoption pass records the swap. */
+export type RepoNameRejectClass = "chars" | "reserved" | "pattern" | "engine";
+
+export function classifyRepoNameReject(name: string): RepoNameRejectClass | null {
+  if (!VALID_REPO_NAME.test(name) || INVALID_REPO_NAME.test(name)) return "chars";
+  if (RESERVED_REPO_NAMES.has(name)) return "reserved";
+  const lower = name.toLowerCase();
+  if (RESERVED_REPO_NAME_SUFFIXES.some((suffix) => lower.endsWith(suffix))) return "pattern";
+  if (!ENGINE_REPO_NAME.test(name)) return "engine";
+  return null; // usable — no reject class
+}
+
 /**
  * Owner namespaces no user/org may take. SPEC-0008 hard-reserves `assets`
  * (the UI asset route); `api` collides with the Hono-owned /api/v1 surface

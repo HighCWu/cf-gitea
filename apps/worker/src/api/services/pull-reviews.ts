@@ -292,6 +292,19 @@ export class PullReviewsService {
       };
     }
 
+    // 884884308d(i) — RE-PIN (099abf5db4): a PENDING "submit" lands or
+    // updates the pending row and RETURNS. The model's early arm skips the
+    // type-22 CommentTypeReview timeline entry (models/issues/review.go:
+    // 548-550 — `committer.Commit()` straight after the row write) and the
+    // service's early arm skips the mentions + notifications
+    // (services/pull/review.go:335-337), so a later real submit shows the
+    // review ONCE (the #40259 double-entry). The decision arms below are
+    // unreachable for pending; the webhook route arm was already
+    // PENDING-silent (notifier.go:751-777).
+    if (reviewType === ReviewType.Pending) {
+      return review;
+    }
+
     // The CommentTypeReview (22) system comment (:551–563) — the local
     // num_comments discipline bumps alongside every inserted comment. The
     // insert RETURNS its row: the mail arms compose over it (the anchor,

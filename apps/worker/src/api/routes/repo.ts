@@ -664,6 +664,31 @@ export function registerRepoRoutes(
           // is. The switch is log-and-continue internally (each step's error
           // is logged upstream, :68-76) — it never fails the PATCH.
           await switchSchedulesToDefaultBranch(c.env, updated, found.repo.defaultBranch);
+          // The audit row (RE-PIN handoff — repo.go:701 at 099abf5db4):
+          // audit.Record(RepositoryBranchDefault, repo, "default_branch",
+          // repo.DefaultBranch) fires in the same landed-change block, right
+          // after the schedule switch. Upstream's writeEvent swallows insert
+          // failures with a log line (services/audit/event.go:139-141), so
+          // the emit is caught-and-logged and the PATCH outcome stands.
+          try {
+            const branchActor = c.get("authUser");
+            const branchScope = `${found.repo.ownerNamespace}/${found.repo.slug}`;
+            await emitAudit(drizzle(c.env.DB), {
+              action: AuditActions.RepositoryBranchDefault,
+              actorId: branchActor?.id ?? 0,
+              actorName: branchActor?.login ?? "",
+              scopeType: "repository",
+              scopeId: found.repo.id,
+              scopeName: branchScope,
+              origin: "api",
+              vars: { scope: branchScope, default_branch: updated.defaultBranch },
+            });
+          } catch (error) {
+            console.error(
+              `[repos] audit emit failed for the default-branch change of ${found.repo.ownerNamespace}/${found.repo.slug}: ` +
+                `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
           // The default-branch license arm (repo.go:680-714 at 099abf5db4): upstream's
           // enqueuer fires ONLY when the change LANDED — the target branch
           // exists (or the repo is empty) and the repo is non-empty (the

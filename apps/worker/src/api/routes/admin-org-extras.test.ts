@@ -197,7 +197,7 @@ describe("POST /org/{org}/repos (createOrgRepoDeprecated)", () => {
     ).toBe(404);
   });
 
-  it("409s a duplicate name (the runtime-only arm stays undeclared)", async () => {
+  it("409s a duplicate name with the APIErrorAuto collision text (the runtime-only arm stays undeclared)", async () => {
     const { owner, org } = await seedActors();
     await seedOrgRepo("9501", "taken", org);
     const res = await router()(`/org/${org.username}/repos`, {
@@ -206,6 +206,30 @@ describe("POST /org/{org}/repos (createOrgRepoDeprecated)", () => {
       body: JSON.stringify({ name: "taken" }),
     });
     expect(res.status).toBe(409);
+    // RE-PIN (099abf5db4, b3422c0920): ErrRepoAlreadyExist.Error() with the
+    // lowercased {owner, repo} pair — was the pre-repin "The repository with
+    // the same name already exists." (the org rides ownerNamespace = its
+    // usernameLower).
+    expect(await res.json<{ message: string }>()).toEqual({
+      message: "repository already exists [owner: acme, repo: taken]",
+      url: "https://example.com/api/swagger",
+    });
+  });
+
+  it("400s a reserved-suffix name (the RE-PIN ErrInvalidArgument unwrap, was 422)", async () => {
+    const { owner, org } = await seedActors();
+    const res = await router()(`/org/${org.username}/repos`, {
+      method: "POST",
+      headers: authHeaders(owner.id),
+      body: JSON.stringify({ name: "held.wiki" }),
+    });
+    expect(res.status).toBe(400);
+    // The conflated port text — upstream splits reserved vs pattern
+    // ("name is reserved [name: %s]" / "name pattern is not allowed
+    // [pattern: %s]", db/name.go:24-26/:48-50); the recorded divergence.
+    expect((await res.json<{ message: string }>()).message).toBe("repository name is not allowed: held.wiki");
+    const rows = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, "held.wiki")).all();
+    expect(rows).toHaveLength(0); // no row lands on the refused name
   });
 });
 

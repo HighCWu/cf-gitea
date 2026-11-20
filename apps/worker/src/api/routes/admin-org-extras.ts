@@ -42,7 +42,10 @@ import {
  *     (routes/org-repos.ts). Upstream's handler IS CreateOrgRepo — the alias
  *     re-drives the same guard chain and service here (extracting the shared
  *     handler would touch org-repos.ts, outside this batch's ownership; the
- *     verbatim duplicate is the documented seam until a consolidation wave).
+ *     verbatim duplicate is the documented seam until a consolidation wave),
+ *     including the RE-PIN (b3422c0920) error ladder: 409 with
+ *     ErrRepoAlreadyExist.Error()'s text, reserved/pattern 400
+ *     (routes/org-repos.ts's module header carries the cites).
  *   - DELETE /orgs/{org}/repos (orgDeleteRepos — org/org.go:540-579): the
  *     org-owner-gated bulk delete over the landed §2.5.5 purge pipeline
  *     (src/repos/purge.ts + RepoService.deleteRepository). Upstream answers
@@ -180,7 +183,10 @@ export function registerAdminOrgExtrasRoutes(
   // POST /org/{org}/repos (createOrgRepoDeprecated) — the alias arm of
   // createOrgRepo (upstream calls CreateOrgRepo verbatim, repo.go:458).
   // Declared set {201,403,404,422} = the contract's; the 409 duplicate-name
-  // arm stays runtime-only undeclared (org-repos.ts module header).
+  // arm stays runtime-only undeclared (org-repos.ts module header), and the
+  // RE-PIN (b3422c0920) error ladder rides below: 409 carries
+  // ErrRepoAlreadyExist.Error()'s text, reserved/pattern names answer 400
+  // (the ErrInvalidArgument unwrap) — also runtime-only undeclared here.
   // -------------------------------------------------------------------------
   app.openapi(createOrgRepoDeprecatedRoute(requireAuth), async (c) => {
     const { org: orgName } = c.req.valid("param");
@@ -198,10 +204,27 @@ export function registerAdminOrgExtrasRoutes(
       });
     } catch (error) {
       if (error instanceof RepoNameCollisionError) {
-        throw new ApiError(409, "The repository with the same name already exists.");
+        // RE-PIN (099abf5db4, b3422c0920): the alias re-drives CreateOrgRepo,
+        // whose create arm maps every error through ctx.APIErrorAuto
+        // (repo.go:249-259) — the collision unwraps util.ErrAlreadyExist →
+        // 409 with the TOP error's text, ErrRepoAlreadyExist.Error()
+        // "repository already exists [owner: %s, repo: %s]"
+        // (models/repo/update.go:79-81; upstream throws {u.LowerName, name} —
+        // the ORG rides ownerNamespace = the org's usernameLower, the
+        // org-repos.ts arm's same field pairing).
+        throw new ApiError(409, `repository already exists [owner: ${error.ownerNamespace}, repo: ${error.repoName}]`);
       }
       if (error instanceof RepoNameInvalidError) {
-        throw new ApiError(422, error.message);
+        // RE-PIN (099abf5db4, b3422c0920): reserved/pattern violations unwrap
+        // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) →
+        // APIErrorAuto 400 on CREATE (was the pre-repin 422; the PATCH
+        // rename arm keeps its explicit 422, repo.go:618-627 — not this
+        // route). The wire text stays our conflated port message — the
+        // user-repos.ts handler note records the class-split divergence.
+        // Runtime-only undeclared like the 409: the frozen contract for this
+        // deprecated alias documents {201,403,404,422} (the {201,default}
+        // fold posture — the emitted 400 is upstream's RUNTIME ladder).
+        throw new ApiError(400, error.message);
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

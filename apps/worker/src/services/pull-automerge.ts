@@ -118,13 +118,14 @@ import {
 } from "../api/services/pull-engine";
 import { findPullRequestByIndex, toApiPullRequest } from "../api/services/pulls";
 import { engineReads } from "../api/services/engine";
-import { findRepositoryById, toApiRepository } from "../api/services/repository";
+import { findRepositoryById, toApiRepository, type RepositoryRow } from "../api/services/repository";
 import {
   checkPullBranchProtections,
   findRule,
   isUserMergeWhitelisted,
   parseRuleConfig,
   principalAccessOf,
+  principalAccessOfRow,
   type ProtectedBranchConfig,
 } from "./branch-protection";
 import { emitIssueEvent } from "./issue-events";
@@ -364,7 +365,12 @@ export async function deleteScheduledAutoMerge(d1: D1Database, issueId: number):
  *  "closed" on IssueChangeStatus and "work_in_progress" on IssueChangeTitle
  *  (services/automerge/notify.go:83-101 at the new pin, b1c5fedd17), and
  *  DisableAutoMergeIfNotWriter (pull.go:398-409) passes the
- *  pushed/retargeted-by-non-writer reasons from the pull update paths. */
+ *  pushed/retargeted-by-non-writer reasons from the pull update paths.
+ *  RE-PIN (SMALLS6) WIRING LANDED: "closed" fires from the IssuesService
+ *  close funnel and "work_in_progress" from its changeTitle arm (both in
+ *  issues/service.ts — our model-layer analogue of the notify dispatch);
+ *  "base_changed"/"pushed_by_non_writer" fire through disableAutoMergeIfNot
+ *  Writer below (the retarget arm + the push-sync loop). */
 export async function removeScheduledAutoMerge(
   d1: D1Database,
   issue: IssueRow,
@@ -384,6 +390,30 @@ export async function removeScheduledAutoMerge(
   return true;
 }
 
+/** `DisableAutoMergeIfNotWriter` (services/pull/pull.go:398-409 — RE-PIN
+ *  b1c5fedd17): a schedule row exists AND the doer CANNOT write code on the
+ *  BASE repo (CanWrite(unit.TypeCode) — our PrincipalAccess.write matrix,
+ *  branch-protection.ts) → the schedule is cancelled with the arm's reason
+ *  via RemoveScheduledAutoMerge; a writer's schedule stays (pull.go:375 —
+ *  "a writer's retarget keeps the schedule, and the new base may have made
+ *  the pull request mergeable"). Upstream reasons: "base_changed"
+ *  (ChangeTargetBranch, pull.go:337) and "pushed_by_non_writer"
+ *  (UpdatePullsRefs, pull.go:613; agit.go:255). */
+export async function disableAutoMergeIfNotWriter(
+  d1: D1Database,
+  issue: IssueRow,
+  doer: { id: number | null; username: string; isAdmin: boolean | null } | null,
+  baseRepo: RepositoryRow,
+  now: Date,
+  reason: string,
+): Promise<boolean> {
+  if ((await getScheduledAutoMerge(d1, issue.id)) === null) return false;
+  const access = await principalAccessOfRow(d1, baseRepo, doer);
+  if (access.write) return false;
+  if (doer === null || doer.id === null) return false;
+  return removeScheduledAutoMerge(d1, issue, doer.id, now, reason);
+}
+
 /** `CreateAutoMergeComment`'s scheduled half (models/issues/comment.go:1272-
  *  1291 at the pin): the type-34 system comment whose CONTENT carries the
  *  merge style string — b1c5fedd17 added the content parameter and the
@@ -394,9 +424,10 @@ export async function removeScheduledAutoMerge(
  *  ("closed"/"work_in_progress"/"base_changed"/"pushed_by_non_writer")
  *  ride the notify family's disableIssueAutoMerge + DisableAutoMergeIfNotWriter.
  *  The REASON MECHANIC has landed here (removeScheduledAutoMerge's optional
- *  `reason`); the WIRING — firing it from the issue close arm, the
- *  WIP-title arm and the non-writer retarget/push arms — stays handoff
- *  PULL2-AUTOCANCEL (issues/pull siblings' write paths). */
+ *  `reason`) and the WIRING is landed (SMALLS6): "closed"/"work_in_progress"
+ *  from the IssuesService close/title funnel (issues/service.ts), the
+ *  non-writer pair through disableAutoMergeIfNotWriter (the retarget arm +
+ *  the push-sync loop). */
 export async function createScheduledAutoMergeComment(d1: D1Database, issueId: number, doerId: number, now: Date, style: string): Promise<void> {
   await new IssuesService(d1).addComment({
     issueId,

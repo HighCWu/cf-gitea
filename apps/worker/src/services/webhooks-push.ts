@@ -179,6 +179,7 @@ import { CommentType } from "../issues/comment-types";
 import { notifyPullRequestPushCommits } from "./mail/notify";
 import { watchIfAuto } from "../api/services/repo-watchers";
 import { IssuesService, type CommentRow } from "../issues/service";
+import { disableAutoMergeIfNotWriter } from "./pull-automerge";
 import { carryLooseRefs, type CarrySource, type CarryTarget } from "../repos/carry";
 import {
   enrichCommitsWithFileLists,
@@ -865,6 +866,16 @@ async function emitPullRequestSyncs(
   const heads = await openPullRequestsByHeadInfo(env.DB, pushedPair.repo.id, branch, log, pushedPair);
   if (heads.length === 0) return;
   const viewer: Viewer = { origin, requester: null };
+  // DisableAutoMergeIfNotWriter's doer (pull.go:613 — reason
+  // "pushed_by_non_writer"): the pusher row resolved once for the loop (the
+  // admin flag rides the users row — the matrix check treats null as a
+  // non-admin). Identity-less receives (the mirror path) resolve no row →
+  // the helper's null-doer arm no-ops (upstream never reaches this loop
+  // without a doer; the schedule stays for the cron re-probe).
+  const pusherRow =
+    options.pusherId === undefined || options.pusherId === null
+      ? null
+      : ((await drizzle(env.DB).select({ id: users.id, username: users.username, isAdmin: users.isAdmin }).from(users).where(eq(users.id, options.pusherId)).get()) ?? null);
   for (const head of heads) {
     try {
       // Same-repo heads reuse the pair in hand; fork heads resolve their base.
@@ -879,6 +890,20 @@ async function emitPullRequestSyncs(
         );
         continue;
       }
+      // The non-writer auto-merge cancel (upstream UpdatePullsRefs' per-PR
+      // half, pull.go:613, BEFORE PushToBaseRepo — log-only, never breaks
+      // the sync; the BASE repo is the permission scope, :402-405). Upstream
+      // excludes the "update branch" merge's own PR (pr.ID != pullRequestID,
+      // pull.go:612) — that arm has no landed caller here, so no exclusion
+      // rides.
+      await disableAutoMergeIfNotWriter(env.DB, head.issue, pusherRow, basePair.repo, options.now ?? new Date(), "pushed_by_non_writer").catch(
+        (error: unknown) =>
+          log(
+            `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: DisableAutoMergeIfNotWriter failed for PR #${head.issue.index}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+      );
       // The §3.4 sync arms (upstream PushToBaseRepo → CreatePushPullComment →
       // markPullRequestStatusAsChecking, pull.go:388-407) — a failure leaves
       // `synced` null and only skips the arms (the event still fires, like

@@ -48,7 +48,8 @@ import {
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
-import { changeIssueTitle, issueNoDependenciesLeft, replaceIssueAssignees, sanitizeDatabaseStringContent } from "../api/services/issues";
+import { changeIssueTitle, hasWorkInProgressPrefix, issueNoDependenciesLeft, replaceIssueAssignees, sanitizeDatabaseStringContent } from "../api/services/issues";
+import { removeScheduledAutoMerge } from "../services/pull-automerge";
 import { labelExclusiveScope, removeDuplicateExclusiveLabels } from "../api/services/labels";
 import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../api/services/repository";
 import { notifyIssueChangeStatus } from "../services/projects-workflow";
@@ -754,6 +755,24 @@ export class IssuesService {
       throw new IssueAlreadyChangedError();
     }
     await this.notifyMailIssueStatus(updated[0]!, close, options.actorId ?? null, now);
+    // The automergeNotifier.IssueChangeStatus arm (services/automerge/
+    // notify.go:90-93 — RE-PIN b1c5fedd17): a PR close cancels any scheduled
+    // auto-merge with the "closed" reason (disableIssueAutoMerge →
+    // RemoveScheduledAutoMerge; the type-35 comment rides the reason). The
+    // MERGE close stays out — its MergePull comment type is exactly the
+    // landed "no IssueChangeStatus" gate above (merge.go:838; the merge flow
+    // already deleted the schedule row — the delete-first mechanic would
+    // no-op). Workflow-driven closes keep the cancel (upstream dispatches
+    // IssueChangeStatus to every notifier, the WithProjectWorkflow mark only
+    // suppresses the workflow re-trigger). Best-effort — the close above
+    // stays committed (upstream logs via log.Error, notify.go:87).
+    if (close && updated[0]!.isPull && commentType !== CommentType.MergePull && options.actorId != null) {
+      try {
+        await removeScheduledAutoMerge(this.d1, updated[0]!, options.actorId, now, "closed");
+      } catch (error) {
+        console.error(`[issues] auto-merge cancel failed (issue ${issueId}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     // The project-workflow arm (services/issue/status.go:43/:56 — the
     // notify fires AFTER the tx commits, on the RELOADED issue): every real
     // close/reopen seam funnels through here, so the human PATCH arms, the
@@ -785,12 +804,26 @@ export class IssuesService {
    * receiver arm: upstream notifies AFTER the update with the UPDATED issue
    * and oldTitle (issue.go:138), so the mail sees the new title and the
    * receiver's WIP-transition gate keys on the pair (notifyIssueTitleChanged).
-   * Best-effort — the write above stays committed.
+   * The automergeNotifier.IssueChangeTitle arm (services/automerge/
+   * notify.go:95-101 — RE-PIN b1c5fedd17) rides the same receiver: a PR
+   * title entering WIP (old title NOT WIP, new title WIP — HasWorkInProgress
+   * Prefix on both, models/issues/pull.go:661) cancels the scheduled
+   * auto-merge with the "work_in_progress" reason; a WIP→normal rename
+   * re-schedules nothing. Best-effort — the write above stays committed.
    */
   async changeTitle(issue: IssueRow, title: string, actorId: number | null, now: Date, appUrl = ""): Promise<IssueRow | null> {
     const oldTitle = issue.title;
     const updated = await changeIssueTitle(this.d1, issue, title, actorId, now, appUrl);
-    if (updated !== null) await this.notifyMailTitleChanged(updated, oldTitle, actorId, now);
+    if (updated !== null) {
+      await this.notifyMailTitleChanged(updated, oldTitle, actorId, now);
+      if (updated.isPull && actorId !== null && !hasWorkInProgressPrefix(oldTitle) && hasWorkInProgressPrefix(updated.title)) {
+        try {
+          await removeScheduledAutoMerge(this.d1, updated, actorId, now, "work_in_progress");
+        } catch (error) {
+          console.error(`[issues] auto-merge cancel failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
     return updated;
   }
 

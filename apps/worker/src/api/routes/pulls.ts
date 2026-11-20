@@ -143,7 +143,7 @@ import { canWriteRepository } from "../services/repo-access";
 import { loadRepoSettings } from "../services/repo-settings";
 import { PullReviewsService } from "../services/pull-reviews";
 import { canBypassBranchProtection, checkPullBranchProtections, findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
-import { createScheduledAutoMergeComment, insertScheduledAutoMergeRow } from "../../services/pull-automerge";
+import { createScheduledAutoMergeComment, disableAutoMergeIfNotWriter, insertScheduledAutoMergeRow } from "../../services/pull-automerge";
 import { emitMilestoneEvent } from "./issues";
 import { requestedReviewersOf } from "./pull-reviews";
 
@@ -1581,6 +1581,21 @@ export function registerPullRoutes(
           doerId: actorId,
         });
         pullRequest = { ...pullRequest, baseBranch: retarget };
+        // DisableAutoMergeIfNotWriter (pull.go:337, reason "base_changed"):
+        // a NON-writer's retarget cancels the scheduled auto-merge; a
+        // writer's stays (pull.go:375 — the new base may have made it
+        // mergeable). Upstream runs the check inside the retarget tx
+        // (UpdateColsIfNotMerged's winner half); ours rides the landed
+        // non-transactional doer-tail posture — a crash between leaves the
+        // schedule for the cron re-probe to settle.
+        await disableAutoMergeIfNotWriter(
+          c.env.DB,
+          issue,
+          { id: requester.id ?? 0, username: requester.login ?? "", isAdmin: requester.is_admin ?? null },
+          found.repo,
+          now,
+          "base_changed",
+        );
         // PullRequestChangeTargetBranch (webhook/notifier.go:726-748):
         // action "edited" with changes.ref.from = the old base.
         await emitPullWebhook(c, {

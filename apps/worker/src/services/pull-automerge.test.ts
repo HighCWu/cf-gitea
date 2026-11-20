@@ -39,7 +39,7 @@ import { createCommitStatus } from "../api/services/commit-status";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { ZERO_OID, branchRef, pullHeadRef } from "../api/services/engine";
 import { stampAutoMergeCommit } from "../api/services/pull-engine";
-import { actions, comments, issueDependencies, PRStatus, protectedBranches, pullAutoMerges, pullRequests, users } from "../db/schema";
+import { actions, comments, issueDependencies, PRStatus, protectedBranches, pullAutoMerges, pullRequests, repositories, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "./branch-protection";
@@ -47,6 +47,7 @@ import { RepoService } from "../repos/service";
 import { handleRepoTasks } from "../repos/purge";
 import {
   deleteScheduledAutoMerge,
+  disableAutoMergeIfNotWriter,
   enqueueDueAutoMergeChecks,
   getScheduledAutoMerge,
   handleAutoMergeCheck,
@@ -278,10 +279,27 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
   });
 
   it("deletes the schedule of a closed PR and answers not-mergeable for a conflicted one", async () => {
-    // Closed with a live schedule → the row goes (upstream's first arm).
+    // Closed with a live schedule → the close funnel cancels EAGERLY now
+    // (the IssueChangeStatus wiring, notify.go:90-93 — the row goes with
+    // the "closed" reason comment) and the tick finds no row at all.
     const closedIndex = await seedScheduledPr("closedpr", "merge");
     const closed = (await findPullRequestByIndex(env.DB, repoId, closedIndex))!;
     await new IssuesService(env.DB).closeIssue(closed.issue.id, { actorId: alice.id, now: new Date((T0 + 120) * 1000) });
+    expect(await getScheduledAutoMerge(env.DB, closed.issue.id)).toBeNull();
+    expect(await handleAutoMergeCheck(env, closed.issue.id)).toBe("not-scheduled");
+
+    // The consumer's own closed-prune arm stays covered (a schedule row on
+    // an already-closed PR — the defensive edge upstream's tick also prunes,
+    // automerge.go:136-141): re-seat a row past the funnel.
+    await d1().insert(pullAutoMerges).values({
+      issueId: closed.issue.id,
+      doerId: alice.id,
+      sha: "a".repeat(40),
+      mergeStyle: "merge",
+      deleteBranchAfterMerge: false,
+      mergeMessage: null,
+      createdUnix: T0 + 130,
+    });
     expect(await handleAutoMergeCheck(env, closed.issue.id)).toBe("deleted-closed-or-merged");
     expect(await getScheduledAutoMerge(env.DB, closed.issue.id)).toBeNull();
 
@@ -591,5 +609,37 @@ describe("REPO_TASKS auto-merge-check dispatch", () => {
     await handleRepoTasks(batch, env);
     expect(acked).toEqual(["am1"]);
     expect(retried).toEqual([]);
+  });
+});
+
+describe("disableAutoMergeIfNotWriter (services/pull/pull.go:398-409 — RE-PIN b1c5fedd17)", () => {
+  it("keeps a writer's schedule, cancels a non-writer's with the reason, no-ops without a row", async () => {
+    const index = await seedScheduledPr("notwriterpr", "merge");
+    const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    const now = new Date((T0 + 140) * 1000);
+    const repoRow = (await d1().select().from(repositories).where(eq(repositories.id, repoId)).get())!;
+    await d1().insert(users).values({ id: 999, username: "zed", usernameLower: "zed", displayName: "Zed", createdAt: new Date(T0 * 1000) });
+
+    // The WRITER (alice owns the repo — CanWrite(unit.TypeCode)) keeps the
+    // schedule (pull.go:375's own comment).
+    expect(
+      await disableAutoMergeIfNotWriter(env.DB, found.issue, { id: alice.id, username: "alice", isAdmin: false }, repoRow, now, "base_changed"),
+    ).toBe(false);
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
+
+    // The non-writer (zed — no collaborator row, no matrix grant) cancels:
+    // the row goes and the type-35 comment's content is the arm's reason.
+    expect(
+      await disableAutoMergeIfNotWriter(env.DB, found.issue, { id: 999, username: "zed", isAdmin: false }, repoRow, now, "base_changed"),
+    ).toBe(true);
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+    const rows = await d1().select({ type: comments.type, content: comments.content }).from(comments).where(eq(comments.issueId, found.issue.id));
+    expect(rows.some((row) => row.type === CommentType.PRUnscheduledToAutoMerge && row.content === "base_changed")).toBe(true);
+
+    // No row left → silent no-op even for the non-writer (the Exist gate,
+    // pull.go:399-401).
+    expect(
+      await disableAutoMergeIfNotWriter(env.DB, found.issue, { id: 999, username: "zed", isAdmin: false }, repoRow, now, "base_changed"),
+    ).toBe(false);
   });
 });

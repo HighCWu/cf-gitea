@@ -40,6 +40,7 @@ import { getRepoLicenses } from "../services/repo-licenses";
 import { addOrUpdateCollaborator } from "./services/repo-collaborators";
 import { watchRepo } from "./services/repo-watchers";
 import { starRepo } from "./services/stars";
+import { AuditActions, findAuditEvents } from "../services/audit";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
 import { buildHistoryPack, buildReceivePackBody, ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 
@@ -665,6 +666,28 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default
     expect(job).toHaveLength(1);
     expect(job[0]!.status).toBe(ACTION_STATUS_CANCELLED);
     expect((await drizzle(env.DB).select().from(actionRuns).all())[0]!.status).toBe(ACTION_STATUS_CANCELLED);
+  });
+
+  it("a landed default_branch PATCH writes the RepositoryBranchDefault audit row (repo.go:701 — the RE-PIN handoff)", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run();
+    const res = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ default_branch: "trunk" }) });
+    expect(res.status).toBe(200);
+    const rows = await findAuditEvents(drizzle(env.DB), { action: AuditActions.RepositoryBranchDefault });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.scopeType).toBe("repository");
+    expect(rows[0]!.scopeId).toBe("7401");
+    expect(rows[0]!.scopeName).toBe("cf-gitea-stub/edit-me");
+    expect(rows[0]!.origin).toBe("api");
+    expect(rows[0]!.message).toBe("Changed default branch of repository cf-gitea-stub/edit-me to trunk.");
+
+    // A skipped change (an unknown branch on a now NON-EMPTY repo — the
+    // IsBranchExist conjunct, repo.go:682's guard) lands nothing and writes
+    // no row (upstream records only inside the landed-change block, :699-701).
+    await drizzle(env.DB).update(repositories).set({ isEmpty: false }).where(eq(repositories.id, "7401")).run();
+    await env.DB.prepare("DELETE FROM audit_event").run();
+    const skip = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ default_branch: "ghost" }) });
+    expect((await skip.json<Record<string, unknown>>()).default_branch).toBe("trunk");
+    expect(await findAuditEvents(drizzle(env.DB), { actionPrefix: "repository" })).toHaveLength(0);
   });
 
   it("403s a non-admin, grants a collaborator-admin, and 422s a wrong-typed body", async () => {

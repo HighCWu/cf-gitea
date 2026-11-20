@@ -538,12 +538,48 @@ describe("release download redirect (web.go:1514 → RedirectDownload)", () => {
     expect(res.status).toBe(404);
   });
 
-  it("serves through the `latest` alias (GetLatestReleaseByRepoID)", async () => {
+  it("serves through the `latest` alias (GetLatestReleaseByRepoID — the date-order fallback)", async () => {
     const res = await fetchUi("/alice/wave41dl/releases/download/latest/notes.txt");
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("plain asset body\n");
     const miss = await fetchUi("/alice/wave41dl/releases/download/latest/missing.txt");
     expect(miss.status).toBe(404);
+  });
+
+  it("the `latest` alias is POINTER-first (GetLatestRelease over the landed latest_release_id — release.go:345-355 via repo.go:324)", async () => {
+    const { repoId, v41Id } = await fixture();
+    const alice = (await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get())!;
+    // A NEWER stable release with NO assets: date-order would resolve it and
+    // 404 the asset name.
+    const newer = await new IssuesService(env.DB).createRelease({
+      repoId,
+      publisherId: alice.id,
+      tagName: "v42-pointer",
+      target: "main",
+      title: "Newer pointer control",
+      note: "",
+      isDraft: false,
+      isPrerelease: false,
+      now: new Date(1_700_000_500_000),
+    });
+    try {
+      // The pointer names v41 (the OLDER stable): the alias must resolve the
+      // POINTER and serve its asset, not the date-newest v42-pointer.
+      await drizzle(env.DB).update(repositories).set({ latestReleaseId: v41Id }).where(eq(repositories.id, repoId)).run();
+      const pointed = await fetchUi("/alice/wave41dl/releases/download/latest/notes.txt");
+      expect(pointed.status).toBe(200);
+      expect(await pointed.text()).toBe("plain asset body\n");
+
+      // The dangling pointer falls through to the date-order arm — v42 has
+      // no notes.txt, so the 404 proves the fallback walked PAST the stale id.
+      await drizzle(env.DB).update(repositories).set({ latestReleaseId: 4_000_049 }).where(eq(repositories.id, repoId)).run();
+      const dangling = await fetchUi("/alice/wave41dl/releases/download/latest/notes.txt");
+      expect(dangling.status).toBe(404);
+    } finally {
+      // Restore the cached fixture's shape for the later suites.
+      await drizzle(env.DB).delete(releases).where(eq(releases.id, newer.id)).run();
+      await drizzle(env.DB).update(repositories).set({ latestReleaseId: 0 }).where(eq(repositories.id, repoId)).run();
+    }
   });
 
   it("404-shells the empty repo (the group's MustBeNotEmpty)", async () => {
