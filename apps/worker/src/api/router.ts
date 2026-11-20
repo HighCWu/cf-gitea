@@ -40,6 +40,7 @@ import { registerBranchRoutes } from "./routes/branches";
 import { registerCollaboratorRoutes } from "./routes/collaborators";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
+import { registerCodeSearchRoutes } from "./routes/code-search";
 import { registerDiffPatchRoutes } from "./routes/diffpatch";
 import { registerFollowRoutes } from "./routes/follows";
 import { registerMirrorRoutes } from "./routes/mirror";
@@ -215,6 +216,13 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerTagRoutes(app, requireAuth, optionalAuth);
   registerGitRoutes(app, requireAuth, optionalAuth);
   registerContentsRoutes(app, requireAuth, optionalAuth);
+  // The 38389f00be code-search pair (re-pin wave, census B-90): the
+  // repo-scoped git-grep real-read (/repos/{owner}/{repo}/code/search —
+  // upstream needs NO indexer for this arm) + the global /search/code arm at
+  // the un-warmed-indexer 404 posture (api.go:337-341's !RepoIndexerEnabled
+  // clause; reqToken's 401 fires first). The /search/code scope-gate row
+  // (api.go:1897, repository category) is the scope-gate owner's handoff.
+  registerCodeSearchRoutes(app, requireAuth, optionalAuth);
   // The commit family owns `commits/{sha}/pull` (repoGetCommitPullRequest)
   // inline. The PULL-ASSETS wave's duplicate pure-D1 variant
   // (routes/commit-pull.ts) was dropped at its landing review (ceb1106) —

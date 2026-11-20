@@ -98,6 +98,9 @@ interface ScopeGroupRow {
  * fallback rows; nested additions encode BOTH categories in one row.
  */
 const SCOPE_GROUP_ROWS: readonly ScopeGroupRow[] = [
+  // --- global search (CODESRCH2's handoff row — the repo-scoped arm rides
+  // --- the /repos tree's repository rows below) ---------------------------
+  { pattern: /^\/search\/code(?:\/|$)/, categories: ["repository"], cite: "api.go:1897 (/search/code)" },
   // --- /repos tree (four sibling chi groups over one URL space) ------------
   { pattern: /^\/repos\/issues(?:\/|$)/, categories: ["issue"], cite: "api.go:1692-1693 (/repos/issues/search)" },
   {
