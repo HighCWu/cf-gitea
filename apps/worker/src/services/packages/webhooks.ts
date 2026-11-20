@@ -49,7 +49,7 @@
  *   { id: version.id, owner, repository (ONLY when the package row is
  *     repo-linked AND the doer can view it — HasAnyUnitAccess gate),
  *     creator, type, name, version, html_url, created_at }
- * — html_url = VersionHTMLURL (models/packages/descriptor.go:100-103):
+ * — html_url = VersionHTMLURL (models/packages/descriptor.go:101-104):
  * {owner URL}/-/packages/{type}/{lowerName}/{lowerVersion}, absolute.
  * Our inner render mirrors api/routes/packages.ts `toApiPackage`
  * (the landed ToPackage port) field-for-field but stands alone here so the

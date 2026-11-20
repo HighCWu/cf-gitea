@@ -325,8 +325,9 @@ describe("the chef read arms", () => {
       "https://ex.com/api/packages/o/chef/api/v1/cookbooks/test/versions/1.0.2/download",
     );
     expect(testVersions["1.0.2"]?.dependencies).toEqual({ apt: ">= 1.0" });
-    // A metadata without dependencies marshals null (Go's nil map).
-    expect(universe.second?.["2.0.0"]?.dependencies).toBeNull();
+    // A metadata without dependencies renders {} (util.MapNilAsEmpty,
+    // chef.go:74 — 3b9b8a8976 changed Go's old nil-map null marshal).
+    expect(universe.second?.["2.0.0"]?.dependencies).toEqual({});
     expect(await buildChefUniverse(env.DB, { id: ownerRow.id + 42, type: "user", visibility: "public" }, "https://x")).toEqual({});
   });
 

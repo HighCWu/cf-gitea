@@ -32,6 +32,7 @@ import {
 } from "../services/repository";
 import { toApiUser } from "../services/user";
 import {
+  PACKAGE_PUBLIC_PROPERTY_NAMES,
   type PackageAccessMode,
   type PackageDescriptor,
   type PackageRow,
@@ -46,6 +47,7 @@ import {
   getPackageByName,
   getPackageDescriptor,
   getFileDescriptors,
+  getFileProperties,
   getVersionByNameAndVersion,
   linkPackageToRepo,
   packagesQuotaFromEnv,
@@ -65,6 +67,7 @@ import {
 } from "../../services/packages/generic";
 import { PackageSizeMismatchError } from "../../services/packages/blobs";
 import { servePackageFileResponse } from "../../services/packages/serve-content";
+import { onAfterRemovePackage } from "../../services/packages/cleanup";
 import {
   emitPackageDeleted,
   resolvePackageEventAllVersions,
@@ -307,9 +310,12 @@ async function requirePackageContext(
 // Wire conversion — convert.ToPackage / ToPackageFile (convert/package.go)
 // ---------------------------------------------------------------------------
 
-/** `PackageFile` (structs/package.go:34-49) — the four hashes + size + name.
+/** `PackageFile` (structs/package.go:34-51) — the four hashes + size + name.
  *  cf-gitea digests every upload with the three WebCrypto-supported sums, so
- *  `md5` renders "" (the schema's hash_md5 stays NULL — see the table note). */
+ *  `md5` renders "" (the schema's hash_md5 stays NULL — see the table note).
+ *  `properties` (b0b31bc593) renders ONLY the file-locating properties of the
+ *  package type (PACKAGE_PUBLIC_PROPERTY_NAMES) and is OMITTED when none
+ *  survive the filter — Go's `omitempty` drops the empty map. */
 export const packageFileSchema = z.object({
   id: z.number().int(),
   size: z.number().int(),
@@ -318,6 +324,7 @@ export const packageFileSchema = z.object({
   sha1: z.string(),
   sha256: z.string(),
   sha512: z.string(),
+  properties: z.record(z.string(), z.string()).optional(),
 });
 
 /** `Package` (structs/package.go:11-31) — keyed by the VERSION id. */
@@ -376,8 +383,25 @@ export async function toApiPackage(
   };
 }
 
-/** `convert.ToPackageFile`. */
-function toApiPackageFile(descriptor: { file: { id: number; name: string }; blob: { size: number; hashMd5: string | null; hashSha1: string | null; hashSha256: string; hashSha512: string | null } }) {
+/** `convert.ToPackageFile` (convert/package.go:44-62) — the file-locating
+ *  properties pass the type's PublicPropertyNames filter; the map is
+ *  OMITTED when empty (Go's `json:"properties,omitempty"` drops a len-0
+ *  map — terraform state and the unspecialized types never carry one). */
+function toApiPackageFile(
+  descriptor: { file: { id: number; name: string }; blob: { size: number; hashMd5: string | null; hashSha1: string | null; hashSha256: string; hashSha512: string | null } },
+  fileProperties: Record<string, string> | undefined,
+  packageType: string,
+) {
+  const publicNames = PACKAGE_PUBLIC_PROPERTY_NAMES[packageType];
+  let properties: Record<string, string> | undefined;
+  if (publicNames !== undefined && fileProperties !== undefined) {
+    for (const name of publicNames) {
+      const value = fileProperties[name];
+      if (value !== undefined) {
+        (properties ??= {})[name] = value;
+      }
+    }
+  }
   return {
     id: descriptor.file.id,
     size: descriptor.blob.size,
@@ -386,6 +410,7 @@ function toApiPackageFile(descriptor: { file: { id: number; name: string }; blob
     sha1: descriptor.blob.hashSha1 ?? "",
     sha256: descriptor.blob.hashSha256,
     sha512: descriptor.blob.hashSha512 ?? "",
+    ...(properties !== undefined ? { properties } : {}),
   };
 }
 
@@ -455,14 +480,14 @@ async function canDoerManagePackage(
 
 // ---------------------------------------------------------------------------
 // The terraform specialization's delete guards — the OnBeforeRemove arms the
-// v1 deletes run upstream (services/packages/terraform/spec.go:50-80 through
+// v1 deletes run upstream (services/packages/terraform/spec.go:52-88 through
 // packages_service.RemovePackage/RemovePackageVersion's spec hooks), the same
 // guards the WEB settings page landed (ui/pages/package-settings.tsx's
 // terraformDeleteGuardAll / terraformDeleteGuardVersion).
 // ---------------------------------------------------------------------------
 
 /**
- * OnBeforeRemovePackageAll (spec.go:50-62): a LOCKED terraform state refuses
+ * OnBeforeRemovePackageAll (spec.go:52-63): a LOCKED terraform state refuses
  * the whole-package delete. Non-terraform packages run no guard — the spec
  * registry registers terraform's specialization for `TypeTerraformState`
  * only, so the hook is a no-op everywhere else (the web port's
@@ -488,7 +513,7 @@ async function assertPackageDeleteAllowed(d1: D1Database, pkg: PackageRow): Prom
 }
 
 /**
- * OnBeforeRemovePackageVersion (spec.go:64-80): LOCKED first, then the
+ * OnBeforeRemovePackageVersion (spec.go:66-88): LOCKED first, then the
  * LATEST-version refusal — upstream `IsLatest` (state.go:29-44) reads
  * SearchLatestVersions (PackageID + IsInternal=false) and compares the
  * first row's id; the landed searchLatestVersions' max-id-per-package GROUP
@@ -561,7 +586,7 @@ const forbiddenResponse = {
 // The terraform delete guards' refusal shape (assertPackageDeleteAllowed /
 // assertPackageVersionDeleteAllowed below): upstream wraps both refusals as
 // util.ErrUnprocessableContent → the errorForUser 422
-// (services/packages/terraform/spec.go:50-80 via modules/util/error.go:25-31)
+// (services/packages/terraform/spec.go:52-88 via modules/util/error.go:25-31)
 // while its vendored swagger documents only {204,404} — the declared 422 is
 // the runtime-faithful superset, carried as a documented runtime-only
 // exception in scripts/check-openapi.mjs (the /user/avatar posture).
@@ -669,7 +694,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       summary: "Delete a package",
       operationId: "deletePackage",
       request: { params: typeParam },
-      // The 422 carries the terraform locked-state refusal (spec.go:50-62
+      // The 422 carries the terraform locked-state refusal (spec.go:52-63
       // wraps util.ErrUnprocessableContent) — the runtime-faithful superset,
       // exception-documented in check-openapi.mjs's RUNTIME_ONLY_RESPONSES.
       responses: { 204: { description: "empty" }, 404: notFoundResponse, 422: terraformDeleteRefusal },
@@ -684,7 +709,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       // RemovePackage's spec hook (packages.go:681): the terraform
       // specialization's locked-state refusal rides here.
       await assertPackageDeleteAllowed(c.env.DB, pkg);
-      // The `package` deleted arm (packages.go:714): RemovePackage fires ONE
+      // The `package` deleted arm (packages.go:720): RemovePackage fires ONE
       // EVENT PER VERSION DESCRIPTOR (the `for _, pd := range pds` loop) —
       // resolve the full descriptor set BEFORE the cascade (the payload
       // renders the pre-delete state).
@@ -693,6 +718,10 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       if (descriptors.length > 0) {
         await emitPackageDeleted(c.env, descriptors, cred.doer?.id ?? 0);
       }
+      // OnAfterRemovePackage (packages.go:722 — the notify loop precedes the
+      // hook): the distro types rebuild the owner's registry index here, so
+      // the API delete stops stranding stale debian/alpine/rpm/arch indexes.
+      await onAfterRemovePackage(c.env.DB, c.env.REPO_PACKS, owner.id, pkg.type);
       return c.body(null, 204);
     },
   );
@@ -728,7 +757,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       summary: "Delete a package version",
       operationId: "deletePackageVersion",
       request: { params: versionParam },
-      // The 422 carries the terraform guards (spec.go:64-80 — locked first,
+      // The 422 carries the terraform guards (spec.go:66-88 — locked first,
       // then the latest-version refusal), as above.
       responses: { 204: { description: "empty" }, 404: notFoundResponse, 422: terraformDeleteRefusal },
     }),
@@ -750,6 +779,9 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       // The `package` deleted arm (packages.go:532): one event, the
       // pre-resolved rows (both were in scope already).
       await emitPackageDeleted(c.env, [{ pkg, version: versionRow }], cred.doer?.id ?? 0);
+      // OnAfterRemovePackage (packages.go:539 — notify precedes the hook):
+      // the distro index rebuild rides the RemovePackageVersion tail too.
+      await onAfterRemovePackage(c.env.DB, c.env.REPO_PACKS, owner.id, pkg.type);
       return c.body(null, 204);
     },
   );
@@ -776,7 +808,11 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       const params = c.req.valid("param");
       const descriptor = await requireDescriptor(c, owner, params.type, params.name, params.version);
       const files = await getFileDescriptors(c.env.DB, descriptor.version.id);
-      return c.json(files.map((entry) => toApiPackageFile(entry)), 200);
+      // b0b31bc593 — ToPackageFile renders the type's public file properties
+      // (convert/package.go:44-62 over the descriptor's loaded file
+      // properties, descriptor.go:264).
+      const fileProperties = await getFileProperties(c.env.DB, descriptor.version.id);
+      return c.json(files.map((entry) => toApiPackageFile(entry, fileProperties.get(entry.file.id), params.type)), 200);
     },
   );
 

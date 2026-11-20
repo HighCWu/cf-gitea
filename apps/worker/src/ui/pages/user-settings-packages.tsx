@@ -406,7 +406,7 @@ export async function loadUserCleanupRulePreview(d1: D1Database, user: UserProfi
     throw new Error(`cleanup rule ${rule.id}: stored pattern does not compile (upstream ServerError "CompiledPattern")`);
   }
 
-  // GetPackagesByType (package.go:298-303) — the owner+type packages with
+  // GetPackagesByType (package.go:304-309) — the owner+type packages with
   // the is_internal pin.
   const pkgs = await drizzle(d1)
     .select()
@@ -588,7 +588,10 @@ export function UserCleanupRuleEditPage(props: { ctx: UiContext; data: UserClean
   const base = "/user/settings/packages";
   const formAction = data.isEditRule ? `${base}/rules/${data.rule.id}` : `${base}/rules/add`;
   return (
-    <BaseLayout ctx={ctx} title={userSettingsPackagesLocale.title} pageClass="user settings packages">
+    // The document title rides the sub-page header (055105d42f —
+    // setRuleEditContext's Title, shared/packages/packages.go:49: the edit/add
+    // split, not the sidebar's "Packages").
+    <BaseLayout ctx={ctx} title={data.isEditRule ? userSettingsPackagesLocale.edit_rule : userSettingsPackagesLocale.add_rule} pageClass="user settings packages">
       <div class="ui container flex-container">
         <UserSettingsNavbar active="packages" />
         <div class="flex-container-main">
@@ -713,7 +716,9 @@ export function renderUserCleanupRulePreviewPage(ctx: UiContext, data: Extract<U
 export function UserCleanupRulePreviewPage(props: { ctx: UiContext; data: Extract<UserCleanupRulePreviewData, { kind: "ok" }> }) {
   const { ctx, data } = props;
   return (
-    <BaseLayout ctx={ctx} title={userSettingsPackagesLocale.title} pageClass="user packages admin">
+    // The document title rides the sub-page header (055105d42f —
+    // SetRulePreviewContext's Title, shared/packages/packages.go:134).
+    <BaseLayout ctx={ctx} title={userSettingsPackagesLocale.preview} pageClass="user packages admin">
       <div class="ui container flex-container">
         <UserSettingsNavbar active="packages" />
         <div class="flex-container-main">
@@ -753,7 +758,7 @@ export function UserCleanupRulePreviewPage(props: { ctx: UiContext; data: Extrac
                           <a href={row.versionLink}>{row.version.version}</a>
                         </td>
                         <td>
-                          {/* The Ghost arm (descriptor.go:134-140) — a
+                          {/* The Ghost arm (descriptor.go:135-141) — a
                               missing creator renders the Ghost user's
                               HomeLink. */}
                           <a href={row.creatorName !== null ? userLink(row.creatorName) : `/${userSettingsPackagesLocale.ghost}`}>

@@ -140,6 +140,7 @@ import {
   HelmArchiveError,
   HelmChartInvalidError,
   HelmChartMissingError,
+  HelmContentTooLargeError,
   HelmNameInvalidError,
   HelmPackageNotExistError,
   HelmProvenanceInvalidError,
@@ -993,9 +994,12 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         error instanceof HelmChartMissingError ||
         error instanceof HelmNameInvalidError ||
         error instanceof HelmVersionInvalidError ||
-        error instanceof HelmChartInvalidError
+        error instanceof HelmChartInvalidError ||
+        error instanceof HelmContentTooLargeError
       ) {
-        // The ErrInvalidArgument arm (helm.go:160-166) → 400.
+        // The ErrInvalidArgument arm (helm.go:160-166) → 400 — including the
+        // archive inflate cap (metadata.go:76, 178d33ed4d: ErrContentTooLarge
+        // rides NewLimitedReader's InvalidArgument family).
         return helmErrorResponse(400, error.message);
       }
       if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {

@@ -2,7 +2,7 @@
  * The package model service (SPEC-0016 §2.2/§4/§5) — the D1 half over the six
  * tables (schema.ts, migration 0039): the GetOrInsert shapes upstream's
  * models answer duplicates with (§5.2), the descriptor assembly the API
- * renders (upstream descriptor.go:56-77), the list queries the management ops
+ * renders (upstream descriptor.go:57-78), the list queries the management ops
  * need (SearchVersions / SearchLatestVersions), the link/unlink pair
  * (package_update.go), the delete cascades, the quota checks
  * (packages.go:366-457 with our §3.4 config surface), and the owner access
@@ -360,7 +360,7 @@ export async function incrementDownloadCounter(d1: D1Database, versionId: number
 }
 
 // ---------------------------------------------------------------------------
-// The descriptor assembly (descriptor.go:56-77) — the read shape every
+// The descriptor assembly (descriptor.go:57-78) — the read shape every
 // management op renders
 // ---------------------------------------------------------------------------
 
@@ -385,6 +385,57 @@ export async function getFileDescriptors(d1: D1Database, versionId: number): Pro
     .orderBy(asc(packageFiles.lowerName), asc(packageFiles.createdUnix), asc(packageFiles.id))
     .all();
   return rows;
+}
+
+/**
+ * The PublicPropertyNames table (b0b31bc593 — one entry per Specialization):
+ * only the FILE properties that LOCATE the file render through the package
+ * files API (`convert.ToPackageFile`'s slices.Contains filter,
+ * convert/package.go:45-52); the internal ones (rpm/alpine/arch/conda
+ * metadata, the Debian control file) stay hidden — they run many MiB per
+ * file. Types not listed ride the SpecPublicPropertyNames default (nil):
+ * terraform state and every registry without a specialization.
+ */
+export const PACKAGE_PUBLIC_PROPERTY_NAMES: Record<string, readonly string[]> = {
+  alpine: ["alpine.branch", "alpine.repository", "alpine.architecture"],
+  arch: ["arch.repository", "arch.architecture"],
+  conan: [
+    "conan.recipe.user",
+    "conan.recipe.channel",
+    "conan.recipe.revision",
+    "conan.package.reference",
+    "conan.package.revision",
+  ],
+  conda: ["conda.subdir"],
+  debian: ["debian.distribution", "debian.component", "debian.architecture"],
+  nuget: ["nuget.symbol.id"],
+  rpm: ["rpm.group", "rpm.architecture"],
+  vagrant: ["vagrant.provider"],
+};
+
+/**
+ * The version's FILE properties keyed by file id (descriptor.go:264 —
+ * `GetProperties(ctx, PropertyTypeFile, pf.ID)` arms the file descriptor;
+ * the files API is the only consumer, so the descriptors load lazily here
+ * instead of riding every getFileDescriptors call).
+ */
+export async function getFileProperties(d1: D1Database, versionId: number): Promise<Map<number, Record<string, string>>> {
+  const rows = await drizzle(d1)
+    .select({ refId: packageProperties.refId, name: packageProperties.name, value: packageProperties.value })
+    .from(packageProperties)
+    .innerJoin(packageFiles, eq(packageFiles.id, packageProperties.refId))
+    .where(and(eq(packageProperties.refType, PropertyType.File), eq(packageFiles.versionId, versionId)))
+    .all();
+  const byFile = new Map<number, Record<string, string>>();
+  for (const row of rows) {
+    let props = byFile.get(row.refId);
+    if (props === undefined) {
+      props = {};
+      byFile.set(row.refId, props);
+    }
+    props[row.name] = row.value;
+  }
+  return byFile;
 }
 
 export async function getPackageDescriptor(

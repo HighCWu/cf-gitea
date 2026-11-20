@@ -248,7 +248,7 @@ async function loadCleanupOwner(db: D1Database, ownerId: number): Promise<Cleanu
  * their isInternal filters; upstream's raw query needs none because the
  * internal `_family` files carry no family properties). This is the
  * iteration source the BuildAllRepositoryFiles arms walk
- * (models/packages/arch/search.go:14-38, debian/search.go:120-151,
+ * (models/packages/arch/search.go:14-38, debian/search.go:112-143,
  * alpine/search.go:14-37).
  */
 async function listDistinctFileProperties(
@@ -330,7 +330,7 @@ async function buildAllArchRepositoryFiles(db: D1Database, bucket: R2Bucket, own
  * delete, then every distribution × component × architecture
  * (GetDistributions / GetComponents / GetArchitectures — the architecture
  * list hangs off the DISTRIBUTION, not the component,
- * models/packages/debian/search.go:120-151) through
+ * models/packages/debian/search.go:112-143) through
  * buildDebianRepositoryFiles — the landed BuildSpecificRepositoryFiles twin
  * (the Packages pair for the exact triple + the whole distribution's
  * Release trio).
@@ -377,6 +377,98 @@ async function buildAllAlpineRepositoryFiles(db: D1Database, bucket: R2Bucket, o
         await buildAlpineRepositoryFiles(db, bucket, owner, branch, repository, architecture, now);
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The OnAfterRemovePackage hook (1fcb6b4cd6) — services/packages/spec.go's
+// SpecOnAfterRemovePackage default (nil no-op) overridden by the four distro
+// specializations (alpine/spec.go, debian/spec.go, rpm/spec.go,
+// arch/spec.go): every RemovePackage / RemovePackageVersion tail rebuilds the
+// owner's registry index, so a delete through the v1 API, the web settings
+// pages or the admin page no longer leaves clients seeing the removed
+// version until the next unrelated rebuild. The protocol file-delete paths
+// (alpine.go:269 / arch.go:290 RemovePackageFileAndVersionIfUnreferenced)
+// deliberately do NOT ride the hook — upstream deletes the version DIRECTLY
+// (packages.go:570-574) and those routers rebuild their own group afterwards.
+// The arch arm's AcquireRegistryLock has no twin here (no globallock — the
+// standing cleanup posture above); the riders below inherit it.
+// ---------------------------------------------------------------------------
+
+/** The structural REPO_PACKS probe (webhooks.ts's WEBHOOK_DELIVERY
+ *  precedent): the delete callers hold full worker Envs, but the shared
+ *  package-delete seams type them loosely (`webhookEnv?: PackageEventEnv`
+ *  is `Pick<Env, "DB">`-shaped) and the test fixtures fabricate partial envs.
+ *  An unbound bucket degrades the rebuild to a logged no-op — the cargo
+ *  rider's repo-absent posture (index.go:94-99), not a silent ignore: the
+ *  delete itself still commits, the index refresh waits for the next
+ *  rebuild trigger exactly as a failed upstream hook would leave it. */
+export function packagesRebuildBucketFromEnv(env: unknown): R2Bucket | null {
+  const candidate: unknown = env === null || typeof env !== "object" ? undefined : (env as { REPO_PACKS?: unknown }).REPO_PACKS;
+  if (candidate === undefined || candidate === null) return null;
+  const bucket = candidate as { get?: unknown; put?: unknown; delete?: unknown };
+  const callable = (value: unknown): value is (...args: unknown[]) => Promise<unknown> => typeof value === "function";
+  if (callable(bucket.get) && callable(bucket.put) && callable(bucket.delete)) {
+    return candidate as R2Bucket;
+  }
+  return null;
+}
+
+/**
+ * The OnAfterRemovePackage dispatch (spec.go:38-39 + the four spec files):
+ * debian/alpine/arch run their BuildAllRepositoryFiles twins, rpm runs its
+ * exported buildAllRpmRepositoryFiles, EVERY other type rides the default
+ * no-op. The owner row re-loads here (upstream passes only the ID); a
+ * vanished owner logs and skips rather than fabricating internal rows (the
+ * cleanup rider's posture). Callers: the v1 deletes (routes/packages.ts
+ * deletePackage/deletePackageVersion) and the shared web deletes
+ * (ui/pages/package-settings.tsx) — the exact RemovePackage /
+ * RemovePackageVersion caller set (v1/packages/package.go:146/:186,
+ * user/package.go:486/:504, admin/packages.go:89); the protocol routers'
+ * own-type callers resolve to the default arm either way.
+ */
+export async function onAfterRemovePackage(
+  db: D1Database,
+  bucket: R2Bucket | null,
+  ownerId: number,
+  packageType: string,
+  now?: Date,
+): Promise<void> {
+  switch (packageType) {
+    case "debian":
+    case "alpine":
+    case "arch":
+    case "rpm":
+      break;
+    default:
+      // The default SpecOnAfterRemovePackage arm — no index to rebuild.
+      return;
+  }
+  if (bucket === null) {
+    console.error(`[packages] onAfterRemovePackage: REPO_PACKS unbound — the ${packageType} repository rebuild for owner ${ownerId} is deferred`);
+    return;
+  }
+  const owner = await loadCleanupOwner(db, ownerId);
+  if (owner === null) {
+    console.error(`[packages] onAfterRemovePackage: owner ${ownerId} vanished — skipping the ${packageType} repository rebuild`);
+    return;
+  }
+  const at = now ?? new Date();
+  switch (packageType) {
+    case "debian":
+      await buildAllDebianRepositoryFiles(db, bucket, owner, at);
+      break;
+    case "alpine":
+      await buildAllAlpineRepositoryFiles(db, bucket, owner, at);
+      break;
+    case "rpm":
+      // rpm's landed BuildAllRepositoryFiles twin owns the whole arm
+      // (repository.go:74-104 — delete-all, then every group).
+      await buildAllRpmRepositoryFiles(db, bucket, owner.id, at);
+      break;
+    case "arch":
+      await buildAllArchRepositoryFiles(db, bucket, owner, at);
+      break;
   }
 }
 

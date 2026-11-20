@@ -18,8 +18,9 @@
  * - Universe (chef.go:35-72): EVERY version (SearchVersions, no
  *   paginator) rendered `{cookbook: {version: {location_type: "opscode",
  *   location_path: baseURL, download_url: …/cookbooks/{name}/versions/
- *   {version}/download, dependencies}}}` — a nil dependencies map marshals
- *   null (Go's encoding/json), which the port reproduces.
+ *   {version}/download, dependencies}}}` — a nil dependencies map renders
+ *   {} (MapNilAsEmpty, chef.go:74 — 3b9b8a8976 changed the old null
+ *   marshal; the port follows the pin).
  * - Search/Enumerate (chef.go:75-136): SearchLatestVersions over the `q`
  *   LIKE filter with the absolute start/items pagination and the
  *   `order` switch (recently_updated|recently_added → created DESC, else
@@ -34,7 +35,8 @@
  * - Version metadata (chef.go:189-236): the version segment's "_" reads
  *   as "." (chef.go:191's ReplaceAll — the knife quirk); the response
  *   carries tarball_file_size (the first file's blob size), published_at,
- *   cookbook/file URLs, license, dependencies (null when absent).
+ *   cookbook/file URLs, license, dependencies ({} when absent —
+ *   MapNilAsEmpty, chef.go:253).
  * - Download (chef.go:239-264): the version → files[0] walk with the
  *   lead-file GET counter bump (packages.go:655-660).
  * - Delete (chef.go:267-316): the version arm is
@@ -342,7 +344,8 @@ export async function buildChefUniverse(
       // ours stays encodeURIComponent-only over the CHEF_VERSION_PATTERN gate
       // (`\d+.\d+(.\d+)?`: no divergent byte is admissible, byte-equal there).
       download_url: `${apiV1BaseURL}/cookbooks/${pathEscape(entry.pkgName)}/versions/${encodeURIComponent(entry.version.version)}/download`,
-      dependencies: entry.metadata.dependencies,
+      // MapNilAsEmpty (chef.go:74, 3b9b8a8976 #40237) — nil renders {}.
+      dependencies: entry.metadata.dependencies ?? {},
     };
     universe[entry.pkgName] = versions;
   }
@@ -475,7 +478,8 @@ export interface ChefVersionMetadata {
   cookbook: string;
   file: string;
   license: string;
-  dependencies: Record<string, string> | null;
+  /** MapNilAsEmpty at the renderer (chef.go:253, 3b9b8a8976) — never null. */
+  dependencies: Record<string, string>;
 }
 
 /**
@@ -506,7 +510,9 @@ export async function getChefVersionMetadata(
     cookbook: cookbookBaseURL,
     file: `${versionUrl}/download`,
     license: metadata.license,
-    dependencies: metadata.dependencies,
+    // MapNilAsEmpty (chef.go:253, 3b9b8a8976 #40237) — a nil dependencies
+    // map renders {} on this endpoint, not Go's null marshal.
+    dependencies: metadata.dependencies ?? {},
   };
 }
 

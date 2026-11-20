@@ -321,7 +321,7 @@ export const PACKAGES_PAGE_SIZE = 20;
  *  slice, package.go:266-286). */
 const VIEW_SIDEBAR_VERSION_COUNT = 5;
 
-/** The upstream links (descriptor.go:79-92 — PackageWebLink /
+/** The upstream links (descriptor.go:80-93 — PackageWebLink /
  *  VersionWebLink over the LOWER name/version, PathEscape per segment). */
 export function packageWebLink(ownerName: string, type: string, lowerName: string): string {
   return `/${ownerName}/-/packages/${type}/${pathEscapeSegments(lowerName)}`;
@@ -331,7 +331,7 @@ export function versionWebLink(ownerName: string, type: string, lowerName: strin
   return `${packageWebLink(ownerName, type, lowerName)}/${pathEscapeSegments(lowerVersion)}`;
 }
 
-/** The settings page link (descriptor.go:84-87 — PackageSettingsLink over
+/** The settings page link (descriptor.go:85-88 — PackageSettingsLink over
  *  the LOWER name, one `/settings` depth above the package link). */
 export function packageSettingsLink(ownerName: string, type: string, lowerName: string): string {
   return `/${ownerName}/-/packages/settings/${type}/${pathEscapeSegments(lowerName)}`;

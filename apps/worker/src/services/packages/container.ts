@@ -2,7 +2,7 @@
  * The OCI container registry service (SPEC-0016 §7 M6 — the seventh package
  * protocol). The upstream map, at the pin (routers 1,459 lines + services 456):
  *
- *   routers/api/packages/api.go:509-547     ContainerRoutes() — the /v2/ root
+ *   routers/api/packages/api.go:523-561     ContainerRoutes() — the /v2/ root
  *                                           mount, the wire arms this module
  *                                           backs (the route half lives in
  *                                           api/routes/packages-protocols.ts's
@@ -139,8 +139,12 @@ export const CONTAINER_PROPERTY_MANIFEST_REFERENCE = "container.manifest.referen
 /** helm.go:8 (modules/packages/container/helm) — the helm config dispatch. */
 const HELM_CONFIG_MEDIA_TYPE = "application/vnd.cncf.helm.config.v1+json";
 
-/** container.go:48 — the image-name grammar (lowercase only). */
-const IMAGE_NAME_PATTERN = /^[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)*$/;
+/** container.go:49 — the image-name grammar (lowercase only), the
+ *  distribution-spec v1.1 shape (ac96408f78, #40363: the v1.0 grammar
+ *  rejected `__` and `-` runs — `a__b` / `a--b` answered NAME_INVALID while
+ *  docker and podman accept them; each path segment separator is now one
+ *  of `.` `_` `__` or a dash-run). */
+const IMAGE_NAME_PATTERN = /^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$/;
 
 /** container.go:49 — the tag-reference grammar (128 chars max). */
 const REFERENCE_PATTERN = /^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$/;
@@ -562,7 +566,7 @@ export interface ContainerOwner {
 }
 
 async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, image: string, now = new Date()) {
-  // blob.go:93-115 — the package row (name IS the lower name, upstream inserts
+  // blob.go:95-117 — the package row (name IS the lower name, upstream inserts
   // ToLower(image)) + the repository property on the created arm.
   const { row: pkg, created } = await getOrInsertPackage(d1, {
     ownerId: owner.id,
@@ -573,7 +577,7 @@ async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, i
   if (created) {
     await insertProperty(d1, PropertyType.Package, pkg.id, CONTAINER_PROPERTY_REPOSITORY, `${owner.usernameLower}/${image.toLowerCase()}`);
   }
-  // blob.go:117-131 — the INTERNAL _upload staging version.
+  // blob.go:119-133 — the INTERNAL _upload staging version.
   const lowerVersion = CONTAINER_UPLOAD_VERSION;
   const existing = await drizzle(d1)
     .select()
@@ -612,7 +616,7 @@ async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, i
   return { pkg, version: winner };
 }
 
-/** createFileForBlob (blob.go:135-160) — the sha256_<hash> file with its
+/** createFileForBlob (blob.go:137-162) — the sha256_<hash> file with its
  *  digest property, on the given version. A duplicate (the same blob already
  *  staged — ANY duplicate, identical or not, upstream's TryInsertFile arm
  *  :146-149) is a no-op. */
@@ -1024,7 +1028,7 @@ export async function isContainerBlobAccessible(
   return false;
 }
 
-/** mountBlob (blob.go:71-80) — the cross-repo mount: the blob gains a file
+/** mountBlob (blob.go:73-82) — the cross-repo mount: the blob gains a file
  *  row on the TARGET image's staging version (the search's digest property
  *  then finds it under both images). */
 export async function mountContainerBlob(
@@ -1089,10 +1093,10 @@ export async function deletePropertiesByName(
 }
 
 // ---------------------------------------------------------------------------
-// Deletes (blob.go:162-186 + the manifest-delete walk)
+// Deletes (blob.go:164-188 + the manifest-delete walk)
 // ---------------------------------------------------------------------------
 
-/** deleteBlob (blob.go:162-186) — every file carrying the digest loses its
+/** deleteBlob (blob.go:164-188) — every file carrying the digest loses its
  *  row (the unreferenced-sweep owns the R2 key, ratification 4). */
 export async function deleteContainerBlob(d1: D1Database, ownerId: number, image: string, digest: string): Promise<void> {
   const descriptors = await getContainerBlobs(d1, { ownerId, image, digest });

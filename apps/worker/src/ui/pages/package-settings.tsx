@@ -50,14 +50,14 @@
  *       name (mismatch → flash delete.invalid_package_name + redirect back
  *       to the settings page), then RemovePackage (:681 runs the
  *       specialization's OnBeforeRemovePackageAll — terraform's is the
- *       LOCKED refusal, spec.go:50-62 "packages.terraform.delete.locked")
+ *       LOCKED refusal, spec.go:52-63 "packages.terraform.delete.locked")
  *       → flash delete.success + redirect `/{owner}/-/packages`. PORT: the
  *       mismatch and locked arms re-render the GET page at 200 with the
  *       exact upstream banner text; success answers the bare 303 onto the
  *       owner's packages list.
  *   - PackageVersionDelete (:503-528): RemovePackageVersion (:520 runs
  *     OnBeforeRemovePackageVersion — terraform's LOCKED then LATEST
- *     refusals, spec.go:64-80: "packages.terraform.delete.locked" /
+ *     refusals, spec.go:66-88: "packages.terraform.delete.locked" /
  *     "…delete.latest"); the redirect target is the package page while ANY
  *     non-internal version remains, else the owner's packages list
  *     (ExistVersion :517-520). PORT: the guard order and the target split
@@ -140,6 +140,7 @@ import {
   resolvePackageEventAllVersions,
   type PackageDeleteEmitOptions,
 } from "../../services/packages/webhooks";
+import { onAfterRemovePackage, packagesRebuildBucketFromEnv } from "../../services/packages/cleanup";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
@@ -327,7 +328,7 @@ export async function applyPackageSettingsLink(
 }
 
 /** The terraform specialization's OnBeforeRemovePackageAll port
- *  (services/packages/terraform/spec.go:50-62): a LOCKED terraform state
+ *  (services/packages/terraform/spec.go:52-63): a LOCKED terraform state
  *  refuses every delete. Other types run no guard (the spec registry's
  *  no-op default). */
 async function terraformDeleteGuardAll(d1: D1Database, pkg: PackageRow): Promise<"locked" | null> {
@@ -337,7 +338,7 @@ async function terraformDeleteGuardAll(d1: D1Database, pkg: PackageRow): Promise
 }
 
 /** The terraform specialization's OnBeforeRemovePackageVersion port
- *  (spec.go:64-80): LOCKED first, then LATEST — the max-id version of the
+ *  (spec.go:66-88): LOCKED first, then LATEST — the max-id version of the
  *  package (SearchLatestVersions' GROUP-BY arm reduces to this on a fixed
  *  package). */
 async function terraformDeleteGuardVersion(
@@ -364,7 +365,7 @@ async function terraformDeleteGuardVersion(
  *  the landed delete cascade. No partial state: every refusal precedes
  *  the first write. `emit` carries the deleted-arm webhook input
  *  (user/package.go:487 — RemovePackage notifies PER VERSION DESCRIPTOR,
- *  the packages.go:714 loop, all rendered from the pre-delete state). */
+ *  the packages.go:720 loop, all rendered from the pre-delete state). */
 export async function applyPackageSettingsDelete(
   d1: D1Database,
   pkg: PackageRow,
@@ -382,6 +383,11 @@ export async function applyPackageSettingsDelete(
   if (emit?.webhookEnv !== undefined && descriptors.length > 0) {
     await emitPackageDeleted(emit.webhookEnv, descriptors, emit.doerId ?? 0);
   }
+  // OnAfterRemovePackage (packages.go:722 — notify precedes the hook): the
+  // distro types rebuild the owner's registry index on the RemovePackage
+  // tail. The bucket rides the caller's full Env through the webhookEnv
+  // slot (the structural probe; unbound = the logged no-op posture).
+  await onAfterRemovePackage(d1, packagesRebuildBucketFromEnv(emit?.webhookEnv), pkg.ownerId, pkg.type);
   return "ok";
 }
 
@@ -403,6 +409,10 @@ export async function deletePackageVersionGuarded(
   if (emit?.webhookEnv !== undefined) {
     await emitPackageDeleted(emit.webhookEnv, [{ pkg, version }], emit.doerId ?? 0);
   }
+  // OnAfterRemovePackage (packages.go:539 — notify precedes the hook): the
+  // distro index rebuild rides the RemovePackageVersion tail (shared by the
+  // settings pages and the admin page's delete POST).
+  await onAfterRemovePackage(d1, packagesRebuildBucketFromEnv(emit?.webhookEnv), pkg.ownerId, pkg.type);
   return "ok";
 }
 
@@ -531,7 +541,7 @@ export function PackageSettingsPage(props: {
 }) {
   const { ctx, data } = props;
   const ownerName = ownerNameOf(data.owner);
-  // descriptor.go:84-87 — `/settings/{type}/{name}` over the LOWER name
+  // descriptor.go:85-88 — `/settings/{type}/{name}` over the LOWER name
   // (the same shape packageSettingsLink builds for the view's anchor).
   const settingsLink = packageSettingsLink(ownerName, data.pkg.type, data.pkg.lowerName);
   const badgeKind = packageVisibilityBadgeKind(data.pkg, ownerVisibilityOf(data.owner));

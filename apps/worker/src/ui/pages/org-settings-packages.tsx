@@ -34,7 +34,7 @@
  *     `CompiledPattern` (:41-54 — `(?i)\A…\z` compiles), Insert/Get/Update/
  *     Delete/GetCleanupRulesByOwner/HasOwnerCleanupRuleForPackageType
  *     (:56-100).
- *   - `models/packages/package.go:298-303` — `GetPackagesByType` (owner+type
+ *   - `models/packages/package.go:304-309` — `GetPackagesByType` (owner+type
  *     + `package.is_internal = false`).
  *   - `services/forms/package_form.go` — `PackageCleanupRuleForm`: Type
  *     `Required;In(<the 23 TypeList values>)`, KeepCount
@@ -325,7 +325,7 @@ export const orgSettingsPackagesLocale = {
   admin_published: "Published", // "admin.packages.published"
   badge_internal: "Internal", // "repo.desc.internal" (visibility_badge.tmpl)
   badge_private: "Private", // "repo.desc.private"
-  ghost: "Ghost", // user_model.GhostUserName — the missing-creator arm (descriptor.go:134-140's NewGhostUser; HomeLink "/Ghost")
+  ghost: "Ghost", // user_model.GhostUserName — the missing-creator arm (descriptor.go:135-141's NewGhostUser; HomeLink "/Ghost")
 } as const;
 
 /** "...cleanuprules.keep.count.n" — "%d versions per package". */
@@ -748,7 +748,7 @@ export async function loadOrgCleanupRuleEditPageData(d1: D1Database, org: OrgRec
 export interface OrgCleanupRulePreviewRow {
   pkg: PackageRow;
   version: PackageVersionRow;
-  /** VersionWebLink (descriptor.go:90-92) — the anchor rides the LOWER
+  /** VersionWebLink (descriptor.go:91-93) — the anchor rides the LOWER
    *  name/version segments. */
   versionLink: string;
   /** The creator's username; null renders the Ghost cell (descriptor.go:
@@ -780,7 +780,7 @@ export type OrgCleanupRulePreviewData =
  * (cleanup.ts:193-203; upstream preview :157-203 minus the container
  * ShouldBeSkipped arm — no container substrate, the sweep's v1 reduction):
  * per GetPackagesByType package (owner+type+is_internal=false,
- * package.go:298-303), the created-desc versions with the positional
+ * package.go:304-309), the created-desc versions with the positional
  * keep-count trim, the keep-pattern skip, the remove-days cut and the
  * remove-pattern gate — each survivor assembled through
  * getPackageDescriptor for the table's size cell.
@@ -801,7 +801,7 @@ export async function loadOrgCleanupRulePreview(
     throw new Error(`cleanup rule ${rule.id}: stored pattern does not compile (upstream ServerError "CompiledPattern")`);
   }
 
-  // GetPackagesByType (package.go:298-303) — the owner+type packages with
+  // GetPackagesByType (package.go:304-309) — the owner+type packages with
   // the is_internal pin (the sweep loop's shape + upstream's pin).
   const pkgs = await drizzle(d1)
     .select()
@@ -984,7 +984,9 @@ export function OrgCleanupRuleEditPage(props: { ctx: UiContext; data: OrgCleanup
   const base = `/org/${data.org.username}/settings/packages`;
   const formAction = data.isEditRule ? `${base}/rules/${data.rule.id}` : `${base}/rules/add`;
   return (
-    <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
+    // The document title rides the sub-page header (055105d42f —
+    // setRuleEditContext's Title, shared/packages/packages.go:49).
+    <BaseLayout ctx={ctx} title={data.isEditRule ? orgSettingsPackagesLocale.edit_rule : orgSettingsPackagesLocale.add_rule} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
         <OrgSettingsNavbar orgLink={`/org/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
@@ -1109,7 +1111,9 @@ export function renderOrgCleanupRulePreviewPage(ctx: UiContext, data: Extract<Or
 export function OrgCleanupRulePreviewPage(props: { ctx: UiContext; data: Extract<OrgCleanupRulePreviewData, { kind: "ok" }> }) {
   const { ctx, data } = props;
   return (
-    <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
+    // The document title rides the sub-page header (055105d42f —
+    // SetRulePreviewContext's Title, shared/packages/packages.go:134).
+    <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.preview} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
         <OrgSettingsNavbar orgLink={`/org/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
@@ -1150,7 +1154,7 @@ export function OrgCleanupRulePreviewPage(props: { ctx: UiContext; data: Extract
                           <a href={row.versionLink}>{row.version.version}</a>
                         </td>
                         <td>
-                          {/* The Ghost arm (descriptor.go:134-140) — a
+                          {/* The Ghost arm (descriptor.go:135-141) — a
                               missing creator renders the Ghost user's
                               HomeLink. */}
                           <a href={row.creatorName !== null ? userLink(row.creatorName) : `/${orgSettingsPackagesLocale.ghost}`}>

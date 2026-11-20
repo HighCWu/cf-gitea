@@ -122,6 +122,17 @@ export class HelmChartInvalidError extends Error {
   }
 }
 
+/** ErrContentTooLarge (limited_reader.go:18) — the ARCHIVE inflate cap
+ *  (metadata.go:76's maxArchiveSize, 178d33ed4d) is a distinct error from
+ *  the per-member metadata cap: same InvalidArgument → 400 classification
+ *  (helm.go:160-166), upstream's own message. */
+export class HelmContentTooLargeError extends Error {
+  constructor() {
+    super("content exceeds the size limit");
+    this.name = "HelmContentTooLargeError";
+  }
+}
+
 /** ErrInvalidProvenance (metadata.go:29). */
 export class HelmProvenanceInvalidError extends Error {
   constructor() {
@@ -366,12 +377,24 @@ export function parseChartYaml(bytes: Uint8Array): HelmMetadata {
 /** packages.MaxMetadataSize (limited_reader.go:14). */
 const MAX_METADATA_SIZE = 32 * 1024 * 1024;
 
-/** Small buffered reader over a byte stream (compacting, grow-on-demand). */
+/** maxArchiveSize (metadata.go:76, 178d33ed4d) — the tar members inflate
+ *  while the scanner looks for Chart.yaml, so the WHOLE decompressed archive
+ *  is capped, not just the metadata read: upstream wraps the gunzip reader
+ *  in NewLimitedReader(gzr, maxArchiveSize) and any read past the cap fails
+ *  with ErrContentTooLarge (limited_reader.go:18 — InvalidArgument → 400,
+ *  helm.go:160-166). */
+const MAX_ARCHIVE_SIZE = 256 * 1024 * 1024;
+
+/** Small buffered reader over a byte stream (compacting, grow-on-demand).
+ *  `consumed` counts every decompressed byte pulled off the stream — the
+ *  NewLimitedReader analogue (limited_reader.go:21-33 counts through the
+ *  reads, erroring on the byte past the limit). */
 class ByteReader {
   private buf = new Uint8Array(64 * 1024);
   private start = 0;
   private end = 0;
   private done = false;
+  consumed = 0;
 
   constructor(private readonly reader: ReadableStreamDefaultReader<Uint8Array>) {}
 
@@ -389,6 +412,7 @@ class ByteReader {
         this.done = true;
         break;
       }
+      this.consumed += read.value.byteLength;
       if (this.end + read.value.byteLength > this.buf.byteLength) {
         this.grow(this.end + read.value.byteLength);
       }
@@ -417,6 +441,7 @@ class ByteReader {
         this.done = true;
         break;
       }
+      this.consumed += read.value.byteLength;
       remaining -= read.value.byteLength;
     }
     if (remaining > 0) throw new HelmArchiveError("tar archive ended mid-member");
@@ -458,12 +483,25 @@ function parseOctalSize(bytes: Uint8Array): number {
   return size;
 }
 
+/** The inflate-cap trip (limited_reader.go:28-31): the byte that pushes the
+ *  consumed count past maxArchiveSize fails the read. Checked at the same
+ *  granularity the streaming reader buffers — the wire answer is the same
+ *  ErrContentTooLarge → 400 whatever member crosses it. */
+function ifArchiveOverInflateCap(tarReader: ByteReader): void {
+  if (tarReader.consumed > MAX_ARCHIVE_SIZE) {
+    throw new HelmContentTooLargeError();
+  }
+}
+
 /**
  * ParseChartArchive's walk (metadata.go:80-105) over a streaming gunzip:
  * iterate tar members; the FIRST regular file whose basename is Chart.yaml
  * with EXACTLY one slash in its full name (`<chart>/Chart.yaml` — root-level
  * and deeper copies are skipped, metadata.go:93-96) answers its bytes. Null
- * when the archive ends without such a member (ErrMissingChartFile).
+ * when the archive ends without such a member (ErrMissingChartFile). The
+ * whole decompressed archive is capped at maxArchiveSize (metadata.go:76,
+ * 178d33ed4d — NewLimitedReader around the gunzip; 178d33ed4d's bound on
+ * how much a hostile archive inflates while looking for Chart.yaml).
  */
 export async function readChartYamlFromTarGz(source: ReadableStream<Uint8Array>): Promise<Uint8Array | null> {
   let decompressed: ReadableStream<Uint8Array>;
@@ -476,6 +514,7 @@ export async function readChartYamlFromTarGz(source: ReadableStream<Uint8Array>)
   try {
     for (;;) {
       if (!(await tarReader.ensure(512))) return null; // clean end of archive
+      ifArchiveOverInflateCap(tarReader);
       const header = tarReader.view(512);
       // Two consecutive zero blocks end the archive; one is enough here.
       if (header.every((byte) => byte === 0)) return null;
@@ -496,15 +535,24 @@ export async function readChartYamlFromTarGz(source: ReadableStream<Uint8Array>)
         if (!(await tarReader.ensure(size))) {
           throw new HelmArchiveError("Chart.yaml member is truncated");
         }
+        ifArchiveOverInflateCap(tarReader);
         return tarReader.view(size).slice();
       }
       await tarReader.drain(512 + Math.ceil(size / 512) * 512);
+      ifArchiveOverInflateCap(tarReader);
     }
   } catch (error) {
     // A gunzip/tar read failure surfaces as a rejected read — wrap it in the
     // 500 class upstream's non-InvalidArgument arm produces (helm.go:163-165),
-    // letting the typed InvalidArgument errors pass through untouched.
-    if (error instanceof HelmChartInvalidError || error instanceof HelmArchiveError) throw error;
+    // letting the typed InvalidArgument errors pass through untouched (the
+    // inflate-cap ErrContentTooLarge twin among them — limited_reader.go:18).
+    if (
+      error instanceof HelmChartInvalidError ||
+      error instanceof HelmContentTooLargeError ||
+      error instanceof HelmArchiveError
+    ) {
+      throw error;
+    }
     throw new HelmArchiveError(`the chart archive is unreadable: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     tarReader.release();

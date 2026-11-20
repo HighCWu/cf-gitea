@@ -45,7 +45,7 @@
  *   Creator     `.Creator.Name` → HomeLink (descriptor.go's Creator load).
  *               An UNATTRIBUTED version (creator_id 0 — the M1 API's
  *               documented null-creator divergence; upstream falls back to
- *               NewGhostUser, descriptor.go:141-148) renders the EMPTY cell:
+ *               NewGhostUser, descriptor.go:142-149) renders the EMPTY cell:
  *               upstream's Ghost anchor targets /.ghost — no landed page (and
  *               no real upstream page either), the dead-link rule, the R04
  *               by-arm's documented posture reshaped for the column
@@ -57,7 +57,7 @@
  *               132-137 — no visibility ladder; a missing repo row degrades
  *               to nil upstream and to the empty cell here), the site-admin
  *               page's own shape
- *   Size        `CalculateBlobSize` (descriptor.go:88-92 — the summed file
+ *   Size        `CalculateBlobSize` (descriptor.go:89-93 — the summed file
  *               blob bytes) → FormatByteSize
  *   Published   `DateUtils.AbsoluteShort .Version.CreatedUnix` — the en-US
  *               "Jan 02, 2006" form (the R04 view sidebar's absoluteShort,
@@ -421,7 +421,7 @@ export async function loadAdminPackagesData(d1: D1Database, search: URLSearchPar
   const creators = new Map(creatorRows.map((row) => [row.id, row.username]));
   const reposById = new Map(repoRows.map((row) => [row.id, row]));
 
-  // CalculateBlobSize per row (descriptor.go:88-92) as ONE grouped files+
+  // CalculateBlobSize per row (descriptor.go:89-93) as ONE grouped files+
   // blobs read over the page's version ids (getPackageDescriptor per row
   // would N+1; a version with no files sums to nothing — the absent group).
   const versionIds = rows.map((row) => row.version.id);

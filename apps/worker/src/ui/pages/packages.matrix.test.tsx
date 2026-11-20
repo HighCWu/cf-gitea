@@ -416,7 +416,7 @@ describe("the R04 list — rows, facets, empty arms", () => {
     const html = renderOwnerPackagesPage(pageCtx(aliceViewer), data);
     expect(html).toContain("<!DOCTYPE html>");
     expect(html).toContain('class="page-content user profile packages"');
-    // The latest version's page is the row link (descriptor.go:90-92's shape
+    // The latest version's page is the row link (descriptor.go:91-93's shape
     // over the LOWER name/version).
     expect(html).toContain('href="/alice/-/packages/generic/app-tools/v1.1.0"');
     expect(html).not.toContain("/generic/app-tools/v1.0.0"); // the latest only

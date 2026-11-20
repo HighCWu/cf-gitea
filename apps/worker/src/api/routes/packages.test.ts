@@ -25,15 +25,15 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packages, packageVersions, repositories, users } from "../../db/schema";
+import { packageFiles, packageProperties, packages, packageVersions, repositories, users } from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { resolveAuth } from "../../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import { registerPackagesRoutes, createPackagesProtocolRouter } from "./packages";
 import type { User } from "../models/user";
-import { packageBlobContentKey } from "../../services/packages/blobs";
-import { getOrInsertPackage, getOrInsertVersion } from "../../services/packages/model";
+import { packageBlobContentKey, getOrInsertBlob } from "../../services/packages/blobs";
+import { PropertyType, getOrInsertPackage, getOrInsertVersion } from "../../services/packages/model";
 import { removeTerraformLock, setTerraformLock } from "../../services/packages/terraform";
 import { mintFor } from "../../auth/testing/seeds";
 
@@ -733,6 +733,49 @@ describe("the 9 management ops + admin list", () => {
     const gotBody = await got.json<Record<string, unknown>>();
     expect(gotBody.id).toBe(version.id);
     expect(gotBody.version).toBe("1.0.0");
+  });
+
+  it("listPackageFiles renders the type's PUBLIC file properties and omits the key when none survive (b0b31bc593)", async () => {
+    const { owner, ownerWrite, ownerRead } = await fixture();
+    void ownerWrite;
+    // A debian version whose file carries two locating properties and one
+    // internal (oversized-control-file class) property: only the public
+    // names (debian.distribution/component/architecture) render.
+    const { row: pkg } = await getOrInsertPackage(env.DB, { ownerId: owner.id, type: "debian", name: "apt", now: new Date() });
+    const { row: ver } = await getOrInsertVersion(env.DB, { packageId: pkg.id, creatorId: owner.id, version: "2.7.0", now: new Date() });
+    const blob = (await getOrInsertBlob(env.DB, { size: 5, sha256: "c".repeat(64), now: new Date() })).row;
+    const inserted = await db()
+      .insert(packageFiles)
+      .values({
+        versionId: ver.id,
+        blobId: blob.id,
+        name: "apt-2.7.0.deb",
+        lowerName: "apt-2.7.0.deb",
+        compositeKey: "bookworm|main|amd64",
+        createdUnix: new Date(),
+      })
+      .returning()
+      .all();
+    const file = inserted[0];
+    if (file === undefined) throw new Error("file seed failed");
+    await db().insert(packageProperties).values([
+      { refType: PropertyType.File, refId: file.id, name: "debian.distribution", value: "bookworm" },
+      { refType: PropertyType.File, refId: file.id, name: "debian.component", value: "main" },
+      { refType: PropertyType.File, refId: file.id, name: "debian.architecture", value: "amd64" },
+      { refType: PropertyType.File, refId: file.id, name: "debian.internal.blob", value: "many-MiB-control" },
+    ]);
+
+    const files = await router()("/api/v1/packages/alice/debian/apt/2.7.0/files", { headers: authHeaders(ownerRead) });
+    expect(files.status).toBe(200);
+    const fileList = await files.json<Record<string, unknown>[]>();
+    expect(fileList).toHaveLength(1);
+    expect(fileList[0]?.properties).toEqual({
+      "debian.distribution": "bookworm",
+      "debian.component": "main",
+      "debian.architecture": "amd64",
+    });
+    // The generic family above stays key-less (no public names — Go's
+    // omitempty drops the empty map).
   });
 
   it("getLatestPackageVersion answers the newest version; unknown package 404s", async () => {

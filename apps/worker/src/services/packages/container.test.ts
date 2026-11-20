@@ -32,6 +32,7 @@ import { mintFor } from "../../auth/testing/seeds";
 import {
   cleanupExpiredContainerUploads,
   createContainerBlobUpload,
+  isValidImageName,
   mintContainerToken,
   resetContainerTokenCacheForTests,
   verifyContainerToken,
@@ -1099,5 +1100,22 @@ describe("REQUIRE_SIGNIN_VIEW (the container arms)", () => {
     expect(challenges).toContain('Bearer realm="https://example.com/v2/token"');
     expect(challenges).not.toContain('Basic realm="Gitea Container Registry"');
     await readOciError(ping);
+  });
+});
+
+// The image-name grammar (container.go:49's globalVars — ac96408f78 #40363
+// moved the pattern to the distribution-spec v1.1 shape: `__` and dash runs
+// are separator-legal, `._` mixes and `___` runs are not; upstream's own
+// TestImageNameVector vectors).
+describe("the OCI v1.1 image-name grammar", () => {
+  it("accepts the v1.1 separator classes (__ and - runs included)", () => {
+    for (const name of ["a", "a.b", "a_b", "a__b", "a-b", "a--b", "a---b", "sub/a__b/c--d"]) {
+      expect(isValidImageName(name), name).toBe(true);
+    }
+  });
+  it("rejects uppercase, mixed separators, edge dashes and malformed paths", () => {
+    for (const name of ["", "A", "a___b", "a._b", "-a", "a-", "a//b", "/a", "a/"]) {
+      expect(isValidImageName(name), name).toBe(false);
+    }
   });
 });

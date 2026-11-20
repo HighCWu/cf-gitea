@@ -168,6 +168,55 @@ async function makeChartTgz(chartName: string, yaml: string): Promise<Uint8Array
   return gzipBytes(buildTar([tarMember(`${chartName}/Chart.yaml`, encoder.encode(yaml))]));
 }
 
+/** A tar whose one member DECLARES `memberSize` bytes but whose payload is
+ *  streamed zeros through CompressionStream lazily — the compressed body
+ *  stays tiny while the decompressed walk inflates past any cap. Never
+ *  materializes the payload (a 300 MiB Uint8Array would pressure the
+ *  workerd test isolate). */
+async function gzipInflatedTarBomb(memberSize: number): Promise<Uint8Array> {
+  const header = new Uint8Array(512);
+  header.set(encoder.encode("bomb/pad.bin").subarray(0, 100), 0);
+  header.set(encoder.encode("0000644\0"), 100);
+  header.set(encoder.encode("0000000\0"), 108);
+  header.set(encoder.encode("0000000\0"), 116);
+  header.set(encoder.encode(`${memberSize.toString(8).padStart(11, "0")}\0`), 124);
+  header.set(encoder.encode("00000000000\0"), 136);
+  header.set(encoder.encode("        "), 148);
+  header[156] = 0x30; // TypeReg
+  header.set(encoder.encode("ustar\x00" + "00"), 257);
+  let sum = 0;
+  for (const byte of header) sum += byte;
+  header.set(encoder.encode(sum.toString(8).padStart(6, "0") + "\0 "), 148);
+
+  const chunk = new Uint8Array(1 << 20); // 1 MiB zeros, reused (immutable content)
+  const terminator = new Uint8Array(1024); // the two zero end-blocks
+  let emitted = 0;
+  const tarStream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (emitted === 0) {
+        controller.enqueue(header);
+        emitted += header.byteLength;
+      } else if (emitted < 512 + memberSize) {
+        controller.enqueue(chunk);
+        emitted += chunk.byteLength;
+      } else {
+        controller.enqueue(terminator);
+        controller.close();
+      }
+    },
+  });
+  const compressed: Uint8Array[] = [];
+  const total = tarStream.pipeThrough(new CompressionStream("gzip"));
+  await total.pipeTo(
+    new WritableStream<Uint8Array>({
+      write(out: Uint8Array) {
+        compressed.push(out);
+      },
+    }),
+  );
+  return concatBytes(compressed);
+}
+
 /** Chart payload with binary richness — proves byte parity through gzip+R2. */
 const CHART_PAYLOAD_FILLER = Uint8Array.from({ length: 1024 }, (_, i) => (i * 7) % 251);
 
@@ -404,6 +453,19 @@ describe("helm validation arms", () => {
     expect(put.status).toBe(500);
     await put.json();
   });
+
+  it("an archive inflating past the 256 MiB cap → 400 'content exceeds the size limit' (maxArchiveSize, 178d33ed4d)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    // A NON-Chart.yaml member declaring 300 MiB of zeros: the compressed body
+    // is tiny, but the scanner's decompressed walk crosses maxArchiveSize
+    // (metadata.go:76) while draining the member — ErrContentTooLarge rides
+    // the InvalidArgument arm (helm.go:160-166) → 400, not the corrupt-gzip
+    // 500 and not the per-member 32 MiB metadata cap.
+    const put = await pushChart("alice", "bomb", "1.0.0", await gzipInflatedTarBomb(300 * 1024 * 1024), authHeaders(writer));
+    expect(put.status).toBe(400);
+    expect(await put.json()).toEqual({ error: "content exceeds the size limit" });
+  }, 30000);
 
   it("a non-clearsign prov body → 400 'provenance file is invalid'", async () => {
     const owner = await seedUser("alice");

@@ -30,6 +30,8 @@ import {
   cleanupOlderThanHoursFromEnv,
   enqueueDuePackagesCleanup,
   handlePackagesCleanup,
+  onAfterRemovePackage,
+  packagesRebuildBucketFromEnv,
   DEFAULT_CLEANUP_OLDER_THAN_HOURS,
 } from "./cleanup";
 import { getOrInsertPackage, getOrInsertVersion } from "./model";
@@ -569,6 +571,76 @@ describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:
 
     expect(await db().select().from(packageVersions).where(eq(packageVersions.id, young.ver.id)).all()).toHaveLength(1);
     expect(await internalFileCount(internalVersionId)).toBe(1); // the stale row survives — no rebuild
+  });
+});
+
+// The OnAfterRemovePackage hook (1fcb6b4cd6 — spec.go's SpecOnAfterRemovePackage
+// default + the four distro specializations): every RemovePackage /
+// RemovePackageVersion tail rebuilds the owner's registry index, so a delete
+// through the v1 API, the web settings pages or the admin page stops
+// stranding stale debian/alpine/rpm/arch indexes.
+describe("onAfterRemovePackage — the RemovePackage*/RemovePackageVersion tail hook", () => {
+  let blobSeq = 1000;
+  const nextSha = () => (++blobSeq).toString(16).padStart(64, "0");
+
+  /** A stale internal index file — the hook's rebuild deletes it whole
+   *  (BuildAllRepositoryFiles step 1) whenever the family arm fires. */
+  async function seedStaleIndexFile(ownerId: number, type: string, repositoryPackage: string, repositoryVersion: string): Promise<number> {
+    const repoVersion = await getOrCreateInternalPackageVersion(env.DB, ownerId, type, repositoryPackage, repositoryVersion);
+    const blob = (await getOrInsertBlob(env.DB, { size: 1, sha256: nextSha(), now: NOW })).row;
+    await db().insert(packageFiles).values({
+      versionId: repoVersion.version.id,
+      blobId: blob.id,
+      name: "stale-index.xml",
+      lowerName: "stale-index.xml",
+      compositeKey: "stale",
+      createdUnix: NOW,
+    });
+    return repoVersion.version.id;
+  }
+
+  const internalFileCount = (versionId: number) =>
+    db()
+      .select({ id: packageFiles.id })
+      .from(packageFiles)
+      .where(eq(packageFiles.versionId, versionId))
+      .all()
+      .then((rows) => rows.length);
+
+  it("each distro family rebuilds the owner's index (the stale internal file sweeps)", async () => {
+    const families = [
+      { type: "debian", repositoryPackage: DEBIAN_REPOSITORY_PACKAGE, repositoryVersion: DEBIAN_REPOSITORY_VERSION },
+      { type: "alpine", repositoryPackage: ALPINE_REPOSITORY_PACKAGE, repositoryVersion: ALPINE_REPOSITORY_VERSION },
+      { type: "rpm", repositoryPackage: RPM_REPOSITORY_PACKAGE, repositoryVersion: RPM_REPOSITORY_VERSION },
+      { type: "arch", repositoryPackage: ARCH_REPOSITORY_PACKAGE, repositoryVersion: ARCH_REPOSITORY_VERSION },
+    ];
+    for (const family of families) {
+      const ownerId = await seedUser(`hook-${family.type}`);
+      const internalVersionId = await seedStaleIndexFile(ownerId, family.type, family.repositoryPackage, family.repositoryVersion);
+      await onAfterRemovePackage(env.DB, env.REPO_PACKS, ownerId, family.type, NOW);
+      expect(await internalFileCount(internalVersionId), `${family.type}: the hook rebuilt the index`).toBe(0);
+    }
+  });
+
+  it("a non-distro type is the default no-op arm (SpecOnAfterRemovePackage)", async () => {
+    const ownerId = await seedUser("hook-generic");
+    const internalVersionId = await seedStaleIndexFile(ownerId, "rpm", RPM_REPOSITORY_PACKAGE, RPM_REPOSITORY_VERSION);
+    await onAfterRemovePackage(env.DB, env.REPO_PACKS, ownerId, "generic", NOW);
+    expect(await internalFileCount(internalVersionId)).toBe(1); // untouched
+  });
+
+  it("a null bucket skips the rebuild (the unbound-bucket no-op posture)", async () => {
+    const ownerId = await seedUser("hook-nobucket");
+    const internalVersionId = await seedStaleIndexFile(ownerId, "debian", DEBIAN_REPOSITORY_PACKAGE, DEBIAN_REPOSITORY_VERSION);
+    await onAfterRemovePackage(env.DB, null, ownerId, "debian", NOW);
+    expect(await internalFileCount(internalVersionId)).toBe(1); // untouched
+  });
+
+  it("the structural bucket probe admits a real R2Bucket and rejects partial envs", () => {
+    expect(packagesRebuildBucketFromEnv({ DB: env.DB, REPO_PACKS: env.REPO_PACKS })).not.toBeNull();
+    expect(packagesRebuildBucketFromEnv({ DB: env.DB })).toBeNull();
+    expect(packagesRebuildBucketFromEnv(undefined)).toBeNull();
+    expect(packagesRebuildBucketFromEnv({ REPO_PACKS: { get: 1 } })).toBeNull();
   });
 });
 

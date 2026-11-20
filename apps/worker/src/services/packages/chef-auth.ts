@@ -16,7 +16,7 @@
  *   arm (auth.go:67 precedes :72), PEM-decoded and parsed as a PKIX
  *   public key, rejected unless RSA (auth.go:81-84).
  * - The timestamp window: `X-Ops-Timestamp` is RFC3339 (auth.go:113-134)
- *   and |now − ts| > 10 min (auth.go:34's `maxTimeDifference`) fails.
+ *   and |now − ts| > 10 min (auth.go:35's `maxTimeDifference`) fails.
  * - `X-Ops-Sign` carries `version=(\d+\.\d+)`; {1.0, 1.1, 1.2, 1.3} are
  *   accepted (auth.go:147-151); an `algorithm=(\w+)` parameter must be
  *   `sha1` — or `sha256` WITH version 1.3 only (auth.go:155-158).
@@ -74,7 +74,7 @@ export const CHEF_PUBLIC_PEM_SETTING = "chef.public_pem";
 /** metadata.go:20 — KeyBits = 4096. */
 export const CHEF_KEY_BITS = 4096;
 
-/** routers/api/packages/chef/auth.go:34 — 10 * time.Minute. */
+/** routers/api/packages/chef/auth.go:35 — 10 * time.Minute. */
 const MAX_TIME_DIFFERENCE_MS = 10 * 60 * 1000;
 
 /**
