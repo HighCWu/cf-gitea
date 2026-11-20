@@ -169,6 +169,14 @@ export function isReservedOwnerName(name: string): boolean {
 // Errors (API layers map them; upstream errclasses in parentheses)
 // ---------------------------------------------------------------------------
 
+// RE-PIN note (fc49368845 → 099abf5db4): upstream's name-validation wire
+// texts are `name is reserved [name: %s]` / `name pattern is not allowed
+// [pattern: %s]` (models/db/name.go:24-26/:48-50). On the CREATE arm those
+// now unwrap `util.ErrInvalidArgument` → APIErrorAuto 400 (was 422 through
+// the dropped handler ladder, b3422c0920); the PATCH rename arm keeps the
+// explicit 422 (repo.go:620-625). Our single conflated class + the routes'
+// 422 mapping keep the pre-repin shape — the split (reserved vs pattern
+// texts, the create-arm 400) rides the routes-family handoff.
 export class RepoNameInvalidError extends Error {
   constructor(public readonly repoName: string) {
     super(`repository name is not allowed: ${repoName}`);
@@ -176,7 +184,23 @@ export class RepoNameInvalidError extends Error {
   }
 }
 
-/** Name taken (upstream `ErrRepoAlreadyExist`; 409 at the API level). */
+/**
+ * Name taken (upstream `ErrRepoAlreadyExist`, models/repo/update.go:67-84;
+ * 409 at the API level). RE-PIN note (fc49368845 → 099abf5db4,
+ * b3422c0920): upstream's create arm answers through `APIErrorAuto` now
+ * (routers/api/v1/repo/repo.go:249-259) — the error unwraps to
+ * `util.ErrAlreadyExist` (update.go:83-85), so the STATUS stays 409 but the
+ * wire TEXT changed from "The repository with the same name already
+ * exists." to this class's upstream Error() format
+ * `repository already exists [owner: %s, repo: %s]` (update.go:79-81). The
+ * PATCH rename arm keeps its explicit 422 + err.Error() mapping unchanged
+ * (repo.go:617-619), so this message is also the rename wire text.
+ * The create routes (user-repos/org-repos/admin-t2) still hardcode the
+ * pre-repin 409 text over this message — the text swap + the reserved-name
+ * 422→400 move (db.ErrNameReserved now unwraps `util.ErrInvalidArgument`,
+ * models/db/name.go:31-33 — the create arm answers 400 where it answered
+ * 422) are the routes-family handoff recorded 2026-11-20.
+ */
 export class RepoNameCollisionError extends Error {
   constructor(
     public readonly ownerNamespace: string,
@@ -611,7 +635,7 @@ export class RepoService {
             // FN-4: upstream's rename stamps BOTH carriers — the API edit arm
             // sets `repo.Name = newRepoName` (display case) beside
             // `repo.LowerName = strings.ToLower(newRepoName)`
-            // (routers/api/v1/repo/repo.go:666-667, updateBasicProperties;
+            // (routers/api/v1/repo/repo.go:633-634 at 099abf5db4, updateBasicProperties;
             // ChangeRepositoryName itself only moves storage + the redirect,
             // transfer.go:409-424 → NewRedirect, redirect.go:67-80). New name
             // in display case; the slug stays folded.
@@ -969,7 +993,7 @@ export class RepoService {
    * The ACL matrix re-reads both rows per request, so no cache invalidation
    * is required; the worst-case stale window is the refs edge-cache TTL
    * (§2.5.6). The forced-value arm of the coupling (a fork PATCH cannot
-   * choose its own visibility) is the ROUTE's — repo.go:673-679 forces
+   * choose its own visibility) is the ROUTE's — repo.go:646-652 at 099abf5db4 forces
    * `private` to the base's value before the change detection.
    */
   async setVisibility(repoId: string, isPrivate: boolean): Promise<RepoRow> {

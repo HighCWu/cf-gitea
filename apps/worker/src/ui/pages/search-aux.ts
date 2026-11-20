@@ -3,8 +3,9 @@
  * unit, two bare-JSON aux endpoints the vendored frontend polls):
  *
  *   GET /repo/search               web.go:1102  repo.SearchRepo
- *                                  (routers/web/repo/repo.go:426-546 — the
- *                                  dashboard/repo-picker repository search)
+ *                                  (routers/web/repo/repo.go:417-537 at
+ *                                  099abf5db4 — the dashboard/repo-picker
+ *                                  repository search)
  *   GET /explore/topics/search     web.go:564   explore.TopicSearch
  *                                  (routers/web/explore/topic.go:17-46 —
  *                                  the topic-picker feed)
@@ -12,7 +13,7 @@
  * ## Feed 1 — /repo/search (reqSignIn, web.go:1097-1103's group gate)
  *
  * Every query param the Go handler consumes, in handler order
- * (repo.go:427-505): `page` (FormInt, <=0 → 1), `limit`
+ * (repo.go:418-496 at 099abf5db4): `page` (FormInt, <=0 → 1), `limit`
  * (ToCorrectPageSize), `q` (FormTrim), `uid` / `priority_owner_id` /
  * `team_id` / `starredBy` (FormInt64), `topic` / `includeDesc` /
  * `exclusive` (FormBool), `private` (`IsSigned && (""
@@ -24,7 +25,8 @@
  * page, never JSON), `sort` + `order` (repo_model.OrderByMap gate —
  * 422 `Invalid sort order/order: "x"`), and `count_only` (FormBool —
  * the count fast path: ctx.SetTotalCountHeader(count) + ctx.JSONOK(),
- * context.go:243-245's `{"ok":true}` dummy, repo.go:507-515).
+ * context.go:243-245's `{"ok":true}` dummy, repo.go:498-506 at
+ * 099abf5db4).
  *
  * ## Feed 1 JSON shape (the ported contract, byte-order included)
  *
@@ -41,9 +43,11 @@
  * — NO omitempty on any member, so all three keys always render (null /
  * "" when the repo has no status). The embedded repository is the
  * **zero-padded** `api.Repository`: the handler populates exactly ten
- * fields (repo.go:526-541 — ID, FullName, Fork, Private, Template,
- * Mirror, Stars, HTMLURL, Link, Internal) and Go marshals the REST of
- * structs.Repository (modules/structs/repo.go:58-134, almost no
+ * fields (repo.go:517-532 at 099abf5db4 — ID, FullName, Fork,
+ * Private, Template, Mirror, Stars, HTMLURL, Link, Internal) and Go
+ * marshals the REST of structs.Repository (modules/structs/repo.go:
+ * 58-136 at 099abf5db4 — the RE-PIN window added the two plain-string
+ * creation-restriction fields at :128-130, 640cd615c4; almost no
  * omitempty) as zero values — `owner: null`, `name: ""`,
  * `stars_count` (Stars' json tag!) the populated number,
  * `created_at` Go-zero `0001-01-01T00:00:00Z`, `topics: null` /
@@ -53,25 +57,32 @@
  * from it — web_src/js/components/DashboardRepoList.vue:16-34,300-311);
  * this module emits the full zero-padded object in the Go struct's
  * marshal order. Field mapping for the ten: full_name =
- * `ownerNamespace/slug` (FullName(), models/repo/repo.go:339-341);
+ * `ownerNamespace/slug` (FullName(), models/repo/repo.go:340-342 at
+ * 099abf5db4);
  * html_url = absolute `origin/owner/slug` (HTMLURL →
- * MakeAbsoluteURL(Link()), repo.go:344-348); link = `/owner/slug`
- * (Link(), repo.go:559-561 — AppSubURL "", PathEscape'd segments);
+ * MakeAbsoluteURL(Link()), repo.go:345-349); link = `/owner/slug`
+ * (Link(), repo.go:560-562 at 099abf5db4 — AppSubURL "", PathEscape'd
+ * segments);
  * internal = public repo under a private-visibility OWNER
  * (repo.go:539 — `!IsPrivate && Owner.Visibility ==
  * api.VisibleTypePrivate`; our users.visibility "private" column);
  * stars_count = the maintained `num_stars` column.
  *
- * `latest_commit_status` is the DEFAULT-BRANCH-TIP combined status,
- * marshaled as the raw `git_model.CommitStatus` MODEL — the model
- * carries NO json tags (models/git/commit_status.go:37-57), so the
- * wire keys are the Go FIELD NAMES (`State`, `TargetURL`, … exactly
- * what DashboardRepoList.vue:309-310 reads). Both upstream resolution
- * paths materialize the same subset (services/repository/commitstatus/
- * commitstatus.go:120-186): latest-per-context statuses of the tip SHA
- * ordered id-DESC → CalcCommitStatus (models/git/commit_status.go:265-
- * 285) — RepoID/SHA from the newest row, State = states.Combine() (the
- * landed combineCommitStatusStates port), TargetURL = first non-empty.
+ * `latest_commit_status` is the DEFAULT-BRANCH-TIP combined status.
+ * RE-PIN SHAPE CHANGE (fc49368845 → 099abf5db4, 0a66642da0): upstream
+ * used to marshal the raw `git_model.CommitStatus` MODEL (no json
+ * tags — Go field names on the wire); the dashboard only consumed
+ * State + TargetURL, so the response now carries the narrowed
+ * `repo_service.WebSearchCommitStatus` (services/repository/
+ * repository.go:36-40) — exactly `{ "state": …, "target_url": … }`,
+ * json-tagged lowercase keys, populated from CalcCommitStatus' combined
+ * row (State = states.Combine(), the landed combineCommitStatusStates
+ * port; TargetURL = first non-empty; the resolver arms unchanged,
+ * services/repository/commitstatus/commitstatus.go:120-186 — the tip
+ * SHA's latest-per-context statuses, id-DESC). DashboardRepoList.vue
+ * reads `.state`/`.target_url` at this pin
+ * (web_src/js/components/DashboardRepoList.vue:309-310) — the vendored
+ * frontend we serve REQUIRES the new keys.
  * Upstream renders `locale_latest_commit_status` via
  * `repo.commitstatus.<state>` locale keys (models/git/commit_status.go:
  * 217-219): Pending/Success/Error/Failure exist (options/locale/
@@ -193,11 +204,15 @@ import { repoTopics, type CommitStatusRow } from "../../db/schema";
 // ---------------------------------------------------------------------------
 
 /** The zero-padded `api.Repository` of a web-search row — every key of
- *  structs.Repository (repo.go:58-134) in Go marshal order, the omitempty
- *  members omitted (Parent/Permissions/InternalTracker/ExternalTracker/
- *  ExternalWiki/RepoTransfer are nil pointers, DefaultTargetBranch ""),
- *  the ten handler-populated fields live, everything else the zero value
- *  Go emits (repo.go:526-541 + structs/repo.go:58-134). */
+ *  structs.Repository (structs/repo.go:58-136 at 099abf5db4) in Go
+ *  marshal order, the omitempty members omitted
+ *  (Parent/Permissions/InternalTracker/ExternalTracker/ExternalWiki/
+ *  RepoTransfer are nil pointers, DefaultTargetBranch ""), the ten
+ *  handler-populated fields live, everything else the zero value Go
+ *  emits (repo.go:517-532 + structs/repo.go:58-136 — including the two
+ *  RE-PIN-window plain-string fields `issues_creation_restriction` /
+ *  `pull_requests_creation_restriction` (:128-130, no omitempty), which
+ *  marshal "" here because the web handler never sets them). */
 export interface WebSearchAuxRepository {
   id: number;
   owner: null;
@@ -233,6 +248,7 @@ export interface WebSearchAuxRepository {
   archived_at: typeof GO_ZERO_TIME;
   has_code: false;
   has_issues: false;
+  issues_creation_restriction: "";
   has_wiki: false;
   has_pull_requests: false;
   has_projects: false;
@@ -255,6 +271,7 @@ export interface WebSearchAuxRepository {
   default_update_style: "";
   squash_merge_commit_message: "";
   default_allow_maintainer_edit: false;
+  pull_requests_creation_restriction: "";
   avatar_url: "";
   internal: boolean;
   mirror_interval: "";
@@ -265,29 +282,18 @@ export interface WebSearchAuxRepository {
   licenses: null;
 }
 
-/** The raw `git_model.CommitStatus` MODEL marshal (models/git/
- *  commit_status.go:37-57 — zero json tags, Go field names on the wire),
- *  carrying CalcCommitStatus' populated subset
- *  (commit_status.go:265-285). `Repo`/`Creator` are the xorm-ignored
- *  pointers: upstream re-arms `Repo` with the full repo model
- *  (commitstatus.go:168/184) — internals our D1 rows cannot carry, so
- *  the port renders null (the vendored frontend reads only State and
- *  TargetURL off this object, DashboardRepoList.vue:309-310). */
+/** `repo_service.WebSearchCommitStatus` (services/repository/
+ *  repository.go:36-40) — the RE-PIN-narrowed latest_commit_status
+ *  payload (0a66642da0): upstream marshaled the whole
+ *  `git_model.CommitStatus` model here (Go field names, no json tags);
+ *  the dashboard only consumed State + TargetURL, so the wire now
+ *  carries exactly these two json-tagged keys. CalcCommitStatus
+ *  (models/git/commit_status.go:265-285) still produces the combined
+ *  row — only its State and first-non-empty TargetURL survive to the
+ *  wire (repo.go:537-545). */
 export interface WebSearchAuxCommitStatus {
-  ID: number;
-  RepoID: number;
-  SHA: string;
-  Index: number;
-  Repo: null;
-  State: string;
-  TargetURL: string;
-  Description: string;
-  ContextHash: string;
-  Context: string;
-  Creator: null;
-  CreatorID: number;
-  CreatedUnix: number;
-  UpdatedUnix: number;
+  state: string;
+  target_url: string;
 }
 
 /** `WebSearchRepository` (services/repository/repository.go:36-41) — no
@@ -441,8 +447,9 @@ function repoIdNumber(id: string): number {
 
 /** CalcCommitStatus (models/git/commit_status.go:265-285) over the
  *  latest-per-context rows (id-DESC order — the landed
- *  latestCommitStatuses read): the newest row carries RepoID/SHA, the
- *  states combine worst-of, the first non-empty TargetURL wins. */
+ *  latestCommitStatuses read), projected onto the narrowed
+ *  WebSearchCommitStatus wire (0a66642da0): the states combine
+ *  worst-of, the first non-empty target_url wins. */
 function calcCommitStatusShell(rows: CommitStatusRow[]): WebSearchAuxCommitStatus | null {
   const newest = rows[0];
   if (newest === undefined) return null;
@@ -453,21 +460,11 @@ function calcCommitStatusShell(rows: CommitStatusRow[]): WebSearchAuxCommitStatu
       break;
     }
   }
+  // The narrowed WebSearchCommitStatus: only the combined state and the
+  // first-non-empty target URL survive to the wire (repo.go:540-543).
   return {
-    ID: 0,
-    RepoID: repoIdNumber(newest.repoId),
-    SHA: newest.sha,
-    Index: 0,
-    Repo: null,
-    State: combineCommitStatusStates(rows.map((row) => row.state)),
-    TargetURL: targetUrl,
-    Description: "",
-    ContextHash: "",
-    Context: "",
-    Creator: null,
-    CreatorID: 0,
-    CreatedUnix: 0,
-    UpdatedUnix: 0,
+    state: combineCommitStatusStates(rows.map((row) => row.state)),
+    target_url: targetUrl,
   };
 }
 
@@ -490,7 +487,8 @@ function localeCommitStatus(state: string): string {
 /** The zero-padded api.Repository for one resolved row — the ten live
  *  fields (repo.go:526-541) over the struct's zero values
  *  (structs/repo.go:58-134). full_name/link/html_url mirror upstream's
- *  FullName()/Link()/HTMLURL() (models/repo/repo.go:339-348,559-561 —
+ *  FullName()/Link()/HTMLURL() (models/repo/repo.go:340-349,560-562 at
+ *  099abf5db4 —
  *  AppSubURL "", PathEscape'd segments, MakeAbsoluteURL against the
  *  request origin); internal is the private-visibility-owner arm
  *  (repo.go:539); stars_count is the maintained num_stars column. */
@@ -532,6 +530,7 @@ function webSearchAuxRepository(row: RepositoryWithOwner, origin: string): WebSe
     archived_at: GO_ZERO_TIME,
     has_code: false,
     has_issues: false,
+    issues_creation_restriction: "",
     has_wiki: false,
     has_pull_requests: false,
     has_projects: false,
@@ -554,6 +553,7 @@ function webSearchAuxRepository(row: RepositoryWithOwner, origin: string): WebSe
     default_update_style: "",
     squash_merge_commit_message: "",
     default_allow_maintainer_edit: false,
+    pull_requests_creation_restriction: "",
     avatar_url: "",
     internal: row.repo.visibility === "public" && row.owner.visibility === "private",
     mirror_interval: "",
@@ -630,7 +630,7 @@ export async function loadRepoSearchAux(
     data.push({
       repository: webSearchAuxRepository(row, viewer.origin),
       latest_commit_status: status,
-      locale_latest_commit_status: status === null ? "" : localeCommitStatus(status.State),
+      locale_latest_commit_status: status === null ? "" : localeCommitStatus(status.state),
     });
   }
   return { total, data };
@@ -649,12 +649,14 @@ function auxJsonHeaders(total: number): HeadersInit {
   };
 }
 
-/** The full search response (repo.go:543-546's WebSearchResults JSON). */
+/** The full search response (repo.go:534-537 at 099abf5db4's WebSearchResults
+ *  JSON). */
 export function repoSearchAuxResponse(total: number, payload: WebSearchAuxResults): Response {
   return new Response(JSON.stringify(payload), { status: 200, headers: auxJsonHeaders(total) });
 }
 
-/** The count_only arm (repo.go:507-515): SetTotalCountHeader + JSONOK —
+/** The count_only arm (repo.go:498-506 at 099abf5db4): SetTotalCountHeader +
+ *  JSONOK —
  *  context.go:243-245's exact `{"ok":true}` dummy body. */
 export function repoSearchCountOnlyResponse(total: number): Response {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: auxJsonHeaders(total) });

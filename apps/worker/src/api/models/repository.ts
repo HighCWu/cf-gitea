@@ -32,6 +32,20 @@ export const internalTrackerSchema = z.object({
     .boolean()
     .optional()
     .openapi({ description: "Let only contributors track time (Built-in issue tracker)" }),
+  // The 640cd615c4 creation gate (RE-PIN window): "reader" (default, any user
+  // with read access), "member" (must be a collaborator with read access) or
+  // "writer" (must be a collaborator with write access). Upstream applies it
+  // through the PATCH internal_tracker object (repo.go:768 — merged over the
+  // loaded IssuesConfig, default CreationRestrictionReader); our tree has no
+  // issues-unit config store yet (census B-33), so the accepted-and-ignored
+  // posture covers this field too.
+  creation_restriction: z
+    .string()
+    .optional()
+    .openapi({
+      description:
+        'who is allowed to create issues: "reader" (default, any user with read access), "member" (must be a collaborator with read access) or "writer" (must be a collaborator with write access).',
+    }),
   enable_issue_dependencies: z
     .boolean()
     .optional()
@@ -87,10 +101,14 @@ export type RepoTransfer = z.infer<typeof repoTransferSchema>;
 /**
  * Mirror of the vendored contract's `Repository` definition
  * (gitea/templates/swagger/v1-swagger.generated.json
- * #/definitions/Repository) — all 71 properties, field-for-field including
+ * #/definitions/Repository) — all 73 properties, field-for-field including
  * formats, enums, and descriptions. The contract declares no `required`
  * fields; the schema mirrors that literally (the contract check diffs
- * declarations against the vendored file, not runtime).
+ * declarations against the vendored file, not runtime). The 71 → 73 growth
+ * is the RE-PIN window's 640cd615c4 creation-restriction pair
+ * (`issues_creation_restriction` / `pull_requests_creation_restriction`,
+ * serialized from the unit configs at convert/repository.go:238/:265 with
+ * the "reader" default).
  *
  * `parent` is the one recursive reference (`#/definitions/Repository` →
  * `Repository`): the string-form `openapi("Repository")` registers
@@ -143,6 +161,10 @@ export const repositorySchema = z
   ignore_whitespace_conflicts: z.boolean().optional(),
   internal: z.boolean().optional(),
   internal_tracker: internalTrackerSchema.optional(),
+  issues_creation_restriction: z
+    .string()
+    .optional()
+    .openapi({ description: 'who is allowed to create issues: "reader", "member" or "writer"' }),
   language: z.string().optional(),
   languages_url: z.string().optional(),
   licenses: z.array(z.string()).optional(),
@@ -164,6 +186,10 @@ export const repositorySchema = z
   permissions: permissionSchema.optional(),
   private: z.boolean().optional(),
   projects_mode: z.string().optional(),
+  pull_requests_creation_restriction: z
+    .string()
+    .optional()
+    .openapi({ description: 'who is allowed to create pull requests: "reader", "member" or "writer"' }),
   release_counter: z.number().int().optional().openapi({ format: "int64" }),
   repo_transfer: repoTransferSchema.optional(),
   size: z.number().int().optional().openapi({ format: "int64" }),
@@ -243,7 +269,7 @@ export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;
 
 /**
  * Mirror of the vendored contract's `EditRepoOption`
- * (#/definitions/EditRepoOption) — all 39 properties, field-for-field.
+ * (#/definitions/EditRepoOption) — all 40 properties, field-for-field.
  * `PATCH /repos/{owner}/{repo}` (repoEdit) applies the MEANINGFUL SUBSET the
  * D1 registry can store today and accepts-and-ignores the rest, exactly like
  * the converter's TODO(SPEC-0005) zero-defaults (routes/repo.ts documents
@@ -263,18 +289,23 @@ export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;
  *    `default_allow_maintainer_edit`, `default_merge_style`,
  *    `default_update_style`, `squash_merge_commit_message`,
  *    `ignore_whitespace_conflicts` — the repo_units 'pull_requests' row's
- *    PullRequestsConfig, upstream updateRepoUnits repo.go:855-966) and
- *    `projects_mode` (the 'projects' row's ProjectsConfig, repo.go:968-989);
+ *    PullRequestsConfig, upstream updateRepoUnits repo.go:815-930 at
+ *    099abf5db4) and
+ *    `projects_mode` (the 'projects' row's ProjectsConfig, repo.go:932-953);
  *  - accepted-and-ignored (no store yet — SPEC-0005 sweep): `has_code`
  *    (needs the creation-seeded code unit row — see services/repo-settings.ts;
  *    census B-32) and the `external_tracker`/`external_wiki`/
  *    `internal_tracker` objects (upstream applies them WITH validation,
- *    repo.go:761-835 — census B-33);
+ *    repo.go:729-795 at 099abf5db4 — census B-33; the window's 640cd615c4 deepened B-33's
+ *    residue — `internal_tracker.creation_restriction` and
+ *    `pull_requests_creation_restriction` now carry the issues/PR creation
+ *    gate through this very object, repo.go:768/:856, so the B-33 port is
+ *    also the creation-gate settings seam);
  *  - applied since the mirror-settings wave (routes/repo.ts
- *    updateMirrorSettings, repo.go:1023-1135): the five mirror fields
+ *    updateMirrorSettings, repo.go:989-1101 at 099abf5db4): the five mirror fields
  *    (`mirror_interval`, `enable_prune`, `mirror_username`/
  *    `mirror_password`/`mirror_token`) — silently skipped for non-mirrors,
- *    which is upstream's own posture (repo.go:1029-1033).
+ *    which is upstream's own posture (repo.go:995-997).
  */
 export const editRepoOptionSchema = z.object({
   allow_fast_forward_only_merge: z
@@ -367,6 +398,13 @@ export const editRepoOptionSchema = z.object({
     .string()
     .optional()
     .openapi({ description: "`repo` to only allow repo-level projects, `owner` to only allow owner projects, `all` to allow both." }),
+  pull_requests_creation_restriction: z
+    .string()
+    .optional()
+    .openapi({
+      description:
+        'who is allowed to create pull requests: "reader" (default, any user with read access), "member" (must be a collaborator with read access) or "writer" (must be a collaborator with write access).',
+    }),
   squash_merge_commit_message: z
     .string()
     .optional()

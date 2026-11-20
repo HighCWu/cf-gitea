@@ -129,10 +129,13 @@ async function ensureSmokeFixture(): Promise<{ repo1Id: string; repo2Id: string;
   return { repo1Id: repo1.id, repo2Id, tip, aliceId: alice.id };
 }
 
-let fixture: Awaited<ReturnType<typeof ensureSmokeFixture>>;
+let _fixture: Awaited<ReturnType<typeof ensureSmokeFixture>>;
 
 beforeAll(async () => {
-  fixture = await ensureSmokeFixture();
+  // The fixture's rows/tip/statuses drive the seeded environment itself;
+  // the narrowed WebSearchAuxItem shape no longer exposes tip/SHA reads
+  // (0a66642da0), so the handle is only awaited for its side effects.
+  _fixture = await ensureSmokeFixture();
 });
 
 // --- feed 1: GET /repo/search ---------------------------------------------------
@@ -176,9 +179,13 @@ describe("GET /repo/search (repo.SearchRepo) — smoke", () => {
     expect(first?.repository.licenses).toBeNull();
 
     expect(first?.latest_commit_status).not.toBeNull();
-    expect(first?.latest_commit_status?.State).toBe("success");
-    expect(first?.latest_commit_status?.TargetURL).toBe("https://ci.example/run/1");
-    expect(first?.latest_commit_status?.SHA).toBe(fixture.tip);
+    // The RE-PIN-narrowed WebSearchCommitStatus ({state, target_url}
+    // only, 0a66642da0 — the pre-repin raw CommitStatus model marshal
+    // carried SHA and the rest of the Go fields, gone upstream).
+    expect(first?.latest_commit_status).toEqual({
+      state: "success",
+      target_url: "https://ci.example/run/1",
+    });
     expect(first?.locale_latest_commit_status).toBe("Success");
 
     const second = body.data[1];

@@ -298,11 +298,21 @@ describe("GET /repo/search through the mounted route", () => {
     ]);
     // The private row rides for its owner (private=true on the wire).
     expect(body.data[2]?.repository.private).toBe(true);
-    // The pushed row carries the tip's combined status; the D1-only rows
-    // render the no-omitempty nulls.
-    expect(body.data[1]?.latest_commit_status?.State).toBe("success");
-    expect(body.data[1]?.latest_commit_status?.TargetURL).toBe("https://ci.example/auxjson/1");
-    expect(body.data[1]?.latest_commit_status?.SHA).toBe(fixture.tip);
+    // The RE-PIN-window plain-string fields (structs/repo.go:128-130,
+    // 640cd615c4 — no omitempty) marshal as Go-zero "" on this envelope:
+    // the web handler populates only the ten live fields and never sets
+    // these (repo.go:517-532 at 099abf5db4).
+    expect(body.data[0]?.repository.issues_creation_restriction).toBe("");
+    expect(body.data[0]?.repository.pull_requests_creation_restriction).toBe("");
+    // The pushed row carries the tip's combined status — the RE-PIN
+    // narrowed WebSearchCommitStatus ({state, target_url} only,
+    // 0a66642da0: the pre-repin raw-model marshal carried SHA and the
+    // rest of the Go fields, gone upstream); the D1-only rows render the
+    // no-omitempty nulls.
+    expect(body.data[1]?.latest_commit_status).toEqual({
+      state: "success",
+      target_url: "https://ci.example/auxjson/1",
+    });
     expect(body.data[1]?.locale_latest_commit_status).toBe("Success");
     expect(body.data[0]?.latest_commit_status).toBeNull();
     expect(body.data[0]?.locale_latest_commit_status).toBe("");

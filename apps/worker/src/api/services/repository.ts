@@ -64,8 +64,8 @@ export type RepoMirrorRow = typeof repoMirrors.$inferSelect;
 
 /**
  * `{origin}/api/v1/repos/{owner}/{repo}` — upstream `Repository.APIURL`
- * (models/repo/repo.go:362–365); the prefix of every repo-scoped API URL
- * (labels, statuses, …).
+ * (models/repo/repo.go:363–366 at 099abf5db4); the prefix of every repo-scoped
+ * API URL (labels, statuses, …).
  */
 export function apiRepositoryUrl(pair: RepositoryWithOwner, origin: string): string {
   return `${origin}/api/v1/repos/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
@@ -841,9 +841,9 @@ export function releaseCountSubquery(repoId: SQL | AnySQLiteColumn): SQL<number>
 }
 
 /**
- * Upstream `Repository.SanitizedOriginalURL` (models/repo/repo.go:227-234):
- * "" when the column is empty (the API model's optional field folds
- * `undefined` in), else the URL re-serialized with its userinfo
+ * Upstream `Repository.SanitizedOriginalURL` (models/repo/repo.go:228-235 at
+ * 099abf5db4): "" when the column is empty (the API model's optional field
+ * folds `undefined` in), else the URL re-serialized with its userinfo
  * stripped (`util.SanitizeURL`, modules/util/url.go:21-28 — `u.User = nil`).
  * Go swallows the parse error into the nil-URL "" too, so any value WHATWG
  * `new URL` rejects (e.g. scp-style `git@host:p`) degrades to "" — upstream's
@@ -852,8 +852,10 @@ export function releaseCountSubquery(repoId: SQL | AnySQLiteColumn): SQL<number>
  * / services/mirror.ts `source.sanitized` — making this render pass defensive
  * and idempotent). NOT mirror-gated: upstream renders the field for any repo
  * with a non-empty column — migrations set OriginalURL at create for plain
- * imports too (services/repository/create.go:236, adopt.go:57;
- * convert/repository.go:215 has no IsMirror arm).
+ * imports too (services/repository/create.go:220, the
+ * `OriginalURL: opts.OriginalURL` struct literal; the adopt.go writer the
+ * pre-repin cite named is DELETED upstream — the 1554b6c939 adopt-feature
+ * removal; convert/repository.go:215's twin has no IsMirror arm either).
  */
 export function sanitizedOriginalUrl(raw: string | null | undefined): string {
   if (raw === null || raw === undefined || raw === "") {
@@ -1033,6 +1035,15 @@ export function toApiRepository(
     permissions: repositoryPermissions(viewer, row, teamMode),
     has_code: true,
     has_issues: settings?.hasIssues ?? true,
+    // Upstream `IssuesCreationRestriction: issuesCreationRestriction`
+    // (convert/repository.go:238, the 640cd615c4 creation gate): the issues
+    // unit's IssuesConfig.CreationRestriction, "reader" when the unit is
+    // missing (convert/repository.go:63). Our tree has no issues-unit config
+    // store (the internal_tracker object is accepted-and-ignored, census
+    // B-33), so "reader" is the only reachable value — the constant stands
+    // until the B-33 unit-config seam lands (then this reads the stored
+    // config like the prUnit family below).
+    issues_creation_restriction: "reader",
     internal_tracker: {
       enable_time_tracker: true,
       allow_only_contributors_to_track_time: true,
@@ -1073,6 +1084,18 @@ export function toApiRepository(
     default_update_style: settings?.prUnit.DefaultUpdateStyle ?? DEFAULT_UPDATE_STYLE,
     squash_merge_commit_message: settings?.prUnit.DefaultSquashMergeMessage ?? DEFAULT_SQUASH_MERGE_MESSAGE,
     default_allow_maintainer_edit: settings?.prUnit.DefaultAllowMaintainerEdit ?? true,
+    // Upstream `PullRequestsCreationRestriction:
+    // pullRequestsCreationRestriction` (convert/repository.go:265, the
+    // 640cd615c4 creation gate): the PR unit's PullRequestsConfig.
+    // CreationRestriction, "reader" when the unit is missing
+    // (convert/repository.go:114). The stored prUnit config's type carries
+    // no CreationRestriction member yet — the apply arm (repo.go:856) is the
+    // repo-settings-family seam (PATCH accepts the field per the contract
+    // and ignores it, the B-33 posture) — so "reader" is the only reachable
+    // value and the constant is behaviorally exact for every storable state;
+    // it reads the stored config once the settings-family type grows the
+    // member.
+    pull_requests_creation_restriction: "reader",
     // FN-4: `AvatarURL: repo.AvatarLink(ctx)` (convert/repository.go:259;
     // models/repo/avatar.go:85-91 + relAvatarLink :66-84 — the stored avatar
     // KEY's `/repo-avatars/<key>` absolute URL, "" under the default fallback
@@ -2046,7 +2069,9 @@ export async function listUserRepositories(
  * middleware; a token user without a D1 row owns nothing (empty list).
  *
  * RESTRICTED doers need no arm here: upstream routes this listing through
- * `SearchRepository` (ListMyRepos, user/repo.go:106-114), whose :516-518
+ * `SearchRepository` (ListMyRepos, user/repo.go:106-114), whose :517-519 at
+ * 099abf5db4 (moved +1 in the window; the same commit also fixed ListMyRepos'
+ * missing `return` after APIErrorInternal — a loop bug our port never had)
  * restricted AND intersects the owner block with the restricted ARC — but
  * the ARC always contains the own arm (repo_list.go:693), so the AND never
  * drops an owned row (the landed own-only shape is ARC-stable under both

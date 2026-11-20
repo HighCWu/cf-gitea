@@ -49,6 +49,7 @@ import {
 import { switchSchedulesToDefaultBranch } from "../../services/actions/schedule";
 import { notifyRepoPendingTransfer } from "../../services/mail/notify";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
+import { AuditActions, emitAudit } from "../../services/audit";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
 import { engineCell, engineReads } from "../services/engine";
 import {
@@ -82,19 +83,20 @@ import {
  * repoEdit applies the meaningful EditRepoOption subset (the model file
  * documents the accepted-and-ignored remainder): rename via the landed
  * repos service, visibility flip (the fork↔base coupling — a fork's
- * `private` is forced to its base's value, repo.go:673-679 — with the full
+ * `private` is forced to its base's value, repo.go:646-652 at 099abf5db4 —
+ * with the full
  * setRepoVisibility port in the service: the private-flip star/watch
  * zeroing, repository.go:172-181, and the fork-tree cascade,
  * repository.go:184-200), default branch (D1 + best-effort engine
  * setHead), archived flip (with the mirror refusal — updateRepoArchivedState
- * repo.go:985-992), the template flag (D1-only — upstream
- * updateBasicProperties repo.go:699-701), and the stored settings subset;
+ * repo.go:948-955 at 099abf5db4), the template flag (D1-only — upstream
+ * updateBasicProperties repo.go:666-668), and the stored settings subset;
  * since the repoEdit parity wave that subset includes the PR-merge
  * configuration family + projects_mode (the repo_units config carriers,
- * updateRepoUnits repo.go:754-985 — services/repo-settings.ts); since the
+ * updateRepoUnits repo.go:722-946 — services/repo-settings.ts); since the
  * mirror-settings wave it also includes the five mirror fields
  * (`mirror_interval`/`enable_prune`/`mirror_username`/`mirror_password`/
- * `mirror_token` — upstream updateMirror repo.go:1023-1135, SPEC-0009
+ * `mirror_token` — upstream updateMirror repo.go:989-1101, SPEC-0009
  * §2.3.1); upstream registers NO mustNotBeArchived on this PATCH, so 423 is
  * never emitted here.
  * repoDelete runs the landed §2.5.5 pipeline (D1 cascade → DO tombstone →
@@ -604,7 +606,7 @@ export function registerRepoRoutes(
       }
 
       // Private flip — the fork↔base coupling first (updateBasicProperties,
-      // repo.go:673-679): a fork's visibility is FORCED to its base's — a
+      // repo.go:646-652 at 099abf5db4): a fork's visibility is FORCED to its base's — a
       // requested `private` on a fork is replaced by the base's value before
       // the change detection, so an out-of-step request is a silent no-op
       // re-rendering the base's posture (a fork may neither out-privacy nor
@@ -636,7 +638,8 @@ export function registerRepoRoutes(
 
       // Default branch: D1 value + the engine setHead best-effort (the
       // service logs, never throws). The existence gate ports upstream's
-      // `repo.IsEmpty || git.IsBranchExist(...)` conjunct (repo.go:713-746):
+      // `repo.IsEmpty || git.IsBranchExist(...)` conjunct (repo.go:680-714 at
+      // 099abf5db4):
       // on a NON-EMPTY repo an unknown target branch SKIPS the change
       // silently — the PATCH answers 200 re-rendering the OLD default (no
       // error arm exists upstream either); an empty repo applies
@@ -657,11 +660,11 @@ export function registerRepoRoutes(
           // re-walks the NEW default (updated's defaultBranch is already the
           // new name — upstream's model mutation, repo.go:718). Fires for
           // empty repos too (upstream gates only on oldDefaultBranch != ""
-          // — repo.go:732-733), which this block's landing condition already
+          // — repo.go:699-700 at 099abf5db4), which this block's landing condition already
           // is. The switch is log-and-continue internally (each step's error
           // is logged upstream, :68-76) — it never fails the PATCH.
           await switchSchedulesToDefaultBranch(c.env, updated, found.repo.defaultBranch);
-          // The default-branch license arm (repo.go:713-746): upstream's
+          // The default-branch license arm (repo.go:680-714 at 099abf5db4): upstream's
           // enqueuer fires ONLY when the change LANDED — the target branch
           // exists (or the repo is empty) and the repo is non-empty (the
           // `!repo.IsEmpty` SetDefaultBranch leg feeding
@@ -700,24 +703,54 @@ export function registerRepoRoutes(
 
       // Archived flip (repositories.is_archived, SPEC-0003 §2.4 row 10).
       // Upstream's mirror refusal rides FIRST (updateRepoArchivedState,
-      // repo.go:985-992: `repo is a mirror, cannot archive/un-archive`,
-      // 422 through ctx.APIError — a declared-422 validationError).
+      // repo.go:953 at 099abf5db4: `repo is a mirror, cannot
+      // archive/un-archive`, 422 through ctx.APIError — a declared-422
+      // validationError).
       if (form.archived !== undefined && found.repo.isMirror) {
         throw new ApiError(422, "repo is a mirror, cannot archive/un-archive");
       }
       if (form.archived !== undefined && form.archived !== found.repo.isArchived) {
         // The landed SetArchiveRepo port (repo-settings.ts) — now also the
         // API arm's schedule-clean seam: upstream's updateRepoArchivedState
-        // tail-calls CleanRepoScheduleTasks on archive (repo.go:1002-1005),
-        // which the shared write carries internally.
+        // tail-calls CleanRepoScheduleTasks on archive (repo.go:966-968 at
+        // 099abf5db4), which the shared write carries internally. The
+        // equality gate mirrors upstream's RE-PIN-window no-op short-circuit
+        // (e5b1ac76f9, repo.go:957-958: `*opts.Archived == repo.IsArchived`
+        // returns early — no state write, no schedule churn, no audit row).
         await setRepoArchived(c.env.DB, found.repo.id, form.archived, now);
+        // The audit arms upstream records on this path (e5b1ac76f9,
+        // repo.go:969/:982 — `audit.Record(ctx,
+        // audit_model.RepositoryArchive|RepositoryUnarchive, repo)`), fired
+        // AFTER the flip lands. Upstream's writeEvent swallows insert
+        // failures with a log line (services/audit/event.go:139-141 —
+        // "audit recording must never crash the request"), so the emit is
+        // caught-and-logged and the PATCH outcome stands either way.
+        const actor = c.get("authUser");
+        const scopeName = `${found.repo.ownerNamespace}/${found.repo.slug}`;
+        try {
+          await emitAudit(drizzle(c.env.DB), {
+            action: form.archived ? AuditActions.RepositoryArchive : AuditActions.RepositoryUnarchive,
+            actorId: actor?.id ?? 0,
+            actorName: actor?.login ?? "",
+            scopeType: "repository",
+            scopeId: found.repo.id,
+            scopeName,
+            origin: "api",
+            vars: { scope: scopeName },
+          });
+        } catch (error) {
+          console.error(
+            `[repos] audit emit failed for ${form.archived ? "archive" : "unarchive"} of ${scopeName}: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
 
       // Mirror settings (SPEC-0009 §2.3.1): upstream dispatches updateMirror
       // when ANY of the five EditRepoOption mirror fields is present
-      // (repo.go:620-628), AFTER updateRepoArchivedState — the same position.
+      // (repo.go:587-595 at 099abf5db4), AFTER updateRepoArchivedState — the same position.
       // NOT a mirror → the service returns null and the PATCH carries on
-      // SILENTLY (repo.go:1029-1033: "Skip this update if the repo is not a
+      // SILENTLY (repo.go:995-997 at 099abf5db4: "Skip this update if the repo is not a
       // mirror, do not return error") — no refusal exists upstream either.
       // The interval arm re-arms the sync inside the service
       // (ScheduleNextUpdate, mirror.go:71-77); credentials re-seal the §4.2
@@ -751,10 +784,10 @@ export function registerRepoRoutes(
         }
       }
 
-      // Template flag (upstream updateBasicProperties, repo.go:699-701:
+      // Template flag (upstream updateBasicProperties, repo.go:666-668 at 099abf5db4:
       // `if opts.Template != nil { repo.IsTemplate = *opts.Template }`,
       // persisted by UpdateRepository at repo.go:727). D1-only — the flag
-      // gates generateRepo's eligibility check (repo.go:349) and the render;
+      // gates generateRepo's eligibility check (repo.go:328) and the render;
       // there is no engine seam (REDEPLOY11 open issue 2: the silent drop
       // made upstream's "mark a repo a template via API" flow unreachable).
       if (form.template !== undefined && form.template !== found.repo.isTemplate) {
@@ -766,7 +799,7 @@ export function registerRepoRoutes(
 
       // The stored settings subset: description/website + has_* unit flags,
       // now including the PR-merge configuration and projects_mode (the
-      // repoEdit parity wave — upstream updateRepoUnits, repo.go:754-985,
+      // repoEdit parity wave — upstream updateRepoUnits, repo.go:722-946 at 099abf5db4,
       // the review's E3 accepted-and-ignored drift closed). The stored
       // settings are read FIRST: the merge-flag merge and the update-style
       // validation both run against the would-be config (upstream's
@@ -786,7 +819,7 @@ export function registerRepoRoutes(
       // The PR-unit merge configuration (EditRepoOption's allow_-prefixed
       // and default_-prefixed fields → PullRequestsConfig). Upstream
       // short-circuits the whole config block when has_pull_requests is
-      // EXPLICITLY false (mustDeletePullRequestUnit, repo.go:843-846) — a
+      // EXPLICITLY false (mustDeletePullRequestUnit, repo.go:826-829 at 099abf5db4) — a
       // body carrying both persists the delete and silently drops the
       // flags, faithfully.
       if (form.has_pull_requests !== false) {
@@ -843,7 +876,7 @@ export function registerRepoRoutes(
       // structs/repo.go:225-227): the binding validates the value whenever
       // present (422 validationError on a miss), but the CONFIG ARM only
       // runs when has_projects=true rides the SAME PATCH
-      // (updateRepoUnits, repo.go:968-989 — `opts.ProjectsMode != nil` is
+      // (updateRepoUnits, repo.go:932-953 at 099abf5db4 — `opts.ProjectsMode != nil` is
       // nested inside the `*opts.HasProjects` branch). A bare
       // projects_mode PATCH is a validated no-op, faithfully.
       if (form.projects_mode !== undefined && !PROJECTS_MODES.includes(form.projects_mode)) {

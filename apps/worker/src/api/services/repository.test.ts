@@ -398,6 +398,34 @@ describe("apiUserFromRow — the last_login authed gate (P3-7)", () => {
 // (services/convert/repository.go:161-166/222/228).
 // -----------------------------------------------------------------------------
 
+describe("the creation-restriction wire pair (RE-PIN 099abf5db4 — 640cd615c4)", () => {
+  it("issues_creation_restriction and pull_requests_creation_restriction render the reader default", async () => {
+    // Upstream serializes both from the unit configs with the "reader"
+    // fallback when the unit is missing (convert/repository.go:63/:114,
+    // rendered at :238/:265). Our tree has no issues-unit config store
+    // (census B-33) and the PR-unit config type carries no member yet (the
+    // settings seam), so "reader" is the only reachable value on either
+    // side — the constant render is behaviorally exact for every storable
+    // state; these pins break the day the seam lands, which is the point.
+    const owner = await seedVerifiedUser({ username: "wire_restriction" });
+    await seedRepo(owner.id, "wire_restriction", "restricted_shape", "public");
+    const pair = await findRepositoryByPath(env.DB, "wire_restriction", "restricted_shape");
+    if (pair === null) throw new Error("fixture repo missing");
+    const payload = await toApiRepositoryFull(env.DB, viewerFor(owner), pair);
+    expect(payload.issues_creation_restriction).toBe("reader");
+    expect(payload.pull_requests_creation_restriction).toBe("reader");
+    // The internal_tracker object still renders the default config WITHOUT
+    // the new member (the accepted-and-ignored object, census B-33 — the
+    // contract schema declares creation_restriction optional, our render
+    // omits it like upstream omits it for a nil pointer).
+    expect(payload.internal_tracker).toEqual({
+      enable_time_tracker: true,
+      allow_only_contributors_to_track_time: true,
+      enable_issue_dependencies: true,
+    });
+  });
+});
+
 describe("the repo wire counters — release_counter / branch_count / updated_at / sort=updated", () => {
   /** A release row with only the wire-relevant tri-state filled in. */
   async function seedRelease(
