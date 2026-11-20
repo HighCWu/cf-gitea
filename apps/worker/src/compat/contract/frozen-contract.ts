@@ -38,3 +38,28 @@ export function contractModelProperties(name: string): Record<string, Swagger2Sc
   }
   return properties;
 }
+
+/**
+ * Whether a route-declared response code is contract-conformant: the code is
+ * declared verbatim, OR it is an explicit 4xx/5xx on an op carrying the
+ * DEFAULT-FOLD shape. Upstream 5671c5192d folded the vendored copy's doc-only
+ * error responses into `default: #/responses/error` on every op shaped exactly
+ * {one 2xx, default} — provably doc-only at the route layer (the handlers
+ * still answer the pre-fold explicit codes), re-aligned as the fold-equivalence
+ * rule by 09c2b92. This mirrors scripts/check-openapi.mjs's
+ * `defaultFoldSuccessCode` acceptance for the route batteries: a fold-shape op
+ * accepts the route's explicit 4xx/5xx spellings; a different success code, or
+ * any extra code on a NON-fold op (multi-success / 3xx arms), stays a hard
+ * miss (those carry the documented RUNTIME_ONLY exceptions instead).
+ */
+export function contractAcceptsDeclaredCode(path: string, method: Swagger2Method, code: string): boolean {
+  const codes = new Set(Object.keys(contract.paths[path]?.[method]?.responses ?? {}));
+  if (codes.has(code)) {
+    return true;
+  }
+  if (codes.size !== 2 || !codes.has("default")) {
+    return false;
+  }
+  const [other] = [...codes].filter((entry) => entry !== "default");
+  return (other?.startsWith("2") ?? false) && (code.startsWith("4") || code.startsWith("5"));
+}

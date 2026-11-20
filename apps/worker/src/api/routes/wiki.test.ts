@@ -47,7 +47,7 @@ import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerWikiRoutes } from "./wiki";
-import { contract } from "../../compat/contract/frozen-contract";
+import { contract, contractAcceptsDeclaredCode } from "../../compat/contract/frozen-contract";
 import {
   createWikiPage,
   gitPathToWebPath,
@@ -242,9 +242,11 @@ describe("contract declaration", () => {
       const expected = contract.paths[path]?.[method];
       expect(expected, `contract ${method.toUpperCase()} ${path}`).toBeDefined();
       expect(declared?.operationId).toBe(expected?.operationId);
-      const contractCodes = Object.keys(expected?.responses ?? {});
       for (const code of Object.keys(declared?.responses ?? {})) {
-        expect(contractCodes, `${method.toUpperCase()} ${path} response ${code}`).toContain(code);
+        expect(
+          contractAcceptsDeclaredCode(path, method, code),
+          `${method.toUpperCase()} ${path} response ${code}: neither a contract status nor a fold-equivalent explicit error (the 09c2b92 default-fold rule)`,
+        ).toBe(true);
       }
     }
   });

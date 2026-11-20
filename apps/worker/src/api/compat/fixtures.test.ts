@@ -162,7 +162,11 @@ describe("contract quirks (SPEC-0004 §2.5)", () => {
       (op) => op.path === "/repos/{owner}/{repo}/pulls/{index}/merge" && op.method === "get",
     );
     expect(merge?.responses["204"]?.kind).toBe("empty");
-    expect(merge?.responses["404"]?.kind).toBe("empty");
+    // Re-pin note (5671c5192d, vendored at 099abf5db4): the op's explicit
+    // 404 notFound doc was folded into `default` — the fixture projects the
+    // contract verbatim, so the error arm is the default error-body now.
+    expect(merge?.responses["default"]?.kind).toBe("error-body");
+    expect(merge?.responses["404"]).toBeUndefined();
   });
 
   it("records pagination exactly on the contract's page+limit|per_page operations", () => {
@@ -217,12 +221,24 @@ describe("contract quirks (SPEC-0004 §2.5)", () => {
     expect(markdown?.responses["200"]?.kind).toBe("string");
   });
 
-  it("keeps the EmptyRepository 409 as a real APIError body (schema, not a header conversion)", () => {
+  it("pins the EmptyRepository 409 to the default error-body fold (5671c5192d)", () => {
+    // The pre-fold contract documented the empty-repo 409 explicitly
+    // (#/definitions/APIError schema); upstream 5671c5192d folded it into
+    // `default` doc-only — the runtime answer is unchanged: ctx.JSON(409,
+    // api.APIError{...}) (gitea/routers/api/v1/repo/commits.go:175-181), the
+    // exact {message, url} envelope the default error-body expectation
+    // asserts. The fixture projects the vendored contract verbatim, so the
+    // 409 is no longer an enumerated status.
     const commits = committed.operations.find(
       (op) => op.path === "/repos/{owner}/{repo}/commits" && op.method === "get",
     );
-    expect(commits?.responses["409"]).toMatchObject({ kind: "model", modelRef: "APIError" });
-    expect(commits?.responses["409"]?.convertedFromHeader).toBeUndefined();
+    expect(Object.keys(commits?.responses ?? {})).toEqual(["200", "default"]);
+    expect(commits?.responses["default"]).toMatchObject({
+      kind: "error-body",
+      modelRef: "APIError",
+      convertedFromHeader: true,
+    });
+    expect(commits?.responses["409"]).toBeUndefined();
   });
 });
 

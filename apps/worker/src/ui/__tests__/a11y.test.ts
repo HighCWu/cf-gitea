@@ -804,17 +804,24 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const header = descendants(root).find((el) => hasClass(el, "repo-header"));
     expect(header, "the repo header").toBeDefined();
     // The B-4 trio (Watch dropdown items + Star + Fork) renders between the
-    // breadcrumb and the tab strip — the anchors' aria-labels drive the names.
+    // breadcrumb and the tab strip. WATCHSHELL's port (upstream 8b48b45def):
+    // the four watch MODE items are button[type=button][role=menuitem] now —
+    // an href-less a[role=menuitem] is not focusable and screen readers never
+    // expose it as a button — so the header's ANCHOR set is the breadcrumb
+    // pair + Star + Fork, and the watch items pin as named buttons below.
     expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
       ["/alice", "alice"],
       ["/alice/golden-ms", "golden-ms"],
-      [undefined, "Participating and mentions"],
-      [undefined, "All activity"],
-      [undefined, "Ignore"],
-      [undefined, "Custom"],
       [undefined, "Star"],
       ["/alice/golden-ms/fork", "Fork0"],
     ]);
+    // The four watch mode items keep their names through the element swap —
+    // the same aria-labels on button[type=button][role=menuitem] (the
+    // dropdown trigger carries no role, so it stays out of this pin).
+    const watchItems = descendants(header ?? root).filter(
+      (el) => el.tag === "button" && el.attrs.type === "button" && el.attrs.role === "menuitem",
+    );
+    expect(watchItems.map((b) => accessibleName(b))).toEqual(["Participating and mentions", "All activity", "Ignore", "Custom"]);
     // The page's single heading is the milestone title (R1's exactly-one
     // holds here like home's README h1).
     const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
@@ -947,15 +954,24 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     // The repo header breadcrumb names owner and repo.
     const header = descendants(root).find((el) => hasClass(el, "repo-header"));
     expect(header, "the repo header").toBeDefined();
+    // WATCHSHELL's port (upstream 8b48b45def): the four watch MODE items are
+    // button[type=button][role=menuitem] now, so the header's ANCHOR set is
+    // the breadcrumb pair + Star + Fork; the watch items pin as named buttons
+    // right after (same derivation as milestone-detail's header pin).
     expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
       ["/alice", "alice"],
       ["/alice/golden", "golden"],
-      [undefined, "Participating and mentions"],
-      [undefined, "All activity"],
-      [undefined, "Ignore"],
-      [undefined, "Custom"],
       [undefined, "Star"],
       ["/alice/golden/fork", "Fork0"],
+    ]);
+    const wikiStartWatchItems = descendants(header ?? root).filter(
+      (el) => el.tag === "button" && el.attrs.type === "button" && el.attrs.role === "menuitem",
+    );
+    expect(wikiStartWatchItems.map((b) => accessibleName(b))).toEqual([
+      "Participating and mentions",
+      "All activity",
+      "Ignore",
+      "Custom",
     ]);
     // The start segment: the single heading (h2, no h1 on the page — R1's
     // at-most-one holds) plus the welcome line.
@@ -1060,15 +1076,24 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     // seeded sibling, not golden's empty-wiki start arm).
     const header = descendants(root).find((el) => hasClass(el, "repo-header"));
     expect(header, "the repo header").toBeDefined();
+    // WATCHSHELL's port (upstream 8b48b45def): the four watch MODE items are
+    // button[type=button][role=menuitem] now, so the header's ANCHOR set is
+    // the breadcrumb pair + Star + Fork; the watch items pin as named buttons
+    // right after (same derivation as milestone-detail's header pin).
     expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
       ["/alice", "alice"],
       ["/alice/golden-alt", "golden-alt"],
-      [undefined, "Participating and mentions"],
-      [undefined, "All activity"],
-      [undefined, "Ignore"],
-      [undefined, "Custom"],
       [undefined, "Star"],
       ["/alice/golden-alt/fork", "Fork0"],
+    ]);
+    const wikiViewWatchItems = descendants(header ?? root).filter(
+      (el) => el.tag === "button" && el.attrs.type === "button" && el.attrs.role === "menuitem",
+    );
+    expect(wikiViewWatchItems.map((b) => accessibleName(b))).toEqual([
+      "Participating and mentions",
+      "All activity",
+      "Ignore",
+      "Custom",
     ]);
     // The page's single heading is the CONTENT h1 (the markdown render's
     // `# Home`); the page title beside it is a plain div (upstream-faithful,

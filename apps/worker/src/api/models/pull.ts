@@ -47,12 +47,35 @@ export const prBranchInfoSchema = z.object({
 
 export type PRBranchInfo = z.infer<typeof prBranchInfoSchema>;
 
+/** `#/definitions/PullRequestAutoMerge` — upstream `api.PullRequestAutoMerge`
+ * (structs/pull.go:103-112), the scheduled-merge block `PullRequest.auto_merge`
+ * carries when the PR is queued for merge-on-green. `enabled_by` is the
+ * scheduler's `User` (`ToUser`, convert/pull.go:28-36); `commit_title` /
+ * `commit_message` are the stored schedule message cut on the first blank
+ * line (`strings.Cut(msg, "\n\n")`, convert/pull.go:29). */
+export const pullRequestAutoMergeSchema = z.object({
+  commit_message: z.string().optional(),
+  commit_title: z.string().optional(),
+  enabled_by: embeddedUserSchema.nullable().optional(),
+  merge_method: z.string().optional().openapi({
+    description: 'The merge method that will be used, eg: "merge", "rebase", "rebase-merge", "squash", "fast-forward-only"',
+  }),
+});
+
+export type PullRequestAutoMerge = z.infer<typeof pullRequestAutoMergeSchema>;
+
 /** `#/definitions/PullRequest` — upstream `api.PullRequest` (structs/pull.go). */
 export const pullRequestSchema = z.object({
   additions: z.number().int().optional().openapi({ format: "int64", description: "The number of lines added in the pull request" }),
   allow_maintainer_edit: z.boolean().optional().openapi({ description: "Whether maintainers can edit the pull request" }),
   assignee: embeddedUserSchema.nullable().optional(),
   assignees: z.array(embeddedUserSchema).nullable().optional(),
+  // Go-nullability: `AutoMerge *PullRequestAutoMerge json:"auto_merge"` carries
+  // NO omitempty (structs/pull.go:67) — the key renders on every payload, null
+  // when nothing is scheduled. Upstream fills it in BOTH converters when the
+  // PR is open and unmerged with a schedule row (convert/pull.go:286-295
+  // single / :505-511 list over the :369-371 open-filtered preload).
+  auto_merge: pullRequestAutoMergeSchema.nullable().optional(),
   base: prBranchInfoSchema.optional(),
   body: z.string().optional(),
   changed_files: z.number().int().optional().openapi({ format: "int64", description: "The number of files changed in the pull request" }),

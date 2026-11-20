@@ -47,7 +47,7 @@ import {
   UPDATE_SAMPLE,
   registerGitHookRoutes,
 } from "./git-hooks";
-import { contract, type Swagger2Operation } from "../../compat/contract/frozen-contract";
+import { contract, contractAcceptsDeclaredCode, type Swagger2Method, type Swagger2Operation } from "../../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -598,6 +598,8 @@ describe("contract declaration", () => {
    *  element); this helper does the structural assertions on the pair. */
   function assertArm(
     label: string,
+    method: Swagger2Method,
+    path: string,
     declared: { operationId?: string; responses?: Record<string, unknown> } | undefined,
     expected: Swagger2Operation | undefined,
   ): void {
@@ -606,9 +608,11 @@ describe("contract declaration", () => {
       throw new Error(`contract is missing ${label}`);
     }
     expect(declared?.operationId).toBe(expected.operationId);
-    const contractCodes = Object.keys(expected.responses ?? {});
     for (const code of Object.keys(declared?.responses ?? {})) {
-      expect(contractCodes, `${label} response ${code}`).toContain(code);
+      expect(
+        contractAcceptsDeclaredCode(path, method, code),
+        `${label} response ${code}: neither a contract status nor a fold-equivalent explicit error (the 09c2b92 default-fold rule)`,
+      ).toBe(true);
     }
   }
 
@@ -620,10 +624,22 @@ describe("contract declaration", () => {
       info: { title: "Gitea API", version: "test" },
     });
     for (const [method, path] of LIST_ARMS) {
-      assertArm(`${method.toUpperCase()} ${path}`, doc.paths?.[path]?.[method], contract.paths[path]?.[method]);
+      assertArm(
+        `${method.toUpperCase()} ${path}`,
+        method,
+        path,
+        doc.paths?.[path]?.[method],
+        contract.paths[path]?.[method],
+      );
     }
     for (const [method, path] of ID_ARMS) {
-      assertArm(`${method.toUpperCase()} ${path}`, doc.paths?.[path]?.[method], contract.paths[path]?.[method]);
+      assertArm(
+        `${method.toUpperCase()} ${path}`,
+        method,
+        path,
+        doc.paths?.[path]?.[method],
+        contract.paths[path]?.[method],
+      );
     }
   });
 

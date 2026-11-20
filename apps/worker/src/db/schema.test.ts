@@ -641,6 +641,9 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       ["template_id", "TEXT", 0, 0],
       ["topics", "TEXT", 0, 0],
       ["trust_model", "TEXT", 0, 0],
+      // 0080 (the release wave): the latest-release pointer — the ALTER
+      // sweep's newest append, LAST position (NOT NULL DEFAULT 0).
+      ["latest_release_id", "INTEGER", 1, 0],
     ]);
     // The appended columns keep the ALTER ADD COLUMN constraints: is_mirror
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url
@@ -652,9 +655,9 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
     expect(byName.get("is_mirror")?.dflt_value).toBe("false");
     expect(byName.get("original_url")?.dflt_value).toBeNull();
     expect(byName.get("is_template")?.dflt_value).toBe("false");
-    // 0029-0031 tails + 0061's counter: NOT NULL DEFAULT 0 (the drizzle
-    // integer default).
-    for (const name of ["size_kb", "num_stars", "num_watches", "num_forks", "num_closed_milestones"]) {
+    // 0029-0031 tails + 0061's counter + 0080's release pointer: NOT NULL
+    // DEFAULT 0 (the drizzle integer default).
+    for (const name of ["size_kb", "num_stars", "num_watches", "num_forks", "num_closed_milestones", "latest_release_id"]) {
       expect(byName.get(name)?.dflt_value).toBe("0");
     }
     expect(await indexNames("repositories")).toContain("repositories_fork_parent_idx");
@@ -922,7 +925,7 @@ describe("repo_mirrors parity (the mirror wave's pinned §3.1 DDL, migration 001
  * constant now follows the iota verbatim and 0064 re-keyed the data.
  */
 describe("PRStatus upstream alignment (ADR-0007 FN-1, migration 0064)", () => {
-  it("pins the constants to upstream's PullRequestStatus iota verbatim (gitea/models/issues/pull.go:100-107)", () => {
+  it("pins the constants to upstream's PullRequestStatus iota verbatim (gitea/models/issues/pull.go:110-118 at the 099abf5db4 pin)", () => {
     expect(PRStatus).toEqual({
       Conflict: 0, // iota 0
       Checking: 1, // iota 1
@@ -931,6 +934,7 @@ describe("PRStatus upstream alignment (ADR-0007 FN-1, migration 0064)", () => {
       Error: 4, // iota 4
       Empty: 5, // iota 5
       Ancestor: 6, // iota 6
+      Unrelated: 7, // iota 7 — the re-pin's enum growth (the unrelated-histories refusal state)
     });
   });
 
@@ -1731,6 +1735,9 @@ SET \`topics\` = COALESCE(
       "template_id",
       "topics",
       "trust_model",
+      // 0080 (the release wave) appends the latest-release pointer after the
+      // batch — the sweep stays additive-only (INTEGER NOT NULL DEFAULT 0).
+      "latest_release_id",
     ]);
     const byName = new Map(info.map((col) => [col.name, col]));
     // The identity pair: display-case name NOT NULL DEFAULT '' (the ALTER

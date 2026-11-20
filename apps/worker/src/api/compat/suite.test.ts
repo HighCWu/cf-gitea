@@ -936,8 +936,12 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       }),
     },
     {
-      name: "invalid name → declared 422",
-      status: 422,
+      // The re-pin's create ladder (ROUTESWAP, 1150e4e): pattern-invalid and
+      // reserved names unwrap util.ErrInvalidArgument on CREATE and answer
+      // 400 (repo.go:249-259 over db/name.go:31-33/:55-57) — was 422 under
+      // the pre-repin ladder.
+      name: "invalid name → 400 (the create ladder's ErrInvalidArgument arm)",
+      status: 400,
       request: (ctx) => ({
         path: "/user/repos",
         init: ctx.withAuth({

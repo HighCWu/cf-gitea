@@ -190,16 +190,25 @@ describe("the settings-change arm (setting.go:27-51 — the §D7 wiring)", () =>
   });
 });
 
-describe("the C9 unit-row gap, end to end: toggle → row → the scan's scope", () => {
-  it("an owner runner's scopeRepoIds sees the repo only while the unit is enabled", async () => {
+describe("the C9 unit-row gap at the re-pin: toggle → row → the scan's scope", () => {
+  it("the unit row no longer scopes the scan — the owner scope lists every owner repo; the CLAIM gate enforces the unit (#40106)", async () => {
     const runner = await seedOwnerRunner();
-    // The reported gap's polarity: a production repo (flag never written,
-    // row absent) is invisible to the owner-scope scan.
-    expect(await scopeRepoIds(env.DB, runner)).toEqual([]);
+    // The PRE-repin pin asserted the gap's old polarity (a repo with no
+    // repo_units row invisible to the owner-scope scan). Upstream #40106
+    // moved pickup onto JobQueueOptions (run_job_queue.go:26-33 at the
+    // 099abf5db4 pin) and DROPPED the repo_unit join from the scan: the
+    // scope is ALL the owner's repos, and the Actions-unit check lives at
+    // CLAIM time — a disabled repo's waiting jobs are CANCELLED there, not
+    // silently skipped (services/actions/model.ts scopeRepoCondition's doc;
+    // the claim arm's battery pins the cancel — model.test.ts "the
+    // repo_unit join is GONE"). The saveRepoSettings toggle keeps writing/
+    // deleting the row (the lockstep tests above) but must not move the
+    // scan scope in either direction.
+    expect((await scopeRepoIds(env.DB, runner))?.sort()).toEqual(["repo-1", "repo-2"]);
     await saveRepoSettings(env.DB, "repo-1", { hasActions: true }, T0);
-    expect(await scopeRepoIds(env.DB, runner)).toEqual(["repo-1"]);
+    expect((await scopeRepoIds(env.DB, runner))?.sort()).toEqual(["repo-1", "repo-2"]);
     await saveRepoSettings(env.DB, "repo-1", { hasActions: false }, T0);
-    expect(await scopeRepoIds(env.DB, runner)).toEqual([]);
+    expect((await scopeRepoIds(env.DB, runner))?.sort()).toEqual(["repo-1", "repo-2"]);
   });
 });
 

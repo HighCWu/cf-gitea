@@ -40,7 +40,7 @@ import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerAvatarRoutes } from "./avatars";
 import { OrgService } from "../../services/orgs/orgs";
-import { contract } from "../../compat/contract/frozen-contract";
+import { contract, contractAcceptsDeclaredCode } from "../../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -592,9 +592,11 @@ describe("contract declaration", () => {
       const expected = contract.paths[path]?.[method];
       expect(expected, `contract ${method.toUpperCase()} ${path}`).toBeDefined();
       expect(declared?.operationId).toBe(expected?.operationId);
-      const contractCodes = Object.keys(expected?.responses ?? {});
       for (const code of Object.keys(declared?.responses ?? {})) {
-        expect(contractCodes, `${method.toUpperCase()} ${path} response ${code}`).toContain(code);
+        expect(
+          contractAcceptsDeclaredCode(path, method, code),
+          `${method.toUpperCase()} ${path} response ${code}: neither a contract status nor a fold-equivalent explicit error (the 09c2b92 default-fold rule)`,
+        ).toBe(true);
       }
     }
   });

@@ -24,9 +24,9 @@
           "modelRef": null,
           "fields": []
         },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -53,9 +53,9 @@
           "modelRef": null,
           "fields": []
         },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -303,6 +303,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -401,6 +406,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -469,10 +479,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -699,6 +721,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -797,6 +824,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -865,7 +897,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -881,28 +913,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -1074,26 +1084,9 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
           "fields": [
             {
               "name": "message",
@@ -1140,9 +1133,9 @@
             }
           ]
         },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -1382,6 +1375,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -1480,6 +1478,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -1548,26 +1551,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        }
-      }
-    },
-    {
-      "path": "/repos/{owner}/{repo}",
-      "method": "delete",
-      "operationId": "repoDelete",
-      "responses": {
-        "204": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -1581,11 +1567,35 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
+        }
+      }
+    },
+    {
+      "path": "/repos/{owner}/{repo}",
+      "method": "delete",
+      "operationId": "repoDelete",
+      "responses": {
+        "204": {
           "kind": "empty",
           "modelRef": null,
           "fields": []
+        },
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -1812,6 +1822,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -1910,6 +1925,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -1978,31 +1998,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2029,10 +2027,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -2170,10 +2180,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -2305,24 +2327,9 @@
             }
           ]
         },
-        "403": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2398,26 +2405,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        }
-      }
-    },
-    {
-      "path": "/repos/{owner}/{repo}/branches/{branch}",
-      "method": "put",
-      "operationId": "repoUpdateBranch",
-      "responses": {
-        "204": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2431,20 +2421,22 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
+        }
+      }
+    },
+    {
+      "path": "/repos/{owner}/{repo}/branches/{branch}",
+      "method": "put",
+      "operationId": "repoUpdateBranch",
+      "responses": {
+        "204": {
           "kind": "empty",
           "modelRef": null,
           "fields": []
         },
-        "409": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2471,31 +2463,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -2522,31 +2492,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2705,10 +2653,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -2722,14 +2682,9 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2756,31 +2711,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2807,14 +2740,9 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -2914,26 +2842,22 @@
             "X-Total-Count"
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
-          "kind": "model",
+        "default": {
+          "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
               "type": "string",
-              "required": false
+              "required": true
             },
             {
               "name": "url",
               "type": "string",
-              "required": false
+              "required": true
             }
-          ]
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -2994,7 +2918,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -3010,11 +2934,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -3086,7 +3005,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -3102,11 +3021,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -3141,6 +3055,12 @@
               "type": "array",
               "required": false,
               "itemRef": "User"
+            },
+            {
+              "name": "auto_merge",
+              "type": "object",
+              "required": false,
+              "ref": "PullRequestAutoMerge"
             },
             {
               "name": "base",
@@ -3335,10 +3255,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -3365,7 +3297,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -3381,11 +3313,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -3510,10 +3437,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -3546,48 +3485,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -3725,10 +3625,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -3785,48 +3697,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -3872,48 +3745,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -3958,77 +3792,9 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -4074,14 +3840,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -4108,10 +3869,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -4346,6 +4119,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -4444,6 +4222,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -4512,10 +4295,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -4742,6 +4537,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -4840,6 +4640,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -4908,36 +4713,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -5002,7 +4780,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -5018,11 +4796,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -5094,14 +4867,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -5128,10 +4896,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5162,10 +4942,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5196,10 +4988,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5252,7 +5056,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -5268,11 +5072,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -5328,7 +5127,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -5344,11 +5143,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -5426,10 +5220,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5499,10 +5305,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5572,10 +5390,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5589,10 +5419,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5662,10 +5504,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5726,10 +5580,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5743,10 +5609,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5809,10 +5687,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -5984,10 +5874,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -6151,65 +6053,9 @@
             }
           ]
         },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "412": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -6295,10 +6141,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -6368,9 +6226,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -6384,11 +6242,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -6402,9 +6255,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -6418,11 +6271,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -6492,31 +6340,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -6693,26 +6519,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        }
-      }
-    },
-    {
-      "path": "/repos/{owner}/{repo}/issues/{index}",
-      "method": "delete",
-      "operationId": "issueDelete",
-      "responses": {
-        "204": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -6726,15 +6535,22 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
+        }
+      }
+    },
+    {
+      "path": "/repos/{owner}/{repo}/issues/{index}",
+      "method": "delete",
+      "operationId": "issueDelete",
+      "responses": {
+        "204": {
           "kind": "empty",
           "modelRef": null,
           "fields": []
         },
-        "423": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -6911,48 +6727,9 @@
             }
           ]
         },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "412": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -7030,10 +6807,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7098,31 +6887,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -7186,10 +6953,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7240,31 +7019,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -7328,31 +7085,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -7379,31 +7114,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -7601,10 +7314,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7663,10 +7388,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7717,14 +7454,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -7788,10 +7520,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7805,10 +7549,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7859,14 +7615,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -7894,10 +7645,22 @@
           "fields": [],
           "mapValueType": "integer"
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7911,10 +7674,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -7934,29 +7709,7 @@
             }
           ]
         },
-        "400": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -8051,10 +7804,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -8126,10 +7891,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -8201,10 +7978,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -8218,10 +8007,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -8293,10 +8094,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -8339,6 +8152,12 @@
               "type": "array",
               "required": false,
               "itemRef": "User"
+            },
+            {
+              "name": "auto_merge",
+              "type": "object",
+              "required": false,
+              "ref": "PullRequestAutoMerge"
             },
             {
               "name": "base",
@@ -8533,12 +8352,7 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "500": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -8590,6 +8404,12 @@
               "itemRef": "User"
             },
             {
+              "name": "auto_merge",
+              "type": "object",
+              "required": false,
+              "ref": "PullRequestAutoMerge"
+            },
+            {
               "name": "base",
               "type": "object",
               "required": false,
@@ -8782,65 +8602,9 @@
             }
           ]
         },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
           "fields": [
             {
               "name": "message",
@@ -8890,6 +8654,12 @@
               "itemRef": "User"
             },
             {
+              "name": "auto_merge",
+              "type": "object",
+              "required": false,
+              "ref": "PullRequestAutoMerge"
+            },
+            {
               "name": "base",
               "type": "object",
               "required": false,
@@ -9082,10 +8852,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -9122,6 +8904,12 @@
               "itemRef": "User"
             },
             {
+              "name": "auto_merge",
+              "type": "object",
+              "required": false,
+              "ref": "PullRequestAutoMerge"
+            },
+            {
               "name": "base",
               "type": "object",
               "required": false,
@@ -9314,10 +9102,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -9354,6 +9154,12 @@
               "itemRef": "User"
             },
             {
+              "name": "auto_merge",
+              "type": "object",
+              "required": false,
+              "ref": "PullRequestAutoMerge"
+            },
+            {
               "name": "base",
               "type": "object",
               "required": false,
@@ -9546,82 +9352,9 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "412": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
           "fields": [
             {
               "name": "message",
@@ -9648,10 +9381,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -9738,10 +9483,22 @@
             "X-Total-Count"
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -9819,68 +9576,7 @@
             "X-Total-Count"
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        }
-      }
-    },
-    {
-      "path": "/repos/{owner}/{repo}/pulls/{index}/merge",
-      "method": "get",
-      "operationId": "repoPullRequestIsMerged",
-      "responses": {
-        "204": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        }
-      }
-    },
-    {
-      "path": "/repos/{owner}/{repo}/pulls/{index}/merge",
-      "method": "post",
-      "operationId": "repoMergePullRequest",
-      "responses": {
-        "200": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "403": {
-          "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "405": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -9896,10 +9592,56 @@
             }
           ],
           "convertedFromHeader": true
+        }
+      }
+    },
+    {
+      "path": "/repos/{owner}/{repo}/pulls/{index}/merge",
+      "method": "get",
+      "operationId": "repoPullRequestIsMerged",
+      "responses": {
+        "204": {
+          "kind": "empty",
+          "modelRef": null,
+          "fields": []
         },
-        "423": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
+        }
+      }
+    },
+    {
+      "path": "/repos/{owner}/{repo}/pulls/{index}/merge",
+      "method": "post",
+      "operationId": "repoMergePullRequest",
+      "responses": {
+        "200": {
+          "kind": "empty",
+          "modelRef": null,
+          "fields": []
+        },
+        "201": {
+          "kind": "empty",
+          "modelRef": null,
+          "fields": []
+        },
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -9926,31 +9668,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -9977,10 +9697,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10088,10 +9820,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10191,31 +9935,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
           "fields": [
             {
               "name": "message",
@@ -10328,10 +10050,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10431,10 +10165,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10448,14 +10194,9 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -10568,10 +10309,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10585,14 +10338,9 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -10705,10 +10453,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10762,10 +10522,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -10819,29 +10591,7 @@
             }
           ]
         },
-        "400": {
-          "kind": "error-body",
-          "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "413": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -10928,7 +10678,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -10944,11 +10694,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -11012,7 +10757,7 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
           "fields": [
@@ -11028,11 +10773,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -11078,10 +10818,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -11127,9 +10879,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -11143,11 +10895,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -11161,10 +10908,22 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -11218,10 +10977,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -11267,41 +11038,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "405": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -11360,41 +11099,9 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        }
-      }
-    },
-    {
-      "path": "/repos/{owner}/{repo}/tags/{tag}",
-      "method": "delete",
-      "operationId": "repoDeleteTag",
-      "responses": {
-        "204": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "405": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "409": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -11408,10 +11115,22 @@
             }
           ],
           "convertedFromHeader": true
+        }
+      }
+    },
+    {
+      "path": "/repos/{owner}/{repo}/tags/{tag}",
+      "method": "delete",
+      "operationId": "repoDeleteTag",
+      "responses": {
+        "204": {
+          "kind": "empty",
+          "modelRef": null,
+          "fields": []
         },
-        "423": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -11453,10 +11172,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -11470,32 +11201,9 @@
           "modelRef": null,
           "fields": []
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIInvalidTopicsError",
-          "fields": [
-            {
-              "name": "invalidTopics",
-              "type": "array",
-              "required": true,
-              "itemType": "string"
-            },
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "423": {
-          "kind": "error-body",
-          "modelRef": "APIRepoArchivedError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -11735,6 +11443,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -11833,6 +11546,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -11901,31 +11619,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -12165,6 +11861,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -12263,6 +11964,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -12331,10 +12037,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -12549,10 +12267,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -12787,6 +12517,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -12881,6 +12616,11 @@
             },
             {
               "name": "projects_mode",
+              "type": "string",
+              "required": false
+            },
+            {
+              "name": "pull_requests_creation_restriction",
               "type": "string",
               "required": false
             },
@@ -13178,6 +12918,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -13276,6 +13021,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -13344,31 +13094,9 @@
             }
           ]
         },
-        "400": {
+        "default": {
           "kind": "error-body",
           "modelRef": "APIError",
-          "fields": [
-            {
-              "name": "message",
-              "type": "string",
-              "required": true
-            },
-            {
-              "name": "url",
-              "type": "string",
-              "required": true
-            }
-          ],
-          "convertedFromHeader": true
-        },
-        "409": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
-        },
-        "422": {
-          "kind": "error-body",
-          "modelRef": "APIValidationError",
           "fields": [
             {
               "name": "message",
@@ -13498,6 +13226,23 @@
               "required": false
             }
           ]
+        },
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -13732,6 +13477,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -13830,6 +13580,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -13898,9 +13653,9 @@
             }
           ]
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -13927,9 +13682,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -13943,11 +13698,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -13961,9 +13711,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -13977,11 +13727,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -13995,9 +13740,9 @@
           "modelRef": null,
           "fields": []
         },
-        "403": {
+        "default": {
           "kind": "error-body",
-          "modelRef": "APIForbiddenError",
+          "modelRef": "APIError",
           "fields": [
             {
               "name": "message",
@@ -14011,11 +13756,6 @@
             }
           ],
           "convertedFromHeader": true
-        },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
         }
       }
     },
@@ -14185,10 +13925,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },
@@ -14423,6 +14175,11 @@
               "ref": "InternalTracker"
             },
             {
+              "name": "issues_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "language",
               "type": "string",
               "required": false
@@ -14521,6 +14278,11 @@
               "required": false
             },
             {
+              "name": "pull_requests_creation_restriction",
+              "type": "string",
+              "required": false
+            },
+            {
               "name": "release_counter",
               "type": "integer",
               "required": false,
@@ -14589,10 +14351,22 @@
             }
           ]
         },
-        "404": {
-          "kind": "empty",
-          "modelRef": null,
-          "fields": []
+        "default": {
+          "kind": "error-body",
+          "modelRef": "APIError",
+          "fields": [
+            {
+              "name": "message",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "required": true
+            }
+          ],
+          "convertedFromHeader": true
         }
       }
     },

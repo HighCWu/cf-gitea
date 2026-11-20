@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueLabels, labels, issues, pullRequests, pullReviews, repositories, teams, users, PRFlow, ReviewType, type TeamAccessMode } from "../../db/schema";
+import { issueLabels, labels, issues, pullAutoMerges, pullRequests, pullReviews, repositories, teams, users, PRFlow, ReviewType, type TeamAccessMode } from "../../db/schema";
 import { discoverCodeOwnerRules, matchCodeOwnerRules, type CodeOwnerRule } from "../../services/codeowners";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
@@ -323,6 +323,11 @@ export interface PullRequestRenderContext {
   /** One batched `viewerTeamAccessModes` verdict per `headRepos` entry (null =
    *  the pure matrix decides — anonymous/admin/owner resolve without D1). */
   headRepoModes: Map<string, TeamAccessMode | null>;
+  /** Scheduled auto-merges by pull issue id, with the scheduler's user row
+   *  (upstream's list preload is open-PR-filtered: convert/pull.go:369-371
+   *  `FilterSlice(prs, …!pr.Issue.IsClosed)`; a missing entry renders the
+   *  null `auto_merge`). */
+  autoMerges: Map<number, { schedule: typeof pullAutoMerges.$inferSelect; doer: UserRow }>;
 }
 
 /**
@@ -355,6 +360,24 @@ export async function prefetchPullRequestRenderContext(
     findRepositoriesByIds(d1, headRepoIds),
     prefetchIssueRenderContext(d1, rows.map((row) => row.issue), { viewer }),
   ]);
+  // The auto-merge schedule batch (upstream GetScheduledMergeByPullIDs over
+  // the open-filtered page ids, convert/pull.go:369-371 + doers via
+  // GetUsersMapByIDs, models/pull/automerge.go:91-108): one inArray per kind.
+  const openIds = [
+    ...new Set(
+      rows.flatMap(({ issue, pullRequest }) => (!pullRequest.hasMerged && !issue.isClosed ? [issue.id] : [])),
+    ),
+  ];
+  const scheduleRows =
+    openIds.length > 0
+      ? await drizzle(d1).select().from(pullAutoMerges).where(inArray(pullAutoMerges.issueId, openIds)).all()
+      : [];
+  const scheduleDoerIds = [...new Set(scheduleRows.map((row) => row.doerId))];
+  const scheduleDoers =
+    scheduleDoerIds.length > 0
+      ? await drizzle(d1).select().from(users).where(inArray(users.id, scheduleDoerIds)).all()
+      : [];
+  const doersById = new Map(scheduleDoers.map((row) => [row.id, row]));
   // The grant batch rides the fetched pairs (ownerId/ownerNamespace feed the
   // matrix arms) — the page's distinct-head fan collapses to the twin's
   // constant ≤4 reads (A9: one inArray per underlying grant kind).
@@ -368,6 +391,12 @@ export async function prefetchPullRequestRenderContext(
     mergers: new Map(mergerRows.map((row) => [row.id, row])),
     headRepos,
     headRepoModes,
+    autoMerges: new Map(
+      scheduleRows
+        .map((schedule) => ({ schedule, doer: doersById.get(schedule.doerId) }))
+        .filter((entry): entry is { schedule: typeof pullAutoMerges.$inferSelect; doer: UserRow } => entry.doer !== undefined)
+        .map((entry) => [entry.schedule.issueId, entry]),
+    ),
   };
 }
 
@@ -569,6 +598,48 @@ export async function toApiPullRequest(
     }
   }
 
+  // `auto_merge` — upstream renders the schedule ONLY for an open, unmerged
+  // PR in BOTH converters: single/payload through GetScheduledMergeByPullID
+  // (convert/pull.go:286-295, the `!pr.HasMerged … !pr.Issue.IsClosed` arm),
+  // list through the open-filtered preload map (:505-511). The field carries
+  // no omitempty (structs/pull.go:67), so the key is ALWAYS present — null
+  // when nothing is scheduled or the doer row is gone.
+  let autoMerge: PullRequest["auto_merge"] = null;
+  if (!pr.hasMerged && !issue.isClosed) {
+    const scheduled =
+      context === undefined
+        ? await drizzle(d1)
+            .select()
+            .from(pullAutoMerges)
+            .where(eq(pullAutoMerges.issueId, issue.id))
+            .limit(1)
+            .then((rows) => rows[0])
+        : context.autoMerges.get(issue.id)?.schedule;
+    if (scheduled !== undefined) {
+      const doer =
+        context === undefined
+          ? await drizzle(d1)
+              .select()
+              .from(users)
+              .where(eq(users.id, scheduled.doerId))
+              .limit(1)
+              .then((rows) => rows[0])
+          : context.autoMerges.get(issue.id)?.doer;
+      if (doer !== undefined) {
+        // toAPIAutoMerge's message cut (convert/pull.go:29): title is
+        // everything before the first blank line, message the rest.
+        const message = scheduled.mergeMessage ?? "";
+        const separator = message.indexOf("\n\n");
+        autoMerge = {
+          enabled_by: apiUserFromRow(doer, viewer),
+          merge_method: scheduled.mergeStyle,
+          commit_title: separator === -1 ? message : message.slice(0, separator),
+          commit_message: separator === -1 ? "" : message.slice(separator + 2),
+        };
+      }
+    }
+  }
+
   return {
     id: pr.id,
     url: htmlUrl,
@@ -594,6 +665,7 @@ export async function toApiPullRequest(
     // converter IS toAPIPullRequest — pull.go:31-34); only "list" keeps the
     // raw null (ToAPIPullRequests vs SliceNilAsEmpty).
     assignees: mode === "list" ? apiIssue.assignees : apiIssue.assignees ?? [],
+    auto_merge: autoMerge,
     requested_reviewers: [],
     requested_reviewers_teams: [],
     state: issue.isClosed ? "closed" : "open",

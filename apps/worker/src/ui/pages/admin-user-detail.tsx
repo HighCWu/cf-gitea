@@ -245,13 +245,14 @@
  *    `admin-user-bot-token-regenerate` family and mounts
  *    `adminUserBotTokenRegenerateSubmit` — the gate ladder + the settings
  *    `regenerateTokenFromForm` + the mint-arm re-render, the POST/405 pair.
- *    AUDIT FOLD (landing-time, recorded): the mounted handler composes the
- *    seam-free path, so upstream's applications.go:182
- *    `user:accesstoken:regenerate` row is NOT yet emitted on the live POST —
- *    this module's `adminUserRegenerateBotToken` seam carries the
- *    owner-scoped pre-read + the emit (owner = the bot, actor = the admin),
- *    and switching the handler onto the seam is the recorded fold (upstream
- *    fires the row for EVERY regenerate, both panels).
+ *    AUDIT FOLD (recorded, and tightened at the freeze-gate triage): the
+ *    seam's OWN emit — owner = the bot, actor = the admin — DUPLICATED the
+ *    shared helper's row once REPIN-OAUTH taught `regenerateTokenFromForm`
+ *    to emit (two `user:accesstoken:regenerate` writes per regenerate). The
+ *    helper now carries the actor override (upstream's admin handler records
+ *    ctx.Doer = the calling admin, web.go:791-793; the settings arm keeps
+ *    doer = owner, applications.go:182) and the seam rides it — ONE row per
+ *    regenerate on both panels.
  */
 
 import { and, asc, eq, inArray , sql} from "drizzle-orm";
@@ -719,17 +720,17 @@ export async function adminUserRegenerateBotToken(
     .get();
   if (row === undefined) return { outcome: "missing" };
 
-  const regenerated = await regenerateTokenFromForm(d1, target.id, tokenId);
-  if (regenerated.outcome !== "regenerated") return { outcome: "missing" };
-  await emitAccessTokenAudit(d1, {
-    userId: target.id,
-    tokenName: row.name,
-    verb: "regenerate",
-    origin: "ui",
-    actor: { id: actor.id, username: actor.username },
-    actorCredential: null,
-    impersonatorUserId: actor.impersonatorUserId ?? null,
+  const regenerated = await regenerateTokenFromForm(d1, target.id, tokenId, actor.impersonatorUserId ?? null, {
+    id: actor.id,
+    username: actor.username,
   });
+  if (regenerated.outcome !== "regenerated") return { outcome: "missing" };
+  // The audit row rides the shared helper's emit with the ADMIN-actor
+  // override (upstream records ctx.Doer = the calling admin on this panel —
+  // web.go:791-793; the settings twin keeps doer = owner). The seam's own
+  // emit is GONE — it duplicated the helper's row (two
+  // user:accesstoken:regenerate writes per regenerate, the freeze-gate
+  // catch).
   return { outcome: "regenerated", plaintext: regenerated.plaintext };
 }
 

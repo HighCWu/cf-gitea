@@ -579,6 +579,11 @@ export async function regenerateTokenFromForm(
   userId: number,
   id: number,
   impersonatorUserId?: number | null,
+  /** The ADMIN bot-token panel's override: upstream's admin handler records
+   *  the REGENERATE row with ctx.Doer = the calling admin (web.go:791-793
+   *  over RegenerateAccessToken's write), not the token's owner. Absent (the
+   *  settings arm) keeps the applications.go:182 default, doer = owner. */
+  actor?: { id: number; username: string } | null,
 ): Promise<RegenerateTokenOutcome> {
   const existing = await drizzle(d1)
     .select({ id: personalAccessTokens.id, name: personalAccessTokens.name })
@@ -609,12 +614,18 @@ export async function regenerateTokenFromForm(
       // (applications.go:182 at the pin — after the write, before the flash).
       // The settings write rides a session: no actor credential; actor =
       // scope = the token's owner (doer = owner on this arm; the
-      // impersonator rides the record seam — the create twin's note).
+      // impersonator rides the record seam — the create twin's note). The
+      // admin bot-token panel overrides the actor to its calling admin
+      // (upstream records ctx.Doer there — web.go:791-793) — ONE row per
+      // regenerate on BOTH panels (the duplicate twin-emit folded at the
+      // freeze-gate triage).
       await emitAccessTokenAudit(d1, {
         userId,
         tokenName: existing.name,
         verb: "regenerate",
         origin: "ui",
+        actor: actor ?? undefined,
+        actorCredential: null,
         impersonatorUserId,
       });
       return { outcome: "regenerated", plaintext: fresh.value };

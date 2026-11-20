@@ -1819,7 +1819,10 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     // +1 (cddae16's project-membership arm — the issues-family ripple twin;
     // its creator+counts render stage batches to ONE creators + ONE grouped
     // counts read per page and skips here — no projects seeded).
-    expect(count).toBeLessThanOrEqual(15);
+    // +1 (the auto_merge schedule preload — one inArray over the page's
+    // open unmerged pull ids; the doer follow-up rides only when a schedule
+    // exists and skips here — nothing scheduled; convert/pull.go:369-371).
+    expect(count).toBeLessThanOrEqual(16);
     expect(count).toBeLessThan(5 * 4);
     // The fork head renders (batched pair lookup worked) and the merged row
     // carries its merger (the batched mergers arm worked).

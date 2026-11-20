@@ -27,7 +27,7 @@ import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
-import { contract, type Swagger2Method } from "../../compat/contract/frozen-contract";
+import { contract, contractAcceptsDeclaredCode, type Swagger2Method } from "../../compat/contract/frozen-contract";
 import { registerBlockRoutes } from "./blocks";
 
 /**
@@ -280,9 +280,11 @@ describe("blocks declared surface vs frozen contract", () => {
       }
       expect(specOp.operationId).toBe(operationId);
 
-      const contractCodes = new Set(Object.keys(contractOp.responses ?? {}));
       for (const code of Object.keys(specOp.responses ?? {})) {
-        expect(contractCodes.has(code), `${operationId} declares undeclared code ${code}`).toBe(true);
+        expect(
+          contractAcceptsDeclaredCode(path, method, code),
+          `${operationId} declares undeclared code ${code} (and it is not a fold-equivalent explicit error, the 09c2b92 default-fold rule)`,
+        ).toBe(true);
       }
     }
   });

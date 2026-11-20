@@ -46,15 +46,13 @@ const OMITTED_REPOSITORY_FIELDS = new Set([
   "parent",
   "repo_transfer",
 ]);
-// ROUTESWAP RE-PIN (fc49368845 → 099abf5db4): the frozen contract still
-// carries the pre-640cd615c4 Repository (71 properties) while the serializer
-// renders the two creation-restriction fields (services/repository.ts, the
-// "reader" defaults) — the emitted set runs +2 over the frozen derivation
-// until the campaign's contract re-freeze folds them in.
-const EXTRA_REPOSITORY_FIELDS = ["issues_creation_restriction", "pull_requests_creation_restriction"];
+// Re-pin note: the 09c2b92 contract re-freeze vendored the post-640cd615c4
+// Repository (73 properties), so issues_creation_restriction and
+// pull_requests_creation_restriction are now IN the frozen derivation — the
+// serializer's "reader" defaults (services/repository.ts) render them and
+// the field-set assertion runs against the contract verbatim again.
 const REPOSITORY_FIELDS = [
   ...Object.keys(contractModelProperties("Repository")).filter((name) => !OMITTED_REPOSITORY_FIELDS.has(name)),
-  ...EXTRA_REPOSITORY_FIELDS,
 ].sort();
 
 const ERROR_URL = "https://example.com/api/swagger";

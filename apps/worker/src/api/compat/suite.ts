@@ -111,15 +111,23 @@ export function implementedOperations(document: unknown): ReadonlySet<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime-only responses (SPEC-0004 §2.5) — the exact table of
-// scripts/check-openapi.mjs RUNTIME_ONLY_RESPONSES, so the static check and
-// this suite accept the same documented divergences.
+// Runtime-only responses (SPEC-0004 §2.5). Historical note: this table
+// mirrored scripts/check-openapi.mjs RUNTIME_ONLY_RESPONSES one-for-one; the
+// 5671c5192d fold (vendored at 099abf5db4, re-aligned by 09c2b92) changed the
+// two tables' roles. The checker still compares route declarations against
+// the folded contract, so its table grew (wire-derived entries). THIS suite
+// resolves non-enumerated wire statuses through the fixture's `default`
+// error-body expectation (runScenarioCase (2b)) — the APIError envelope — so
+// only statuses whose runtime body differs from that default (the SUCCESS
+// class: transfer's 201 Repository) strictly need an entry here; the
+// reqToken-class 401 entries stay as wire-bar documentation with their
+// upstream references, never silent skips.
 // ---------------------------------------------------------------------------
 
 /**
  * Declared-by-router responses upstream really sends at runtime but the
- * vendored swagger omits. Keyed `path → method → status → reason`; each entry
- * is a documented exception with its upstream reference, never a silent skip.
+ * vendored swagger does not enumerate. Keyed `path → method → status →
+ * reason`; each entry is a documented exception with its upstream reference.
  */
 export const RUNTIME_ONLY_RESPONSES: Readonly<
   Record<string, Partial<Record<Swagger2Method, Readonly<Record<string, string>>>>>
@@ -178,6 +186,45 @@ export const RUNTIME_ONLY_RESPONSES: Readonly<
 /** The documented reason when a status is a runtime-only response, else undefined. */
 export function runtimeOnlyResponseNote(path: string, method: string, status: number): string | undefined {
   return RUNTIME_ONLY_RESPONSES[path]?.[method as Swagger2Method]?.[String(status)];
+}
+
+/**
+ * Default-fold error-BODY exceptions (SPEC-0004 §2.5): statuses where
+ * upstream's real wire body is NOT the APIError {message, url} envelope the
+ * folded `default` arm documents. The pre-fold contract documented these as
+ * explicit non-error response $refs; 5671c5192d folded the refs away, but the
+ * runtime bodies are unchanged — the fold is doc-only (09c2b92's rule: the
+ * pre-fold docs stay the wire bar). Field expectations are quoted from the
+ * upstream handler at the pin, never inferred.
+ */
+const DEFAULT_ERROR_BODY_FIELDS: Readonly<
+  Record<string, Partial<Record<Swagger2Method, Readonly<Record<string, { modelRef: string; fields: FieldExpectation[] }>>>>>
+> = {
+  "/repos/{owner}/{repo}/topics": {
+    put: {
+      // repoUpdateTopics' two 422 arms answer an inline
+      // {message, invalidTopics} map (gitea/routers/api/v1/repo/topic.go:111-120)
+      // — the pre-fold contract carried #/responses/invalidTopicsError
+      // (APIInvalidTopicsError) here; the folded swagger comment now points
+      // the 422 at #/responses/error while the handler still sends the map.
+      422: {
+        modelRef: "APIInvalidTopicsError",
+        fields: [
+          { name: "message", type: "string", required: true },
+          { name: "invalidTopics", type: "array", itemType: "string", required: true },
+        ],
+      },
+    },
+  },
+};
+
+/** The default-fold body override for one status, else undefined. */
+function defaultErrorBodyFields(
+  path: string,
+  method: Swagger2Method,
+  status: number,
+): { modelRef: string; fields: FieldExpectation[] } | undefined {
+  return DEFAULT_ERROR_BODY_FIELDS[path]?.[method]?.[String(status)];
 }
 
 /**
@@ -411,36 +458,56 @@ async function runScenarioCase(
     return problems;
   }
 
-  const expectation = operation.responses[String(response.status)];
+  let expectation = operation.responses[String(response.status)];
   if (expectation === undefined) {
-    // (2) Not a fixture status: only the documented runtime-only responses are
-    // acceptable — the error class carries the generic APIError envelope, and
+    // (2) Not an enumerated fixture status: a documented runtime-only response
+    // comes first — the error class carries the generic APIError envelope, and
     // a scenario declaring `runtimeOnlyModelRef` validates against that
     // contract model (the documented runtime-only SUCCESS class).
     const note = runtimeOnlyResponseNote(operation.path, operation.method, response.status);
-    if (note === undefined) {
+    if (note !== undefined) {
+      if (scenarioCase.runtimeOnlyModelRef !== undefined) {
+        const contentType = response.headers.get("content-type") ?? "";
+        if (!contentType.includes(JSON_CONTENT_TYPE)) {
+          problems.push(`${at}: runtime-only model response ${response.status} (${note}) must be ${JSON_CONTENT_TYPE}, got "${contentType}"`);
+          return problems;
+        }
+        const parsedModel = tryParseJson(bodyText);
+        if (!parsedModel.ok || !isPlainObject(parsedModel.value)) {
+          problems.push(`${at}: runtime-only model response ${response.status} (${note}) must be a JSON object, got ${clip(bodyText)}`);
+          return problems;
+        }
+        assertModelShape(parsedModel.value, lookup(scenarioCase.runtimeOnlyModelRef), at, problems, lookup, scenarioCase.runtimeOnlyModelRef);
+        return problems;
+      }
+      assertRuntimeOnlyErrorEnvelope(bodyText, response, at, note, problems);
+      return problems;
+    }
+    // (2b) The 5671c5192d fold: the vendored contract at 099abf5db4 collapsed
+    // every doc-only error response into `default` (scripts/check-openapi.mjs's
+    // fold-equivalence rule — the pre-fold contract's explicit docs remain the
+    // wire bar). Swagger's `default` IS the op's catch-all status, and
+    // upstream's runtime answer on such statuses is the APIError envelope
+    // (services/context/api.go apiErrorAuto), so the fixture's `default`
+    // expectation (the error-body derived from #/responses/error's declared
+    // headers) is the wire contract for every status the op does not
+    // enumerate. cf-gitea's route-level explicit 4xx/5xx declarations are the
+    // fold-equivalent spellings of that same bar (09c2b92).
+    expectation = operation.responses["default"];
+    if (expectation === undefined) {
       problems.push(
         `${at}: status ${response.status} is neither a fixture response ` +
           `{${Object.keys(operation.responses).join(", ")}} nor a documented runtime-only exception`,
       );
       return problems;
     }
-    if (scenarioCase.runtimeOnlyModelRef !== undefined) {
-      const contentType = response.headers.get("content-type") ?? "";
-      if (!contentType.includes(JSON_CONTENT_TYPE)) {
-        problems.push(`${at}: runtime-only model response ${response.status} (${note}) must be ${JSON_CONTENT_TYPE}, got "${contentType}"`);
-        return problems;
-      }
-      const parsedModel = tryParseJson(bodyText);
-      if (!parsedModel.ok || !isPlainObject(parsedModel.value)) {
-        problems.push(`${at}: runtime-only model response ${response.status} (${note}) must be a JSON object, got ${clip(bodyText)}`);
-        return problems;
-      }
-      assertModelShape(parsedModel.value, lookup(scenarioCase.runtimeOnlyModelRef), at, problems, lookup, scenarioCase.runtimeOnlyModelRef);
-      return problems;
+    // The default arm documents the APIError envelope; where upstream's real
+    // body for this status is a different shape (the fold erased the old
+    // explicit doc), the documented exception table supplies the fields.
+    const overrideFields = defaultErrorBodyFields(operation.path, operation.method, response.status);
+    if (overrideFields !== undefined) {
+      expectation = { ...expectation, kind: "error-body", ...overrideFields };
     }
-    assertRuntimeOnlyErrorEnvelope(bodyText, response, at, note, problems);
-    return problems;
   }
 
   // (3) Content-Type per response kind.
