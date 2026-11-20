@@ -199,8 +199,8 @@ describe("the watch action arm (upstream ActionWatch's three modes)", () => {
     // The fragment is the whole #repo-header-watch div (the sync target).
     expect(html.startsWith('<div id="repo-header-watch" class="flex-text-block">')).toBe(true);
     expect(html).toContain('data-global-init="initRepoWatchMenu" aria-label="Watching"');
-    expect(html).toContain('<a class="item active" role="menuitem" aria-label="All activity" data-fetch-method="post" data-fetch-url="/b4-owner/paint/action/watch"');
-    expect(html).toContain('<a class="item" role="menuitem" aria-label="Participating and mentions" data-fetch-method="post" data-fetch-url="/b4-owner/paint/action/participate"');
+    expect(html).toContain('<button type="button" class="item active" role="menuitem" aria-label="All activity" data-fetch-method="post" data-fetch-url="/b4-owner/paint/action/watch"');
+    expect(html).toContain('<button type="button" class="item" role="menuitem" aria-label="Participating and mentions" data-fetch-method="post" data-fetch-url="/b4-owner/paint/action/participate"');
     expect(html).toContain('<span class="ui small label">1</span>');
     expect(await counters(f.repoId, f.owner.id)).toEqual({ repoStars: 0, userStars: 0, repoWatches: 1, starRows: 0, watchRows: 1 });
     // The write is the WatchOptions setter's Normal arm: the row's include
@@ -221,7 +221,7 @@ describe("the watch action arm (upstream ActionWatch's three modes)", () => {
     const res = await repoWatchActionResponse(env.DB, repo, userRow(f.owner), "participate");
     const html = await res.text();
     expect(html).toContain('data-global-init="initRepoWatchMenu" aria-label="Watch"');
-    expect(html).toContain('<a class="item active" role="menuitem" aria-label="Participating and mentions"');
+    expect(html).toContain('<button type="button" class="item active" role="menuitem" aria-label="Participating and mentions"');
     expect(html).toContain('<span class="ui small label">0</span>');
     expect(await counters(f.repoId, f.owner.id)).toEqual({ repoStars: 0, userStars: 0, repoWatches: 0, starRows: 0, watchRows: 0 });
   });
@@ -237,7 +237,7 @@ describe("the watch action arm (upstream ActionWatch's three modes)", () => {
     const html = await res.text();
     expect(html).toContain('data-global-init="initRepoWatchMenu" aria-label="Ignoring"');
     expect(html).toContain('class="svg octicon-eye-closed"');
-    expect(html).toContain('<a class="item active" role="menuitem" aria-label="Ignore" data-fetch-method="post" data-fetch-url="/b4-owner/paint/action/ignore"');
+    expect(html).toContain('<button type="button" class="item active" role="menuitem" aria-label="Ignore" data-fetch-method="post" data-fetch-url="/b4-owner/paint/action/ignore"');
     expect(html).toContain('<span class="ui small label">0</span>');
     expect(await counters(f.repoId, f.owner.id)).toEqual({ repoStars: 0, userStars: 0, repoWatches: 0, starRows: 0, watchRows: 1 });
     const watch = await getWatch(env.DB, f.repoId, f.owner.id);
@@ -335,6 +335,7 @@ function syntheticRepo(overrides: Partial<RepoRow> = {}): RepoRow {
     templateId: null,
     topics: "[]",
     trustModel: null,
+    latestReleaseId: 0, // migration 0080 — the release-latest pointer (fixtures start date-order)
     ...overrides,
   };
 }
@@ -363,6 +364,16 @@ describe("the fragment renderers (pure — the same bytes the responses carry)",
     expect(html.startsWith('<div id="repo-header-watch" class="flex-text-block">')).toBe(true);
     expect(html).toContain('data-global-init="initRepoWatchMenu" aria-label="Watching"');
     expect(html).toContain('<span class="ui small label">9</span>');
+    // The four menu items are <button type="button"> (watch.tmpl at
+    // 099abf5db4, upstream 8b48b45def #40338 — an href-less a[role=menuitem]
+    // is not focusable / not exposed as a button), each KEEPING
+    // role="menuitem" with the derived class arms for this Normal row:
+    // Participating/Ignore plain, All active, Custom show-modal.
+    expect((html.match(/<button type="button" class="item( active| show-modal)?" role="menuitem"/g) ?? []).length).toBe(4);
+    expect(html).toContain('<button type="button" class="item" role="menuitem" aria-label="Participating and mentions"');
+    expect(html).toContain('<button type="button" class="item active" role="menuitem" aria-label="All activity"');
+    expect(html).toContain('<button type="button" class="item" role="menuitem" aria-label="Ignore"');
+    expect(html).toContain('<button type="button" class="item show-modal" role="menuitem" aria-label="Custom"');
     expect(renderRepoHeaderWatchFragment(syntheticRepo(), viewer, { ...watching, mode: WatchMode.None })).toContain('aria-label="Watch">');
   });
 });

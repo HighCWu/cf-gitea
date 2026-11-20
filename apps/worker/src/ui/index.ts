@@ -11439,7 +11439,7 @@ async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
     const data = await loadUserStarsTabData(c.env.DB, profile.user, doer, url.searchParams);
     return respond(c.html(renderUserStarsTabPage(ctx, data), 200));
   }
-  // The WATCHING tab (profile.go:220-246 — upstream's DisableStars {{else}}
+  // The WATCHING tab (profile.go:203-229 — upstream's DisableStars {{else}}
   // arm: by default reachable by DIRECT URL ONLY, nothing active in the
   // header).
   if (url.searchParams.get("tab") === "watching") {

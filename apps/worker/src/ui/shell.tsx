@@ -392,7 +392,11 @@ export function watchSelectedMode(watch: RepoWatch): "ignore" | "participate" | 
  * fragment response; the custom item's data-modal-* attributes are
  * common-button.ts's fill-the-modal contract — `data-modal-form.url` sets
  * the form's action, the data-modal-<input-name> booleans check the
- * checkboxes). Anonymous viewers get upstream's login-link variant (the
+ * checkboxes). The four items are `<button type="button">` elements keeping
+ * `role="menuitem"` (watch.tmpl at 099abf5db4, upstream 8b48b45def #40338:
+ * an href-less `<a role="menuitem">` is not focusable and screen readers
+ * never exposed it as a button; the bundle's css/js fixes for the conversion
+ * ride the submodule pin's asset build). Anonymous viewers get upstream's login-link variant (the
  * login route is ours: /login, the navbar's Sign in arm — upstream's
  * AppSubUrl + /user/login). The count is the maintained `repositories.
  * num_watches` column (upstream `.Repository.NumWatches`, plain digits —
@@ -430,7 +434,15 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
             <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
           </button>
           <div class="tippy-target">
-            <a
+            {/* The four menu items are `<button type="button">` (watch.tmpl's
+                8b48b45def conversion — an href-less a[role=menuitem] is not
+                focusable and screen readers never expose it as a button);
+                `role="menuitem"` is KEPT on the buttons. The template writes
+                the class attr as `item {{if}}active{{end}}` (rendering a
+                trailing space when inactive); the ternary is the same
+                classList without the insignificant whitespace. */}
+            <button
+              type="button"
               class={isParticipating ? "item active" : "item"}
               role="menuitem"
               aria-label={repoActionsLocale.mode_participating}
@@ -443,8 +455,9 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
                 {repoActionsLocale.mode_participating}
                 <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_participating_desc}</div>
               </div>
-            </a>
-            <a
+            </button>
+            <button
+              type="button"
               class={isAll ? "item active" : "item"}
               role="menuitem"
               aria-label={repoActionsLocale.mode_all}
@@ -457,8 +470,9 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
                 {repoActionsLocale.mode_all}
                 <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_all_desc}</div>
               </div>
-            </a>
-            <a
+            </button>
+            <button
+              type="button"
               class={isIgnoring ? "item active" : "item"}
               role="menuitem"
               aria-label={repoActionsLocale.mode_ignore}
@@ -471,8 +485,9 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
                 {repoActionsLocale.mode_ignore}
                 <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_ignore_desc}</div>
               </div>
-            </a>
-            <a
+            </button>
+            <button
+              type="button"
               class={isCustom ? "item active show-modal" : "item show-modal"}
               role="menuitem"
               aria-label={repoActionsLocale.mode_custom}
@@ -491,7 +506,7 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
                 {repoActionsLocale.mode_custom}
                 <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_custom_desc}</div>
               </div>
-            </a>
+            </button>
           </div>
         </>
       ) : (
