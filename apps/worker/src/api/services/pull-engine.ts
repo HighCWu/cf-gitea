@@ -71,7 +71,9 @@ import { canWriteRepository } from "./repo-access";
  * upstream's xorm stores the raw int, no migration, and neither do we);
  * the merge box imports this constant so both sides agree until then.
  */
-export const PR_STATUS_UNRELATED = 7;
+// PULL2's handoff adopted: the enum member landed in db/schema.ts (xorm raw
+// int — no migration); the local const aliases it for the file's readers.
+export const PR_STATUS_UNRELATED = PRStatus.Unrelated;
 
 /** `PullRequestStatus` mapping (§2.4; unrelated carries its own status since
  *  b1c5fedd17 — previously it collapsed into Empty). */

@@ -897,6 +897,8 @@ export const PRStatus = {
   Error: 4,
   Empty: 5,
   Ancestor: 6,
+  /** Upstream `PullRequestStatusUnrelated` — xorm raw int, no migration (PULL2's handoff). */
+  Unrelated: 7,
 } as const;
 
 /** `pull_requests.flow` — upstream `PullRequestFlow` (github = 0 default). */
