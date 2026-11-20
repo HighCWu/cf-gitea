@@ -238,7 +238,7 @@ async function seedPackage(ownerId: number, name: string): Promise<void> {
 
 /** One sessions row for the edit-arm's token-invalidation assertion (the
  *  remember rows are upstream's auth_token twin — UpdateAuth sweeps them on
- *  a password change, update.go:278-284; live rows are untouched). */
+ *  a password change, update.go:295-298; live rows are untouched). */
 async function seedSession(userId: number, id: string, remember: boolean): Promise<void> {
   await drizzle(env.DB).insert(sessions).values({
     id,
@@ -320,7 +320,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(row[0]?.visibility).toBe("limited");
   });
 
-  it("stores the hashed password record and the rands salt (user.go:788-794); must_change_password DEFAULTS TRUE (admin/user.go:89-95)", async () => {
+  it("stores the hashed password record and the rands salt (user.go:807-813); must_change_password DEFAULTS TRUE (admin/user.go:83-89)", async () => {
     const res = await adminSend(
       "/admin/users",
       jsonAdmin({ username: "hashed", email: "hashed@example.com", password: "Sup3r-Secret!" }),
@@ -329,7 +329,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "hashed")).limit(1))[0]!;
     // The admin-user-edit.test.tsx stored-record pattern: SetPassword under
     // the CONFIGURED spec (new salt, pbkdf2$50000$50) plus the Rands salt
-    // every upstream create writes (user.go:785-786).
+    // every upstream create writes (user.go:804-805).
     expect(row.passwd).toMatch(/^[0-9a-f]{100}$/);
     expect(row.salt).toMatch(/^[0-9a-f]{32}$/);
     expect(row.passwdHashAlgo).toBe("pbkdf2$50000$50");
@@ -339,7 +339,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(await verifyPassword("wrong-password", row.passwd, row.salt, row.passwdHashAlgo)).toBe(false);
   });
 
-  it("400 PasswordIsRequired when the password is absent or below MinPasswordLength (admin/user.go:102-106)", async () => {
+  it("400 PasswordIsRequired when the password is absent or below MinPasswordLength (admin/user.go:96-100)", async () => {
     const absent = await adminSend("/admin/users", jsonAdmin({ username: "nopass", email: "nopass@example.com" }));
     expect(absent.status).toBe(400);
     expect(((await absent.json<Record<string, unknown>>())).message).toBe("PasswordIsRequired");
@@ -362,7 +362,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(row[0]?.username).toBe("weakpass");
   });
 
-  it("400 PasswordComplexity on a long single-class password when the knob is ARMED (admin/user.go:107-112 over PASSWORD_COMPLEXITY=lower,upper,digit,spec)", async () => {
+  it("400 PasswordComplexity on a long single-class password when the knob is ARMED (admin/user.go:101-106 over PASSWORD_COMPLEXITY=lower,upper,digit,spec)", async () => {
     const send = adminSendKnobs({ PASSWORD_COMPLEXITY: "lower,upper,digit,spec" });
     const res = await send(
       "/admin/users",
@@ -372,7 +372,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(((await res.json<Record<string, unknown>>())).message).toBe("PasswordComplexity");
   });
 
-  it("the armed min-length floor rides MIN_PASSWORD_LENGTH (MustInt(8) default; admin/user.go:103)", async () => {
+  it("the armed min-length floor rides MIN_PASSWORD_LENGTH (MustInt(8) default; admin/user.go:97)", async () => {
     const send = adminSendKnobs({ MIN_PASSWORD_LENGTH: "16" });
     const short = await send(
       "/admin/users",
@@ -404,14 +404,14 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(res.status).toBe(201);
     const body: Record<string, unknown> = await res.json();
     expect(body.active).toBe(true);
-    // The explicit *bool override of the default-true (admin/user.go:93-95).
+    // The explicit *bool override of the default-true (admin/user.go:87-89).
     const row = (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "tokenonly")).limit(1))[0]!;
     expect(row.mustChangePassword).toBe(false);
   });
 
-  it("threads restricted through the create: a present value lands the column, absent stays false (admin/user.go:122-125 → user.go:741-742, B-89's follow-up); the UserCreate audit arm carries no restricted row", async () => {
+  it("threads restricted through the create: a present value lands the column, absent stays false (admin/user.go:116-119 → user.go:760-761, B-89's follow-up); the UserCreate audit arm carries no restricted row", async () => {
     // optional.FromPtr(form.Restricted) → overwriteDefault.IsRestricted
-    // (admin/user.go:122-125): a PRESENT field writes ANY value — true here.
+    // (admin/user.go:116-119): a PRESENT field writes ANY value — true here.
     const flagged = await adminSend(
       "/admin/users",
       jsonAdmin({ username: "restricted-true", email: "rtrue@example.com", password: "Sup3r-Secret!", restricted: true }),
@@ -424,8 +424,8 @@ describe("POST /admin/users (adminCreateUser)", () => {
     )[0]!;
     expect(trueRow.restricted).toBe(true);
 
-    // An ABSENT field keeps createUser's default (user.go:712
-    // setting.Service.DefaultUserIsRestricted — unset → false; user.go:741-742
+    // An ABSENT field keeps createUser's default (user.go:731
+    // setting.Service.DefaultUserIsRestricted — unset → false; user.go:760-761
     // never fires without a Some).
     const defaulted = await adminSend(
       "/admin/users",
@@ -449,9 +449,9 @@ describe("POST /admin/users (adminCreateUser)", () => {
     )[0]!;
     expect(falseRow.restricted).toBe(false);
 
-    // Upstream's create emits ONLY UserCreate (admin/user.go:149) — no
+    // Upstream's create emits ONLY UserCreate (admin/user.go:143) — no
     // restricted-family row at create (the status trio lives in the
-    // UpdateUser tail, update.go:204-218, which create never calls).
+    // UpdateUser tail, update.go:211-225, which create never calls).
     const audits = await drizzle(env.DB).select().from(auditEvents).all();
     expect(audits.map((row) => row.action)).toEqual(["user:create", "user:create", "user:create"]);
   });
@@ -479,7 +479,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(emailBody.message).toBe("e-mail already in use [email: FRESH@example.com]");
   });
 
-  it("400s on unusable names and invalid emails AFTER the password ladder (upstream order, admin/user.go:102-142)", async () => {
+  it("400s on unusable names and invalid emails AFTER the password ladder (upstream order, admin/user.go:96-136)", async () => {
     const reserved = await adminSend(
       "/admin/users",
       jsonAdmin({ username: "org", email: "a@example.com", password: "Sup3r-Secret!" }),
@@ -516,7 +516,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(await new OrgService(env.DB).lookupUserRedirect("neighbor")).toBeNull();
   });
 
-  it("emits the user:create audit row — actor the ADMIN, scope the created user (B-73, admin/user.go:149)", async () => {
+  it("emits the user:create audit row — actor the ADMIN, scope the created user (B-73, admin/user.go:143)", async () => {
     const res = await adminSend(
       "/admin/users",
       jsonAdmin({ username: "audited", email: "audited@example.com", password: "Sup3r-Secret!" }),
@@ -528,7 +528,7 @@ describe("POST /admin/users (adminCreateUser)", () => {
     expect(rows[0]).toMatchObject({
       action: "user:create",
       actorId: adminId, // ctx.Doer — the admin, not the created user
-      actorName: "cf-gitea Stub User", // DisplayName (user.go:476-482): FullName set → FullName (the stub resolver's full_name)
+      actorName: "cf-gitea Stub User", // DisplayName (user.go:494-500): FullName set → FullName (the stub resolver's full_name)
       scopeType: "user",
       scopeId: String(created.id), // the decimal string (the scope_id drift note)
       scopeName: "audited",
@@ -561,13 +561,16 @@ describe("POST /admin/users (adminCreateUser)", () => {
 // ---------------------------------------------------------------------------
 
 describe("GET /admin/users (adminSearchUsers)", () => {
-  /** Seed three more users with distinct sort keys + states, plus one org
-   *  (orgs are Individuals-only in the listing — Types=[UserTypeIndividual]). */
+  /** Seed three more users with distinct sort keys + states, one bot, and one
+   *  org (the listing is AdminListedUserTypes since 405ba258a8 — every account
+   *  kind except organizations: individuals + bots; the Reserved/Remote types
+   *  have no D1 enum members). */
   beforeEach(async () => {
     await drizzle(env.DB).insert(users).values([
       { username: "alpha", usernameLower: "alpha", email: "alpha@example.com", fullName: "Alpha One", status: "active", visibility: "public", createdAt: new Date("2025-01-01T00:00:00Z") },
       { username: "bravo", usernameLower: "bravo", email: "bravo@example.com", fullName: "Bravo Two", status: "prohibited", visibility: "limited", createdAt: new Date("2025-03-01T00:00:00Z") },
       { username: "charlie", usernameLower: "charlie", email: "charlie@example.com", fullName: "Alpha Three", status: "active", visibility: "private", createdAt: new Date("2025-02-01T00:00:00Z") },
+      { username: "gitea-bot", usernameLower: "gitea-bot", email: "bots@example.com", type: "bot", status: "active", visibility: "public", createdAt: new Date("2025-04-01T00:00:00Z") },
     ]);
     // Distinct creation timestamps for the seeded principal rows too.
     await env.DB.prepare("UPDATE users SET created_at = ?1 WHERE username_lower = 'cf-gitea-stub'")
@@ -582,16 +585,17 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     await new OrgService(env.DB).createOrg({ name: "orgshoulnotlist", ownerId: adminId });
   });
 
-  it("lists only individual users, alphabetically, with the runtime list headers", async () => {
+  it("lists AdminListedUserTypes (individuals + bots, orgs excluded), alphabetically", async () => {
     const res = await adminSend("/admin/users", authed());
     expect(res.status).toBe(200);
-    expect(res.headers.get("X-Total-Count")).toBe("6"); // stub + neighbor + root + 3 seeded; the org is excluded
+    expect(res.headers.get("X-Total-Count")).toBe("7"); // stub + neighbor + root + 3 humans + the bot; the org is excluded
     const listed: Array<Record<string, unknown>> = await res.json();
     expect(listed.map((entry) => entry.login)).toEqual([
       "alpha",
       "bravo",
       "cf-gitea-stub",
       "charlie",
+      "gitea-bot",
       "neighbor",
       "root",
     ]);
@@ -633,11 +637,12 @@ describe("GET /admin/users (adminSearchUsers)", () => {
   it("sorts by name/created/id with asc/desc and 422s invalid sort/order/visibility", async () => {
     const createdDesc = await adminSend("/admin/users?sort=created&order=desc", authed());
     const desc: Array<Record<string, unknown>> = await createdDesc.json();
-    // neighbor (2026) > root (2025-05) > bravo (2025-03) > charlie (2025-02)
-    // > alpha (2025-01) > stub (2024).
+    // neighbor (2026) > root (2025-05) > gitea-bot (2025-04) > bravo (2025-03)
+    // > charlie (2025-02) > alpha (2025-01) > stub (2024).
     expect(desc.map((entry) => entry.login)).toEqual([
       "neighbor",
       "root",
+      "gitea-bot",
       "bravo",
       "charlie",
       "alpha",
@@ -656,6 +661,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
       "bravo",
       "cf-gitea-stub",
       "charlie",
+      "gitea-bot",
       "neighbor",
       "root",
     ].reverse());
@@ -680,14 +686,14 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     // users.is_restricted landed and the write arms followed — its own
     // describe arm below.)
     const locals = await adminSend("/admin/users?source_id=0", authed());
-    expect(locals.headers.get("X-Total-Count")).toBe("6");
+    expect(locals.headers.get("X-Total-Count")).toBe("7");
     const foreign = await adminSend("/admin/users?source_id=7", authed());
     expect(foreign.headers.get("X-Total-Count")).toBe("0");
     const external = await adminSend("/admin/users?login_name=ext-id", authed());
     expect(external.headers.get("X-Total-Count")).toBe("0");
   });
 
-  it("filters is_restricted by exact boolean match — both polarities, absent = no filter (search.go:118-120; admin/user.go:500-501)", async () => {
+  it("filters is_restricted by exact boolean match — both polarities, absent = no filter (search.go:118-120; admin/user.go:478-479)", async () => {
     // The column landed NOT NULL DEFAULT false, so the six fixture users are
     // all unrestricted; one explicit flag creates the restricted side.
     await drizzle(env.DB).update(users).set({ restricted: true }).where(eq(users.usernameLower, "bravo"));
@@ -700,16 +706,16 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     // is_restricted=false → only the unrestricted rows (the EXACT match —
     // NOT a "true-only" arm).
     const unrestricted = await adminSend("/admin/users?is_restricted=false", authed());
-    expect(unrestricted.headers.get("X-Total-Count")).toBe("5");
+    expect(unrestricted.headers.get("X-Total-Count")).toBe("6");
     expect(
       (await unrestricted.json<Array<Record<string, unknown>>>()).every((entry) => entry.login !== "bravo"),
     ).toBe(true);
 
     // Param absent → no filter at all (search.go:118's Has() gate — the
     // option is armed only when the form string is non-empty,
-    // admin/user.go:500-501).
+    // admin/user.go:478-479).
     const unfiltered = await adminSend("/admin/users", authed());
-    expect(unfiltered.headers.get("X-Total-Count")).toBe("6");
+    expect(unfiltered.headers.get("X-Total-Count")).toBe("7");
 
     // The filter ANDs with the keyword arm like every other condition.
     const combined = await adminSend("/admin/users?q=brav&is_restricted=true", authed());
@@ -731,7 +737,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     const enrolled = await adminSend("/admin/users?is_2fa_enabled=true", authed());
     expect(((await enrolled.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["neighbor"]);
     const plain = await adminSend("/admin/users?is_2fa_enabled=false", authed());
-    expect(plain.headers.get("X-Total-Count")).toBe("5");
+    expect(plain.headers.get("X-Total-Count")).toBe("6");
     expect(
       (await plain.json<Array<Record<string, unknown>>>()).every((entry) => entry.login !== "neighbor"),
     ).toBe(true);
@@ -739,7 +745,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
 
   it("paginates with silent clamping", async () => {
     const page = await adminSend("/admin/users?limit=2&page=2", authed());
-    expect(page.headers.get("X-Total-Count")).toBe("6");
+    expect(page.headers.get("X-Total-Count")).toBe("7");
     const listed: Array<Record<string, unknown>> = await page.json();
     expect(listed.map((entry) => entry.login)).toEqual(["cf-gitea-stub", "charlie"]);
     expect(page.headers.get("Link")).toContain('rel="next"');
@@ -756,7 +762,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
   it("sorts by 'updated' through the created_at stand-in in both directions (deviation 5)", async () => {
     // The describe's beforeEach stamped distinct created_at values:
     // stub 2024 < alpha 2025-01 < charlie 2025-02 < bravo 2025-03
-    // < root 2025-05 < neighbor 2026.
+    // < gitea-bot 2025-04 < root 2025-05 < neighbor 2026.
     const updatedAsc = await adminSend("/admin/users?sort=updated", authed());
     const asc: Array<Record<string, unknown>> = await updatedAsc.json();
     expect(asc.map((entry) => entry.login)).toEqual([
@@ -764,6 +770,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
       "alpha",
       "charlie",
       "bravo",
+      "gitea-bot",
       "root",
       "neighbor",
     ]);
@@ -773,6 +780,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     expect(desc.map((entry) => entry.login)).toEqual([
       "neighbor",
       "root",
+      "gitea-bot",
       "bravo",
       "charlie",
       "alpha",
@@ -790,6 +798,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
       "bravo",
       "cf-gitea-stub",
       "charlie",
+      "gitea-bot",
       "neighbor",
       "root",
     ]);
@@ -800,6 +809,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
       "bravo",
       "cf-gitea-stub",
       "charlie",
+      "gitea-bot",
       "neighbor",
       "root",
     ]);
@@ -845,6 +855,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
       "alpha",
       "cf-gitea-stub",
       "charlie",
+      "gitea-bot",
       "neighbor",
       "root",
     ]);
@@ -854,13 +865,14 @@ describe("GET /admin/users (adminSearchUsers)", () => {
       "alpha",
       "cf-gitea-stub",
       "charlie",
+      "gitea-bot",
       "neighbor",
       "root",
     ]);
   });
 
   it("the pager caps at exactly 50 (ToCorrectPageSize) with the true total in the headers", async () => {
-    // 6 fixture users + 49 seeded = 55: enough to observe the cap AND the
+    // 7 fixture users + 49 seeded = 56: enough to observe the cap AND the
     // 50-boundary second page. Single-row inserts — D1 caps a statement at
     // 100 bound variables, and one users row carries 19.
     for (let i = 0; i < 49; i++) {
@@ -875,16 +887,16 @@ describe("GET /admin/users (adminSearchUsers)", () => {
 
     // The cap: limit=51 clamps to 50 rows; X-Total-Count stays the TRUE 55.
     const capped = await adminSend("/admin/users?limit=51", authed());
-    expect(capped.headers.get("X-Total-Count")).toBe("55");
+    expect(capped.headers.get("X-Total-Count")).toBe("56");
     expect((await capped.json<Array<Record<string, unknown>>>())).toHaveLength(50);
     expect(capped.headers.get("Link")).toContain('rel="next"');
 
     // The absent limit rides the 30 default.
     const defaulted = await adminSend("/admin/users", authed());
-    expect(defaulted.headers.get("X-Total-Count")).toBe("55");
+    expect(defaulted.headers.get("X-Total-Count")).toBe("56");
     expect((await defaulted.json<Array<Record<string, unknown>>>())).toHaveLength(30);
 
-    // Exactly 50 per page: page 1 carries no prev/first; page 2 the 5 leftovers.
+    // Exactly 50 per page: page 1 carries no prev/first; page 2 the 6 leftovers.
     const p1 = await adminSend("/admin/users?limit=50", authed());
     expect((await p1.json<Array<Record<string, unknown>>>())).toHaveLength(50);
     const p1Link = p1.headers.get("Link") ?? "";
@@ -894,7 +906,7 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     expect(p1Link).not.toContain('rel="first"');
 
     const p2 = await adminSend("/admin/users?limit=50&page=2", authed());
-    expect((await p2.json<Array<Record<string, unknown>>>())).toHaveLength(5);
+    expect((await p2.json<Array<Record<string, unknown>>>())).toHaveLength(6);
     const p2Link = p2.headers.get("Link") ?? "";
     expect(p2Link).toContain('rel="prev"');
     expect(p2Link).toContain('rel="first"');
@@ -986,7 +998,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(same.status).toBe(200);
   });
 
-  it("sets the password through the UpdateAuth ladder: hash stored, remember sessions swept, live rows kept (admin/user.go:203-226)", async () => {
+  it("sets the password through the UpdateAuth ladder: hash stored, remember sessions swept, live rows kept (admin/user.go:191-214)", async () => {
     await seedSession(neighborId, "sess-remember", true);
     await seedSession(neighborId, "sess-live", false);
     const before = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
@@ -1005,13 +1017,13 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     // verify arms would verify a seeded old row, which is exactly why the
     // replacement, not the verify, is the assertion).
 
-    // update.go:278-284 — the token invalidation: the remember rows (our
+    // update.go:295-298 — the token invalidation: the remember rows (our
     // auth_token twin) die, live non-remember sessions are untouched.
     const remaining = await drizzle(env.DB).select().from(sessions).where(eq(sessions.userId, neighborId)).all();
     expect(remaining.map((s) => s.id).sort()).toEqual(["sess-live"]);
   });
 
-  it("absent and empty password leave the stored record untouched (optional.FromNonDefault, update.go:249)", async () => {
+  it("absent and empty password leave the stored record untouched (optional.FromNonDefault, update.go:257)", async () => {
     const before = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
 
     const absent = await adminSend("/admin/users/neighbor", jsonPatch({ full_name: "Renamed" }));
@@ -1025,7 +1037,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(after.passwdHashAlgo).toBe(before.passwdHashAlgo);
   });
 
-  it("walks the edit password ladder with the UpdateAuth texts — DIFFERENT from create's bare codes (admin/user.go:212-216)", async () => {
+  it("walks the edit password ladder with the UpdateAuth texts — DIFFERENT from create's bare codes (admin/user.go:204-209)", async () => {
     const short = await adminSend("/admin/users/neighbor", jsonPatch({ password: "Aa1!Aa1" }));
     expect(short.status).toBe(400);
     expect(((await short.json<Record<string, unknown>>())).message).toBe("password must be at least 8 characters");
@@ -1042,7 +1054,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(complex.status).toBe(400);
     expect(((await complex.json<Record<string, unknown>>())).message).toBe("password not complex enough");
 
-    // MIN_PASSWORD_LENGTH moves the edit arm's fmt string too (admin/user.go:213).
+    // MIN_PASSWORD_LENGTH moves the edit arm's fmt string too (admin/user.go:205).
     const raised = adminSendKnobs({ MIN_PASSWORD_LENGTH: "16" });
     const floorText = await raised("/admin/users/neighbor", jsonPatch({ password: "Aa1!Aa1" }));
     expect(floorText.status).toBe(400);
@@ -1051,7 +1063,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     );
   });
 
-  it("must_change_password: create defaults TRUE, the edit arm sets and clears it (update.go:265-267)", async () => {
+  it("must_change_password: create defaults TRUE, the edit arm sets and clears it (update.go:283-284)", async () => {
     const created = await adminSend(
       "/admin/users",
       jsonAdmin({ username: "mcpuser", email: "mcp@example.com", password: "Sup3r-Secret!" }),
@@ -1071,7 +1083,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(setRow.mustChangePassword).toBe(true);
   });
 
-  it("the bot auth-material guard 400s before the conversion arms (admin/user.go:200-204)", async () => {
+  it("the bot auth-material guard 400s before the conversion arms (admin/user.go:198-201)", async () => {
     const withPassword = await adminSend(
       "/admin/users/neighbor",
       jsonPatch({ type: "Bot", password: "Sup3r-Secret!" }),
@@ -1108,7 +1120,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(((await botPlain.json<Record<string, unknown>>())).type).toBe("Bot");
     const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).limit(1))[0]!;
     expect(row.type).toBe("bot");
-    // UpdateUser's type-change audit (update.go:217): actor the ADMIN,
+    // UpdateUser's type-change audit (update.go:223): actor the ADMIN,
     // {user_type} DisplayName's English render.
     const audits = await drizzle(env.DB).select().from(auditEvents).all();
     expect(audits).toHaveLength(1);
@@ -1139,7 +1151,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(audits[0]).toMatchObject({ action: "user:type:update", message: "Changed type of user neighbor to User." });
   });
 
-  it("an ALREADY-bot target refuses auth material without a type change (UpdateAuth's service guard, update.go:231-235)", async () => {
+  it("an ALREADY-bot target refuses auth material without a type change (UpdateAuth's service guard, update.go:241-243)", async () => {
     await drizzle(env.DB)
       .update(users)
       .set({ type: "bot" })
@@ -1157,7 +1169,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(((await noMaterial.json<Record<string, unknown>>())).prohibit_login).toBe(true);
   });
 
-  it("org targets refuse BOTH conversion directions with ErrUserTypeCanNotConvert (update.go:301)", async () => {
+  it("org targets refuse BOTH conversion directions with ErrUserTypeCanNotConvert (update.go:312-318)", async () => {
     const orgId = (
       await drizzle(env.DB)
         .insert(users)
@@ -1175,7 +1187,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(orgId).not.toBe(neighborId);
   });
 
-  it("admin:false + type:Bot on an admin target CONVERTS (the effective-admin fold — opts.IsAdmin applies first, update.go:289-303)", async () => {
+  it("admin:false + type:Bot on an admin target CONVERTS (the effective-admin fold — opts.IsAdmin applies first, update.go:186-190)", async () => {
     // root is the ONLY admin here → unsetting admin trips the last-admin
     // guard; seed a second admin so the fold is observable.
     await drizzle(env.DB)
@@ -1202,9 +1214,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
   it("404s a missing user and 307s a renamed one (UserAssignmentAPI seam)", async () => {
     const missing = await adminSend("/admin/users/ghost", jsonPatch({ full_name: "x" }));
     expect(missing.status).toBe(404);
-    expect(((await missing.json<Record<string, unknown>>())).message).toBe(
-      "user redirect does not exist [name: ghost]",
-    );
+    expect(((await missing.json<Record<string, unknown>>())).message).toBe("user not found");
 
     await adminSend("/admin/users/neighbor/rename", jsonAdmin({ new_username: "renamed" }));
     const redirected = await adminSend("/admin/users/neighbor", jsonPatch({ full_name: "x" }));
@@ -1213,13 +1223,13 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // The UpdateUser audit tail (B-89, services/user/update.go:204-218) — the
+  // The UpdateUser audit tail (B-89, services/user/update.go:211-225) — the
   // family emits ride the shared emitUserColumnAuditRows helper at the exact
   // upstream point (after the UPDATE, before the type row). Upstream fires a
   // row per ACTUALLY-changed column against the pre-write snapshot (:68).
   // -------------------------------------------------------------------------
 
-  it("emits user:status:active on an active flip — and NOTHING on a prohibit_login-only flip (B-89, update.go:204-206 vs the UpdateAuth tail's prohibit silence)", async () => {
+  it("emits user:status:active on an active flip — and nothing here on a prohibit_login-only flip (B-89, update.go:211-213; the pin's UpdateAuth tail gained UserProhibitLogin :305-307 — 3f1b738f09 — the update unit's pending port)", async () => {
     const off = await adminSend("/admin/users/neighbor", jsonPatch({ active: false }));
     expect(off.status).toBe(200);
     let rows = await drizzle(env.DB).select().from(auditEvents).all();
@@ -1245,15 +1255,17 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     });
 
     // The prohibit arm: the status column flips (deviation 6) but upstream's
-    // prohibit_login write rides UpdateAuth, whose tail (update.go:281-293)
-    // records no prohibit row — so the fold's driver stays silent here too.
+    // prohibit_login write rides UpdateAuth, whose PRE-PIN tail recorded no
+    // prohibit row — the pin RECORDS user:prohibitlogin:update (:305-307,
+    // 3f1b738f09), still PENDING on our side, so the fold's driver stays
+    // silent here too (the recorded pending delta, not a parity fact).
     const prohibit = await adminSend("/admin/users/neighbor", jsonPatch({ prohibit_login: true }));
     expect(prohibit.status).toBe(200);
     rows = await drizzle(env.DB).select().from(auditEvents).all();
     expect(rows).toHaveLength(2);
   });
 
-  it("emits user:status:admin on a grant and a demote; the last-admin 400 emits nothing (B-89, update.go:207-209)", async () => {
+  it("emits user:status:admin on a grant and a demote; the last-admin 400 emits nothing (B-89, update.go:214-216)", async () => {
     // root is the ONLY admin: the guard 400s BEFORE the write — upstream's
     // ErrDeleteLastAdminUser return precedes UpdateUserCols, so no row.
     const demote = await adminSend("/admin/users/root", jsonPatch({ admin: false }));
@@ -1281,7 +1293,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     });
   });
 
-  it("emits user:visibility:update with old/new on a change; the same-value post is silent (B-89, update.go:213-215)", async () => {
+  it("emits user:visibility:update with old/new on a change; the same-value post is silent (B-89, update.go:220-222)", async () => {
     const change = await adminSend("/admin/users/neighbor", jsonPatch({ visibility: "limited" }));
     expect(change.status).toBe(200);
     let rows = await drizzle(env.DB).select().from(auditEvents).all();
@@ -1301,7 +1313,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(rows).toHaveLength(1);
   });
 
-  it("writes is_restricted presence-gated and emits user:status:restricted on a flip; the same-value post is silent (B-89's OPEN half 2 cured: update.go:135-139's write arms :210-212)", async () => {
+  it("writes is_restricted presence-gated and emits user:status:restricted on a flip; the same-value post is silent (B-89's OPEN half 2 cured: update.go:137-141's write arms :216-218)", async () => {
     // A PRESENT field writes ANY value (the API binds
     // optional.FromPtr(form.Restricted), admin/user.go:247 — no
     // last-admin/actual-change guard, unlike IsAdmin and Visibility): true
@@ -1344,7 +1356,7 @@ describe("PATCH /admin/users/{username} (adminEditUser)", () => {
     expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(2);
   });
 
-  it("a combined patch emits the family in upstream order BEFORE the type row (B-89, update.go:204-218's fixed order)", async () => {
+  it("a combined patch emits the family in upstream order BEFORE the type row (B-89, update.go:211-225's fixed order)", async () => {
     // root with a second admin beside it: admin:false passes the last-admin
     // guard AND the Bot conversion's effective-admin check (the 1105 test's
     // fold), so ONE patch carries all five family/type diffs at once —
@@ -1682,7 +1694,7 @@ describe("DELETE /admin/users/{username} (adminDeleteUser)", () => {
   it("404s a missing user", async () => {
     const res = await adminSend("/admin/users/ghost", authed({ method: "DELETE" }));
     expect(res.status).toBe(404);
-    expect(((await res.json<Record<string, unknown>>())).message).toBe("user redirect does not exist [name: ghost]");
+    expect(((await res.json<Record<string, unknown>>())).message).toBe("user not found");
   });
 });
 
@@ -1764,7 +1776,7 @@ describe("POST /admin/users/{username}/orgs (adminCreateOrg)", () => {
   it("404s a missing target", async () => {
     const res = await adminSend("/admin/users/ghost/orgs", jsonAdmin({ username: "fresh-org" }));
     expect(res.status).toBe(404);
-    expect(((await res.json<Record<string, unknown>>())).message).toBe("user redirect does not exist [name: ghost]");
+    expect(((await res.json<Record<string, unknown>>())).message).toBe("user not found");
   });
 });
 

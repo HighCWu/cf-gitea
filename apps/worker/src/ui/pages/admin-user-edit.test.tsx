@@ -4,9 +4,9 @@
  * module header's; the seams drive directly, the admin-user-detail.test
  * pattern).
  *
- * Coverage (upstream at the pin: web.go:820's
+ * Coverage (upstream at the pin: web.go:786's
  * `m.Combo("/{userid}/edit").Get(admin.EditUser).Post(web.Bind[*forms.AdminEditUserForm](), admin.EditUserPost)`,
- * routers/web/admin/users.go:391-557 over prepareUserInfo, and
+ * routers/web/admin/users.go:396-570 over prepareUserInfo, and
  * templates/admin/user/edit.tmpl):
  *
  *   - THE LOADER (prepareUserInfo): the unknown-id null — the caller's 303
@@ -632,7 +632,7 @@ describe("the submit — the flag folds", () => {
     expect((await rowOf(seeded.aliceId)).status).toBe("active");
   });
 
-  it("the skip-self guard forces prohibit false for the doer's own row (users.go:476-480)", async () => {
+  it("the skip-self guard forces prohibit false for the doer's own row (users.go:474-479)", async () => {
     const seeded = await seedEdit();
     expect(await submit(seeded, aliceForm({}, []))).toEqual({ outcome: "updated" }); // prohibited first
     const outcome = await submit(seeded, aliceForm({}, ["active", "prohibit_login"]), seeded.aliceId, seeded.aliceId);

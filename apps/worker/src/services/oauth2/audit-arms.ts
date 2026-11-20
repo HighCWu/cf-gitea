@@ -163,9 +163,11 @@ const APPLICATION_ACTIONS: Record<OAuth2ApplicationAuditVerb, { user: string; or
   revoke: { user: AuditActions.UserOAuth2ApplicationRevoke },
 };
 
-/** The PAT verbs (applications.go:133/:162 — the web arms; app.go:156/:231
- *  are the API twins with the same ids). */
-export type AccessTokenAuditVerb = "add" | "remove";
+/** The PAT verbs (applications.go:133/:162/:182 at the 099abf5db4 pin — the
+ *  web arms; app.go:156/:231 are the API twins with the same ids). The
+ *  "regenerate" verb is 365cb2bd5e's user:accesstoken:regenerate row — the
+ *  admin bot-token arm emits it (pages/admin-user-detail.tsx). */
+export type AccessTokenAuditVerb = "add" | "remove" | "regenerate";
 
 export interface AccessTokenAuditArm {
   /** The token's owner (upstream `owner` / `ctx.ContextUser`). */
@@ -239,16 +241,21 @@ export async function emitOAuth2ApplicationAudit(db: D1Database, arm: OAuth2Appl
 }
 
 /**
- * The access-token add/remove emit — audit.Record with owner as the scope
- * (applications.go:133/:162, app.go:156/:231). Message vars: the add
- * template's three tokens {token}/{scope}/{token_scope}, the remove
- * template's two.
+ * The access-token add/remove/regenerate emit — audit.Record with owner as
+ * the scope (applications.go:133/:162/:182 at the 099abf5db4 pin,
+ * app.go:156/:231). Message vars: the add template's three tokens
+ * {token}/{scope}/{token_scope}, the remove/regenerate templates' two.
  */
 export async function emitAccessTokenAudit(db: D1Database, arm: AccessTokenAuditArm): Promise<void> {
   try {
     const owner = await loadOwnerRow(db, arm.userId);
     const username = owner?.username ?? "";
-    const action = arm.verb === "add" ? AuditActions.UserAccessTokenAdd : AuditActions.UserAccessTokenRemove;
+    const action =
+      arm.verb === "add"
+        ? AuditActions.UserAccessTokenAdd
+        : arm.verb === "regenerate"
+          ? AuditActions.UserAccessTokenRegenerate
+          : AuditActions.UserAccessTokenRemove;
     const vars: Record<string, string> = { token: arm.tokenName, scope: username };
     if (arm.verb === "add") {
       vars.token_scope = arm.tokenScope ?? "";

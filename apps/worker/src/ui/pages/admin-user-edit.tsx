@@ -2,7 +2,7 @@
  * The ADMIN USER EDIT page — `/-/admin/users/{userid}/edit` — the GET+POST
  * combo of upstream web.go:820's
  * `m.Combo("/{userid}/edit").Get(admin.EditUser).Post(web.Bind[*forms.AdminEditUserForm](), admin.EditUserPost)`
- * (routers/web/admin/users.go:391-557 over editUserCommon + prepareUserInfo,
+ * (routers/web/admin/users.go:396-570 over editUserCommon + prepareUserInfo,
  * rendered by templates/admin/user/edit.tmpl). PORT-FIRST: the module owns
  * the load + render + submit; the route lives behind the orchestrator's
  * index.ts fold (the mount recipe at the bottom). This is the last unlanded
@@ -10,7 +10,7 @@
  * avatar write pair at 2a00e28, and the list's actions column has pointed
  * nowhere until now.
  *
- * ## The unknown-id arm (prepareUserInfo, users.go:269-278)
+ * ## The unknown-id arm (prepareUserInfo, users.go:268-277)
  *
  * An unknown {userid} REDIRECTS to `/-/admin/users` (the list), never a 404
  * — the SAME arm the detail page answers (`loadAdminUserEdit` answers null;
@@ -25,7 +25,7 @@
  * (active "users"), then the ONE `<form action="./edit" method="post">`
  * whose field set reads exactly upstream's:
  *
- *   - `user_name` — the RENAME field (users.go:427-462's RenameUser arm,
+ *   - `user_name` — the RENAME field (users.go:434-457's RenameUser arm,
  *     skipped when the posted value is empty or unchanged). Targets of
  *     type 'user' ride the module-local mirror of admin-t2.ts's
  *     `renameUserRow` (route-private there — the list page's
@@ -36,21 +36,21 @@
  *     user.form.name_pattern_not_allowed / user.form.name_chars_not_allowed),
  *     mapped from the typed org errors, flagged on the field.
  *   - `user_type` — renders ONLY when upstream's CanConvertUserType holds
- *     (CheckConvertUserType, services/user/update.go:299-307: admins and
+ *     (CheckConvertUserType, services/user/update.go:312-320: admins and
  *     orgs can't convert; BOT rows pass — the field renders preselected to
  *     the current type, edit.tmpl:17's Iif). Since B-72 (the users.type
- *     'bot' value) the submit CONVERTS for real (users.go:515-518's
+ *     'bot' value) the submit CONVERTS for real (users.go:536/:539's
  *     UpdateUser UserType arm): a parsed type differing from the current
- *     one rides the column patch with the change audited (update.go:217).
+ *     one rides the column patch with the change audited (update.go:223).
  *     Refusals: an effective-admin target → ErrBotCanNotBeAdmin
- *     (users.go:545-550 — Flash + redirect; the no-flash reduction 303s
+ *     (users.go:543-545 — Flash + redirect; the no-flash reduction 303s
  *     silently; upstream checks the IN-MEMORY IsAdmin after the posted
  *     admin checkbox applied, so admin:false + Bot CONVERTS); an org
  *     target (hand-crafted only — the field doesn't render) →
  *     ErrUserTypeCanNotConvert → the errors.Is(util.ErrInvalidArgument)
- *     arm (users.go:541-544 — Flash + redirect, the flash dropped; NOT a
+ *     arm (users.go:546-548 — Flash + redirect, the flash dropped; NOT a
  *     ServerError). Junk values fail the In(,User,Bot) bind — the
- *     flag-less silent re-render (users.go:421-424's HasError arm; the
+ *     flag-less silent re-render (users.go:427-430's HasError arm; the
  *     rendered select cannot produce junk).
  *   - `login_type` — the auth-source dropdown. Upstream lists Local (0-0)
  *     plus every FindSources row; the port lists the LANDED login_sources
@@ -74,21 +74,21 @@
  *     (services/user-accounts.ts invalidEmailMessage — the
  *     IsEmailAddressValid port); a bind miss re-renders FLAGGED with no
  *     banner (upstream's silent HasError arm). The email arm
- *     (users.go:497-510 → ReplacePrimaryEmailAddress): org targets answer
+ *     (users.go:504-521 → ReplacePrimaryEmailAddress): org targets answer
  *     upstream's InvalidArgument mapping (email.go:28-31 →
- *     users.go:507-509 — "The email address is invalid." + the field
+ *     users.go:510-512 — "The email address is invalid." + the field
  *     flag; the API twin's 400 carries the service text instead), the
  *     case-fold-same address no-ops, a foreign duplicate re-renders
  *     flagged with form.email_been_used. The domain-allowlist flash
- *     warning (users.go:511-513) has no allowlist config landed — dead
+ *     warning (users.go:518-520) has no allowlist config landed — dead
  *     arm, not ported.
  *   - `password` — LIVE (SPEC-0002 §6.2's admin-set arm, PWD-2 — the
  *     former disabled interim is superseded): rendered ENABLED and empty
  *     with upstream's password_helper. FromNonDefault semantics — EMPTY =
  *     unchanged; non-empty → the UpdateAuth ladder (the min-length /
- *     complexity arms answer the Err_Password re-render, users.go:486-490),
+ *     complexity arms answer the Err_Password re-render, users.go:491-495),
  *     then SetPassword + the remember-me invalidation + the audit row
- *     (update.go:279-283). Never echoes.
+ *     (update.go:292-298). Never echoes.
  *   - `language` — DROPPED: users has no language column (the detail
  *     page's unproducible-language-line posture) and the landed
  *     EditUserOption contract (admin-t2.ts editUserOptionSchema) declares
@@ -96,15 +96,15 @@
  *   - `website` / `location` → the landed columns, empty clears.
  *   - `max_repo_creation` — rendered at upstream's fresh-row default -1,
  *     DISABLED with an explicit not-supported notice (the ADR-0008 rule-4
- *     remedy, the password pattern: upstream's arm is real — users.go:526
- *     → the user.MaxRepoCreation column, user.go:129 — and ADR-0008
+ *     remedy, the password pattern: upstream's arm is real — users.go:531
+ *     → the user.MaxRepoCreation column, user.go:135 — and ADR-0008
  *     re-opens it; until the column lands the disabled input cannot offer
  *     the operation), the int bind still enforced (junk re-renders
  *     flagged, silent — the bind is upstream's own wire level), the
  *     submit keeps ignoring any hand-crafted value (no column to hit).
  *   - `active` / `prohibit_login` — the status-enum fold (admin-t2.ts
  *     deviation 6): either off-signal lands 'prohibited', an explicit-on
- *     lands 'active'. The SKIP-SELF guard (users.go:476-480) forces
+ *     lands 'active'. The SKIP-SELF guard (users.go:474-479) forces
  *     prohibit false when the target IS the doer — the rendered checkbox
  *     is also disabled for self (edit.tmpl:132's eq arm).
  *   - `admin` — users.is_admin, always applied (upstream's
@@ -112,8 +112,8 @@
  *     (admin-t2.ts's isLastAdminUser — route-private, mirrored
  *     module-local): unsetting the last admin re-renders with
  *     auth.last_admin, no field flag (upstream's exact arm,
- *     users.go:539-541).
- *   - `restricted` — the REAL arm (users.go:523 binds
+ *     users.go:541-542).
+ *   - `restricted` — the REAL arm (users.go:533 binds
  *     `IsRestricted: optional.Some(form.Restricted)`, always applied like
  *     IsAdmin): the landed `users.is_restricted` column (the d32b0a4
  *     rule-4 interim flipped live — the disabled-with-notice posture, the
@@ -127,19 +127,19 @@
  *     DisableGitHooks defaults true, security.go:71; ImportLocalPaths
  *     defaults false, security.go:168 → both fields carry tw-hidden and
  *     the checkbox disabled at our no-config posture; CanEditGitHook /
- *     CanImportLocal fold to false, user.go:306-319), the posted values
+ *     CanImportLocal fold to false, user.go:312-325), the posted values
  *     accepted and ignored.
  *   - `allow_create_organization` — rendered checked iff isAdmin
- *     (CanCreateOrganization, user.go:301-303) DISABLED with the
+ *     (CanCreateOrganization, user.go:307-309) DISABLED with the
  *     not-supported notice (the rule-4 remedy: upstream's arm is real —
- *     users.go:527 → user.AllowCreateOrganization, user.go:142 — ADR-0008
+ *     users.go:532 → user.AllowCreateOrganization, user.go:148 — ADR-0008
  *     re-opens it; the flag column is the absent half), the posted value
  *     still ignored.
  *   - `reset_2fa` — present iff upstream's TwoFactorEnabled holds:
- *     hasTOTP || hasWebAuthn (users.go:305-307) — the landed `two_factor`
+ *     hasTOTP || hasWebAuthn (users.go:307) — the landed `two_factor`
  *     table (schema.ts migration 0059) is read for the TOTP half; WebAuthn
  *     has no store yet (its half is the constant false). On submit the
- *     DisableTwoFactor arm (users.go:551-556, twofactor.go:199-208) dies
+ *     DisableTwoFactor arm (users.go:557-565, twofactor.go:199-208) dies
  *     the TOTP row; the WebAuthn half is the recorded future unit.
  *   - The DELETE-ACCOUNT button + #delete-user-modal are OMITTED — they
  *     POST `./delete` (web.go:819's admin.DeleteUser, unlanded) and the
@@ -328,7 +328,7 @@ export const adminUserEditLocale = {
   reset_2fa: "Reset 2FA", // "admin.users.reset_2fa" (:174)
   update_profile: "Update User Account", // "admin.users.update_profile" (:183)
   avatar_section: "Avatar", // "settings.avatar" (:190)
-  // The RenderWithErr ladder's en-US texts (users.go:434-458, :500-509, :540).
+  // The RenderWithErr ladder's en-US texts (users.go:436-455, :506-516, :541-542).
   username_been_taken: "The username is already taken.", // "form.username_been_taken"
   name_reserved: 'The username "%s" is reserved.', // "user.form.name_reserved"
   name_pattern_not_allowed: 'The pattern "%s" is not allowed in a username.', // "user.form.name_pattern_not_allowed"
@@ -350,19 +350,19 @@ export interface AdminUserEditData {
    *  FindSources over every row, name ASC). */
   sources: LoginSourceRow[];
   /** `user_type` renders only when CheckConvertUserType(u) == nil
-   *  (services/user/update.go:299-307): NOT an admin and NOT an org —
+   *  (services/user/update.go:312-320): NOT an admin and NOT an org —
    *  bot rows PASS the check (IsTypeBot short-circuits the
    *  not-Individual arm), so a bot target renders the field preselected
    *  to Bot and can convert back (B-72 handoff 2). */
   canConvertUserType: boolean;
-  /** hasTOTP || hasWebAuthn (users.go:305-307): the landed two_factor row
+  /** hasTOTP || hasWebAuthn (users.go:307): the landed two_factor row
    *  is the TOTP half; WebAuthn has no store yet (the constant-false
    *  half). Gates the reset_2fa checkbox (edit.tmpl:170-178). */
   twoFactorEnabled: boolean;
 }
 
 /**
- * prepareUserInfo's pull (users.go:269-281): the users row by id (`null` =
+ * prepareUserInfo's pull (users.go:268-280): the users row by id (`null` =
  * the LIST-redirect arm, never a 404), the auth sources, the convert gate,
  * and the 2FA-enabled read.
  */
@@ -438,13 +438,13 @@ export function parseAdminUserEditForm(params: URLSearchParams): AdminUserEditFo
 }
 
 // ---------------------------------------------------------------------------
-// The submit (EditUserPost, users.go:413-557, over the landed seams)
+// The submit (EditUserPost, users.go:418-570, over the landed seams)
 // ---------------------------------------------------------------------------
 
 /** The fields the re-render can flag (upstream's Err_UserName /
  *  Err_LoginType / Err_Visibility / Err_Email / Err_MaxRepoCreation class
  *  hooks; Err_Password is LIVE — the PWD-2 ladder answers it
- *  (validateNewPassword → the re-render, users.go:486-490); Err_LoginName
+ *  (validateNewPassword → the re-render, users.go:483-488); Err_LoginName
  *  stays unreachable — no login-name column). */
 export type AdminUserEditErrorField = "userName" | "loginType" | "visibility" | "email" | "maxRepoCreation" | "password";
 
@@ -480,7 +480,7 @@ export interface AdminUserEditKnobs {
 
 /** admin-t2.ts's `isLastAdminUser` (route-private — mirrored module-local,
  *  the list page's predicate posture): only the FALSE-set checks
- *  (update.go:145-157). */
+ *  (update.go:142-155). */
 async function isLastAdminUser(d1: D1Database, target: { id: number; isAdmin: boolean }): Promise<boolean> {
   if (!target.isAdmin) return false;
   const others = await drizzle(d1)
@@ -561,7 +561,7 @@ async function renameUserRow(
   }
 }
 
-/** The WEB rename ladder's texts (users.go:431-458) mapped from the typed
+/** The WEB rename ladder's texts (users.go:436-455) mapped from the typed
  *  org errors — the locale strings upstream's RenderWithErr arms carry
  *  (the API twin answers the service texts instead). */
 function renameErrorMessage(error: OrgError, newName: string): string {
@@ -579,7 +579,7 @@ function visibilityFromString(raw: string): "public" | "limited" | "private" {
 }
 
 /**
- * POST /-/admin/users/{userid}/edit (admin.EditUserPost, users.go:413-557)
+ * POST /-/admin/users/{userid}/edit (admin.EditUserPost, users.go:418-570)
  * over the landed seams — the module header carries the ladder and every
  * reduction. The caller supplies the §2.8-guarded, prologue-gated doer id
  * (`doerId`) for the skip-self prohibit guard. `request` is the raw Request
@@ -610,7 +610,7 @@ export async function submitAdminUserEdit(
 
   // --- the bind phase (web.Bind's AdminEditUserForm validation; a miss
   // re-renders at 200 with the flagged fields and NO banner — the silent
-  // HasError arm, users.go:421-424 — and NOTHING else runs).
+  // HasError arm, users.go:427-430 — and NOTHING else runs).
   if (form.loginType === "") return { outcome: "invalid", message: null, field: "loginType" };
   if (!/^(0|1|2)$/.test(form.visibility)) return { outcome: "invalid", message: null, field: "visibility" };
   if (!/^-?\d+$/.test(form.maxRepoCreation)) return { outcome: "invalid", message: null, field: "maxRepoCreation" };
@@ -624,7 +624,7 @@ export async function submitAdminUserEdit(
     return { outcome: "invalid", message: null, field: "email" };
   }
 
-  // --- the rename arm (users.go:427-462 → RenameUser): commits
+  // --- the rename arm (users.go:434-457 → RenameUser): commits
   // immediately like upstream's own tx — a later arm's failure re-renders
   // the NEW name (the partial-persist observable).
   if (form.userName !== "" && form.userName !== user.username) {
@@ -642,7 +642,7 @@ export async function submitAdminUserEdit(
     }
   }
 
-  // --- the posted type (users.go:453-456): upstream parses form.UserType
+  // --- the posted type (users.go:459-462): upstream parses form.UserType
   // (the bind admits ""/User/Bot — junk never reaches here) and overrides
   // the current type on a successful parse; "" = no change. B-72 handoff 2:
   // the enum carries 'bot' now, so the parse is the REAL conversion's
@@ -650,13 +650,13 @@ export async function submitAdminUserEdit(
   const parsedUserType: "user" | "bot" | null =
     form.userType === "" ? null : form.userType === "User" ? "user" : "bot";
 
-  // --- the auth arm (users.go:464-495 → UpdateAuth): the PASSWORD arm is
+  // --- the auth arm (users.go:464-502 → UpdateAuth): the PASSWORD arm is
   // REAL (SPEC-0002 §6.2 admin-set row — PWD-2 supersedes the interim
   // disabled field): FromNonDefault semantics — EMPTY = unchanged,
   // non-empty → the UpdateAuth ladder (validateNewPassword: min length 8 /
-  // complexity → the Err_Password re-render, users.go:486-490), then
+  // complexity → the Err_Password re-render, users.go:483-488), then
   // SetPassword + the remember-me invalidation + the audit row
-  // (update.go:279-283). The BOT SKIP (users.go:459-460
+  // (update.go:295-298). The BOT SKIP (users.go:465
   // `!u.IsTypeBot() && userType != UserTypeBot` — "the auth fields hidden
   // for bots still submit their values"): when the CURRENT type is bot OR
   // the posted type parses to Bot, the password arm is silently NOT
@@ -664,7 +664,7 @@ export async function submitAdminUserEdit(
   // rendered form omits for bots (edit.tmpl:82) but a hand-crafted post
   // may carry. login_name / login_type carry no arm (the interim posture
   // stands for them). The prohibit fold with the SKIP-SELF guard
-  // (users.go:476-480), then the deviation-6 status fold (admin-t2.ts's
+  // (users.go:474-479), then the deviation-6 status fold (admin-t2.ts's
   // PATCH posture).
   if (form.password !== "" && user.type !== "bot" && parsedUserType !== "bot") {
     // The ladder + SetPassword consume the deploy-config knobs (census
@@ -703,7 +703,7 @@ export async function submitAdminUserEdit(
   const activated = form.active === true || form.prohibitLogin === false;
   const nextStatus: "active" | "prohibited" | null = prohibited ? "prohibited" : activated ? "active" : null;
 
-  // --- the email arm (users.go:497-510 → ReplacePrimaryEmailAddress): the
+  // --- the email arm (users.go:504-521 → ReplacePrimaryEmailAddress): the
   // case-fold-same address no-ops (email.go:33-35); an org target answers
   // upstream's InvalidArgument mapping; a foreign duplicate the
   // email_been_used arm.
@@ -751,7 +751,7 @@ export async function submitAdminUserEdit(
     website: form.website,
     location: form.location,
     isAdmin: form.admin,
-    // users.go:523 `IsRestricted: optional.Some(form.Restricted)` — always
+    // users.go:533 `IsRestricted: optional.Some(form.Restricted)` — always
     // applied (the users.is_restricted column; the repo-listing visibility
     // composition reads it, api/services/repository.ts restrictedArcCondition).
     restricted: form.restricted,
@@ -762,10 +762,10 @@ export async function submitAdminUserEdit(
   const typeChanged = parsedUserType !== null && parsedUserType !== user.type;
   if (typeChanged) patch.type = parsedUserType;
   await db.update(users).set(patch).where(eq(users.id, user.id));
-  // UpdateUser's audit tail (B-89, services/user/update.go:204-218 — the
+  // UpdateUser's audit tail (B-89, services/user/update.go:211-225 — the
   // shared service block upstream runs after EVERY UpdateUser commit,
   // :200's UpdateUserCols; both admin edit arms emit through it upstream,
-  // this web arm at users.go:511-548's opts): one row per ACTUALLY-changed
+  // this web arm at users.go:523-553's opts): one row per ACTUALLY-changed
   // audited column against the pre-UPDATE `user` snapshot (:68), in
   // upstream's fixed order active → admin → restricted → visibility; the
   // type emit below is the tail's LAST member (:216-218) and stays after
@@ -773,10 +773,12 @@ export async function submitAdminUserEdit(
   // in-memory struct — not a re-read). The status fold's driver rule (the
   // UserColumnAuditContext doc): the web form ALWAYS posts `active` (the
   // rendered checkbox, upstream's `IsActive: optional.Some(form.Active)`,
-  // users.go:514), so the posted value rides as `activePosted` — only an
+  // users.go:527), so the posted value rides as `activePosted` — only an
   // active-driven status flip emits user:status:active; a prohibit-only
-  // flip stays silent (upstream's prohibit_login write rides UpdateAuth,
-  // whose tail :281-293 records no prohibit row). Failure posture =
+  // flip stays silent HERE (upstream's prohibit_login write rides
+  // UpdateAuth, whose tail records `user:prohibitlogin:update` SINCE
+  // 3f1b738f09, update.go:305-307 at the pin — the silence is a PENDING
+  // DELTA, the update unit's UpdateAuth-tail port, HANDOFF). Failure posture =
   // upstream writeEvent (audit/event.go:129-133): a failed audit INSERT
   // logs and never errorizes the successful write.
   await emitUserColumnAuditRows(
@@ -800,7 +802,7 @@ export async function submitAdminUserEdit(
     console.error(`admin-edit: user update-family audit rows failed (scope=${user.id}): ${String(error)}`);
   });
   if (typeChanged) {
-    // UpdateUser's type-change audit (update.go:217 — the shared service
+    // UpdateUser's type-change audit (update.go:223 — the shared service
     // tail, the API arm's twin): actor the doer, scope the edited row,
     // {user_type} DisplayName's English render. A failed insert logs and
     // never fails the edit (upstream writeEvent's posture).
@@ -821,11 +823,38 @@ export async function submitAdminUserEdit(
     });
   }
 
-  // --- the reset-2FA arm (users.go:551-556 → DisableTwoFactor,
-  // twofactor.go:199-208): the TOTP row dies; the WebAuthn half has no
-  // landed store (the module header).
+  // --- the reset-2FA arm (users.go:557-565 at the 099abf5db4 pin →
+  // DisableTwoFactor, twofactor.go:199-208): the TOTP row dies; the
+  // WebAuthn half has no landed store (the module header). c144668e59
+  // added the AUDIT half: `totp, webAuthn, err := DisableTwoFactor(...)`,
+  // then `if totp+webAuthn > 0 { audit.Record(ctx,
+  // audit_model.UserTwoFactorDisable, u) }` — the row fires ONLY when
+  // something was actually disabled (a no-enrollment target stays silent,
+  // the post-refresh idempotent click emits nothing). Actor = the calling
+  // admin (ctx.Doer), scope = the edited row; the failure posture is the
+  // file's emit convention (a failed INSERT logs, never errorizes).
   if (form.reset2fa) {
-    await db.delete(twoFactor).where(eq(twoFactor.userId, user.id));
+    const enrolled = await db
+      .delete(twoFactor)
+      .where(eq(twoFactor.userId, user.id))
+      .returning({ userId: twoFactor.userId });
+    if (enrolled.length > 0) {
+      const { AuditActions, emitAudit } = await import("../../services/audit");
+      void emitAudit(db, {
+        action: AuditActions.UserTwoFactorDisable,
+        actorId: doerId,
+        actorName: user.username, // the seam's actor-name posture (the password arm's)
+        actorCredential: null, // the write rode a session
+        scopeType: "user",
+        scopeId: user.id,
+        scopeName: user.username,
+        origin: "ui",
+        ipAddress: auditIp,
+        vars: { scope: user.username },
+      }).catch((error: unknown) => {
+        console.error(`admin-edit: reset-2FA audit row failed: ${String(error)}`);
+      });
+    }
   }
 
   return { outcome: "updated" };
@@ -991,7 +1020,7 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
 
           {/* max_repo_creation (:115-119) — the ADR-0008 rule-4 interim
               posture (the password pattern): upstream's arm is REAL
-              (users.go:526 → the user.MaxRepoCreation column, user.go:129
+              (users.go:531 → the user.MaxRepoCreation column, user.go:135
               `NOT NULL DEFAULT -1`) so the field renders at the fresh-row
               default -1, but DISABLED — a disabled input never posts, so
               the rendered form cannot offer the store the backend lacks.
@@ -1013,7 +1042,7 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               users.is_restricted column landed — see the field comment
               below); allow_create_organization DISABLED (the ADR-0008
               rule-4 interim posture — upstream's arm is real:
-              users.go:527 → user.go:142 `AllowCreateOrganization`; the
+              users.go:532 → user.go:148 `AllowCreateOrganization`; the
               column does not exist here, and a disabled checkbox never
               posts, so the form cannot offer a store the backend lacks;
               the submit keeps ignoring hand-crafted values — flips live
@@ -1044,7 +1073,7 @@ export function AdminUserEditPage(props: { ctx: UiContext; data: AdminUserEditRe
               <input name="admin" type="checkbox" checked={user.isAdmin} />
             </div>
           </div>
-          {/* restricted (:147-152) — the REAL arm (users.go:528 → the landed
+          {/* restricted (:147-152) — the REAL arm (users.go:533 → the landed
               users.is_restricted column, the d32b0a4 rule-4 interim flipped
               live exactly like the password field's PWD-2 flip): the row's
               stored flag renders checked/unchecked, the checkbox posts, and

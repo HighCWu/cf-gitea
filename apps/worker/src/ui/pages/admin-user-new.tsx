@@ -1,9 +1,9 @@
 /**
  * The ADMIN USER CREATE page — `/-/admin/users/new` — the GET+POST combo of
- * upstream web.go:815's
+ * upstream web.go:784's
  * `m.Combo("/new").Get(admin.NewUser).Post(web.Bind[*forms.AdminCreateUserForm](), admin.NewUserPost)`
- * (routers/web/admin/users.go:129-263 — the GET's sources pull at :137-145,
- * the POST at :151-265, rendered by templates/admin/user/new.tmpl). B-88
+ * (routers/web/admin/users.go:127-266 — the GET's sources pull at :136-144,
+ * the POST at :150-266, rendered by templates/admin/user/new.tmpl). B-88
  * (the census module-3 pass): the page
  * U22 cited but never graded — the route was UNLANDED and the list header's
  * "Create User Account" button omitted (admin-users.tsx's note), while
@@ -21,8 +21,8 @@
  * Email Required;Email;MaxSize(254), Password MaxSize(255), Visibility),
  * builds the user_model.User directly, calls user_model.AdminCreateUser,
  * and answers in RE-RENDERS and a redirect (RenderWithErrDeprecated /
- * Flash) rather than JSON — the ladder (:199-219), the error mapping
- * (:226-249), the audit (:256), the notify (:262) and the redirect (:265)
+ * Flash) rather than JSON — the ladder (:198-218), the error mapping
+ * (:226-248), the audit (:255), the notify (:260-262) and the redirect (:265)
  * are the web ladder's own. The port keeps that shape: this module carries
  * its own web ladder over the LANDED seams the API arm already uses
  * (validateNewPassword / usableUsernameError / invalidEmailMessage / the
@@ -39,15 +39,16 @@
  *   - `user_name` — required, maxlength 40, autofocus (new.tmpl:8-13).
  *   - `user_type` — the User/Bot selector (new.tmpl:15-27), default User.
  *     LANDED (B-72, 2026-11-13): the Bot option is LIVE — upstream's create
- *     arm mints bot rows (:190-193: `u.Type = UserTypeBot; u.Passwd = ""`),
+ *     arm mints bot rows (:186-188: `u.Type = UserTypeBot; u.Passwd = ""`),
  *     our users.type enum now carries 'bot' (the schema's block comment;
  *     drizzle-kit generates NO migration — the TEXT column has no CHECK
  *     constraint, the enum is type-level). The bot branch semantics (the
  *     POST ladder section below): type 'bot', the whole password ladder
- *     SKIPPED (:199's `!u.IsTypeBot()` gate), must_change_password stored
- *     FALSE (:220-221's assignment sits inside that gate — bots get the Go
+ *     SKIPPED (:197's `!u.IsTypeBot()` gate), must_change_password stored
+ *     FALSE (:218's assignment sits inside that gate — bots get the Go
  *     zero value), passwd='' + salt='' + passwd_hash_algo='' with the Rands
- *     salt still written (createUser :785-794's empty-passwd branch), the
+ *     salt still written (createUser :804-806's Rands; the empty-passwd
+ *     branch :811-814's zero triple), the
  *     name/collision/email/audit/notify/redirect arms UNCHANGED (bots ride
  *     them like any create). Bots never password-authenticate: the row
  *     carries no hash AND the login lookups are Individual-only upstream
@@ -84,14 +85,14 @@
  *     `u.MustChangePassword = form.MustChangePassword` — the web form has
  *     no nil→true default; that default is the API arm's, PW12).
  *   - `send_notify` — the checkbox (new.tmpl:99-105). Upstream renders it
- *     only when CanSendEmail (setting.MailService != nil, users.go:137);
+ *     only when CanSendEmail (setting.MailService != nil, users.go:145);
  *     the register-notify seam is LANDED with its own master gate
  *     (MAIL_ENABLED, register-notify.ts's fail-closed polarity), so the
  *     checkbox renders and the seam answers "disabled" when mail is off —
  *     upstream's render gate is subsumed by the seam's runtime gate.
  *   - base/disable_form_autofill's dummy inputs are omitted — every landed
  *     form omits the autofill bait.
- *   - the email-domain-allowlist warning flash (users.go:252-254) has no
+ *   - the email-domain-allowlist warning flash (users.go:251-253) has no
  *     allowlist config landed — dead arm, not ported (the edit page's
  *     posture); the pwned ladder arm (:211-219) is dormant —
  *     PASSWORD_CHECK_PWNED is default-OFF and no HIBP client ships
@@ -105,14 +106,14 @@
  * ## The POST ladder (NewUserPost's observable order)
  *
  * the BIND phase (silent flagged re-renders, NOTHING else runs —
- * users.go:169-172's HasError arm) → the Bot branch (upstream :190-193 —
- * type 'bot', Passwd='') → the password ladder (:199-211 — min length then
+ * users.go:168-171's HasError arm) → the Bot branch (upstream :186-188 —
+ * type 'bot', Passwd='') → the password ladder (:198-217 — min length then
  * complexity, gated `!u.IsTypeBot()` so BOTS SKIP IT entirely; the texts
  * are validateNewPassword's, the landed web-EDIT twin's ladder texts) →
  * the must_change_password store (as-posted for users; the assignment
  * :220-221 sits inside the non-bot gate, so bots store FALSE) → the name
  * rules
- * (AdminCreateUser's arms, users.go:226-249's mapping: reserved / pattern
+ * (AdminCreateUser's arms, users.go:226-248's mapping: reserved / pattern
  * / chars carry the WEB texts) → the collision + email-duplicate arms
  * (users.go:227-232) → the redirect consumption (user.go:798's
  * DeleteUserRedirect — creating on a live redirect consumes it; the API
@@ -206,7 +207,7 @@ import { renderPage } from "../shell";
 // ---------------------------------------------------------------------------
 
 export const adminUserNewLocale = {
-  new_account: "Create User Account", // "admin.users.new_account" (the Title + the h4 + the submit label, users.go:133/:162, new.tmpl:6/:86)
+  new_account: "Create User Account", // "admin.users.new_account" (the Title + the h4 + the submit label, users.go:128/:152, new.tmpl:6/:86)
   allow_password_change: "Require user to change password (recommended)", // "auth.allow_password_change" (new.tmpl:81's label)
   send_register_notify: "Send User Registration Notification", // "admin.users.send_register_notify" (new.tmpl:92's label)
 } as const;
@@ -267,7 +268,7 @@ export function adminUserNewDefaults(): AdminUserCreateForm {
 }
 
 // ---------------------------------------------------------------------------
-// The loader (NewUser's data pull — users.go:137-145's FindSources; the
+// The loader (NewUser's data pull — users.go:136-144's FindSources; the
 // CanSendEmail / DefaultUserVisibilityMode / AllowedUserVisibilityModes
 // data arms fold into the seam gates and the column default, the header)
 // ---------------------------------------------------------------------------
@@ -282,7 +283,7 @@ export async function loadAdminUserNew(d1: D1Database): Promise<AdminUserNewData
 }
 
 // ---------------------------------------------------------------------------
-// The submit (NewUserPost, users.go:151-265, over the landed seams)
+// The submit (NewUserPost, users.go:150-266, over the landed seams)
 // ---------------------------------------------------------------------------
 
 /** The fields the re-render can flag (upstream's Err_UserName /
@@ -300,7 +301,7 @@ export type AdminUserCreateOutcome =
   | { outcome: "created"; userId: number }
   | { outcome: "invalid"; message: string | null; field: AdminUserCreateErrorField | null };
 
-/** The WEB name-rule texts (users.go:236-249's mapping) from the typed org
+/** The WEB name-rule texts (users.go:236-244's text arms) from the typed org
  *  errors — the locale strings upstream's RenderWithErr arms carry (the
  *  edit page's renameErrorMessage twin; the collision arm here is the
  *  explicit pre-check + the insert race below, not a rename). */
@@ -345,7 +346,7 @@ function isUniqueCollision(error: unknown): boolean {
 
 /**
  * The deploy-config knobs the create ladder consumes (census B-87's
- * :392 handoff — upstream reads the SAME settings at users.go:199-219's
+ * :392 handoff — upstream reads the SAME settings at users.go:198-218's
  * ladder over the shared UpdateAuth): `policy` is
  * `resolvePasswordPolicy(env)` (an ARMED MIN_PASSWORD_LENGTH/
  * PASSWORD_COMPLEXITY/PASSWORD_CHECK_PWN gates the ladder; omitted =
@@ -362,7 +363,7 @@ export interface AdminUserCreateKnobs {
 }
 
 /**
- * POST /-/admin/users/new (admin.NewUserPost, users.go:151-265) over the
+ * POST /-/admin/users/new (admin.NewUserPost, users.go:150-266) over the
  * landed seams — the module header carries the ladder and every reduction.
  * The caller supplies the prologue-gated doer (the audit's actor; the
  * DisplayName read resolves inside — upstream ctx.Doer is the full row).
@@ -382,7 +383,7 @@ export async function submitAdminUserCreate(
 
   // --- the bind phase (web.Bind's AdminCreateUserForm validation; a miss
   // re-renders at 200 with the flagged field and NO banner — the silent
-  // HasError arm, users.go:169-172 — and NOTHING else runs).
+  // HasError arm, users.go:168-171 — and NOTHING else runs).
   if (form.loginType === "") return { outcome: "invalid", message: null, field: "loginType" };
   if (form.userName === "" || form.userName.length > 40) {
     // The Required;MaxSize(40) bind — Err_UserName flagged, silent.
@@ -402,8 +403,8 @@ export async function submitAdminUserCreate(
     return { outcome: "invalid", message: null, field: "visibility" };
   }
 
-  // --- the Bot branch (B-72, upstream users.go:190-193): type "Bot" mints
-  // a bot row — the password ladder below is SKIPPED (:199's
+  // --- the Bot branch (B-72, upstream users.go:186-188): type "Bot" mints
+  // a bot row — the password ladder below is SKIPPED (:197's
   // `!u.IsTypeBot()` gate wraps the whole ladder INCLUDING the
   // must_change_password assignment, so bots store the Go zero value
   // false), and the row carries passwd='' + salt='' + passwd_hash_algo=''
@@ -413,7 +414,7 @@ export async function submitAdminUserCreate(
   // notify, redirect — rides for bots exactly like any create.
   const isBot = form.userType === "Bot";
 
-  // --- the password ladder (users.go:199-211 — min length then
+  // --- the password ladder (users.go:198-217 — min length then
   // complexity; gated `!u.IsTypeBot()` so bots answer no ladder; for
   // users it is UNCONDITIONED because deviation 1 makes every created
   // user local — upstream's :202 login-type gate has no non-local target
@@ -429,7 +430,7 @@ export async function submitAdminUserCreate(
     }
   }
 
-  // --- the name rules (AdminCreateUser's arms, users.go:226-249's
+  // --- the name rules (AdminCreateUser's arms, users.go:221-249's
   // mapping — upstream's bind-level Username checker subsumes into this
   // banner arm: same flag, the message the mapping carries).
   const nameError = usableUsernameError(form.userName);
@@ -457,7 +458,7 @@ export async function submitAdminUserCreate(
   // full_name field, so both display columns stay null where the API's
   // optional full_name would land) plus the B-73 audit row in the SAME
   // batch ("a failed write emits nothing", §4.2 — upstream's audit.Record
-  // at users.go:256, actor the ADMIN, scope the created user). The new
+  // at users.go:255, actor the ADMIN, scope the created user). The new
   // user's numeric id is allocated by the insert of the same batch, so
   // scope_id resolves through the scalar subquery (cast to text — the
   // scope_id drift note) exactly like the API arm's.
@@ -522,7 +523,7 @@ export async function submitAdminUserCreate(
     throw error;
   }
 
-  // --- the register-notify arm (users.go:262's SendRegisterNotifyMail —
+  // --- the register-notify arm (users.go:260-262's SendRegisterNotifyMail —
   // the API twin's posture: fire-and-forget in EFFECT, EVERY failure class
   // caught-and-logged, never load-bearing for the landing; NO type gate —
   // a posted send_notify fires for a bot create too, upstream's shape).

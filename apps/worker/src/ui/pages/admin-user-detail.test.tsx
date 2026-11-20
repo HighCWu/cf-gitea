@@ -4,12 +4,12 @@
  * header's; the seams drive directly, the admin-users-avatar.test.ts
  * pattern).
  *
- * Coverage (upstream at the pin: web.go:817's GET /-/admin/users/{userid},
- * routers/web/admin/users.go:314-370's ViewUser over prepareUserInfo
+ * Coverage (upstream at the pin: web.go:785's GET /-/admin/users/{userid},
+ * routers/web/admin/users.go:313-362's ViewUser over prepareUserInfo
  * (:269-281), templates/admin/user/view.tmpl + view_details/view_emails/
  * view_orgs, and the 2a00e28 avatar-pair fold):
  *
- *   - THE UNKNOWN-ID ARM (prepareUserInfo, users.go:269-278): the loader
+ *   - THE UNKNOWN-ID ARM (prepareUserInfo, users.go:268-277): the loader
  *     answers null — the caller's 303 onto the LIST, never a 404 — and the
  *     landed loadAdminAvatarUser seam agrees (one id space).
  *   - THE DETAILS BLOCK (view_details.tmpl): the 48px avatar through the
@@ -26,7 +26,7 @@
  *   - THE REPOSITORIES (view.tmpl:31-38): every OWNED repo, slug ASC, the
  *     private badge, the shared row's description line.
  *   - THE ORGS (view_orgs.tmpl): the membership rows with the private
- *     badge + joined-on line; THE REMOVE ARMS (census B-71, web.go:824-825)
+ *     badge + joined-on line; THE REMOVE ARMS (census B-71, web.go:794-795)
  *     render as the no-JS plain-form reductions — the Remove All sweep
  *     button (only when orgs exist, the `{{if $userOrgs}}` gate) and the
  *     per-org Remove buttons, POSTing `{link}/orgs/remove-all` and
@@ -42,16 +42,21 @@
  *     for a type=bot target ONLY (users.go:355-359's gate — a user/org row
  *     is null, the `{{if .BotAccessTokens}}` slot), the render carries the
  *     shared template's bot arms (the `admin.users.bot_token_desc` lead,
- *     NO regenerate button/modal, the delete forms posting
- *     `{link}/delete`), the mint seam (web.go:822-823 → getTargetBot →
+ *     the UNCONDITIONAL regenerate button (365cb2bd5e — the per-row form
+ *     posting `{link}/regenerate`) beside the delete forms posting
+ *     `{link}/delete`), the mint seam (web.go:791-792 → getTargetBot →
  *     user_setting.CreateAccessToken) through the EXISTING token service —
  *     the token owned by the BOT, the one-time plaintext, the audit row
  *     carrying owner=BOT + actor=the calling admin (applications.go:133's
  *     shape), the at_least_one_permission / duplicate-name / Required
  *     gates, the NON-bot refusal (`admin.users.bot_token_only`, the
  *     impersonate 400-map convention's body constant), the unknown-target
- *     arm, the revoke seam + its owner-scoped stale-id arm — and the
- *     parseUiRoute claims (digits-only {userid}, junk stays engine-404).
+ *     arm, the revoke seam + its owner-scoped stale-id arm, the regenerate
+ *     seam (365cb2bd5e: RegenerateBotToken → regenerateTokenFromForm — the
+ *     fresh plaintext verifies, the old value dies, the pin's
+ *     user:accesstoken:regenerate audit row) — and the parseUiRoute claims
+ *     (digits-only {userid}, junk stays engine-404; the regenerate family's
+ *     claim is LIVE since REPIN-ROUTES 0a97aed's index.ts fold).
  *
  * Fixture discipline: tables wiped per test (children first), ids captured
  * at seed time — never hardcoded.
@@ -77,6 +82,7 @@ import {
   ADMIN_USERS_LIST_LINK,
   adminUserDetailLocale,
   adminUserMintBotToken,
+  adminUserRegenerateBotToken,
   adminUserRevokeBotToken,
   displayNameWithFullName,
   loadAdminUserDetail,
@@ -469,24 +475,25 @@ describe("the bot panel's render (access_tokens.tmpl's bot arms)", () => {
     expect(html).not.toContain("/access_tokens");
   });
 
-  it("the token rows: the delete form posts `{link}/delete` with the hidden id; NO regenerate control or modal (tmpl:51/:115), no confirm dialog", async () => {
+  it("the token rows: the delete form posts `{link}/delete` and the UNCONDITIONAL regenerate form posts `{link}/regenerate` (365cb2bd5e — the former `{{if not $.IsBot}}` wraps are history), no confirm dialogs", async () => {
     const { bot } = await seedBotFixture();
     const minted = await new TokenService(env.DB).mint({ userId: bot.id, name: "row-token", scopes: "write:issue" });
     const data = (await loadAdminUserDetail(env.DB, bot.id, PANEL_NOW))!;
     const html = renderAdminUserDetailPage(ctx, { ...data });
     expect(html).toContain(`<form method="post" action="/-/admin/users/${bot.id}/access_tokens/delete">`);
+    // The regenerate arm: the settings reduction's plain form POST, the
+    // hidden id, upstream's settings.regenerate_token label — rendered for
+    // the admin panel's bot rows exactly like the settings page's own rows.
+    expect(html).toContain(`<form method="post" action="/-/admin/users/${bot.id}/access_tokens/regenerate">`);
     expect(html).toContain(`name="id" value="${String(minted.id)}"`);
     expect(html).toContain(`Delete</button>`);
+    expect(html).toContain("Regenerate</button>");
     // The row's details: the name summary, the access line, the scope list.
     expect(html).toContain("<details>"); // closed — tokens exist (tmpl:67)
     expect(html).toContain("row-token");
     expect(html).toContain("<li>write:issue</li>");
     expect(html).toContain("All (public, private, and limited)"); // write:issue is not public-only
-    // The IsBot arms: regenerate renders never for the admin panel.
-    expect(html).not.toContain("Regenerate");
-    expect(html).not.toContain("/regenerate");
-    expect(html).not.toContain("regenerate-token");
-    // The delete confirm dialog drops (the settings reduction).
+    // The confirm dialogs drop (the settings reduction).
     expect(html).not.toContain("delete-token");
     expect(html).not.toContain("data-modal-confirm");
   });
@@ -535,7 +542,7 @@ describe("the bot panel's render (access_tokens.tmpl's bot arms)", () => {
   });
 });
 
-describe("the bot-token write pair (web.go:822-823 over getTargetBot — the EXISTING token service)", () => {
+describe("the bot-token write pair (web.go:791-792 over getTargetBot — the EXISTING token service)", () => {
   it("the mint FOR a bot: owned by the bot, verifies as the bot; the audit row carries owner=BOT + actor=the calling ADMIN", async () => {
     const { admin, bot, actor } = await seedBotFixture();
     const outcome = await adminUserMintBotToken(env.DB, actor, bot.id, { name: "bot-credentials", scopesRaw: "read:repository" });
@@ -643,6 +650,53 @@ describe("the bot-token write pair (web.go:822-823 over getTargetBot — the EXI
     expect(await adminUserRevokeBotToken(env.DB, actor, bot.id, bots.id)).toBe("deleted");
   });
 
+  it("the regenerate (365cb2bd5e): a fresh plaintext verifies, the old value dies, and the pin's user:accesstoken:regenerate audit row carries owner=BOT + actor=the calling ADMIN", async () => {
+    const { admin, bot, actor } = await seedBotFixture();
+    const minted = await new TokenService(env.DB).mint({ userId: bot.id, name: "regen-me", scopes: "read:repository" });
+    const oldVerify = await new TokenService(env.DB).verify(minted.plaintext);
+    expect(oldVerify).not.toBeNull();
+
+    const outcome = await adminUserRegenerateBotToken(env.DB, actor, bot.id, minted.id);
+    expect(outcome).toMatchObject({ outcome: "regenerated" });
+    const fresh = (outcome as { outcome: "regenerated"; plaintext: string }).plaintext;
+    expect(fresh).not.toBe(minted.plaintext);
+    // The old value stops verifying; the same row verifies with the fresh one.
+    expect(await new TokenService(env.DB).verify(minted.plaintext)).toBeNull();
+    expect(await new TokenService(env.DB).verify(fresh)).toMatchObject({ token: { id: minted.id } });
+    // The name + scopes ride untouched (upstream updates ONLY the credential columns).
+    expect(await new TokenService(env.DB).list(bot.id, 1, 30)).toMatchObject({ total: 1 });
+    // applications.go:182's Record shape — owner = the bot, actor = the admin.
+    const rows = await auditRows("user:accesstoken:regenerate");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      scopeType: "user",
+      scopeId: String(bot.id),
+      scopeName: bot.username,
+      actorId: admin.id,
+      actorName: admin.username,
+      actorCredential: null,
+    });
+    expect(JSON.parse(rows[0]?.metadata ?? "{}")).toEqual({ token: "regen-me" });
+  });
+
+  it("the regenerate gates: a stale/foreign id is `missing` with NO audit; a non-bot target refuses; an unknown id is unknown-target", async () => {
+    const { human, bot, actor } = await seedBotFixture();
+    const bots = await new TokenService(env.DB).mint({ userId: bot.id, name: "bots-own", scopes: "read:repository" });
+    const humans = await new TokenService(env.DB).mint({ userId: human.id, name: "humans-own", scopes: "read:repository" });
+    // Stale id on the bot: missing, silent.
+    expect(await adminUserRegenerateBotToken(env.DB, actor, bot.id, 424242)).toEqual({ outcome: "missing" });
+    // A foreign id (the human's token) is the owner-scoped miss — never
+    // reaches across owners.
+    expect(await adminUserRegenerateBotToken(env.DB, actor, bot.id, humans.id)).toEqual({ outcome: "missing" });
+    // A non-bot target refuses at the gate.
+    expect(await adminUserRegenerateBotToken(env.DB, actor, human.id, humans.id)).toEqual({ outcome: "refused" });
+    // An unknown target id is the getTargetBot ServerError arm.
+    expect(await adminUserRegenerateBotToken(env.DB, actor, 987654, bots.id)).toEqual({ outcome: "unknown-target" });
+    // Nothing was written, nothing audited.
+    expect(await new TokenService(env.DB).verify(bots.plaintext)).not.toBeNull();
+    expect(await auditRows("user:accesstoken:regenerate")).toHaveLength(0);
+  });
+
   it("the refusal body is upstream's buildJsonErrorMap shape with the en-US locale string", () => {
     expect(ADMIN_BOT_TOKEN_ONLY_ERROR).toEqual({
       errorMessage: "Access tokens can only be generated for bot accounts here.",
@@ -652,11 +706,18 @@ describe("the bot-token write pair (web.go:822-823 over getTargetBot — the EXI
 });
 
 describe("the bot-token pair's parse claims (handlesUiRoute's dispatcher gate)", () => {
-  it("claims the mint and the delete shapes, digits-only {userid} (junk stays engine-404)", () => {
+  it("claims the mint, the delete and the regenerate shapes, digits-only {userid} (junk stays engine-404)", () => {
     expect(parseUiRoute("/-/admin/users/42/access_tokens")).toEqual({ family: "admin-user-bot-token", adminUserId: 42 });
     expect(parseUiRoute("/-/admin/users/42/access_tokens/delete")).toEqual({ family: "admin-user-bot-token-delete", adminUserId: 42 });
     expect(parseUiRoute("/-/admin/users/x/access_tokens")).toBeNull();
-    expect(parseUiRoute("/-/admin/users/42/access_tokens/regenerate")).toBeNull();
+    // LANDED with the mount (REPIN-ROUTES 0a97aed): the regenerate shape
+    // claims `admin-user-bot-token-regenerate` (web.go:793, 365cb2bd5e) —
+    // the module header's recipe step 5, live in index.ts.
+    expect(parseUiRoute("/-/admin/users/42/access_tokens/regenerate")).toEqual({
+      family: "admin-user-bot-token-regenerate",
+      adminUserId: 42,
+    });
+    expect(parseUiRoute("/-/admin/users/42/access_tokens/regenerate/extra")).toBeNull();
     expect(parseUiRoute("/-/admin/users/42/access_tokens/delete/extra")).toBeNull();
     // The detail page's claim is untouched.
     expect(parseUiRoute("/-/admin/users/42")).toEqual({ family: "admin-user-detail", adminUserId: 42 });

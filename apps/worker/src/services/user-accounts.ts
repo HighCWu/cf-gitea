@@ -13,7 +13,7 @@
  *
  * The row shape and the validation ladder are the `POST /admin/users`
  * path's (`api/routes/admin-t2.ts` adminCreateUser, itself the port of
- * upstream `user_model.createUser`, models/user/user.go:700–812):
+ * upstream `user_model.createUser`, models/user/user.go:718–831):
  *   1. usable name — `usableUsernameError` (services/orgs/orgs.ts, the
  *      upstream reserved/pattern list, REUSED verbatim here);
  *   2. email format — `invalidEmailMessage` (a byte-identical port of the
@@ -23,7 +23,7 @@
  *   3. name collision — pre-check, then the `UNIQUE(users.username_lower)`
  *      arbiter on the insert itself (admin-t2.ts:482–495 unwrapping);
  *   4. email-in-use pre-check (admin-t2 `emailUsedByOther` shape);
- *   5. live `user_redirect` consumption on create (user.go:798).
+ *   5. live `user_redirect` consumption on create (user.go:817).
  * **No password store** (SPEC-0002 §4.6.7, admin-t2 deviation 1): the forms
  * accept a password field for upstream InstallForm/RegisterForm parity and
  * it is IGNORED — users authenticate exclusively with personal access
@@ -140,7 +140,7 @@ export function allowSignup(env: FirstRunEnv): boolean {
 /** A web account-creation form. `password` handling SPLIT by ladder since
  *  PWD-2's store landed (SPEC-0002 §6 superseded §4.6.7's PAT-only
  *  posture): initializeAdminUser requires it non-empty (the retype-match
- *  arm is the form's confirm) and STORES the hash record (user.go:783-794's
+ *  arm is the form's confirm) and STORES the hash record (user.go:802-813's
  *  SetPassword posture); the register ladder still ignores it
  *  (insertAccountRow takes {username, email} only) until its own arm
  *  lands. `retype` is checked for equality with the password (upstream
@@ -233,6 +233,21 @@ async function emailUsed(d1: D1Database, email: string): Promise<boolean> {
  * (admin-t2.ts:443–479): display_name stays NULL (no full_name field on the
  * web forms; the toApiUser render treats null the same), `type='user'`,
  * `is_admin` per the caller, `status='active'`, `visibility='public'`.
+ *
+ * createUser's defaults block (user.go:723–732 at the 099abf5db4 pin) maps
+ * onto this row: the columns it sets that HAVE landed pairs are written
+ * above (`type`, `is_admin`, `status` from `IsActive`'s true-default arm —
+ * the confirm-free web ladders upstream too, deviation-free — and
+ * `visibility` from DefaultUserVisibilityMode's public default); the rest
+ * have no landed columns and hold upstream's unset-knob values implicitly.
+ * ONE NEW DEFAULT since 1f614953a2: `u.KeepActivityPrivate =
+ * setting.Service.ForceUserActivityVisibility == "private"` (user.go:725) —
+ * the knob's unset value makes the default FALSE, exactly this insert's
+ * constant posture (no keep_activity_private column exists in the landed
+ * schema), so the web create paths are upstream-faithful WITHOUT a write.
+ * The knob surface (config + column + UpdateUser's 422 refusal +
+ * SyncForcedActivityVisibility startup sync) is the update unit's pending
+ * port — when it lands, this insert gains the knob-fold alongside it.
  */
 async function insertAccountRow(
   d1: D1Database,
@@ -315,7 +330,7 @@ export async function initializeAdminUser(
   // first-run.ts — upstream `err_empty_admin_password`). NO
   // length/complexity gate on the install arm: upstream validates only
   // non-empty + match here (the CreateUser prepare runs SetPassword
-  // directly, user.go:783-794).
+  // directly, user.go:802-813).
   if (form.password === "") {
     return { outcome: "invalid", message: "Administrator password is empty" };
   }
@@ -323,7 +338,7 @@ export async function initializeAdminUser(
   const now = options?.now ?? new Date();
   const lower = form.username.toLowerCase();
   // The password record is hashed BEFORE the guarded insert so the winning
-  // row lands complete (user.go:783-794's prepare step — SetPassword: new
+  // row lands complete (user.go:802-813's prepare step — SetPassword: new
   // salt + current algorithm; rands rides EVERY upstream create, :786).
   // The configured algorithm is the caller's env-resolved spec (census
   // B-87's consumption half — see PasswordArmOptions.configuredHashSpec);
@@ -389,9 +404,9 @@ export async function initializeAdminUser(
 
 /**
  * The shared UpdateAuth password-validation ladder's SYNC half (upstream
- * services/user/update.go:256-262): minimum length over
+ * services/user/update.go:266-274): minimum length over
  * `policy.minLength`, complexity over `policy.complexityClasses`. The pwned
- * arm (update.go:263-265) is ASYNC + networked, so it lives in the caller
+ * arm (update.go:272-274) is ASYNC + networked, so it lives in the caller
  * (`isPwned` + the knob's `checkPwned` — the change/reset arms' options and
  * the admin-t2 routes). `policy` defaults to DEFAULT_PASSWORD_POLICY =
  * upstream's DEFAULT config (floor 8, NO complexity — security.go:209-218
@@ -473,8 +488,8 @@ export type ChangePasswordOutcome =
 
 /**
  * The change-password arm (upstream AccountPost, routers/web/user/setting/
- * account.go:60-96 folded with UpdateAuth's password block, update.go:
- * 247-283): the old-password check when a password IS set, the retype
+ * account.go:55-91 folded with UpdateAuth's password block, update.go:
+ * 262-285): the old-password check when a password IS set, the retype
  * match, the validation ladder, SetPassword, the MustChangePassword=false
  * clear (account.go:78's `optional.Some(false)` — ANY own-password change
  * clears the admin-set must-change flag, the PWD-4 enforcement half), and
@@ -503,7 +518,7 @@ export async function changeOwnPassword(
   }
   const policy = validateNewPassword(form.newPassword, options?.policy);
   if (policy !== null) return { outcome: "invalid", message: policy };
-  // The pwned arm (update.go:263-265) — ONLY when the knob is armed
+  // The pwned arm (update.go:272-274) — ONLY when the knob is armed
   // (PASSWORD_CHECK_PWN, default off = upstream's default posture).
   if (options?.policy?.checkPwned === true) {
     const pwned = await isPwned(form.newPassword, { fetchImpl: options?.fetchImpl });
@@ -532,8 +547,8 @@ export async function changeOwnPassword(
   const row = updated[0];
   if (row === undefined) return { outcome: "invalid", message: "user not found" };
 
-  // update.go:279-284 — the invalidation: remember-me rows only (upstream
-  // DeleteAuthTokensByUserID), then the audit row (update.go:283).
+  // update.go:295-298 — the invalidation: remember-me rows only (upstream
+  // DeleteAuthTokensByUserID), then the audit row (update.go:300).
   const { sessions } = await import("../db/schema");
   await db.delete(sessions).where(and(eq(sessions.userId, userId), eq(sessions.remember, true)));
   const { AuditActions, emitAudit } = await import("./audit");
@@ -571,7 +586,7 @@ export type RegisterOutcome =
  * A standard registration (upstream `SignUpPost`, routers/web/auth/
  * auth.go:548–632, gated on ALLOW_SIGNUP instead of DISABLE_REGISTRATION):
  * the shared validation ladder, the name/email collision pre-checks, the
- * live-redirect consumption (adminCreateUser parity, user.go:798), then the
+ * live-redirect consumption (adminCreateUser parity, user.go:817), then the
  * insert whose UNIQUE arbiter settles the two-signups race. Plain member
  * account: `is_admin=false`.
  */
@@ -587,7 +602,7 @@ export async function registerUser(
   if (await emailUsed(d1, form.email)) return { outcome: "email-taken" };
 
   const now = options?.now ?? new Date();
-  // DeleteUserRedirect (user.go:798): creating on a live redirect consumes
+  // DeleteUserRedirect (user.go:817): creating on a live redirect consumes
   // it — the adminCreateUser arm verbatim (admin-t2.ts:862).
   await drizzle(d1)
     .delete(userRedirects)
@@ -618,7 +633,12 @@ export type DeleteUserEnv = Env;
 /**
  * One owner's repositories, driven through the EXISTING deleteRepository
  * cascade — the port of upstream `DeleteOwnerRepositoriesDirectly`
- * (services/repository/delete.go:396-421): page over the owner's repos
+ * (services/repository/delete.go:399-423 at the 099abf5db4 pin — the
+ * loop now also emits `audit.Record(ctx, RepositoryDelete, repo)` per
+ * deleted repo, :419, 3f1b738f09's addition; cf-gitea's purge parity is
+ * ALREADY carried by the shared cascade: every purged repo rides
+ * repos/service.ts deleteRepository, whose batch emits the same
+ * repository:delete row) — page over the owner's repos
  * (oldest first, LIMIT 50 — upstream's `RepositoryListDefaultPageSize`
  * re-page loop) and delete each through `RepoService.deleteRepository` with
  * the SAME deps the API's DELETE route and the demo-sweep consumer ride
@@ -686,12 +706,12 @@ async function deleteOwnerRepositories(env: DeleteUserEnv, ownerId: number): Pro
  *      (versions + files + properties + the package row); blob rows and R2
  *      content keys ride the sole-deleter package-cleanup sweep (the
  *      rows-then-sweep split upstream itself has — see the inline comment).
- *   4. Branch-protection whitelist scrub (delete.go:137-160, the
+ *   4. Branch-protection whitelist scrub (delete.go:136-159, the
  *      "***** START: Branch Protections *****" block): the deleted id is
  *      stripped from every allowlist column of every SURVIVING rule —
  *      pre-batch, so a failed scrub aborts the delete (the landed route
  *      arm's ordering; ids are JSON-serialized, hence the full-rule pages).
- *   5. THE CENSUS BATCH — one D1 transaction (delete.go:31-206's
+ *   5. THE CENSUS BATCH — one D1 transaction (delete.go:31-205's
  *      `deleteUser` shape), statement order FK-safe:
  *        a. counter decrements FIRST, while the edge rows they read still
  *           exist: each repo the user stars/watches loses exactly one
@@ -701,7 +721,7 @@ async function deleteOwnerRepositories(env: DeleteUserEnv, ownerId: number): Pro
  *           upstream's follower counters have no landed users columns —
  *           nothing to decrement for follows (n/a);
  *        b. the FK-less user-associable stores die by id — the DeleteBeans
- *           census (delete.go:74-103) ∩ our FK-less tables: watch,
+ *           census (delete.go:74-102) ∩ our FK-less tables: watch,
  *           collaboration, reaction, issue-subscription (the landed route
  *           batch), plus the post-landing families the census names:
  *           notification (Notification{UserID}, :101), stopwatch
@@ -715,11 +735,11 @@ async function deleteOwnerRepositories(env: DeleteUserEnv, ownerId: number): Pro
  *           the rest of the census: personal access tokens, sessions, org
  *           memberships, redirects, follows, stars, user settings, email
  *           addresses, public keys, GPG keys, blocks, team memberships
- *           (delete.go:75-103 beans ∩ our FK tables).
+ *           (delete.go:75-102 beans ∩ our FK tables).
  *
  * Upstream keeps issues/comments/reviews/projects as ghost data (the
  * DeleteUser docstring, user.go:139-141) — so do we; the census's
- * purge-gated comment deletion (delete.go:111-135) is NOT ported (a
+ * purge-gated comment deletion (delete.go:110-134) is NOT ported (a
  * purge deletes the user's comments upstream; ours keeps them, the same
  * ghost posture — documented divergence). The demo sweep stays the
  * fail-safe backstop: hand-D1 user deletes that skip this service leave
@@ -778,7 +798,7 @@ export async function deleteUserCascade(
   }
 
   // The scrub is pre-batch (upstream runs it inside deleteUser, before the
-  // user-row delete — delete.go:137-160); a failure aborts the delete.
+  // user-row delete — delete.go:136-159); a failure aborts the delete.
   await scrubUserFromAllRules(d1, userId);
 
   const db = drizzle(d1);
@@ -826,7 +846,7 @@ export async function deleteUserCascade(
 /**
  * The SHARED UpdateAuth password arm with the MustChangePassword=false
  * clear — upstream's one `UpdateAuth(Password, MustChangePassword:
- * optional.Some(false))` call (services/user/update.go:247-283) answers
+ * optional.Some(false))` call (services/user/update.go:262-285) answers
  * BOTH no-old-password surfaces at the pin: ResetPasswdPost's apply
  * (routers/web/auth/password.go:204-207) and MustChangePasswordPost's
  * apply (password.go:298-301, the admin-created account's forced change —
@@ -849,7 +869,8 @@ export async function applyPasswordReset(
   }
   const policy = validateNewPassword(newPassword, options?.policy);
   if (policy !== null) return { outcome: "invalid", message: policy };
-  // The pwned arm (password.go:213-221's UpdateAuth error switch, the same
+  // The pwned arm (password.go:213-226's UpdateAuth error switch — the pin calls
+  // UpdateAuth(audit.WithDoer(ctx, u), …), :213 — the same
   // ladder) — ONLY when the knob is armed (PASSWORD_CHECK_PWN).
   if (options?.policy?.checkPwned === true) {
     const pwned = await isPwned(newPassword, { fetchImpl: options?.fetchImpl });
@@ -934,17 +955,21 @@ export interface UserColumnAuditContext {
   actorCredential?: string | null;
   /**
    * The `active` FIELD the edit posted (upstream `opts.IsActive`'s value —
-   * update.go:111-114); `undefined` = not posted. This is the deviation-6
+   * update.go:132-136); `undefined` = not posted. This is the deviation-6
    * fold's audit consequence: upstream carries `is_active` (UpdateUser) and
-   * `prohibit_login` (UpdateAuth) as SEPARATE columns, and only the
-   * is_active arm has an audit tail (:204-206) — the UpdateAuth
-   * ProhibitLogin arm records NOTHING (update.go:281-293's tail names only
-   * UserPassword/UserAuthenticationSource). Our single `status` column
-   * folds both, so a flip's DRIVER must be named: a flip with
-   * `activePosted` set to the posted value emits
-   * `user:status:active {active: <posted>}` (upstream's `u.IsActive` after
-   * the opts IS the posted value, :105-114), a prohibit_login-only flip
-   * emits NOTHING — upstream-faithful silence.
+   * `prohibit_login` (UpdateAuth) as SEPARATE columns, each with its own
+   * audit tail — the is_active arm (:205-206 → :211-213 at the pin) and,
+   * SINCE 3f1b738f09, the UpdateAuth ProhibitLogin arm TOO
+   * (`UserProhibitLogin`, update.go:305-307 at 099abf5db4; the pre-pin
+   * tail :281-293 named only UserPassword/UserAuthenticationSource — the
+   * "upstream-faithful silence" note below is now a PENDING DELTA, not a
+   * parity fact). Our single `status` column folds both, so a flip's
+   * DRIVER must be named: a flip with `activePosted` set to the posted
+   * value emits `user:status:active {active: <posted>}` (upstream's
+   * `u.IsActive` after the opts IS the posted value, :105-114); a
+   * prohibit_login-only flip STILL emits nothing here — the
+   * `user:prohibitlogin:update` row is the UpdateAuth-tail owner's port
+   * (the update unit's file; HANDOFF, not landed in this pass).
    */
   activePosted?: boolean;
 }
@@ -952,7 +977,7 @@ export interface UserColumnAuditContext {
 /**
  * The shared UpdateUser audit tail — the port of the service-layer block
  * upstream runs after EVERY UpdateUser commit (services/user/update.go:
- * 204-218): compare the post-write state against the pre-write snapshot
+ * 211-225 at the pin): compare the post-write state against the pre-write snapshot
  * (:68) and record one row per ACTUALLY-changed audited column, in
  * upstream's fixed order (active → admin → restricted → visibility):
  *
@@ -1075,7 +1100,7 @@ export const INACTIVE_ACCOUNT_OLDER_THAN_MS = 180 * 60 * 1000;
 /**
  * The B-68 sweep — upstream `DeleteInactiveUsers(ctx, olderThan)`
  * (services/user/user.go:311-334) over `GetInactiveUsers(ctx, olderThan)`
- * (models/user/user.go:1009-1030), adapted to the landed users store:
+ * (models/user/user.go:1033-1050), adapted to the landed users store:
  *
  *   - Upstream's candidate predicate is `is_active = false` AND type ∈
  *     {individual, user_reserved}, plus `created_unix < now - olderThan`

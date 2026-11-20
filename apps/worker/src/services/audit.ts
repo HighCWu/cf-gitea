@@ -157,6 +157,14 @@ export const AuditActions = {
     "user:accesstoken:add",
     "Added access token {token} for user {scope} with scope {token_scope}.",
   ),
+  // The regenerate row (365cb2bd5e, action.go:93 at 099abf5db4 — not
+  // present at the prior pin). The admin bot-token regenerate arm emits it
+  // (pages/admin-user-detail.tsx — owner = the bot, actor = the calling
+  // admin, applications.go:182's Record shape).
+  UserAccessTokenRegenerate: defineAction(
+    "user:accesstoken:regenerate",
+    "Regenerated access token {token} of user {scope}.",
+  ),
   UserAccessTokenRemove: defineAction(
     "user:accesstoken:remove",
     "Removed access token {token} from user {scope}.",
@@ -292,6 +300,19 @@ export const AuditActions = {
     "user:authentication:fail:twofactor",
     "Failed two-factor authentication for user {scope}.",
   ),
+  // The admin edit page's reset-2FA arm (c144668e59, action.go:86 at
+  // 099abf5db4 — not present at the prior pin): upstream fires
+  // `audit.Record(ctx, audit_model.UserTwoFactorDisable, u)` AFTER
+  // DisableTwoFactor when totp+webAuthn > 0 (users.go:557-565) — i.e. only
+  // when something was ACTUALLY disabled. Ported at
+  // pages/admin-user-edit.tsx's reset-2FA arm (actor = the calling admin,
+  // scope = the target). OWNERSHIP NOTE: minimal disclosed append, the
+  // B-84 precedent — the action id must be registered before any emit and
+  // an unregistered id throws by design.
+  UserTwoFactorDisable: defineAction(
+    "user:twofactor:disable",
+    "Disabled two-factor authentication for user {scope}.",
+  ),
   UserPassword: defineAction("user:password", "Changed password of user {scope}."),
   // The forgot-REQUEST arm's row (B-84, action.go:77 — id AND template
   // verbatim): `audit.RecordAs(ctx, u, UserPasswordResetRequest, u)` at
@@ -339,6 +360,47 @@ export const AuditActions = {
   OrganizationTeamPermission: defineAction("organization:team:permission", "Changed permission of team {scope}/{team} to {permission}."),
   OrganizationTeamMemberAdd: defineAction("organization:team:member:add", "Added user {member} to team {scope}/{team}."),
   OrganizationTeamMemberRemove: defineAction("organization:team:member:remove", "Removed user {member} from team {scope}/{team}."),
+  // The ORG-scope Actions runner/variable rows (3f1b738f09 "enhance(audit):
+  // record remaining security-relevant events", the RE-PIN window fc49368845
+  // -> 099abf5db4 — models/audit/action.go:143-148 at the pin, not present
+  // at the prior one). Upstream emits them per scope through
+  // audit.RecordScopedByID(ctx, ownerID, repoID, action, …): the runner trio
+  // at the shared web handlers (routers/web/shared/actions/runners.go —
+  // ResetRunnerRegistrationToken / RunnerDeletePost / RunnerUpdatePost /
+  // RunnerBulkActionPost) and their API twins
+  // (routers/api/v1/shared/runners.go), the variable trio at the variables
+  // SERVICE (services/actions/variables.go — CreateVariable /
+  // UpdateVariableNameData / DeleteVariable, so every caller inherits it).
+  // OWNERSHIP NOTE: minimal disclosed append, the B-84 precedent (the action
+  // id must be registered before any emit; an unregistered id throws by
+  // design) — only the org-scope rows the ACTIONS unit's emit helpers
+  // register (services/actions/audit-arms.ts). The user/repository/system
+  // rows of the same 3f1b738f09 families belong to those scopes' owners
+  // (handoff 2026-11-20, ACTIONS2).
+  OrganizationRunnerToken: defineAction(
+    "organization:runner:token",
+    "Issued Actions runner registration token for organization {scope}.",
+  ),
+  OrganizationRunnerUpdate: defineAction(
+    "organization:runner:update",
+    "Updated Actions runner {runner} of organization {scope}.",
+  ),
+  OrganizationRunnerRemove: defineAction(
+    "organization:runner:remove",
+    "Removed Actions runner {runner} from organization {scope}.",
+  ),
+  OrganizationVariableAdd: defineAction(
+    "organization:variable:add",
+    "Added variable {variable} to organization {scope}.",
+  ),
+  OrganizationVariableUpdate: defineAction(
+    "organization:variable:update",
+    "Updated variable {variable} of organization {scope}.",
+  ),
+  OrganizationVariableRemove: defineAction(
+    "organization:variable:remove",
+    "Removed variable {variable} from organization {scope}.",
+  ),
   // repository:* (action.go:136-171)
   RepositoryCreate: defineAction("repository:create", "Created repository {scope}."),
   RepositoryCreateFork: defineAction("repository:fork:create", "Created fork {scope} of repository {base_repo}."),
@@ -354,6 +416,18 @@ export const AuditActions = {
   // `audit.Record(ctx, audit_model.RepositoryWikiDelete, repo)` — the
   // sweep's final statement, reached even when the storage sweep failed).
   RepositoryWikiDelete: defineAction("repository:wiki:delete", "Deleted wiki of repository {scope}."),
+  // Upstream action.go:195 (added by 3f1b738f09 "enhance(audit): record
+  // remaining security-relevant events", the RE-PIN window fc49368845 ->
+  // 099abf5db4 — not present at the prior pin). The release family's delete
+  // emit (services/release/release.go:465-467 at 099abf5db4):
+  // `audit.RecordAs(ctx, doer, audit_model.RepositoryReleaseRemove, repo,
+  // "release", rel.TagName)` — gated `if isRelease` (a pure tag record's
+  // removal is NOT audited), fired AFTER the sweeps, BEFORE the delete
+  // notification. Ported at api/services/releases.ts deleteRelease's batch.
+  RepositoryReleaseRemove: defineAction(
+    "repository:release:remove",
+    "Removed release {release} from repository {scope}.",
+  ),
   // actions:* (action.go:196-198) — the workflow toggle/dispatch trio, ids
   // AND templates verbatim. Upstream emit sites (pin fc4936884584a41931906553d9
   // 6c2601d750e6ef, all in services/actions/workflow.go):

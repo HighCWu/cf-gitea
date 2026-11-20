@@ -4,9 +4,9 @@
  * module header's; the seams drive directly, the admin-user-edit.test
  * pattern).
  *
- * Coverage (upstream at the pin: web.go:815's
+ * Coverage (upstream at the pin: web.go:784's
  * `m.Combo("/new").Get(admin.NewUser).Post(web.Bind[*forms.AdminCreateUserForm](), admin.NewUserPost)`,
- * routers/web/admin/users.go:129-265 over AdminCreateUserForm, and
+ * routers/web/admin/users.go:127-266 over AdminCreateUserForm, and
  * templates/admin/user/new.tmpl — census B-88):
  *
  *   - THE LOADER (NewUser's sources pull).
@@ -344,7 +344,7 @@ describe("the submit — the created round-trip (NewUserPost's landing)", () => 
     expect((await rowByName("priv-user"))!.visibility).toBe("private");
   });
 
-  it("emits the user:create audit row in the SAME batch — actor the ADMIN, scope the created user, origin ui (B-73, users.go:256)", async () => {
+  it("emits the user:create audit row in the SAME batch — actor the ADMIN, scope the created user, origin ui (B-73, users.go:255)", async () => {
     const seeded = await seedNew();
     const outcome = await submit(seeded, createForm());
     const createdId = outcome.outcome === "created" ? outcome.userId : 0;
@@ -412,7 +412,7 @@ describe("the submit — the created round-trip (NewUserPost's landing)", () => 
 
 // --- the submit: the password ladder ------------------------------------------------
 
-describe("the submit — the password ladder (users.go:199-211, unconditioned per deviation 1)", () => {
+describe("the submit — the password ladder (users.go:198-217, unconditioned per deviation 1)", () => {
   it("a too-short password re-renders with the min-length text, field flagged, nothing lands", async () => {
     const seeded = await seedNew();
     const before = await userCount();
@@ -478,7 +478,7 @@ describe("the submit — the armed config ladder (B-87: submitAdminUserCreate's 
     expect(await rowByName("armed-strong")).not.toBeNull();
   });
 
-  it("an ARMED ladder still skips BOTS (:199's gate wraps the knobs too)", async () => {
+  it("an ARMED ladder still skips BOTS (:197's gate wraps the knobs too)", async () => {
     const seeded = await seedNew();
     const knobs = { policy: resolvePasswordPolicy({ MIN_PASSWORD_LENGTH: "16", PASSWORD_COMPLEXITY: "lower,upper,digit,spec" }) };
     expect(
@@ -528,9 +528,9 @@ describe("the submit — the armed config ladder (B-87: submitAdminUserCreate's 
   });
 });
 
-// --- the submit: the landed Bot branch (B-72, users.go:190-193 + the :199 gate) -------
+// --- the submit: the landed Bot branch (B-72, users.go:186-188 + the :197 gate) -------
 
-describe("the submit — the landed Bot branch (B-72: users.go:190-193's arm over the :199 !IsTypeBot gate)", () => {
+describe("the submit — the landed Bot branch (B-72: users.go:186-188's arm over the :197 !IsTypeBot gate)", () => {
   it("user_type Bot CREATES a bot row: type 'bot', the empty-passwd triple (user.go:788-794), the Rands salt, the audit + outcome unchanged", async () => {
     const seeded = await seedNew();
     const outcome = await submit(
@@ -553,7 +553,7 @@ describe("the submit — the landed Bot branch (B-72: users.go:190-193's arm ove
     expect(audits[0]).toMatchObject({ action: "user:create", scopeName: "ci-bot", origin: "ui" });
   });
 
-  it("the password ladder is SKIPPED for bots (:199's !IsTypeBot gate wraps it) — a 1-char password still lands", async () => {
+  it("the password ladder is SKIPPED for bots (:197's !IsTypeBot gate wraps it) — a 1-char password still lands", async () => {
     const seeded = await seedNew();
     expect(
       await submit(seeded, createForm({ user_type: "Bot", user_name: "weak-bot", email: "weak-bot@example.com", password: "a" })),
@@ -619,7 +619,7 @@ describe("the submit — the landed Bot branch (B-72: users.go:190-193's arm ove
 
 // --- the submit: the name rules, collisions, duplicates -------------------------------
 
-describe("the submit — the name rules, the collision, and the duplicate email (users.go:226-249's mapping)", () => {
+describe("the submit — the name rules, the collision, and the duplicate email (users.go:221-249's arms)", () => {
   it("reserved and junk-char names carry the WEB texts, field flagged, nothing lands", async () => {
     const seeded = await seedNew();
     const before = await userCount();
@@ -663,7 +663,7 @@ describe("the submit — the name rules, the collision, and the duplicate email 
 
 // --- the submit: the silent bind arms -------------------------------------------------
 
-describe("the submit — the silent bind arms (web.Bind's AdminCreateUserForm, users.go:169-172)", () => {
+describe("the submit — the silent bind arms (web.Bind's AdminCreateUserForm, users.go:168-171)", () => {
   it("each bind miss re-renders flagged, NO banner, NOTHING else runs", async () => {
     const seeded = await seedNew();
     const before = await userCount();

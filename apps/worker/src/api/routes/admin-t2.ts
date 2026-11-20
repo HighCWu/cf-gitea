@@ -2,7 +2,7 @@ import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { and, asc, desc, eq, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
@@ -42,40 +42,52 @@ import { toApiUser } from "../services/user";
  * (SPEC-0004 appendix A category f, the table-free subset — 8 of the 33
  * contract operations in the tag):
  *
- *   - `GET /admin/users`                    (adminSearchUsers, admin/user.go:394–524)
- *   - `POST /admin/users`                   (adminCreateUser, admin/user.go:57–158)
- *   - `PATCH /admin/users/{username}`       (adminEditUser, admin/user.go:161–263)
- *   - `DELETE /admin/users/{username}`      (adminDeleteUser, admin/user.go:266–317)
- *   - `GET /admin/orgs`                     (adminGetAllOrgs, admin/org.go:85–127)
- *   - `POST /admin/users/{username}/orgs`   (adminCreateOrg, admin/org.go:23–82)
- *   - `POST /admin/users/{username}/rename` (adminRenameUser, admin/user.go:527–569)
- *   - `POST /admin/users/{username}/repos`  (adminCreateRepo, admin/repo.go:14–49 —
+ *   - `GET /admin/users`                    (adminSearchUsers, admin/user.go:374–502)
+ *   - `POST /admin/users`                   (adminCreateUser, admin/user.go:57–152)
+ *   - `PATCH /admin/users/{username}`       (adminEditUser, admin/user.go:155–251)
+ *   - `DELETE /admin/users/{username}`      (adminDeleteUser, admin/user.go:254–301)
+ *   - `GET /admin/orgs`                     (adminGetAllOrgs, admin/org.go:83–125)
+ *   - `POST /admin/users/{username}/orgs`   (adminCreateOrg, admin/org.go:23–80)
+ *   - `POST /admin/users/{username}/rename` (adminRenameUser, admin/user.go:505–545)
+ *   - `POST /admin/users/{username}/repos`  (adminCreateRepo, admin/repo.go:14–41 —
  *                                             a thin delegation to repo.CreateUserRepo,
  *                                             exactly what POST /user/repos rides)
  *
  * The remaining 24 ops are TABLE-DEPENDENT and stay undeclared: cron
  * (`/admin/cron*` — no task model), emails (`/admin/emails*` — no
  * email_address store), system-wide webhooks (`/admin/hooks*` — webhooks is
- * repo-scoped), packages, unadopted repositories (no adoption model), user
- * badges (no badge tables) and admin user keys (no public_key tables).
+ * repo-scoped), packages, user badges (no badge tables) and admin user keys
+ * (no public_key tables). (Upstream REMOVED the `/admin/unadopted` surface in
+ * this window — 1554b6c939 "feat!: remove repository adopt feature"; the
+ * unadopted line above was already undeclared here, and the landed
+ * admin-degenerate.ts routes are a handoff for the removing wave.)
  *
- * Upstream wiring (`routers/api/v1/api.go:1824–1877`): the whole /admin group
- * runs `tokenRequiresScopes(admin) → reqToken() → reqSiteAdmin() →
- * rejectPublicOnly()`, and the `/users/{username}` subgroup adds
- * `context.UserAssignmentAPI()`. Landed seams:
+ * Upstream wiring (`routers/api/v1/api.go:1843–1892` at the 099abf5db4 pin):
+ * the whole /admin group runs `tokenRequiresScopes(admin) → reqToken() →
+ * reqSiteAdmin() → rejectPublicOnly()`, and the `/users/{username}` subgroup
+ * adds `context.UserAssignmentAPI()`. Landed seams:
  *   - reqToken → the shared requireAuth middleware (401 `token is required`;
  *     runtime-only, the documented /user 401 class — the contract declares no
  *     401s in this tag);
- *   - reqSiteAdmin (api.go:343–347) → the requireSiteAdmin middleware below,
+ *   - reqSiteAdmin (api.go:364–368) → the requireSiteAdmin middleware below,
  *     403 `user should be the site admin`;
  *   - tokenRequiresScopes → mounted tree-wide (auth-parity H1):
  *     src/api/router.ts's apiScopeGate — the /admin row carries `admin`
- *     (api.go:1842-1876's group gate); rejectPublicOnly → the src/index.ts
+ *     (api.go:1891's group gate); rejectPublicOnly → the src/index.ts
  *     arm at /api/v1/admin/*;
- *   - UserAssignmentAPI (api.go:31–66) → resolveTargetRow below: type-blind
- *     name lookup, the user_redirect 307 seam, else 404 with upstream's
- *     `user redirect does not exist [name: …]` body (the redirect-miss error
- *     is what upstream's errCb carries, api.go:48–52).
+ *   - UserAssignmentAPI (services/context/user.go:36–41 at the pin) →
+ *     resolveTargetRow below: type-blind name lookup, the user_redirect 307
+ *     seam, else 404 with upstream's `user not found` body — the pin's
+ *     errCb carries `util.NewNotExistErrorf("user not found")` and
+ *     APIErrorAuto renders the wrapper message over ErrNotExist's 404 class
+ *     (user.go:55–56; the pre-pin text `user redirect does not exist
+ *     [name: …]` is history — 1d8474ee1f/b3422c0920's error-system port).
+ *
+ * Annotation drift at the pin (5671c5192d, wire-identical): upstream's
+ * swagger comments folded the per-endpoint 400/403/404/409/422 entries into
+ * a single `default: error` response per op; our route `responses` blocks
+ * keep the explicit statuses (the same apiErrorSchema shape — a documented
+ * superset, never served as generated JSON, the /api/swagger redirect only).
  *
  * ---------------------------------------------------------------------------
  * Documented deviations from upstream (PAT-only auth model + landed columns):
@@ -84,22 +96,22 @@ import { toApiUser } from "../services/user";
  *      `login_name` (external-auth concepts) are accepted and ignored on
  *      both arms: every cf-gitea user is LOCAL (LoginType Plain), so
  *      upstream's parseAuthSource arm (admin/user.go:99) and its
- *      `LoginType == Plain` ladder gate (admin/user.go:102) always resolve
+ *      `LoginType == Plain` ladder gate (admin/user.go:96) always resolve
  *      to the local ladder. The PASSWORD fields left this deviation when
  *      the password store landed (SPEC-0002 §6, PWD-2/PWD-4): create
- *      enforces the length/complexity 400s (admin/user.go:102–120 — the
+ *      enforces the length/complexity 400s (admin/user.go:96–114 — the
  *      pwned arm stays dormant, default-off config, pwn.go:37-39), edit
- *      re-hashes `password` (admin/user.go:203–226 → UpdateAuth), and
+ *      re-hashes `password` (admin/user.go:191–214 → UpdateAuth), and
  *      `must_change_password` persists (see 7). `send_notify` left the
  *      deviation when the mailer landed (specs/email-outbound.md §2.5 — it
- *      fires the register-notify mail, upstream admin/user.go:153-156).
+ *      fires the register-notify mail, upstream admin/user.go:147-150).
  *   2. **`purge` distinguished through the real cascade** (adminDeleteUser):
  *      upstream purge disables the account, deletes every owned repository
  *      through the repo-deletion service (services/user/user.go:172-182 →
  *      DeleteOwnerRepositoriesDirectly), removes org memberships and deletes
  *      last-owner orgs (user.go:184-219), then re-checks both counts inside
  *      the final transaction (user.go:234-248) whose errors the route maps
- *      422 (admin/user.go:303-311). cf-gitea rides the SAME shape: purge=true
+ *      422 (admin/user.go:287-296). cf-gitea rides the SAME shape: purge=true
  *      drives every owned repo through the engine-backed deleteRepository
  *      cascade (repos/service.ts — the exact path the demo-sweep consumer
  *      rides; D1 cascade + tombstone inline, R2-prefix purge/destroy
@@ -124,13 +136,13 @@ import { toApiUser } from "../services/user";
  *      `users.type` 'bot' value landed): the patch rides the same UPDATE as
  *      the profile columns (upstream's one UpdateUserCols), the conversion
  *      checks run against the EFFECTIVE admin (opts.IsAdmin applies
- *      in-memory first — update.go:289-303), org targets 400
+ *      in-memory first — update.go:186-190), org targets 400
  *      `user type can not be converted` (ErrUserTypeCanNotConvert) and the
- *      change emits `user:type:update` (update.go:217; B-72's handoff 1 —
+ *      change emits `user:type:update` (update.go:223; B-72's handoff 1 —
  *      the former deviation-3 blanket 400 is history). The route-level
- *      auth-material guard (admin/user.go:200–204) covers the
+ *      auth-material guard (admin/user.go:198-201) covers the
  *      conversion-to-bot path; UpdateAuth's service-level twin
- *      (update.go:231-235) covers an ALREADY-bot target — both 400 with
+ *      (update.go:241-243) covers an ALREADY-bot target — both 400 with
  *      `a bot account cannot have a password or authentication source`.
  *   4. **No external-login columns**: the `source_id`/`login_name` filters
  *      evaluate against the constant local-everything state (every user is
@@ -140,7 +152,7 @@ import { toApiUser } from "../services/user";
  *      `is_restricted` LEFT it too once `users.is_restricted` landed (and the
  *      PATCH/CREATE arms write it): the filter is the exact-match boolean
  *      `is_restricted = <value>` (search.go:118–120), engaged only when the
- *      param is present and non-empty (admin/user.go:500–501).
+ *      param is present and non-empty (admin/user.go:478–479).
  *   5. **No `updated` column**: the adminSearchUsers `updated` sort orders by
  *      `created_at` (upstream orders by `updated_unix`, user/search.go:21–36).
  *   6. **`active`/`prohibit_login` conflation**: upstream keeps two columns;
@@ -148,10 +160,10 @@ import { toApiUser } from "../services/user";
  *      active=false or prohibit_login=true both land 'prohibited' (the same
  *      correlation convert.ToUser already renders, services/user.ts).
  *   7. **`must_change_password` stores but does not enforce (yet)** — the
- *      column landed (migration 0075, upstream user.go:107-109
+ *      column landed (migration 0075, upstream user.go:113-115
  *      `NOT NULL DEFAULT false`): create defaults it TRUE (admin/user.go:
- *      89-95), edit sets/clears it (admin/user.go:207 → UpdateAuth
- *      update.go:265-267), and the change-password posts upstream pair with
+ *      89-95), edit sets/clears it (admin/user.go:195 → UpdateAuth
+ *      update.go:283-285), and the change-password posts upstream pair with
  *      `optional.Some(false)` clears. The ENFORCEMENT surface — the web
  *      redirect to /user/settings/change_password (web.go:197-206), the
  *      /user/change_password flow (password.go:267+) and the API 403 arm
@@ -213,15 +225,18 @@ function requireSiteAdmin(): MiddlewareHandler<ApiEnv> {
 type TargetRow = typeof users.$inferSelect;
 
 /**
- * `context.UserAssignmentAPI` (api.go:31–66) for the admin
- * `/users/{username}` subgroup: type-blind case-folded lookup (an org row is
- * a valid ContextUser — upstream GetUserByName has no type filter); on a miss
- * consult `user_redirects` (LookupUserRedirect) and answer the 307 seam with
- * the same path/query rewrite RedirectToUser performs
+ * `context.UserAssignmentAPI` (services/context/user.go:36–41 at the pin)
+ * for the admin `/users/{username}` subgroup: type-blind case-folded lookup
+ * (an org row is a valid ContextUser — upstream GetUserByName has no type
+ * filter); on a miss consult `user_redirects` (LookupUserRedirect) and answer
+ * the 307 seam with the same path/query rewrite RedirectToUser performs
  * (services/context/context_response.go:28–56) — the visibility gate always
  * passes here because reqToken+reqSiteAdmin guarantee a signed-in admin;
- * otherwise the 404 body carries upstream's redirect-miss message
- * (api.go:48–52: `errCb(404, ErrUserRedirectNotExist.Error())`).
+ * otherwise the 404 body carries upstream's pin message `user not found` —
+ * the errCb now throws `util.NewNotExistErrorf("user not found")` through
+ * APIErrorAuto (user.go:55–56; the pre-pin text
+ * `user redirect does not exist [name: …]` is history, the error-system
+ * consolidation b3422c0920 + 1d8474ee1f).
  */
 async function resolveTargetRow(c: Context<ApiEnv>, username: string): Promise<TargetRow> {
   const row = await findUserByName(c.env.DB, username);
@@ -243,7 +258,9 @@ async function resolveTargetRow(c: Context<ApiEnv>, username: string): Promise<T
       });
     }
   }
-  throw new ApiError(404, `user redirect does not exist [name: ${username}]`);
+  // util.NewNotExistErrorf("user not found") → APIErrorAuto: ErrNotExist's
+  // 404 class, the wrapper's message as the body (user.go:55–56, :66–68).
+  throw new ApiError(404, "user not found");
 }
 
 /** Missing member targets are the same 404-shaped miss (userAssignment). */
@@ -305,15 +322,21 @@ function resolveAdminUserSort(
 
 /**
  * The adminSearchUsers filter row — upstream `SearchUsers`
- * (models/user/search.go:76–170) restricted to the landed `users` columns
- * (Types=[UserTypeIndividual] → type='user'; deviations 1/4/5 above).
+ * (models/user/search.go:76–170) restricted to the landed `users` columns.
+ * The type base is `user_model.AdminListedUserTypes` since 405ba258a8 (the
+ * admin lists every account kind except organizations — admin/user.go:462,
+ * `Types: AdminListedUserTypes`, models/user/user.go:72–73): our type enum
+ * carries 'user' (Individual) and 'bot' (Bot); the Reserved/Remote members
+ * have no D1 enum values, so the base is `type IN ('user','bot')` — the WEB
+ * list page's exact predicate (admin-users.tsx loader). Deviations 1/4/5
+ * above.
  */
 async function searchAdminUsers(
   d1: D1Database,
   url: URL,
   options: { page: number; limit: number },
 ): Promise<{ items: TargetRow[]; total: number }> {
-  const conditions: SQL[] = [eq(users.type, "user")];
+  const conditions: SQL[] = [inArray(users.type, ["user", "bot"])];
 
   const keyword = formString(url.searchParams, "q").trim().toLowerCase();
   if (keyword !== "") {
@@ -469,25 +492,25 @@ const adminSearchUsersRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
 /**
  * Mirror of the contract's `CreateUserOption` (required: username, email).
  * `password` and `must_change_password` are LIVE (SPEC-0002 §6): the ladder
- * enforces upstream's 400s (admin/user.go:102–120) and the flag stores with
- * the default-true semantics (admin/user.go:89–95). `restricted` is LIVE
+ * enforces upstream's 400s (admin/user.go:96–114) and the flag stores with
+ * the default-true semantics (admin/user.go:83–89). `restricted` is LIVE
  * (the B-89 follow-up): upstream threads it through
- * `overwriteDefault.IsRestricted` (admin/user.go:122–125,
+ * `overwriteDefault.IsRestricted` (admin/user.go:116–119,
  * `optional.FromPtr(form.Restricted)`) into createUser's overwrite loop
- * (user.go:741–742 `if overwrite.IsRestricted.Has()`) against the user.go:712
+ * (user.go:760–761 `if overwrite.IsRestricted.Has()`) against the user.go:731
  * default `setting.Service.DefaultUserIsRestricted` (unset → false; no config
  * surface landed) — a present field lands ANY value, an absent field stays
  * false; the landed `users.is_restricted` column carries it and the response
  * render reflects it. NO template interplay (`Meta{}` carries no restricted)
  * and NO visibility interplay (Visibility has its own overwrite arm,
- * admin/user.go:127–129). Upstream's create emits ONLY the UserCreate audit
- * row (admin/user.go:149) — no restricted-family row exists at create (the
- * status trio lives in the UpdateUser tail, update.go:204–218, which create
+ * admin/user.go:121–123). Upstream's create emits ONLY the UserCreate audit
+ * row (admin/user.go:143) — no restricted-family row exists at create (the
+ * status trio lives in the UpdateUser tail, update.go:211–225, which create
  * never calls). `source_id` / `login_name` remain accepted-and-ignored —
  * deviation 1 (every user is local). `send_notify` LEFT deviation 1 when the
  * mailer landed
  * (specs/email-outbound.md §2.5): it fires the register-notify mail via
- * services/mail/register-notify.ts, upstream admin/user.go:153-156 parity.
+ * services/mail/register-notify.ts, upstream admin/user.go:147-150 parity.
  * Out-of-enum `visibility` dies in the request validator (runtime-only 400
  * where upstream binding 422s — the documented orgs.ts divergence class).
  */
@@ -537,23 +560,23 @@ function invalidEmailMessage(email: string): string | null {
 }
 
 /**
- * D1 row insert behind `user_model.createUser` (models/user/user.go:700–812).
+ * D1 row insert behind `user_model.createUser` (models/user/user.go:718–831).
  * `password` has already cleared the route's ladder (the 400s fire before
  * AdminCreateUser upstream), so the row always stores a hashed record here —
- * upstream's SetPassword arm (user.go:788–791: new salt, the CONFIGURED
- * algorithm) plus the Rands salt every create writes (user.go:785–786) and
- * the MustChangePassword default-true flag (admin/user.go:89–95).
+ * upstream's SetPassword arm (user.go:807–810: new salt, the CONFIGURED
+ * algorithm) plus the Rands salt every create writes (user.go:804–805) and
+ * the MustChangePassword default-true flag (admin/user.go:83–89).
  *
  * B-73: the `user:create` audit row rides the SAME batch — the §4.2
  * transactional form ("a failed write emits nothing"), the org-create twin's
  * shape (services/orgs/orgs.ts:459-474). Upstream emits
  * `audit.Record(ctx, audit_model.UserCreate, u)` immediately after
- * AdminCreateUser (admin/user.go:149): actor the ADMIN (ctx.Doer), scope the
+ * AdminCreateUser (admin/user.go:143): actor the ADMIN (ctx.Doer), scope the
  * created user, message the registry template. The new user's numeric id is
  * allocated by the insert of the same batch, so scope_id resolves through the
  * scalar subquery (cast to text — the schema's scope_id drift note: decimal
  * string for numeric entities) exactly like the org twin's mid-batch id;
- * actor_name snapshots upstream's DisplayName (models/user/user.go:476-482 —
+ * actor_name snapshots upstream's DisplayName (models/user/user.go:494-500 —
  * FullName when set, else Name).
  */
 async function insertCreatedUser(
@@ -566,7 +589,7 @@ async function insertCreatedUser(
   const lower = form.username.toLowerCase();
   // SetPassword under the request env's CONFIGURED algorithm (census B-87's
   // consumption half — the route resolves
-  // `configuredPasswordHashAlgo(c.env).specification`; user.go:788-791's
+  // `configuredPasswordHashAlgo(c.env).specification`; user.go:807-810's
   // "current algo" IS setting.PasswordHashAlgo). An unexecutable configured
   // spec refuses through the controlled PasswordHashUnsupportedError before
   // any write.
@@ -585,14 +608,19 @@ async function insertCreatedUser(
           // FullName, so a user-typed create fills both.
           displayName: form.full_name ?? null,
           isAdmin: false,
-          // IsRestricted at create (admin/user.go:122-125 → createUser:
-          // user.go:712's `setting.Service.DefaultUserIsRestricted` default →
-          // user.go:741-742's `if overwrite.IsRestricted.Has()`): the API
+          // IsRestricted at create (admin/user.go:116-119 → createUser:
+          // user.go:731's `setting.Service.DefaultUserIsRestricted` default →
+          // user.go:760-761's `if overwrite.IsRestricted.Has()`): the API
           // binds optional.FromPtr(form.Restricted), so a present field
           // writes ANY value and an absent field keeps the default — false,
           // the setting's unset value (no config surface landed). The
           // `?? false` fold is observationally identical to upstream's
           // overwrite-or-default while the default stays constant.
+          // Sibling default SINCE 1f614953a2: createUser also sets
+          // u.KeepActivityPrivate = ForceUserActivityVisibility=="private"
+          // (user.go:725) — the knob's unset value makes it FALSE, this
+          // insert's constant posture (no keep_activity_private column
+          // landed); the knob surface is the update unit's pending port.
           restricted: form.restricted ?? false,
           status: "active",
           visibility: form.visibility ?? "public",
@@ -625,7 +653,7 @@ async function insertCreatedUser(
     return inserted[0]!;
   } catch (error) {
     // The UNIQUE(users.username_lower) race arbiter (upstream IsUserExist
-    // pre-check inside the tx, user.go:776–783). Same OrgError convention as
+    // pre-check inside the tx, user.go:783–790). Same OrgError convention as
     // the org service: the API layer maps the class.
     let text = error instanceof Error ? error.message : String(error);
     let cause: unknown = error;
@@ -665,7 +693,7 @@ class EmailAlreadyUsedError extends ApiError {
 /**
  * 400 — upstream `ErrNameReserved`/`ErrNameCharsNotAllowed`/
  * `ErrNamePatternNotAllowed` unwrap to util.ErrInvalidArgument → APIErrorAuto
- * 400 in adminCreateUser (admin/user.go:140–142). The messages are the org
+ * 400 in adminCreateUser (admin/user.go:134–136). The messages are the org
  * errors module's byte-exact ports; only the STATUS differs from the org
  * surface (explicit 422s there, auto-400 here).
  */
@@ -713,14 +741,14 @@ const adminCreateUserRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
  * external-auth set, deviation 1). `password` and `must_change_password` are
  * LIVE (SPEC-0002 §6): a non-empty password runs upstream's UpdateAuth
  * ladder (update.go:247–262) and the flag persists whenever present
- * (update.go:265–267) — an empty/absent password leaves the stored record
+ * (update.go:273–275) — an empty/absent password leaves the stored record
  * untouched (optional.FromNonDefault semantics). `active`, `admin`,
  * `description`, `email`, `full_name`, `location`, `prohibit_login`,
  * `restricted`, `visibility`, `website` map onto landed columns —
  * `restricted` writes `users.is_restricted` PRESENCE-gated exactly like
  * upstream (the API binds `IsRestricted: optional.FromPtr(form.Restricted)`,
  * admin/user.go:247 → `optional.FromPtr`: a present field writes ANY value,
- * an absent field never touches the column; update.go:135-139's
+ * an absent field never touches the column; update.go:137-141's
  * `if opts.IsRestricted.Has()` — no last-admin/actual-change guard, unlike
  * IsAdmin and Visibility). The still-columnless account-flag set
  * (`allow_create_organization`, `allow_git_hook`, `allow_import_local`,
@@ -770,9 +798,9 @@ const editUserOptionSchema = z.object({
 });
 
 /**
- * 400 — upstream `ErrDeleteLastAdminUser` (models/user/user.go:853–855):
+ * 400 — upstream `ErrDeleteLastAdminUser` (models/user/user.go:869–871):
  * "can not delete the last admin user [uid: %d]". The adminEditUser mapping
- * (admin/user.go:251–257) is an explicit 400; the delete mapping is a 422.
+ * (admin/user.go:239–245) is an explicit 400; the delete mapping is a 422.
  */
 class DeleteLastAdminUserError extends ApiError {
   constructor(uid: number) {
@@ -988,29 +1016,29 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     return c.json(items.map((row) => toApiUser(viewer, row)), 200);
   });
 
-  // POST /admin/users — the createUser ladder (user.go:700–812): the
-  // password 400s FIRST (admin/user.go:102-120 — upstream order: the ladder
+  // POST /admin/users — the createUser ladder (user.go:718–831): the
+  // password 400s FIRST (admin/user.go:96-114 — upstream order: the ladder
   // runs before AdminCreateUser's user-model validation), then usable name
   // (400 arms via APIErrorAuto — deviation-free messages from the org errors
   // module), email format (400), namespace collision (409), email-in-use
   // (409), redirect consumption, insert with the hashed password record and
   // the default-true must_change_password flag (deviation 7: stored, not
   // enforced). `send_notify` fires the register-notify mailer
-  // (specs/email-outbound.md §2.5, upstream admin/user.go:153-156) —
+  // (specs/email-outbound.md §2.5, upstream admin/user.go:147-150) —
   // caught-and-logged, never load-bearing for the 201.
   app.openapi(adminCreateUserRoute(requireAuth), async (c) => {
     const form = c.req.valid("json");
 
-    // The password ladder (admin/user.go:102–120), unconditioned because
+    // The password ladder (admin/user.go:96–114), unconditioned because
     // every cf-gitea user is local (LoginType Plain — deviation 1). An
     // absent/empty password fails the min-length arm upstream too
     // (len("") < MinPasswordLength → `PasswordIsRequired`), so the field is
     // effectively REQUIRED on create. The complexity arm answers upstream's
     // bare code `PasswordComplexity`. The pwned arm (`PasswordPwned`,
-    // admin/user.go:113-119) runs ONLY when the knob is armed (census
+    // admin/user.go:107-113) runs ONLY when the knob is armed (census
     // B-87: PASSWORD_CHECK_PWN, default off = upstream's default posture);
     // BOTH pwned failure shapes answer PasswordPwned, with the
-    // request-failure logged (admin/user.go:115-117's log.Error).
+    // request-failure logged (admin/user.go:109-111's log.Error).
     const policy = resolvePasswordPolicy(c.env);
     const password = form.password ?? "";
     if (password.length < policy.minLength) {
@@ -1045,7 +1073,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     }
 
     const lower = form.username.toLowerCase();
-    // DeleteUserRedirect (user.go:798): creating on a live redirect consumes it.
+    // DeleteUserRedirect (user.go:817): creating on a live redirect consumes it.
     await drizzle(c.env.DB).delete(userRedirects).where(eq(userRedirects.lowerName, lower));
     // The audit emit rides the insert batch (B-73 — admin/user.go:149):
     // actor the ADMIN (ctx.Doer), name the DisplayName mapping.
@@ -1076,7 +1104,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     );
     // The register-notify mail arm (specs/email-outbound.md §2.5) — upstream
     // `if form.SendNotify { mailer.SendRegisterNotifyMail(u) }`
-    // (routers/api/v1/admin/user.go:153-156; the web twin admin/users.go:262).
+    // (routers/api/v1/admin/user.go:147-150; the web twin admin/users.go:261).
     // The previously accepted-and-ignored `send_notify` field fires the
     // mailer's first real surface. Fire-and-forget in EFFECT (upstream
     // SendAsync, services/mailer/mailer.go:66-80): the helper's await covers
@@ -1096,7 +1124,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     return c.json(toApiUser(viewerOf(c), row), 201);
   });
 
-  // PATCH /admin/users/{username} — the EditUser ladder (admin/user.go:161–263
+  // PATCH /admin/users/{username} — the EditUser ladder (admin/user.go:155–251
   // over services/user/update.go): type arms first (the parse rejects
   // "Organization"; the convert check rejects admin→Bot), then the auth arm —
   // the optional password (empty/absent = unchanged, non-empty = upstream's
@@ -1109,7 +1137,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     const target = await resolveTargetRow(c, username);
     const form = c.req.valid("json");
 
-    // --- type parse arm (user.go:193–201 → convert.UserTypeFromString):
+    // --- type parse arm (admin/user.go:181–189 → convert.UserTypeFromString):
     // the posted type only engages when it DIFFERS from the target's
     // current type string (upstream parses form.Type non-empty and !=
     // UserTypeToString(u.Type); identical/no posts leave userType None and
@@ -1124,7 +1152,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (parsedType === "Organization") {
       throw new ApiError(400, 'invalid user type "Organization" (expected User, Bot)');
     }
-    // Upstream's route-level auth-material guard (admin/user.go:200–204):
+    // Upstream's route-level auth-material guard (admin/user.go:198-201):
     // fires ONLY when the NEW type is Bot — a user→Bot conversion carrying
     // password/auth-source material 400s before UpdateAuth runs, regardless
     // of admin status.
@@ -1137,7 +1165,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     // upstream runs UpdateAuth to completion (UpdateUserCols) before
     // ReplacePrimaryEmailAddress; no transaction spans them, so a later 409
     // never rolls the password write back here either.
-    // UpdateAuth's service-level bot guard (update.go:231-235) — REACHABLE
+    // UpdateAuth's service-level bot guard (update.go:241-243) — REACHABLE
     // since B-72 (the route-level guard above covers only the
     // conversion-to-bot path): an ALREADY-bot target refuses any
     // auth-material assignment even without a type change. Same 400 +
@@ -1150,9 +1178,9 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (password !== "") {
       // optional.FromNonDefault semantics (update.go:249): empty/absent =
       // unchanged. The ladder texts DIFFER from create's bare codes — the
-      // route maps ErrMinLength to its own fmt string (admin/user.go:212–214)
-      // and ErrComplexity to err.Error() (admin/user.go:215–216, "password
-      // not complex enough"). The pwned arm (admin/user.go:220-221) maps
+      // route maps ErrMinLength to its own fmt string (admin/user.go:204-205)
+      // and ErrComplexity to err.Error() (admin/user.go:206-207, "password
+      // not complex enough"). The pwned arm (admin/user.go:208-209) maps
       // BOTH failure shapes to the raw err.Error() text at 400 — and runs
       // ONLY when the knob is armed (census B-87: PASSWORD_CHECK_PWN,
       // default off = upstream's default posture).
@@ -1172,7 +1200,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
           throw new ApiError(400, pwned.message);
         }
       }
-      // SetPassword (user.go:407–414): new salt + the CONFIGURED algorithm —
+      // SetPassword (user.go:413–420): new salt + the CONFIGURED algorithm —
       // the env-resolved spec (census B-87's consumption half, the same
       // bridge the create arm takes). An unexecutable configured spec
       // refuses through the controlled PasswordHashUnsupportedError BEFORE
@@ -1183,14 +1211,14 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       authPatch.passwdHashAlgo = record.passwdHashAlgo;
     }
     if (form.must_change_password !== undefined) {
-      // optional.FromPtr (update.go:265–267): present = write, absent =
+      // optional.FromPtr (update.go:283–284): present = write, absent =
       // untouched — an explicit false clears the create-defaulted flag.
       authPatch.mustChangePassword = form.must_change_password;
     }
     if (Object.keys(authPatch).length > 0) {
       await drizzle(c.env.DB).update(users).set(authPatch).where(eq(users.id, target.id));
       if (authPatch.passwd !== undefined) {
-        // UpdateAuth's token invalidation (update.go:278–284 →
+        // UpdateAuth's token invalidation (update.go:295–298 →
         // DeleteAuthTokensByUserID): our remember-session rows play the
         // auth_token role (the changeOwnPassword interpretation,
         // services/user-accounts.ts) — live non-remember sessions and PATs
@@ -1201,7 +1229,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       }
     }
 
-    // --- email replace arm (user.go:228–233 → ReplacePrimaryEmailAddress,
+    // --- email replace arm (admin/user.go:216–221 → ReplacePrimaryEmailAddress,
     // services/user/email.go:21–33): org targets 400, same-address no-op,
     // invalid format 400, foreign duplicate 409.
     if (form.email !== undefined) {
@@ -1219,13 +1247,13 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       }
     }
 
-    // --- last-admin guard (update.go:145–157): only the false-set checks.
+    // --- last-admin guard (update.go:142–155): only the false-set checks.
     if (form.admin === false && (await isLastAdminUser(c.env.DB, target))) {
       throw new DeleteLastAdminUserError(target.id);
     }
 
-    // --- the type conversion (update.go:289-303: `opts.UserType.Has() &&
-    // value != u.Type` → CheckConvertUserType, update.go:295-303). Upstream
+    // --- the type conversion (update.go:186-190: `opts.UserType.Has() &&
+    // value != u.Type` → CheckConvertUserType, update.go:187–189 + :312–318). Upstream
     // checks the IN-MEMORY IsAdmin — opts.IsAdmin applies FIRST (the
     // UpdateUser column loop runs before the UserType arm), so posting
     // {admin:false, type:"Bot"} on an admin target CONVERTS (the admin flag
@@ -1259,7 +1287,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (form.email !== undefined) patch.email = form.email;
     if (form.visibility !== undefined) patch.visibility = form.visibility;
     if (form.admin !== undefined) patch.isAdmin = form.admin;
-    // IsRestricted (update.go:135-139): PRESENCE-gated only — the API binds
+    // IsRestricted (update.go:137-141): PRESENCE-gated only — the API binds
     // optional.FromPtr(form.Restricted) (admin/user.go:247), so a present
     // field writes ANY value and an absent field never touches the column.
     // The formerly accepted-and-ignored posture is cured here (B-89's OPEN
@@ -1278,20 +1306,23 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if (convertedType !== null) patch.type = convertedType;
     if (Object.keys(patch).length > 0) {
       await drizzle(c.env.DB).update(users).set(patch).where(eq(users.id, target.id));
-      // UpdateUser's audit tail (B-89, services/user/update.go:204-218 —
+      // UpdateUser's audit tail (B-89, services/user/update.go:211-225 —
       // the shared service block upstream runs after EVERY UpdateUser
       // commit, :200's UpdateUserCols): one row per ACTUALLY-changed
       // audited column against the pre-UPDATE target snapshot (:68), in
       // upstream's fixed order active → admin → restricted → visibility;
-      // the type emit below is the tail's LAST member (:216-218) and stays
-      // after it. `after` is the write's own intent (upstream compares the
-      // mutated in-memory struct, :68 vs :204-218 — not a re-read). The
+      // the pin's tail adds OrganizationTeamAccess (:226, no users-side
+      // write surface landed) and the type emit below stays LAST (:223).
+      // `after` is the write's own intent (upstream compares the
+      // mutated in-memory struct, :68 vs :211-225 — not a re-read). The
       // status fold's driver rule: only an `active` post emits
       // user:status:active — upstream's prohibit_login write rides
-      // UpdateAuth, whose tail (:281-293) records no prohibit row. The
+      // UpdateAuth, whose tail records `user:prohibitlogin:update` SINCE
+      // 3f1b738f09 (:305-307; the pre-pin silence is a PENDING DELTA — the
+      // row is the update unit's UpdateAuth-tail port, HANDOFF). The
       // restricted arm is LIVE: `restricted` writes the column above
-      // (update.go:135-139's presence gate), so a flip emits
-      // user:status:restricted (:210-212). Failure posture = upstream writeEvent
+      // (update.go:137-141's presence gate), so a flip emits
+      // user:status:restricted (:216-218). Failure posture = upstream writeEvent
       // (audit/event.go:129-133): a failed audit INSERT logs and never
       // errorizes the successful write.
       const doer = c.get("authUser");
@@ -1326,7 +1357,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
         console.log(`[audit] user update-family rows failed (scope=${target.id}): ${String(error)}`);
       });
       if (convertedType !== null) {
-        // UpdateUser's type-change audit (update.go:217:
+        // UpdateUser's type-change audit (update.go:223:
         // `audit.Record(ctx, audit_model.UserType, u, "user_type",
         // u.Type.DisplayName())`) — the shared service tail, so the API arm
         // emits exactly like the web arm. DisplayName's English render
@@ -1360,7 +1391,7 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   // (services/user/user.go:147-149), then — WITHOUT purge — the repo/
   // membership/packages count guards upstream checks inside its final
   // transaction (user.go:234-255, the route's 422 mapping at
-  // admin/user.go:303-311). The cascade itself (purge's owned-repo +
+  // admin/user.go:291-299). The cascade itself (purge's owned-repo +
   // membership + packages arms, the branch-protection scrub, the census
   // batch and the row delete) is the deleteUserCascade service
   // (services/user-accounts.ts) — the port of upstream's
@@ -1407,8 +1438,8 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       // The third in-tx guard (user.go:250-255): `HasOwnerPackages` (an
       // INNER JOIN over package_versions with is_internal=false —
       // models/packages/package.go:342-351) → `ErrUserOwnPackages` ("user
-      // still has ownership of packages [uid: N]", package.go:338-340),
-      // mapped 422 beside the repos/orgs pair (admin/user.go:303-311). The
+      // still has ownership of packages [uid: N]", package.go:344-346),
+      // mapped 422 beside the repos/orgs pair (admin/user.go:287-296). The
       // purge path clears the packages first (the cascade's sweep), matching
       // upstream running RemoveAllPackages before this transaction.
       const packageCount = await db
@@ -1438,8 +1469,8 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   });
 
   // POST /admin/users/{username}/orgs — CreateOrganization with the TARGET as
-  // the owner row (admin/org.go:56–67: ctx.ContextUser, not the admin). The
-  // name errors 422 with err.Error() (org.go:68–72) — the shared-namespace
+  // the owner row (admin/org.go:54–65: ctx.ContextUser, not the admin). The
+  // name errors 422 with err.Error() (org.go:66–70) — the shared-namespace
   // collision included (upstream IsErrUserAlreadyExist in the same arm).
   app.openapi(adminCreateOrgRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
