@@ -125,9 +125,14 @@ function userCurrentListReposRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
  * required` body, the /user RUNTIME_ONLY class; not declared: the vendored
  * contract declares only {201, 400, 409, 422}). Guard order mirrors
  * CreateUserRepo: unknown readme template → 400; duplicate name → 409 with
- * the upstream message; invalid/reserved name → 422 (the IsUsableRepoName
- * port; our message text differs from Go's error strings — the createOrgRepo
- * note applies). `auto_init` lands the initial commit through the engine
+ * ErrRepoAlreadyExist.Error() "repository already exists [owner: %s, repo:
+ * %s]" (the b3422c0920 APIErrorAuto ladder, update.go:79-81 — was the
+ * pre-repin "The repository with the same name already exists.");
+ * invalid/reserved name → 400 (ErrNameReserved/ErrNamePatternNotAllowed
+ * unwrap util.ErrInvalidArgument, db/name.go:31-33/:55-57 — was the
+ * pre-repin 422; the IsUsableRepoName port, our message text differs from
+ * Go's class-split strings — the handler note applies). `auto_init` lands
+ * the initial commit through the engine
  * (services/user-repos.ts owns the fidelity notes and divergences); an
  * unknown `gitignores`/`license` template name → the init-failure 500 with
  * the row rolled back (create.go:236-241,448-456 via the unmapped-error arm
@@ -213,12 +218,26 @@ export function registerUserReposRoutes(
       repo = await createUserRepository(c.env.DB, c.env, owner, form, new Date());
     } catch (error) {
       if (error instanceof RepoNameCollisionError) {
-        throw new ApiError(409, "The repository with the same name already exists.");
+        // RE-PIN (099abf5db4, b3422c0920): upstream's create arm maps every
+        // error through ctx.APIErrorAuto (repo.go:249-259) — the collision
+        // unwraps util.ErrAlreadyExist → 409 with the TOP error's text,
+        // ErrRepoAlreadyExist.Error() "repository already exists [owner: %s,
+        // repo: %s]" (models/repo/update.go:79-81; upstream throws
+        // {u.LowerName, name} — our fields are the same lowercased pair).
+        throw new ApiError(409, `repository already exists [owner: ${error.ownerNamespace}, repo: ${error.repoName}]`);
       }
       if (error instanceof RepoNameInvalidError) {
-        // upstream 422s err.Error() for reserved/pattern violations; our
-        // ported message text differs from Go's error strings
-        throw new ApiError(422, error.message);
+        // RE-PIN (099abf5db4, b3422c0920): reserved/pattern violations unwrap
+        // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) →
+        // APIErrorAuto 400 on CREATE (was the pre-repin 422; the PATCH
+        // rename arm keeps its explicit 422, repo.go:618-627 — not this
+        // route). The wire text stays our conflated port message: upstream
+        // splits the texts by class — "name is reserved [name: %s]" /
+        // "name pattern is not allowed [pattern: %s]" (models/db/name.go:
+        // 24-26/:48-50) — and our single RepoNameInvalidError cannot
+        // distinguish them at the route; the classifier lives in
+        // repos/service.ts's private validator tables (recorded divergence).
+        throw new ApiError(400, error.message);
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

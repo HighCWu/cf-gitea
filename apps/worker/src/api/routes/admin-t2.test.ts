@@ -1871,16 +1871,23 @@ describe("POST /admin/users/{username}/repos (adminCreateRepo)", () => {
     );
   });
 
-  it("409s a name collision and 422s an unusable repo name", async () => {
+  // ROUTESWAP RE-PIN (099abf5db4, b3422c0920): upstream adminCreateRepo is a
+  // one-line delegation to CreateUserRepo's APIErrorAuto ladder — the
+  // duplicate 409 text is ErrRepoAlreadyExist.Error() "repository already
+  // exists [owner: %s, repo: %s]" (update.go:79-81, fields = the lowercased
+  // pair) and reserved/pattern names unwrap util.ErrInvalidArgument → 400
+  // (was 422; db/name.go:31-33). The wire text for the invalid class stays
+  // our conflated port message (the user-repos.ts divergence note).
+  it("409s a name collision (APIErrorAuto text) and 400s an unusable repo name", async () => {
     await seedRepo(neighborId, "neighbor", "taken", "9102");
     const collision = await adminSend("/admin/users/neighbor/repos", jsonAdmin({ name: "taken" }));
     expect(collision.status).toBe(409);
     expect(((await collision.json<Record<string, unknown>>())).message).toBe(
-      "The repository with the same name already exists.",
+      "repository already exists [owner: neighbor, repo: taken]",
     );
 
     const invalid = await adminSend("/admin/users/neighbor/repos", jsonAdmin({ name: "held.wiki" }));
-    expect(invalid.status).toBe(422);
+    expect(invalid.status).toBe(400);
     expect(((await invalid.json<Record<string, unknown>>())).message).toBe(
       "repository name is not allowed: held.wiki",
     );

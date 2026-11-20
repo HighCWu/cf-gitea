@@ -1520,12 +1520,14 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   });
 
   // POST /admin/users/{username}/repos — upstream is a one-line delegation to
-  // repo.CreateUserRepo (admin/repo.go:46–48), the same service POST
+  // repo.CreateUserRepo (admin/repo.go:40), the same service POST
   // /user/repos rides: the readme-template 400 first, then the create with
-  // the TARGET row as owner, mapped 409/422 like user-repos.ts; an unknown
-  // gitignores/license template name 500s with the row rolled back
-  // (create.go:236-241,448-456 — the user-repos route note and the
-  // RUNTIME_ONLY table entry carry the cites).
+  // the TARGET row as owner, mapped 409/400 like user-repos.ts (the
+  // b3422c0920 APIErrorAuto ladder — the collision text is
+  // ErrRepoAlreadyExist.Error(), reserved/pattern unwrap
+  // util.ErrInvalidArgument → 400); an unknown gitignores/license template
+  // name 500s with the row rolled back (create.go:236-241,448-456 — the
+  // user-repos route note and the RUNTIME_ONLY table entry carry the cites).
   app.openapi(adminCreateRepoRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
     const target = await resolveTargetRow(c, username);
@@ -1538,10 +1540,21 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       repo = await createUserRepository(c.env.DB, c.env, target, form, new Date());
     } catch (error) {
       if (error instanceof RepoNameCollisionError) {
-        throw new ApiError(409, "The repository with the same name already exists.");
+        // RE-PIN (099abf5db4, b3422c0920): APIErrorAuto renders the collision
+        // 409 with ErrRepoAlreadyExist.Error() "repository already exists
+        // [owner: %s, repo: %s]" (models/repo/update.go:79-81; the fields
+        // are the lowercased owner/repo pair, matching upstream's
+        // {u.LowerName, name}) — was the pre-repin "The repository with the
+        // same name already exists."
+        throw new ApiError(409, `repository already exists [owner: ${error.ownerNamespace}, repo: ${error.repoName}]`);
       }
       if (error instanceof RepoNameInvalidError) {
-        throw new ApiError(422, error.message);
+        // RE-PIN (099abf5db4, b3422c0920): reserved/pattern unwrap
+        // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) → 400 on
+        // CREATE (was the pre-repin 422; PATCH rename keeps its explicit
+        // 422). Text stays the conflated port message — the user-repos.ts
+        // handler note records the upstream class-split divergence.
+        throw new ApiError(400, error.message);
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

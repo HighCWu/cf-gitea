@@ -372,3 +372,42 @@ describe("POST /user/repos object_format_name (B-24)", () => {
     expect(omitted.status).toBe(201);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROUTESWAP RE-PIN (fc49368845 → 099abf5db4, b3422c0920) — the create-arm
+// error ladder: every error rides ctx.APIErrorAuto now (repo.go:249-259),
+// so the duplicate answers 409 with ErrRepoAlreadyExist.Error()
+// "repository already exists [owner: %s, repo: %s]" (models/repo/update.go:
+// 79-81, fields = the lowercased {u.LowerName, name} pair) — was the
+// pre-repin "The repository with the same name already exists." — and
+// reserved/pattern names unwrap util.ErrInvalidArgument (models/db/name.go:
+// 31-33/:55-57) → 400, was the pre-repin 422. The PATCH rename arm keeps
+// its explicit 422 (repo.go:618-627) — not this route.
+// ---------------------------------------------------------------------------
+
+describe("POST /user/repos name-error ladder (RE-PIN b3422c0920)", () => {
+  it("409s a duplicate with the APIErrorAuto collision text", async () => {
+    await seedStubRow();
+    const first = await apiCreate({ name: "dup-name" });
+    expect(first.status).toBe(201);
+    const duplicate = await apiCreate({ name: "dup-name" });
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toEqual({
+      message: "repository already exists [owner: cf-gitea-stub, repo: dup-name]",
+      url: "https://example.com/api/swagger",
+    });
+  });
+
+  it("400s a reserved-suffix name (the ErrInvalidArgument unwrap)", async () => {
+    await seedStubRow();
+    const reserved = await apiCreate({ name: "held.wiki" });
+    expect(reserved.status).toBe(400);
+    const body = await reserved.json<{ message: string }>();
+    // The conflated port text — upstream splits reserved vs pattern
+    // ("name is reserved [name: %s]" / "name pattern is not allowed
+    // [pattern: %s]", db/name.go:24-26/:48-50); the recorded divergence.
+    expect(body.message).toBe("repository name is not allowed: held.wiki");
+    const rows = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+    expect(rows).toHaveLength(0);
+  });
+});

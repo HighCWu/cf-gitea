@@ -240,6 +240,28 @@ export type SearchResults = z.infer<typeof searchResultsSchema>;
  * the create service with upstream's exact text (the engine is sha1-only,
  * SPEC-0001 §5 — the enum mirrors the frozen contract, not an engine
  * capability).
+ *
+ * RUNTIME error ladder of the three consuming create ops (RE-PIN
+ * fc49368845 → 099abf5db4, b3422c0920; the R28 precedent shape — a
+ * contract-mirror note, NOT a RUNTIME_ONLY_RESPONSES entry, because every
+ * emitted code sits inside each op's frozen-declared set): the frozen
+ * contract declares createCurrentUserRepo {201,400,409,422},
+ * createOrgRepo {201,400,403,404} (409 runtime-only, documented in the
+ * module header) and adminCreateRepo {201,400,403,404,409,422}. At the new
+ * pin upstream maps every create error through ctx.APIErrorAuto
+ * (repo.go:249-259): a duplicate name answers 409 with
+ * ErrRepoAlreadyExist.Error() "repository already exists [owner: %s, repo:
+ * %s]" (models/repo/update.go:79-81 — was the pre-repin "The repository
+ * with the same name already exists."), and reserved/pattern names answer
+ * 400 — ErrNameReserved/ErrNamePatternNotAllowed unwrap
+ * util.ErrInvalidArgument (models/db/name.go:31-33/:55-57; was the
+ * pre-repin 422, so the runtime 400 rides the ops' declared 400 whose
+ * original cite is the readme arm — a declared-set-compatible move, like
+ * R28's runtime-only 400 but INSIDE the declared set). Upstream's own
+ * new-pin swagger folds these per-op error entries into `default`
+ * (5671c5192d #40048) — the frozen copy still carries the old shape until
+ * the campaign's re-freeze. The PATCH rename arm keeps its explicit 422s
+ * (repo.go:618-627) — a different op, no bearing here.
  */
 export const createRepoOptionSchema = z.object({
   auto_init: z.boolean().optional().openapi({ description: "Whether the repository should be auto-initialized?" }),

@@ -46,9 +46,16 @@ const OMITTED_REPOSITORY_FIELDS = new Set([
   "parent",
   "repo_transfer",
 ]);
-const REPOSITORY_FIELDS = Object.keys(contractModelProperties("Repository"))
-  .filter((name) => !OMITTED_REPOSITORY_FIELDS.has(name))
-  .sort();
+// ROUTESWAP RE-PIN (fc49368845 → 099abf5db4): the frozen contract still
+// carries the pre-640cd615c4 Repository (71 properties) while the serializer
+// renders the two creation-restriction fields (services/repository.ts, the
+// "reader" defaults) — the emitted set runs +2 over the frozen derivation
+// until the campaign's contract re-freeze folds them in.
+const EXTRA_REPOSITORY_FIELDS = ["issues_creation_restriction", "pull_requests_creation_restriction"];
+const REPOSITORY_FIELDS = [
+  ...Object.keys(contractModelProperties("Repository")).filter((name) => !OMITTED_REPOSITORY_FIELDS.has(name)),
+  ...EXTRA_REPOSITORY_FIELDS,
+].sort();
 
 const ERROR_URL = "https://example.com/api/swagger";
 
@@ -249,7 +256,7 @@ describe("GET /orgs/{org}/repos (orgListRepos)", () => {
     expect((await memberView.json<Array<{ name: string }>>()).map((r) => r.name)).toEqual(["public-repo"]);
   });
 
-  it("renders the frozen 71-field Repository set for listed rows", async () => {
+  it("renders the frozen Repository set (+2 RE-PIN creation-restriction fields) for listed rows", async () => {
     const alice = await seedUser("Alice");
     const org = await seedOrg("Acme", alice.id);
     await seedOrgRepo(org, "visible");
@@ -420,7 +427,13 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
     expect(ownerCreate.status).toBe(201);
   });
 
-  it("409s a duplicate name and 422s an invalid/reserved name (upstream messages)", async () => {
+  // ROUTESWAP RE-PIN (099abf5db4, b3422c0920): the create arm's errors ride
+  // upstream's APIErrorAuto ladder — the duplicate 409 text is
+  // ErrRepoAlreadyExist.Error() "repository already exists [owner: %s, repo:
+  // %s]" (update.go:79-81, fields = the lowercased pair), and
+  // reserved/pattern names unwrap util.ErrInvalidArgument → 400 (was 422;
+  // db/name.go:31-33). The PATCH rename arm keeps its explicit 422.
+  it("409s a duplicate name (APIErrorAuto text) and 400s an invalid/reserved name", async () => {
     const alice = await seedUser("Alice");
     const org = await seedOrg("Acme", alice.id);
     await seedOrgRepo(org, "widget");
@@ -428,25 +441,27 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
     const duplicate = await router()("/orgs/acme/repos", { method: "POST", headers: authHeaders(alice.id), body: createBody });
     expect(duplicate.status).toBe(409);
     expect(await duplicate.json()).toEqual({
-      message: "The repository with the same name already exists.",
+      message: "repository already exists [owner: acme, repo: widget]",
       url: ERROR_URL,
     });
 
     // Invalid names: the IsUsableRepoName port (pattern, reserved suffixes) —
     // single dots are legal, so use a real violation (space / .git suffix).
+    // Status 400 (the ErrInvalidArgument unwrap); the wire text stays our
+    // conflated port message (the user-repos.ts handler divergence note).
     const spaced = await router()("/orgs/acme/repos", {
       method: "POST",
       headers: authHeaders(alice.id),
       body: JSON.stringify({ name: "bad name" }),
     });
-    expect(spaced.status).toBe(422);
+    expect(spaced.status).toBe(400);
 
     const gitSuffix = await router()("/orgs/acme/repos", {
       method: "POST",
       headers: authHeaders(alice.id),
       body: JSON.stringify({ name: "repo.git" }),
     });
-    expect(gitSuffix.status).toBe(422);
+    expect(gitSuffix.status).toBe(400);
 
     const malformed = await router()("/orgs/acme/repos", { method: "POST", headers: authHeaders(alice.id), body: "{not json" });
     expect(malformed.status).toBe(400); // hono's media-type gate, Gitea error shape

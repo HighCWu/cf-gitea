@@ -37,9 +37,14 @@ import { findRepositoryById, toApiRepository, viewerOf } from "../services/repos
  *                            swagger-declared 404 is unreachable
  *   - GET /orgs/{org}/repos: none — anonymous is allowed (no reqToken on
  *                            this GET, api.go:1733)
- *   - POST /orgs/{org}/repos: 401 (reqToken), 409 ("The repository with the
- *                            same name already exists."), 422 (invalid name
- *                            — upstream 422s err.Error())
+ *   - POST /orgs/{org}/repos: 401 (reqToken), 409 (runtime-only —
+ *                            ErrRepoAlreadyExist.Error() "repository already
+ *                            exists [owner: %s, repo: %s]", the b3422c0920
+ *                            APIErrorAuto ladder, update.go:79-81), 400 for
+ *                            reserved/pattern names IS declared (the
+ *                            ErrInvalidArgument unwrap, db/name.go:31-33 —
+ *                            the RE-PIN move from 422; the declared 400's
+ *                            contract cite is the readme arm)
  */
 
 const notFoundResponse = {
@@ -126,9 +131,12 @@ const orgReposRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
  * `POST /orgs/{org}/repos` — 201 + the Repository at owner permissions.
  * Guard order (upstream `prepareDoerCreateRepoInOrg` + `CreateUserRepo`):
  * org missing/invisible → 404; create grant missing → 403; duplicate name →
- * 409; invalid/reserved name → 422. The §4.3 demo quota rides the declared
- * 403 arm (the M2 known-gap fold — the user-repos note applies, with the
- * ORG as the quota owner). The create itself is upstream's shared
+ * 409 (ErrRepoAlreadyExist.Error() "repository already exists [owner: %s,
+ * repo: %s]", update.go:79-81 — the b3422c0920 APIErrorAuto ladder);
+ * invalid/reserved name → 400 (the ErrInvalidArgument unwrap,
+ * db/name.go:31-33 — was the pre-repin 422). The §4.3 demo quota rides the
+ * declared 403 arm (the M2 known-gap fold — the user-repos note applies,
+ * with the ORG as the quota owner). The create itself is upstream's shared
  * `CreateUserRepo` service half (`repo.go:493` — `org.AsUser()` IS the
  * owner), so `auto_init` lands the initial commit through the engine and
  * `description`/`default_branch` persist, exactly like `POST /user/repos`.
@@ -241,12 +249,23 @@ export function registerOrgRoutes(
       repo = await createUserRepository(c.env.DB, c.env, ownerRow, form, new Date());
     } catch (error) {
       if (error instanceof RepoNameCollisionError) {
-        throw new ApiError(409, "The repository with the same name already exists.");
+        // RE-PIN (099abf5db4, b3422c0920): upstream's create arm maps every
+        // error through ctx.APIErrorAuto (repo.go:249-259) — the collision
+        // unwraps util.ErrAlreadyExist → 409 with the TOP error's text,
+        // ErrRepoAlreadyExist.Error() "repository already exists [owner: %s,
+        // repo: %s]" (models/repo/update.go:79-81; upstream throws
+        // {u.LowerName, name} — our fields are the same lowercased pair, so
+        // the ORG rides ownerNamespace = the org's usernameLower).
+        throw new ApiError(409, `repository already exists [owner: ${error.ownerNamespace}, repo: ${error.repoName}]`);
       }
       if (error instanceof RepoNameInvalidError) {
-        // upstream 422s err.Error() for reserved/pattern violations; our
-        // ported message text differs from Go's error strings
-        throw new ApiError(422, error.message);
+        // RE-PIN (099abf5db4, b3422c0920): reserved/pattern violations unwrap
+        // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) →
+        // APIErrorAuto 400 on CREATE (was the pre-repin 422; the PATCH
+        // rename arm keeps its explicit 422, repo.go:618-627 — not this
+        // route). The wire text stays our conflated port message (the
+        // user-repos.ts handler note records the class-split divergence).
+        throw new ApiError(400, error.message);
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused
