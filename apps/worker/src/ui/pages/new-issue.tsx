@@ -267,7 +267,7 @@ export interface NewIssuePrefill {
 /**
  * `setTemplateIfExists` (issue_new.go:40-96) over the engine reads: the
  * candidate chain is `?template=` FIRST then the 18 fallback paths
- * (IssueTemplateCandidates, routers/web/repo/issue.go:56-74 — appended "to
+ * (IssueTemplateCandidates, routers/web/repo/issue.go:55-73 — appended "to
  * the end because they should be fallback", :50); a missing blob falls
  * through (the util.ErrNotExist continue), a parse error records per file
  * name and falls through too (:58-60), the first success wins and carries

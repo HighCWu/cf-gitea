@@ -46,7 +46,7 @@
  *   TimeSince timestamp (opened_by/closed_by/merged_by — GetLastEventLabel),
  *   the milestone link, the linked-PR rows (the comments refIssueId+refIsPull
  *   refs, ViewProject's linkedPrsMap), the task counter (issueTasksPat —
- *   models/issues/issue.go:114-115, 441-449) and the label/assignee bottom;
+ *   models/issues/issue.go:116-127, 470-478) and the label/assignee bottom;
  * - the board's facet filters (`?labels=`, `?assignee=`, `?milestone=` —
  *   ViewProject's FormString/FormInt64 reads) are HONORED, filtered in memory
  *   over the loaded cards (upstream filters in SQL; the same rows, the
@@ -434,7 +434,7 @@ export interface BoardCard {
   /** The task counter (GetTasks/GetTasksDone over the content). */
   tasks: { total: number; done: number };
   /** The meta line's timestamp (GetLastEventTimestamp: closed → closed_unix,
-   *  else created_unix — models/issues/issue.go:451-455). */
+   *  else created_unix — models/issues/issue.go:480-484). */
   lastEventUnix: number;
   /** opened/closed/merged — GetLastEventLabel's three-way split. */
   lastEventKind: "opened" | "closed" | "merged";
@@ -460,7 +460,7 @@ export interface ProjectBoardData {
   filters: { labels: number[]; assignee: number | null; milestone: number | null };
 }
 
-/** Upstream issueTasksPat/issueTasksDonePat (models/issues/issue.go:114-115)
+/** Upstream issueTasksPat/issueTasksDonePat (models/issues/issue.go:125-126)
  *  — `- [ ]`/`- [x]` list-item checkboxes. */
 const ISSUE_TASKS_PATTERN = /(^[\s]*[-*][\s]\[[\sxX]\][\s].)|(\n[\s]*[-*][\s]\[[\sxX]\][\s].)/g;
 const ISSUE_TASKS_DONE_PATTERN = /(^[\s]*[-*][\s]\[[xX]\][\s].)|(\n[\s]*[-*][\s]\[[xX]\][\s].)/g;

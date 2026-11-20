@@ -118,26 +118,33 @@ export async function assertIssuesUnitReadable(d1: D1Database, found: Repository
 }
 
 /**
- * ListIssues' `type` narrowing (routers/api/v1/repo/issue.go:375-390): an
- * explicit `type` against a unit the viewer cannot read is the 404; without
- * a type, the filter collapses to the readable side (only pulls readable →
- * `true`, only issues readable → `false`). Input/output use the parse
- * convention of services/issues.ts (`null` = no filter).
+ * ListIssues' `type` narrowing (routers/api/v1/repo/issue.go:373-377 →
+ * common.ParseIssueFilterTypeIsPullWithPermission, routers/common/
+ * issue_filter.go:35-66): an explicit `type` against a unit the viewer
+ * cannot read — and a request with no readable unit at all — answer
+ * 403 "no permission to read issues or pulls" (the #40192 re-grade: the
+ * ladder moved into the parse helper and the NOT-found became Forbidden);
+ * without a type, the filter collapses to the readable side (only pulls
+ * readable → `true`, only issues readable → `false`). Input/output use the
+ * parse convention of services/issues.ts (`null` = no filter).
  */
 export function narrowIssueListType(units: IssuePullUnits, isPull: boolean | null): boolean | null {
   if (isPull !== null) {
     if (!(isPull ? units.pulls : units.issues)) {
-      throw notFound();
+      throw forbiddenListType();
     }
     return isPull;
   }
-  if (!units.issues) return units.pulls ? true : null;
+  if (!units.issues && !units.pulls) {
+    throw forbiddenListType();
+  }
+  if (!units.issues) return true;
   if (!units.pulls) return false;
   return null;
 }
 
 /**
- * `getRepoIssueByIndexForDoer`'s narrowing (issue.go:998-1009) — the
+ * `getRepoIssueByIndexForDoer`'s narrowing (issue.go:956-967) — the
  * per-issue unit check every issue-by-index handler runs after the lookup:
  * 404 "not found" unless the issue's OWN unit (issues vs pulls) is readable.
  * This is what hides plain issues on a repo whose issues unit is off while
@@ -152,4 +159,11 @@ export function assertIssueRowUnit(units: IssuePullUnits, isPull: boolean): void
 /** `ctx.APIErrorNotFound()` — the shared 404 body (services/context/api.go:137-142). */
 function notFound(): ApiError {
   return new ApiError(404, "not found");
+}
+
+/** The type-filter ladder's Forbidden arm (issue.go:375-377 —
+ * `ctx.APIError(http.StatusForbidden, "no permission to read issues or
+ * pulls")`). */
+function forbiddenListType(): ApiError {
+  return new ApiError(403, "no permission to read issues or pulls");
 }

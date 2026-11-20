@@ -7,8 +7,8 @@
  * fork-dispatch model).
  *
  * Upstream reaches its webhook from exactly this route (submodule pin
- * fc4936884584): routers/api/v1/repo/issue.go:851→:886 →
- * services/issue/issue.go:155→:183 (DeleteIssue: the attributes load BEFORE
+ * 099abf5db4): routers/api/v1/repo/issue.go:815→:846 →
+ * services/issue/issue.go:166→:196 (DeleteIssue: the attributes load BEFORE
  * the delete — the payload renders the pre-delete state — and the notify
  * runs after it) → services/webhook/notifier.go:313-341: the issue arm one
  * `issues` IssuePayload, the PR arm one `pull_request` PullRequestPayload,

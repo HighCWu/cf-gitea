@@ -913,7 +913,7 @@ export async function applyStopwatchCancelWrite(d1: D1Database, issue: IssueRow,
   return { outcome: "canceled" };
 }
 
-/** ChangeIssueTimeEstimate (models/issues/issue.go:785-806): the
+/** ChangeIssueTimeEstimate (models/issues/issue.go:814-835): the
  *  time_estimate column + the change_time_estimate (38) comment with the
  *  DECIMAL SECONDS as content + the counter fold. */
 export async function applyTimeEstimateWrite(d1: D1Database, issue: IssueRow, seconds: number, actorId: number, now: Date): Promise<void> {
@@ -1620,7 +1620,7 @@ async function commentGate(
   if (!commentHasContentSupport(found.comment.type)) {
     return { response: respond(httpErrorText(400, "comment does not support content")) };
   }
-  // canSelfChangeOrAccessContent (services/issue/issue.go:322-337) reduced:
+  // canSelfChangeOrAccessContent (services/issue/issue.go:334-348) reduced:
   // the repo resolution proved read access; the self-change arm accepts
   // the content's poster; accessMode=WRITE needs a repo writer.
   const allowed =

@@ -1216,20 +1216,111 @@ export function commentTypeIsRef(type: number): boolean {
   return type === CommentType.CommentRef || type === CommentType.PullRef || type === CommentType.IssueRef;
 }
 
-/** The comment projection `isXRefCommentAccessible` needs. */
+/** The comment projection the readable-comment probe needs (the timeline rows). */
+export interface ReadableCommentProbe {
+  type: number;
+  refRepoId: string | null;
+  refIsPull: boolean;
+  /** Types 19/20 — the dependency arm's target (upstream LoadDepIssueDetails). */
+  dependentIssueId: number | null;
+}
+
+/**
+ * `issue_service.FilterReadableComments` (services/issue/comments.go:205-254,
+ * #39942 — the 178d33ed4d re-grade of the API timeline's inline
+ * isXRefCommentAccessible, deleted upstream): per comment row, resolve the
+ * row's REFERENCE target and drop the row when the VIEWER cannot read that
+ * target's unit there.
+ *   - ref types 3/5/6: target = ref_repo, unit = pulls/issues by ref_is_pull;
+ *   - type 4 (CommitRef): target = ref_repo, unit = code (our code unit has
+ *     no settings flag — repo visibility IS the code-read gate);
+ *   - types 19/20 (dependency): target = the DEPENDENT issue's repo + unit;
+ *   - no resolvable target → the row stays.
+ * The same-repo short-circuit is GONE (upstream checks the issue's own repo
+ * too — "including pull requests of the same repository without pull
+ * request access"), so a same-repo type-6 row hides from a viewer whose
+ * pulls unit is off. The repo+unit probe is memoized per call (upstream's
+ * EphemeralCache).
+ */
+export async function isCommentReadable(d1: D1Database, viewer: Viewer, comment: ReadableCommentProbe): Promise<boolean> {
+  const readable = await resolveCommentTargetReadable(d1, viewer, comment);
+  return readable === null ? true : readable;
+}
+
+/** Per-call memo entry — the unit-read answers for one reference repo. */
+interface CommentTargetProbe {
+  readablePulls: boolean;
+  readableIssues: boolean;
+  /** The code-unit read gate (our repo-visibility predicate). */
+  canView: boolean;
+}
+
+/**
+ * The per-row target resolution of FilterReadableComments: null = the row
+ * carries no resolvable target (kept), boolean = the target unit's read
+ * answer.
+ */
+async function resolveCommentTargetReadable(d1: D1Database, viewer: Viewer, comment: ReadableCommentProbe): Promise<boolean | null> {
+  // Upstream's EphemeralCache("ref-target") — one repo+perm probe per
+  // distinct reference repo per call.
+  const cache = new Map<string, CommentTargetProbe>();
+  const probeRepo = async (repoId: string): Promise<CommentTargetProbe> => {
+    const cached = cache.get(repoId);
+    if (cached !== undefined) return cached;
+    const repoFound = await findRepositoryById(d1, repoId);
+    let entry: CommentTargetProbe;
+    if (repoFound === null) {
+      entry = { readablePulls: false, readableIssues: false, canView: false };
+    } else {
+      const canView = await canViewRepositoryWithTeams(d1, viewer, repoFound.repo);
+      const settings = await loadRepoSettings(d1, repoFound.repo.id);
+      entry = { readablePulls: canView && settings.hasPullRequests, readableIssues: canView && settings.hasIssues, canView };
+    }
+    cache.set(repoId, entry);
+    return entry;
+  };
+
+  let targetRepoId: string | null = null;
+  let targetUnit: "issues" | "pulls" | "code" | null = null;
+  if (commentTypeIsRef(comment.type)) {
+    targetRepoId = comment.refRepoId;
+    targetUnit = comment.refIsPull ? "pulls" : "issues";
+  } else if (comment.type === CommentType.CommitRef) {
+    targetRepoId = comment.refRepoId;
+    targetUnit = "code";
+  } else if (comment.type === CommentType.AddDependency || comment.type === CommentType.RemoveDependency) {
+    if (comment.dependentIssueId === null) return null;
+    const dep = await drizzle(d1)
+      .select({ repoId: issues.repoId, isPull: issues.isPull })
+      .from(issues)
+      .where(eq(issues.id, comment.dependentIssueId))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (dep === undefined) return null; // upstream keeps the row when the dependent issue is gone
+    targetRepoId = dep.repoId;
+    targetUnit = dep.isPull ? "pulls" : "issues";
+  }
+  if (targetRepoId === null || targetUnit === null) return null;
+
+  const target = await probeRepo(targetRepoId);
+  switch (targetUnit) {
+    case "issues":
+      return target.readableIssues;
+    case "pulls":
+      return target.readablePulls;
+    case "code":
+      return target.canView;
+  }
+}
+
+/** The deprecated pre-pin helper (see isCommentReadable) — same shape it
+ *  always had, kept only while its citations re-anchor. */
 export interface XrefCommentProbe {
   type: number;
   refRepoId: string | null;
   refIsPull: boolean;
 }
 
-/**
- * `isXRefCommentAccessible` (routers/api/v1/repo/issue_comment.go:205-222):
- * a ref-type row whose origin repo differs from the timeline's repo is
- * dropped when the origin repo is gone or the VIEWER cannot read its
- * issue/pull unit there (the unit flag + the landed repo-read predicate —
- * `canViewRepositoryWithTeams`, the same gate `requireVisibleRepo` applies).
- */
 export async function isXRefCommentAccessible(d1: D1Database, viewer: Viewer, comment: XrefCommentProbe, issueRepoId: string): Promise<boolean> {
   if (!commentTypeIsRef(comment.type)) return true;
   if (comment.refRepoId === null || comment.refRepoId === issueRepoId) return true;

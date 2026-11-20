@@ -82,11 +82,11 @@ import {
  * delete, the issue-edit field writes upstream owns in services/issue, and
  * the issue-delete cascade.
  *
- * Upstream citations (submodule pin fc4936884584):
+ * Upstream citations (submodule pin 099abf5db4):
  *   - Issue converter: `services/convert/issue.go toIssue` (URL/HTMLURL from
  *     Issue.APIURL/HTMLURL, ToAuthor poster, ToAPIMilestone milestone,
  *     SliceNilAsEmpty labels, PullRequestMeta, deadline/closed pointers,
- *     NumComments, PinOrder -1→0 (LoadPinOrder, models/issues/issue.go:272),
+ *     NumComments, PinOrder -1→0 (LoadPinOrder, models/issues/issue.go:301),
  *     TimeEstimate, ContentVersion);
  *   - Comment converter: `services/convert/issue_comment.go ToAPIComment`
  *     (HTMLURL = issue HTMLURL + `#issuecomment-<id>`, IssueURL "" for PRs,
@@ -103,8 +103,8 @@ import {
  *     cascade + DecrRepoIssueNumbers; the index counter is never rewound)
  *     plus its webhook pair — `services/webhook/notifier.go DeleteIssue:313`
  *     fires the `action=deleted` Issue/PullRequest payload from exactly the
- *     v1 DELETE route (`routers/api/v1/repo/issue.go:851`→`:886` →
- *     `services/issue/issue.go:155`→`:183`); ours emits from the same
+ *     v1 DELETE route (`routers/api/v1/repo/issue.go:815`→`:846` →
+ *     `services/issue/issue.go:166`→`:196`); ours emits from the same
  *     `deleteIssueCascade` funnel so API and any UI delete path emit
  *     identically.
  */
@@ -306,7 +306,7 @@ async function pullRequestMetaOf(
 }
 
 /**
- * `issue.LoadPinOrder` (models/issues/issue.go:272-284) — the pinned row's
+ * `issue.LoadPinOrder` (models/issues/issue.go:301-313) — the pinned row's
  * pin_order, or the unpinned sentinel -1 (mapped to 0 by the converter).
  */
 async function pinOrderOf(d1: D1Database, issueId: number): Promise<number> {
@@ -372,7 +372,7 @@ export interface IssueRenderContext {
   /** The page's distinct projects' joined open/closed member-issue counts by
    *  project id — ONE GROUP BY read over the page's project ids, the page
    *  twin of `projectIssueCounts` (upstream `LoadIssueNumbersForProject`,
-   *  services/projects/issue.go:291-340, whose numbers `toProject` renders
+   *  services/projects/issue.go:359-408, whose numbers `toProject` renders
    *  preloaded, services/convert/project.go:126-152). The branch split rides
    *  the collapse: repository projects (ownerId === 0) count unfiltered,
    *  owner projects only the viewer-visible repos when the render viewer was
@@ -524,9 +524,9 @@ export async function prefetchIssueRenderContext(
   // exactly like the per-row path whose toApiProject is never reached).
   // The grouped read keys per REPO too (R5-3's counts scope): owner-scope
   // projects (ownerId > 0) must count only the member issues inside the
-  // viewer's visible repo set (services/projects/issue.go:330-340's
+  // viewer's visible repo set (services/projects/issue.go:398-408's
   // IssuesOptions{Doer, AllPublic, Owner}; the repository branch —
-  // :298-309's `project.OwnerID == 0` — stays unfiltered), so the buckets
+  // :366-377's `project.OwnerID == 0` — stays unfiltered), so the buckets
   // carry issues.repoId and the collapse below filters per project. The
   // visible sets ride the ONE landed walk (`userVisibleRepos`, once per
   // distinct owner); an un-threaded viewer (opts.viewer === undefined)
@@ -1302,10 +1302,12 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
 
 /**
  * Timeline renderability — upstream drops `CommentTypeCode` rows from the
- * timeline (ListIssueCommentsAndTimeline) and xref rows whose reference
- * repo is unreadable (isXRefCommentAccessible). Reviews/code comments are
- * tier 2 (no rows exist yet) and xrefs are same-repo only, so nothing is
- * filtered in practice today; the predicates stay for parity.
+ * timeline (ListIssueCommentsAndTimeline) and, since 178d33ed4d, runs the
+ * rows through FilterReadableComments (services/issue/comments.go:205-254 —
+ * isCommentReadable in xref.ts): ref rows by their repo+unit, CommitRef rows
+ * by code readability, dependency rows by the dependent issue's repo+unit.
+ * Reviews/code comments are tier 2 (no rows exist yet); xrefs and
+ * dependencies exist, so the dependency arm is live today.
  */
 /**
  * `convert.ToTimelineComment` → the contract `TimelineComment`. Emits the
@@ -1550,7 +1552,7 @@ export function goRfc3339ParseError(value: string): string {
 /**
  * RFC3339-only query-time parse (parseFormTime, services/context/utils.go:31-40);
  * ""/absent → null; a malformed value → 422 (the GetQueryBeforeSince callers,
- * routers/api/v1/repo/issue.go:152-156 / issue_comment.go:173-176). A value
+ * routers/api/v1/repo/issue.go:150-154 / issue_comment.go:173-176). A value
  * that PARSES to unix seconds <= 0 is the UNSET sentinel, never a 422
  * (ledger ⑬-#13): Go returns the parsed Unix() and every filter gate is
  * `> 0` — comment.go:1129-1135 (`opts.Since > 0` / `opts.Before > 0`) and
@@ -2066,6 +2068,9 @@ export async function updateCommentBody(d1: D1Database, commentId: number, body:
   const priorRows = await drizzle(d1).select().from(comments).where(eq(comments.id, commentId)).limit(1).all();
   const prior = priorRows[0];
   if (prior === undefined) return null;
+  // The no-op gate compares the RAW body (upstream's c.Content != oldContent
+  // runs before the model hook folds NULs); the writes below carry the
+  // folded text (comment.go:414/:424, via sanitizeDatabaseStringContent).
   const needsHistory = prior.content !== body && commentHasContentSupport(prior.type);
   const backfill = needsHistory && !(await hasIssueContentHistory(d1, prior.issueId, commentId))
     ? { posterId: prior.posterId, editedAt: prior.createdAt ?? now, contentText: prior.content ?? "" }
@@ -2073,10 +2078,10 @@ export async function updateCommentBody(d1: D1Database, commentId: number, body:
 
   const updateStatement = drizzle(d1)
     .update(comments)
-    .set({ content: body, contentVersion: sql`content_version + 1`, updatedAt: now })
+    .set({ content: sanitizeDatabaseStringContent(body), contentVersion: sql`content_version + 1`, updatedAt: now })
     .where(eq(comments.id, commentId))
     .returning();
-  const newRevision = { posterId: actorId ?? prior.posterId, editedAt: now, contentText: body };
+  const newRevision = { posterId: actorId ?? prior.posterId, editedAt: now, contentText: sanitizeDatabaseStringContent(body) };
 
   let updated: CommentRow | null;
   if (backfill !== null) {
@@ -2117,7 +2122,8 @@ export async function updateCommentBody(d1: D1Database, commentId: number, body:
       await syncCommentCrossReferences(d1, {
         issue: { id: origin.id, repoId: origin.repoId, isPull: origin.isPull },
         commentId,
-        content: body,
+        // the sanitized body — upstream's scan reads the post-hook strings
+        content: sanitizeDatabaseStringContent(body),
         doerId: actorId ?? null,
         removeOld: true,
         appUrl,
@@ -2171,6 +2177,21 @@ export async function deleteComment(d1: D1Database, comment: CommentRow, now: Da
 type BatchStatement = Parameters<DrizzleD1Database["batch"]>[number][number];
 
 /**
+ * `sanitizeDatabaseStringContent` (models/issues/issue.go:134-138, invoked by
+ * the Issue/Comment `BeforeInsert`/`BeforeUpdate` hooks — issue.go:145-154,
+ * comment.go:414/:424): every issue TITLE + CONTENT and comment CONTENT
+ * write replaces NUL ("\x00") with a space before the row lands. Upstream's
+ * hook is a postgres "\x00" workaround, but the stored VALUE is the
+ * contract — the sanitizer rides every row write here (create, PATCH title/
+ * body, comment create/edit), so the derived readers (content history
+ * revisions, the xref scans — upstream scans the sanitized in-memory
+ * strings too) see the same text.
+ */
+export function sanitizeDatabaseStringContent(value: string): string {
+  return value.replace(/\0/g, " ");
+}
+
+/**
  * `issue_service.ChangeTitle` — title update + `change_title` (10) comment +
  * the num_comments fold, one batch; then ChangeIssueTitle's tail
  * (models/issues/issue_update.go:217) — AddCrossReferences(doer,
@@ -2184,7 +2205,11 @@ export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: s
   const results = await drizzle(d1).batch([
     drizzle(d1)
       .update(issues)
-      .set({ title, updatedAt: now })
+      // Issue.BeforeUpdate's sanitize (issue.go:150-154) — the COLUMN write
+      // carries the NUL-folded title. The type-10 comment's new_title column
+      // is NOT a Content column, so upstream's comment hook leaves it raw —
+      // mirrored here (raw `title` below).
+      .set({ title: sanitizeDatabaseStringContent(title), updatedAt: now })
       .where(eq(issues.id, issue.id))
       .returning(),
     drizzle(d1).insert(comments).values({
@@ -2235,7 +2260,9 @@ export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: s
 export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: string, expectedVersion: number, now: Date, actorId?: number | null, appUrl = ""): Promise<IssueRow | null> {
   const updated = await drizzle(d1)
     .update(issues)
-    .set({ content: body, contentVersion: sql`content_version + 1`, updatedAt: now })
+    // Issue.BeforeUpdate's sanitize (issue.go:150-154) — the CAS write and
+    // every derived reader (history revision, xref scan) see the folded text.
+    .set({ content: sanitizeDatabaseStringContent(body), contentVersion: sql`content_version + 1`, updatedAt: now })
     .where(and(eq(issues.id, issue.id), eq(issues.contentVersion, expectedVersion)))
     .returning();
   const row = updated[0] ?? null;
@@ -2244,7 +2271,7 @@ export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: str
   const backfill = (await hasIssueContentHistory(d1, issue.id, 0))
     ? null
     : { posterId: issue.posterId, editedAt: issue.createdAt ?? now, contentText: issue.content ?? "" };
-  const newRevision = { posterId: actorId ?? issue.posterId, editedAt: now, contentText: body };
+  const newRevision = { posterId: actorId ?? issue.posterId, editedAt: now, contentText: sanitizeDatabaseStringContent(body) };
   if (backfill !== null) {
     // The lazy first-revision back-fill + the edited revision commit as one
     // atomic batch (ordering by edited_unix puts the back-fill first).
@@ -2277,7 +2304,7 @@ function trimBranchPrefix(ref: string): string {
 
 /** `issue_service.ChangeIssueRef` — ref update + change_issue_ref (33)
  *  comment. The ISSUE's ref column carries the raw value upstream too
- *  (services/issue/issue.go:140-150 sets issue.Ref = ref, the model writes
+ *  (services/issue/issue.go:151-161 sets issue.Ref = ref, the model writes
  *  it); the COMMENT's old_ref/new_ref carry the TrimPrefix'd "friendly"
  *  forms (models/issues/issue_update.go:231-232). */
 export async function changeIssueRef(d1: D1Database, issue: IssueRow, ref: string, actorId: number | null, now: Date): Promise<void> {
@@ -2394,7 +2421,7 @@ export async function changeIssueMilestone(
 // `IssueAssignOrRemoveProject` (models/issues/issue_project.go:92-160) over
 // the landed projects seams. The API arms: create (issue.go:621-624 — the
 // writer branch passes form.Projects through NewIssue, the non-writer arm
-// clears it) and PATCH (issue.go:827-828 — `canWrite && form.Projects !=
+// clears it) and PATCH (issue.go:791-792 — `canWrite && form.Projects !=
 // nil`, an empty array clearing every membership).
 // ---------------------------------------------------------------------------
 
@@ -2454,15 +2481,18 @@ export interface IssueProjectsWriteResult {
  * `addIssueToColumn` (the web sidebar arm's primitive,
  * ui/pages/issue-sidebar-writes.ts). Requested ids resolve UNSCOPED
  * (GetProjectsMapByIDs — any scope); a missing id is upstream's
- * `project %d not found` (util.NewNotExistErrorf, :123-126) and an
+ * `project %d not found` (util.NewNotExistErrorf, :112-114) and an
  * inaccessible one `issue %d can't be accessed by project %d`
- * (util.NewPermissionDeniedErrorf, :128-130) — the API arms map the
- * ErrNotExist/ErrPermissionDenied pair to 400 (issue.go:633-636 create /
- * :829-833 PATCH), so both throw here BEFORE any write (upstream's tx rolls
+ * (util.NewPermissionDeniedErrorf, :115-117). The arms DIVERGE since #40069
+ * swapped the create arm to APIErrorAuto: the errors now serve their OWN
+ * errorForUser codes — 404 / 403 on CREATE (routers/api/v1/repo/issue.go:600
+ * `ctx.APIErrorAuto(err)`) — while PATCH keeps its explicit 400 map
+ * (issue.go:793-797); this writer throws the create-arm codes and the PATCH
+ * arm re-maps to 400. Both throw here BEFORE any write (upstream's tx rolls
  * the whole diff back — the observable "bad request touches nothing" is
  * kept by validating up front). Returns the diff for callers. The workflow
  * notification (upstream IssueChangeProjects — services/issue/project.go:17
- * PATCH / services/issue/issue.go:88 create tail, whose ONLY implementation
+ * PATCH / services/issue/issue.go:97 create tail, whose ONLY implementation
  * is the projects workflow notifier, workflow_notifier.go:32-35 — NO
  * webhook, NO mail arm exists): the removals emit here in upstream's
  * removed-first position; the adds ride `addIssueToColumn`'s own
@@ -2512,10 +2542,10 @@ export async function assignOrRemoveIssueProjects(
     const rows = await drizzle(d1).select().from(projects).where(eq(projects.id, projectId)).limit(1);
     const project = rows[0];
     if (project === undefined) {
-      throw new ApiError(400, `project ${projectId} not found`);
+      throw new ApiError(404, `project ${projectId} not found`);
     }
     if (!projectCanBeAccessedByOwnerRepo(repo, project)) {
-      throw new ApiError(400, `issue ${issue.id} can't be accessed by project ${project.id}`);
+      throw new ApiError(403, `issue ${issue.id} can't be accessed by project ${project.id}`);
     }
     addRows.push(project);
   }
@@ -2662,7 +2692,7 @@ async function resolveAssigneeNames(d1: D1Database, names: string[]): Promise<Us
 }
 
 /**
- * loadAssigneeUserIDs (routers/api/v1/repo/issue.go:524-553) — the CREATE
+ * loadAssigneeUserIDs (routers/api/v1/repo/issue.go:508-537) — the CREATE
  * arms' pre-write resolution (issue create issue.go:614, PR create
  * pull.go:527): names are lowercased, deduped and empty-dropped (the
  * container.Set), then resolved through the doer-user lookup —
@@ -2930,7 +2960,7 @@ export async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, fo
 /**
  * Request-scoped emission context for the delete arms — the delete funnel's
  * optional webhook half (upstream DeleteIssue, notifier.go:313-341, reached
- * from the v1 DELETE route, routers/api/v1/repo/issue.go:851→:886). Every
+ * from the v1 DELETE route, routers/api/v1/repo/issue.go:815→:846). Every
  * caller that holds a request threads it (`issueDeleteEmission`), so the API
  * route and any future UI delete funnel emit identically through ONE seam
  * (the house rule — the same funnel posture as the wiki family's service
@@ -2992,7 +3022,7 @@ interface IssueDeletedEvent {
  * identity render is the doer-viewer §2.7 converters — every other emission's
  * render (upstream's issue-arm poster-viewer quirk is sub-visible; the house
  * render passes the doer viewer throughout). Upstream loads the payload's
- * attributes BEFORE deleting (issue.go:157-162) and notifies AFTER (:183),
+ * attributes BEFORE deleting (issue.go:168-172) and notifies AFTER (:196),
  * so this render runs on the live rows and the fan-out follows the cascade.
  * Null = an unresolvable identity (orphaned repo row / missing PR row) — the
  * push wave's log-and-skip degradation.
@@ -3108,19 +3138,19 @@ async function emitIssueDeletedEvent(d1: D1Database, event: IssueDeletedEvent, e
  * index counter is NOT rewound (§2.2).
  *
  * The tier-2 arms are the upstream `db.DeleteBeans` set
- * (services/issue/issue.go:234–252) minus one accepted delta: upstream's
+ * (services/issue/issue.go:247–265) minus one accepted delta: upstream's
  * `IssueUser` bean is not modeled (the derived read-state design — schema's
- * notification_states comment). The `ProjectIssue` detach (issue.go:246)
+ * notification_states comment). The `ProjectIssue` detach (issue.go:259)
  * rides this sweep too — the review-wave closure: without it a deleted issue
  * left a ghost `project_issues` membership row behind. The upstream git-data
- * half (issue.go:173–181 — the `refs/pull/N/head` RemoveRef) lands through
+ * half (issue.go:185–192 — the pull-index ref sweep) lands through
  * `removePullHeadRefOf` below, riding the emission context's REPO binding
  * (ledger ⑬-#B).
  *
  * Attachment STORAGE is deleted first (the landed single-attachment delete's
  * storage-first contract — routes/issue-attachments.ts:986-991: a failed R2
  * delete leaves the D1 rows intact and the request retryable; upstream's
- * cascade removes the files after commit, services/issue/issue.go:166–172).
+ * cascade removes the files after commit, services/issue/issue.go:177–183).
  * The row sweep rides the batch; a NULL `r2_key` (row-first landing, upload
  * not completed) has no object to delete. R2 delete of a missing key is a
  * no-op, so a retry after a partial storage pass is safe.
@@ -3134,24 +3164,26 @@ async function emitIssueDeletedEvent(d1: D1Database, event: IssueDeletedEvent, e
  * never emits both).
  */
 /**
- * The PR's `refs/pull/N/head` sweep (ledger ⑬-#B — the stale-deferral close):
- * upstream DeleteIssue deletes the pull request's git data after the bean
- * cascade — `git.RemoveRef(ctx, issue.PullRequest.BaseRepo,
- * issue.PullRequest.GetGitHeadRefName())` (services/issue/issue.go:173-181;
- * `update-ref --no-deref -d`, modules/git/ref.go:264-266) — so a deleted PR
- * never leaves a ghost head ref on the base cell. Rides the emission
- * context's REPO binding: a bare cascade (in-process callers without a
- * request, the webhook half's fail-closed posture) leaves the engine
- * untouched. Error posture mirrors upstream: a refused delete THROWS after
- * the D1 cascade committed — the same post-commit failure upstream's
- * RemoveRef error produces (the retry then 404s at the issue lookup). The
- * one tolerated arm is the ref ALREADY absent: upstream's `update-ref -d`
- * errors there too, but our pre-refs-era PR rows (created before the
- * refs/pull machinery landed) make the arm reachable-in-practice, and the
- * engine itself models an already-gone ref as an idempotent ok
- * (deleteApiRef's `ref_conflict` with a null currentOid). A CAS loss
- * (concurrent push moved the tip between the read and the delete) retries
- * once with the fresh tip before giving up.
+ * The PR's pull-ref sweep (ledger ⑬-#B — the stale-deferral close): upstream
+ * DeleteIssue deletes the pull request's git data after the bean cascade —
+ * since e0b2f3425e THREE refs per PR index (services/issue/issue.go:185-192:
+ * RefNameFromPullIndex = `refs/pull/N/head`, MergeRefNameFromPullIndex =
+ * `refs/pull/N/merge`, MergedRefNameFromPullIndex = `refs/pull/N/merged`;
+ * `update-ref --no-deref -d`, modules/git/ref.go) — so a deleted PR never
+ * leaves a ghost ref on the base cell. The merge/merged names have no
+ * writers in this tree yet (only `refs/pull/N/head` exists) — their removal
+ * rides the same loop as the already-absent idempotent ok, so the shape is
+ * upstream's and the refs land covered when their writers arrive.
+ * Rides the emission context's REPO binding: a bare cascade (in-process
+ * callers without a request, the webhook half's fail-closed posture) leaves
+ * the engine untouched. Error posture FOLLOWS the new upstream: each ref
+ * removal failure is LOGGED and the sweep continues (issue.go:190-192
+ * `log.Error("RemoveRef %s: %v", ...)` — the delete no longer fails after
+ * the D1 cascade committed); the still-tolerated extra arm is the ref ALREADY
+ * absent (the engine models it as an idempotent ok — deleteApiRef's
+ * `ref_conflict` with a null currentOid). A CAS loss (concurrent push moved
+ * the tip between the read and the delete) retries once with the fresh tip
+ * before the failure is logged.
  */
 async function removePullHeadRefOf(d1: D1Database, pr: PullRequestRow, repo: ApiEnv["Bindings"]["REPO"]): Promise<void> {
   const pair = await findRepositoryById(d1, pr.baseRepoId);
@@ -3163,7 +3195,28 @@ async function removePullHeadRefOf(d1: D1Database, pr: PullRequestRow, repo: Api
     return;
   }
   const cell = repo.getByName(engineRepoName({ ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug }));
-  const ref = pullHeadRef(pr.index);
+  const refs = [pullHeadRef(pr.index), pullMergeRef(pr.index), pullMergedRef(pr.index)];
+  for (const ref of refs) {
+    await removeOnePullRef(cell, ref, pr.index);
+  }
+}
+
+/** `MergeRefNameFromPullIndex` (modules/git/ref.go:90-92) — the open PR's
+ *  test merge ref. No writer exists in this tree yet; the delete sweep
+ *  covers the name for parity. */
+function pullMergeRef(index: number): string {
+  return `refs/pull/${index}/merge`;
+}
+
+/** `MergedRefNameFromPullIndex` (modules/git/ref.go:95-97) — the hidden
+ *  post-merge ref (`refs/gitea/pull/N/merged`). No writer exists in this
+ *  tree yet; the delete sweep covers the name for parity. */
+function pullMergedRef(index: number): string {
+  return `refs/gitea/pull/${index}/merged`;
+}
+
+/** One ref's tolerant removal (upstream's per-ref log-and-continue arm). */
+async function removeOnePullRef(cell: ReturnType<ApiEnv["Bindings"]["REPO"]["getByName"]>, ref: string, prIndex: number): Promise<void> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const tip = await cell.readCommit(ref);
     if (tip === null) {
@@ -3177,12 +3230,15 @@ async function removePullHeadRefOf(d1: D1Database, pr: PullRequestRow, repo: Api
       return; // raced to absent — same idempotent ok
     }
     if (result.tag !== "ref_conflict") {
-      throw new Error(`pull head ref delete refused (${result.tag}${result.tag === "invalid" ? `: ${result.reason}` : ""})`);
+      // the new upstream posture: a refused delete is logged, not raised —
+      // the D1 cascade has already committed (issue.go:190-192)
+      console.error(`[issues] delete: RemoveRef ${ref} refused (${result.tag}${result.tag === "invalid" ? `: ${result.reason}` : ""}) [pr index: ${prIndex}]`);
+      return;
     }
     // ref_conflict with a live currentOid: a concurrent push moved the tip —
-    // one retry with the fresh value, then the failure propagates.
+    // one retry with the fresh value, then the failure is logged below.
   }
-  throw new Error(`pull head ref delete kept losing the CAS race [ref: ${ref}]`);
+  console.error(`[issues] delete: RemoveRef ${ref} kept losing the CAS race [pr index: ${prIndex}]`);
 }
 
 export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue: IssueRow, emission?: IssueDeleteEmission): Promise<void> {
@@ -3212,7 +3268,7 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     if (key !== null) await bucket.delete(key);
   }
 
-  // The FEED SWEEP (upstream DeleteIssueActions, services/issue/issue.go:219 →
+  // The FEED SWEEP (upstream DeleteIssueActions, services/issue/issue.go:232 →
   // models/activities/action.go:558-586) runs before the DeleteBeans batch
   // upstream and joins it here: (1) the action rows pointing at the issue's
   // comments (upstream pages the comment ids at DefaultMaxInSize for a
@@ -3249,7 +3305,7 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     drizzle(d1).delete(comments).where(eq(comments.refIssueId, issue.id)),
     drizzle(d1).delete(comments).where(eq(comments.dependentIssueId, issue.id)),
     drizzle(d1).delete(issueLabels).where(eq(issueLabels.issueId, issue.id)),
-    // Tier-2 children — the upstream DeleteBeans sweep (issue.go:234–252).
+    // Tier-2 children — the upstream DeleteBeans sweep (issue.go:247–265).
     drizzle(d1).delete(issueContentHistory).where(eq(issueContentHistory.issueId, issue.id)),
     drizzle(d1).delete(issueAssignees).where(eq(issueAssignees.issueId, issue.id)),
     drizzle(d1).delete(issueDependencies).where(eq(issueDependencies.issueId, issue.id)),
@@ -3257,7 +3313,7 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     drizzle(d1).delete(notificationStates).where(eq(notificationStates.issueId, issue.id)),
     drizzle(d1).delete(issueStopwatches).where(eq(issueStopwatches.issueId, issue.id)),
     drizzle(d1).delete(trackedTimes).where(eq(trackedTimes.issueId, issue.id)),
-    // The ProjectIssue detach (issue.go:246) — the review-wave closure of the
+    // The ProjectIssue detach (issue.go:259) — the review-wave closure of the
     // orphaned-membership gap: a deleted issue must not survive as a ghost
     // card on project columns (the projects service joins project_issues to
     // issues, so the orphan row never rendered, but it stayed in D1).
@@ -3324,7 +3380,7 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     await removePullHeadRefOf(d1, pullRow, emission.env.REPO);
   }
   // The delete event fans out AFTER the sweep committed (upstream notify
-  // order, issue.go:183) — from the pre-delete render taken above.
+  // order, issue.go:196) — from the pre-delete render taken above.
   if (event !== null && emission !== undefined) {
     await emitIssueDeletedEvent(d1, event, emission);
   }

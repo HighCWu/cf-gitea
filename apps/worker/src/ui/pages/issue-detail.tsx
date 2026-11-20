@@ -27,7 +27,7 @@
  * `.issue-content-right.ui.segment` (the reduced sidebar: labels + milestone,
  * plus the wave-5 admin label edit form).
  *
- * ## Cross-family URL semantics (upstream ViewIssue, issue_view.go:347-352)
+ * ## Cross-family URL semantics (upstream ViewIssue, issue_view.go:323-328)
  *
  * "Make sure type and URL matches": `/{issues}/{n}` of a PR row 303s onto
  * `/{pulls}/{n}` and the mirror image (upstream `ctx.Redirect` →
@@ -424,7 +424,7 @@ function detailApiUser(viewer: Viewer): ApiViewer["requester"] {
 }
 
 /** TotalTimesForEachUser (models/issues/tracked_time.go over the live
- *  rows — issue_view.go:614's WorkingUsers), username order. */
+ *  rows — issue_view.go:554's WorkingUsers), username order. */
 async function workingUsersOf(d1: D1Database, issueId: number): Promise<Array<{ user: UserRow; seconds: number }>> {
   const rows = await drizzle(d1)
     .select({ userId: trackedTimes.userId, seconds: trackedTimes.seconds })
@@ -575,7 +575,7 @@ export interface IssueDetailData {
    *  nowhere, or its row/repo vanished). */
   otherStopwatchUrl: string | null;
   /** Census gap #1 part two: TotalTimesForEachUser over the live rows
-   *  (issue_view.go:614 — the WorkingUsers list), username order. */
+   *  (issue_view.go:554 — the WorkingUsers list), username order. */
   workingUsers: Array<{ user: UserRow; seconds: number }>;
   /** Census gap #1 part two: the dependency block's two edge lists with
    *  the per-entry read verdict (issue_dependencies.tmpl). */
@@ -633,7 +633,7 @@ function formatDueDate(date: Date): string {
  *
  * The §13.4 view arm (specs/email-outbound.md): a signed viewer's load
  * marks the issue read for THEM — upstream ViewIssue's
- * `if ctx.IsSigned { SetIssueReadBy(...) }` (issue_view.go:386-391), and
+ * `if ctx.IsSigned { SetIssueReadBy(...) }` (issue_view.go:365-370), and
  * because this one loader serves both families, the PR twin
  * (pull.go:150-155) rides the same call. Both halves stamp (the carrier's
  * setIssueReadBy): issue_user.is_read and the derived mailbox's
@@ -644,9 +644,9 @@ function formatDueDate(date: Date): string {
  * — their SUCCESS paths 303 onto this page and mark through the view
  * anyway; (2) the mark precedes the caller's crossFamilyRedirect, so a
  * wrong-family URL marks before its 303 (upstream redirects first,
- * issue_view.go:347-352 — the redirect target's own view then marks once).
+ * issue_view.go:323-328 — the redirect target's own view then marks once).
  * Error posture is upstream's: a failed mark fails the view
- * (issue_view.go:390-392, ctx.ServerError("ReadBy", err)).
+ * (issue_view.go:368-370, ctx.ServerErrorAuto(err)).
  *
  * `reads` is the optional engine read bundle the merge box's squash body
  * prefill rides (pull-merge-box.tsx's optional-seam shape, the listTips
@@ -668,8 +668,8 @@ export async function loadIssueDetailData(
   const issue = await findIssueByRepoAndIndex(d1, repo.id, index);
   if (issue === null) return null;
 
-  // The view seam's read-mark — the signed viewer only (issue_view.go:386-
-  // 391; the header note's over-fire inventory). Runs before the render
+  // The view seam's read-mark — the signed viewer only (issue_view.go:
+  // 365-370; the header note's over-fire inventory). Runs before the render
   // assembly, upstream's mark position ahead of the page metadata.
   if (viewer.kind === "user") {
     await setIssueReadBy(d1, issue.id, viewer.id, new Date());
@@ -678,7 +678,7 @@ export async function loadIssueDetailData(
   const pr = issue.isPull ? ((await findPullRequestByIndex(d1, repo.id, index))?.pullRequest ?? null) : null;
   const reviews = pr === null ? [] : await loadPullReviewEntries(d1, issue.id, viewer);
   // The upstream conversation page computes the merge box server-side on
-  // every view (prepareMergeBox, issue_view.go:413); the archived gate is
+  // every view (prepareMergeBox, issue_view.go:390); the archived gate is
   // view_content.tmpl:67's `not $.Repository.IsArchived` — the fragment
   // loader itself stays repo-shape-only (the route arm carries no archive
   // refusal either).
@@ -816,7 +816,7 @@ export async function loadIssueDetailData(
 }
 
 /**
- * Upstream ViewIssue's type/URL match (issue_view.go:347-352): the wrong URL
+ * Upstream ViewIssue's type/URL match (issue_view.go:323-328): the wrong URL
  * family for the row redirects onto `Issue.Link()`. Returns the target when
  * the families mismatch, `null` when the page can render in place.
  */
@@ -865,14 +865,14 @@ export interface IssueDetailAccess {
    *  issue_management.tmpl's `and .IsRepoAdmin (not .Repository.IsArchived)`
    *  — `canAdminRepo` is the IsRepoAdmin stand-in). */
   canManageIssue: boolean;
-  /** Census gap #1: the pin button's state (issue_view.go:645-659) —
+  /** Census gap #1: the pin button's state (issue_view.go:587-599) —
    *  `pinned` (the issue_pins row exists) and `canAddPin` (upstream
    *  NewPinAllowed = IsNewPinAllowed: the type-half count sits under
    *  ISSUE_DETAIL_MAX_PINNED); `null` = not an admin (the block never
    *  renders, the reads stay unloaded). */
   pin: { pinned: boolean; canAddPin: boolean } | null;
   /** Census gap #1: the signed viewer's CheckIssueWatch state
-   *  (issue_view.go:573-584 → the landed checkIssueSubscription); `null` =
+   *  (issue_view.go:516-521 → the landed checkIssueSubscription); `null` =
    *  anonymous (the subscribe button never renders). */
   watching: boolean | null;
   /** Census gap #1: the milestone select's options — open + closed, the

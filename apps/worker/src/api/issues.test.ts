@@ -721,7 +721,7 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(await db().select().from(issues).where(eq(issues.repoId, repoId)).all()).toHaveLength(0);
   });
 
-  it("403s the poster blocked by a requested assignee BEFORE the row (NewIssue issue.go:33-34's second half — owner first, then the assignees)", async () => {
+  it("403s the poster blocked by a requested assignee BEFORE the row (NewIssue issue.go:36-38's translatable assignee arm — owner first, then the assignees)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const blocker = await seedUser("Blocker");
@@ -734,7 +734,7 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
       body: JSON.stringify({ title: "x", assignees: ["Blocker"] }),
     });
     expect(both.status).toBe(403);
-    expect(await both.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await both.json()).toEqual({ message: "Cannot create an issue or pull request because you are blocked by an assignee.", url: ERROR_URL });
     expect(await db().select().from(issues).where(eq(issues.repoId, repoId)).all()).toHaveLength(0);
   });
 
@@ -3902,8 +3902,11 @@ describe("GET /repos/issues/search (issueSearchIssues)", () => {
 
 // ---------------------------------------------------------------------------
 // Blocked-user enforcement (the wave-blocks-enforcement arms) — the upstream
-// 403 "user is blocked" writes (ErrBlockedUser, models/user/block.go:21,
- // answered via APIErrorAuto's permission-denied unwrap). Cites per case.
+// 403 blocked writes (ErrBlockedUser, models/user/block.go:23 — #40069
+// re-worded the base text to "you are blocked by the user" and gave the
+// CREATE arm its own translatable messages; the NON-create arms here still
+// answer the shared blocks.ts BLOCKED_USER_MESSAGE "user is blocked" until
+// the blocks family re-anchors). Cites per case.
 // ---------------------------------------------------------------------------
 
 describe("blocked-user enforcement (ErrBlockedUser arms)", () => {
@@ -3940,7 +3943,7 @@ describe("blocked-user enforcement (ErrBlockedUser arms)", () => {
       app.fetch(new Request(`https://example.com${path}`, init), env);
   };
 
-  it("POST /issues: a doer blocked by the repo owner answers 403 user is blocked (issue.go:625 → services/issue/issue.go:33-34)", async () => {
+  it("POST /issues: a doer blocked by the repo owner answers the 403 translatable owner arm (issue.go:600 → services/issue/issue.go:33-35, repo.creation_blocked_by_owner)", async () => {
     const owner = await seedUser("Alice");
     await seedOwnedRepo(owner);
     await seedBlock(owner.id, 1); // the repo owner blocks the stub doer
@@ -3951,7 +3954,7 @@ describe("blocked-user enforcement (ErrBlockedUser arms)", () => {
       body: JSON.stringify({ title: "opened while blocked" }),
     });
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await res.json()).toEqual({ message: "Cannot create an issue or pull request because you are blocked by the repository owner.", url: ERROR_URL });
   });
 
   it("POST /issues: a site-admin doer bypasses the block (IsUserBlockedBy's IsAdmin arm, block.go:42-44)", async () => {
@@ -4479,7 +4482,7 @@ describe("issue unit gates (mustEnableIssuesOrPulls)", () => {
     expect((await router()("/repos/alice/units/milestones")).status).toBe(200);
   });
 
-  it("narrows the list `type` to the readable side and hides plain issues when only pulls are readable (issue.go:375-390, :998-1009)", async () => {
+  it("narrows the list `type` to the readable side and hides plain issues when only pulls are readable (issue.go:373-377, :956-967)", async () => {
     const owner = await seedUser("alice");
     const repoId = await seedRepo(owner.usernameLower, "mixed");
     const plain = await seedIssue(repoId, "plain issue");
@@ -4500,10 +4503,11 @@ describe("issue unit gates (mustEnableIssuesOrPulls)", () => {
     const items = await list.json<Array<{ number: number }>>();
     expect(items.map((item) => item.number)).toEqual([pull.issue.index]);
 
-    expect((await router()("/repos/alice/mixed/issues?type=issues")).status).toBe(404);
+    // The #40192 re-grade: the explicit-unreadable type answers Forbidden.
+    expect((await router()("/repos/alice/mixed/issues?type=issues")).status).toBe(403);
     expect((await router()("/repos/alice/mixed/issues?type=pulls")).status).toBe(200);
 
-    // The per-issue narrowing of getRepoIssueByIndexForDoer (issue.go:998-1009).
+    // The per-issue narrowing of getRepoIssueByIndexForDoer (issue.go:956-967).
     const hiddenPlain = await router()(`/repos/alice/mixed/issues/${plain.index}`);
     expect(hiddenPlain.status).toBe(404);
     expect(await hiddenPlain.json()).toEqual({ message: "not found", url: ERROR_URL });
@@ -4836,7 +4840,53 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
     expect(await db().select().from(projectIssues).all()).toHaveLength(0);
   });
 
-  it("⑯-P3-4: PATCH projects replaces the set (empty array clears) and 400s the unknown id (issue.go:827-833)", async () => {
+  it("⑯-P3-4: CREATE projects answers the APIErrorAuto own-codes — 404 unknown id, 403 inaccessible (issue.go:600's APIErrorAuto swap, #40069)", async () => {
+    const owner = await seedUser("Alice");
+    const stranger = await seedUser("Stranger");
+    await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const foreign = await db()
+      .insert(projects)
+      .values({
+        title: "stranger board",
+        description: "",
+        ownerId: stranger.id,
+        repoId: "",
+        creatorId: stranger.id,
+        boardType: 0,
+        cardType: 0,
+        type: 2,
+        createdAt: new Date("2026-04-01T00:00:00Z"),
+        updatedAt: new Date("2026-04-01T00:00:00Z"),
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    // Unknown id: upstream's util.NewNotExistErrorf serves its own 404.
+    const missing = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x", projects: [424242] }),
+    });
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ message: "project 424242 not found", url: ERROR_URL });
+
+    // Inaccessible (another owner's board): the PermissionDenied errorf
+    // serves its own 403.
+    const denied = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "y", projects: [foreign.id] }),
+    });
+    expect(denied.status).toBe(403);
+    // the message carries the NEW issue's row id (allocated by this POST) —
+    // shape-matched, the id is not predictable from the seed state
+    const deniedBody = await denied.json<{ message: string; url: string }>();
+    expect(deniedBody.message).toMatch(/^issue \d+ can't be accessed by project \d+$/);
+    expect(deniedBody.url).toBe(ERROR_URL);
+    expect(await db().select().from(projectIssues).all()).toHaveLength(0);
+  });
+
+  it("⑯-P3-4: PATCH projects replaces the set (empty array clears) and 400s the unknown id (issue.go:791-797)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const issue = await seedIssue(repoId, "movable", { posterId: owner.id });
@@ -4905,8 +4955,9 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
     });
     expect(nulled.status).toBe(201);
 
-    // The unknown id answers upstream's ErrNotExist text via the 400 family
-    // (issue.go:829-833).
+    // The unknown id answers upstream's ErrNotExist text via the PATCH arm's
+    // explicit 400 family (issue.go:793-797; the CREATE arm now serves the
+    // APIErrorAuto own-codes 404/403).
     const missing = await router()(`/repos/alice/visible/issues/${issue.index}`, {
       method: "PATCH",
       headers: authHeaders,
@@ -4921,8 +4972,8 @@ describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
 // R5-3's counts scope: the Issue.projects numbers on OWNER-level projects
 // intersect the member issues with the viewer's visible repo set (upstream
 // LoadIssueNumbersForProject's owner branch — services/projects/issue.go:
-// 330-340's IssuesOptions{Doer, AllPublic, Owner} — only the repository
-// branch at :298-309 counts unfiltered). The K6 batched stage
+// 398-408's IssuesOptions{Doer, AllPublic, Owner} — only the repository
+// branch at :366-377 counts unfiltered). The K6 batched stage
 // (prefetchIssueRenderContext's grouped counts read) and the per-row twin
 // (toApiProject) run the SAME split, so a private-repo issue counts for its
 // owner but not for a stranger on the org board render.

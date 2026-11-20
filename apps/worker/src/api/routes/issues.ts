@@ -30,7 +30,7 @@ import {
 } from "../models/issue";
 import { issueLabelSchema } from "../models/issue";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
-import { assertNotBlockedForIssueContent, assertNotBlockedForIssueCreate, BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
+import { assertNotBlockedForIssueContent, isUserBlockedBy } from "../services/blocks";
 import { toApiLabel } from "../services/labels";
 import {
   addIssueAssignees,
@@ -87,7 +87,7 @@ import {
 import { parseMilestoneDeadline } from "../services/milestones";
 import { pullRequestDiffShortStat } from "../services/pull-engine";
 import { toApiPullRequest } from "../services/pulls";
-import { isXRefCommentAccessible } from "../services/xref";
+import { isCommentReadable } from "../services/xref";
 import {
   apiUserFromRow,
   canViewRepositoryWithTeams,
@@ -126,7 +126,7 @@ import {
  *                                   format: X"; undeclared in the contract;
  *                                   the parse rides the create arm's writer
  *                                   gate, so only a WRITER's bad due_date can
- *                                   reach it — issue.go:606-622)
+ *                                   reach it — issue.go:582-598)
  *   - PATCH issues/{index}:         409 (stale content_version CAS — upstream
  *                                   EditIssue → StatusConflict "the issue is
  *                                   already changed"), 400 (invalid due_date;
@@ -154,10 +154,12 @@ import {
  * state rides the repo_settings has_issues/has_pull_requests flags), mounted
  * inside requireVisibleRepo below so it runs at upstream's exact chain
  * position (after repo resolution, before the handler). The in-handler
- * narrowing rides the same units: the list `type` filter collapses/404s per
- * unit readability (issue.go:375-390), every issue-by-index lookup 404s on
+ * narrowing rides the same units: the list `type` filter collapses per unit
+ * readability and 403s a request with no readable side (issue.go:373-377 →
+ * common.ParseIssueFilterTypeIsPullWithPermission — the #40192 re-grade
+ * turned the old 404s into Forbidden), every issue-by-index lookup 404s on
  * an issue whose own unit is unreadable (getRepoIssueByIndexForDoer,
- * issue.go:998-1009), and the global-comment GET narrows on its issue's unit
+ * issue.go:956-967), and the global-comment GET narrows on its issue's unit
  * (issue_comment.go:440). POST issues additionally carries the route-level
  * `reqRepoReader(unit.TypeIssues)` arm (api.go:1576) AFTER the archived 423,
  * upstream's order. The repo-level /labels and /milestones groups carry NO
@@ -165,8 +167,8 @@ import {
  * The 412 family is LIVE on POST/PATCH issues: the merged-PR precondition
  * (PATCH only) and the close-with-open-dependencies gate — POST closed=true
  * answers "cannot close this issue because it still has open dependencies"
- * (issue.go:643-652), PATCH state "cannot close this issue or pull request
- * because it still has open dependencies" (issue.go:981-989), both mapped
+ * (issue.go:613-622), PATCH state "cannot close this issue or pull request
+ * because it still has open dependencies" (issue.go:939-947), both mapped
  * from the shared transition's DependenciesLeftError (the SetIssueAsClosed
  * dependency arm, models/issues/issue_update.go:62-72).
  *
@@ -289,6 +291,19 @@ function asApiError(error: unknown): never | undefined {
   return undefined;
 }
 
+/**
+ * NewIssue's blocked-arm wire texts (#40069 — the arms wrap
+ * util.ErrorWrapTranslatable(user_model.ErrBlockedUser, key) and APIErrorAuto
+ * resolves the locale keys repo.creation_blocked_by_owner /
+ * repo.creation_blocked_by_assignee, options/locale/locale_en-US.json:1406).
+ * The assignee-arm's assertNotBlockedForIssueCreate predecessor carried the
+ * shared ErrBlockedUser base text ("user is blocked", blocks.ts) — that base
+ * text upstream is now "you are blocked by the user", still served by the
+ * NON-create blocked arms through blocks.ts (a blocks-family surface).
+ */
+export const CREATION_BLOCKED_BY_OWNER_MESSAGE = "Cannot create an issue or pull request because you are blocked by the repository owner.";
+export const CREATION_BLOCKED_BY_ASSIGNEE_MESSAGE = "Cannot create an issue or pull request because you are blocked by an assignee.";
+
 // ---------------------------------------------------------------------------
 // Shared guards
 // ---------------------------------------------------------------------------
@@ -317,7 +332,7 @@ function assertNotArchived(found: RepositoryWithOwner): void {
 }
 
 /** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
- *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:956-967): an
  *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
  *  — a plain issue hides on a pulls-fallback repo. */
 async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string, units: IssuePullUnits): Promise<IssueRow> {
@@ -333,7 +348,7 @@ async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawI
 /** Poster-or-writer rule of EditIssue/EditIssueComment (CanWriteIssuesOrPulls
  *  via the ASYNC collaborator/team-aware grant — canWriteRepository adds the
  *  write/admin collaborator rows and the write-grade team arms to the owner/
- *  site-admin matrix, services/issue/issue.go:322-336's poster-OR-AccessMode
+ *  site-admin matrix, services/issue/issue.go:334-348's poster-OR-AccessMode
  *  composition): the poster, or any repo writer. */
 async function canEditIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, posterId: number | null): Promise<boolean> {
   const requester = c.get("authUser");
@@ -1120,7 +1135,7 @@ export function registerIssueRoutes(
     const listOptions = parseListOptions(url);
 
     // created_by/assigned_by/mentioned_by all resolve through
-    // getUserIDForFilter (routers/api/v1/repo/issue.go:398-406, 469-479):
+    // getUserIDForFilter (routers/api/v1/repo/issue.go:382-390, 453-463):
     // an unknown login is the APIErrorAuto(ErrUserNotExist) 404, resolved in
     // upstream's order (created → assigned → mentioned).
     let posterId: number | null | undefined;
@@ -1150,9 +1165,10 @@ export function registerIssueRoutes(
 
     const { items, total } = await listRepoIssues(c.env.DB, found.repo.id, {
       isClosed: parseStateFilter(url.searchParams.get("state")),
-      // The `type` narrowing of ListIssues (issue.go:375-390): an explicit
-      // type against an unreadable unit is the bare 404; without one the
-      // filter collapses to the single readable side.
+      // The `type` narrowing of ListIssues (issue.go:373-377): an explicit
+      // type against an unreadable unit — and a request with no readable
+      // side — is 403 "no permission to read issues or pulls"; without a
+      // type the filter collapses to the single readable side.
       isPull: narrowIssueListType(units, parseTypeFilter(url.searchParams.get("type"))),
       keyword: (url.searchParams.get("q") ?? "").trim(),
       labelIds: await labelIdsByRepoNames(c.env.DB, found.repo.id, csvParam(url.searchParams, "labels")),
@@ -1195,7 +1211,7 @@ export function registerIssueRoutes(
       const event = issueEventContext(c, found);
 
       // The create arm resolves the writer ladder BEFORE applying any
-      // writer-gated field (issue.go:606-622 CanWrite(unit.TypeIssues)):
+      // writer-gated field (issue.go:582-598 CanWrite(unit.TypeIssues)):
       // the deadline, milestone and assignees ride the writer branch only,
       // while a NON-writer's labels are silently cleared and the issue STILL
       // creates (201) — just without those fields. (Upstream also nils
@@ -1222,7 +1238,7 @@ export function registerIssueRoutes(
       // filter; a resolved but non-assignable login 422s "User X cannot be
       // assigned to this issue" — the create arm's own not-a-collaborator
       // outcome). A non-writer's fields are bound-and-dropped (upstream's
-      // writer branch never reads them, issue.go:606-622). The ARG order
+      // writer branch never reads them, issue.go:582-598). The ARG order
       // mirrors upstream's call — loadAssigneeUserIDs(ctx, form.Assignee,
       // form.Assignees): the singular rides FIRST (upstream's Set then
       // randomizes, so this is the deterministic analogue of its input
@@ -1235,20 +1251,24 @@ export function registerIssueRoutes(
         : [];
 
       let issue: IssueRow;
-      // NewIssue's blocked arm (services/issue/issue.go:33-34 via
-      // routers/api/v1/repo/issue.go:625): the poster must not be blocked
-      // by the repo owner — 403 "user is blocked" — NOR by any requested
-      // assignee (the condition's second half, upstream `|| ` order:
+      // NewIssue's blocked arms (services/issue/issue.go:33-40 via the
+      // routers/api/v1/repo/issue.go:600 NewIssue call — #40069 split the
+      // single `||` into two translatable arms answered through
+      // APIErrorAuto): the poster must not be blocked by the repo owner —
+      // 403 "Cannot create an issue or pull request because you are blocked
+      // by the repository owner." — NOR by any requested assignee — 403
+      // "…blocked by an assignee." (the locale keys
+      // repo.creation_blocked_by_owner / _by_assignee; upstream order:
       // owner first, then the assignees). The assignee half is REACHABLE
       // now the create resolves form.assignee(s) above.
-      await assertNotBlockedForIssueCreate(
-        c.env.DB,
-        { id: requester.id ?? 0, isAdmin: requester.is_admin === true },
-        found.repo.ownerId,
-      );
+      if (
+        await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, ...(found.repo.ownerId === null ? [] : [found.repo.ownerId]))
+      ) {
+        throw new ApiError(403, CREATION_BLOCKED_BY_OWNER_MESSAGE);
+      }
       for (const user of createAssignees) {
         if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, user.id)) {
-          throw new ApiError(403, BLOCKED_USER_MESSAGE);
+          throw new ApiError(403, CREATION_BLOCKED_BY_ASSIGNEE_MESSAGE);
         }
       }
       try {
@@ -1257,7 +1277,7 @@ export function registerIssueRoutes(
           title: form.title,
           content: form.body ?? null,
           posterId: requester.id,
-          // issue.go:612/619-621: the milestone applies only behind
+          // issue.go:588/595-597: the milestone applies only behind
           // CanWrite, and a non-writer's form.Labels is cleared to the
           // empty list before NewIssue ever sees it (so unknown ids are
           // never validated for a non-writer — no 404, just dropped).
@@ -1301,7 +1321,7 @@ export function registerIssueRoutes(
           throw error;
         }
       }
-      // NewIssue's assignee half (services/issue/issue.go:47-58): the rows +
+      // NewIssue's assignee half (services/issue/issue.go:58-69): the rows +
       // type-9 comments land through the /assignees trio's AddAssignees core
       // — the fresh issue has no pre-assignment, so every requested assignee
       // is added (AddAssigneeIfNotAssigned's already-assigned skip is
@@ -1321,7 +1341,7 @@ export function registerIssueRoutes(
       // notify order emits opened even when the close arm below aborts with
       // the dependencies-left 412. The wire render below carries the
       // assignees through toApiIssue's issue_assignees fold — upstream's
-      // post-create refetch (GetIssueByID, issue.go:633) renders the same
+      // post-create refetch (GetIssueByID, issue.go:609) renders the same
       // rows (ToAPIIssue → LoadAssignees).
       await emitIssueEvent(c, {
         repoId: found.repo.id,
@@ -1336,7 +1356,7 @@ export function registerIssueRoutes(
         ),
       });
       // NewIssue's create-time enrichment notifications (services/issue/
-      // issue.go:74-79, ledger ⑬-#17): a create that CARRIED labels/milestone
+      // issue.go:85-90, ledger ⑬-#17): a create that CARRIED labels/milestone
       // notifies IssueChangeLabels (when the attached set is non-empty) and
       // IssueChangeMilestone (when a milestone is set) right after the opened
       // notification — the SAME emitters the PATCH label/milestone arms use
@@ -1362,7 +1382,7 @@ export function registerIssueRoutes(
           issue = await service.closeIssue(issue.id, { actorId: requester.id });
         } catch (error) {
           // The create arm's DISTINCT DependenciesLeftError mapping
-          // (issue.go:643-652): the issue-only text, NOT the PATCH family's
+          // (issue.go:613-622): the issue-only text, NOT the PATCH family's
           // "issue or pull request" message (:981-989).
           if (error instanceof DependenciesLeftError) {
             throw new ApiError(412, "cannot close this issue because it still has open dependencies");
@@ -1589,7 +1609,7 @@ export function registerIssueRoutes(
 
     const title = patchField(form.title);
     if (title !== undefined && title.length > 0 && title !== issue.title) {
-      // ChangeIssueTitle's blocked arm (services/issue/issue.go:104-106):
+      // ChangeIssueTitle's blocked arm (services/issue/issue.go:115-117):
       // a doer blocked by the issue poster or the repo owner answers
       // 403 "user is blocked" unless they are a repo admin
       // (access_model.IsUserRepoAdmin — the permission matrix's admin flag).
@@ -1771,13 +1791,13 @@ export function registerIssueRoutes(
       await emitMilestoneEvent(c, found, issue, newMilestoneId !== null ? "milestoned" : "demilestoned");
     }
 
-    // State: the merged precondition first — upstream (repo/issue.go:810-817)
+    // State: the merged precondition first — upstream (repo/issue.go:774-781)
     // 412s ANY state arm on a merged PR (the guard runs before the requested
     // value is examined, so both "closed" and "open" attempts answer 412),
     // then the CAS-guarded close/reopen transitions. A blocked close (an
     // OPEN dependency) rides the transition's DependenciesLeftError through
     // asApiError → 412 "cannot close this issue or pull request because it
-    // still has open dependencies" (issue.go:981-989 — closeOrReopenIssue's
+    // still has open dependencies" (issue.go:939-947 — closeOrReopenIssue's
     // text, shared with the pulls-PATCH twin).
     const state = patchField(form.state);
     if (state !== undefined && issue.isPull) {
@@ -1824,14 +1844,23 @@ export function registerIssueRoutes(
     // writer-gated on the SAME resolved canWrite; a PRESENT list replaces the
     // membership set the GitHub-way (form.Projects is *[]int64 — JSON null is
     // the nil pointer and skips, an EMPTY array clears every membership). The
-    // diff rides the upstream IssueAssignOrRemoveProject writer (missing
-    // project id / inaccessible project answer the 400 family — issue.go:
-    // 829-833's ErrPermissionDenied/ErrNotExist mapping). No webhook fires:
+    // diff rides the upstream IssueAssignOrRemoveProject writer — the writer
+    // throws the APIErrorAuto own-codes (404 not-found / 403 denied) the
+    // CREATE arm now serves; PATCH KEEPS its explicit 400 map (issue.go:
+    // 793-797's ErrPermissionDenied/ErrNotExist → StatusBadRequest), so both
+    // are re-mapped here. No webhook fires:
     // upstream's IssueChangeProjects notification has no webhook or mail
     // implementation — its only consumer is the projects workflow notifier
     // (services/projects/workflow_notifier.go:32).
     if (canWrite && form.projects !== undefined && form.projects !== null) {
-      await assignOrRemoveIssueProjects(c.env.DB, found, issue, form.projects, actorId, now);
+      try {
+        await assignOrRemoveIssueProjects(c.env.DB, found, issue, form.projects, actorId, now);
+      } catch (error) {
+        if (error instanceof ApiError && (error.status === 404 || error.status === 403)) {
+          throw new ApiError(400, error.message);
+        }
+        throw error;
+      }
     }
 
     return c.json(await toApiIssue(c.env.DB, viewer, found, issue), 201);
@@ -2085,13 +2114,16 @@ export function registerIssueRoutes(
     // omitted-preload callers.
     const timelineContext = await prefetchTimelineContext(c.env.DB, rows);
     const candidates = rows.filter((comment) => comment.type !== CommentType.Code); // upstream drops code comments
-    // isXRefCommentAccessible (issue_comment.go:197-222): a cross-repo xref
-    // row whose ORIGIN repo is gone or unreadable by the viewer leaves the
-    // stream (landed with the B-46 writers — the rows exist now;
-    // services/xref.ts carries the derivation). The probe short-circuits for
-    // non-ref rows and same-repo rows, so only genuine cross-repo rows pay a
-    // read.
-    const accessible = await Promise.all(candidates.map((comment) => isXRefCommentAccessible(c.env.DB, viewer, comment, found.repo.id)));
+    // FilterReadableComments (services/issue/comments.go:205-254 — the
+    // 178d33ed4d re-grade; the inline isXRefCommentAccessible the old arm
+    // rode is DELETED upstream): a row's REFERENCE target decides — ref
+    // rows by their repo+unit, CommitRef rows by code readability, and
+    // type-19/20 dependency rows by the DEPENDENT issue's repo+unit (the
+    // dependent row is fetched here, upstream LoadDepIssueDetails' arm). The
+    // same-repo short-circuit is gone upstream: a same-repo PR-ref row
+    // hides from a viewer whose pulls unit is off. The probe is memoized
+    // per call (services/xref.ts isCommentReadable).
+    const accessible = await Promise.all(candidates.map((comment) => isCommentReadable(c.env.DB, viewer, comment)));
     const converted = await Promise.all(
       candidates
         .filter((_, i) => accessible[i])

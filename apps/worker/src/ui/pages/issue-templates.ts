@@ -59,7 +59,7 @@ export interface ParsedIssueConfig {
 export const DEFAULT_ISSUE_CONFIG: ParsedIssueConfig = { blankIssuesEnabled: true, contactLinks: [] };
 
 // ---------------------------------------------------------------------------
-// Candidates (services/issue/template.go:24-41 + routers/web/repo/issue.go:56-74)
+// Candidates (services/issue/template.go:24-41 + routers/web/repo/issue.go:55-73)
 // ---------------------------------------------------------------------------
 
 /** templateDirCandidates (template.go:24-33) — precedence order matters: the
@@ -86,7 +86,7 @@ export const TEMPLATE_CONFIG_CANDIDATES = [
   ".github/issue_template/config",
 ] as const;
 
-/** IssueTemplateCandidates (routers/web/repo/issue.go:56-74) — the fallback
+/** IssueTemplateCandidates (routers/web/repo/issue.go:55-73) — the fallback
  *  single-file paths the new-issue form tries after `?template=`. */
 export const ISSUE_TEMPLATE_CANDIDATES = [
   "ISSUE_TEMPLATE.md",

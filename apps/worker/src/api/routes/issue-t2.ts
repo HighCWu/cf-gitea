@@ -163,7 +163,7 @@ const editDeadlineOptionSchema = z.object({
     .openapi({ format: "date-time", description: "The updated due date; null or empty removes the deadline" }),
 });
 
-/** api.IssueDeadline — the deadline route's 201 body (issue.go:972), the
+/** api.IssueDeadline — the deadline route's 201 body (issue.go:930), the
  *  single `due_date` field. Upstream renders `issue.DeadlineUnix.AsTimePtr()`
  *  AFTER the update, so the cleared form carries the zero TimeStamp's Unix
  *  epoch — a string, never null. */
@@ -515,7 +515,7 @@ async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string;
 }
 
 /** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
- *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:956-967): an
  *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
  *  — plain issues hide on a pulls-fallback repo (services/issue-unit-gates.ts). */
 async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string): Promise<IssueRow> {
@@ -893,7 +893,7 @@ export function registerIssueT2Routes(
   // the 3 accepted formats to end-of-day, sub-2-day values clear) via the
   // shared parseMilestoneDeadline; a changed value rides
   // changeIssueDeadline's system-comment batch; the 201 body is the
-  // IssueDeadline shape (issue.go:972).
+  // IssueDeadline shape (issue.go:930).
   // -------------------------------------------------------------------------
   app.openapi(editDeadlineRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));

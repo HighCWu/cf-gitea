@@ -48,7 +48,7 @@ import {
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
-import { changeIssueTitle, issueNoDependenciesLeft, replaceIssueAssignees } from "../api/services/issues";
+import { changeIssueTitle, issueNoDependenciesLeft, replaceIssueAssignees, sanitizeDatabaseStringContent } from "../api/services/issues";
 import { labelExclusiveScope, removeDuplicateExclusiveLabels } from "../api/services/labels";
 import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../api/services/repository";
 import { notifyIssueChangeStatus } from "../services/projects-workflow";
@@ -273,10 +273,10 @@ export type MilestoneStateFilter = "open" | "closed" | "all";
  * `SetIssueAsClosed` dependency arm (models/issues/issue_update.go:62-72 →
  * `ErrDependenciesLeft`, models/issues/dependency.go). The class message is
  * the PATCH-family mapping verbatim ("issue or pull request",
- * routers/api/v1/repo/issue.go:981-989) — every arm that funnels the error
+ * routers/api/v1/repo/issue.go:939-947) — every arm that funnels the error
  * through `issueErrorToApiError` (the issues-PATCH and pulls-PATCH state
  * arms) serves it as-is; the create-closed arm remaps to its issue-only
- * text ("cannot close this issue because …", issue.go:643-652). Colocated
+ * text ("cannot close this issue because …", issue.go:613-622). Colocated
  * with the transition that throws it, outside the ./errors family file.
  */
 export class DependenciesLeftError extends IssueError {
@@ -510,14 +510,17 @@ export class IssuesService {
         .where(eq(repoCounters.repoId, input.repoId))
         .returning({ allocated: repoCounters.issueIndex }),
       // 2: insert with the freshly bumped index (same transaction ⇒ visible).
+      // Issue.BeforeInsert's sanitize (models/issues/issue.go:145-149 via
+      // sanitizeDatabaseStringContent, api/services/issues.ts) — NUL folds
+      // to a space on every title/content row write.
       this.db
         .insert(issues)
         .values({
           repoId: input.repoId,
           index: indexSub,
           posterId: input.posterId ?? null,
-          title,
-          content: input.content ?? null,
+          title: sanitizeDatabaseStringContent(title),
+          content: input.content == null ? null : sanitizeDatabaseStringContent(input.content),
           isPull: options.isPull,
           ref: input.ref ?? "",
           milestoneId,
@@ -667,7 +670,7 @@ export class IssuesService {
     // this` edges onto an OPEN dependency_id block): close-only, so a reopen
     // never trips on unsatisfied dependencies (the upstream comment at :65).
     // The enabled collapse (IssuesConfig.EnableDependencies default true,
-    // models/repo/issue.go:52-57 — the landed no-settings convention) makes
+    // models/repo/issue.go:30-32 — the landed no-settings convention) makes
     // the check unconditional. It sits BEFORE the CAS batch like upstream's
     // pre-update position, so a blocked close writes NOTHING (no system
     // comment, no counter drift). Every close seam funnels through here:
@@ -777,10 +780,10 @@ export class IssuesService {
   }
 
   /**
-   * `issue_service.ChangeTitle` (services/issue/issue.go:86-128) — the title
+   * `issue_service.ChangeTitle` (services/issue/issue.go:97-139) — the title
    * write through the shared changeIssueTitle plus the IssueChangeTitle
    * receiver arm: upstream notifies AFTER the update with the UPDATED issue
-   * and oldTitle (issue.go:127), so the mail sees the new title and the
+   * and oldTitle (issue.go:138), so the mail sees the new title and the
    * receiver's WIP-transition gate keys on the pair (notifyIssueTitleChanged).
    * Best-effort — the write above stays committed.
    */
@@ -912,7 +915,8 @@ export class IssuesService {
           type: input.type ?? CommentType.Comment,
           posterId: input.posterId ?? null,
           issueId: input.issueId,
-          content: input.content,
+          // Comment.BeforeInsert's sanitize (models/issues/comment.go:414).
+          content: sanitizeDatabaseStringContent(input.content),
           createdAt: now,
           updatedAt: now,
         })
@@ -949,7 +953,7 @@ export class IssuesService {
 
   /** The FULL FindAndUpdateIssueMentions (upstream runs the whole function
    *  in the issue service BEFORE the notify fires — services/issue/
-   *  comments.go:81, issue.go:68, pull.go:184 — and hands the resolved
+   *  comments.go:81, issue.go:79, pull.go:184 — and hands the resolved
    *  users to the receiver): parse + visibility resolution
    *  (services/mentions) then the issue_user carrier upsert
    *  (updateIssueMentions — upstream's persistence arm, issue_update.go:567
@@ -1009,7 +1013,7 @@ export class IssuesService {
    * `notifyMailNewPullRequest` below), and upstream's NewIssue arm is the
    * issue arm. The mentions arm runs UNCONDITIONALLY (upstream's CreateIssue
    * runs FindAndUpdateIssueMentions with no mail-env notion,
-   * services/issue/issue.go:68 — see notifyCommentCreated); only the notify
+   * services/issue/issue.go:79 — see notifyCommentCreated); only the notify
    * half stays mail-gated. Best-effort, never throws (the write above stays
    * committed).
    */
@@ -1022,7 +1026,7 @@ export class IssuesService {
         console.error(`[issues] new-issue notify skipped: poster row missing [id: ${issue.posterId}]`);
         return;
       }
-      // Upstream services/issue/issue.go:68 — the issue body's mentions.
+      // Upstream services/issue/issue.go:79 — the issue body's mentions.
       const mentions = await this.resolveMailMentions(issue, doer, issue.content ?? "");
       if (this.mailEnv === undefined) return;
       const outcome = await notifyIssueCreated(this.mailEnv, { issue, doer, mentions }, { now });

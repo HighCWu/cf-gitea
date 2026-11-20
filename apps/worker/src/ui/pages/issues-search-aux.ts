@@ -61,7 +61,7 @@
  * One param: `q` via FormValue — NOT trimmed (issue_suggestions.go:17).
  * GetSuggestion (services/issue/suggestion.go:16-73): pageSize 5;
  * empty `q` → the 5 latest-updated threads (FindLatestUpdatedIssues,
- * models/issues/issue.go:516-524, `updated_unix DESC`, isPull filter);
+ * models/issues/issue.go:545-553, `updated_unix DESC`, isPull filter);
  * otherwise a numeric `q` (strconv.ParseInt — "+7"/"007" parse, overflow
  * errors to 0) resolves GetIssueByIndex FIRST and is PREPENDED verbatim —
  * the index hit ignores the isPull filter — and the remaining 4 slots take
