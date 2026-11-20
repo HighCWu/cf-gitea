@@ -1,9 +1,10 @@
 import { and, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { reactions, releaseAssets, releases, users } from "../../db/schema";
+import { reactions, releaseAssets, releases, repositories, users } from "../../db/schema";
 import { ReleaseAlreadyExistError } from "../../issues/errors";
 import { IssuesService, type ReleaseRow } from "../../issues/service";
+import { auditEventInsert, AuditActions } from "../../services/audit";
 import { notifyNewRelease } from "../../services/mail/notify";
 import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
 import { ApiError } from "../errors";
@@ -30,44 +31,56 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  * for a fresh `tag_name` through the shared tag-store service (services/
  * tags.ts — the tag-creation API's mechanism) and FILLS the row's
  * `sha1`/`num_commits`/`created_unix` from the tagged commit (upstream
- * createTag's post-write fill, release.go:148-158); the EDIT path now runs
+ * createTag's post-write fill, release.go:155-160); the EDIT path now runs
  * the same helper — upstream's UpdateRelease re-runs createTag on EVERY edit
- * (release.go:269), so a publish-from-draft lands the missing tag here, a
+ * (release.go:300), so a publish-from-draft lands the missing tag here, a
  * `tag_name` rename lands the NEW ref (the old ref is NEVER deleted —
- * `git tag -d` exists only in DeleteReleaseByID, release.go:388), and every
+ * `git tag -d` exists only in DeleteReleaseByID, release.go:413), and every
  * published edit re-fills sha1/created/num_commits; DELETE stays D1-only
  * (upstream's API DeleteRelease passes delTag=false — the row goes, the git
  * tag stays).
  *
- * Upstream citations (submodule pin fc4936884584):
+ * Upstream citations (submodule pin 099abf5db4 — the RE-PIN window refreshed
+ * these from fc49368845; the window's own deltas — the make_latest pointer
+ * feature a5201dc427, the edited-payload `changes` 53aafd7ee1, the release
+ * audit event 3f1b738f09 — are ported below beside their upstream cites):
  *  - list: `routers/api/v1/repo/release.go ListReleases` — FindReleases
  *    {IncludeDrafts: write access, IncludeTags: false, `draft`/`pre-release`
  *    optional-bool filters, `tag_filter` LIKE with `*` wildcards}, ordering
  *    `created_unix DESC, id DESC` (models/repo/release.go FindReleasesOptions
  *    ToOrders);
- *  - latest: `GetLatestReleaseByRepoID` (release.go:338–350) — not draft,
- *    not prerelease, not tag, newest created_unix (id tiebreak);
+ *  - latest: `GetLatestRelease` (models/repo/release.go:345-356) — the
+ *    repository's `latest_release_id` POINTER first (resolved through the
+ *    stable-release condition), else the newest-by-date fallback
+ *    `GetLatestReleaseByRepoID` (:358-371) — not draft, not prerelease, not
+ *    tag, newest created_unix (id tiebreak);
  *  - single: `GetReleaseForRepoByID` — the GLOBAL id scoped through this
  *    repo; tag-only records (`is_tag`) are 404 for every operation; drafts
  *    are 404 without release-write access (canAccessReleaseDraft);
  *  - edit: `EditRelease` — only set fields apply (empty string = untouched);
- *    then `release_service.UpdateRelease` (services/release/release.go:263-369)
- *    re-runs createTag with an EMPTY message (release.go:269 — so edit-created
+ *    then `release_service.UpdateRelease` (services/release/release.go:294-393)
+ *    re-runs createTag with an EMPTY message (release.go:300 — so edit-created
  *    tags are always lightweight), zeroes `PublishedUnix` back when an edit
- *    re-drafts (release.go:281-283), stamps it when the edit publishes a
- *    draft or converts a tag record (release.go:283-285), and notifies
- *    UpdateRelease ("updated") unless the edit CREATED the tag or converted a
- *    tag record, in which case NewRelease ("published") fires (release.go:
- *    361-367);
- *  - delete: `DeleteReleaseByID` (services/release/release.go:408-434) with
+ *    re-drafts (release.go:311-312), stamps it when the edit publishes a
+ *    draft or converts a tag record (release.go:313-314), moves the
+ *    latest-release pointer (UpdateLatestRelease, release.go:322), and
+ *    notifies UpdateRelease ("updated") unless the edit CONVERTED a tag
+ *    record or PUBLISHED a draft (oldRelease.IsDraft), in which case
+ *    NewRelease ("published") fires (release.go:385-391 — since 53aafd7ee1
+ *    a tag-CREATING rename between two published states fires "updated",
+ *    the createTag `created` flag no longer drives the fork);
+ *  - delete: `DeleteReleaseByID` (services/release/release.go:396-473) with
  *    the API's delTag=false: the row is NOT dropped — `rel.IsTag = true`
- *    is persisted (release.go:414-417) so a re-create keeps the id (the §2.3
+ *    is persisted (release.go:434-438) so a re-create keeps the id (the §2.3
  *    conversion) and the tags-API delete lookup finds the record; beside it
  *    the attachment ROWS go (DeleteAttachmentsByRelease), the release's
- *    reactions go (release.go:425-429), and the R2 asset OBJECTS are swept
- *    (the storage loop, release.go:431-434 — best-effort there, logged,
- *    never failing the delete); the git tag is never touched (delTag=false's
- *    whole point) — the ledger R2+R4 thread;
+ *    reactions go (release.go:454-457), the latest-release POINTER is unset
+ *    (release.go:441-443), and the R2 asset OBJECTS are swept (the storage
+ *    loop, release.go:458-463 — best-effort there, logged, never failing the
+ *    delete); a REAL release (not a tag record) also lands the
+ *    `repository:release:remove` audit row (release.go:465-467, 3f1b738f09);
+ *    the git tag is never touched (delTag=false's whole point) — the ledger
+ *    R2+R4 thread;
  *  - converter: `services/convert/release.go ToAPIRelease` + the Release URL
  *    methods (models/repo/release.go:130–155) — APIURL
  *    `{repo APIURL}/releases/{id}`, HTMLURL `{repo HTMLURL}/releases/tag/
@@ -210,17 +223,204 @@ export async function listReleases(
   return { items, total: Number(totalRows[0]?.value ?? 0) };
 }
 
-/** `GetLatestReleaseByRepoID` — the install-script contract (SPEC-0004 §2.4). */
-export async function findLatestRelease(d1: D1Database, repoId: string): Promise<ReleaseRow | null> {
+/**
+ * The stable-release condition every "latest" resolution runs under —
+ * `latestReleaseCond` (models/repo/release.go:342-343) =
+ * `FindReleasesOptions{RepoID, IsPreRelease: Some(false)}.ToConds()`
+ * (:273-301) = `repo_id = ? AND is_draft = false AND is_tag = false AND
+ * is_prerelease = false` (IncludeDrafts/IncludeTags default false).
+ */
+function latestReleaseConditions(repoId: string): SQL[] {
+  return [
+    eq(releases.repoId, repoId),
+    eq(releases.isDraft, false),
+    eq(releases.isPrerelease, false),
+    eq(releases.isTag, false),
+  ];
+}
+
+/** `Release.CanBeLatest` (models/repo/release.go:337-339) — the pointer's
+ *  eligibility test: drafts, prereleases and tag-only records can never be
+ *  the latest. */
+export function canBeLatest(row: ReleaseRow): boolean {
+  return !row.isDraft && !row.isPrerelease && !row.isTag;
+}
+
+/**
+ * `SetLatestReleaseID` (models/repo/release.go:373-379): point the
+ * repository's `latest_release_id` at the release, the write guarded by
+ * `WHERE latest_release_id != ?` (a re-set of the same pointer is a no-op)
+ * and mirroring the in-memory row the way upstream mutates `repo` before the
+ * UPDATE (the caller's RepositoryWithOwner row object — `{ latestReleaseId }`
+ * must stay in lockstep for the same-request re-reads, exactly upstream's
+ * `repo.LatestReleaseID = releaseID` assignment, :375).
+ */
+export async function setLatestReleaseId(d1: D1Database, repo: { id: string; latestReleaseId: number }, releaseId: number): Promise<void> {
+  await drizzle(d1)
+    .update(repositories)
+    .set({ latestReleaseId: releaseId })
+    .where(and(eq(repositories.id, repo.id), sql`${repositories.latestReleaseId} <> ${releaseId}`));
+  repo.latestReleaseId = releaseId;
+}
+
+/**
+ * `UnsetLatestReleaseID` (models/repo/release.go:381-390): clear the pointer
+ * ONLY when it currently names `releaseId` (the guarded UPDATE), and mirror
+ * the in-memory row (`if repo.LatestReleaseID == releaseID { = 0 }`, :387-389).
+ * `releaseId == 0` is the early-out no-op (:382-384).
+ */
+export async function unsetLatestReleaseId(d1: D1Database, repo: { id: string; latestReleaseId: number }, releaseId: number): Promise<void> {
+  if (releaseId === 0) return;
+  await drizzle(d1)
+    .update(repositories)
+    .set({ latestReleaseId: 0 })
+    .where(and(eq(repositories.id, repo.id), eq(repositories.latestReleaseId, releaseId)));
+  if (repo.latestReleaseId === releaseId) {
+    repo.latestReleaseId = 0;
+  }
+}
+
+/**
+ * `GetLatestRelease` (models/repo/release.go:345-356) — the pointer-first
+ * resolution (a5201dc427): when the repository names a release, return it IF
+ * it still passes the stable-release condition (a withdrawn/drafted/
+ * prereleased or deleted pointer falls through), else the newest-by-date
+ * fallback `GetLatestReleaseByRepoID` (:358-371, `created_unix DESC, id
+ * DESC` over the same condition). Every caller in both trees rides this
+ * pair now (the API route release.go:113, the web redirect release.go:343,
+ * RedirectDownload repo.go:324, view_home.go:208); `findLatestRelease`'s old
+ * repoId-only signature was the fallback arm alone.
+ */
+export async function findLatestRelease(d1: D1Database, repo: { id: string; latestReleaseId: number }): Promise<ReleaseRow | null> {
+  // The pointer arm (a stale caller passing a pre-0080 shape degrades to the
+  // date-order fallback rather than binding `undefined` — the type keeps the
+  // contract, this guard keeps the runtime honest).
+  if (typeof repo.latestReleaseId === "number" && repo.latestReleaseId !== 0) {
+    const pointed = await drizzle(d1)
+      .select()
+      .from(releases)
+      .where(and(...latestReleaseConditions(repo.id), eq(releases.id, repo.latestReleaseId)))
+      .limit(1);
+    if (pointed[0] !== undefined) {
+      return pointed[0];
+    }
+  }
   const rows = await drizzle(d1)
     .select()
     .from(releases)
-    .where(
-      and(eq(releases.repoId, repoId), eq(releases.isDraft, false), eq(releases.isPrerelease, false), eq(releases.isTag, false)),
-    )
+    .where(and(...latestReleaseConditions(repo.id)))
     .orderBy(desc(releases.createdAt), desc(releases.id))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * GitHub's `make_latest` (modules/structs/release.go:46-54, a5201dc427):
+ * `"true"` sets the release as the latest, `"false"` keeps the current
+ * latest, `"legacy"` returns to the newest stable release by date; omitted
+ * (`""` — the binding's `In(,true,false,legacy)` admits the empty string)
+ * lets a newly published release become the latest only if it is the newest
+ * by date.
+ */
+export type MakeLatest = "true" | "false" | "legacy" | "";
+
+/**
+ * `UpdateLatestRelease` (services/release/release.go:174-197, a5201dc427) —
+ * the latest-release pointer move under the create/edit flows, GitHub's
+ * make_latest semantics with the date-order default. Statement for statement
+ * over the Go switch:
+ *
+ *   1. `makeLatest == "true" && rel.CanBeLatest()` → SET the pointer to this
+ *      release (the explicit ask);
+ *   2. `makeLatest == "legacy"` → UNSET the pointer (fall back to date
+ *      order);
+ *   3. the pointer names THIS release and it lost eligibility (drafted /
+ *      prereleased / converted) → UNSET (its own edit invalidated it);
+ *   4. `wasEligible || !rel.CanBeLatest()` OR (`pointer == 0 &&
+ *      makeLatest != "false"`) → no-op. The first disjunct keeps an edit of
+ *      a release that WAS the eligible old state from reshuffling the
+ *      pointer; the second keeps the DEFAULT flow (no make_latest given) of
+ *      a pointer-less repo untouched — a newly published release becomes the
+ *      latest by date order anyway, there is nothing to write;
+ *   5. otherwise the date-order arbitration (the "false keeps the current
+ *      latest" tail): find the two newest stable releases; if THIS release
+ *      is not the newest, done (the pointer stays — `return err` with a nil
+ *      error); if `makeLatest != "false"` UNSET the pointer (the newest
+ *      stable release is this one and no explicit pointer may override the
+ *      date order... upstream's exact statement: the unset rides when a
+ *      make_latest value other than "false" reaches this arm); if the
+ *      pointer is already set or there is only one stable release, done;
+ *      finally SET the pointer to the SECOND newest (newest[1]) — the
+ *      make_latest:"false" publish of the newest release pins the pointer at
+ *      the previous newest so the explicit "keep" is honored.
+ *
+ * Errors propagate (a failed pointer write fails the write, exactly the
+ * upstream `return err` arms); the Find uses `PageSize: 2` over the
+ * stable-release condition ordered `created_unix DESC, id DESC`
+ * (ToOrders, models/repo/release.go:313-316).
+ */
+export async function updateLatestRelease(
+  d1: D1Database,
+  repo: { id: string; latestReleaseId: number },
+  rel: ReleaseRow,
+  wasEligible: boolean,
+  makeLatest: MakeLatest,
+): Promise<void> {
+  if (makeLatest === "true" && canBeLatest(rel)) {
+    await setLatestReleaseId(d1, repo, rel.id);
+    return;
+  }
+  if (makeLatest === "legacy") {
+    await unsetLatestReleaseId(d1, repo, repo.latestReleaseId);
+    return;
+  }
+  if (repo.latestReleaseId === rel.id && !canBeLatest(rel)) {
+    await unsetLatestReleaseId(d1, repo, rel.id);
+    return;
+  }
+  if (wasEligible || !canBeLatest(rel) || (repo.latestReleaseId === 0 && makeLatest !== "false")) {
+    return;
+  }
+  const newest = await drizzle(d1)
+    .select()
+    .from(releases)
+    .where(and(...latestReleaseConditions(repo.id)))
+    .orderBy(desc(releases.createdAt), desc(releases.id))
+    .limit(2);
+  if (newest[0]?.id !== rel.id) {
+    return;
+  }
+  if (makeLatest !== "false") {
+    await unsetLatestReleaseId(d1, repo, repo.latestReleaseId);
+    return;
+  }
+  if (repo.latestReleaseId !== 0 || newest.length === 1) {
+    return;
+  }
+  await setLatestReleaseId(d1, repo, newest[1]!.id);
+}
+
+/**
+ * `ToReleaseChanges` (services/convert/release.go:36-49, 53aafd7ee1) — the
+ * `changes` object the release webhook's "updated" payload carries
+ * (`ReleasePayload.Changes`, modules/structs/hook.go:337): the OLD value of
+ * every changed field — title → `name`, note → `body`, tag name →
+ * `tag_name` (`ChangesFromPayload{From}`, hook.go:459-462). The Go side
+ * always sends a non-nil (possibly empty) ChangesPayload for updated events;
+ * this port returns the same shape — `{}` when nothing changed.
+ */
+export function toReleaseChanges(rel: ReleaseRow, oldRelease: ReleaseRow): Record<string, { from: string }> {
+  const changes: Record<string, { from: string }> = {};
+  if (oldRelease.title !== rel.title) {
+    changes.name = { from: oldRelease.title };
+  }
+  if ((oldRelease.note ?? "") !== (rel.note ?? "")) {
+    changes.body = { from: oldRelease.note ?? "" };
+  }
+  if (oldRelease.tagName !== rel.tagName) {
+    changes.tag_name = { from: oldRelease.tagName };
+  }
+  return changes;
 }
 
 /** `GetRelease(repoID, tag)` — case-insensitive tag lookup (lower_tag_name). */
@@ -234,13 +434,13 @@ export async function findReleaseByTag(d1: D1Database, repoId: string, tag: stri
 }
 
 /** SingleRelease's web lookup — `FindReleasesOptions.TagNames:
- *  []string{ctx.PathParam("*")}` (routers/web/repo/release.go:296-308)
+ *  []string{ctx.PathParam("*")}` (routers/web/repo/release.go:304-310)
  *  lands in FindReleases' `builder.In("tag_name", ...)` arm
  *  (models/repo/release.go:282-284) over the RAW column: CASE-SENSITIVE,
  *  unlike the lowered GetRelease pair above. `/releases/tag/V1.0` over a
  *  `v1.0` row is a 404 upstream; only this loader mirrors that — the API's
  *  by-tag arms and the edit-form loader stay on GetRelease's
- *  lower_tag_name (release.go:568-576). */
+ *  lower_tag_name (release.go:561-576). */
 export async function findReleaseByTagExact(d1: D1Database, repoId: string, tag: string): Promise<ReleaseRow | null> {
   const rows = await drizzle(d1)
     .select()
@@ -267,15 +467,15 @@ export async function findReleaseForRepoById(d1: D1Database, repoId: string, id:
 // The create path WITH the git tag (findings-links N2): upstream
 // POST /repos/{owner}/{repo}/releases auto-creates the release's git tag —
 // routers/api/v1/repo/release.go CreateRelease 259-287 → release_service
-// .CreateRelease (services/release/release.go:173-199) → createTag
-// (release.go:69-166) — from `target_commitish` (the default branch when
+// .CreateRelease (services/release/release.go:200-231) → createTag
+// (release.go:73-172) — from `target_commitish` (the default branch when
 // absent). Without it every git-tag-shaped link for the release 404s.
 // ---------------------------------------------------------------------------
 
 /**
  * `util.EllipsisDisplayString(s, limit)` (modules/util/truncate.go) —
  * truncate to `limit - 1` runes and append "…" when past the limit. The
- * release title's write-time form (CreateRelease's release.go:187 and the
+ * release title's write-time form (CreateRelease's release.go:214 and the
  * model UpdateRelease's models/repo/release.go:169-173 both apply it, R8);
  * the rune-count port is the tree's landed shape (services/actions/
  * model.ts ellipsisDisplayString, duplicated here to keep the actions
@@ -383,6 +583,10 @@ export interface CreateReleaseWithGitTagInput {
   note: string;
   isDraft: boolean;
   isPrerelease: boolean;
+  /** GitHub's `make_latest` (a5201dc427): "true" pins the latest-release
+   *  pointer here, "false" keeps the current latest, "legacy"/"" ride the
+   *  date-order arms — UpdateLatestRelease's full ladder, release.go:224. */
+  makeLatest: MakeLatest;
 }
 
 export interface CreateReleaseWithGitTagResult {
@@ -399,13 +603,13 @@ export interface CreateReleaseWithGitTagResult {
    *  131-143) — prefer `tagCommitSha` for the wire. */
   tagTip?: string;
   /** The tagged COMMIT's oid (the fill's sha1) when the tag was created —
-   *  upstream's createTag emission oid (release.go:136/:143 both carry
+   *  upstream's createTag emission oid (release.go:138/:145 both carry
    *  `commit.ID.String()`, the pre-peel GetCommit resolution, R16-e). */
   tagCommitSha?: string;
 }
 
 /**
- * `git.CommitsCountOfCommit` (release.go:155 `CommitsCount`) — commits
+ * `git.CommitsCountOfCommit` (release.go:157 `CommitsCount`) — commits
  * reachable from the tagged commit. The engine has no count RPC; the answer
  * is the paged unfiltered listLog walk (the wiki countCommitsForPath
  * precedent, services/wiki.ts) capped at the engine's own unfiltered walk
@@ -431,14 +635,14 @@ async function countCommitsAt(reads: ReturnType<typeof engineReads>, tip: string
 }
 
 /**
- * createTag's post-write fill (release.go:148-158), shared by the CREATE and
+ * createTag's post-write fill (release.go:155-160), shared by the CREATE and
  * EDIT paths: the tagged commit is read (GetTagCommit's dereference — an
  * annotated tag peels to its commit), then `sha1` = commit oid, `num_commits`
  * = CommitsCountOfCommit, `created_unix` = the COMMIT's committer time —
  * "dated by its commit, so an old commit does not become the latest release"
- * (release.go:154). A read failure is the upstream abort: the caller runs
+ * (release.go:156). A read failure is the upstream abort: the caller runs
  * this BEFORE its row write, so the row stays untouched (CreateRelease's
- * insert, release.go:189, / UpdateRelease's AllCols update, release.go:288,
+ * insert, release.go:216, / UpdateRelease's AllCols update, release.go:318,
  * both sit after createTag).
  */
 async function readTaggedCommitFill(
@@ -452,7 +656,7 @@ async function readTaggedCommitFill(
   return {
     sha1: commit.oid,
     numCommits: await countCommitsAt(reads, commit.oid),
-    createdAt: new Date(commit.committer.time * 1000), // release.go:154: dated by its commit
+    createdAt: new Date(commit.committer.time * 1000), // release.go:156: dated by its commit
   };
 }
 
@@ -460,22 +664,22 @@ async function readTaggedCommitFill(
  * Create a release row AND its git tag, upstream's exact sequence:
  *
  *   1. duplicate release row → 409 BEFORE any git write (CreateRelease's
- *      IsReleaseExist, release.go:174-181; exact-tagName lookup, the
+ *      IsReleaseExist, release.go:201-208; exact-tagName lookup, the
  *      IssuesService semantics — the unique index arbitrates the race);
  *   2. a tag-only record does NOT conflict (the §2.3 conversion path —
  *      upstream reaches it through UpdateRelease, whose createTag arm
- *      release.go:262 lands the tag before the row write, as below);
+ *      release.go:318 lands the tag before the row write, as below);
  *   3. published releases only (drafts defer the tag to their publish
- *      moment — createTag's `!rel.IsDraft` gate, release.go:78), ordered
+ *      moment — createTag's `!rel.IsDraft` gate, release.go:85), ordered
  *      exactly like createTag: git tag exists → RIDE it, no duplicate
- *      (release.go:78 `IsTagExist`); protected tag → 422 "release tag name
- *      is protected [tag_name: …]" (release.go:87-102 + the handler's
- *      IsErrProtectedTagName answer, release.go:281-282); unresolvable
+ *      (release.go:86 `IsTagExist`); protected tag → 422 "release tag name
+ *      is protected [tag_name: …]" (release.go:92-105 + the handler's
+ *      IsErrProtectedTagName answer, release.go:277-278); unresolvable
  *      target → 404 "target not found" with NO row created
- *      (release.go:104-113 GetCommit + the handler's git.IsErrNotExist
- *      answer, release.go:283-284); `tag_message` → annotated tag
- *      (release.go:110-121);
- *   4. the post-write fill (createTag release.go:148-158 — this change):
+ *      (release.go:107-116 GetCommit + the handler's git.IsErrNotExist
+ *      answer, release.go:279-280); `tag_message` → annotated tag
+ *      (release.go:113-124);
+ *   4. the post-write fill (createTag release.go:155-160 — this change):
  *      for EVERY resolved tag (fresh-created, ridden existing, and the §2.3
  *      D1-only conversions alike — upstream's fill sits inside the
  *      `!IsDraft` block after the tag arm) the tagged commit is read
@@ -484,9 +688,9 @@ async function readTaggedCommitFill(
  *      commit oid, `num_commits` = reachable-commit count
  *      (CommitsCountOfCommit), `created_unix` = the COMMIT's committer time
  *      — "dated by its commit, so an old commit does not become the latest
- *      release" (release.go:154). The reads run BEFORE the row write, in
+ *      release" (release.go:156). The reads run BEFORE the row write, in
  *      upstream's order (createTag fills, THEN CreateRelease inserts,
- *      release.go:183-189): a failed fill aborts with no row, exactly
+ *      release.go:214-219): a failed fill aborts with no row, exactly
  *      upstream's GetTagCommit/CommitsCount error path. The write itself is
  *      the one residual of the shared-writer boundary (IssuesService owns
  *      the INSERT): the precomputed fill lands as an UPDATE returning the
@@ -498,26 +702,26 @@ async function readTaggedCommitFill(
  *      (IssuesService.createRelease — the 409 race fallback + the
  *      tag-record conversion, unchanged).
  *
- * Draft posture (release.go:166-168's else arm): NO tag, NO fill —
+ * Draft posture (release.go:169-171's else arm): NO tag, NO fill —
  * `created_unix` stays the row time, `sha1` null, `num_commits` 0. The
  * publish-time fill is the EDIT path's job, upstream's UpdateRelease →
- * createTag re-run (release.go:269 — every edit re-runs createTag, whose
+ * createTag re-run (release.go:300 — every edit re-runs createTag, whose
  * fill then applies): editRelease below lands the missing tag and fills
  * sha1/created/num_commits at the publish-from-draft moment.
  *
  * The archived arm (createTag's MustNotBeArchived, services/release/
- * release.go:75-78 — retired divergence, the v1.3.2 board's P2-5): the gate
+ * release.go:78-81 — retired divergence, the v1.3.2 board's P2-5): the gate
  * sits INSIDE createTag, after the duplicate 409 and before the !IsDraft
  * gate; the release subtree registers NO route-level mustNotBeArchived
  * (api.go:1408-1429 — only mustEnableUnit(TypeReleases)), so the middleware's
  * 423 never fires here and the failure surfaces as the handlers' unmapped
- * ctx.APIErrorInternal → 500 (routers/api/v1/repo/release.go:285-287 create,
+ * ctx.APIErrorInternal → 500 (routers/api/v1/repo/release.go:281-283 create,
  * :379-382 edit). Replicated: untyped throw → the house 500.
  */
 
 /**
  * The NewRelease mail emit seam (services/mail/notify.ts's receiver doc;
- * upstream release.go:198 create arm + :361-368 publish/convert arm — both
+ * upstream release.go:229 create arm + :385-391 publish/convert arm — both
  * fire `!rel.IsDraft` after the row + assets land). Fire-and-log: the
  * receiver never throws for its skips (upstream logs at the receiver,
  * notify.go:201-202) and the release write stays committed; a D1 failure
@@ -546,10 +750,10 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
   const { pair } = input;
   const repoId = pair.repo.id;
 
-  // Upstream's IsReleaseExist (models/repo/release.go:160-166) — a
+  // Upstream's IsReleaseExist (models/repo/release.go:160-165) — a
   // lower_tag_name lookup with NO is_tag filter (R3): any row for the tag
   // (release or tag-only record) counts; the handler splits the outcome by
-  // IsTag (release.go:288-310 — duplicate release → the 409, tag record →
+  // IsTag (release.go:285-305 — duplicate release → the 409, tag record →
   // the §2.3 conversion).
   const existing = await drizzle(input.d1)
     .select()
@@ -557,23 +761,23 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, input.tagName.toLowerCase())))
     .get();
   if (existing !== undefined && !existing.isTag) {
-    throw new ReleaseAlreadyExistError(input.tagName); // 409 "Release is has no Tag" (release.go:292)
+    throw new ReleaseAlreadyExistError(input.tagName); // 409 "Release is has no Tag" (release.go:288)
   }
   // The conversion arm keeps the STORED tag-name spelling: upstream reaches
   // it through the handler's loaded `rel` (GetRelease → the row's TagName)
-  // and never rewrites TagName there (release.go:288-310) — the git tag and
+  // and never rewrites TagName there (release.go:285-305) — the git tag and
   // the converted row both carry the original spelling, whatever case the
   // request used (the lower_tag_name lookup above matched it caseless).
   const tagName = existing !== undefined ? existing.tagName : input.tagName;
 
-  // createTag's MustNotBeArchived arm (services/release/release.go:75-78),
+  // createTag's MustNotBeArchived arm (services/release/release.go:78-81),
   // in createTag's position: after the duplicate check (upstream's
-  // IsReleaseExist 409 precedes createTag, release.go:176-186), before the
+  // IsReleaseExist 409 precedes createTag, release.go:203-213), before the
   // !IsDraft gate — the refusal is UNCONDITIONAL (drafts die here too). Both
-  // upstream surfaces reach it (CreateRelease release.go:187 and the
-  // tag-record conversion's UpdateRelease release.go:269) and neither maps
+  // upstream surfaces reach it (CreateRelease release.go:214 and the
+  // tag-record conversion's UpdateRelease release.go:300) and neither maps
   // the outcome: ErrRepoIsArchived falls to ctx.APIErrorInternal → 500
-  // (routers/api/v1/repo/release.go:285-287) — untyped here, so the error
+  // (routers/api/v1/repo/release.go:281-283) — untyped here, so the error
   // handler renders the house 500. Message mirrors ErrRepoIsArchived.Error()
   // (LogString + " is archived", models/repo/repo.go:63,272-277); wire-invisible.
   if (pair.repo.isArchived) {
@@ -602,10 +806,10 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
         commitSha: resolved.commitSha,
         // The message rides the FRESH-create arm only: CreateRelease's
         // createTag(rel, msg) copies form.TagMessage into the ANNOTATED tag
-        // object (release.go:110-121 + :186), but the conversion arm (an
+        // object (release.go:113-124 + :210), but the conversion arm (an
         // existing is_tag row) reaches the write through UpdateRelease's
-        // createTag(ctx, gitRepo, rel, "") — release.go:269's EMPTY message,
-        // release.go:306's handler never forwards TagMessage — so an
+        // createTag(ctx, gitRepo, rel, "") — release.go:300's EMPTY message,
+        // release.go:301's handler never forwards TagMessage — so an
         // adopted row's missing tag is always LIGHTWEIGHT (B-54's adopt
         // arm; the B-54 landing's disclosed fix).
         message: existing === undefined ? input.tagMessage : undefined,
@@ -621,17 +825,17 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
       tagCreated = true;
       tagTip = written.refTip;
       taggedCommitSha = written.commitSha; // already the peeled commit (resolveTagTarget)
-      tagCommitSha = written.commitSha; // upstream's createTag emission oid (release.go:136/:143)
+      tagCommitSha = written.commitSha; // upstream's createTag emission oid (release.go:138/:145)
     } else {
       // The ride arm: the ref's tip peeled to its commit — an annotated tag
       // carries the engine's peel cache (`peeled`), a lightweight tag's
-      // target IS the commit (GetTagCommit's dereference, release.go:148).
+      // target IS the commit (GetTagCommit's dereference, release.go:150).
       taggedCommitSha = existingTip.peeled ?? existingTip.target;
     }
   }
 
   // The pre-write fill reads, upstream's order (createTag's fill precedes
-  // CreateRelease's insert — release.go:148-158 then :189): a read failure
+  // CreateRelease's insert — release.go:155-160 then :216): a read failure
   // aborts with NO row, exactly the upstream GetTagCommit/CommitsCount 500.
   let fill: { sha1: string; numCommits: number; createdAt: Date } | undefined;
   if (taggedCommitSha !== undefined) {
@@ -639,12 +843,12 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
   }
 
   // The row's `target`: the FRESH arm stores the handler's defaulted
-  // `form.Target` (release.go:260-265 — `If len(form.Target) == 0 →
+  // `form.Target` (release.go:256-261 — `If len(form.Target) == 0 →
   // DefaultBranch` runs inside the not-exist branch, before the rel is
-  // built); the CONVERSION arm stores `form.Target` VERBATIM (release.go:303
+  // built); the CONVERSION arm stores `form.Target` VERBATIM (release.go:299
   // — `rel.Target = form.Target`, no IfZero on the else arm, R16-b), so an
   // absent target_commitish lands "" there and createTag's own
-  // `IfZero(rel.Target, DefaultBranch)` (release.go:104) still resolves the
+  // `IfZero(rel.Target, DefaultBranch)` (release.go:107) still resolves the
   // tag write.
   const target =
     existing !== undefined
@@ -652,7 +856,7 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
       : input.targetCommitish !== undefined && input.targetCommitish !== ""
         ? input.targetCommitish
         : pair.repo.defaultBranch;
-  // CreateRelease's title ellipsis (release.go:187 — `util.EllipsisDisplay-
+  // CreateRelease's title ellipsis (release.go:214 — `util.EllipsisDisplay-
   // String(rel.Title, 255)` before the insert; R8).
   const title = ellipsisDisplayString(input.title, 255);
   const row = await new IssuesService(input.d1).createRelease({
@@ -667,9 +871,14 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
   });
 
   if (fill === undefined) {
-    // The NewRelease emit (release.go:198 create arm; the tag-record
+    // The latest-release pointer move (CreateRelease's UpdateLatestRelease,
+    // release.go:224 — wasEligible false on every create arm; the tag-record
+    // conversion arm rides the same call site as upstream's UpdateRelease
+    // :322). Sits between the row write and the notify, upstream's order.
+    await updateLatestRelease(input.d1, pair.repo, row, false, input.makeLatest);
+    // The NewRelease emit (release.go:257 create arm; the tag-record
     // conversion arm rides the same seam — its isConvertedFromTag fire at
-    // :361-368 lands on this same published row). Drafts skip inside the
+    // :385-391 lands on this same published row). Drafts skip inside the
     // seam.
     await emitNewReleaseNotify(input.env, input.d1, row);
     return { row, tagCreated, tagTip, tagCommitSha };
@@ -683,6 +892,9 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     .where(eq(releases.id, row.id))
     .returning();
   const finalRow = filled[0] ?? row;
+  // The latest-release pointer move — see the fill-undefined arm above
+  // (upstream's UpdateLatestRelease sits after the insert, before the notify).
+  await updateLatestRelease(input.d1, pair.repo, finalRow, false, input.makeLatest);
   // The NewRelease emit — see the fill-undefined arm above.
   await emitNewReleaseNotify(input.env, input.d1, finalRow);
   return { row: finalRow, tagCreated, tagTip, tagCommitSha };
@@ -697,6 +909,10 @@ export interface EditReleasePatch {
   /** Explicit tri-flags (undefined = untouched). */
   isDraft?: boolean;
   isPrerelease?: boolean;
+  /** GitHub's `make_latest` (a5201dc427) — UpdateRelease's :322 pointer
+   *  move; `wasEligible` rides from the PRE-edit row (oldRelease.CanBeLatest,
+   *  release.go:322). */
+  makeLatest: MakeLatest;
   now: Date;
 }
 
@@ -719,39 +935,39 @@ export interface EditReleaseResult {
   /** The updated row; null only when the optimistic update lost a
    *  concurrent write (the row vanished mid-edit). */
   row: ReleaseRow | null;
-  /** createTag's `created` (release.go:80,127): true when THIS edit landed a
-   *  FRESH git tag — drives the ref-webhook pair and the NewRelease ("published")
-   *  notification mapping (UpdateRelease's `!isTagCreated && !isConvertedFromTag`
-   *  arm, release.go:361-367). */
+  /** createTag's fresh-write arm (release.go:86-146 — the `created` return was dropped by 53aafd7ee1): true when THIS edit landed a
+   *  FRESH git tag — drives the ref-webhook pair ONLY (since 53aafd7ee1 the
+   *  notification fork keys on the OLD row's draft state, not this flag: a
+   *  published→published rename that lands a new tag notifies "updated"). */
   tagCreated: boolean;
 }
 
 /**
  * `EditRelease` + `release_service.UpdateRelease` — upstream's exact edit→tag
- * semantics (services/release/release.go:263-369 over the field guards of
- * routers/api/v1/repo/release.go:361-378; the web EditReleasePost rides the
+ * semantics (services/release/release.go:294-393 over the field guards of
+ * routers/api/v1/repo/release.go:357-374; the web EditReleasePost rides the
  * same service with its own unconditional Title/Note assignments):
  *
- *   1. EVERY edit re-runs createTag (release.go:269) with an EMPTY message —
- *      so an edit-created tag is always LIGHTWEIGHT (release.go:119). The
- *      re-run's MustNotBeArchived gate (release.go:75-78, right after
+ *   1. EVERY edit re-runs createTag (release.go:300) with an EMPTY message —
+ *      so an edit-created tag is always LIGHTWEIGHT (release.go:122). The
+ *      re-run's MustNotBeArchived gate (release.go:78-81, right after
  *      LoadAttributes) fires first, so an edit on an ARCHIVED repo 500s
  *      before any tag work, draft or published alike. For a post-edit DRAFT
  *      nothing touches git (createTag's else arm :166-168
  *      only re-stamps created_unix = now — a re-edited draft rises in the
  *      created_unix DESC list). For a PUBLISHED post-edit state:
- *        - tag exists → RIDE it, no write, no error (release.go:83 IsTagExist);
- *        - tag missing → the protected-tag gate (release.go:89-102), then
- *          `target = rel.Target` or the default branch (IfZero, :104),
+ *        - tag exists → RIDE it, no write, no error (release.go:86 IsTagExist);
+ *        - tag missing → the protected-tag gate (release.go:92-105), then
+ *          `target = rel.Target` or the default branch (IfZero, :107),
  *          GetCommit (unresolvable → the error PROPAGATES — the API edit
  *          surface maps none of these to 4xx, ctx.APIErrorInternal → 500,
- *          release.go:379-382; the web surface JSONErrorAuto → 500 "internal
+ *          release.go:375-378; the web surface JSONErrorAuto → 500 "internal
  *          server error", context.go:257-274), then the lightweight write
- *          (`created = true`, :127).
+ *          (the fresh-write arm, :86-146).
  *      The OLD tag on a `tag_name` rename is NEVER deleted — UpdateRelease
  *      has no `tag -d`; the old ref stays in git orphaned (only
- *      DeleteReleaseByID deletes tags, release.go:388, on its delTag arm).
- *   2. The fill (:148-158) runs for EVERY published edit — fresh tag, ridden
+ *      DeleteReleaseByID deletes tags, release.go:413, on its delTag arm).
+ *   2. The fill (:155-160) runs for EVERY published edit — fresh tag, ridden
  *      tag, and the D1-only conversion rows alike: sha1 = the tagged commit,
  *      num_commits = the reachable depth, created_unix = the commit's
  *      committer time. A published body-only edit therefore re-fills too
@@ -762,16 +978,21 @@ export interface EditReleaseResult {
  *   3. `PublishedUnix` rules (:280-285, order matters): a post-edit DRAFT
  *      zeroes it back ("a zero PublishedUnix means draft"); publishing a
  *      draft (oldRelease.IsDraft) stamps now; a published row whose stamp is
- *      still zero takes now (createTag's zero arm, :145-147). The
+ *      still zero takes now (createTag's zero arm, :147-149). The
  *      isConvertedFromTag arm is unreachable here — tag-only records 404 on
  *      every edit surface (assertNotTagRecord).
- *   4. `LowerTagName` re-lowers unconditionally (:273) and the column write
+ *   4. `LowerTagName` re-lowers unconditionally (:303) and the column write
  *      mirrors upstream's AllCols().Update (models/repo/release.go:169-173):
  *      the re-filled sha1/num_commits/created_unix of a published edit and
  *      the created_unix = now of a draft edit both land in the row.
+ *   5. `UpdateLatestRelease` (:322, a5201dc427) moves the repository's
+ *      latest-release pointer — `wasEligible` = the PRE-edit row's
+ *      `CanBeLatest` (oldRelease), `makeLatest` from the caller. Runs
+ *      UNCONDITIONALLY (upstream calls it inside the tx for draft edits
+ *      too — a draft that held the pointer loses it, case 3).
  *
  * The git writes PRECEDE the D1 update, as upstream orders them (createTag
- * runs outside UpdateRelease's transaction, release.go:269 vs :287) — a D1
+ * runs outside UpdateRelease's transaction, release.go:300 vs :287) — a D1
  * failure after a fresh tag leaves the tag in git, byte-faithful. The
  * rename-collision edge diverges on the store level: our landed
  * `releases_repo_tag_uq` unique index rejects renaming onto another release
@@ -791,24 +1012,24 @@ export async function editRelease(input: EditReleaseTagContext & {
   const nowSec = Math.floor(patch.now.getTime() / 1000);
 
   // Step 0 — createTag's MustNotBeArchived arm (services/release/release.go:
-  // 75-78): UpdateRelease re-runs createTag UNCONDITIONALLY (release.go:269 —
+  // 75-78): UpdateRelease re-runs createTag UNCONDITIONALLY (release.go:300 —
   // draft states included), so an edit on an archived repo dies before the
   // tag arm for every post-edit state. Upstream's EditRelease maps none of
   // UpdateRelease's outcomes (ctx.APIErrorInternal → 500, routers/api/v1/
-  // repo/release.go:379-382) — untyped here, the house 500 (message mirrors
+  // repo/release.go:375-378) — untyped here, the house 500 (message mirrors
   // ErrRepoIsArchived.Error(), wire-invisible).
   if (pair.repo.isArchived) {
     throw new Error(`<Repository ${pair.repo.id}:${pair.owner.username}/${pair.repo.slug}> is archived`);
   }
 
-  // Step 1 — the tag arm (createTag's !IsDraft gate, release.go:78).
+  // Step 1 — the tag arm (createTag's !IsDraft gate, release.go:85).
   let tagCreated = false;
   let taggedCommitSha: string | undefined;
   if (!isDraft) {
     const tips = refTipMap(await engineReads(env, pair.repo).listRefs());
     const existingTip = tips.get(tagRef(tagName));
     if (existingTip === undefined) {
-      // release.go:89-102 — the protected gate runs BEFORE the target
+      // release.go:92-105 — the protected gate runs BEFORE the target
       // resolves, in createTag's order.
       if (!(await isTagControlAllowed(input.d1, await listProtectedTags(input.d1, pair.repo.id), tagName, input.doer?.id ?? 0))) {
         // ErrProtectedTagName — unmapped on the edit surfaces (upstream
@@ -823,7 +1044,7 @@ export async function editRelease(input: EditReleaseTagContext & {
       const written = await writeTagRef(env, pair.repo, {
         name: tagName,
         commitSha: resolved.commitSha,
-        // release.go:269 — the edit re-runs createTag with an EMPTY message:
+        // release.go:300 — the edit re-runs createTag with an EMPTY message:
         // always a lightweight tag, even on a rename of a once-annotated one.
         message: undefined,
         doer: input.doer,
@@ -838,23 +1059,23 @@ export async function editRelease(input: EditReleaseTagContext & {
       tagCreated = true;
       taggedCommitSha = written.commitSha; // the peeled commit (resolveTagTarget)
     } else {
-      // The ride arm's peel (GetTagCommit's dereference, release.go:148).
+      // The ride arm's peel (GetTagCommit's dereference, release.go:150).
       taggedCommitSha = existingTip.peeled ?? existingTip.target;
     }
   }
 
-  // Step 2 — the fill (every published edit; release.go:148-158 via
+  // Step 2 — the fill (every published edit; release.go:155-160 via
   // readTaggedCommitFill) / the draft arm's created_unix = now (:166-168).
   const fill = taggedCommitSha === undefined ? undefined : await readTaggedCommitFill(engineReads(env, pair.repo), taggedCommitSha);
 
-  // Step 3 — the PublishedUnix rules (release.go:280-285 + :145-147).
+  // Step 3 — the PublishedUnix rules (release.go:310-315 + :147-149).
   const publishedUnix = isDraft ? 0 : row.isDraft ? nowSec : row.publishedUnix === 0 ? nowSec : row.publishedUnix;
 
   const rows = await drizzle(input.d1)
     .update(releases)
     .set({
       tagName,
-      lowerTagName: tagName.toLowerCase(), // release.go:273 — unconditional
+      lowerTagName: tagName.toLowerCase(), // release.go:299 — unconditional
       target,
       // The model UpdateRelease ellipsifies the title on EVERY update
       // (models/repo/release.go:169-173 — R8).
@@ -872,14 +1093,23 @@ export async function editRelease(input: EditReleaseTagContext & {
     .where(eq(releases.id, row.id))
     .returning();
   const finalRow = rows[0] ?? null;
-  // The NewRelease emit (UpdateRelease's `!rel.IsDraft && (isTagCreated ||
-  // isConvertedFromTag)` arm, release.go:361-367): the conversion half is
-  // unreachable on this surface (tag-only records 404 on every edit —
-  // assertNotTagRecord), so the live arm is publish-from-draft (a draft
-  // never holds a tag, so publishing always lands a FRESH tag) and a
-  // published edit whose tag_name rename landed a NEW tag; an edit that
-  // RODE the existing tag fires nothing, exactly upstream.
-  if (finalRow !== null && !isDraft && tagCreated) {
+  // Step 5 — the latest-release pointer move (UpdateRelease's
+  // UpdateLatestRelease, release.go:322, inside the tx → after our row
+  // write): unconditional (draft edits included — case 3 drops a pointer a
+  // re-draft invalidates); wasEligible = the PRE-edit row's eligibility.
+  if (finalRow !== null) {
+    await updateLatestRelease(input.d1, pair.repo, finalRow, canBeLatest(row), patch.makeLatest);
+  }
+  // The NewRelease emit (UpdateRelease's `!rel.IsDraft` arm, release.go:
+  // 385-391, SINCE 53aafd7ee1): the "published" (NewRelease) half fires when
+  // the edit CONVERTED a tag record or the OLD release was a draft — the
+  // conversion half is unreachable on this surface (tag-only records 404 on
+  // every edit — assertNotTagRecord), so the live arm is publish-from-draft.
+  // A tag-CREATING rename between two published states no longer fires it
+  // (the createTag `created` flag stopped driving the fork) — it is an
+  // "updated" event now. An edit that rode the existing tag fired nothing
+  // before and still fires nothing.
+  if (finalRow !== null && !isDraft && row.isDraft) {
     await emitNewReleaseNotify(env, input.d1, finalRow);
   }
   return { row: finalRow, tagCreated };
@@ -897,37 +1127,84 @@ export interface DeleteReleaseResult {
    * The asset rows as they were BEFORE the delete — the delete webhook's
    * payload carries them (upstream's DeleteReleaseByID loads Attachments in
    * LoadAttributes BEFORE DeleteAttachmentsByRelease wipes the rows,
-   * release.go:418-421, so the notification still renders them).
+   * release.go:446-453, so the notification still renders them).
    */
   assets: ReleaseAssetRow[];
 }
 
+/** The delete's audit + pointer inputs (the callers hold them all). */
+export interface DeleteReleaseInput {
+  /** The repository row — the latest-release pointer's store + the unset's
+   *  target (DeleteReleaseByID's `repo`, release.go:478). */
+  repo: { id: string; latestReleaseId: number };
+  /** The audit scope render (`{owner}/{slug}` — the {scope} var). */
+  pair: { ownerNamespace: string; slug: string };
+  /** The deleting caller — the audit row's actor (RecordAs's doer). */
+  doer: { id: number; username: string };
+  /** The audit origin face: "api" (the DELETE routes) or "ui" (the web
+   *  form write) — upstream's request-mounted origin. */
+  origin: "ui" | "api";
+  /** The release row as it was BEFORE the delete. */
+  row: ReleaseRow;
+}
+
 /**
  * `DeleteReleaseByID` with the API's delTag=false (services/release/
- * release.go:408-434) — the ledger R2+R4 thread. The row is NOT dropped:
- * `rel.IsTag = true` is persisted (release.go:414-417) so the id survives a
+ * release.go:396-473) — the ledger R2+R4 thread. The row is NOT dropped:
+ * `rel.IsTag = true` is persisted (release.go:434-438) so the id survives a
  * re-create (the §2.3 conversion) and the tags-API delete's GetRelease
  * lookup still finds the record; the release's attachment ROWS go
- * (DeleteAttachmentsByRelease, :421-424), the release's REACTIONS go
- * (:425-429), and the R2 asset OBJECTS are swept (the storage loop,
- * :431-434 — best-effort: a failed object delete logs and moves on, the D1
- * state is already authoritative). The git tag is untouched (delTag=false).
- * One D1 batch (the row conversion + the attachment/reaction deletes);
- * upstream orders the conversion first, the sweeps after — same net state.
+ * (DeleteAttachmentsByRelease, :450-453), the release's REACTIONS go
+ * (:454-457), and the R2 asset OBJECTS are swept (the storage loop,
+ * :458-463 — best-effort: a failed object delete logs and moves on, the D1
+ * state is already authoritative). A REAL release (never a pure tag record —
+ * the `isRelease := !rel.IsTag` gate, :397) also lands the
+ * `repository:release:remove` AUDIT row (release.go:465-467, 3f1b738f09 —
+ * `audit.RecordAs(ctx, doer, RepositoryReleaseRemove, repo, "release",
+ * rel.TagName)`; folded into the D1 batch so a failed delete emits nothing —
+ * the seam's transactional form) and the latest-release POINTER is unset
+ * (release.go:441-443 — after the sweeps, before LoadAttributes; a failed
+ * unset FAILS the delete, `DeleteReleaseByID: %w`). The git tag is untouched
+ * (delTag=false). One D1 batch (the row conversion + the attachment/reaction
+ * deletes + the audit row); upstream orders the conversion first, the sweeps
+ * after — same net state.
  */
-export async function deleteRelease(env: ReleaseDeleteEnv, d1: D1Database, row: ReleaseRow): Promise<DeleteReleaseResult> {
+export async function deleteRelease(env: ReleaseDeleteEnv, d1: D1Database, input: DeleteReleaseInput): Promise<DeleteReleaseResult> {
+  const { row, repo, pair, doer, origin } = input;
   const assets = await listReleaseAssets(d1, row.id);
+  const scopeName = `${pair.ownerNamespace}/${pair.slug}`;
   await drizzle(d1).batch([
     drizzle(d1).delete(releaseAssets).where(eq(releaseAssets.releaseId, row.id)),
-    // release.go:425-429 — `DeleteByBean(&Reaction{ReleaseID: rel.ID})`.
+    // release.go:454-457 — `DeleteByBean(&Reaction{ReleaseID: rel.ID})`.
     drizzle(d1).delete(reactions).where(eq(reactions.releaseId, row.id)),
-    // release.go:414-417 — the is_tag conversion keeps the row (and its id).
+    // release.go:434-438 — the is_tag conversion keeps the row (and its id).
     drizzle(d1)
       .update(releases)
       .set({ isTag: true })
       .where(eq(releases.id, row.id)),
+    // release.go:500-467 — the `repository:release:remove` audit row; a REAL
+    // release only (`isRelease := !rel.IsTag`, :397 — a tag record's delete
+    // carries no row).
+    ...(row.isTag
+      ? []
+      : [
+          auditEventInsert(drizzle(d1), {
+            action: AuditActions.RepositoryReleaseRemove,
+            actorId: doer.id,
+            actorName: doer.username,
+            actorCredential: null,
+            scopeType: "repository",
+            scopeId: repo.id,
+            scopeName,
+            origin,
+            vars: { release: row.tagName, scope: scopeName },
+          }),
+        ]),
   ]);
-  // The R2 sweep (release.go:431-434's storage loop): per-object best-effort
+  // release.go:441-443 — the pointer unset (after the sweeps, upstream's
+  // order; a failure propagates, failing the delete).
+  await unsetLatestReleaseId(d1, repo, row.id);
+  // The R2 sweep (release.go:458-463's storage loop): per-object best-effort
   // — a failed delete logs and continues, exactly upstream's "Even delete
   // files failed ... should not return error but only record the error on
   // logs" posture.
@@ -960,7 +1237,7 @@ export async function deleteTagRecord(d1: D1Database, row: ReleaseRow): Promise<
 }
 
 /**
- * `PushUpdateDeleteTags` (models/repo/release.go:465-492, reached from
+ * `PushUpdateDeleteTags` (models/repo/release.go:500-527, reached from
  * services/repository/push.go:317's PushUpdateAddDeleteTags): the GIT-PUSH
  * tag-deletion lifecycle, the R5 arm. Upstream's shape, statement for
  * statement: the tag-only records for the lowered names are DELETED
@@ -981,11 +1258,11 @@ export async function pushUpdateDeleteTags(d1: D1Database, repoId: string, tags:
   const lowerTags = [...new Set(tags.map((tag) => tag.toLowerCase()))];
   if (lowerTags.length === 0) return;
   await drizzle(d1).batch([
-    // release.go:471-478 — the is_tag=true rows die with their tag.
+    // release.go:506-513 — the is_tag=true rows die with their tag.
     drizzle(d1)
       .delete(releases)
       .where(and(eq(releases.repoId, repoId), eq(releases.isTag, true), inArray(releases.lowerTagName, lowerTags))),
-    // release.go:480-490 — the real releases withdraw to draft with the
+    // release.go:515-525 — the real releases withdraw to draft with the
     // zero-valued Cols (num_commits, sha1, published_unix).
     drizzle(d1)
       .update(releases)
@@ -1120,23 +1397,23 @@ export interface CreateNewTagRecordInput {
   /** The tag name (original case — the row's tag_name). */
   tagName: string;
   /** The commit the fill reads — the REF's tip peeled (upstream's
-   *  GetTagCommit(rel.TagName), release.go:148): the created commit on the
+   *  GetTagCommit(rel.TagName), release.go:150): the created commit on the
    *  fresh arm, the existing ref's commit on the ride arm. The row's sha1
    *  and created_unix/num_commits source. */
   commitSha: string;
-  /** rel.Target (release.go:250 — `Target: commit`): the REQUEST's resolved
+  /** rel.Target (release.go:277 — `Target: commit`): the REQUEST's resolved
    *  commit (GetTargetCommit), even when the ride arm's ref points
    *  elsewhere. */
   targetCommit: string;
   /** The doer (CreateNewTag's `PublisherID: doer.ID`). */
   publisherId: number;
   /** The request moment — PublishedUnix (createTag's zero arm stamps the
-   *  PUBLISH moment, release.go:145-147 — NOT the tagger time). */
+   *  PUBLISH moment, release.go:147-149 — NOT the tagger time). */
   now: Date;
 }
 
 /**
- * `CreateNewTag`'s row (services/release/release.go:244-261 + createTag's
+ * `CreateNewTag`'s row (services/release/release.go:271-288 + createTag's
  * fill :145-158) — the API tag-create mint (B-54's second arm). The COLUMN
  * semantics deliberately DIVERGE from the push mint above — upstream's own
  * divergence between the two arms, ported verbatim:
@@ -1149,11 +1426,11 @@ export interface CreateNewTagRecordInput {
  *     without either field);
  *   - created_unix = the commit's committer time, sha1 = the peeled commit
  *     (the shared fill);
- *   - Target = the resolved commit (`rel.Target = commit`, release.go:250).
- * The row INSERTs AFTER the ref write (release.go:261), so a failed insert
+ *   - Target = the resolved commit (`rel.Target = commit`, release.go:277).
+ * The row INSERTs AFTER the ref write (release.go:287), so a failed insert
  * leaves the tag in git — upstream's wedge (the retry 409s on the row
  * lookup) reproduced faithfully. The duplicate guard is the CALLER's
- * (IsReleaseExist order, release.go:224-232); the (repo_id, tag_name)
+ * (IsReleaseExist order, release.go:255-263); the (repo_id, tag_name)
  * unique index arbitrates the race as an untyped error, upstream's
  * db.Insert failure shape.
  */
@@ -1258,7 +1535,7 @@ function releaseUrls(pair: RepositoryWithOwner, origin: string, row: ReleaseRow)
   const apiRepoUrl = `${origin}/api/v1/repos/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
   const htmlRepoUrl = `${origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
   // HTMLURL/TarURL/ZipURL all run the tag through util.PathEscapeSegments
-  // (models/repo/release.go:136-146) — slashes KEPT per segment.
+  // (models/repo/release.go:138-146) — slashes KEPT per segment.
   const tag = pathEscapeSegments(row.tagName);
   return {
     url: `${apiRepoUrl}/releases/${row.id}`,
@@ -1309,7 +1586,7 @@ function ghostApiUser(origin: string): User {
 }
 
 /**
- * `hasDuplicateName` (models/repo/release.go:421-428) — true when any name
+ * `hasDuplicateName` (models/repo/release.go:412-421) — true when any name
  * repeats within the release's asset set. Drives the R13 download-url flip:
  * unique names → the name-based URL, duplicates → the uuid shape.
  */
@@ -1325,9 +1602,9 @@ function hasDuplicateName(assets: ReleaseAssetRow[]): boolean {
 /**
  * The release row's PUBLISHER rendered as the webhook `sender`/`pusher`
  * (R2-L7): upstream notifies with `rel.Publisher` — createTag's PushCommits
- * + CreateRef pass it (services/release/release.go:137, :143), NewRelease
+ * + CreateRef pass it (services/release/release.go:139, :143), NewRelease
  * does too (services/webhook/notifier.go:889-890) — and `rel.Publisher` is
- * set once at insert (`Publisher: doer`, CreateNewTag release.go:243-244) and
+ * set once at insert (`Publisher: doer`, CreateNewTag release.go:274-275) and
  * NEVER touched by UpdateRelease, so publish-from-draft by a non-publisher
  * still carries the ORIGINAL publisher. Rendered through LoadAttributes'
  * ghost swap: a publisher id with no surviving user row renders
@@ -1341,7 +1618,7 @@ export async function releasePublisherSender(d1: D1Database, publisherId: number
 /**
  * The R13 name-based download-url builder: `release.Repo.HTMLURL() +
  * /releases/download/ + url.PathEscape(tag) + / + url.PathEscape(name)`
- * (models/repo/release.go:430-443's CustomDownloadURL assignment — plain
+ * (models/repo/release.go:478's CustomDownloadURL assignment — plain
  * `url.PathEscape` per value here, NOT PathEscapeSegments: a slash in a
  * tag/asset name encodes %2F), returned ONLY when the release's asset names
  * are unique — `undefined` means the caller keeps the uuid shape (upstream's
@@ -1381,7 +1658,7 @@ export function uniqueNameDownloadUrlBuilder(
  * interaction.
  *
  * `browser_download_url` is upstream's CustomDownloadURL flip (R13/QW-3,
- * models/repo/release.go:430-443): when a release's asset NAMES are unique
+ * models/repo/release.go:478): when a release's asset NAMES are unique
  * (`hasDuplicateName`), every attachment renders
  * `{repo HTMLURL}/releases/download/{tag}/{name}`; on duplicates the uuid
  * shape (`/attachments/{uuid}`) stands in, exactly upstream's
@@ -1409,7 +1686,7 @@ export async function toApiRelease(
   const author: User = publisherRow === undefined ? ghostApiUser(viewer.origin) : apiUserFromRow(publisherRow, viewer);
   const urls = releaseUrls(pair, viewer.origin, row);
   // The unique-name flip (R13): computed over THIS release's asset set,
-  // GetReleaseAttachments' per-release loop (release.go:430-443).
+  // GetReleaseAttachments' per-release loop (release.go:468-480).
   const downloadUrl = uniqueNameDownloadUrlBuilder(viewer.origin, pair.repo, row.tagName, assetRows);
   return {
     id: row.id,

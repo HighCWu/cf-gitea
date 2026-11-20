@@ -463,13 +463,15 @@ async function findReleaseById(d1: D1Database, id: number): Promise<ReleaseRow |
  * 303-347): the EXACT tag-name find (case-sensitive, tag-only records
  * excluded, drafts only for writers — FindReleases' ToConds verbatim), then
  * the release's attachment by exact name; zero releases and the literal
- * `latest` falls to GetLatestReleaseByRepoID (the GitHub alias). Every miss
- * is the 404 family.
+ * `latest` falls to the latest release — GetLatestRelease since a5201dc427
+ * (repo.go:324, the pointer-first resolution over the whole Repository row,
+ * not the bare GetLatestReleaseByRepoID fallback). Every miss is the 404
+ * family.
  */
 export async function loadReleaseDownload(
   bucket: R2Bucket,
   d1: D1Database,
-  repo: { id: string },
+  repo: { id: string; latestReleaseId: number },
   vTag: string,
   fileName: string,
   options: { canWriteReleases: boolean },
@@ -486,7 +488,7 @@ export async function loadReleaseDownload(
   // duplicated tag row would refuse rather than guess.
   let release: ReleaseRow | null = found.length === 1 ? (found[0] ?? null) : null;
   if (release === null && vTag === "latest") {
-    release = await findLatestRelease(d1, repo.id); // the alias arm (repo.go:330-345)
+    release = await findLatestRelease(d1, repo); // the alias arm (repo.go:322-326, pointer-first)
   }
   if (release === null) return { kind: "not-found" };
   const asset = await drizzle(d1)

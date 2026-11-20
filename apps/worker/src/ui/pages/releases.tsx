@@ -183,12 +183,13 @@
  */
 
 import { drizzle } from "drizzle-orm/d1";
-import { inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 
 import type { ReleaseAssetRow } from "../../api/services/release-assets";
 import { listReleaseAssets, toApiAttachment } from "../../api/services/release-assets";
 import { ALLOWED_RELEASE_REACTIONS, listReleaseReactions } from "../../api/services/release-reactions";
 import {
+  canBeLatest,
   createReleaseWithGitTag,
   deleteRelease,
   editRelease,
@@ -199,6 +200,7 @@ import {
   listReleases,
   pathEscapeSegments,
   toApiRelease,
+  toReleaseChanges,
   uniqueNameDownloadUrlBuilder,
 } from "../../api/services/releases";
 import type { ReleaseReactionRow } from "../../api/services/release-reactions";
@@ -211,7 +213,7 @@ import {
 } from "../../api/services/repository";import { ReleaseAlreadyExistError } from "../../issues/errors";
 import { type ReleaseRow } from "../../issues/service";
 import { emitIssueEvent, type IssueEventRequest } from "../../services/issue-events";
-import { users } from "../../db/schema";
+import { repositories, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { REACTION_EMOJI, groupReactions, renderIssueMarkdown, type ReactionGroup } from "./issue-detail";
 // The B-55 write tails' form faces: the dropzone fragment (repo/upload.tmpl
@@ -250,6 +252,8 @@ export const releasesLocale = {
   prerelease_desc: "Mark as Pre-Release", // "repo.release.prerelease_desc"
   prerelease_helper: "Mark this release unsuitable for production use.", // "repo.release.prerelease_helper"
   save_draft: "Save Draft", // "repo.release.save_draft" (the draft checkbox label)
+  make_latest: "Set as Latest Release", // "repo.release.make_latest" (a5201dc427)
+  make_latest_helper: "Label this release as the latest for this repository.", // "repo.release.make_latest_helper"
   publish: "Publish Release", // "repo.release.publish"
   /** Upstream `repo.release.title_empty` — the empty-title re-render. */
   title_required: "Title cannot be empty.",
@@ -475,7 +479,7 @@ export async function loadReleasesData(
       page,
       limit: RELEASES_PAGE_SIZE,
     }),
-    findLatestRelease(d1, repo.id),
+    findLatestRelease(d1, repo),
     tagTipsOf(env, repo),
   ]);
   const items = await enrichEntries(env, d1, repo, rows, latest?.id ?? -1, origin, tags);
@@ -520,7 +524,7 @@ export async function loadReleaseDetailData(
   const row = await findReleaseByTagExact(d1, repo.id, tag);
   if (row === null) return null;
   if (row.isDraft && !canWrite) return null;
-  const [latest, tags] = await Promise.all([findLatestRelease(d1, repo.id), tagTipsOf(env, repo)]);
+  const [latest, tags] = await Promise.all([findLatestRelease(d1, repo), tagTipsOf(env, repo)]);
   const [entry] = await enrichEntries(env, d1, repo, [row], latest?.id ?? -1, origin, tags);
   if (entry === undefined) return null;
   // The header menu's Tags count (F9): upstream's SingleRelease render carries
@@ -549,11 +553,17 @@ export interface NewReleaseForm {
   content: string;
   draft: boolean;
   prerelease: boolean;
+  /** The `make_latest` checkbox (upstream `NewReleaseForm.MakeLatest`,
+   *  repo_form.go — a5201dc427): checked → the created release is pinned as
+   *  the latest (CreateRelease's makeLatest "true"), unchecked → "" (the
+   *  date-order arms). */
+  makeLatest: boolean;
 }
 
 /** Parse the urlencoded POST (`tag_name`, `tag_target`, `title`, `content`,
- *  `draft`, `prerelease` — the upstream NewReleaseForm field names; the
- *  checkboxes are the task brief's shape, the module header's note). */
+ *  `draft`, `prerelease`, `make_latest` — the upstream NewReleaseForm field
+ *  names; the checkboxes are the task brief's shape, the module header's
+ *  note). */
 export function parseNewReleaseForm(params: URLSearchParams): NewReleaseForm {
   return {
     tagName: (params.get("tag_name") ?? "").trim(),
@@ -562,6 +572,7 @@ export function parseNewReleaseForm(params: URLSearchParams): NewReleaseForm {
     content: params.get("content") ?? "",
     draft: parseFormBool(params.get("draft")),
     prerelease: parseFormBool(params.get("prerelease")),
+    makeLatest: parseFormBool(params.get("make_latest")),
   };
 }
 
@@ -636,6 +647,9 @@ export async function createReleaseFromForm(input: {
       note: form.content,
       isDraft: form.draft,
       isPrerelease: form.prerelease,
+      // The checkbox's MakeLatest (upstream NewReleasePost passes
+      // `util.Iif(form.MakeLatest, api.MakeLatestTrue, "")`, release.go:518).
+      makeLatest: form.makeLatest ? "true" : "",
     });
     row = created.row;
   } catch (error) {
@@ -677,13 +691,20 @@ export async function createReleaseFromForm(input: {
 // ---------------------------------------------------------------------------
 
 /** The parsed edit-release submission (upstream EditReleaseForm's fields —
- *  services/forms/repo_form.go:557-564: title/content/draft/prerelease; the
- *  hidden tag pair arrives but the handler ignores it). */
+ *  services/forms/repo_form.go:557-564 + a5201dc427's `make_latest`:
+ *  title/content/draft/prerelease/make_latest; the hidden tag pair arrives
+ *  but the handler ignores it). */
 export interface EditReleaseForm {
   title: string;
   content: string;
   draft: boolean;
   prerelease: boolean;
+  /** The `make_latest` checkbox (upstream `EditReleaseForm.MakeLatest`,
+   *  repo_form.go:566). The edit write's switch (release.go:637-642):
+   *  checked → makeLatest "true"; unchecked but the row IS the repository's
+   *  current latest → "legacy" (the pointer unset — fall back to date
+   *  order); otherwise "" (the default arms). */
+  makeLatest: boolean;
 }
 
 export function parseEditReleaseForm(params: URLSearchParams): EditReleaseForm {
@@ -692,14 +713,31 @@ export function parseEditReleaseForm(params: URLSearchParams): EditReleaseForm {
     content: params.get("content") ?? "",
     draft: parseFormBool(params.get("draft")),
     prerelease: parseFormBool(params.get("prerelease")),
+    makeLatest: parseFormBool(params.get("make_latest")),
   };
 }
 
 /**
- * Load the edit form (upstream EditRelease, release.go:557-597): the
+ * The edit form's checkbox prefill (upstream `ctx.Data["make_latest"]`,
+ * release.go:576 — `ctx.Repo.Repository.LatestReleaseID == rel.ID &&
+ * rel.CanBeLatest()`): checked when the repository's latest-release pointer
+ * names THIS release and the release is still pointer-eligible (published,
+ * stable, a real release). The GET handler wires it through
+ * `NewReleaseForm.makeLatest` — this helper is the exact predicate so the
+ * form render and the write's legacy-switch share one source.
+ */
+export function editReleaseMakeLatestPrefill(
+  repo: { latestReleaseId: number },
+  row: ReleaseRow,
+): boolean {
+  return repo.latestReleaseId === row.id && canBeLatest(row);
+}
+
+/**
+ * Load the edit form (upstream EditRelease, release.go:550-585): the
  * release row by the URL's tag, 404 arms first (a missing row —
  * GetRelease's IsErrReleaseNotExist; a TAG-ONLY record — "for a pure tag
- * release, don't allow to edit it as a release", release.go:573-576), then
+ * release, don't allow to edit it as a release", release.go:564-567), then
  * the stored values as the form's prefill (`tag_target` falls back to the
  * default branch, release.go:583's util.IfZero). The write gate (upstream's
  * reqSignIn + RepoMustNotBeArchived + reqRepoReleaseWriter group) is the
@@ -716,26 +754,28 @@ export type EditReleaseResult =
   | { outcome: "invalid"; message: string };
 
 /**
- * The write (upstream EditReleasePost, release.go:599-655, over the LANDED
- * edit arm): the title guards (the binding's TrimSpace;Required;MaxSize(255)
- * — the create form's carried server-side mirror), then `editRelease` with
- * Title/Note set UNCONDITIONALLY (the web form's plain assignments — an
- * emptied note clears, the API PATCH's non-empty guards are its own
- * semantics) and the flags from the checkboxes, then the `release` webhook
- * through the shared emit seam — drafts stay silent (routes/releases.ts
- * emitReleaseEvent's gate), the action follows upstream's notifier fork
- * (release.go:361-367): an edit that CREATED the tag (isTagCreated — the
- * publish-from-draft whose git tag was missing) maps to "published", every
- * other published edit to "updated" (the fixture tag already in git rides).
- * The hidden tag pair the form carries stays ignored (upstream's handler
- * never reads it) — the tag arm works from the STORED row: publishing a
- * draft whose tag doesn't exist lands refs/tags/<tag> at the stored target
- * through the same createTag re-run the API PATCH runs. The created tag's
- * ref-webhook pair (PushCommits + CreateRef) stays the API route's emission —
- * the landed web create write carries the same reduction. Failures answer
- * `invalid` with the message (upstream JSONErrorAuto's message render — an
- * untaggable publish, protected tag included, is a 500 there, context.go:
- * 257-274; the re-render convention keeps the form).
+ * The write (upstream EditReleasePost, release.go:588-649 at 099abf5db4, over
+ * the LANDED edit arm): the title guards (the binding's
+ * TrimSpace;Required;MaxSize(255) — the create form's carried server-side
+ * mirror), then `editRelease` with Title/Note set UNCONDITIONALLY (the web
+ * form's plain assignments — an emptied note clears, the API PATCH's
+ * non-empty guards are its own semantics), the flags from the checkboxes and
+ * the make_latest switch (release.go:637-642 — checked → "true"; unchecked
+ * while the row holds the repository's latest pointer → "legacy"; else ""),
+ * then the `release` webhook through the shared emit seam — drafts stay
+ * silent (routes/releases.ts emitReleaseEvent's gate), the action follows
+ * upstream's SINCE-53aafd7ee1 notifier fork (release.go:385-391):
+ * publish-from-draft (the OLD row was a draft) maps to "published", every
+ * other published edit — a tag-CREATING rename included — to "updated" with
+ * the `changes` payload. The hidden tag pair the form carries stays ignored
+ * (upstream's handler never reads it) — the tag arm works from the STORED
+ * row: publishing a draft whose tag doesn't exist lands refs/tags/<tag> at
+ * the stored target through the same createTag re-run the API PATCH runs.
+ * The created tag's ref-webhook pair (PushCommits + CreateRef) stays the API
+ * route's emission — the landed web create write carries the same reduction.
+ * Failures answer `invalid` with the message (upstream JSONErrorAuto's
+ * message render — an untaggable publish, protected tag included, is a 500
+ * there, context.go:257-274; the re-render convention keeps the form).
  */
 export async function editReleaseFromForm(input: {
   env: Env;
@@ -766,6 +806,10 @@ export async function editReleaseFromForm(input: {
         note: form.content,
         isDraft: form.draft,
         isPrerelease: form.prerelease,
+        // The write's make_latest switch (release.go:637-642): checked →
+        // "true"; unchecked but the row IS the repository's current latest →
+        // "legacy" (the pointer unset); otherwise "" (the default arms).
+        makeLatest: form.makeLatest ? "true" : input.repo.latestReleaseId === row.id ? "legacy" : "",
         now: new Date(),
       },
     });
@@ -778,8 +822,12 @@ export async function editReleaseFromForm(input: {
     // (here: the edit simply failed, the kept form re-renders).
     return { outcome: "invalid", message: "the release was deleted by someone else" };
   }
-  // The `release` webhook (the API PATCH route's action mapping) — drafts
-  // silent, best-effort (the create write's posture).
+  // The `release` webhook (the API PATCH route's action mapping, SINCE
+  // 53aafd7ee1) — drafts silent, best-effort (the create write's posture):
+  // "published" for a publish-from-draft (the old row was a draft), else
+  // "updated" with the `changes` payload (ToReleaseChanges over the PRE-edit
+  // row) — a tag-CREATING rename between two published states is an
+  // "updated" now (the createTag `created` flag stopped driving the fork).
   if (!updated.row.isDraft) {
     try {
       const apiViewer = { origin: input.origin, requester: apiUserFromRow(input.doer, { origin: input.origin, requester: null }) };
@@ -789,7 +837,8 @@ export async function editReleaseFromForm(input: {
         ownerId: input.repo.ownerId,
         eventType: "release",
         payload: {
-          action: updated.tagCreated ? "published" : "updated",
+          action: row.isDraft ? "published" : "updated",
+          ...(row.isDraft ? {} : { changes: toReleaseChanges(updated.row, row) }),
           release: rendered,
           repository: toApiRepository(apiViewer, input.pair),
           sender: apiUserFromRow(input.doer, apiViewer),
@@ -829,7 +878,13 @@ export async function deleteReleaseFromForm(input: {
 }): Promise<DeleteReleaseResult> {
   const row = await findReleaseForRepoById(input.env.DB, input.repo.id, input.id);
   if (row === null) return { outcome: "missing", name: `#${input.id}` };
-  const { assets } = await deleteRelease(input.env, input.env.DB, row);
+  const { assets } = await deleteRelease(input.env, input.env.DB, {
+    repo: input.repo,
+    pair: { ownerNamespace: input.repo.ownerNamespace, slug: input.repo.slug },
+    doer: { id: input.doer.id, username: input.doer.username },
+    origin: "ui",
+    row,
+  });
   if (!row.isDraft) {
     try {
       const apiViewer = { origin: input.origin, requester: apiUserFromRow(input.doer, { origin: input.origin, requester: null }) };
@@ -1455,6 +1510,19 @@ export function NewReleasePage(props: {
             </div>
             <div class="help tw-block tw-ml-[21px]">{releasesLocale.prerelease_helper}</div>
           </div>
+          {/* The make_latest checkbox (new.tmpl:120-127, a5201dc427 — the
+            * `Set as Latest Release` field after the prerelease helper): the
+            * edit arm's prefill rides NewReleaseForm.makeLatest (upstream's
+            * ctx.Data["make_latest"], release.go:576). */}
+          <div class="field">
+            <div class="ui checkbox">
+              <input type="checkbox" name="make_latest" id="release-make-latest" checked={form.makeLatest ? true : undefined} />
+              <label for="release-make-latest">
+                <strong>{releasesLocale.make_latest}</strong>
+              </label>
+            </div>
+            <div class="help tw-block tw-ml-[21px]">{releasesLocale.make_latest_helper}</div>
+          </div>
           <div class="flex-text-block tw-justify-end">
             {edit !== undefined ? (
               // PageIsEditRelease's submit row (new.tmpl:104-118): Cancel,
@@ -1500,12 +1568,22 @@ export function NewReleasePage(props: {
 // ---------------------------------------------------------------------------
 
 /**
- * The redirect target of `GET /releases/latest` (upstream
- * `ctx.Redirect(release.Link())` — Release.Link() is the HTMLURL shape
- * `{repo}/releases/tag/{tag}`, models/repo/release.go:130-155). `null` when
- * no stable release exists (the caller 404-shells — upstream NotFound).
+ * The redirect target of `GET /releases/latest` (upstream LatestRelease,
+ * routers/web/repo/release.go:341-356 — `repo_model.GetLatestRelease(ctx,
+ * ctx.Repo.Repository)`, the POINTER-first resolution, then
+ * `ctx.Redirect(release.Link())`; Release.Link() is the HTMLURL shape
+ * `{repo}/releases/tag/{tag}`, models/repo/release.go:155-159). The caller
+ * hands the bare repo id (the UI seam's row-less convention), so the pointer
+ * is read HERE — the one-column `repositories.latest_release_id` fetch the
+ * route's loaded Repository carries upstream. `null` when no stable release
+ * exists (the caller 404-shells — upstream NotFound).
  */
 export async function latestReleaseTagOf(d1: D1Database, repoId: string): Promise<string | null> {
-  const row = await findLatestRelease(d1, repoId);
+  const repoRow = await drizzle(d1)
+    .select({ latestReleaseId: repositories.latestReleaseId })
+    .from(repositories)
+    .where(eq(repositories.id, repoId))
+    .get();
+  const row = await findLatestRelease(d1, { id: repoId, latestReleaseId: repoRow?.latestReleaseId ?? 0 });
   return row === null ? null : row.tagName;
 }

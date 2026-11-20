@@ -50,11 +50,11 @@ import { emitRefWebhook, readTagData, renderAnnotatedTag, renderTag, resolveTagT
  *   - POST on an empty repo → **405**; a missing `target` → 404
  *     "target not found: …"; a duplicate tag → 409 "tag already exists";
  *   - POST MINTS the is_tag releases record (B-54 — CreateNewTag's
- *     db.Insert, release.go:261) with this arm's own column semantics
+ *     db.Insert, release.go:287) with this arm's own column semantics
  *     (published_unix = the publish moment NOW, num_commits = the real
  *     count, title/note EMPTY — upstream's divergence from the push mint,
  *     services/releases.ts createNewTagRecord); an existing ref with no row
- *     RIDES (createTag's IsTagExist, release.go:83 — no write, no protected
+ *     RIDES (createTag's IsTagExist, release.go:86 — no write, no protected
  *     check, no ref events) and still mints;
  *   - DELETE refuses a tag that has a release attached with 409 "a tag
  *     attached to a release cannot be deleted directly" (the releases table
@@ -101,15 +101,15 @@ import { emitRefWebhook, readTagData, renderAnnotatedTag, renderTag, resolveTagT
  * pusher_type "user"). The sender is the authenticated API caller (upstream's
  * `pusher` doer); the repository renders with the caller's viewer, like every
  * api-routes emission. Upstream's API tag create/delete additionally fire a
- * zero-commit `push` event around the create/delete pair (release.go:136-143
- * / :396-403, always push first). The CREATE pair carries the corrected
+ * zero-commit `push` event around the create/delete pair (release.go:138-145
+ * / :421-428, always push first). The CREATE pair carries the corrected
  * SPEC-0005 §2.3 shape (tagCreatePushPayload below — the git-push tag arm's
  * exact shape, emitUserPushCreatedRef: head_commit = the PEELED tip commit,
  * compare_url = `compare/{zero}...{raw tip}`, push FIRST then create — the
  * W5 follow-up; the zero-list mirror shape it replaces rode the mirror path's
  * headless payload). The DELETE pair stays the zero-commit shape
  * (zeroCommitPushPayload): upstream's delete PushCommits is the bare
- * NewPushCommits() with no head (release.go:396-403, push.go:100-110).
+ * NewPushCommits() with no head (release.go:421-428, push.go:100-110).
  */
 
 const notFoundResponse = {
@@ -202,8 +202,8 @@ async function tagsByCreatorDate(c: Context<ApiEnv>, pair: { ownerNamespace: str
  * attached to a release cannot be deleted directly" (tag.go:265-268); a
  * tag-only row (a converted release — R2's is_tag conversion) rides the
  * delete to its full DeleteReleaseByID(delTag=true) cascade, ROW included
- * (release.go:388-434). The CREATE route's duplicate gate is the same table
- * read: CreateNewTag's `IsReleaseExist` (services/release/release.go:224-232)
+ * (release.go:398-433). The CREATE route's duplicate gate is the same table
+ * read: CreateNewTag's `IsReleaseExist` (services/release/release.go:255-263)
  * — ANY row for the lower name answers ErrTagAlreadyExists.
  */
 async function findReleaseRecord(d1: D1Database, repoId: string, tagName: string) {
@@ -256,7 +256,7 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   // → `!tag.IsTag` → 409, tag.go:247-268). A TAG-ONLY record (R2's is_tag
   // conversion) does NOT conflict — upstream's delete proceeds through
   // DeleteReleaseByID(delTag=true), which removes the record beside the ref
-  // (release.go:388-412) — the sweep runs after the ref CAS below.
+  // (release.go:413-433) — the sweep runs after the ref CAS below.
   const record = await findReleaseRecord(c.env.DB, pair.repo.id, tagName);
   if (record !== undefined && !record.isTag) {
     throw new ApiError(409, "a tag attached to a release cannot be deleted directly");
@@ -264,7 +264,7 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
   // A missing ref with a release row is NOT a 404: upstream's `git tag -d`
   // tolerates the "not found" error and the delTag flow PROCEEDS — events
-  // then row delete (release.go:389-393). Only the rowless pair (no record,
+  // then row delete (release.go:413-433). Only the rowless pair (no record,
   // no ref) 404s here (upstream's GetRelease miss, routers/api/v1/repo/
   // tag.go:267-273).
   if (tip === undefined && record === undefined) {
@@ -272,7 +272,7 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   }
   // Protected-tag enforcement runs FIRST — before the ref-delete decision —
   // (upstream DeleteReleaseByID's delTag arm checks IsUserAllowedToControlTag
-  // BEFORE `git tag -d`, services/release/release.go:376-387, answered 422
+  // BEFORE `git tag -d`, services/release/release.go:399-412, answered 422
   // "user not allowed to delete protected tag", routers/api/v1/repo/tag.go:
   // 281-285), so it guards the missing-ref arm exactly like the delete arm.
   // The rowless pure-ref arm rides the same check (no upstream analog — that
@@ -283,7 +283,7 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   }
   // The CAS delete rides only when the ref exists; the missing-ref arm
   // skips straight to the events + row delete (upstream's tolerated
-  // `git tag -d` failure, release.go:389-393).
+  // `git tag -d` failure, release.go:413-433).
   let deleted = false;
   if (tip !== undefined) {
     const result = await engineCell(c.env, pair.repo).deleteApiRef({ ref: tagRef(tagName), expectedOid: tip.target });
@@ -297,21 +297,21 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   // The missing-ref arm proceeds WITH its events when a record exists.
   const missingRefArm = tip === undefined && record !== undefined;
   // The tag-only record goes WITH the ref (upstream's delTag=true branch:
-  // `git tag -d` then `DeleteByID[Release]`, release.go:388-412; the ledger
+  // `git tag -d` then `DeleteByID[Release]`, release.go:413-433; the ledger
   // R2 note "tags-API delete finds it"). Upstream's delTag arm deletes ONLY
   // the row here (its attachment/reaction sweeps and the storage loop are
   // shared tail code this bare tag-record delete rides too — a converted
   // record's assets were already swept at the release delete that converted
   // it, so the bare row delete is the complete cascade for the states our
   // tree can reach). The missing-ref arm deletes the row too (upstream's
-  // DeleteByID runs after the tolerated tag -d, release.go:405-407).
+  // DeleteByID runs after the tolerated tag -d, release.go:430-433).
   if (record !== undefined && record.isTag) {
     await drizzle(c.env.DB).delete(releases).where(eq(releases.id, record.id));
   }
   // Upstream's API tag delete fires the zero-commit `push` event too
-  // (release.go:395-403 — PushCommits with OldCommitID = rel.Sha1 — the
-  // PEELED commit id set at release.go:150-151, NOT the raw tag-object oid
-  // — and the empty NewCommitID, then DeleteRef :403). The event fires on
+  // (release.go:421-428 — PushCommits with OldCommitID = rel.Sha1 — the
+  // PEELED commit id set at release.go:155, NOT the raw tag-object oid
+  // — and the empty NewCommitID, then DeleteRef :428). The event fires on
   // the missing-ref arm as well (upstream's PushCommits/DeleteRef sit after
   // the tolerated tag -d). before = the ROW's sha1, falling back to the ref
   // tip when the row never carried one (empty/null), and the zero oid when
@@ -401,7 +401,7 @@ function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: s
  * likewise the RAW ref tip (the PushUpdateOptions.NewCommitID — the tag
  * object oid for an annotated tag), while the RELEASE surfaces pass their
  * pre-peel commit oid (createTag's PushUpdateOptions carries
- * commit.ID.String(), release.go:129-133) — the caller picks. The commit
+ * commit.ID.String(), release.go:140-142) — the caller picks. The commit
  * render is emitUserPushCreatedRef's exact shape (toPayloadCommit + the
  * added/removed/modified enrichment, head_commit matched by id, null on a
  * failed read — the push arm's dirty-data tolerance skips BOTH events there;
@@ -411,9 +411,9 @@ function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: s
  *
  * `sender` is the PUBLISHER (R2-L7): upstream createTag notifies with
  * `rel.Publisher` — PushCommits' pusher AND sender plus CreateRef's sender
- * are that one identity (services/release/release.go:136-143, the
+ * are that one identity (services/release/release.go:138-145, the
  * notifier.go:821/:852 renders) — and `rel.Publisher` is set at insert
- * (CreateNewTag's `Publisher: doer`, release.go:243-244) and never re-bound by
+ * (CreateNewTag's `Publisher: doer`, release.go:274-275) and never re-bound by
  * an edit, so the release surfaces thread the ROW's publisher here instead
  * of the calling context. On THIS (tags API) surface publisher == doer ==
  * the authenticated caller.
@@ -560,12 +560,12 @@ export function registerTagRoutes(
       const commitSha = resolved.commitSha;
 
       // The duplicate gate, upstream's order (CreateTag → CreateNewTag's
-      // `IsReleaseExist` — models/repo/release.go:160-166's LOWER_TAG_NAME
+      // `IsReleaseExist` — models/repo/release.go:160-165's LOWER_TAG_NAME
       // lookup over the releases table, ANY row kind, R3; answered
       // ErrTagAlreadyExists → 409 `err.Error()` = "tag already exists
-      // [name: X]" (services/release/release.go:212-217 + tag.go:212-214,
+      // [name: X]" (services/release/release.go:241-248 + tag.go:212-214,
       // R16-a's suffix)). The git REF existence is NOT a second gate here —
-      // upstream's createTag rides an existing ref (release.go:83
+      // upstream's createTag rides an existing ref (release.go:86
       // `IsTagExist`: skip the write, `created = false`, no notifications)
       // and CreateNewTag still INSERTS the row (the B-54 mint below) — a
       // pushed-but-rowless tag POSTs into a ride + mint, never a 409.
@@ -578,18 +578,18 @@ export function registerTagRoutes(
       let newTarget: string;
       let mintCommitSha: string;
       if (existingTip !== undefined) {
-        // The ride arm (createTag's IsTagExist, release.go:83): no write, no
+        // The ride arm (createTag's IsTagExist, release.go:86): no write, no
         // protected check (upstream's IsUserAllowedToControlTag sits INSIDE
         // the !IsTagExist branch), no ref events (`created = false` skips
-        // the notify block, release.go:127-148). The mint's fill reads the
+        // the notify block, release.go:86-146). The mint's fill reads the
         // REF's commit — upstream's GetTagCommit(rel.TagName) peels the tag
-        // NAME (release.go:148), not the request's resolved target.
+        // NAME (release.go:150), not the request's resolved target.
         newTarget = existingTip.target;
         mintCommitSha = existingTip.peeled ?? existingTip.target;
       } else {
         // Protected-tag enforcement on the create arm (upstream CreateTag →
         // release_service.CreateNewTag's IsUserAllowedToControlTag check,
-        // services/release/release.go:87-102, answered 422 "user not allowed
+        // services/release/release.go:92-105, answered 422 "user not allowed
         // to create protected tag", routers/api/v1/repo/tag.go:224-227 — the
         // check runs after the duplicate arm, inside createTag's
         // !IsTagExist branch, exactly here). An unresolvable viewer id
@@ -622,7 +622,7 @@ export function registerTagRoutes(
         mintCommitSha = commitSha;
 
         // Upstream's API tag create fires the zero-commit `push` event around
-        // the `create` event (services/release/release.go:136-143 — PushCommits
+        // the `create` event (services/release/release.go:138-145 — PushCommits
         // :136 first, CreateRef :143, BOTH carrying rel.Publisher). The push
         // payload is the §2.3 tag-create shape (tagCreatePushPayload, the W5
         // correction): before = the zero oid, after = the new ref tip — the
@@ -630,9 +630,9 @@ export function registerTagRoutes(
         // commit and compare/{zero}...{raw tip}; the create event's `sha` stays
         // the raw tip (the push path's `Sha: refID` semantics, the module
         // header). The publisher IS the doer on this surface (CreateNewTag's
-        // `Publisher: doer`, release.go:243-244). The RIDE arm emits nothing
+        // `Publisher: doer`, release.go:274-275). The RIDE arm emits nothing
         // (created = false) — the events sit inside createTag's
-        // !IsTagExist branch, release.go:127-148.
+        // !IsTagExist branch, release.go:86-146.
         await emitRefWebhook(c, pair, "push", await tagCreatePushPayload(c, pair, tagRef(name), ZERO_OID, newTarget, commitSha, doer), tagRef(name));
 
         // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
@@ -655,15 +655,15 @@ export function registerTagRoutes(
         );
       }
 
-      // The B-54 mint — CreateNewTag's db.Insert (release.go:261), AFTER the
+      // The B-54 mint — CreateNewTag's db.Insert (release.go:287), AFTER the
       // ref write and the notifications (createTag runs first, release.go:
-      // 259). The row's column semantics are this arm's own (upstream's
+      // 284). The row's column semantics are this arm's own (upstream's
       // divergence from the push mint, ported verbatim): PublishedUnix = the
-      // publish moment NOW (createTag's zero arm :145-147), NumCommits = the
+      // publish moment NOW (createTag's zero arm :147-149), NumCommits = the
       // real count, Title/Note EMPTY (msg is never copied into the row
       // here), created_unix = the REF's commit's committer time, sha1 = the
       // peeled commit, Target = the request's resolved commit (rel.Target
-      // = commit, release.go:250 — the ride arm can carry a different
+      // = commit, release.go:277 — the ride arm can carry a different
       // commit than the ref). A failed insert leaves the tag in git —
       // upstream's wedge, faithfully (the retry 409s on the row lookup).
       await createNewTagRecord({

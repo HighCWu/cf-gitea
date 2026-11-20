@@ -1,0 +1,1 @@
+ALTER TABLE `repositories` ADD `latest_release_id` integer DEFAULT 0 NOT NULL;

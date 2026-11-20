@@ -341,6 +341,28 @@ export const repositories = sqliteTable(
     trustModel: text("trust_model", {
       enum: ["default", "collaborator", "committer", "collaboratorcommitter"],
     }),
+    // -------------------------------------------------------------------------
+    // Latest-release pointer (RE-PIN wave REPIN-RELEASE, upstream a5201dc427
+    // "feat(release): allow setting a release as the latest"). Kept LAST like
+    // fork_parent/is_mirror/is_template/size_kb/num_stars/num_watches/
+    // num_forks above — ALTER TABLE ADD COLUMN physically appends, so the
+    // table_info order stays the migration order. The repositories TABLE
+    // block is the repo.go-family's; this COLUMN is the release family's
+    // write path (only the release flows touch it — disclosed shared-file
+    // integration, reported to the orchestrator).
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.LatestReleaseID int64 xorm:"NOT NULL DEFAULT 0"`
+     *  (models/repo/repo.go:212 — "0 selects the latest release by date"):
+     *  the explicit latest pointer GitHub's make_latest models. Written ONLY
+     *  by the release family's setLatestReleaseId/unsetLatestReleaseId
+     *  (services/release/release.go ports: SetLatestReleaseID /
+     *  UnsetLatestReleaseID, models/repo/release.go:373-390); read by
+     *  findLatestRelease's pointer-first lookup (GetLatestRelease,
+     *  release.go:346-357 — pointer resolved through the stable-release
+     *  condition, else the newest-by-date fallback). NOT NULL DEFAULT 0:
+     *  the ALTER backfills pre-existing rows to 0 (the date-order default,
+     *  exactly upstream's pre-migration rows). */
+    latestReleaseId: integer("latest_release_id").notNull().default(0),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -3610,7 +3632,7 @@ export const projectWorkflows = sqliteTable(
  * /repos/{owner}/{repo}/tag_protections (api/routes/tag-protections.ts); the
  * enforcement arms are the pre-receive tag walk (routers/private/
  * hook_pre_receive.go preReceiveTag:308-339) and the API tag create/delete
- * path (services/release/release.go:87-102/:376-390).
+ * path (services/release/release.go:90-105/:376-390).
  *
  * The two allowlists carry upstream's `xorm:"JSON TEXT"` encoding — JSON
  * arrays in TEXT columns. NO UNIQUE(repo_id, name_pattern): upstream declares

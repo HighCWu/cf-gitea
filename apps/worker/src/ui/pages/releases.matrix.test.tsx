@@ -569,14 +569,57 @@ describe("the create round-trips (prerelease + draft flags)", () => {
 
     expect((await drizzle(env.DB).select({ id: releases.id }).from(releases).all()).length).toBe(0);
   });
+
+  it("renders the make_latest checkbox on the form and pins repositories.latest_release_id when checked (a5201dc427 — new.tmpl:120-127)", async () => {
+    const { repo, ownerCookie } = await theFixture();
+
+    // The GET form carries the checkbox (the writer arm renders it unchecked
+    // — upstream's .make_latest defaults false on the create form).
+    const form = await fetchUi("/relmx-owner/rel/releases/new", { headers: { cookie: ownerCookie } });
+    expect(form.status).toBe(200);
+    expect(await form.text()).toContain('name="make_latest"');
+
+    // Checked → makeLatest "true" → the create PINS the pointer
+    // (NewReleasePost's util.Iif(form.MakeLatest, MakeLatestTrue, "")).
+    const res = await postArm("/relmx-owner/rel/releases/new", ownerCookie, {
+      tag_name: "pinned-via-form",
+      tag_target: "main",
+      title: "Pinned",
+      make_latest: "on",
+    });
+    expect(res.status).toBe(303);
+    const pinnedRow = await findReleaseByTag(env.DB, repo.id, "pinned-via-form");
+    const repoRows = await drizzle(env.DB).select().from(repositories).all();
+    const pinnedRepo = repoRows.find((r) => r.id === repo.id);
+    expect(pinnedRepo?.latestReleaseId).toBe(pinnedRow?.id);
+
+    // Unchecked edit of the pinned release → the legacy switch unsets
+    // (release.go:637-642 — form unchecked + the row IS the current latest →
+    // MakeLatestLegacy → the pointer clears, date order resumes).
+    const edit = await postArm("/relmx-owner/rel/releases/edit/pinned-via-form", ownerCookie, {
+      title: "Pinned",
+      content: "Unpinning via the unchecked checkbox.",
+    });
+    expect(edit.status).toBe(303);
+    const repoRowsAfter = await drizzle(env.DB).select().from(repositories).all();
+    expect(repoRowsAfter.find((r) => r.id === repo.id)?.latestReleaseId).toBe(0);
+    // Cell hygiene: the created tag leaves the SHARED cached cell (the F9
+    // count pins read the engine refs/tags universe) and the D1 rows leave
+    // the shared fixtures' list views.
+    await deleteRelmxTagRef("pinned-via-form");
+    await drizzle(env.DB).delete(releaseAssets).where(eq(releaseAssets.releaseId, pinnedRow!.id));
+    await drizzle(env.DB).delete(releases).where(eq(releases.id, pinnedRow!.id));
+  });
 });
 
 describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
-  it("publishing a draft whose tag already exists rides it and maps to updated (upstream's isTagCreated=false fork, release.go:361-367)", async () => {
+  it("publishing a draft whose tag already exists rides it and STILL maps to published (53aafd7ee1: the fork keys on oldRelease.IsDraft, release.go:385-391 — the tag arm stopped driving it)", async () => {
     const { repo, ownerCookie } = await theFixture();
     // The fixture's v1 IS in git (seeded at the root commit) — the publish's
-    // createTag re-run RIDES it (release.go:83 IsTagExist) and the notifier
-    // fork stays on UpdateRelease/"updated".
+    // createTag re-run RIDES it (release.go:83 IsTagExist); the notifier fork
+    // keys on the OLD row's draft state, so a publish-from-draft maps to
+    // NewRelease/"published" even on the ride arm (it was isTagCreated-gated
+    // "updated" before 53aafd7ee1).
     await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Draft v1", isDraft: true });
     expect((await fetchUi("/relmx-owner/rel/releases/tag/v1")).status).toBe(404);
 
@@ -602,7 +645,7 @@ describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
     expect(row?.createdAt?.toISOString()).toBe(new Date(T0 * 1000).toISOString());
     const delivery = (await releaseDeliveries())[0];
     expect(delivery?.eventType).toBe("release");
-    expect(delivery?.payloadContent).toContain('"updated"');
+    expect(delivery?.payloadContent).toContain('"published"');
     expect(delivery?.payloadContent).toContain("v1");
     // The round-trip closes: the anonymous viewer sees the release now.
     expect((await fetchUi("/relmx-owner/rel/releases/tag/v1")).status).toBe(200);

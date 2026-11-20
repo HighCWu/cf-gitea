@@ -59,10 +59,29 @@ export const releaseListSchema = z.array(releaseSchema);
 
 export type ReleaseList = z.infer<typeof releaseListSchema>;
 
+/**
+ * `#/definitions/MakeLatest` (modules/structs/release.go:46-54, a5201dc427):
+ * `"true"` sets the release as the latest, `"false"` keeps the current
+ * latest, `"legacy"` returns to the newest stable release by date. The
+ * binding is `In(,true,false,legacy)` — the EMPTY string is admitted and
+ * behaves as omitted (the date-order default arms), so the schema union
+ * carries it; any other value is the binding's 422 (validationError).
+ */
+export const makeLatestSchema = z
+  .union([z.enum(["true", "false", "legacy"]), z.literal("")])
+  .optional()
+  .openapi({
+    description:
+      '"true" sets the release as the latest, "false" keeps the current latest, "legacy" returns to the newest stable release by date. If omitted, a newly published release becomes the latest only if it is the newest by date',
+  });
+
+export type MakeLatest = z.infer<typeof makeLatestSchema>;
+
 /** `#/definitions/CreateReleaseOption` — `tag_name` required. */
 export const createReleaseOptionSchema = z.object({
   body: z.string().optional().openapi({ description: "The release notes or description" }),
   draft: z.boolean().optional().openapi({ description: "Whether to create the release as a draft" }),
+  make_latest: makeLatestSchema,
   name: z.string().optional().openapi({ description: "The display title of the release" }),
   prerelease: z.boolean().optional().openapi({ description: "Whether to mark the release as a prerelease" }),
   tag_message: z.string().optional().openapi({ description: "The message for the git tag" }),
@@ -82,6 +101,7 @@ export type CreateReleaseOption = z.infer<typeof createReleaseOptionSchema>;
 export const editReleaseOptionSchema = z.object({
   body: z.string().optional().openapi({ description: "The new release notes or description" }),
   draft: z.boolean().optional().openapi({ description: "Whether to change the draft status" }),
+  make_latest: makeLatestSchema,
   name: z.string().optional().openapi({ description: "The new display title of the release" }),
   prerelease: z.boolean().optional().openapi({ description: "Whether to change the prerelease status" }),
   tag_name: z.string().optional().openapi({ description: "The new name of the git tag" }),

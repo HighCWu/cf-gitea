@@ -35,6 +35,7 @@ import {
   listReleases,
   releasePublisherSender,
   toApiRelease,
+  toReleaseChanges,
 } from "../services/releases";
 import { emitRefWebhook } from "../services/tags";
 import { tagCreatePushPayload } from "./tags";
@@ -64,34 +65,45 @@ import { tagCreatePushPayload } from "./tags";
  *   - POST/PATCH: 500 on an ARCHIVED repo — the release subtree registers NO
  *     route-level mustNotBeArchived (api.go:1408-1429, unlike topics/
  *     contents), so the 423 middleware never fires; the refusal is createTag's
- *     in-service MustNotBeArchived arm (services/release/release.go:75-78,
- *     reached by both CreateRelease release.go:187 and UpdateRelease
- *     release.go:269), which neither handler maps — ctx.APIErrorInternal →
- *     500 (release.go:285-287 / :379-382). Upstream's own vendored contract
+ *     in-service MustNotBeArchived arm (services/release/release.go:78-81,
+ *     reached by both CreateRelease release.go:214 and UpdateRelease
+ *     release.go:300), which neither handler maps — ctx.APIErrorInternal →
+ *     500 (release.go:281-283 / :375-378). Upstream's own vendored contract
  *     declares no 500 either; untyped here, the house 500 body.
  *
  * Engine boundary (the N2 wave + the UpdateRelease tag wave): creating AND
  * editing a release land the git tag through the shared tag-store service
  * (upstream CreateRelease → createTag for the create; UpdateRelease's
- * re-run of createTag, release.go:269, for the edit — publish-from-draft
+ * re-run of createTag, release.go:300, for the edit — publish-from-draft
  * lands the missing tag, a tag_name rename lands the NEW ref while the old
- * ref stays (upstream deletes tags only in DeleteReleaseByID, release.go:388),
+ * ref stays (upstream deletes tags only in DeleteReleaseByID, release.go:413),
  * and every published edit re-fills sha1/created/num_commits); DELETE does
  * not delete the ref (the API passes delTag=false) and CONVERTS the row to
- * `is_tag = true` instead of dropping it (release.go:414-417 — a re-create
+ * `is_tag = true` instead of dropping it (release.go:433-439 — a re-create
  * keeps the id, the tags-API delete finds the record, the R2 asset objects
  * are swept beside the rows; the ledger R2+R4 thread).
  *
  * Webhook triggers (`release`, upstream services/webhook/notifier.go
- * sendReleaseHook:879 ← NewRelease:889 / UpdateRelease:893 / DeleteRelease:897,
- * callers services/release/release.go:198,363,366,437): every mutation emits
+ * sendReleaseHook:889 ← NewRelease:907 / UpdateRelease:911 / DeleteRelease:915,
+ * callers services/release/release.go:229,387,390,469): every mutation emits
  * through emitWebhookDeliveries — see emitReleaseWebhook. Upstream gates ALL
- * three actions on `!rel.IsDraft` (release.go:198,358,435): drafts emit
- * nothing, including on delete. Action mapping: create → "published";
- * edit → "updated", EXCEPT an edit that CREATED the tag (isTagCreated — the
- * publish-from-draft whose tag was missing, or a rename onto a fresh name;
- * upstream reaches the same fork at release.go:361-367) and therefore maps
- * to "published"; delete → "deleted".
+ * three actions on `!rel.IsDraft` (release.go:228,385,468): drafts emit
+ * nothing, including on delete. Action mapping (SINCE 53aafd7ee1 the fork
+ * keys on the OLD row's draft state, release.go:385-391): create →
+ * "published"; edit → "updated" unless the edit PUBLISHED a draft or
+ * converted a tag record (both → NewRelease/"published") — a tag-CREATING
+ * rename between two published states is an "updated" now, the createTag
+ * `created` flag no longer drives the fork; delete → "deleted". The
+ * "updated" payload carries `changes` (ToReleaseChanges — the old title/
+ * note/tag_name, convert/release.go:36-49). SENDER (also 53aafd7ee1):
+ * sendReleaseHook now takes the DOER for ALL three actions (:889-905 —
+ * NewRelease passes `doer` where it passed `rel.Publisher` before), so the
+ * "published" sender is the publishing caller, not the stored publisher.
+ * The latest-release POINTER (a5201dc427): create/edit move it through
+ * UpdateLatestRelease (release.go:224/:322), delete unsets it (:441-443),
+ * and the latest read is pointer-first (models/repo/release.go:345-356).
+ * A real-release delete lands the `repository:release:remove` audit row
+ * (release.go:465-467, 3f1b738f09).
  *
  * Activity feeds (specs/activity-feeds.md §3.3): the publish_release
  * `action` row rides the same emitReleaseEvent seam — published only,
@@ -259,58 +271,63 @@ function releasePayload(
  * The post-mutation emit shared by the three write routes. `row` is the
  * release state the payload renders (post-edit for PATCH, the deleted row for
  * DELETE); drafts stay silent per the upstream `!rel.IsDraft` gate
- * (release.go:198,358,435). `assets` preloads the attachment rows the
+ * (release.go:228,385,468). `assets` preloads the attachment rows the
  * payload renders — the DELETE arm passes the rows deleteRelease read
  * before wiping them, because upstream's DeleteReleaseByID loads
  * Attachments in LoadAttributes BEFORE DeleteAttachmentsByRelease and the
- * notification still renders them (release.go:418-424).
+ * notification still renders them (release.go:446-453). `changes` rides the
+ * "updated" payload only (sendReleaseHook's Changes argument — nil on
+ * published/deleted, ToReleaseChanges on updated, notifier.go:889-917).
  *
  * Activity-feed leg (specs/activity-feeds.md §3.3): ONLY the "published"
  * action records a row — upstream's actionNotifier has a NewRelease method
- * and no UpdateRelease/DeleteRelease ones (services/feed/notifier.go:458-477:
+ * and no UpdateRelease/DeleteRelease ones (services/feed/notifier.go:
  * ActionPublishRelease, content = rel.Title, ref_name =
  * git.RefNameFromTag(rel.TagName).String() = `refs/tags/<tag>`). act_user is
- * the RELEASE PUBLISHER (rel.PublisherID), NOT the flipping doer — the
- * draft→published PATCH keeps the original publisher. Same caught-and-logged
- * posture as the webhook fan-out, awaited inline.
+ * the DOER since 53aafd7ee1 (`NewRelease(ctx, doer, rel)` — ActUserID:
+ * doer.ID, feed/notifier.go; it was `rel.PublisherID` before), so the
+ * publish-from-draft PATCH credits the flipping caller. Same
+ * caught-and-logged posture as the webhook fan-out, awaited inline.
  *
- * Sender identity (R2-L7): the payload's sender mirrors the notifier's doer
- * argument — NewRelease passes `rel.Publisher` (notifier.go:889-890, the
- * "published" arm), UpdateRelease/DeleteRelease pass the DOER (notifier.go
- * :893-899, "updated"/"deleted"). So "published" renders the ROW's
- * publisher (releasePublisherSender — LoadAttributes' ghost swap on a
- * missing row), the other actions the editing caller, unchanged.
+ * Sender identity (R2-L7, UPDATED by 53aafd7ee1): sendReleaseHook's doer
+ * argument IS the sender (convert.ToUser(ctx, doer, nil), notifier.go:901)
+ * for ALL three actions now — NewRelease stopped passing `rel.Publisher`
+ * (services/release/release.go:257 passes the doer like the other arms), so
+ * every action renders the editing caller.
  */
 async function emitReleaseEvent(
   c: Context<ApiEnv>,
   found: RepositoryWithOwner,
   row: ReleaseRow,
   action: string,
-  assets?: ReleaseAssetRow[],
+  options?: { assets?: ReleaseAssetRow[]; changes?: Record<string, { from: string }> },
 ): Promise<void> {
   if (row.isDraft) {
     return; // upstream emits nothing for drafts (any action)
   }
   const repository = toApiRepository(viewerOf(c), found);
+  const payload: Record<string, unknown> = releasePayload(
+    action,
+    await toApiRelease(c.env.DB, viewerOf(c), found, row, options?.assets),
+    repository,
+    c.get("authUser"),
+  );
+  if (options?.changes !== undefined && action === "updated") {
+    payload.changes = options.changes; // ReleasePayload.Changes, hook.go:337
+  }
   await emitReleaseWebhook(c, {
     repoId: found.repo.id,
     ownerId: found.repo.ownerId,
     eventType: "release",
-    payload: releasePayload(
-      action,
-      await toApiRelease(c.env.DB, viewerOf(c), found, row, assets),
-      repository,
-      action === "published"
-        ? await releasePublisherSender(c.env.DB, row.publisherId, viewerOf(c).origin)
-        : c.get("authUser"),
-    ),
+    payload,
   });
   if (action !== "published") {
     return; // updated/deleted write no action upstream (no notifier method)
   }
+  const doer = c.get("authUser");
   try {
     await recordAction(c.env.DB, {
-      actUserId: row.publisherId,
+      actUserId: doer?.id ?? row.publisherId,
       repoId: found.repo.id,
       opType: ActionType.PublishRelease,
       isPrivate: repository.private === true,
@@ -381,7 +398,7 @@ const getLatestReleaseRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     path: "/repos/{owner}/{repo}/releases/latest",
     middleware: [optionalAuth],
     tags: ["repository"],
-    summary: "Gets the most recent non-prerelease, non-draft release of a repository, sorted by created_at",
+    summary: "Gets the release set as latest, else the most recent non-prerelease, non-draft release of a repository by created_at",
     operationId: "repoGetLatestRelease",
     request: { params: z.object(ownerRepoParams) },
     responses: {
@@ -537,6 +554,10 @@ export function registerReleaseRoutes(
           note: form.body ?? "",
           isDraft: form.draft === true,
           isPrerelease: form.prerelease === true,
+          // GitHub's make_latest (a5201dc427): "true" pins the latest
+          // pointer here, "false" keeps it, "" /"legacy" ride the date arms
+          // (UpdateLatestRelease, release.go:224 — wasEligible false).
+          makeLatest: form.make_latest ?? "",
         });
         row = created.row;
         tagCreated = created.tagCreated;
@@ -548,10 +569,10 @@ export function registerReleaseRoutes(
         throw error;
       }
       // The ref-webhook pair for a freshly created tag — upstream's
-      // createTag emission (services/release/release.go:125-148): PushCommits
-      // FIRST (:136) with head_commit = the tagged COMMIT (its
-      // `commits.HeadCommit = CommitToPushCommit(commit)`, :128) and a
-      // `compare/{zero}...{commit}` compare URL (:129), THEN CreateRef (:143)
+      // createTag emission (services/release/release.go:129-146): PushCommits
+      // FIRST (:138) with head_commit = the tagged COMMIT (its
+      // `commits.HeadCommit = CommitToPushCommit(commit)`, :134) and a
+      // `compare/{zero}...{commit}` compare URL (:135), THEN CreateRef (:145)
       // whose `sha` is the COMMIT oid too (`commit.ID.String()` — the
       // release path's pre-peel resolution; R16-e: unlike the tags API
       // (tag.go — which rides the raw ref tip), createTag resolves
@@ -559,9 +580,9 @@ export function registerReleaseRoutes(
       // commit, never the annotated tag object oid). The payload shape is
       // the §2.3 tag-create pair (tagCreatePushPayload — the tags route's
       // corrected builder, emitUserPushCreatedRef's exact shape). Both events
-      // carry rel.Publisher as pusher/sender (:137, :143 — R2-L7); on a
+      // carry rel.Publisher as pusher/sender (:139, :145 — R2-L7); on a
       // create the publisher IS the requester (`PublisherID: doer.ID`,
-      // release.go:243).
+      // release.go:274-275).
       if (tagCreated && tagCommitSha !== undefined) {
         const fullName = tagRef(row.tagName);
         await emitRefWebhook(
@@ -585,7 +606,7 @@ export function registerReleaseRoutes(
           fullName,
         );
       }
-      // Webhook: NewRelease (release.go:198) — drafts stay silent.
+      // Webhook: NewRelease (release.go:229) — drafts stay silent.
       await emitReleaseEvent(c, found, row, "published");
       return c.json(await toApiRelease(c.env.DB, viewer, found, row), 201);
     },
@@ -595,7 +616,11 @@ export function registerReleaseRoutes(
   app.openapi(getLatestReleaseRoute(optionalAuth), async (c) => {
     const found = await requireReleasesRepo(c, c.req.valid("param"));
     const viewer = { origin: new URL(c.req.url).origin, requester: c.get("authUser") ?? null };
-    const row = await findLatestRelease(c.env.DB, found.repo.id);
+    // The pointer-first resolution (repo_model.GetLatestRelease,
+    // models/repo/release.go:345-356 — release.go:113 passes the whole
+    // Repository): the stored latest_release_id wins when it still passes
+    // the stable-release condition, else the newest-by-date fallback.
+    const row = await findLatestRelease(c.env.DB, found.repo);
     if (row === null) {
       throw releaseNotExist();
     }
@@ -626,11 +651,20 @@ export function registerReleaseRoutes(
     assertNotTagRecord(row);
     // DeleteReleaseByID(delTag=false): the row CONVERTS to is_tag=true (the
     // id survives a re-create; the tags-API delete finds it), the asset rows
-    // + R2 objects + reactions go. `assets` are the pre-wipe rows — the
-    // delete payload still renders them (release.go:418-424).
-    const { assets } = await deleteRelease(c.env, c.env.DB, row);
-    // Webhook: DeleteRelease (release.go:437) — drafts stay silent.
-    await emitReleaseEvent(c, found, row, "deleted", assets);
+    // + R2 objects + reactions go, the latest pointer is unset
+    // (release.go:441-443), the audit row lands (release.go:465-467).
+    // `assets` are the pre-wipe rows — the delete payload still renders them
+    // (release.go:446-453).
+    const requester = c.get("authUser");
+    const { assets } = await deleteRelease(c.env, c.env.DB, {
+      repo: found.repo,
+      pair: found.repo,
+      doer: { id: requester?.id ?? 0, username: requester?.username ?? "" },
+      origin: "api",
+      row,
+    });
+    // Webhook: DeleteRelease (release.go:469) — drafts stay silent.
+    await emitReleaseEvent(c, found, row, "deleted", { assets });
     return c.body(null, 204);
   });
 
@@ -662,7 +696,7 @@ export function registerReleaseRoutes(
       // target, unreadable commit) propagate as untyped errors → the
       // handler's 500 "internal server error" — upstream EditRelease maps
       // NONE of UpdateRelease's outcomes (ctx.APIErrorInternal,
-      // release.go:379-382).
+      // release.go:375-378).
       const updated = await editRelease({
         env: c.env,
         d1: c.env.DB,
@@ -677,6 +711,9 @@ export function registerReleaseRoutes(
           note: form.body !== undefined && form.body !== "" ? form.body : undefined,
           isDraft: form.draft,
           isPrerelease: form.prerelease,
+          // GitHub's make_latest (a5201dc427): the edit's pointer move rides
+          // wasEligible = the PRE-edit row's CanBeLatest (release.go:322).
+          makeLatest: form.make_latest ?? "",
           now: new Date(),
         },
       });
@@ -691,14 +728,14 @@ export function registerReleaseRoutes(
         return c.json(await toApiRelease(c.env.DB, viewer, found, fresh), 200);
       }
       // The ref-webhook pair when the edit landed a FRESH tag — the same
-      // createTag emission the create path runs (release.go:125-148, R16-e:
+      // createTag emission the create path runs (release.go:129-146, R16-e:
       // both events carry the PEELED COMMIT — the edit-created tag is
-      // lightweight (msg="", release.go:269) so the tip IS the filled sha1,
+      // lightweight (msg="", release.go:300) so the tip IS the filled sha1,
       // and the payload shape is the §2.3 tag-create pair). Pusher/sender =
-      // rel.Publisher (release.go:137/:143, R2-L7) — UNCHANGED by the edit:
+      // rel.Publisher (release.go:139/:145, R2-L7) — UNCHANGED by the edit:
       // a publish-from-draft (or rename) by a non-publisher still carries
       // the ORIGINAL publisher, not the editing caller (CreateNewTag binds
-      // Publisher at insert, release.go:243-244; UpdateRelease never
+      // Publisher at insert, release.go:274-275; UpdateRelease never
       // re-binds).
       if (updated.tagCreated) {
         const fullName = tagRef(updated.row.tagName);
@@ -719,12 +756,17 @@ export function registerReleaseRoutes(
           fullName,
         );
       }
-      // Webhook: UpdateRelease ("updated", release.go:363) — except an edit
-      // that CREATED the tag (isTagCreated), which upstream maps to
-      // NewRelease/"published" (release.go:366); a draft result stays silent
-      // (emitReleaseEvent's !IsDraft gate). isConvertedFromTag is unreachable
-      // — tag-only records 404 above.
-      await emitReleaseEvent(c, found, updated.row, updated.tagCreated ? "published" : "updated");
+      // Webhook: UpdateRelease's SINCE-53aafd7ee1 fork (release.go:385-391) —
+      // "updated" (with the `changes` payload, ToReleaseChanges over the
+      // PRE-edit row) for every published edit that neither converted a tag
+      // record nor published a draft; "published" (NewRelease) for a
+      // publish-from-draft. A tag-CREATING rename between two published
+      // states is an "updated" now — the createTag `created` flag stopped
+      // driving the fork (it still drives the ref-webhook pair above). A
+      // draft result stays silent (emitReleaseEvent's !IsDraft gate);
+      // isConvertedFromTag is unreachable — tag-only records 404 above.
+      const changes = toReleaseChanges(updated.row, row);
+      await emitReleaseEvent(c, found, updated.row, row.isDraft ? "published" : "updated", { changes });
       return c.json(await toApiRelease(c.env.DB, viewer, found, updated.row), 200);
     },
     releaseBodyHook,
@@ -735,11 +777,19 @@ export function registerReleaseRoutes(
     await requireReleaseWriter(c, found);
     const { id } = c.req.valid("param");
     const row = await requireReleaseById(c, found.repo.id, id);
-    // DeleteReleaseByID(delTag=false) — the is_tag conversion (see the
-    // by-tag arm's note); the payload carries the pre-wipe assets.
-    const { assets } = await deleteRelease(c.env, c.env.DB, row);
-    // Webhook: DeleteRelease (release.go:437) — drafts stay silent.
-    await emitReleaseEvent(c, found, row, "deleted", assets);
+    // DeleteReleaseByID(delTag=false) — the is_tag conversion + pointer
+    // unset + audit row (see the by-tag arm's note); the payload carries the
+    // pre-wipe assets.
+    const requester = c.get("authUser");
+    const { assets } = await deleteRelease(c.env, c.env.DB, {
+      repo: found.repo,
+      pair: found.repo,
+      doer: { id: requester?.id ?? 0, username: requester?.username ?? "" },
+      origin: "api",
+      row,
+    });
+    // Webhook: DeleteRelease (release.go:469) — drafts stay silent.
+    await emitReleaseEvent(c, found, row, "deleted", { assets });
     return c.body(null, 204);
   });
 }

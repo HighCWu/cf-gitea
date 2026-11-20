@@ -340,7 +340,7 @@ describe("the delete arm's release coupling (release.go:376-404)", () => {
     expect(rowless.status).toBe(404);
   });
 
-  it("the protected check precedes the missing-ref arm: a protected GHOST tag with a row is the 422, not a silent 204 (release.go:376-387)", async () => {
+  it("the protected check precedes the missing-ref arm: a protected GHOST tag with a row is the 422, not a silent 204 (release.go:399-412)", async () => {
     const repoId = await repoIdOf();
     await seedTagRow(repoId, "protected-ghost", TIP2);
     await drizzle(env.DB).insert(protectedTags).values({
@@ -371,9 +371,9 @@ describe("the delete arm's release coupling (release.go:376-404)", () => {
 // is_tag releases row with THIS arm's divergent columns (published_unix =
 // the publish moment NOW, num_commits = the real count, title/note EMPTY —
 // upstream's own divergence from the push mint), and a pushed-but-rowless
-// ref RIDES (createTag's IsTagExist, release.go:83) instead of 409ing.
+// ref RIDES (createTag's IsTagExist, release.go:86) instead of 409ing.
 // ---------------------------------------------------------------------------
-describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
+describe("the B-54 mint (CreateNewTag's row, release.go:271-288)", () => {
   const repoIdOf = async (): Promise<string> => {
     const row = await drizzle(env.DB)
       .select({ id: repositories.id })
@@ -404,13 +404,13 @@ describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
     expect(row.isDraft).toBe(false);
     expect(row.isPrerelease).toBe(false);
     expect(row.sha1).toBe(TIP1);
-    expect(row.target).toBe(TIP1); // rel.Target = commit (release.go:250)
-    expect(row.numCommits).toBe(1); // the REAL count (release.go:155) — not the push mint's -1
-    expect(row.title).toBe(""); // Title/Note EMPTY (msg never copied — release.go:248-251)
+    expect(row.target).toBe(TIP1); // rel.Target = commit (release.go:277)
+    expect(row.numCommits).toBe(1); // the REAL count (release.go:157) — not the push mint's -1
+    expect(row.title).toBe(""); // Title/Note EMPTY (msg never copied — release.go:271-282)
     expect(row.note).toBe("");
-    expect(row.createdAt?.getTime()).toBe(T0 * 1000); // the commit's committer time (release.go:154)
-    expect(row.publisherId).toBe(OWNER_ID); // PublisherID: doer.ID (release.go:243)
-    // PublishedUnix = the PUBLISH moment (createTag's zero arm :145-147),
+    expect(row.createdAt?.getTime()).toBe(T0 * 1000); // the commit's committer time (release.go:156)
+    expect(row.publisherId).toBe(OWNER_ID); // PublisherID: doer.ID (release.go:274)
+    // PublishedUnix = the PUBLISH moment (createTag's zero arm :147-149),
     // NOT the commit's committer time — the push mint's key divergence.
     expect(row.publishedUnix).toBeGreaterThan(T0);
     // cleanup: the tag delete takes the ref AND the minted row.
@@ -442,7 +442,7 @@ describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
     await send(`${REPO_PATH}/tags/b54-annotated`, authed({ method: "DELETE" }));
   });
 
-  it("a pushed-but-rowless ref RIDES (200, no ref write) and still mints (createTag's IsTagExist, release.go:83)", async () => {
+  it("a pushed-but-rowless ref RIDES (200, no ref write) and still mints (createTag's IsTagExist, release.go:86)", async () => {
     const repoId = await repoIdOf();
     // A ref created OUTSIDE the receive flow (direct cell CAS — no tail, no
     // mint): the shape upstream's legacy arm serves.
@@ -454,8 +454,8 @@ describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
       expect(created.status).toBe(200); // NOT the old ref-existence 409
       const row = await rowFor(repoId, "ride-direct");
       // The fill reads the REF's commit (GetTagCommit(rel.TagName),
-      // release.go:148) while rel.Target keeps the REQUEST's resolution
-      // (release.go:250) — the two differ here on purpose.
+      // release.go:156) while rel.Target keeps the REQUEST's resolution
+      // (release.go:278) — the two differ here on purpose.
       expect(row.sha1).toBe(TIP2);
       expect(row.numCommits).toBe(2);
       expect(row.target).toBe(TIP1);
@@ -466,7 +466,7 @@ describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
     }
   });
 
-  it("the protected check sits INSIDE the fresh arm: a protected rowless ref rides (upstream release.go:83's branch order)", async () => {
+  it("the protected check sits INSIDE the fresh arm: a protected rowless ref rides (upstream release.go:86's branch order)", async () => {
     const repoId = await repoIdOf();
     await drizzle(env.DB).insert(protectedTags).values({
       repoId,
@@ -491,7 +491,7 @@ describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
     }
   });
 
-  it("the duplicate ROW still 409s with the upstream text (IsReleaseExist, release.go:224-232)", async () => {
+  it("the duplicate ROW still 409s with the upstream text (IsReleaseExist, release.go:255-263)", async () => {
     await send(`${REPO_PATH}/tags/b54-dup`, authed({ method: "DELETE" }));
     const first = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "b54-dup", target: TIP1 }));
     expect(first.status).toBe(200);
@@ -504,14 +504,14 @@ describe("the B-54 mint (CreateNewTag's row, release.go:244-261)", () => {
 
 // ---------------------------------------------------------------------------
 // The create arm's sender identity (v1.5.5 R2-L7 threading — services/
-// release/release.go:136-143): createTag notifies with rel.Publisher —
+// release/release.go:138-145): createTag notifies with rel.Publisher —
 // PushCommits' pusher AND sender, CreateRef's sender — and on the tags API
 // the publisher IS the doer (CreateNewTag's `Publisher: doer`, :243-244), so the
 // payload pair carries the authenticated caller. tagCreatePushPayload now
 // takes the sender as a parameter (the release surfaces thread the ROW's
 // publisher); this pins the tags surface's half of the threading.
 // ---------------------------------------------------------------------------
-describe("the create arm's sender threading (release.go:136-143, CreateNewTag :243-244)", () => {
+describe("the create arm's sender threading (release.go:138-145, CreateNewTag :274-275)", () => {
   it("the push payload's pusher/sender and the create payload's sender are the authenticated caller (publisher == doer here)", async () => {
     const repoRow = await drizzle(env.DB)
       .select({ id: repositories.id })

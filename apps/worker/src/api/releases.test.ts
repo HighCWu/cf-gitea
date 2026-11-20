@@ -31,7 +31,7 @@
  * protected-tag 422 message.
  *
  * The kept-open tail (this change) — createTag's post-write fill
- * (release.go:148-158): a published release's row carries sha1 = the tagged
+ * (release.go:155-160): a published release's row carries sha1 = the tagged
  * commit (annotated tags peel), num_commits = the commit depth at it,
  * created_unix = the COMMIT's committer time (rendered straight through the
  * API's created_at); the ride-existing and §2.3 conversion arms fill alike,
@@ -39,10 +39,10 @@
  * row time) until publish.
  *
  * The UpdateRelease tag wave (this change) — the EDIT path runs upstream's
- * createTag re-run (release.go:269): a publish-from-draft lands the missing
+ * createTag re-run (release.go:300): a publish-from-draft lands the missing
  * tag WITH the fill, a tag_name rename lands the NEW ref and leaves the old
  * one orphaned (upstream deletes tags only in DeleteReleaseByID, release.go:
- * 388), a body-only published edit over an existing tag touches no ref (the
+ * 413), a body-only published edit over an existing tag touches no ref (the
  * ride arm), and the untaggable edit arms (unresolvable target, protected
  * tag) answer the upstream UNMAPPED 500 (ctx.APIErrorInternal, release.go:
  * 379-382) with row and refs untouched. The webhook action mapping follows
@@ -51,9 +51,9 @@
  * The assets-render wave (this change) — toApiRelease now loads the
  * release's attachment rows (upstream ToAPIRelease renders Attachments over
  * LoadAttributes → GetReleaseAttachments, models/repo/release.go:111-127,
- * :389-449): list/latest/by-tag/by-id AND the `release` webhook payload
+ * :424-480): list/latest/by-tag/by-id AND the `release` webhook payload
  * carry them, in OUR renderer's asset-id order (the attachment-list route's
- * own read; upstream orders by name, release.go:417), with the uuid
+ * own read; upstream orders by name, release.go:450), with the uuid
  * browser_download_url (upstream's unique-name /releases/download/{tag}/
  * {name} — the release review's R13 finding — rides the v1.5.2 wave).
  */
@@ -66,7 +66,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { protectedTags, releaseAssets, releases, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { auditEvents, protectedTags, releaseAssets, releases, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware } from "./auth";
 import { giteaErrorHandler } from "./errors";
@@ -267,7 +267,7 @@ async function releaseRow(tag: string): Promise<typeof releases.$inferSelect> {
 }
 
 /** The seed commits' committer time (beforeAll's person) — the fill's
- *  created_unix, "dated by its commit" (release.go:154). */
+ *  created_unix, "dated by its commit" (release.go:156). */
 const SEED_COMMIT_ISO = new Date(1761000000 * 1000).toISOString();
 
 describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
@@ -296,7 +296,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect(body.assets).toEqual([]);
   });
 
-  it("409s a duplicate tag with the upstream handler message (R7 — 'Release is has no Tag', release.go:292)", async () => {
+  it("409s a duplicate tag with the upstream handler message (R7 — 'Release is has no Tag', release.go:287)", async () => {
     await seedRelease({ tag: "v1.0.0" });
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
@@ -364,9 +364,9 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
   it("500s an archived repo (createTag's MustNotBeArchived — no route gate, the unmapped APIErrorInternal answer)", async () => {
     // The release subtree registers NO route-level mustNotBeArchived
     // (api.go:1408-1429), so the 423 middleware never fires; the refusal is
-    // createTag's in-service gate (services/release/release.go:75-78), which
+    // createTag's in-service gate (services/release/release.go:78-81), which
     // the create handler maps to ctx.APIErrorInternal → 500
-    // (routers/api/v1/repo/release.go:285-287).
+    // (routers/api/v1/repo/release.go:281-283).
     await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, "7301"));
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
@@ -449,7 +449,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect(await page.text()).toContain("README"); // the repo tree AT the tag rendered
   });
 
-  it("rides an existing git tag without duplicating it (upstream IsTagExist, release.go:78)", async () => {
+  it("rides an existing git tag without duplicating it (upstream IsTagExist, release.go:86)", async () => {
     const before = await makeApp()(`${REPO_PATH}/tags`);
     const beforeList = await before.json<Array<{ name: string }>>();
     expect(beforeList.map((tag) => tag.name)).toContain("ride-tag");
@@ -468,7 +468,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect((await one.json<{ commit: { sha: string } }>()).commit.sha).toBe(RIDE_TAG_TIP); // untouched target
   });
 
-  it("404s 'target not found' on an unresolvable target_commitish and creates NO row (release.go:283)", async () => {
+  it("404s 'target not found' on an unresolvable target_commitish and creates NO row (release.go:279)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -482,7 +482,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect((await makeApp()(`${REPO_PATH}/tags/n2-bad-target`)).status).toBe(404);
   });
 
-  it("defaults the tag to the default branch when target_commitish is omitted (release.go:260-262)", async () => {
+  it("defaults the tag to the default branch when target_commitish is omitted (release.go:255-256)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -495,7 +495,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect((await one.json<{ commit: { sha: string } }>()).commit.sha).toBe(MAIN_TIP);
   });
 
-  it("creates NO git tag for a draft (createTag's !IsDraft gate, release.go:78)", async () => {
+  it("creates NO git tag for a draft (createTag's !IsDraft gate, release.go:85)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -505,7 +505,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect((await makeApp()(`${REPO_PATH}/tags/n2-draft`)).status).toBe(404);
   });
 
-  it("creates an ANNOTATED tag object when tag_message is set (release.go:110-121)", async () => {
+  it("creates an ANNOTATED tag object when tag_message is set (release.go:113-124)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -520,16 +520,16 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
   });
 
   // -----------------------------------------------------------------------
-  // The kept-open tail — createTag's post-write fill (release.go:148-158):
+  // The kept-open tail — createTag's post-write fill (release.go:155-160):
   // for EVERY resolved tag (fresh, ridden, §2.3 conversion) the row's
   // sha1 = the tagged commit, num_commits = the commit depth at it, and
   // created_unix = the COMMIT's committer time (dated by its commit, "so an
-  // old commit does not become the latest release", release.go:154). The
+  // old commit does not become the latest release", release.go:156). The
   // seed's two commits both carry committer time 1761000000 (beforeAll's
   // person), main's depth at its tip is 2 and at ride-tag's root 1.
   // -----------------------------------------------------------------------
 
-  it("fills sha1/num_commits/created from the tagged commit (created arm, release.go:148-158)", async () => {
+  it("fills sha1/num_commits/created from the tagged commit (created arm, release.go:155-160)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -570,7 +570,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO);
   });
 
-  it("converts a tag-only record WITH the fill (§2.3 + release.go:148-158)", async () => {
+  it("converts a tag-only record WITH the fill (§2.3 + release.go:155-160)", async () => {
     const tagOnlyId = await seedRelease({ tag: "fill-conv", isTag: true, minutesOffset: 0 });
     const before = await releaseRow("fill-conv");
     expect(before.createdAt?.toISOString()).toBe("2026-03-01T00:00:00.000Z"); // the tag record's own time, pre-conversion
@@ -587,7 +587,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO); // the fill OVERWRITES the record's creation time
   });
 
-  it("leaves the draft arm unfilled until publish (createTag's else arm, release.go:166-168)", async () => {
+  it("leaves the draft arm unfilled until publish (createTag's else arm, release.go:169-171)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -604,7 +604,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect((await makeApp()(`${REPO_PATH}/tags/fill-draft`)).status).toBe(404);
   });
 
-  it("the ADOPT stamps published_unix with the conversion moment and the doer (isConvertedFromTag, release.go:283-285)", async () => {
+  it("the ADOPT stamps published_unix with the conversion moment and the doer (isConvertedFromTag, release.go:313-315)", async () => {
     const tagOnlyId = await seedRelease({ tag: "adopt-stamp", isTag: true });
     await drizzle(env.DB).update(releases).set({ publishedUnix: 0 }).where(eq(releases.id, tagOnlyId));
     const before = await releaseRow("adopt-stamp");
@@ -622,11 +622,11 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     // The conversion stamps the PUBLISH MOMENT (oldRelease.IsTag && !rel.IsTag
     // → now), overwriting whatever the push mint had put there.
     expect(row.publishedUnix).toBeGreaterThan(1_700_000_000);
-    // The publisher fills from the calling doer (release.go:299).
+    // The publisher fills from the calling doer (release.go:295).
     expect(row.publisherId).toBe(1);
   });
 
-  it("the ADOPT of a draft zeroes published_unix back (the zero-means-draft rule, release.go:281-283)", async () => {
+  it("the ADOPT of a draft zeroes published_unix back (the zero-means-draft rule, release.go:311-313)", async () => {
     const tagOnlyId = await seedRelease({ tag: "adopt-draft", isTag: true });
     await drizzle(env.DB).update(releases).set({ publishedUnix: 1_700_000_000 }).where(eq(releases.id, tagOnlyId));
     const res = await makeApp()(`${REPO_PATH}/releases`, {
@@ -640,7 +640,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect(row.publishedUnix).toBe(0);
   });
 
-  it("the ADOPT's missing-tag write is LIGHTWEIGHT even with tag_message set (UpdateRelease's createTag(\"\") — release.go:269)", async () => {
+  it("the ADOPT's missing-tag write is LIGHTWEIGHT even with tag_message set (UpdateRelease's createTag(\"\") — release.go:300)", async () => {
     await seedRelease({ tag: "adopt-light", isTag: true });
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
@@ -661,7 +661,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     await deleteTagRef("adopt-light"); // the tag-CREATING pin's cleanup (idempotence)
   });
 
-  it("422s the release-specific protected-tag message on a fresh protected tag (release.go:281)", async () => {
+  it("422s the release-specific protected-tag message on a fresh protected tag (release.go:277)", async () => {
     await drizzle(env.DB).insert(protectedTags).values({
       repoId: "7301",
       namePattern: "n2-prot-*",
@@ -785,6 +785,139 @@ describe("GET /repos/{owner}/{repo}/releases/latest (repoGetLatestRelease)", () 
   it("404s a release-less repo", async () => {
     expect((await makeApp()(`${REPO_PATH}/releases/latest`)).status).toBe(404);
   });
+
+  // -----------------------------------------------------------------------
+  // The latest-release POINTER (a5201dc427, GitHub's make_latest): create
+  // with make_latest "true" pins repositories.latest_release_id; the read is
+  // pointer-first (models/repo/release.go:345-356) — the pinned release wins
+  // even when a newer stable one exists. "legacy" (or un-pinning through the
+  // edit switch) returns to date order; delete unsets (:441-443).
+  // -----------------------------------------------------------------------
+
+  it("make_latest=true pins an OLDER release as latest; an omitted make_latest on a NEWER publish lets date order resume (release.go:174 comment's contract)", async () => {
+    const older = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1-pin", name: "Pinned" }),
+    });
+    expect(older.status).toBe(201);
+    const newer = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v2-newer" }),
+    });
+    expect(newer.status).toBe(201);
+    // Equal created_unix in the test cell (one commit) → the id DESC tiebreak
+    // makes v2-newer the date-order latest.
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v2-newer");
+
+    // Pin the OLDER one through the edit surface (make_latest "true").
+    const olderId = (await older.json<{ id: number }>()).id;
+    const pinned = await makeApp()(`${REPO_PATH}/releases/${olderId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ make_latest: "true" }),
+    });
+    expect(pinned.status).toBe(200);
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v1-pin");
+
+    // A NEWER publish with make_latest OMITTED ("") lands newest[0] and the
+    // default arm UNSETS the pointer (UpdateLatestRelease's doc: "omitting it
+    // lets a newly published release become the latest only if it is the
+    // newest by date") — date order resumes.
+    await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v3-newest" }),
+    });
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v3-newest");
+  });
+
+  it("make_latest=legacy unsets the pointer and the newest-by-date release wins again", async () => {
+    const older = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1-pin-legacy" }),
+    });
+    const olderId = (await older.json<{ id: number }>()).id;
+    const newer = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v2-pin-legacy" }),
+    });
+    expect(newer.status).toBe(201);
+    // Pin the OLDER one (id-DESC tiebreak makes v2 the date-order newest).
+    const pinned = await makeApp()(`${REPO_PATH}/releases/${olderId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ make_latest: "true" }),
+    });
+    expect(pinned.status).toBe(200);
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v1-pin-legacy");
+
+    const edited = await makeApp()(`${REPO_PATH}/releases/${olderId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ make_latest: "legacy" }),
+    });
+    expect(edited.status).toBe(200);
+    // The pointer is gone: the date-order fallback answers (v2, the
+    // id-DESC tiebreak winner).
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v2-pin-legacy");
+  });
+
+  it("make_latest=false on the newest publish keeps the PREVIOUS newest as latest (the newest[1] pointer arm, release.go:195-197)", async () => {
+    const first = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1-first" }),
+    });
+    expect(first.status).toBe(201); // date-order default: v1-first becomes latest (pointer 0 arm)
+    const second = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v2-second", make_latest: "false" }),
+    });
+    expect(second.status).toBe(201);
+    // v2-second IS the newest but "false" keeps the current latest: the
+    // pointer pins v1-first (the newest[1] arm — pointer was 0, make_latest
+    // is "false", the newest is this release, two stable releases exist).
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v1-first");
+  });
+
+  it("deleting the pinned release unsets the pointer (release.go:441-443) and date order resumes", async () => {
+    const older = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1-del-pin" }),
+    });
+    const olderId = (await older.json<{ id: number }>()).id;
+    await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v2-del-newer" }),
+    });
+    // Pin the OLDER one (the id-DESC tiebreak's loser) via the edit surface.
+    const pinned = await makeApp()(`${REPO_PATH}/releases/${olderId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ make_latest: "true" }),
+    });
+    expect(pinned.status).toBe(200);
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v1-del-pin");
+
+    expect((await makeApp()(`${REPO_PATH}/releases/${olderId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v2-del-newer");
+  });
+
+  it("rejects a make_latest value outside In(,true,false,legacy) with 422", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v-bad-ml", make_latest: "newest" }),
+    });
+    expect(res.status).toBe(422);
+  });
 });
 
 describe("GET/DELETE /repos/{owner}/{repo}/releases/tags/{tag}", () => {
@@ -874,17 +1007,17 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
 
   // -----------------------------------------------------------------------
   // The UpdateRelease tag wave — every edit re-runs createTag (services/
-  // release/release.go:269) with an EMPTY message, so the edit-created tags
+  // release/release.go:300) with an EMPTY message, so the edit-created tags
   // are always lightweight: a publish-from-draft lands the missing tag AND
-  // the fill (:148-158), a tag_name rename lands the NEW ref and leaves the
-  // OLD one in git (no `tag -d` outside DeleteReleaseByID, release.go:388),
+  // the fill (:155-160), a tag_name rename lands the NEW ref and leaves the
+  // OLD one in git (no `tag -d` outside DeleteReleaseByID, release.go:413),
   // a body-only published edit re-fills through the ride arm, and the
   // untaggable arms (the archived gate, unresolvable target, protected tag)
-  // answer upstream's unmapped 500 (ctx.APIErrorInternal, release.go:379-382)
+  // answer upstream's unmapped 500 (ctx.APIErrorInternal, release.go:375-378)
   // with the row untouched.
   // -----------------------------------------------------------------------
 
-  it("publishing a draft stamps published_at AND lands the tag with the fill (the D1-only publish closes: release.go:269 + :148-158)", async () => {
+  it("publishing a draft stamps published_at AND lands the tag with the fill (the D1-only publish closes: release.go:300 + :155-160)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
       method: "PATCH",
       headers: jsonAuth,
@@ -903,7 +1036,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO); // the COMMIT time, not the edit time
   });
 
-  it("renames the tag: the NEW ref lands and the OLD ref stays (upstream never deletes it — release.go:263-369 has no tag -d)", async () => {
+  it("renames the tag: the NEW ref lands and the OLD ref stays (upstream never deletes it — release.go:294-393 has no tag -d)", async () => {
     // A published release whose git tag EXISTS (the POST path landed it) —
     // the rename must not orphan the old ref by deleting it.
     const created = await makeApp()(`${REPO_PATH}/releases`, {
@@ -933,7 +1066,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect(row.sha1).toBe(MAIN_TIP); // re-filled from the new tag
   });
 
-  it("a body-only edit of a published release with an existing tag touches NO ref (the ride arm, release.go:83)", async () => {
+  it("a body-only edit of a published release with an existing tag touches NO ref (the ride arm, release.go:86)", async () => {
     const created = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
@@ -959,7 +1092,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
 
   it("an unresolvable target on publish aborts the edit with the upstream 500 and the row untouched (GetCommit propagates → APIErrorInternal)", async () => {
     // A draft whose git tag does NOT exist — createTag checks IsTagExist
-    // FIRST (release.go:83), so only a missing tag reaches the target
+    // FIRST (release.go:86), so only a missing tag reaches the target
     // resolution that fails. v7-draft is never landed by any other pin.
     const fresh = await seedRelease({ tag: "v7-draft", isDraft: true, minutesOffset: 9 });
     const res = await makeApp()(`${REPO_PATH}/releases/${fresh}`, {
@@ -976,7 +1109,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect((await makeApp()(`${REPO_PATH}/tags/v7-draft`)).status).toBe(404);
   });
 
-  it("a protected-tag rename answers the 500 too (ErrProtectedTagName is unmapped on the edit surface, release.go:379-382)", async () => {
+  it("a protected-tag rename answers the 500 too (ErrProtectedTagName is unmapped on the edit surface, release.go:375-378)", async () => {
     await drizzle(env.DB).insert(protectedTags).values({
       repoId: "7301",
       namePattern: "prot-*",
@@ -1040,7 +1173,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
       createdAt: new Date(),
     });
     expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
-    // The row SURVIVES as the tag-only record (release.go:414-417) — a
+    // The row SURVIVES as the tag-only record (release.go:433-439) — a
     // re-create keeps the id and the tags-API delete finds it.
     const converted = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).all();
     expect(converted).toHaveLength(1);
@@ -1060,6 +1193,35 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect((await reborn.json<Record<string, unknown>>()).id).toBe(releaseId);
   });
 
+  it("delete lands the repository:release:remove audit row (3f1b738f09 — RecordAs(doer, RepositoryReleaseRemove, repo, \"release\", tag)) and unsets the latest pointer (release.go:441-443/:465-467)", async () => {
+    // Pin THIS describe's seeded release (make_latest "true" over the PATCH),
+    // then delete it: BOTH the audit row and the pointer unset ride the same
+    // delete.
+    const pinned = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ make_latest: "true" }),
+    });
+    expect(pinned.status).toBe(200);
+    expect((await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>()).tag_name).toBe("v1");
+    const auditBefore = await drizzle(env.DB).select().from(auditEvents).all();
+    expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+
+    const auditRows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(auditRows.length).toBe(auditBefore.length + 1);
+    const row = auditRows[auditRows.length - 1]!;
+    expect(row.action).toBe("repository:release:remove");
+    expect(row.actorId).toBe(1); // the doer (the stub token's user)
+    expect(row.scopeType).toBe("repository");
+    expect(row.scopeId).toBe("7301");
+    expect(row.origin).toBe("api");
+    expect(row.message).toBe("Removed release v1 from repository cf-gitea-stub/rel.");
+    // The pointer unset (release.go:441-443): the latest read no longer
+    // answers the deleted tag.
+    const latestBody = (await (await makeApp()(`${REPO_PATH}/releases/latest`)).json<Record<string, unknown>>());
+    expect(latestBody.tag_name).not.toBe("v1");
+  });
+
   it("the tags-API delete finds the CONVERTED record and drops the row beside the ref (R2's tail — delTag=true)", async () => {
     // A real git ref for v1 (seedRelease writes the D1 row only) — the
     // tags-API delete needs the ref to CAS. Idempotent across runs: create
@@ -1076,7 +1238,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
       const converted = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).get();
       expect(converted?.isTag).toBe(true);
       // The tags-API delete: a REAL release answers 409; the tag-only record
-      // rides the delete to its delTag=true row arm (release.go:388-412) —
+      // rides the delete to its delTag=true row arm (release.go:398-433) —
       // ref gone, ROW gone.
       expect((await makeApp()(`${REPO_PATH}/tags/v1`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
       expect(await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).all()).toEqual([]);
@@ -1095,12 +1257,12 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
 // ---------------------------------------------------------------------------
 // Release assets in the release payloads (upstream ToAPIRelease renders
 // Attachments over LoadAttributes → GetReleaseAttachments, models/repo/
-// release.go:111-127,389-449): every read that renders the converter —
+// release.go:111-127,424-480): every read that renders the converter —
 // list, latest, by-tag, by-id — carries the release's attachment rows.
 // Pinned in OUR renderer's order (asset-id ascending — the attachment-list
 // route's own read via listReleaseAssets); upstream orders by name
-// (release.go:417) — ours matches since R14/R1-a. browser_download_url is
-// upstream's CustomDownloadURL flip (R13, release.go:430-443): unique asset
+// (release.go:450) — ours matches since R14/R1-a. browser_download_url is
+// upstream's CustomDownloadURL flip (R13, release.go:478): unique asset
 // names render /releases/download/{tag}/{name}, duplicates keep the uuid
 // /attachments/{uuid} shape (hasDuplicateName's fallback).
 // ---------------------------------------------------------------------------
@@ -1187,7 +1349,7 @@ describe("release assets render in the release payloads (ToAPIRelease attachment
     expect(body.assets.map((a) => a.name)).toEqual(["alpha.zip", "zeta.zip"]);
   });
 
-  it("DUPLICATE asset names fall back to the uuid download shape (R13's hasDuplicateName gate, release.go:421-428)", async () => {
+  it("DUPLICATE asset names fall back to the uuid download shape (R13's hasDuplicateName gate, release.go:412-421)", async () => {
     await drizzle(env.DB).insert(releaseAssets).values({
       uuid: "asset-u-dup",
       repoId: "7301",
@@ -1211,8 +1373,8 @@ describe("release assets render in the release payloads (ToAPIRelease attachment
 // ---------------------------------------------------------------------------
 // Go-parity path escaping (R2-L2): the release URL family runs the tag
 // through util.PathEscapeSegments (html_url/tarball/zipball — slashes KEPT
-// per segment, models/repo/release.go:136-146) and the R13 download builder
-// through plain url.PathEscape (models/repo/release.go:443). The truth
+// per segment, models/repo/release.go:138-146) and the R13 download builder
+// through plain url.PathEscape (models/repo/release.go:478). The truth
 // table pins Go's shouldEscape (encodePathSegment) exactly: the unreserved
 // set plus $&+:;=@ stay raw; !'()* and everything else encodes —
 // encodeURIComponent is the INVERSE on those legal tag/asset characters.
@@ -1228,7 +1390,7 @@ describe("Go-parity path escaping (R2-L2)", () => {
     expect(pathEscape("rélease 中文")).toBe("r%C3%A9lease%20%E4%B8%AD%E6%96%87"); // per-byte UTF-8, uppercase
   });
 
-  it("pathEscapeSegments keeps the separators — a slash tag renders / (release.go:136-146), never %2F", () => {
+  it("pathEscapeSegments keeps the separators — a slash tag renders / (release.go:138-146), never %2F", () => {
     expect(pathEscapeSegments("v1/2")).toBe("v1/2");
     expect(pathEscapeSegments("release/v1.2!")).toBe("release/v1.2%21");
     expect(pathEscapeSegments("")).toBe("");
@@ -1250,7 +1412,7 @@ describe("Go-parity path escaping (R2-L2)", () => {
     expect(body.zipball_url).toBe("https://example.com/cf-gitea-stub/rel/archive/v1/0+$&=:@.zip");
   });
 
-  it("the R13 download builder runs plain url.PathEscape per value (release.go:443) — keep-set raw, a %2F slash tag", async () => {
+  it("the R13 download builder runs plain url.PathEscape per value (release.go:478) — keep-set raw, a %2F slash tag", async () => {
     // Plain PathEscape on the download URL vs the html_url's segments
     // escaper: the SAME slash tag renders %2F here, kept in html_url.
     const releaseId = await seedRelease({ tag: "dl/v1", minutesOffset: 0 });
@@ -1277,7 +1439,7 @@ describe("Go-parity path escaping (R2-L2)", () => {
 // ---------------------------------------------------------------------------
 // `release` webhook emissions (upstream sendReleaseHook:879 — NewRelease:889
 // "published" / UpdateRelease:893 "updated" / DeleteRelease:897 "deleted",
-// all gated on `!rel.IsDraft`, services/release/release.go:198,358,435).
+// all gated on `!rel.IsDraft`, services/release/release.go:228,385,468).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -1385,7 +1547,7 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     );
   });
 
-  it("emits `updated` on a riding edit and `published` on a tag-creating edit (upstream isTagCreated fork, release.go:361-367)", async () => {
+  it("emits `updated` on a riding edit and `published` on a publish-from-draft (the 53aafd7ee1 fork keys on the OLD row's draft state, release.go:385-391)", async () => {
     const hookId = await seedHook("7301", ["release"]);
     // The "updated" arm rides an EXISTING git tag (ride-tag is in the cell):
     // tagCreated=false → UpdateRelease. A D1-only seeded tag (v1) whose ref
@@ -1418,7 +1580,63 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     await deleteTagRef("v2-hook-draft");
   });
 
-  it("an edit that creates the tag emits the ref webhook pair too (createTag's PushCommits + CreateRef, release.go:135-143)", async () => {
+  it("a tag-CREATING rename between two published states notifies `updated` WITH the changes payload (53aafd7ee1: the fork keys on oldRelease.IsDraft, not the tag arm; ToReleaseChanges)", async () => {
+    const hookId = await seedHook("7301", ["release"]);
+    // fresh-tag-name has NO ref in the cell → the rename lands a NEW tag
+    // (tagCreated=true), the arm the OLD fork mapped to "published".
+    const releaseId = await seedRelease({ tag: "old-tag", title: "Old title", minutesOffset: 0 });
+
+    const renamed = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "fresh-tag-name" }),
+    });
+    expect(renamed.status).toBe(200);
+    await deleteTagRef("fresh-tag-name");
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      action: string;
+      changes?: Record<string, { from: string }>;
+    };
+    expect(payload.action).toBe("updated"); // was "published" before 53aafd7ee1
+    expect(payload.changes).toEqual({ tag_name: { from: "old-tag" } }); // only the changed field
+  });
+
+  it("an `updated` edit that changed nothing carries the empty changes object; a `published` payload carries no changes key (ReleasePayload.Changes, hook.go:337)", async () => {
+    const hookId = await seedHook("7301", ["release"]);
+    const releaseId = await seedRelease({ tag: "ride-tag", minutesOffset: 0 });
+
+    const patched = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ name: "Same-title edit", body: "New notes" }),
+    });
+    expect(patched.status).toBe(200);
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      action: string;
+      changes?: Record<string, { from: string }>;
+    };
+    expect(payload.action).toBe("updated");
+    expect(payload.changes).toEqual({ name: { from: "ride-tag" }, body: { from: "notes for ride-tag" } });
+
+    const created = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "changes-absent", name: "Fresh" }),
+    });
+    expect(created.status).toBe(201);
+    const createPayload = JSON.parse(
+      (await deliveriesFor(hookId)).find((d) => (JSON.parse(d.payloadContent) as { action: string }).action === "published")!
+        .payloadContent,
+    ) as Record<string, unknown>;
+    expect(Object.keys(createPayload)).not.toContain("changes");
+  });
+
+  it("an edit that creates the tag emits the ref webhook pair too (createTag's PushCommits + CreateRef, release.go:138-145)", async () => {
     const createHook = await seedHook("7301", ["create"]);
     const draftId = await seedRelease({ tag: "v9-draft", isDraft: true, minutesOffset: 0 });
     await deleteTagRef("v9-draft"); // fresh-create precondition, every run
@@ -1440,14 +1658,17 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     await deleteTagRef("v9-draft");
   });
 
-  // R2-L7 — the sender identity: upstream createTag notifies with
-  // rel.Publisher (release.go:136-143) and the tag-creating edit's "published"
-  // ReleasePayload does too (NewRelease → sendReleaseHook(rel.Publisher),
-  // notifier.go:889-890); rel.Publisher is bound at insert (CreateNewTag's
-  // `Publisher: doer`, release.go:241) and NEVER re-bound by UpdateRelease,
-  // so a publish-from-draft flipped by a NON-publisher carries the ORIGINAL
-  // publisher as pusher/sender — not the editing caller.
-  it("a publish-from-draft by a NON-publisher carries the ROW's publisher as pusher/sender on every emitted payload (R2-L7)", async () => {
+  // R2-L7 — the sender identity, SINCE 53aafd7ee1: createTag's ref pair still
+  // notifies with rel.Publisher (PushCommits :139 / CreateRef :145 — the
+  // publisher is bound at insert, CreateNewTag's `Publisher: doer`,
+  // release.go:274-275, and NEVER re-bound by UpdateRelease), but the
+  // ReleasePayload's sender is the DOER for every action now (sendReleaseHook
+  // takes doer and renders convert.ToUser(ctx, doer, nil), notifier.go:889-905;
+  // NewRelease passes the editing caller since services/release/release.go:390
+  // stopped relaying rel.Publisher). So a publish-from-draft flipped by a
+  // NON-publisher carries the ORIGINAL publisher only on the create event —
+  // the release payload carries the editing caller.
+  it("a publish-from-draft by a NON-publisher: the create event carries the ROW's publisher, the release payload the DOER (R2-L7 since 53aafd7ee1)", async () => {
     await drizzle(env.DB).insert(users).values({
       id: 2,
       username: "publisher",
@@ -1474,11 +1695,11 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     const createPayload = JSON.parse(
       deliveries.find((d) => d.eventType === "create")!.payloadContent,
     ) as { sender: { login: string } };
-    expect(createPayload.sender).toMatchObject({ login: "publisher" }); // CreateRef's sender — rel.Publisher
+    expect(createPayload.sender).toMatchObject({ login: "publisher" }); // CreateRef's sender — rel.Publisher (release.go:145)
     const releasePayload = JSON.parse(
       deliveries.find((d) => d.eventType === "release")!.payloadContent,
     ) as { action: string; sender: { login: string } };
-    expect(releasePayload).toMatchObject({ action: "published", sender: { login: "publisher" } }); // NewRelease — rel.Publisher
+    expect(releasePayload).toMatchObject({ action: "published", sender: { login: "cf-gitea-stub" } }); // sendReleaseHook's DOER (notifier.go:901)
   });
 
   it("a riding (non-tag-creating) edit keeps the DOER as sender even when the row's publisher differs (R2-L7 — UpdateRelease passes doer, notifier.go:893-894)", async () => {
@@ -1591,7 +1812,7 @@ describe("activity feeds — publish_release action rows", () => {
     });
   });
 
-  it("drafts stay silent; the draft→published PATCH records the row with the RELEASE PUBLISHER as act_user (rel.PublisherID, not the flipping doer)", async () => {
+  it("drafts stay silent; the draft→published PATCH records the row with the DOER as act_user (ActUserID: doer.ID since 53aafd7ee1 — feed/notifier.go)", async () => {
     await drizzle(env.DB).insert(users).values({
       id: 2,
       username: "publisher",
@@ -1601,7 +1822,8 @@ describe("activity feeds — publish_release action rows", () => {
       createdAt: new Date("2026-01-01T00:00:00Z"),
     });
     // The doer is the stub (id 1); the release is PUBLISHED BY user 2 — the
-    // action row must keep the publisher (upstream acts on rel.Publisher).
+    // action row credits the DOER since 53aafd7ee1 (upstream NewRelease(ctx,
+    // doer, rel) → ActUserID: doer.ID; it was rel.PublisherID before).
     const row = await new IssuesService(env.DB).createRelease({
       repoId: "7301",
       publisherId: 2,
@@ -1611,8 +1833,9 @@ describe("activity feeds — publish_release action rows", () => {
       note: "",
       isDraft: true,
     });
-    // The flip must run the FRESH-create arm (tagCreated → "published" → the
-    // action row); a leaked ref from a previous run would flip it to "updated".
+    // The flip must run the publish arm (oldRelease.IsDraft → "published" →
+    // the action row); a leaked ref from a previous run would not matter to
+    // the fork anymore (it keys on the old draft state, not tagCreated).
     await deleteTagRef("v2.0");
     const app = feedsApp();
     expect((await (await app(`${REPO_PATH}/activities/feeds`)).json<unknown[]>()).length).toBe(0);
@@ -1631,7 +1854,7 @@ describe("activity feeds — publish_release action rows", () => {
       op_type: "publish_release",
       content: "Publisher's release",
       ref_name: "refs/tags/v2.0",
-      act_user_id: 2, // the publisher — NOT the doer (id 1) who flipped the draft
+      act_user_id: 1, // the DOER (id 1) who flipped the draft — NOT the publisher (id 2)
     });
   });
 
