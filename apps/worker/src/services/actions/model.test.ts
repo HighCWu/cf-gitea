@@ -306,7 +306,7 @@ describe("runner rows", () => {
   });
 });
 
-describe("the dispatch scan's scope condition (task.go:279-286)", () => {
+describe("the dispatch scan's scope condition (the JobQueueOptions legs, run_job_queue.go:26-33 at the pin — #40106)", () => {
   async function seedJob(repoId: string, ownerId: number, jobId: string): Promise<void> {
     const now = new Date("2026-01-02T00:00:00Z");
     await db().insert(actionRunJobs).values({
@@ -321,12 +321,12 @@ describe("the dispatch scan's scope condition (task.go:279-286)", () => {
     });
   }
 
-  it("an owner scope rides the repo_unit subquery — scoped repos only", async () => {
+  it("an owner scope sees ALL the owner's repos — the repo_unit join is GONE (#40106; the claim gate cancels the disabled repo's job instead)", async () => {
     const ownerId = await seedUser("cond-org");
     const otherOwner = await seedUser("cond-other");
     await seedRepo("repo-c1", "cond-org", ownerId, "c1");
     await seedRepo("repo-c2", "cond-org", ownerId, "c2");
-    await seedRepo("repo-cx", "cond-org", ownerId, "cx", false); // unit off → out of scope
+    await seedRepo("repo-cx", "cond-org", ownerId, "cx", false); // unit off — IN the scan now; the CLAIM gate cancels its job
     await seedRepo("repo-co", "cond-other", otherOwner, "co"); // other owner → out of scope
     const runner = await createRunner(env.DB, {
       uuid: "uuid-cond",
@@ -346,7 +346,7 @@ describe("the dispatch scan's scope condition (task.go:279-286)", () => {
     await seedJob("repo-co", otherOwner, "jo");
 
     const rows = await db().select({ jobId: actionRunJobs.jobId }).from(actionRunJobs).where(cond);
-    expect(rows.map((r) => r.jobId).sort()).toEqual(["j1", "j2"]);
+    expect(rows.map((r) => r.jobId).sort()).toEqual(["j1", "j2", "jx"]);
   });
 
   it("a repo runner scopes to its repo and a global runner gets no scope leg", async () => {

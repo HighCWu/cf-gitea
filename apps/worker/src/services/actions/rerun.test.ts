@@ -253,7 +253,7 @@ describe("rerun-all (RerunWorkflowRunJobs with the empty set — rerun.go:39, 40
   });
 });
 
-describe("rerun-failed (GetFailedJobsForRerun's set — view.go:1002-1008)", () => {
+describe("rerun-failed (GetFailedJobsForRerun's set — view.go:998-1004)", () => {
   it("resets ONLY the failed/cancelled jobs; the succeeded job passes through with its history", async () => {
     await seedRepo();
     const seeded = await seedRun(1, [
@@ -294,7 +294,7 @@ describe("rerun-failed (GetFailedJobsForRerun's set — view.go:1002-1008)", () 
     const newBuild = attempt2Jobs.find((job) => job.jobId === "build")!;
     expect(newBuild.status).toBe(ACTION_STATUS_SUCCESS);
     expect(newBuild.taskId).toBe(0);
-    expect(newBuild.sourceTaskId).toBe(42); // EffectiveTaskID (run_job.go:158-163)
+    expect(newBuild.sourceTaskId).toBe(42); // EffectiveTaskID (run_job.go:156-161)
     expect(newBuild.started).toEqual(T0);
     expect(newBuild.stopped).toEqual(new Date(T0.getTime() + 1000));
   });
@@ -375,7 +375,7 @@ describe("the run-level concurrency fill + gate (rerun.go:209-233)", () => {
     await seedRepo();
     const SOURCE_SHA = "aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const seeded = await seedRun(1, [{ jobId: "build" }]);
-    // The scoped producer's pre-insert trio (workflow.go:260-263): the
+    // The scoped producer's pre-insert trio (workflow.go:266-268): the
     // content source commit differs from the run's own commit_sha.
     await db()
       .update(actionRuns)
@@ -755,9 +755,9 @@ describe("validateRerun's arms (rerun.go:71-117) + the plan guards", () => {
   });
 
   // --- the scoped-run twin (rerun.go:89-99; the web twin checkRunRerunAllowed,
-  //     view.go:929-936 — the C10 row-filter wave): a scoped run consults the
+  //     view.go:925-932 — the C10 row-filter wave): a scoped run consults the
   //     opt-out store INSTEAD of the repo-level map.
-  describe("the rerun scoped twin (rerun.go:89-99 + view.go:929-936)", () => {
+  describe("the rerun scoped twin (rerun.go:89-99 + view.go:925-932)", () => {
     const SRC_ID = "repo-source";
 
     /** A done run marked the way the scoped dispatch producer writes it

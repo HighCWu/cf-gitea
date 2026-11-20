@@ -1,14 +1,14 @@
 /**
  * The workflow DISPATCH producer — the ⑲A4 row's POST /actions/run arm
  * (docs/compat/v1.5.2-ledger.md §1.6), ported from upstream
- * services/actions/workflow.go:64-199 `DispatchActionWorkflow` (repo-level
- * arm) plus the view.go:1378-1419 `actions.Run` handler's input-processing
+ * services/actions/workflow.go:66-201 `DispatchActionWorkflow` (repo-level
+ * arm) plus the view.go:1374-1415 `actions.Run` handler's input-processing
  * closure. The service carries the store + engine work; the route handler
  * (the orchestrator-owned ui/index.ts mount) owns the form parse and the
  * wire answers.
  *
  * Upstream pin (VERIFIED at fc4936884584a41931906553d96c2601d750e6ef):
- *   - DispatchActionWorkflow (workflow.go:64-199): the empty workflow/ref
+ *   - DispatchActionWorkflow (workflow.go:66-201): the empty workflow/ref
  *     guards (:65-77 — translatable not-exist), the ActionsConfig disabled
  *     check (:85-99 — IsWorkflowDisabled for repo-level workflows, the
  *     IsScopedWorkflowOptedOut read for the scoped arm), the
@@ -17,22 +17,22 @@
  *     name, a miss → form.target_ref_not_exist), the run skeleton
  *     (:126-144 — event/trigger_event "workflow_dispatch",
  *     IsForkPullRequest false, Title = the commit's MessageTitle, Ref = the
- *     NORMALIZED RefName), the content resolution (:193-236 — the
+ *     NORMALIZED RefName), the content resolution (:194-237 — the
  *     repo-level arm is the workflow-dir walk with the exact-entry match;
- *     the scoped arm resolveScopedDispatchContent (:237-268) demands an
+ *     the scoped arm resolveScopedDispatchContent (:238-269) demands an
  *     EFFECTIVE source (IsScopedWorkflowSourceEffective), walks the SOURCE
  *     repo's default branch (LoadParsedScopedWorkflows) and records the
  *     content's (repo, commit) on the run: WorkflowRepoID = sourceRepo.ID,
  *     WorkflowCommitSHA = the source sha, IsScopedRun = true), the
  *     WorkflowDispatchConfig presence check (:165-170 — the
  *     has_no_workflow_dispatch error), the processInputs closure
- *     (:167-172) + coerceDispatchInputTypes (:201-210 — boolean-typed
+ *     (:167-172) + coerceDispatchInputTypes (:202-211 — boolean-typed
  *     inputs become real bools via ParseYamlBool), the
  *     WorkflowDispatchPayload JSON (:174-193 — workflow/ref/inputs/
  *     repository/sender, `inputs` stringified via CoerceToString), and
- *     PrepareRunAndInsert with the inputs threaded (:195-198 — the
+ *     PrepareRunAndInsert with the inputs threaded (:196-199 — the
  *     landed insertTriggeredRunSplit's new optional `inputs` parameter).
- *   - actions.Run's closure (view.go:1397-1404): per declared input —
+ *   - actions.Run's closure (view.go:1393-1400): per declared input —
  *     boolean → strconv.FormatBool(FormBool(name)); otherwise the POST form
  *     value when non-empty, else the declaration's default.
  *
@@ -42,7 +42,7 @@
  *     ctx.Flash.Success + ctx.Redirect (the no-session-flash reduction
  *     303s onto the actions-list URL, the secrets-family convention).
  *   - "translatable" — the user-facing failure upstream reports through
- *     Flash.Error + Redirect (workflow.go:186-191's ErrorAsTranslatable
+ *     Flash.Error + Redirect (workflow.go:187-192's ErrorAsTranslatable
  *     arm): disabled, unknown ref/workflow, invalid workflow, no dispatch
  *     trigger. The same 303 answers (the flash text has no session store
  *     to ride — the repoActionsSecretsSubmit posture); the message rides
@@ -52,7 +52,7 @@
  *     chrome.
  *
  * ## The scoped arm (the C10 half-stage — resolveScopedDispatchContent's
- * port, workflow.go:237-268)
+ * port, workflow.go:239-270)
  *
  * `scopedWorkflowSourceRepoId` carries the SOURCE repo's id; "" is the
  * repo-level arm. Upstream's form value is FormInt64 over an int64 repo id
@@ -60,29 +60,29 @@
  * TEXT adaptation, schema.ts:3931). The landed wire keeps upstream's zero
  * semantics through config.ts's scopedSourceRepoParam: "" (absent), "0"
  * (the landed page's dispatch form always posts it) and any NEGATIVE
- * spelling (`isScoped := scopedWorkflowSourceRepoID > 0`, workflow.go:79 —
+ * spelling (`isScoped := scopedWorkflowSourceRepoID > 0`, workflow.go:80 —
  * a negative parse is repo-level) are the repo-level arm; every other
  * nonempty value rides verbatim as a source-id candidate (a bogus one dies
  * on the effective-source gate below — the recorded divergence from
  * upstream's junk→0 fallback).
  * The arm:
- *   1. the opt-out disabled check (workflow.go:84-99's isScoped branch —
+ *   1. the opt-out disabled check (workflow.go:85-100's isScoped branch —
  *     config.ts's isScopedWorkflowOptedOut, the flagged-disabled AND
  *     not-required read with upstream's cheap early-out);
  *   2. the source must be EFFECTIVE for the consumer's owner
  *     (IsScopedWorkflowSourceEffective — a miss answers the same
- *     actions.workflow.not_found translatable, :241-249);
- *   3. the source repo row (GetRepositoryByID, :251-254 — the miss is the
+ *     actions.workflow.not_found translatable, :242-250);
+ *   3. the source repo row (GetRepositoryByID, :252-255 — the miss is the
  *     ServerError class upstream, our "throw" arm);
  *   4. the source's DEFAULT-BRANCH content walk (LoadParsedScopedWorkflows
  *     → ParseScopedWorkflows' ListScopedWorkflows — the SCOPED_WORKFLOW_DIRS
  *     walk at the source's default-branch HEAD, the entry-name match);
- *     a missing workflow answers not-found (:260-267);
+ *     a missing workflow answers not-found (:262-268);
  *   5. the run records its content source: the whole trio rides the shared
  *     insert's input PRE-INSERT (workflowSha/workflowRepoId/isScopedRun —
  *     upstream sets the fields on the run skeleton before PrepareRunAndInsert,
- *     :260-263; the repo-level arm leaves them undefined for the shared
- *     insert's workflow.go:136-137 defaults), so github.workflow_sha
+ *     :262-264; the repo-level arm leaves them undefined for the shared
+ *     insert's workflow.go:137-138 defaults), so github.workflow_sha
  *     (context.go:115) and the workflow_commit_sha/workflow_repo_id/
  *     is_scoped_run columns carry the content source from birth — the
  *     R1-F5 fix retired the scoped arm's former post-insert UPDATE. The
@@ -93,9 +93,9 @@
  * insert grew the workflowSha input, so a scoped run's github.workflow_sha
  * carries the SOURCE commit (context.go:115's run.WorkflowCommitSHA) while
  * github.sha / commit_sha keep the consumer ref's commit — upstream's
- * exact split (workflow.go:126-142 builds CommitSHA = runTargetCommit and
+ * exact split (workflow.go:127-143 builds CommitSHA = runTargetCommit and
  * WorkflowCommitSHA = the content source as two independent skeleton
- * fields). A repo-level dispatch keeps them equal (workflow.go:136-137).
+ * fields). A repo-level dispatch keeps them equal (workflow.go:137-138).
  * The whole trio is insert-carried now (the R1-F5 note above) — the
  * repo_id/is_scoped_run halves stopped riding the old post-insert UPDATE
  * with it.
@@ -198,10 +198,10 @@ export interface WorkflowDispatchInputRequest {
   d1: D1Database;
   reads: WorkflowDispatchReads;
   repo: WorkflowDispatchRepo;
-  /** The `?workflow=` id (view.go:1382's FormString). */
+  /** The `?workflow=` id (view.go:1372's FormString). */
   workflowId: string;
-  /** The `ref` form value (view.go:1389's FormString — the RAW string; the
-   *  payload carries it verbatim, workflow.go:179). */
+  /** The `ref` form value (view.go:1386's FormString — the RAW string; the
+   *  payload carries it verbatim, workflow.go:177). */
   ref: string;
   /** `scoped_workflow_source_repo_id` — the SOURCE repo's TEXT id; "" is
    *  the repo-level arm (upstream FormInt64's 0; the TEXT adaptation, the
@@ -262,8 +262,8 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
   const scopedWorkflowSourceRepoId = scopedSourceRepoParam(input.scopedWorkflowSourceRepoId);
   const isScoped = scopedWorkflowSourceRepoId !== "";
 
-  // The empty guards (workflow.go:65-77) — the Run handler pre-checks both
-  // with ServerError (view.go:1384-1394); the service carries the same
+  // The empty guards (workflow.go:66-78) — the Run handler pre-checks both
+  // with ServerError (view.go:1372-1392); the service carries the same
   // translatable texts, the handler's guard answering first in practice.
   if (workflowId === "") {
     return { status: "throw", reason: "workflow dispatch: workflow is required" };
@@ -272,7 +272,7 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     return { status: "throw", reason: "workflow dispatch: ref is required" };
   }
 
-  // The ActionsConfig disabled check (workflow.go:85-99): the repo-level
+  // The ActionsConfig disabled check (workflow.go:86-100): the repo-level
   // arm reads DisabledWorkflows; the scoped arm reads the opt-out store
   // (IsScopedWorkflowOptedOut — flagged disabled AND not required, with
   // upstream's unflagged early-out).
@@ -285,7 +285,7 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     return { status: "translatable", message: workflowDispatchLocale.workflowDisabled };
   }
 
-  // The ref's commit resolution (workflow.go:101-124): tags and full branch
+  // The ref's commit resolution (workflow.go:102-125): tags and full branch
   // refs ride the engine's ref-aware readCommit; anything else re-reads as
   // a BRANCH name (RefNameFromBranch). A miss is the translatable ref arm.
   const refName = ref.startsWith("refs/tags/") || ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`;
@@ -294,8 +294,8 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     return { status: "translatable", message: tr(workflowDispatchLocale.targetRefNotExist, ref) };
   }
 
-  // The content resolution (workflow.go:193-236's repo-level arm / the
-  // scoped :237-268 arm). The engine's one-level listTree is the
+  // The content resolution (workflow.go:66-199's DispatchActionWorkflow, the repo-level arm / the
+  // scoped :238-269 arm). The engine's one-level listTree is the
   // module-header reduction.
   let content: string;
   let scopedSource: { repoId: string; sha: string } | null = null;
@@ -330,7 +330,7 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     content = new TextDecoder().decode(blob.data);
   }
 
-  // The light validation + the dispatch-config presence (workflow.go:146-170
+  // The light validation + the dispatch-config presence (workflow.go:147-171
   // at the light-check stage — the module header).
   const parsed = parseWorkflowDispatchInputs(content);
   if (parsed.errMsg !== null) {
@@ -340,8 +340,8 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     return { status: "translatable", message: tr(workflowDispatchLocale.hasNoWorkflowDispatch, workflowId) };
   }
 
-  // processInputs (view.go:1397-1404) + coerceDispatchInputTypes
-  // (workflow.go:201-210): booleans type FIRST (FormatBool(FormBool)), then
+  // processInputs (view.go:1393-1400) + coerceDispatchInputTypes
+  // (workflow.go:203-212): booleans type FIRST (FormatBool(FormBool)), then
   // the declared boolean type re-coerces the string back to a real bool —
   // net: a typed bool. Everything else: the form value when non-empty,
   // else the declaration's default.
@@ -350,14 +350,14 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     typed[declared.name] = coerceDeclared(declared, form);
   }
 
-  // The payload's `inputs` field — dispatchEventInputs (workflow.go:213-219),
+  // The payload's `inputs` field — dispatchEventInputs (workflow.go:215-221),
   // CoerceToString's stringify.
   const eventInputs: Record<string, string> = {};
   for (const [name, value] of Object.entries(typed)) {
     eventInputs[name] = coerceToString(value);
   }
 
-  // WorkflowDispatchPayload.JSONPayload (workflow.go:174-193) — the
+  // WorkflowDispatchPayload.JSONPayload (workflow.go:175-194) — the
   // repository/sender objects stay {}-shaped (the buildPushEventPayload
   // convention, the module header).
   const eventPayloadJson = JSON.stringify({
@@ -368,14 +368,14 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     sender: {},
   });
 
-  // PrepareRunAndInsert (workflow.go:195-198) with the inputs threaded —
+  // PrepareRunAndInsert (workflow.go:191) with the inputs threaded —
   // the landed insert's optional `inputs` parameter (jobparser.WithInputs'
   // expression surface). Title = MessageTitle = the commit subject; Ref =
-  // the NORMALIZED RefName (workflow.go:132/141). The content-source trio
+  // the NORMALIZED RefName (workflow.go:130/142). The content-source trio
   // rides the shared insert's input PRE-INSERT exactly as upstream sets the
-  // fields on the run (workflow.go:136-137's repo-level skeleton —
+  // fields on the run (workflow.go:137-138's repo-level skeleton —
   // WorkflowRepoID = this repo, WorkflowCommitSHA = the run commit, the
-  // undefined-defaults arm; :260-263's scoped overrides — the SOURCE repo +
+  // undefined-defaults arm; :262-264's scoped overrides — the SOURCE repo +
   // HEAD sha + IsScopedRun), so github.workflow_sha (context.go:115), the
   // workflow_commit_sha column and the scoped parity pair carry the content
   // source from birth (the R1-F5 fix retires the scoped arm's former
@@ -412,9 +412,9 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
 }
 
 /**
- * resolveScopedDispatchContent (workflow.go:237-268): the source must be an
+ * resolveScopedDispatchContent (workflow.go:239-270): the source must be an
  * EFFECTIVE scoped source for the consumer's owner (a miss answers the same
- * actions.workflow.not_found translatable, :241-249), then the source repo
+ * actions.workflow.not_found translatable, :242-250), then the source repo
  * row (GetRepositoryByID — the miss is the ServerError class, our throw),
  * then the source's default-branch SCOPED_WORKFLOW_DIRS walk
  * (LoadParsedScopedWorkflows' ListScopedWorkflows half) with the entry-name
@@ -436,7 +436,7 @@ async function resolveScopedDispatchContent(
     };
   }
 
-  // GetRepositoryByID (:251-254) — the row miss is upstream's ServerError
+  // GetRepositoryByID (:252-255) — the row miss is upstream's ServerError
   // class (the error propagates un-translated).
   const sourceRows = await drizzle(d1)
     .select({ id: repositories.id, ownerNamespace: repositories.ownerNamespace, slug: repositories.slug, defaultBranch: repositories.defaultBranch })
@@ -485,7 +485,7 @@ async function resolveScopedDispatchContent(
     (entry) => entry.type === "blob" && (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml")) && entry.name === baseName,
   )?.name;
   if (dir === null || entryName === undefined) {
-    // the parsed set has no such EntryName (:260-267's not-found)
+    // the parsed set has no such EntryName (:262-268's not-found)
     return {
       outcome: { status: "translatable", message: tr(workflowDispatchLocale.workflowNotFound, workflowId) },
       content: "",

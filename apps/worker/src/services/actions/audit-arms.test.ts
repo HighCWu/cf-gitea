@@ -1,8 +1,9 @@
 /**
- * The Actions workflow toggle + dispatch audit emit arms' tests
- * (services/actions/audit-arms.ts — the Wave I-a deferred family): the
- * registry trio's verbatim templates, both emit shapes' full row (the
- * RecordWorkflowToggle / DispatchActionWorkflow ports), the origin and
+ * The Actions audit emit arms' tests (services/actions/audit-arms.ts — the
+ * Wave I-a deferred family): the workflow registry trio's verbatim templates,
+ * both emit shapes' full row (the RecordWorkflowToggle /
+ * DispatchActionWorkflow ports), the ORG-scope runner/variable sextet's rows
+ * (#40323 — 3f1b738f09's RecordScopedByID org arms), the origin and
  * credential variants (the web vs API arms), the impersonation pass-through,
  * and the swallow-on-failure posture (upstream writeEvent's log-not-fail,
  * event.go:136-140).
@@ -18,7 +19,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { users } from "../../db/schema";
 import { actionFilters, findAuditEvents, messageTemplate, renderMessage, AuditActions } from "../audit";
-import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "./audit-arms";
+import {
+  emitOrgRunnerRemoveAudit,
+  emitOrgRunnerTokenAudit,
+  emitOrgRunnerUpdateAudit,
+  emitOrgVariableAddAudit,
+  emitOrgVariableRemoveAudit,
+  emitOrgVariableUpdateAudit,
+  emitWorkflowDispatchAudit,
+  emitWorkflowToggleAudit,
+} from "./audit-arms";
 
 const REPO = { id: "repo-uuid-1", ownerNamespace: "alice", slug: "alpha" };
 const ACTOR = { id: 7, username: "alice" };
@@ -32,7 +42,7 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM audit_event").run();
 });
 
-describe("the actions:workflow registry trio (action.go:196-198)", () => {
+describe("the actions:workflow registry trio (action.go:140-142)", () => {
   it("registers the verbatim ids and templates", () => {
     expect(messageTemplate("actions:workflow:enable")).toBe("Enabled Actions workflow {workflow} in repository {scope}.");
     expect(messageTemplate("actions:workflow:disable")).toBe("Disabled Actions workflow {workflow} in repository {scope}.");
@@ -55,7 +65,7 @@ describe("the actions:workflow registry trio (action.go:196-198)", () => {
   });
 });
 
-describe("emitWorkflowToggleAudit (RecordWorkflowToggle, workflow.go:53-60)", () => {
+describe("emitWorkflowToggleAudit (RecordWorkflowToggle, workflow.go:54-61)", () => {
   it("the enable arm records the full row: action, rendered message, repo scope, metadata", async () => {
     await emitWorkflowToggleAudit(env.DB, {
       repo: REPO,
@@ -113,7 +123,7 @@ describe("emitWorkflowToggleAudit (RecordWorkflowToggle, workflow.go:53-60)", ()
   });
 });
 
-describe("emitWorkflowDispatchAudit (DispatchActionWorkflow's tail, workflow.go:192-193)", () => {
+describe("emitWorkflowDispatchAudit (DispatchActionWorkflow's tail, workflow.go:194-195)", () => {
   it("records the dispatch row: the RAW ref, the numeric run_id in the metadata", async () => {
     await emitWorkflowDispatchAudit(env.DB, {
       repo: REPO,
@@ -259,5 +269,111 @@ describe("the swallow-on-failure posture (event.go:136-140)", () => {
       emitWorkflowDispatchAudit(d1ThatThrows(), { repo: REPO, workflowId: "build.yml", ref: "main", runId: 1, actor: ACTOR }),
     ).resolves.toBeUndefined();
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("workflow dispatch audit event"), expect.any(Error));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ORG-scope runner/variable arms (#40323 — 3f1b738f09, models/audit/
+// action.go:143-148 at the pin; RecordScopedByID's org resolution)
+// ---------------------------------------------------------------------------
+
+const ORG = { id: 42, username: "coalcorp" };
+const RUNNER = { id: 9, name: "org-runner-1" };
+
+describe("the org runner/variable registry sextet (action.go:143-148)", () => {
+  it("registers the verbatim ids and templates", () => {
+    expect(messageTemplate("organization:runner:token")).toBe("Issued Actions runner registration token for organization {scope}.");
+    expect(messageTemplate("organization:runner:update")).toBe("Updated Actions runner {runner} of organization {scope}.");
+    expect(messageTemplate("organization:runner:remove")).toBe("Removed Actions runner {runner} from organization {scope}.");
+    expect(messageTemplate("organization:variable:add")).toBe("Added variable {variable} to organization {scope}.");
+    expect(messageTemplate("organization:variable:update")).toBe("Updated variable {variable} of organization {scope}.");
+    expect(messageTemplate("organization:variable:remove")).toBe("Removed variable {variable} from organization {scope}.");
+  });
+});
+
+describe("emitOrgRunnerTokenAudit (ResetRunnerRegistrationToken, runners.go:278)", () => {
+  it("records the bare issuance row: org scope, no metadata pairs", async () => {
+    await emitOrgRunnerTokenAudit(env.DB, { org: ORG, actor: ACTOR, ipAddress: "203.0.113.9" });
+    const rows = await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" });
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("organization:runner:token");
+    expect(row.actorId).toBe(7);
+    expect(row.actorName).toBe("alice");
+    expect(row.scopeName).toBe("coalcorp");
+    expect(row.origin).toBe("ui"); // the web arm default
+    expect(row.message).toBe("Issued Actions runner registration token for organization coalcorp.");
+    expect(row.metadata).toBeNull(); // RecordScopedByID(ctx, ownerID, repoID, audit.RunnerToken) — no pairs
+    expect(row.ipAddress).toBe("203.0.113.9");
+  });
+
+  it("the API twin's variant: origin api + the access-token credential + the impersonator pair", async () => {
+    await emitOrgRunnerTokenAudit(env.DB, {
+      org: ORG,
+      actor: ACTOR,
+      origin: "api",
+      actorCredential: "access-token:3",
+      impersonator: { id: 1, username: "root" },
+    });
+    const row = (await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" }))[0]!;
+    expect(row.origin).toBe("api");
+    expect(row.actorCredential).toBe("access-token:3");
+    expect(row.impersonatorId).toBe(1);
+    expect(row.impersonatorName).toBe("root");
+  });
+});
+
+describe("emitOrgRunnerRemoveAudit / emitOrgRunnerUpdateAudit (RunnerDeletePost :312 / RunnerUpdatePost :356)", () => {
+  it("the remove arm carries the runner name pair", async () => {
+    await emitOrgRunnerRemoveAudit(env.DB, { org: ORG, runner: RUNNER, actor: ACTOR });
+    const row = (await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" }))[0]!;
+    expect(row.action).toBe("organization:runner:remove");
+    expect(row.message).toBe("Removed Actions runner org-runner-1 from organization coalcorp.");
+    expect(JSON.parse(row.metadata ?? "")).toEqual({ runner: "org-runner-1" });
+  });
+
+  it("the update arm renders runner/scope and carries disabled as metadata-only (Go map key order: disabled < runner)", async () => {
+    await emitOrgRunnerUpdateAudit(env.DB, { org: ORG, runner: RUNNER, disabled: true, actor: ACTOR });
+    const row = (await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" }))[0]!;
+    expect(row.action).toBe("organization:runner:update");
+    expect(row.message).toBe("Updated Actions runner org-runner-1 of organization coalcorp.");
+    // the disabled bool rides the metadata (the template does not name it),
+    // serialized in Go's json.Marshal sorted-key order
+    expect(row.metadata).toBe('{"disabled":true,"runner":"org-runner-1"}');
+  });
+});
+
+describe("emitOrgVariable{Add,Update,Remove}Audit (variables.go:24/:38/:47)", () => {
+  it("the add arm records the stored (UPPERCASE) variable name", async () => {
+    await emitOrgVariableAddAudit(env.DB, { org: ORG, variable: "DEPLOY_TARGET", actor: ACTOR });
+    const row = (await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" }))[0]!;
+    expect(row.action).toBe("organization:variable:add");
+    expect(row.message).toBe("Added variable DEPLOY_TARGET to organization coalcorp.");
+    expect(JSON.parse(row.metadata ?? "")).toEqual({ variable: "DEPLOY_TARGET" });
+  });
+
+  it("the update arm flips the action id and message", async () => {
+    await emitOrgVariableUpdateAudit(env.DB, { org: ORG, variable: "DEPLOY_TARGET", actor: ACTOR });
+    const row = (await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" }))[0]!;
+    expect(row.action).toBe("organization:variable:update");
+    expect(row.message).toBe("Updated variable DEPLOY_TARGET of organization coalcorp.");
+  });
+
+  it("the remove arm flips the action id and message", async () => {
+    await emitOrgVariableRemoveAudit(env.DB, { org: ORG, variable: "DEPLOY_TARGET", actor: ACTOR });
+    const row = (await findAuditEvents(db(), { scopeType: "organization", scopeId: "42" }))[0]!;
+    expect(row.action).toBe("organization:variable:remove");
+    expect(row.message).toBe("Removed variable DEPLOY_TARGET from organization coalcorp.");
+  });
+
+  it("a failed org emit resolves, logging only (the swallow posture)", async () => {
+    const errSpy = vi.spyOn(console, "error");
+    await expect(
+      emitOrgVariableAddAudit(
+        new Proxy({}, { get() { throw new Error("D1 failure injected"); } }) as D1Database,
+        { org: ORG, variable: "X", actor: ACTOR },
+      ),
+    ).resolves.toBeUndefined();
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("variable add audit event"), expect.any(Error));
   });
 });

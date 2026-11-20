@@ -517,6 +517,79 @@ describe("the owner-runner scope scan past D1's 100-bind cap", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The Actions-unit claim gate (#40106, task.go:333-341 at the 099abf5db4
+// pin): claimJobForRunner CANCELS a candidate whose repo has no repo_units
+// actions row — for EVERY runner scope (repo/owner/global were all able to
+// pick disabled repos' waiting jobs before; only owner runners were filtered
+// in SQL). The cancelled rows ride back for PickTask's post-scan emission
+// tail (notifyAndEmitFinishedJobs, task.go:100-103) and the scan moves on.
+// ---------------------------------------------------------------------------
+
+describe("the Actions-unit claim gate (#40106)", () => {
+  it("a repo-scoped runner CANCELS the waiting job of a repo without its actions unit — no task, no task row", async () => {
+    const seedInfo = await seed();
+    // Disable Actions: drop the unit row (the UnitEnabled reduction — the
+    // unit row IS the truth).
+    await db().delete(repoUnits).where(eq(repoUnits.repoId, seedInfo.repoId));
+
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    expect(response.task).toBeUndefined();
+
+    const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0]!;
+    expect(job.status).toBe(3); // ACTION_STATUS_CANCELLED (the CAS waiting -> cancelled)
+    expect(job.taskId).toBe(0); // never claimed
+    expect(job.stopped).not.toBeNull(); // the cancel stamps stopped=now
+    expect(await db().select().from(actionTasks)).toHaveLength(0);
+    // The cancelled row left the waiting pool — the next poll picks nothing.
+    const second = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    expect(second.task).toBeUndefined();
+  });
+
+  it("a GLOBAL runner cancels too (the #40106 point: the gate is scope-universal)", async () => {
+    const seedInfo = await seed();
+    await db().delete(repoUnits).where(eq(repoUnits.repoId, seedInfo.repoId));
+    const runner = await createRunner(env.DB, {
+      uuid: crypto.randomUUID(),
+      name: "global-runner",
+      version: "v1",
+      ownerId: 0,
+      repoId: "",
+      agentLabels: ["ubuntu-latest"],
+      ephemeral: false,
+      hasCancellingSupport: false,
+    });
+    const response = await fetchTask(env, env.DB, runner, 0, "");
+    expect(response.task).toBeUndefined();
+    const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0]!;
+    expect(job.status).toBe(3);
+    expect(job.taskId).toBe(0);
+  });
+
+  it("the gate leaves an ENABLED repo's claim untouched (the probe is the unit row)", async () => {
+    const seedInfo = await seed();
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    expect(response.task).toBeDefined();
+    const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0]!;
+    expect(job.status).not.toBe(3);
+  });
+
+  it("the emission tail settles the cancelled job's run aggregate (the post-scan notifyAndEmitFinishedJobs port)", async () => {
+    const seedInfo = await seed();
+    await db().delete(repoUnits).where(eq(repoUnits.repoId, seedInfo.repoId));
+    await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    // The run's aggregate refreshed to the cancelled status (refreshRunStatus
+    // inside the cancelled arm) — the sole job's cancellation settles it.
+    const run = (await db().select().from(actionRuns))[0]!;
+    expect(run.status).toBe(3); // ACTION_STATUS_CANCELLED
+    expect(run.stopped).not.toBeNull();
+    // The tail re-posted the job's commit status (createCommitStatusForRunJobs
+    // — the pull_request event resolves its head sha from the payload).
+    const statuses = await db().select().from(commitStatuses);
+    expect(statuses.length).toBeGreaterThan(0);
+  });
+});
+
 describe("the registration-token mint (the harness's token source)", () => {
   it("mints and consumes through the model seam", async () => {
     const token = await newRunnerTokenWithValue(env.DB, 0, "", "minted");
@@ -542,7 +615,7 @@ describe("the registration-token mint (the harness's token source)", () => {
 // whose job is still waiting, wedging an ephemeral runner on pickTask's
 // one-task-per-lifetime check forever. The terminal stopTask finalizes the
 // stranded tasks of the job (finalizeStrandedTasksOfJob) and carries the
-// upstream StopTask piggybacks (the run_job.go:511-530 version wake, the
+// upstream StopTask piggybacks (the run_job.go:493-512 version wake, the
 // task.go:452-464 ephemeral removal, and — with the storage env — the
 // clear_tasks.go:177-187 log transfer).
 // ---------------------------------------------------------------------------

@@ -176,10 +176,11 @@ describe("OrgActionsGeneralPage (org/settings/actions_general.tmpl + shared/acti
     // layout_head's `page-content {{.pageClass}}` with an EMPTY dict — Go
     // renders the trailing space (verified on Go 1.27; the module header).
     expect(html).toContain('class="page-content "');
-    // The Title is actions.actions (general.go:48) — the aria-label on
-    // role=main and the <title> pair.
-    expect(html).toContain('aria-label="Actions"');
-    expect(html).toContain("<title>Actions - cf-gitea</title>");
+    // The Title is actions.general ("General", general.go:48 — #40336
+    // re-pointed it from actions.actions so the tab names the sidebar label)
+    // — the aria-label on role=main and the <title> pair.
+    expect(html).toContain('aria-label="General"');
+    expect(html).toContain("<title>General - cf-gitea</title>");
     // The org frame (actions_general.tmpl's layout_head pulls org/header).
     expect(html).toContain('<div class="org-setting-content">');
     // The shared navbar with the Actions disclosure open + General active —

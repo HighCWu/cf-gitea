@@ -8,7 +8,7 @@
  * isolation, the cascade), and the repo-list reads the owner page rides.
  *
  * Upstream pin fc4936884584a41931906553d96c2601d750e6ef:
- * models/actions/config.go:20-51 + models/user/setting.go:22-29,186-232 +
+ * models/actions/config.go:18-37 + models/user/setting.go:22-29,186-232 +
  * setting_options.go:26 + models/repo/repo_list.go:844-850 + repo.go:763-780
  * (the module header carries the full cite set).
  */
@@ -75,14 +75,23 @@ describe("serializeOwnerActionsConfig (SetUserSettingJSON's json.Marshal)", () =
 
 // --- the parse (FromDB + EnumValue normalization) ------------------------------
 
-describe("parseOwnerActionsConfig (GetUserSettingJSON's FromDB, setting.go:210-232 + config.go:38-45)", () => {
+describe("parseOwnerActionsConfig (GetUserSettingJSON's FromDB, setting.go:210-232 + config.go:32-37 at the pin)", () => {
   it("normalizes an absent row (null and \"\") to the default config — mode permissive, max nil, allowed empty", () => {
     expect(parseOwnerActionsConfig(null)).toEqual({ tokenPermissionMode: "permissive", maxTokenPermissions: null, allowedCrossRepoIds: [] });
     expect(parseOwnerActionsConfig("")).toEqual(parseOwnerActionsConfig(null)); // the absent-row "" bytes' road
   });
 
-  it("treats junk bytes as the zero config (the ignored Unmarshal error)", () => {
-    expect(parseOwnerActionsConfig("not json{")).toEqual(parseOwnerActionsConfig(null));
+  it("THROWS on junk bytes — #39998 swapped the ignored Unmarshal for db.UnmarshalFromDB, whose corrupted-value arm panics in dev (the house throw posture)", () => {
+    // The pre-#39998 road (junk -> the zero config, the `_ =` on Unmarshal)
+    // is RETIRED: FromDB's parse failure runs setting.PanicInDevOrTesting
+    // ("UnmarshalFromDB %q failed", db/convert.go:93-101) — dev/testing
+    // PANICS (visible), production logs-and-continues. The house
+    // PanicInDevOrTesting posture throws; a corrupted config is a
+    // broken-DB signal, never silently eaten.
+    expect(() => parseOwnerActionsConfig("not json{")).toThrow(/^UnmarshalFromDB "not json\{" failed: /);
+    // The absent row's "" bytes still answer the default (the len(data)==0
+    // arm answers BEFORE the unmarshal — db/convert.go:88-90).
+    expect(parseOwnerActionsConfig("")).toEqual(parseOwnerActionsConfig(null));
   });
 
   it("normalizes an invalid stored mode to permissive (EnumValue's enums[0], util.go:302-310)", () => {

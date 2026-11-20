@@ -32,7 +32,7 @@
  *     `GetOwnerRepositoriesByIDs` :84-88 — repo_list.go:844-850, an empty id
  *     list answers an empty list WITHOUT a query :845-847 — and OwnerID
  *     :91), then renders `org/settings_actions_general`'s tpl (:93-97).
- *   - `models/actions/config.go:20-33` — the OwnerActionsConfig (a user OR
+ *   - `models/actions/config.go:18-28` — the OwnerActionsConfig (a user OR
  *     org owner — the SAME store both scopes read): TokenPermissionMode,
  *     MaxTokenPermissions, AllowedCrossRepoIDs; :38-46 its store:
  *     `user_setting` KV row `SettingsKeyActionsConfig` via
@@ -144,7 +144,8 @@ import {
 // ---------------------------------------------------------------------------
 
 export const orgSettingsActionsGeneralLocale = {
-  actions: "Actions", // "actions.actions" — the page Title (general.go:48) and the navbars' disclosure summary
+  general: "General", // "actions.general" — the page Title (general.go:48 — #40336 re-pointed it from actions.actions, so the tab names the active sidebar label)
+  actions: "Actions", // "actions.actions" — the navbars' disclosure summary (settings/navbar.tmpl:30; upstream kept it on the summary)
   cross_repo: "Cross-Repository Access", // "actions.general.cross_repo" (owner_general_settings.tmpl:2)
   cross_repo_desc:
     "Allow the selected repositories to be accessed (read-only) by all the repositories in this owner with GITEA_TOKEN when running Actions jobs.", // .cross_repo_desc (:7)
@@ -395,7 +396,7 @@ export function OrgActionsGeneralPage(props: { ctx: UiContext; data: OrgActionsG
   const orgLink = `/org/${props.data.org.username}`;
   const link = `${orgLink}/settings/actions/general`;
   return (
-    <BaseLayout ctx={ctx} title={orgSettingsActionsGeneralLocale.actions} pageClass="">
+    <BaseLayout ctx={ctx} title={orgSettingsActionsGeneralLocale.general} pageClass="">
       <OrgHeader org={props.data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
         <OrgSettingsNavbar orgLink={orgLink} active="actions-general" oauth2Enabled={props.data.oauth2Enabled} />

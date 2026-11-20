@@ -13,9 +13,9 @@
  *     enable/disable pair by the toggle's polarity, scope = the repository
  *     (ScopeFromRepository, services/audit/refs.go:65-70 — id + FullName),
  *     metadata the single "workflow" pair, actor the doer. Upstream call
- *     sites: the web toggle (routers/web/repo/actions/view.go:1365 — AFTER
+ *     sites: the web toggle (routers/web/repo/actions/view.go:207 — AFTER
  *     UpdateRepoUnitConfig, before the Flash arms) and the API twin
- *     (EnableOrDisableWorkflow, workflow.go:49).
+ *     (EnableOrDisableWorkflow, workflow.go:50).
  *   - `emitWorkflowDispatchAudit` — DispatchActionWorkflow's tail
  *     (:192-193): audit.RecordAs(ctx, doer, ActionsWorkflowDispatch, repo,
  *     "workflow", workflowID, "ref", ref, "run_id", run.ID). The ref is the
@@ -84,7 +84,7 @@ export interface WorkflowAuditRepo {
  *  request context the AuditEventInput carries). */
 export interface WorkflowToggleAuditArm {
   repo: WorkflowAuditRepo;
-  /** The workflow id string (view.go:1365's form `workflow` / the API
+  /** The workflow id string (view.go:207's form `workflow` / the API
    *  arm's workflow.ID — the ActionsConfig key, verbatim). */
   workflowId: string;
   /** The toggle polarity (view.go's disableOrEnableWorkflowFile's arg). */
@@ -111,11 +111,11 @@ export interface WorkflowToggleAuditArm {
   impersonatorUserId?: number | null;
 }
 
-/** The dispatch arm's input (DispatchActionWorkflow's :192-193 pairs). */
+/** The dispatch arm's input (DispatchActionWorkflow's :193-194 pairs). */
 export interface WorkflowDispatchAuditArm {
   repo: WorkflowAuditRepo;
   workflowId: string;
-  /** The RAW `ref` (the form value / API body field — workflow.go:193's
+  /** The RAW `ref` (the form value / API body field — workflow.go:194's
    *  own `ref`, before the RefName normalization). */
   ref: string;
   /** The inserted run's id (run.ID — numeric; accepted as a string too,
@@ -245,4 +245,123 @@ export async function emitWorkflowDispatchAudit(db: D1Database, arm: WorkflowDis
   } catch (error) {
     swallow("workflow dispatch", error);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The ORG-scope runner/variable arms (#40323 — 3f1b738f09, models/audit/
+// action.go:143-148 at the 099abf5db4 pin). Upstream's
+// audit.RecordScopedByID(ctx, ownerID, repoID, action, pairs…) resolves the
+// scope row from the owner id; the org arm renders as scopeType
+// "organization", scopeId = the org's users.id, scopeName = the org's
+// username. The metadata pairs are the template's own keys plus the
+// unrendered details upstream carries in the same map ("upstream's metadata
+// carries every parser key, renderMessage only renders the named ones") —
+// the runner-update arm's `disabled` bool is metadata-only.
+//
+// WIRING STATUS (the ownership seam): upstream emits at the shared WEB
+// handlers (routers/web/shared/actions/runners.go) and the variables SERVICE
+// (services/actions/variables.go); our web route handlers live in
+// ui/index.ts (orchestrator-owned) and the mutation services are the
+// settings pages' thin helpers — the ORG callers must thread the actor
+// snapshot into these helpers (HANDOFF 2026-11-20, ACTIONS2). The helpers
+// are complete and verified by audit-arms.test.ts; the registry rows they
+// emit are the disclosed append in services/audit.ts.
+// ---------------------------------------------------------------------------
+
+/** The org-scope arm's shared input: the org snapshot (RecordScopedByID's
+ *  owner resolution) plus the house actor/impersonation/origin carrier —
+ *  the {@link WorkflowToggleAuditArm} shape minus the repo. */
+export interface OrgActionsAuditArm {
+  org: { id: number; username: string };
+  actor: { id: number; username: string };
+  origin?: "ui" | "api";
+  ipAddress?: string | null;
+  actorCredential?: string | null;
+  impersonator?: { id: number; username: string } | null;
+  impersonatorUserId?: number | null;
+}
+
+/** The runner arms' target snapshot ({ActionRunner.ID, Name} — upstream's
+ *  `"runner", runner.Name` pair; the id rides the metadata for correlation). */
+export interface OrgActionsRunnerArm extends OrgActionsAuditArm {
+  runner: { id: number; name: string };
+}
+
+/** The variable arms' target (the variable's stored — UPPERCASE — name,
+ *  `"variable", v.Name` upstream). */
+export interface OrgActionsVariableArm extends OrgActionsAuditArm {
+  variable: string;
+}
+
+/** The shared org emit: one registered org-scope action, the vars the
+ *  template names plus `scope`, the metadata pairs in Go's json.Marshal map
+ *  order (sorted keys). The swallow posture is the module's writeEvent
+ *  shape — an audit row never fails the write it describes. */
+async function emitOrgActionsAudit(
+  db: D1Database,
+  action: string,
+  arm: OrgActionsAuditArm,
+  vars: Record<string, string>,
+  metadata: Record<string, unknown> | null,
+  scope: string,
+): Promise<void> {
+  try {
+    const impersonator = await resolveImpersonator(db, arm);
+    await emitAudit(drizzle(db), {
+      action,
+      actorId: arm.actor.id,
+      actorName: arm.actor.username,
+      actorCredential: arm.actorCredential ?? null,
+      impersonatorId: impersonator.id,
+      impersonatorName: impersonator.name,
+      scopeType: "organization",
+      scopeId: arm.org.id,
+      scopeName: arm.org.username,
+      origin: arm.origin ?? "ui",
+      ipAddress: arm.ipAddress ?? null,
+      vars: { ...vars, scope: arm.org.username },
+      metadata,
+    });
+  } catch (error) {
+    swallow(scope, error);
+  }
+}
+
+/** ResetRunnerRegistrationToken's arm (runners.go:278 at the pin):
+ *  `audit.RecordScopedByID(ctx, ownerID, repoID, audit.RunnerToken)` — no
+ *  metadata pairs, the bare token issuance row. */
+export function emitOrgRunnerTokenAudit(db: D1Database, arm: OrgActionsAuditArm): Promise<void> {
+  return emitOrgActionsAudit(db, AuditActions.OrganizationRunnerToken, arm, {}, null, "runner token");
+}
+
+/** RunnerDeletePost's arm (:312): `"runner", runner.Name` — remove. */
+export function emitOrgRunnerRemoveAudit(db: D1Database, arm: OrgActionsRunnerArm): Promise<void> {
+  return emitOrgActionsAudit(db, AuditActions.OrganizationRunnerRemove, arm, { runner: arm.runner.name }, { runner: arm.runner.name }, "runner remove");
+}
+
+/** RunnerUpdatePost's arm (:356): `"runner", runner.Name, "disabled",
+ *  isDisabled.Value()` — the description update and the enable/disable flip
+ *  share the row (upstream emits after EITHER write). The disabled bool is
+ *  metadata-only (the template names runner/scope), Go map key order:
+ *  disabled < runner. */
+export function emitOrgRunnerUpdateAudit(db: D1Database, arm: OrgActionsRunnerArm & { disabled: boolean }): Promise<void> {
+  return emitOrgActionsAudit(db, AuditActions.OrganizationRunnerUpdate, arm, { runner: arm.runner.name }, { disabled: arm.disabled, runner: arm.runner.name }, "runner update");
+}
+
+/** CreateVariable's arm (variables.go:24): `"variable", v.Name` — add. */
+export function emitOrgVariableAddAudit(db: D1Database, arm: OrgActionsVariableArm): Promise<void> {
+  return emitOrgActionsAudit(db, AuditActions.OrganizationVariableAdd, arm, { variable: arm.variable }, { variable: arm.variable }, "variable add");
+}
+
+/** UpdateVariableNameData's arm (:38-42): emitted only when the row actually
+ *  changed (`if updated`) — the caller gates on the update's boolean. */
+export function emitOrgVariableUpdateAudit(db: D1Database, arm: OrgActionsVariableArm): Promise<void> {
+  return emitOrgActionsAudit(db, AuditActions.OrganizationVariableUpdate, arm, { variable: arm.variable }, { variable: arm.variable }, "variable update");
+}
+
+/** DeleteVariable's arm (:47): the delete firehose — DeleteVariableByID and
+ *  DeleteVariableByName both funnel here upstream, so every org variable
+ *  delete path records. */
+export function emitOrgVariableRemoveAudit(db: D1Database, arm: OrgActionsVariableArm): Promise<void> {
+  return emitOrgActionsAudit(db, AuditActions.OrganizationVariableRemove, arm, { variable: arm.variable }, { variable: arm.variable }, "variable remove");
 }

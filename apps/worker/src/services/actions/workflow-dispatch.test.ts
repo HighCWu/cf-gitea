@@ -1,6 +1,6 @@
 /**
  * The workflow DISPATCH producer's tests (the ⑲A4 row's service arm —
- * workflow.go:64-199's port): the validation ladder with its
+ * workflow.go:66-201's port): the validation ladder with its
  * upstream messages (the disabled check, the ref resolution arms, the
  * workflow-not-found and has-no-dispatch arms, the light invalid arm), the
  * input processing (boolean coercion, the default fallback, the form-value
@@ -8,7 +8,7 @@
  * stringified inputs, the {}-shaped repository/sender), and the inserted
  * run's skeleton (event/trigger_event workflow_dispatch, the normalized
  * ref, the commit-subject title) with its waiting jobs. The C10 half-stage
- * adds the SCOPED arm's battery (workflow.go:237-268's
+ * adds the SCOPED arm's battery (workflow.go:239-270's
  * resolveScopedDispatchContent): the effective-source gate, the source
  * default-branch walk, the opt-out/required disabled check and the run's
  * content-source columns (is_scoped_run / workflow_repo_id /
@@ -138,7 +138,7 @@ function deadReads(): WorkflowDispatchReads {
   };
 }
 
-describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 producer)", () => {
+describe("dispatchWorkflow (workflow.go:66-201's repo-level arm, the ⑲A4 producer)", () => {
   beforeEach(seedRepo);
 
   it("inserts the run with the dispatch skeleton: normalized ref, commit-subject title, event pair, waiting jobs", async () => {
@@ -154,7 +154,7 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     expect(outcome.run.commitSha).toBe(SHA);
     expect(outcome.run.isForkPullRequest).toBe(false);
     expect(outcome.run.status).toBe(ACTION_STATUS_WAITING);
-    // The content-source trio at the repo-level posture (workflow.go:136-137's
+    // The content-source trio at the repo-level posture (workflow.go:137-138's
     // skeleton: WorkflowRepoID = the repo itself, WorkflowCommitSHA = the run
     // target commit — the two shas stay EQUAL; IsScopedRun false).
     expect(outcome.run.workflowCommitSha).toBe(SHA);
@@ -172,7 +172,7 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     expect(row?.isScopedRun).toBe(false);
   });
 
-  it("a bare branch ref re-reads as refs/heads/<branch> (workflow.go:113-115's RefNameFromBranch arm); the payload keeps the RAW ref", async () => {
+  it("a bare branch ref re-reads as refs/heads/<branch> (workflow.go:114-116's RefNameFromBranch arm); the payload keeps the RAW ref", async () => {
     const outcome = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }), { ref: "feature" });
     expect(outcome.status).toBe("translatable"); // the fake resolves only refs/heads/main
     if (outcome.status !== "translatable") return;
@@ -186,10 +186,10 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     if (ok.status !== "ok") return;
     expect(ok.run.ref).toBe("refs/heads/feature");
     const payload = JSON.parse(ok.run.eventPayload) as { ref: string; inputs: Record<string, string> };
-    expect(payload.ref).toBe("feature"); // the RAW form string (workflow.go:179)
+    expect(payload.ref).toBe("feature"); // the RAW form string (workflow.go:177)
   });
 
-  it("processes the inputs: booleans coerce, the default fills, the form value wins (view.go:1397-1404 + workflow.go:201-210)", async () => {
+  it("processes the inputs: booleans coerce, the default fills, the form value wins (view.go:1393-1400 + workflow.go:203-212)", async () => {
     const outcome = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }), {
       form: { greeting: "hi there", flag: "on" },
     });
@@ -208,7 +208,7 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     expect(typed.status).toBe("ok");
     // The empty-form arm: the non-boolean falls back to the declared
     // default; the boolean takes FormBool directly (an absent checkbox is
-    // false — the form's checked state carries the default, view.go:1397-1404).
+    // false — the form's checked state carries the default, view.go:1393-1400).
     const defaultForm = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }));
     if (defaultForm.status !== "ok") throw new Error("expected ok");
     const defaultPayload = JSON.parse(defaultForm.run.eventPayload) as { inputs: Record<string, string> };
@@ -267,19 +267,19 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     const zero = await dispatch(reads, { scopedWorkflowSourceRepoId: "0" });
     expect(zero.status).toBe("ok");
     // A NEGATIVE spelling is repo-level too: upstream parses FormInt64 and
-    // arms the scoped branch only when the value is > 0 (workflow.go:79's
+    // arms the scoped branch only when the value is > 0 (workflow.go:80's
     // `isScoped := scopedWorkflowSourceRepoID > 0`) — "-5" dispatches the
     // repo's own workflow dir like the zero arm (the R1-F11 pin).
     const negative = await dispatch(reads, { scopedWorkflowSourceRepoId: "-5" });
     expect(negative.status).toBe("ok");
     if (negative.status === "ok") {
       expect(negative.run.isScopedRun).toBe(false);
-      expect(negative.run.workflowRepoId).toBe(REPO_ID); // workflow.go:136 — the repo itself
+      expect(negative.run.workflowRepoId).toBe(REPO_ID); // workflow.go:137 — the repo itself
     }
   });
 });
 
-describe("dispatchWorkflow's scoped arm (resolveScopedDispatchContent, workflow.go:237-268 — the C10 half-stage)", () => {
+describe("dispatchWorkflow's scoped arm (resolveScopedDispatchContent, workflow.go:239-270 — the C10 half-stage)", () => {
   const SRC_ID = "src-repo";
   const SRC_SHA = "aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -329,9 +329,9 @@ describe("dispatchWorkflow's scoped arm (resolveScopedDispatchContent, workflow.
     const outcome = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": DISPATCH_WORKFLOW });
     expect(outcome.status).toBe("ok");
     if (outcome.status !== "ok") return;
-    expect(outcome.run.isScopedRun).toBe(true); // workflow.go:262's IsScopedRun
-    expect(outcome.run.workflowRepoId).toBe(SRC_ID); // :260's WorkflowRepoID = sourceRepo.ID
-    expect(outcome.run.workflowCommitSha).toBe(SRC_SHA); // :261's WorkflowCommitSHA = the source HEAD
+    expect(outcome.run.isScopedRun).toBe(true); // workflow.go:268's IsScopedRun
+    expect(outcome.run.workflowRepoId).toBe(SRC_ID); // :262's WorkflowRepoID = sourceRepo.ID
+    expect(outcome.run.workflowCommitSha).toBe(SRC_SHA); // :262's WorkflowCommitSHA = the source HEAD
     expect(outcome.run.repoId).toBe(REPO_ID); // the run lives in the CONSUMER repo
     expect(outcome.run.commitSha).toBe(SHA); // ... at the consumer's commit
     expect(outcome.run.title).toBe("default subject"); // Title = the CONSUMER commit's MessageTitle
@@ -368,10 +368,10 @@ jobs:
     expect(ok.status).toBe("ok");
 
     const missing = await dispatchScoped({ ".gitea/scoped_workflows/other.yml": DISPATCH_WORKFLOW });
-    expect(missing).toEqual({ status: "translatable", message: "Workflow 'ci.yml' not found." }); // :260-267's not-found
+    expect(missing).toEqual({ status: "translatable", message: "Workflow 'ci.yml' not found." }); // :262-268's not-found
   });
 
-  it("the opt-out check: a flagged consumer's dispatch answers disabled; a REQUIRED workflow dispatches anyway (workflow.go:84-99)", async () => {
+  it("the opt-out check: a flagged consumer's dispatch answers disabled; a REQUIRED workflow dispatches anyway (workflow.go:85-100)", async () => {
     await registerSource(0);
     await saveRepoActionsConfig(env.DB, REPO_ID, {
       disabledWorkflows: [],

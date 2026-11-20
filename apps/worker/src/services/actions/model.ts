@@ -669,13 +669,15 @@ export interface TaskWithToken extends TaskRow {
 const PICK_TASK_BATCH_SIZE = 100;
 
 /**
- * The scope's candidate repositories for the dispatch scan (CreateTaskForRunner's
- * jobCond, task.go:279-286): a repo runner sees its repo; an owner runner
- * sees the owner's repos with the Actions unit enabled (upstream's
- * repo_unit type-10 join); null = a global runner sees everything.
- * The materialized read — the scan itself filters through
- * {@link scopeRepoCondition}, the same join as a subquery (see there for
- * why the scan must not consume this list directly).
+ * The scope's candidate repositories for the dispatch scan (the
+ * JobQueueOptions owner leg, run_job_queue.go:31-32 at the 099abf5db4 pin —
+ * #40106 moved pickup onto JobQueueOptions): a repo runner sees its repo; an
+ * owner runner sees ALL the owner's repos — the repo_unit type-10 join is
+ * GONE (the Actions-unit check moved to claim time, where a disabled repo's
+ * waiting jobs are CANCELLED instead of silently skipped); null = a global
+ * runner sees everything. The materialized read — the scan itself filters
+ * through {@link scopeRepoCondition}, the same query as a subquery (see
+ * there for why the scan must not consume this list directly).
  */
 export async function scopeRepoIds(d1: D1, runner: RunnerRow): Promise<string[] | null> {
   const db = drizzle(d1);
@@ -686,25 +688,28 @@ export async function scopeRepoIds(d1: D1, runner: RunnerRow): Promise<string[] 
     const rows = await db
       .select({ id: repositories.id })
       .from(repositories)
-      .innerJoin(sql`repo_units`, sql`repo_units.repo_id = repositories.id`)
-      .where(and(sql`repositories.owner_id = ${runner.ownerId}`, sql`repo_units.type = 'actions'`));
+      .where(eq(repositories.ownerId, runner.ownerId));
     return rows.map((r) => r.id);
   }
   return null;
 }
 
 /**
- * The scan's scope filter (CreateTaskForRunner's jobCond, task.go:279-286):
- * a repo runner sees its repo; an owner runner sees the owner's repos with
- * the Actions unit enabled; a global runner gets undefined (no scope leg).
- * The owner branch keeps upstream's `builder.In("repo_id", subquery)` shape
- * (task.go:280-283) — an IN over the repo_unit JOIN SUBQUERY, not over
- * materialized ids: D1 caps a statement at 100 bound parameters, so the
- * materialized list (one bind per repo + the scan's three eq legs) 500s
- * every FetchTask once an owner passes ~95 actions-enabled repos, while the
- * subquery carries a single bind (the owner id) at any repo count. An empty
- * scope set needs no special case — the subquery matches nothing, which is
- * exactly an empty IN.
+ * The scan's scope filter (the JobQueueOptions session legs, run_job_queue.go:26-33
+ * at the 099abf5db4 pin — #40106 unified pickup onto it): a repo runner sees
+ * its repo (`repo_id = ?`); an owner runner sees ALL the owner's repos
+ * (`repo_id IN (SELECT id FROM repository WHERE owner_id = ?)` — the
+ * repo_unit join upstream dropped from the scan; the claim now checks the
+ * Actions unit per job and CANCELS it when the repo disabled Actions, for
+ * every runner scope, instead of filtering owner runners in SQL and leaving
+ * repo/global runners picking disabled repos' jobs); a global runner gets
+ * undefined (no scope leg — the same claim-time check guards it).
+ * The owner branch keeps an IN over a SUBQUERY, not materialized ids: D1
+ * caps a statement at 100 bound parameters, so the materialized list (one
+ * bind per repo + the scan's three eq legs) 500s every FetchTask once an
+ * owner passes ~95 repos, while the subquery carries a single bind (the
+ * owner id) at any repo count. An empty scope set needs no special case —
+ * the subquery matches nothing, which is exactly an empty IN.
  */
 export function scopeRepoCondition(d1: D1, runner: RunnerRow): SQL<unknown> | undefined {
   const db = drizzle(d1);
@@ -717,23 +722,37 @@ export function scopeRepoCondition(d1: D1, runner: RunnerRow): SQL<unknown> | un
       db
         .select({ id: repositories.id })
         .from(repositories)
-        .innerJoin(sql`repo_units`, sql`repo_units.repo_id = repositories.id`)
-        .where(and(sql`repositories.owner_id = ${runner.ownerId}`, sql`repo_units.type = 'actions'`)),
+        .where(eq(repositories.ownerId, runner.ownerId)),
     );
   }
   return undefined;
 }
 
+/** The claim callback's cancellation marker (#40106): the candidate's repo
+ *  has its Actions unit disabled — the callback cancelled the job instead of
+ *  claiming it, the scan moves to the next candidate, and the cancelled row
+ *  accumulates for the caller's emission tail. */
+export interface ScanClaimCancelled {
+  cancelledJob: RunJobRow;
+}
+
 /** Scan candidates for an idle runner (CreateTaskForRunner,
- *  task.go:265-331): keyset-paginated oldest-first over waiting, unclaimed,
- *  non-reusable-caller jobs within the runner's scope. Each label-matched
- *  candidate goes to `claim`; a lost race (null) moves to the next
- *  candidate — the CAS decides, the scan never errors on contention. */
-export async function scanAndClaimWaitingJobs<T>(
+ *  task.go:262-318 at the 099abf5db4 pin): keyset-paginated oldest-first
+ *  over waiting, unclaimed, non-reusable-caller jobs within the runner's
+ *  scope. Each label-matched candidate goes to `claim`; a lost race (null)
+ *  moves to the next candidate, a cancellation ({@link ScanClaimCancelled})
+ *  is collected and the scan CONTINUES (#40106 — upstream's loop appends the
+ *  cancelled job and tries the next one), and a claimed task ends the scan
+ *  with the cancellations gathered so far. An EXHAUSTED scan answers
+ *  `{ cancelledJobs }` when any candidate was cancelled — upstream returns
+ *  (nil, cancelledJobs, nil) and PickTask settles them before the nil-task
+ *  answer — and plain null only when nothing at all happened. The CAS
+ *  decides, the scan never errors on contention. */
+export async function scanAndClaimWaitingJobs<T extends object>(
   d1: D1,
   runner: RunnerRow,
-  claim: (job: RunJobRow) => Promise<T | null>,
-): Promise<T | null> {
+  claim: (job: RunJobRow) => Promise<T | ScanClaimCancelled | null>,
+): Promise<{ task: T; cancelledJobs: RunJobRow[] } | { cancelledJobs: RunJobRow[] } | null> {
   const db = drizzle(d1);
   const base: SQL<unknown>[] = [
     eq(actionRunJobs.taskId, 0),
@@ -745,6 +764,7 @@ export async function scanAndClaimWaitingJobs<T>(
     base.push(scope);
   }
 
+  const cancelledJobs: RunJobRow[] = [];
   let cursorUpdated: Date | null = null;
   let cursorId = 0;
   for (;;) {
@@ -779,15 +799,29 @@ export async function scanAndClaimWaitingJobs<T>(
       if (!canMatchLabels(JSON.parse(runner.agentLabels) as string[], jobRunsOn)) {
         continue;
       }
-      const task = await claim(job);
-      if (task !== null) {
-        return task;
+      const claimed = await claim(job);
+      if (claimed !== null) {
+        if ("cancelledJob" in claimed) {
+          cancelledJobs.push(claimed.cancelledJob);
+          // claimJobForRunner's cancelled arm (task.go:306-309): another
+          // runner may yet win, and the remaining candidates still need a
+          // runner — the scan advances.
+          continue;
+        }
+        return { task: claimed, cancelledJobs };
       }
       // Another runner claimed this job concurrently; try the next one.
     }
 
     if (isLastPage) {
-      return null;
+      // CreateTaskForRunner's exhausted-scan arm (models/actions/task.go:313-315
+      // at the 099abf5db4 pin): the cancellations ride EVEN when no task was
+      // claimed — upstream returns (nil, cancelledJobs, nil), and PickTask's
+      // notifyAndEmitFinishedJobs settles them BEFORE the nil-task answer
+      // (services/actions/task.go:100-107). A plain null here would strand
+      // the #40106 claim-time cancellations without their emission tail
+      // (the all-candidates-cancelled poll — the common disabled-repo case).
+      return cancelledJobs.length > 0 ? { cancelledJobs } : null;
     }
   }
 }
