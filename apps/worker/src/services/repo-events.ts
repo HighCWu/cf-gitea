@@ -18,7 +18,12 @@
  *   - the fork replication consumer (src/repos/fork-task.ts) — the `fork`
  *     event (upstream ForkRepository, notifier.go:86-91), routed through the
  *     SOURCE repository's hooks (upstream's `EventSource{Repository:
- *     oldRepo}`) with `forkee` = the source and `repository` = the fork.
+ *     oldRepo}`) with `forkee` = the source and `repository` = the fork;
+ *   - the transfer-accept settle (src/repos/service.ts acceptTransfer) —
+ *     `repository` action=transferred after the ownership move commits
+ *     (upstream notifies post-commit at services/repository/transfer.go:89,
+ *     AcceptTransferOwnership; the direct-transfer twin rides
+ *     StartRepositoryTransfer's isDirectTransfer arm, transfer.go:507).
  *
  * The delivery mechanics are emitIssueEvent's, moved verbatim (the routes'
  * inline-helper lineage): the delivery-row insert is AWAITED inline after the
@@ -35,12 +40,27 @@
  * recordAction fan-out — same caught-and-logged posture, awaited inline so
  * tests and readers see the rows when the response lands.
  *
- * Upstream shapes (submodule pin fc4936884584):
- *   - RepositoryPayload (modules/structs/hook.go:566): action
- *     created|deleted|renamed (HookRepoAction, :557-562 — there is NO
- *     transfer action; upstream's webhookNotifier inherits NullNotifier's
- *     no-op TransferRepository, so our pending-transfer 201 and the
- *     transfer-accept route stay silent, upstream-faithful);
+ * Upstream shapes (submodule pin 099abf5db4):
+ *   - RepositoryPayload (modules/structs/hook.go:585): action
+ *     created|deleted|renamed|transferred (HookRepoAction, :570-581) —
+ *     be297b7e05 retired the fc49368845-era "no transfer action" posture:
+ *     webhookNotifier.TransferRepository (services/webhook/notifier.go:
+ *     149-163) fires the `transferred` webhook, so the accept arm emits it
+ *     here (the stale NullNotifier no-op claim this header once carried is
+ *     dead). Payload: `repository` renders the POST-transfer row at owner
+ *     access (ToRepo, AccessModeOwner), `organization` is the NEW owner
+ *     (repo.MustOwner), `sender` the doer, and `changes.owner.from` carries
+ *     the OLD owner exactly once as `user` or `organization`
+ *     (ChangesOwnerPayload, hook.go:469-475 — non-pointer `from` always
+ *     marshals; the two arms are omitempty pointers filled by the
+ *     IsOrganization branch, notifier.go:151-155). Recipients = the repo's
+ *     own active hooks + the NEW owner's active hooks + system webhooks
+ *     (PrepareWebhooks over the post-transfer EventSource,
+ *     services/webhook/webhook.go:207-249 — our ownerId rides the settled
+ *     row, so emitWebhookDeliveries derives the same set). The feed's
+ *     actionNotifier writes the ActionTransferRepo (= 8) row with the old
+ *     full name as content (services/feed/notifier.go:167-177) — the
+ *     repoActionDraft transferred arm.
  *   - ForkPayload (hook.go:272): forkee/repository/sender — the notifier
  *     fills forkee with the SOURCE (oldRepo), not the fork (the stale field
  *     doc says otherwise; notifier.go:86-91 is authoritative).
@@ -70,6 +90,23 @@ export interface RepoEventRequest {
   readonly env: Env;
   /** `Context.executionCtx` — read inside the try/catch (see above). */
   readonly executionCtx: RepoEventExecution;
+}
+
+/**
+ * The transfer-accept's emission context: the hono request the route hands
+ * over (env for the Queue producer, executionCtx for the waitUntil enqueue)
+ * plus the §2.7 identity inputs only the route owns. Upstream renders the
+ * sender from the accepting doer (ToUser(doer), notifier.go:159) with the
+ * same request-scoped converters; when absent (in-process service callers),
+ * acceptTransfer degrades to `emitRepoEventInline` — delivery rows stay
+ * `pending`, the durable source of truth.
+ */
+export interface RepoTransferEventContext {
+  request: RepoEventRequest;
+  /** The request's viewer — renders the repository/organization identity. */
+  viewer: Viewer;
+  /** The rendered doer (`c.get("authUser")`) — upstream ToUser(doer). */
+  sender: unknown;
 }
 
 /**
@@ -141,7 +178,9 @@ function payloadString(record: Record<string, unknown> | null, key: string): str
  * The repo-family action draft for one emission, or null when the event
  * carries no upstream action. Fields derive from the rendered payload:
  * act_user = sender.id, is_private = repository.private, old name =
- * changes.name.from (the renamed action's content, notifier.go:161).
+ * changes.name.from (the renamed action's content, notifier.go:161), the
+ * transferred action's content = the old owner's login + "/" + repository.name
+ * (feed/notifier.go:167-177).
  */
 export function repoActionDraft(emission: RepoEventEmission): ActionDraft | null {
   const payload = payloadRecord(emission.payload);
@@ -166,6 +205,23 @@ export function repoActionDraft(emission: RepoEventEmission): ActionDraft | null
         // The old name (upstream content = oldRepoName, notifier.go:161;
         // the webhook's changes.name.from carries it).
         content: payloadString(payloadRecord(payloadRecord(payload.changes)?.name), "from"),
+      };
+    }
+    if (payload.action === "transferred") {
+      // ActionTransferRepo with the old full name as content (feed/notifier.go:
+      // 167-177 — Content: path.Join(oldOwner.Name, repo.Name); the rendered
+      // login and repository.name are the display-case pair, and the old
+      // owner rides exactly one of changes.owner.from.user/organization).
+      const from = payloadRecord(payloadRecord(payloadRecord(payload.changes)?.owner)?.from);
+      const oldOwner = payloadRecord(from?.user) ?? payloadRecord(from?.organization);
+      const repoName = payloadString(payloadRecord(payload.repository), "name");
+      if (oldOwner === null || repoName === undefined) return null;
+      return {
+        actUserId,
+        repoId: emission.repoId,
+        opType: ActionType.TransferRepo,
+        isPrivate,
+        content: `${payloadString(oldOwner, "login") ?? ""}/${repoName}`,
       };
     }
   }
@@ -259,18 +315,22 @@ export async function emitRepoEventInline(env: RepoEventEnv, emission: RepoEvent
 }
 
 /**
- * The shared RepositoryPayload wrapper (§2.7, modules/structs/hook.go:566).
+ * The shared RepositoryPayload wrapper (§2.7, modules/structs/hook.go:585).
  * `organization` is upstream's `ToUser(owner)` — the owner user row even when
  * that owner is a user, not an org (CreateRepository/DeleteRepository/
- * RenameRepository all pass the owner). `changes` renders only for the
- * renamed action (omitempty upstream).
+ * RenameRepository/TransferRepository all pass the owner). `changes` renders
+ * only for the renamed/transferred actions (omitempty upstream): the renamed
+ * arm is the string-`from` shape, the transferred arm the owner shape
+ * (transferredOwnerChanges).
  */
 export function repositoryEventPayload(
   action: string,
   repository: unknown,
   organization: unknown,
   sender: unknown,
-  options: { changes?: Record<string, { from: string }> } = {},
+  options: {
+    changes?: Record<string, { from: string } | { from: { user?: unknown; organization?: unknown } }>;
+  } = {},
 ): Record<string, unknown> {
   return {
     action,
@@ -279,6 +339,21 @@ export function repositoryEventPayload(
     sender,
     ...(options.changes === undefined ? {} : { changes: options.changes }),
   };
+}
+
+/**
+ * The transferred action's `changes.owner` (upstream ChangesOwnerPayload,
+ * modules/structs/hook.go:469-475): `from` is a non-pointer struct — it
+ * always marshals, even when empty — while the two arms inside are omitempty
+ * pointers, so exactly ONE of `user`/`organization` renders, mirroring the
+ * old owner's kind (webhook/notifier.go:151-155 branches on
+ * oldOwner.IsOrganization).
+ */
+export function transferredOwnerChanges(
+  oldOwner: unknown,
+  oldOwnerIsOrg: boolean,
+): { owner: { from: Record<string, unknown> } } {
+  return { owner: { from: oldOwnerIsOrg ? { organization: oldOwner } : { user: oldOwner } } };
 }
 
 /**

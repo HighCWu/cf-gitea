@@ -30,7 +30,8 @@ import {
 import { carryRepoCell } from "./carry";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
-import { comments, issueLabels, issues, labels, projectColumns, projectIssues, projectWorkflows, projects, protectedBranches, repoCollaborators, repoCounters, repoRedirects, repoSettings, repoTransfer, repoUnits, repoWatchers, repositories, stars, teamRepoAccess, teams, users } from "../db/schema";
+import { actions, comments, issueLabels, issues, labels, projectColumns, projectIssues, projectWorkflows, projects, protectedBranches, repoCollaborators, repoCounters, repoRedirects, repoSettings, repoTransfer, repoUnits, repoWatchers, repositories, stars, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
+import { ActionType } from "../api/services/activity-feeds";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { starRepo } from "../api/services/stars";
@@ -53,7 +54,10 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_settings", "repo_transfer", "repo_redirects", "repo_counters", "stars", "repositories", "audit_event"]) {
+  // webhook_deliveries/webhooks/action: the transfer arm's emission-window
+  // wipe (the transfer webhook now fires from EVERY acceptTransfer, including
+  // the direct service calls below — the audit_event precedent, 9f9b47f).
+  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_settings", "repo_transfer", "repo_redirects", "repo_counters", "stars", "webhook_deliveries", "webhooks", "action", "repositories", "audit_event"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users WHERE username_lower != 'assets'").run();
@@ -397,6 +401,171 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     expect(await svc.canUserAcceptOrRejectTransfer(owner.id, outsider.id)).toBe(false);
     // A missing recipient row refuses (upstream LoadAttributes fails the check).
     expect(await svc.canUserAcceptOrRejectTransfer(424242, outsider.id)).toBe(false);
+  });
+
+  /** The §2.7 transferred-payload slice the witnesses drill into
+   *  (RepositoryPayload, hook.go:585 + ChangesOwnerPayload :469-475). */
+  type TransferredPayload = {
+    action: string;
+    sender: { id: number; login: string };
+    organization: { id: number; login: string };
+    repository: { name: string; owner: { login: string } };
+    changes: { owner: { from: Record<string, { id: number; login: string }> } };
+  };
+
+  it("acceptTransfer fires the repository/transferred webhook — the three recipient sets (repo's own + NEW owner + system) and the changes.owner.from.user shape (be297b7e05; notifier.go:149-163)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "moving");
+
+    // The recipient set, one hook per set: the repo's own, the NEW owner's
+    // (PrepareWebhooks resolves the owner off the POST-transfer repo,
+    // webhook.go:214-231), and a system webhook (:232-239). Two negatives:
+    // the OLD owner's hook must NOT receive (the pre-fix set), and a repo
+    // hook subscribed to another event must not match.
+    const seedHook = async (patch: { repoId?: string; ownerId?: number; isSystemWebhook?: boolean; events?: string }) =>
+      (
+        await drizzle(env.DB)
+          .insert(webhooks)
+          .values({
+            url: "https://hooks.example.com/x",
+            events: patch.events ?? JSON.stringify({ send_everything: true }),
+            isActive: true,
+            repoId: patch.repoId,
+            ownerId: patch.ownerId,
+            isSystemWebhook: patch.isSystemWebhook ?? false,
+          })
+          .returning({ id: webhooks.id })
+          .all()
+      )[0]!.id;
+    const repoHookId = await seedHook({ repoId: repo.id });
+    const bobHookId = await seedHook({ ownerId: bob.id });
+    const systemHookId = await seedHook({ isSystemWebhook: true });
+    const oldOwnerHookId = await seedHook({ ownerId: alice.id });
+    const pushOnlyHookId = await seedHook({
+      repoId: repo.id,
+      events: JSON.stringify({ choose_events: true, events: { push: true } }),
+    });
+
+    await svc.requestTransfer(repo.id, alice.id, bob.id);
+    // The route hands its request/viewer/sender over (the Queue producer is a
+    // binding only the caller has); the sender here is the stub identity —
+    // the payload carries it verbatim (upstream ToUser(doer)).
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false }, {
+      request: { env, executionCtx: { waitUntil: () => {} } },
+      viewer: { origin: "https://example.com", requester: null },
+      sender: { id: bob.id, login: "Bob" },
+    });
+
+    const rows = await drizzle(env.DB).select().from(webhookDeliveries).all();
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((r) => r.hookId))).toEqual(new Set([repoHookId, bobHookId, systemHookId]));
+    expect(rows.map((r) => r.hookId)).not.toContain(oldOwnerHookId);
+    expect(rows.map((r) => r.hookId)).not.toContain(pushOnlyHookId);
+    for (const row of rows) {
+      expect(row.eventType).toBe("repository");
+      expect(row.eventGroup).toBe("repository");
+      expect(row.state).toBe("pending");
+      expect(row.repoId).toBe(repo.id);
+    }
+
+    const payload = JSON.parse(rows.find((r) => r.hookId === repoHookId)!.payloadContent) as TransferredPayload;
+    expect(payload.action).toBe("transferred");
+    expect(payload.sender).toEqual({ id: bob.id, login: "Bob" });
+    // `organization` is the NEW owner (repo.MustOwner, notifier.go:158) even
+    // for a user owner; the repository renders the POST-transfer row.
+    expect(payload.organization.id).toBe(bob.id);
+    expect(payload.organization.login).toBe("Bob");
+    expect(payload.repository.name).toBe("moving");
+    expect(payload.repository.owner.login).toBe("Bob");
+    // exactly ONE arm renders (both are omitempty pointers, hook.go:469-475).
+    expect(Object.keys(payload.changes.owner.from)).toEqual(["user"]);
+    expect(payload.changes.owner.from.user.id).toBe(alice.id);
+    expect(payload.changes.owner.from.user.login).toBe("Alice");
+
+    // The feed's actionNotifier twin: ActionTransferRepo (8) with the old
+    // full name as content (feed/notifier.go:167-177, display-case
+    // path.Join(oldOwner.Name, repo.Name)).
+    const transferred = await drizzle(env.DB).select().from(actions).where(eq(actions.opType, ActionType.TransferRepo)).all();
+    expect(transferred.some((a) => a.actUserId === bob.id && a.content === "Alice/moving")).toBe(true);
+  });
+
+  it("the org arm renders changes.owner.from.organization and the no-request inline arm still lands the rows (notifier.go:151-155, the off-response posture)", async () => {
+    // ORG→user: the OLD owner is the org, so from renders the organization
+    // arm (oldOwner.IsOrganization, notifier.go:151-155); the user→org twin
+    // above exercises the user arm. Repo owned by acme, filed by the org
+    // owner, accepted by the user recipient alone (the user admission arm).
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const orgId = await seedOrgRow("acme");
+    const olive = await seedVerifiedUser({ username: "Olive" });
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'owner', ?)")
+      .bind(orgId, olive.id, Math.floor(Date.now() / 1000))
+      .run();
+    const svc = service();
+    const repo = await createRepo({ id: orgId, usernameLower: "acme" }, "orgtarget");
+    const seedHook = async (patch: { repoId?: string; ownerId?: number }) =>
+      (
+        await drizzle(env.DB)
+          .insert(webhooks)
+          .values({ url: "https://hooks.example.com/x", events: JSON.stringify({ send_everything: true }), isActive: true, ...patch })
+          .returning({ id: webhooks.id })
+          .all()
+      )[0]!.id;
+    const repoHookId = await seedHook({ repoId: repo.id });
+    const bobHookId = await seedHook({ ownerId: bob.id }); // the NEW owner's set
+    const oldOrgHookId = await seedHook({ ownerId: orgId }); // the OLD owner — negative
+
+    await svc.requestTransfer(repo.id, olive.id, bob.id);
+    // NO events bundle: the direct service call takes the inline arm —
+    // delivery rows persist `pending` (the durable source of truth) with the
+    // doer-row fallback render as sender.
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
+
+    const rows = await drizzle(env.DB).select().from(webhookDeliveries).all();
+    expect(new Set(rows.map((r) => r.hookId))).toEqual(new Set([repoHookId, bobHookId]));
+    expect(rows.map((r) => r.hookId)).not.toContain(oldOrgHookId);
+    const payload = JSON.parse(rows.find((r) => r.hookId === repoHookId)!.payloadContent) as TransferredPayload;
+    expect(payload.action).toBe("transferred");
+    expect(Object.keys(payload.changes.owner.from)).toEqual(["organization"]);
+    expect(payload.changes.owner.from.organization.id).toBe(orgId);
+    expect(payload.changes.owner.from.organization.login).toBe("acme");
+    expect(payload.organization.login).toBe("Bob"); // the NEW owner
+    expect(payload.sender.login).toBe("Bob"); // the accepting doer (fallback render)
+    const transferred = await drizzle(env.DB).select().from(actions).where(eq(actions.opType, ActionType.TransferRepo)).all();
+    expect(transferred.some((a) => a.actUserId === bob.id && a.content === "acme/orgtarget")).toBe(true);
+  });
+
+  it("the accept route hands the request context to the emission — POST transfer/accept 202 and the rows land (ADR-0008 behavioral witness)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "routed");
+    const repoHookId = (
+      await drizzle(env.DB)
+        .insert(webhooks)
+        .values({ repoId: repo.id, url: "https://hooks.example.com/route", events: JSON.stringify({ send_everything: true }), isActive: true })
+        .returning({ id: webhooks.id })
+        .all()
+    )[0]!.id;
+    await svc.requestTransfer(repo.id, alice.id, bob.id);
+
+    const token = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+    const res = await SELF.fetch("https://example.com/api/v1/repos/alice/routed/transfer/accept", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(res.status).toBe(202);
+
+    // The queue producer is not wired in vitest: rows stay pending — but they
+    // EXIST, which proves the route's request/viewer/sender hand-over feeds
+    // the same emission (the service default alone would too; this pins the
+    // route arm).
+    const rows = await drizzle(env.DB).select().from(webhookDeliveries).all();
+    expect(rows.map((r) => r.hookId)).toEqual([repoHookId]);
+    const payload = JSON.parse(rows[0]!.payloadContent) as TransferredPayload;
+    expect(payload.action).toBe("transferred");
+    expect(payload.changes.owner.from.user.login).toBe("Alice");
   });
 });
 

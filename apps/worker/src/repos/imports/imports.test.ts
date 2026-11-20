@@ -437,8 +437,8 @@ describe("import state machine (SPEC-0003 §2.6, §3.1)", () => {
   it("the migrate surface emits no repository webhook — creation was announced by POST /repos, and upstream fires MigrateRepository once per migrated repo", async () => {
     // Parity guard (webhook audit, 2026-10-25). Upstream's migrate notifies
     // HookRepoCreated exactly ONCE, at task completion (routers/api/v1/repo/
-    // migrate.go → services/task/task.go:60 → services/task/migrate.go:57 →
-    // notify/notify.go:377 → services/webhook/notifier.go:149-151); the
+    // migrate.go → services/task/task.go:59 → services/task/migrate.go:57 →
+    // notify/notify.go:367-368 → services/webhook/notifier.go:167-169); the
     // migration's repo row is created model-layer (services/migrations/
     // migrate.go), so there is no second event. Our journey splits that into
     // POST /repos (which emits `repository` created — api/routes/user-repos.ts)

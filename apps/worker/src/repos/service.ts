@@ -106,8 +106,18 @@ import {
   webhooks,
 } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
+import { apiUserFromRow, type Viewer } from "../api/services/repository";
 import { clearRepoStars } from "../api/services/stars";
 import { clearRepoWatches, unwatchRepo, watchRepo } from "../api/services/repo-watchers";
+import {
+  emitRepoEvent,
+  emitRepoEventInline,
+  repositoryEventIdentity,
+  repositoryEventPayload,
+  transferredOwnerChanges,
+  type RepoEventEmission,
+  type RepoTransferEventContext,
+} from "../services/repo-events";
 import type { RepoPurgeMessage } from "./purge";
 
 /** Statement type accepted by drizzle's D1 `batch` (one SQLite transaction). */
@@ -795,8 +805,23 @@ export class RepoService {
    * arms the earlier reduction carried are gone with the port. 403 message
    * is upstream's `util.ErrPermissionDenied` text (the reject route's
    * verbatim twin).
+   *
+   * The `events` context is the route's hand-over for the `repository`
+   * action=transferred webhook (upstream webhookNotifier.TransferRepository,
+   * services/webhook/notifier.go:149-163, fired post-commit by
+   * AcceptTransferOwnership — services/repository/transfer.go:89; the
+   * direct-transfer twin rides StartRepositoryTransfer's isDirectTransfer
+   * arm, transfer.go:507, with RepoPendingTransfer replacing it when the
+   * transfer pends — we file pending rows only, so the emission lives at
+   * the accept alone). Without it (in-process callers), the emission still
+   * fires through `emitRepoEventInline` — delivery rows stay `pending`, the
+   * documented off-response posture.
    */
-  async acceptTransfer(repoId: string, doer: { id: number; isAdmin: boolean }): Promise<RepoRow> {
+  async acceptTransfer(
+    repoId: string,
+    doer: { id: number; isAdmin: boolean },
+    events?: RepoTransferEventContext,
+  ): Promise<RepoRow> {
     const repo = await this.get(repoId);
     if (repo === null) throw new RepoNotExistError(repoId);
     const pending = await this.db.select().from(repoTransfer).where(eq(repoTransfer.repoId, repoId)).get();
@@ -809,11 +834,10 @@ export class RepoService {
       throw new OwnerNotAssignableError("target owner does not exist or is not active");
     }
     if (repo.ownerId === null) throw new OwnerNotAssignableError("repository has no recorded owner");
-    const oldOwner = await this.db
-      .select({ id: users.id, type: users.type })
-      .from(users)
-      .where(eq(users.id, repo.ownerId))
-      .get();
+    // Full row: the transferred webhook's changes.owner.from renders it
+    // (apiUserFromRow) — upstream passes the whole oldOwner user into
+    // TransferRepository (transfer.go:62 → notifier.go:151-155).
+    const oldOwner = await this.db.select().from(users).where(eq(users.id, repo.ownerId)).get();
     const oldOwnerIsOrg = oldOwner?.type === "org";
 
     // Upstream's label sweep narrows to labels that do not belong to the
@@ -966,6 +990,56 @@ export class RepoService {
     await this.moveEngineCell(oldEngine, newEngine, repo);
     const row = await this.get(repoId);
     if (row === null) throw new RepoNotExistError(repoId);
+
+    // Webhook: repository action=transferred (upstream TransferRepository,
+    // transfer.go:89 → webhook/notifier.go:149-163). `repository` renders the
+    // POST-transfer row at owner access, `organization` the NEW owner
+    // (repo.MustOwner — the identity block below), `sender` the accepting
+    // doer, and changes.owner.from the OLD owner exactly once as
+    // `user`/`organization` (hook.go:469-475; the IsOrganization branch is
+    // oldOwnerIsOrg). Recipients = the repo's own hooks + the NEW owner's
+    // hooks + system webhooks (PrepareWebhooks over the post-transfer
+    // EventSource, webhook.go:207-249 — the ownerId rides the settled row).
+    // The action row (ActionTransferRepo, content = the old full name) is the
+    // emission's draft (feed/notifier.go:167-177). Delivery-row failures are
+    // caught-and-logged inside the emitters, never propagated — upstream's
+    // log.Error-only posture at notifier.go:161-162.
+    // The no-request fallback origin: the instance DEFAULT_APP_URL twin
+    // (webhooks-push.ts:260, consumer.ts:117 — the appOrigin chain's last
+    // leg; a direct service caller has no env to read APP_URL from, and
+    // toApiRepository renders URLs against a parseable origin).
+    const viewer: Viewer = events?.viewer ?? { origin: "http://localhost:3000", requester: null };
+    let sender = events?.sender;
+    if (sender === undefined) {
+      const doerRow = await this.db.select().from(users).where(eq(users.id, doer.id)).get();
+      sender = doerRow !== undefined ? apiUserFromRow(doerRow, viewer) : undefined;
+    }
+    const identity = repositoryEventIdentity(viewer, { repo: row, owner: target });
+    const emission: RepoEventEmission = {
+      repoId: row.id,
+      ownerId: row.ownerId,
+      eventType: "repository",
+      payload: repositoryEventPayload(
+        "transferred",
+        identity.repository,
+        identity.organization,
+        sender,
+        {
+          changes: transferredOwnerChanges(
+            oldOwner !== undefined ? apiUserFromRow(oldOwner, viewer) : undefined,
+            oldOwnerIsOrg,
+          ),
+        },
+      ),
+    };
+    if (events !== undefined) {
+      await emitRepoEvent(events.request, emission);
+    } else {
+      // In-process caller (the batteries' direct service calls): the inline
+      // variant keeps the delivery rows durable (`pending`) with no queue
+      // producer — the fork consumer's off-response posture.
+      await emitRepoEventInline({ DB: this.d1 }, emission);
+    }
     return row;
   }
 

@@ -1213,7 +1213,16 @@ export function registerRepoExtrasT2Routes(
           registry: c.env.REGISTRY.getByName("registry"),
           tombstone: (engineName) => tombstoneRepoDO(c.env, engineName),
           carry: (fromEngine, toEngine, storageKey) => carryRepoCell(c.env, fromEngine, toEngine, storageKey),
-        }).acceptTransfer(found.repo.id, { id: doer.id, isAdmin: doer.isAdmin });
+        }).acceptTransfer(found.repo.id, { id: doer.id, isAdmin: doer.isAdmin }, {
+          // The transferred webhook rides the request (the Queue producer is
+          // an env binding — only the caller can hand it over): upstream fires
+          // the emission post-commit (services/repository/transfer.go:89),
+          // ours rides the settle tail with the same request-scoped
+          // identity/sender converters.
+          request: c,
+          viewer: viewerOf(c),
+          sender: c.get("authUser"),
+        });
       } catch (error) {
         if (error instanceof TransferNotExistError || error instanceof OwnerNotAssignableError) {
           throw new ApiError(404, error.message);
