@@ -72,7 +72,22 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: "./wrangler.jsonc" },
         miniflare: {
-          bindings: { TEST_MIGRATIONS: migrations },
+          bindings: {
+            TEST_MIGRATIONS: migrations,
+            // The ambient TEST posture, deliberately pinned (L71, 2026-11-21):
+            // the plugin reads the account-local wrangler.jsonc, whose
+            // deployable vars may legitimately differ from the posture the
+            // batteries were written and green under (first-run/webauthn's
+            // POST /login arms need the form ON; the pinned sign-up/link
+            // arms construct their own env explicitly either way). Without
+            // this pin, flipping the deployable config silently re-classes
+            // whole batteries (observed: the L71 alignment flip turned both
+            // files red at their 303 pins). Posture-specific arms that need
+            // the OFF shape build their own env (login-external-auth's B-87
+            // describe passes the flag as a render argument).
+            ALLOW_SIGNUP: "false",
+            ENABLE_PASSWORD_SIGNIN_FORM: "true",
+          },
         },
       }),
       sourcemapStripPlugin(),

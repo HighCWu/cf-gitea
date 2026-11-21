@@ -68,3 +68,49 @@ time; citations name the commit or the code site.
   config ships `"ALLOW_SIGNUP": "false"`). Self-registration stays off until
   the operator flips it; the admin-init window is the intended first
   account.
+
+## The two-worker topology + the var-fork alignment (2026-11-21, L71)
+
+Two independent Workers serve builds of this repo in the hecongw account —
+a deploy from `apps/worker` touches ONLY the first:
+
+- **`cf-gitea`** — the demo instance (`wrangler.jsonc`, D1 `cf-gitea`,
+  R2 `cf-gitea-packs`, `cf-gitea.hecongw.workers.dev`). No custom domains.
+  `DEMO_MODE` is deliberately `"true"` here (SPEC-0014: the demo instance is
+  the ONLY deployment that arms the sweep).
+- **`cf-gitea-prod`** — the production instance behind
+  `git.aiapp.run` (zone route; L39's independent assembly
+  `wrangler.git-prod.jsonc`, D1 `cf-gitea-prod`, R2 `cf-gitea-prod-packs`,
+  `cf-gitea-prod-*` queues, `APP_URL=https://git.aiapp.run`). Its config is
+  NOT in this repo — it lives with the laimon operator artifacts; deploying
+  THIS repo's config can never touch it (no `routes` key anywhere, L1
+  lesson).
+
+**The var-fork class is closed (2026-11-21)**: the account-local
+`apps/worker/wrangler.jsonc` had drifted to `ALLOW_SIGNUP: "true"` +
+`ENABLE_PASSWORD_SIGNIN_FORM: "true"` while both deployed faces answer
+closed (prod: sign_up 404 / POST /login 403; receipts laimon L60 §四 / L63
+§1). The file is now flipped back to `"false"`/`"false"` and the L71
+redeploy carried the explicit belt-and-suspenders overrides
+(`--var ALLOW_SIGNUP:false --var ENABLE_PASSWORD_SIGNIN_FORM:false`).
+Standing discipline for EVERY redeploy of this worker, until an operator
+explicitly decides otherwise:
+
+```sh
+pnpm build   # REQUIRED: wrangler deploy reads dist/cf_gitea/wrangler.json —
+             # a stale dist carries the OLD vars silently (verified 2026-11-21:
+             # pre-build dry-run showed "true"/"true" from the stale dist)
+pnpm deploy --var ALLOW_SIGNUP:false --var ENABLE_PASSWORD_SIGNIN_FORM:false
+```
+
+Related traps recorded here so the next wave skips them:
+
+- `wrangler deploy` uses `dist/cf_gitea/wrangler.json` (the vite plugin's
+  generated config), not the source `wrangler.jsonc` directly —
+  `pnpm build` is not optional (the runbook's stale-dist warning is real).
+- Frontend assets must be rebuilt per pin before a deploy that carries a
+  submodule bump: `pnpm build:assets` (emits into `apps/worker/public/assets`
+  from the `gitea/` working tree — it prints the pin it built from).
+- The L71 freeze-chain deploy record: see
+  `docs/RELEASE-NOTES-v1.6.0.md` (version id + probe results recorded
+  there and in the closing commit message).

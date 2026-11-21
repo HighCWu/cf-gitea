@@ -713,6 +713,10 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     // 5 issue-side arms + 0 mergers (unmerged) + 0 head repos (same-repo
     // heads skip) = 8 — page-INDEPENDENT. Pre-fix: 2 + N×(1 pair + 1 poster
     // + 1 labels + 1 pin) = 12 at this N; any returning per-row fan breaks it.
+    // +2 (GATEFIX's auto_merge page batch — the convert/pull.go:369-371 +
+    // models/pull/automerge.go:91-108 port in services/pulls.ts: the open-
+    // filtered scheduleRows inArray + the doers inArray, ONE each per page;
+    // the seeded rows are open+unmerged so both fire) = 10, pinned ≤13.
     const pullsMeter = countedD1();
     const pullsRes = await send("/repos/cf-gitea-stub/extras/pulls/pinned", undefined, pullsMeter.db);
     expect(pullsRes.status).toBe(200);
@@ -724,8 +728,8 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     // +1 (cddae16's project-membership arm — the tier-2 ripple twin; its
     // creator+counts render stage batches to ONE creators + ONE grouped
     // counts read per page and skips here — no projects seeded).
-    expect(pullsCount).toBeLessThanOrEqual(12);
-    expect(pullsCount).toBeLessThan(13);
+    expect(pullsCount).toBeLessThanOrEqual(13);
+    expect(pullsCount).toBeLessThan(14);
 
     // Contract discipline: the batched pulls render is deep-equal to the
     // unbatched per-row path (mode "list", no extras, on the same rows) —
