@@ -18,6 +18,13 @@ export interface Env {
   GIT_TOKENS?: string;
   /** max accepted push size in MB (default 512) */
   MAX_PUSH_MB?: string;
+  /** R2 range GETs a single receive's delta resolution may spend (default 256,
+   *  receive/delta.ts RANGE_BUDGET). Raise it for windowed pushes of large
+   *  repositories, whose delta chains re-read more staging bytes than the
+   *  default budgets; every unit is one subrequest against the platform's
+   *  per-request subrequest cap, so the raise trades cap headroom for
+   *  resolution reach. */
+  RANGE_BUDGET?: string;
   /** in-memory ingest cache budget in MB, holding decompressed objects for
    * delta-base resolution during a push. Misses reload from SQLite, so a
    * smaller budget trades ingest speed for peak memory. Default: 16 on real

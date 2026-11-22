@@ -26,7 +26,7 @@ import {
 } from "./control-plane";
 import type { RepoCell } from "./repo";
 import type { PlanCloneStreamResult } from "./read-leases";
-import { DeltaResolver } from "./receive/delta";
+import { DeltaResolver, RANGE_BUDGET } from "./receive/delta";
 import { walkPack } from "./receive/scan";
 import { writeIdx } from "./receive/idx";
 import { copyObject } from "./fork/replicate";
@@ -1234,6 +1234,7 @@ async function receivePack<E extends Env>(
         metrics.scanGets++;
         const collisionDetect = env.SHA1DC === "1";
         const cacheMb = parseInt(env.INGEST_CACHE_MB ?? "", 10) || 16;
+        const rangeBudget = parseInt(env.RANGE_BUDGET ?? "", 10) || RANGE_BUDGET;
         const resolver = new DeltaResolver(
           {
             selfPackKey: begin.stagingKey,
@@ -1255,6 +1256,7 @@ async function receivePack<E extends Env>(
           },
           {
             cacheBytes: Math.max(1, cacheMb) * 1024 * 1024,
+            rangeBudget,
             collisionDetect,
             onProgress: progress,
           }

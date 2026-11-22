@@ -274,6 +274,16 @@
     // fold (services/repo-watchers.ts).
     "AUTO_WATCH_ON_CHANGES": "",
     "MAX_PUSH_MB": "512",
+    // R2 range GETs one receive's delta resolution may spend (the engine's
+    // receive quota — RANGE_BUDGET, packages/git-engine src/env.ts; default
+    // 256, receive/delta.ts). Unset/garbage keeps the engine default, so the
+    // value here only DOCUMENTS the shipped posture. Raise it (e.g. 1024) to
+    // admit windowed pushes of large repositories, whose delta chains re-read
+    // more staging bytes than the default budgets; every unit is one R2
+    // subrequest against the platform's per-request subrequest cap (~1000,
+    // shared with the receive's staging/idx/copy/RPC budget), so raise it
+    // only as far as the window sizes you must admit require.
+    "RANGE_BUDGET": "256",
     // LFS store mode (SPEC-0006 §6 as-built, the L14 config wave) — strict
     // polarity: ONLY the exact string "true" constructs the presign store
     // (PresignLfsStore) over the relay store; absent/anything else = relay
