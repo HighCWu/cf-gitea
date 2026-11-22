@@ -13,6 +13,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { Hono } from "hono";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
@@ -271,6 +272,76 @@ describe("the OAUTH2_ENABLED gate — the /login/oauth group 403 (both routers)"
     expect(oauth2FeatureEnabled({ OAUTH2_ENABLED: "False" })).toBe(true);
     expect(oauth2FeatureEnabled({ OAUTH2_ENABLED: "0" })).toBe(true);
     expect(oauth2FeatureEnabled({ OAUTH2_ENABLED: "" })).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The gate's GROUP scope (the L143 fix): upstream's wrap is the chi group
+// option on m.Group("/login/oauth", ...) (web.go:592-606) — it reaches only
+// the group's own routes. The W4-era use("*") form, merged through the root
+// mount (index.ts :353/:395), made the disabled 403 SITE-WIDE (the L39
+// production finding: only pre-mount routes survived). The tests below pin
+// the restored shape on a condensed production-order mount: a pre-mount
+// canary, the two gated routers, then the families a disabled provider must
+// never reach (first-run /install, the /login session face, the / uiRouter
+// page — stand-in handlers, no D1 render).
+// ---------------------------------------------------------------------------
+
+describe("the gate is group-scoped — a disabled provider shuts ONLY /login/oauth (L143)", () => {
+  /** The index.ts mount chain, condensed to its order-bearing bones. */
+  function mountedApp(): Hono<{ Bindings: AuthorizeTestEnv }> {
+    const app = new Hono<{ Bindings: AuthorizeTestEnv }>();
+    app.get("/healthz", () => new Response("pre-mount")); // e.g. healthz — mounted BEFORE both gate routers
+    app.route("/", oauth2Router); // index.ts :353
+    app.route("/", oauth2AuthorizeRouter); // index.ts :395
+    app.get("/install", () => new Response("install-face")); // firstRunRouter stand-in (:364)
+    app.get("/login", () => new Response("login-face")); // sessionRouter stand-in (:378)
+    app.get("/", () => new Response("home-face")); // uiRouter stand-in (:390)
+    return app;
+  }
+  const app = mountedApp();
+
+  it("OAUTH2_ENABLED=false: the non-IdP faces answer; only the /login/oauth family 403s", async () => {
+    const disabled = authorizeEnv("false");
+    for (const [path, want] of [
+      ["/healthz", "pre-mount"],
+      ["/install", "install-face"],
+      ["/login", "login-face"],
+      ["/", "home-face"],
+    ] as const) {
+      const response = await app.request(path, undefined, disabled);
+      expect(response.status, path).toBe(200);
+      expect(await response.text(), path).toBe(want);
+    }
+    // The IdP face itself stays fully gated (both routers, pre-handler).
+    const authorize = await app.request("/login/oauth/authorize", undefined, disabled);
+    expect(authorize.status).toBe(403);
+    expect(await authorize.text()).toBe("Forbidden\n");
+    const token = await app.request(
+      "/login/oauth/access_token",
+      { method: "POST", body: "grant_type=authorization_code" },
+      disabled,
+    );
+    expect(token.status).toBe(403);
+    // The deliberate delta (pinned): an unregistered tail INSIDE the group
+    // answers 403 under the disabled gate, not the global 404 (chi's
+    // group-scoped middleware would fall through — a disabled provider owns
+    // its whole /login/oauth surface; see oauth2-token.ts's gate comment).
+    const tail = await app.request("/login/oauth/junk", undefined, disabled);
+    expect(tail.status).toBe(403);
+  });
+
+  it("OAUTH2_ENABLED on (the default polarity): the non-IdP faces unchanged, the group handlers own their paths", async () => {
+    const enabled = authorizeEnv(undefined);
+    for (const path of ["/healthz", "/install", "/login", "/"]) {
+      const response = await app.request(path, undefined, enabled);
+      expect(response.status, path).toBe(200);
+    }
+    // The group behaves exactly as in isolation (the gate passes; the
+    // anonymous authorize rides reqSignIn's 303 — the shape pinned above).
+    const authorize = await app.request("/login/oauth/authorize?response_type=code", undefined, enabled);
+    expect(authorize.status).toBe(303);
+    expect(authorize.headers.get("location")).toContain("/login");
   });
 });
 

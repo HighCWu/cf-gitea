@@ -781,13 +781,21 @@ function httpForbidden(): Response {
 // THE GATE SLOT, WIRED (W4): oauth2Enabled (web.go:373-378 —
 // setting.OAuth2.Enabled false ⇒ 403) as the OUTERMOST middleware of the
 // group (web.go:631 — the group option runs before reqSignIn, so a disabled
-// provider 403s the authorize/grant pair before any session read). The gate
-// reads the OAUTH2_ENABLED var through the landed strict-polarity helper
-// (oauth2FeatureEnabled — ONLY the exact string "false" disables, default
-// true is upstream's, modules/setting/oauth2.go:104); the widened read
-// below is the Env-posture (the generated Env may not type the var yet —
-// the OAuth2TokenEnv alias note, web/oauth2-token.ts).
-oauth2AuthorizeRouter.use("*", async (c, next) => {
+// provider 403s the authorize/grant pair before any session read).
+// GROUP-SCOPED, not site-wide (the L143 scope fix, mirroring the token
+// router's): upstream's wrap is the chi group option on
+// m.Group("/login/oauth", ...) (web.go:592-606); this router is mounted at
+// "/" (index.ts), where the W4-era use("*") merged as a global middleware
+// and the disabled 403 rode every route mounted after it (/, /login,
+// /install — the L39 production finding). The "/login/oauth/*" prefix
+// restores upstream's disabled semantics: closing OAUTH2_ENABLED shuts only
+// the IdP face. The gate reads the OAUTH2_ENABLED var through the landed
+// strict-polarity helper (oauth2FeatureEnabled — ONLY the exact string
+// "false" disables, default true is upstream's,
+// modules/setting/oauth2.go:104); the widened read below is the Env-posture
+// (the generated Env may not type the var yet — the OAuth2TokenEnv alias
+// note, web/oauth2-token.ts).
+oauth2AuthorizeRouter.use("/login/oauth/*", async (c, next) => {
   if (!oauth2FeatureEnabled(c.env)) {
     return httpForbidden();
   }

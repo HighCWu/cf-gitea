@@ -265,7 +265,19 @@ function httpForbidden(): Response {
 // provider 403s even the OPTIONS probes). Registered FIRST so it wraps every
 // route below (Hono composes in registration order). The well-known route
 // answers 404 instead (oauth2_wellknown.go:17-20 — it self-gates).
-oauth2Router.use("*", async (c, next) => {
+//
+// GROUP-SCOPED, not site-wide (the L143 scope fix): upstream's wrap is the
+// chi group option on m.Group("/login/oauth", ...) (web.go:592-606) — it
+// reaches only the group's own routes. This router is mounted at "/" (the
+// index.ts seam), where a use("*") merges as a global middleware and the
+// disabled 403 rode EVERY path mounted after it (/, /login, /install — the
+// L39 production finding; only pre-mount routes survived). The
+// "/login/oauth/*" prefix restores upstream's disabled semantics: closing
+// OAUTH2_ENABLED shuts only the IdP face. One deliberate delta from chi:
+// an unregistered /login/oauth/* tail answers 403 under the disabled gate
+// where chi's group-scoped middleware would fall through to its 404 — a
+// disabled provider owns its whole /login/oauth surface.
+oauth2Router.use("/login/oauth/*", async (c, next) => {
   if (!oauth2FeatureEnabled(c.env)) {
     return httpForbidden();
   }
@@ -282,9 +294,10 @@ oauth2Router.use("*", async (c, next) => {
 // the payload.
 // ---------------------------------------------------------------------------
 
-/** The four paths the JSON group serves (web.go:625-631). chi group
- *  middleware wraps only the group's own routes, so an unknown
- *  /login/oauth/* subpath 404s ungated — the whitelist, not a prefix. */
+/** The four paths the JSON group serves (web.go:625-631). The middleware's
+ *  own pattern is prefix-scoped to the group (the L143 gate fix), and the
+ *  whitelist keeps chi's member precision: an unknown /login/oauth/*
+ *  subpath (authorize/grant/junk) skips this gate, not just the 403. */
 const MUST_CHANGE_GATED_PATHS = new Set<string>([
   "/login/oauth/access_token",
   "/login/oauth/introspect",
@@ -306,7 +319,7 @@ const MUST_CHANGE_GATED_PATHS = new Set<string>([
  * holder's payload must not slip past a transient error), while a request
  * with no credential at all never probes.
  */
-oauth2Router.use("*", async (c, next) => {
+oauth2Router.use("/login/oauth/*", async (c, next) => {
   if (c.req.method === "OPTIONS") return await next();
   if (!MUST_CHANGE_GATED_PATHS.has(new URL(c.req.url).pathname)) return await next();
   let flagged: boolean | null = null;
