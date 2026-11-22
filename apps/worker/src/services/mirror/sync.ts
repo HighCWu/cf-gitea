@@ -870,15 +870,18 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
 
 /**
  * The stuck-syncing sweep budget: a `syncing` mirror row is reclaimed once
- * its claim is this old. The budget is the engine's receive-lease TTL
- * (RECEIVE_LEASE_TTL_MS = 15 min, packages/git-engine/src/control-plane.ts:330)
- * — a live sync's receive cannot outlive it (the engine's own hard backstop
- * rejects an expired lease), and the consuming queue invocation cannot
- * outlive its 15-min wall (AGENTS.md queue rules), so a claim older than
- * this proves no sync is mid-flight; a claim WITHIN it may be one, and the
- * sweep leaves those rows alone. Named by the availability-gap diagnosis
- * (docs/research/sqlite-locked-2026-10-26.md §4/§5.3: "~15 min (the receive
- * lease's own TTL)"). SHARED with push-sync.ts (symmetric sweep).
+ * its claim is this old. The budget is the engine's receive-lease TTL DEFAULT
+ * (RECEIVE_LEASE_TTL_MS = 15 min, packages/git-engine/src/control-plane.ts —
+ * this constant mirrors the engine default; the operator-facing knob is the
+ * GIT_TIMEOUT_RECEIVE var, seconds, default 900). A live sync's receive
+ * cannot outlive the TTL unless GIT_TIMEOUT_RECEIVE is raised past 900 —
+ * raise THIS budget alongside it (the queue invocation still cannot outlive
+ * its 15-min wall, AGENTS.md queue rules, so the wall remains the effective
+ * sync ceiling); a claim older than this proves no sync is mid-flight; a
+ * claim WITHIN it may be one, and the sweep leaves those rows alone. Named
+ * by the availability-gap diagnosis (docs/research/sqlite-locked-2026-10-26.md
+ * §4/§5.3: "~15 min (the receive lease's own TTL)"). SHARED with push-sync.ts
+ * (symmetric sweep).
  */
 export const SYNCING_SWEEP_AFTER_SEC = 15 * 60;
 

@@ -20,6 +20,7 @@ import { idxR2Key, packName, packR2Key } from "./git/r2keys";
 import {
   asCommandResults,
   NO_PACK,
+  resolveReceiveLeaseTtlSeconds,
   type FinalizedPack,
   type PushCommandKind,
   type ReceiveCommandResult,
@@ -152,6 +153,16 @@ export {
   COMPACTION_WINDOW_PACKS,
   runCompaction,
 } from "./compaction";
+// the receive lease's configurable TTL (L325): the embedding Worker resolves
+// GIT_TIMEOUT_RECEIVE through the resolver and passes beginReceive's
+// leaseTtlMs; exported so deployments and tests pin the same clamp/default
+export {
+  RECEIVE_LEASE_TTL_MAX_MS,
+  RECEIVE_LEASE_TTL_MIN_MS,
+  RECEIVE_LEASE_TTL_MS,
+  clampReceiveLeaseTtlMs,
+  resolveReceiveLeaseTtlSeconds,
+} from "./control-plane";
 // GC (SPEC-0011 §2, M3.4): the RETIRED→RECLAIMABLE→DELETED transitions + the
 // clone-cache drain, re-exported for the same reason — the entry points are
 // the RepoCell.gcNow RPC and the DO alarm pass over `gc_wanted_at`.
@@ -863,7 +874,10 @@ interface StagedPack {
  * length-delimited body: a short or lying body errors instead of hanging);
  * chunked → 16 MiB multipart parts via MultipartCapture (moved unchanged from
  * the DO's ingest). The SHA-1 trailer is verified through a 20-byte sliding
- * window before the object is declared complete.
+ * window before the object is declared complete. Every body read races the
+ * client-disconnect signal: a mid-pack client death fails HERE (inside this
+ * function's own unwinds, so the writer/multipart capture abort) instead of
+ * parking on a read that a silent drop never settles.
  */
 async function stagePack(
   bucket: R2Bucket,
@@ -872,7 +886,8 @@ async function stagePack(
   maxBytes: number,
   sideband: boolean,
   emit: (chunk: Uint8Array) => void,
-  metrics: { stagingPuts: number; stagingParts: number }
+  metrics: { stagingPuts: number; stagingParts: number },
+  signal: AbortSignal | null | undefined
 ): Promise<StagedPack> {
   const sha = new Sha1();
   let tail = new Uint8Array(0); // rolling 20-byte lookbehind (the trailer)
@@ -921,7 +936,7 @@ async function stagePack(
         await writer.write(push.head);
       }
       for (;;) {
-        const { done, value } = await push.reader.read();
+        const { done, value } = await raceAbort(push.reader.read(), signal);
         if (done) break;
         if (value?.length) {
           absorb(value);
@@ -935,6 +950,10 @@ async function stagePack(
       } catch {
         // already errored by the short write
       }
+      // the destination rejects alongside the aborted writer — an abort-thrown
+      // catch never reaches `await put`, and a dangling rejection would log as
+      // an unhandled error on every disconnected push
+      put.catch(() => {});
       throw err;
     }
     await put;
@@ -956,7 +975,7 @@ async function stagePack(
         if (capture.aborted) throw new Error("pack upload to R2 failed");
       }
       for (;;) {
-        const { done, value } = await push.reader.read();
+        const { done, value } = await raceAbort(push.reader.read(), signal);
         if (done) break;
         if (value?.length) {
           absorb(value);
@@ -1074,6 +1093,61 @@ function statusOfCommands(
 }
 
 /**
+ * The client-disconnect failure. A fixed, matched message (the same filter
+ * discipline as the size-cap wording above): every receive-phase catch
+ * rethrows it to the outer catch, which releases the lease and answers the
+ * unobservable 499. Upstream's equivalent event is the request-context
+ * cancel that KILLS the receive-pack child process (gitcmd command.go
+ * CommandContext; serviceRPC pipes the request body into it) — git's
+ * advisory locks die with the process, so upstream never needs this error:
+ * there is no lock left behind to release. Here the lease must be released
+ * explicitly, because the DO row outlives the isolate otherwise.
+ */
+const RECEIVE_CLIENT_GONE = "client disconnected mid-push";
+function clientGoneError(): Error {
+  return new Error(RECEIVE_CLIENT_GONE);
+}
+function isClientGoneError(err: unknown): boolean {
+  return err instanceof Error && err.message === RECEIVE_CLIENT_GONE;
+}
+
+/**
+ * Reject the awaited promise the moment `signal` aborts — the disconnect
+ * fast-fail for the two receive phases that read the CLIENT's body
+ * (parsePushRequest's command section, stagePack's pack stream). The body
+ * read itself is what normally notices a disconnect, but a client that dies
+ * SILENTLY (no TCP FIN/RST reaches the edge) delivers no error at all: the
+ * read pends forever while the exclusive receive lease 503s every other
+ * push to the repo until its TTL expires. The abort signal is the runtime's
+ * disconnect event (upstream: the request-context cancel that kills the
+ * receive-pack process); racing it turns a dead client's slot over in one
+ * event-loop turn. Server-side phases (R2 scan, idx write, finalize) are
+ * deliberately NOT raced: once the pack is staged the client's presence no
+ * longer matters — upstream's receive-pack keeps the pack and its ref
+ * updates ride or die on whether the process was killed BEFORE
+ * execute_commands, which the explicit pre-finalize abort check below
+ * mirrors.
+ */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal | null | undefined): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(clientGoneError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(clientGoneError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    );
+  });
+}
+
+/**
  * POST /git-receive-pack — the Worker-side receive flow. Auth (write) has
  * already run. Wire behavior is unchanged end to end: 503 Retry-After when
  * another push holds the lease (T7), report-status with per-command ok/ng
@@ -1081,10 +1155,13 @@ function statusOfCommands(
  *
  * `internal` carries the embedding Worker's per-call options: `pusher`, the
  * authenticated identity for this receive (surfaced verbatim on the onPush
- * event, never used for authorization), and `validatePush`, the SPEC-0013
+ * event, never used for authorization), `validatePush`, the SPEC-0013
  * M2 per-ref policy hook (invoked between the scan and finalize; absent →
- * no enforcement).
+ * no enforcement), and `signal`, the client-disconnect signal (the abort
+ * fast-fail below; absent → `req.signal`, and the lease TTL stays the only
+ * backstop for holders that stop making progress without a disconnect).
  */
+
 async function receivePack<E extends Env>(
   req: Request,
   env: E,
@@ -1095,6 +1172,14 @@ async function receivePack<E extends Env>(
   internal?: EngineCallOptions,
 ): Promise<Response> {
   const pusher = internal?.pusher;
+  // The disconnect fast-fail channel (EngineCallOptions.signal doc): a
+  // re-wrapped D1 forward loses the original request's signal, so the
+  // embedding Worker hands it across; a verbatim passthrough falls back to
+  // the request's own signal.
+  const signal = internal?.signal ?? req.signal;
+  const throwIfClientGone = () => {
+    if (signal?.aborted) throw clientGoneError();
+  };
   const bucket = env.REPO_PACKS;
   if (!bucket) {
     return new Response("error: git push requires an R2 bucket binding (REPO_PACKS)\n", { status: 500 });
@@ -1122,8 +1207,11 @@ async function receivePack<E extends Env>(
   };
   let leaseToken: string | null = null;
   try {
-    // 1. the command section only — the pack is never parsed here
-    const push = await parsePushRequest(req, maxBytes);
+    // 1. the command section only — the pack is never parsed here. Raced
+    // against the disconnect signal: no lease is held yet, but a client dead
+    // before its command section must not park this handler on a body read
+    // that may never settle (silent drop).
+    const push = await raceAbort(parsePushRequest(req, maxBytes), signal);
     const sideband = push.caps.includes("side-band-64k");
     // report-status-v2 (gitprotocol-pack) extends report-status with proc-
     // receive option lines; a client requesting either capability gets a
@@ -1152,6 +1240,7 @@ async function receivePack<E extends Env>(
       capabilities: push.caps,
       packBytesHint: push.hint,
       storageKey: req.headers.get("x-storage-key"),
+      leaseTtlMs: resolveReceiveLeaseTtlSeconds(env.GIT_TIMEOUT_RECEIVE),
     });
     if (begin.tag === "busy") {
       return new Response("busy: too many concurrent pushes, retry shortly\n", {
@@ -1183,8 +1272,12 @@ async function receivePack<E extends Env>(
     let staged: StagedPack | null = null;
     if (push.head.length > 0) {
       try {
-        staged = await stagePack(bucket, begin.stagingKey, push, maxBytes, sideband, emit, metrics);
+        staged = await stagePack(bucket, begin.stagingKey, push, maxBytes, sideband, emit, metrics, signal);
       } catch (err) {
+        // a client disconnect is not an unpack verdict: the push is dead and
+        // the lease must turn over NOW (the outer catch releases + sweeps);
+        // rethrown before the unpackError swallow, mirroring the size-cap arm
+        if (isClientGoneError(err)) throw err;
         const stagedMsg = err instanceof Error ? err.message : String(err);
         // the cap's violation is a TRANSPORT answer, not a protocol one: the
         // same violation detected from the declared length 413s before any
@@ -1263,7 +1356,15 @@ async function receivePack<E extends Env>(
         );
         await walkPack(
           { body: stagedObj.body, size: stagedObj.size },
-          (entry) => resolver.onEntry(entry),
+          // a disconnect during a long scan fails the walk the same way a
+          // staging failure does: the step-4 catch rethrows it to the outer
+          // release (rows already pushed are crash debris the DO's orphan
+          // sweep reclaims), instead of finishing a push whose client is gone
+          // and holding the lease for the whole walk
+          (entry) => {
+            throwIfClientGone();
+            return resolver.onEntry(entry);
+          },
           { collisionDetect, onHeader: (count) => resolver.init(count), onProgress: progress }
         );
         const resolved = await resolver.finish();
@@ -1323,6 +1424,9 @@ async function receivePack<E extends Env>(
           idxBytes,
         };
       } catch (err) {
+        // a disconnect mid-scan rethrows to the outer release — never an
+        // unpack verdict for a client that cannot read the report anyway
+        if (isClientGoneError(err)) throw err;
         // scan/resolution/idx failures surface verbatim in report-status
         // ("unpack <msg>"); rows already pushed are crash debris the DO's
         // orphan sweep reclaims (their pack never reaches pack_catalog)
@@ -1396,6 +1500,15 @@ async function receivePack<E extends Env>(
       if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, null), null, sideband));
       return new Response(concat(chunks) as unknown as BodyInit, { headers: receiveHeaders() });
     }
+    // The upstream kill boundary, mirrored: a receive-pack canceled by the
+    // HTTP request context BEFORE execute_commands applies nothing (the
+    // process dies holding git's advisory locks; refs never move). The
+    // staging/scan arms rethrow disconnects above, but a deletes-only push
+    // never reads a pack byte — this check is the only fast-fail it gets.
+    // Failing here releases the lease via the outer catch and applies
+    // nothing; a disconnect AFTER finalize has already decided the lease is
+    // not observable (this line sits strictly before the RPC).
+    throwIfClientGone();
     const fin = await stub.finalizeReceive({
       leaseToken: begin.leaseToken,
       expectedRefsVersion: begin.refsVersion,
@@ -1473,7 +1586,12 @@ async function receivePack<E extends Env>(
     }
     return new Response(concat(chunks) as unknown as BodyInit, { headers: receiveHeaders() });
   } catch (err) {
-    console.log(`[receive ${repo}] FAILED: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    const clientGone = isClientGoneError(err);
+    // one line per failure class: a disconnect is not a FAILED receive (the
+    // push is dead by client choice), it is a lease turnover
+    if (!clientGone) {
+      console.log(`[receive ${repo}] FAILED: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    }
     if (leaseToken) {
       // abandon the lease and sweep the staging object; safe even when the
       // failure raced a finalize (idempotent-on-lease_mismatch)
@@ -1485,6 +1603,14 @@ async function receivePack<E extends Env>(
     }
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("exceeds maximum size")) return tooLargeResponse(maxBytes);
+    if (clientGone) {
+      // The client is gone and will never read this; the status exists for
+      // logs and probes (499, nginx's "client closed request" convention — a
+      // deliberate non-standard pick, recorded in SPEC-0001 §5). The lease
+      // release above is the behavior that matters.
+      console.log(`[receive ${repo}] client disconnected (abort signal) — receive lease released`);
+      return new Response(`error: ${RECEIVE_CLIENT_GONE}\n`, { status: 499 });
+    }
     return new Response(`error: ${msg}\n`, { status: 500 });
   }
 }
@@ -1551,6 +1677,24 @@ export interface EngineCallOptions {
    * passthrough) pass no hook: no enforcement, byte-identical flow.
    */
   validatePush?: PushValidator;
+  /**
+   * The CLIENT-side disconnect signal for a receive-pack, observed by the
+   * receive flow's fast-fail race: an aborted signal fails the push
+   * immediately, releases the lease with a sweep, and applies nothing.
+   * In-process because a D1-resolved receive forward is RE-WRAPPED
+   * (the x-storage-key override), and a reconstructed Request carries a
+   * fresh never-aborting signal — the embedding Worker must hand the
+   * original request's signal across (gate.ts forwardToEngine passes
+   * `req.signal` here); receives that arrive verbatim (the D1-missing
+   * passthrough) fall back to `req.signal` engine-side. Upstream shape:
+   * serviceRPC's receive-pack child process is bound to the request
+   * context (gitcmd command.go CommandContext), so a disconnect kills the
+   * process and git's advisory locks die with it — this signal is the
+   * same cancel event for a lease that has no process to die. Absent
+   * (mirror/import internal receives) → no disconnect observation beyond
+   * the request's own signal; the lease TTL stays the backstop.
+   */
+  signal?: AbortSignal | null;
 }
 
 /**

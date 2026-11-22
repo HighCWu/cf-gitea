@@ -33,6 +33,20 @@ export interface Env {
   /** "1" screens every pushed object with SHA-1DC collision detection; default
    * hashes with native crypto.subtle (identical oid, far faster) */
   SHA1DC?: string;
+  /** How long one receive lease may hold a repo's push slot after its holder
+   * stopped making progress, in SECONDS (default 900 — 15 minutes). Named for
+   * upstream's `[git.timeout]` app.ini section (MIGRATE/MIRROR/GC, seconds):
+   * upstream needs no receive key because its receive-pack is a child process
+   * bound to the HTTP request context — a client disconnect kills the process
+   * and git's advisory locks die with it. A DO lease has no process to die,
+   * so the engine releases on the request's abort signal (the disconnect
+   * fast-fail) and this TTL bounds the one case no signal can cover: a SILENT
+   * client drop that delivers neither bytes, EOF, nor abort. Only
+   * unexpired-but-dead holders block concurrent pushes (T7's 503), so a lower
+   * value tightens the worst-case stall window; a higher one admits longer
+   * unattended pushes (raise MAX_PUSH_MB's loopback transfers together).
+   * Floor/ceiling: [60, 86400] s. Unset/garbage keeps the default. */
+  GIT_TIMEOUT_RECEIVE?: string;
   SITE_NAME?: string;
   SITE_DESC?: string;
   SITE_OWNER?: string;

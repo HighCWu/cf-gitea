@@ -1598,7 +1598,16 @@ async function resolvePushPusher(env: Env, req: Request): Promise<PusherIdentity
  *  forwards only (resolvePushPusher) — the engine puts it on PushEvent.
  *  `validatePush` (SPEC-0013 M2) rides the same in-process channel on
  *  receive forwards only (protectedBranchValidator) — the engine enforces
- *  its per-ref verdicts before finalize. */
+ *  its per-ref verdicts before finalize. `signal` (the client-disconnect
+ *  fast-fail) rides it on EVERY forward: a D1-resolved receive is re-wrapped
+ *  by prepareEngineRequest whenever a storageKey override exists, and a
+ *  reconstructed Request carries a fresh never-aborting signal — the engine
+ *  would otherwise watch a dead signal while the real client vanishes. The
+ *  verbatim passthrough needs no channel (the engine falls back to
+ *  `req.signal`, the same object). Upstream shape: serviceRPC's receive-pack
+ *  child is bound to the request context, so a disconnect kills the process
+ *  and git's advisory locks die with it; here the signal is what lets the
+ *  DO lease — which has no process to die — release immediately. */
 async function forwardToEngine(
   req: Request,
   url: URL,
@@ -1625,7 +1634,12 @@ async function forwardToEngine(
           ...(validatePush ? { validatePush } : {}),
         }
       : undefined;
-  return engine.fetch(forwarded, env, ctx, callOptions);
+  // Always present in call options (never undefined overall): the disconnect
+  // signal is not receive-conditional at this seam — only receivePack reads
+  // it, and threading it unconditionally keeps the gate's forward shape one
+  // constructor for every route family.
+  const signal = req.signal;
+  return engine.fetch(forwarded, env, ctx, { ...(callOptions ?? {}), signal });
 }
 
 /**

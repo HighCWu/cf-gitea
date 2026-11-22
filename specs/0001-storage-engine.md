@@ -237,6 +237,27 @@ retry path). Protocol: v0/v1 receive advertisement (`capabilities^{}` for empty 
 semantics; thin packs accepted and resolved (dgit ingest phase C). Fast-forward is
 client-enforced; force allowed; non-FF without force rejected.
 
+**Disconnect fast-fail (the L325 amendment, 2026-11-23).** The receive's body-reading
+phases race the request's abort signal (`EngineCallOptions.signal`, handed across the
+gate's re-wrap because a reconstructed Request carries a fresh never-aborting signal,
+falling back to `req.signal` on the verbatim passthrough): an aborted signal fails the
+parse/stage/scan immediately, the outer catch releases the lease with a sweep, and the
+answer is `499` (nginx's "client closed request" convention — deliberately
+non-standard, a recorded divergence; the dead client never reads it, the status exists
+for logs and probes). Finalize is guarded by an explicit pre-RPC abort check instead
+of a race, so a cancel can never land mid-transaction: a disconnect BEFORE finalize
+applies nothing — upstream's exact kill boundary (serviceRPC's receive-pack child is
+bound to the HTTP request context, gitcmd command.go CommandContext, so the disconnect
+kills the process and git's advisory locks die with it; canceled before
+execute_commands means refs never move) — and a disconnect AFTER finalize changes
+nothing. The receive lease TTL is configurable: `GIT_TIMEOUT_RECEIVE` (seconds, named
+for upstream's `[git.timeout]` app.ini section — MIGRATE 600/MIRROR 300/GC 60;
+upstream needs no receive key there because process death already releases the locks —
+recorded divergence), default 900 = the historical 15-minute backstop, clamped to
+[60, 86400] s. It bounds the one holder no signal can cover: the SILENT client drop
+(no bytes, no EOF, no abort — the 2026-11-23 incident shape, T7a), where the only
+alternative is waiting out the TTL.
+
 Serve (fetch): v2 advertisement (`ls-refs` with `ref-prefix`/`peel`/`symref`/unborn
 HEAD; `fetch` with two-phase negotiation — acknowledgments block on `done=false`, then
 pack); `side-band-64k`, `ofs-delta`, `object-format=sha1`; complete (non-thin) packs.
@@ -273,6 +294,7 @@ phase, under the same CAS/`refs_version` machinery.
 | T5 | SSH protocol | Not built. Documented exclusion; HTTPS git only | n/a (docs check) |
 | T6 | 10 GB per-DO SQLite | Packs ≥16 MiB live only in R2; SQLite holds index rows (~100 B/object) | Push a 32 MiB pack → R2 object present; DO storage growth < idx size |
 | T7 | Concurrent pushes to one repo | DO lease; loser gets `503 Retry-After: 10` | Two concurrent pushes: exactly one 503 with header; stock git client retries and succeeds |
+| T7a | A push holder that dies mid-pack (client disconnect) must not hold the exclusive slot: pre-fix, a silent drop parked the handler on a body read that never settled and 503'd every later push until the 15-min TTL (L325, 2026-11-22/23: five 20–40 min 503 windows in one mirror job) | Abort-signal fast-fail through the parse/stage/scan races + the pre-finalize abort check — lease released with a sweep on disconnect, nothing applied; `GIT_TIMEOUT_RECEIVE` (default 900 s, [60, 86400]) bounds the signal-less silent drop | Stalled receive holding the lease: concurrent push 503s; abort the holder → next push acquires the lease immediately and applies; TTL resolver pins default/floor/ceiling and a beginReceive with a short `leaseTtlMs` expires while a default one stays active |
 
 Correctness gates (all required): every e2e push followed by `git fsck` clean (dgit
 `scripts/e2e.sh` checklist adopted into CI: clone, shallow + unshallow, thin push, force

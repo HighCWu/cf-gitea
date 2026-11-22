@@ -260,9 +260,9 @@
     // client cannot split — a pull mirror's initial population fetches the
     // source's full pack in ONE internal receive (the git-HTTP request body
     // limit of a fronting proxy does not apply to that loopback call). Keep
-    // the pairing in mind: the receive must also finish inside the engine's
-    // 15-minute receive lease, and its delta resolution spends up to
-    // RANGE_BUDGET R2 range reads — raise the two together when admitting
+    // the pairing in mind: the receive must also finish inside the receive
+    // lease TTL (GIT_TIMEOUT_RECEIVE below), and its delta resolution spends
+    // up to RANGE_BUDGET R2 range reads — raise them together when admitting
     // larger initial populations.
     // The auto-watch push flip (specs/email-outbound.md §15, the ledger's
     // M7): upstream's [service] AUTO_WATCH_ON_CHANGES
@@ -284,6 +284,25 @@
     // shared with the receive's staging/idx/copy/RPC budget), so raise it
     // only as far as the window sizes you must admit require.
     "RANGE_BUDGET": "256",
+    // Receive lease TTL in SECONDS — how long one push may hold a repo's
+    // exclusive push slot after its holder stopped making progress (the
+    // engine's GIT_TIMEOUT_RECEIVE, packages/git-engine src/env.ts; named for
+    // upstream's [git.timeout] app.ini section, whose keys are seconds:
+    // MIGRATE 600 / MIRROR 300 / GC 60 — upstream needs no receive key there
+    // because its receive-pack is a child process that DIES on client
+    // disconnect, releasing git's locks with it). A disconnected push here
+    // releases the lease immediately (the engine's abort fast-fail, the
+    // same cancel event); this TTL bounds only the SILENT drop — a client
+    // that delivers neither bytes, EOF, nor a disconnect signal — which is
+    // the L325 incident shape: each stalled holder 503'd every other push
+    // until expiry. Default 900 (= the engine's historical 15-minute
+    // backstop); floor 60, ceiling 86400; unset/garbage keeps the default.
+    // Lower it to tighten the worst-case 503 window; raise it together with
+    // MAX_PUSH_MB for long loopback transfers, and with the mirror
+    // SYNCING_SWEEP_AFTER_SEC budget (services/mirror/sync.ts) if raised
+    // past 900. A value above the queue/cron wall clocks does not extend
+    // those consumers.
+    "GIT_TIMEOUT_RECEIVE": "900",
     // LFS store mode (SPEC-0006 §6 as-built, the L14 config wave) — strict
     // polarity: ONLY the exact string "true" constructs the presign store
     // (PresignLfsStore) over the relay store; absent/anything else = relay

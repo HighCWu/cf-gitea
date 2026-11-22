@@ -126,6 +126,16 @@ export interface BeginReceiveInput {
    * can rebuild keys without a request.
    */
   storageKey?: string | null;
+  /**
+   * OPTIONAL lease TTL override (milliseconds) — the embedding Worker's
+   * resolved `GIT_TIMEOUT_RECEIVE` config ({@link resolveReceiveLeaseTtlSeconds}
+   * output). Absent/invalid keeps the engine default
+   * ({@link clampReceiveLeaseTtlMs}). In-process config transport, the same
+   * trust shape as every other EngineCallOptions member: the DO has no env of
+   * its own contract to read, and the lease table stays the single source the
+   * sweeps consult.
+   */
+  leaseTtlMs?: number | null;
 }
 
 export type BeginReceiveOk = {
@@ -336,8 +346,56 @@ interface LeasePayload {
  * a max-size push at modest bandwidth; a crashed holder recovers earlier via
  * the Worker's releaseReceive on abort, and this TTL is the hard backstop that
  * the begin-time/alarm sweep reclaims.
+ *
+ * This is the DEFAULT of the configurable receive lease TTL: the embedding
+ * Worker resolves `GIT_TIMEOUT_RECEIVE` (seconds, the `[git.timeout] RECEIVE`
+ * key style of upstream's app.ini) through {@link resolveReceiveLeaseTtlSeconds}
+ * and hands the value to beginReceive as `leaseTtlMs`. The TTL only ever
+ * bounds a holder whose process died WITHOUT a disconnect signal (a silent
+ * client drop delivers no TCP error and no abort, so nothing releases the
+ * lease early) — an observed disconnect releases immediately (mod.ts
+ * receivePack's abort race), which is upstream's exact semantic: its
+ * receive-pack runs as a child process bound to the request context
+ * (gitcmd command.go CommandContext), so a client disconnect KILLS the
+ * process and git's advisory locks die with it — no stale lock can outlive
+ * a dead client. A DO lease has no process to die, hence the abort race plus
+ * this expiry backstop.
  */
-const RECEIVE_LEASE_TTL_MS = 15 * 60 * 1000;
+export const RECEIVE_LEASE_TTL_MS = 15 * 60 * 1000;
+/** Config floor: a TTL below one minute cannot cover even a small push's
+ * staging+scan+finalize round trips, and an expiring-mid-push lease reads at
+ * every lease-checking RPC as "lease lost" (the push dies). The resolver
+ * clamps configured values up to this. */
+export const RECEIVE_LEASE_TTL_MIN_MS = 60 * 1000;
+/** Config ceiling: one day. Nothing rational holds a push slot longer, and a
+ * typo (e.g. seconds pasted as milliseconds) must not wedge a repo's push
+ * serialization for days. */
+export const RECEIVE_LEASE_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Resolve the `GIT_TIMEOUT_RECEIVE` var (seconds, upstream `[git.timeout]`
+ * style — Migrate 600 / Mirror 300 / GC 60) into the receive lease TTL in
+ * milliseconds. Unset/garbage/non-positive falls back to the engine default;
+ * finite values clamp to [RECEIVE_LEASE_TTL_MIN_MS, RECEIVE_LEASE_TTL_MAX_MS].
+ */
+export function resolveReceiveLeaseTtlSeconds(raw: string | null | undefined): number {
+  const parsed = parseInt(raw ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return RECEIVE_LEASE_TTL_MS;
+  return Math.min(Math.max(parsed * 1000, RECEIVE_LEASE_TTL_MIN_MS), RECEIVE_LEASE_TTL_MAX_MS);
+}
+
+/**
+ * Guard the beginReceive input channel: an absent/invalid `leaseTtlMs` keeps
+ * the default; a finite positive value passes through as-is (the seconds
+ * floor/ceiling live in the config resolver — an in-process caller passing an
+ * explicit small TTL is a deliberate test/recovery gesture, not a config
+ * error, and clamping it here would hide the very expiry it asked for).
+ */
+export function clampReceiveLeaseTtlMs(ms: number | null | undefined): number {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) return RECEIVE_LEASE_TTL_MS;
+  return ms;
+}
+
 /** T7: the 503 Retry-After value a busy beginReceive hands back. */
 const RECEIVE_BUSY_RETRY_AFTER_SECONDS = 10;
 
@@ -505,7 +563,7 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
   const storageKey = resolveStorageKey(store, input.storageKey);
   const leaseToken = crypto.randomUUID().replaceAll("-", "");
   const stagingKey = buildStagingKey(storageKey, leaseToken);
-  const leaseExpiresAt = Date.now() + RECEIVE_LEASE_TTL_MS;
+  const leaseExpiresAt = Date.now() + clampReceiveLeaseTtlMs(input.leaseTtlMs);
   const payload: LeasePayload = { stagingKey, storageKey };
   store.createLease(leaseToken, "receive", leaseExpiresAt, JSON.stringify(payload));
   try {
