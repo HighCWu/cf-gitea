@@ -25,13 +25,15 @@
  *      `finalizeReceive` IS the refs CAS: `old === current` per command, so a
  *      concurrent writer surfaces as "fetch first" (§2.6 step 4).
  *   4. settle D1: success → `last_sync_at = now`, `next_sync_at = now +
- *      interval` (0 → unscheduled), `sync_state='idle'`, clear `last_error`;
- *      the first sync that gives the still-empty repo refs also settles the
- *      repositories row (`is_empty=false` + the source's advertised HEAD
- *      branch when it landed, else the engine's recorded HEAD branch — the
- *      import channel's settleDone shape); failure → sanitized `last_error`,
- *      `sync_state='idle'`, `next_sync_at` left DUE so the next cron retries
- *      — upstream's retry posture (mirror_pull.go:303-308).
+ *      interval` (0 → unscheduled), `sync_state='idle'`, clear `last_error`,
+ *      reset `sync_failures`; the first sync that gives the still-empty repo
+ *      refs also settles the repositories row (`is_empty=false` + the
+ *      source's advertised HEAD branch when it landed, else the engine's
+ *      recorded HEAD branch — the import channel's settleDone shape);
+ *      failure → sanitized `last_error`, `sync_state='idle'`,
+ *      `next_sync_at = now + backoff` (the consecutive-failure backoff below;
+ *      upstream's posture mirror_pull.go:303-308 leaves the row due, which
+ *      re-attempts the same failing full pull every cron tick).
  *   5. notify (§2.7): POST-SETTLE best-effort webhook fan-out from the
  *      applied updates delta — per created ref the zero-commit push event +
  *      the create event, per deleted ref the delete event, per updated ref
@@ -92,6 +94,10 @@ import { and, eq, inArray, lte, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { createDurableGit, type RefsResult } from "@cf-gitea/git-engine";
 
+import {
+  MIRROR_DEFAULT_INTERVAL_SECONDS,
+  MIRROR_MIN_INTERVAL_SECONDS,
+} from "../../api/services/mirror";
 import { apiUserFromRow, findRepositoryById, toApiRepository, type Viewer } from "../../api/services/repository";
 import { repoMirrors, repositories } from "../../db/schema";
 import { authorize } from "../../git-http/authorize";
@@ -212,6 +218,7 @@ interface MirrorRow {
   syncState: "idle" | "queued" | "syncing";
   nextSyncAt: number;
   lastSyncAt: number | null;
+  syncFailures: number;
 }
 
 async function readMirrorRow(db: D1Database, repoId: string): Promise<MirrorRow | null> {
@@ -228,6 +235,7 @@ async function readMirrorRow(db: D1Database, repoId: string): Promise<MirrorRow 
     syncState: row.syncState,
     nextSyncAt: row.nextSyncAt,
     lastSyncAt: row.lastSyncAt,
+    syncFailures: row.syncFailures,
   };
 }
 
@@ -269,6 +277,7 @@ async function settleMirrorSuccess(
       nextSyncAt: mirror.intervalSeconds > 0 ? now + mirror.intervalSeconds : 0,
       syncState: "idle",
       lastError: null,
+      syncFailures: 0,
       updatedAt: new Date(),
     })
     .where(and(eq(repoMirrors.repoId, repo.id), eq(repoMirrors.syncState, "syncing")));
@@ -338,12 +347,53 @@ async function settlePopulatedRepo(env: MirrorSyncEnv, repo: RepoRow, advertised
   }
 }
 
-/** §2.6 step 5 — failure settle: `last_error` (sanitized), back to idle,
- *  `next_sync_at` untouched (it stays due — the next cron retries). */
-async function settleMirrorFailure(db: D1Database, repoId: string, errorText: string): Promise<void> {
+/**
+ * The consecutive-failure retry backoff. Upstream's failure posture
+ * (mirror_pull.go:303-308 TouchMirror) leaves `next_update` untouched, so its
+ * 10-minute `update_mirrors` cron (tasks_basic.go:35) re-attempts the same
+ * failing sync forever — and every attempt here is a full outbound re-pull
+ * plus a queue invocation, so a permanently failing mirror would burn the
+ * transfer budget on an unchanging error at maximum frequency. The Nth
+ * CONSECUTIVE failure instead schedules the retry at
+ *
+ *   MIRROR_MIN_INTERVAL * 2^(N-1)   (10 m → 20 m → 40 m → …),
+ *
+ * capped at the mirror's own interval (an interval-scheduled mirror never
+ * waits longer than its normal cadence — the steady state a failing mirror
+ * degrades to) or at `MIRROR_DEFAULT_INTERVAL_SECONDS` for a manually-synced
+ * (interval 0) mirror. A FIRST failure still retries at the very next tick,
+ * upstream's responsiveness for the transient case; `sync_failures` (the
+ * schema column) persists the count and every success resets it. This is the
+ * one deliberate deviation from upstream's failure posture; the constants are
+ * upstream's own (modules/setting/mirror.go:21-24).
+ */
+export function backoffSeconds(consecutiveFailures: number, intervalSeconds: number): number {
+  const shift = Math.min(Math.max(consecutiveFailures, 1) - 1, 6);
+  const grown = MIRROR_MIN_INTERVAL_SECONDS << shift;
+  const ceiling = intervalSeconds > 0 ? intervalSeconds : MIRROR_DEFAULT_INTERVAL_SECONDS;
+  return Math.min(grown, ceiling);
+}
+
+/** §2.6 step 5 — failure settle: `last_error` (sanitized), the failure count
+ *  advanced, back to idle, and the retry scheduled with the backoff above
+ *  (ceilinged by this mirror's own cadence). */
+async function settleMirrorFailure(
+  db: D1Database,
+  repoId: string,
+  errorText: string,
+  nowSec: number,
+  consecutiveFailures: number,
+  intervalSeconds: number,
+): Promise<void> {
   await drizzle(db)
     .update(repoMirrors)
-    .set({ lastError: errorText.slice(0, 2000), syncState: "idle", updatedAt: new Date() })
+    .set({
+      lastError: errorText.slice(0, 2000),
+      syncFailures: consecutiveFailures + 1,
+      nextSyncAt: nowSec + backoffSeconds(consecutiveFailures + 1, intervalSeconds),
+      syncState: "idle",
+      updatedAt: new Date(),
+    })
     .where(and(eq(repoMirrors.repoId, repoId), eq(repoMirrors.syncState, "syncing")));
 }
 
@@ -724,7 +774,7 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
   if (!(await claimMirrorRow(env.DB, repoId))) return { ok: false, skipped: "busy" };
 
   const fail = async (errorText: string): Promise<MirrorSyncResult> => {
-    await settleMirrorFailure(env.DB, repoId, errorText);
+    await settleMirrorFailure(env.DB, repoId, errorText, nowSec, mirror.syncFailures, mirror.intervalSeconds);
     return { ok: false, error: errorText };
   };
 

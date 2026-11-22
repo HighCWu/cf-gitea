@@ -1,0 +1,1 @@
+ALTER TABLE `repo_mirrors` ADD `sync_failures` integer DEFAULT 0 NOT NULL;

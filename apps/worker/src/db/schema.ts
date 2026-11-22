@@ -2160,7 +2160,7 @@ export const userSettingsKv = sqliteTable(
  *   idle --cron CAS--> queued --claim CAS--> syncing --success--> idle
  *      \                     \                  \
  *       \                     + delete race     + failure settle --> idle
- *        + (any CAS loser is a no-op: 0 rows)    (next_sync_at stays due)
+ *        + (any CAS loser is a no-op: 0 rows)    (backoff schedules the retry)
  */
 export const repoMirrors = sqliteTable(
   "repo_mirrors",
@@ -2199,10 +2199,18 @@ export const repoMirrors = sqliteTable(
     /** Last successful sync (unix seconds); null until the first one
      *  (upstream `LastUpdateUnix`) — the due scan's oldest-first order key. */
     lastSyncAt: integer("last_sync_at"),
-    /** Sanitized last failure (§2.6 step 5); cleared on success. Failure
-     *  leaves `next_sync_at` due so the next cron retries (upstream posture,
-     *  mirror_pull.go:303-308). */
+    /** Sanitized last failure (§2.6 step 5); cleared on success. A failure
+     *  schedules the retry with the consecutive-failure backoff
+     *  (services/mirror/sync.ts backoffSeconds): upstream leaves
+     *  `next_update` untouched so its cron re-attempts the same failing sync
+     *  every tick (mirror_pull.go:303-308), which here means re-pulling the
+     *  full pack each time — so the retry spacing escalates instead. */
     lastError: text("last_error"),
+    /** Consecutive sync failures — the backoff exponent and the operator's
+     *  health signal; reset by the next successful sync. Upstream keeps no
+     *  counter (its `LastError` column exists only on push mirrors,
+     *  models/repo/pushmirror.go:30). */
+    syncFailures: integer("sync_failures").notNull().default(0),
     createdAt: integer("created_at", { mode: "timestamp" })
       .notNull()
       .default(sql`(unixepoch())`),

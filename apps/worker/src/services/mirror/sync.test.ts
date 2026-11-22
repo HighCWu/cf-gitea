@@ -790,3 +790,79 @@ describe("stuck-syncing sweep (pull cron producer)", () => {
     expect((await mirrorRow())!.syncState).toBe("queued");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The consecutive-failure retry backoff (services/mirror/sync.ts
+// backoffSeconds): upstream's failure posture leaves `next_update` untouched,
+// so its 10-minute cron re-attempts the same failing sync forever; every
+// attempt here is a full outbound re-pull, so the spacing escalates and the
+// count persists on the row. Constants are upstream's own
+// (MIRROR_MIN_INTERVAL=10 m base, the mirror's interval / DEFAULT_INTERVAL
+// ceiling).
+// ---------------------------------------------------------------------------
+
+describe("handleMirrorSync failure backoff", () => {
+  it("a failed sync schedules the retry one MIN_INTERVAL out and persists the failure state", async () => {
+    await seedMirrorTarget("backoff-first");
+    const { fetchImpl } = stubFetch([]); // no canned responses — the fetch arm throws
+
+    const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
+    expect(result.ok).toBe(false);
+
+    const mirror = await mirrorRow();
+    expect(mirror!.syncState).toBe("idle");
+    expect(mirror!.lastError).toContain("source request failed");
+    expect(mirror!.syncFailures).toBe(1);
+    expect(mirror!.nextSyncAt).toBe(NOW_SEC + 600); // MIRROR_MIN_INTERVAL — the next tick
+
+    // The backed-off row is NOT due at the failure instant: the producer
+    // enqueues nothing until the backoff elapses.
+    const queue = recordingQueue();
+    expect(await enqueueDueMirrorSyncs(envWithQueue(queue), { now: NOW })).toBe(0);
+    expect(queue.batches).toEqual([]);
+  });
+
+  it("consecutive failures double the spacing up to the mirror's interval and the count persists", async () => {
+    await seedMirrorTarget("backoff-escalation"); // intervalSeconds 28800
+    const failing = { fetchImpl: (): Promise<Response> => Promise.reject(new Error("boom")) };
+
+    const expectedBackoff = [600, 1200, 2400, 4800, 9600, 19200, 28800];
+    for (let n = 1; n <= expectedBackoff.length; n++) {
+      const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl: failing.fetchImpl, now: NOW });
+      expect(result.ok).toBe(false);
+      const mirror = await mirrorRow();
+      expect(mirror!.syncFailures).toBe(n);
+      // 600 << (n-1), capped at the mirror's own 8 h cadence (600 << 6 = 38400
+      // would overshoot it on the 7th failure).
+      expect(mirror!.nextSyncAt).toBe(NOW_SEC + (expectedBackoff[n - 1] as number));
+    }
+
+    // The producer only picks the row back up once the capped backoff elapses.
+    const queue = recordingQueue();
+    expect(await enqueueDueMirrorSyncs(envWithQueue(queue), { now: new Date((NOW_SEC + 28799) * 1000) })).toBe(0);
+    expect(await enqueueDueMirrorSyncs(envWithQueue(queue), { now: new Date((NOW_SEC + 28800) * 1000) })).toBe(1);
+    expect((await mirrorRow())!.syncState).toBe("queued");
+  });
+
+  it("a success resets the failure count and returns to the interval cadence", async () => {
+    await ensureSeededRepo({ owner: "mirror-src", slug: "upstream", commits: SEED_COMMITS });
+    const sourceRefs = await env.REPO.getByName("mirror-src/upstream").listRefs();
+    await seedMirrorTarget("backoff-reset");
+    const failing = { fetchImpl: (): Promise<Response> => Promise.reject(new Error("boom")) };
+    await handleMirrorSync(env, { repoId: "7401", fetchImpl: failing.fetchImpl, now: NOW });
+    await handleMirrorSync(env, { repoId: "7401", fetchImpl: failing.fetchImpl, now: NOW });
+    expect((await mirrorRow())!.syncFailures).toBe(2);
+
+    const { fetchImpl } = stubFetch([
+      advertResponse(v0AdvertBytes(sourceRefs.refs, sourceRefs.head)),
+      resultResponse(packResponseBytes((await buildHistoryPack(SEED_COMMITS)).pack)),
+    ]);
+    const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
+    expect(result.ok).toBe(true);
+
+    const mirror = await mirrorRow();
+    expect(mirror!.syncFailures).toBe(0);
+    expect(mirror!.lastError).toBeNull();
+    expect(mirror!.nextSyncAt).toBe(NOW_SEC + 28800); // the mirror's own interval
+  });
+});

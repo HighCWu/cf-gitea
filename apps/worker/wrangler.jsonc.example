@@ -256,6 +256,14 @@
     // applies to the compressed request body too: a gzipped push body
     // (Content-Length-declared or counted off the stream) over the cap is
     // rejected 413 BEFORE the bytes buffer or the inflate runs.
+    // RAISING it (e.g. 1024/2048) is the lever for server-side transfers a
+    // client cannot split — a pull mirror's initial population fetches the
+    // source's full pack in ONE internal receive (the git-HTTP request body
+    // limit of a fronting proxy does not apply to that loopback call). Keep
+    // the pairing in mind: the receive must also finish inside the engine's
+    // 15-minute receive lease, and its delta resolution spends up to
+    // RANGE_BUDGET R2 range reads — raise the two together when admitting
+    // larger initial populations.
     // The auto-watch push flip (specs/email-outbound.md §15, the ledger's
     // M7): upstream's [service] AUTO_WATCH_ON_CHANGES
     // (modules/setting/service.go:216, default false) — a branch push by a
