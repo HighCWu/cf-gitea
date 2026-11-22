@@ -242,9 +242,18 @@ export class DeltaResolver {
         baseHex = entry.refBase; // in-pack base
       } else {
         // external (thin-pack) base: finish() batch-looked it up and cached
-        // the materialized content; until then this entry stays a straggler
+        // the materialized content; until then this entry stays a straggler.
+        // A base that never stuck in the cache (over the ObjCache's
+        // per-object bound, or evicted under budget pressure) is
+        // re-materialized through the same lookup channel — the object
+        // database's verdict, not the cache's, decides availability.
         base = this.cache.get(entry.refBase);
-        if (!base) return false;
+        if (!base) {
+          const hit = await this.lookupOne(entry.refBase);
+          if (!hit.found) return false;
+          base = await this.materializeForeign(hit);
+          this.cache.put(entry.refBase, base);
+        }
         baseHex = entry.refBase;
       }
     } else {
@@ -320,6 +329,9 @@ export class DeltaResolver {
    * bounding chain length and detecting cycles before any delta is inflated —
    * then applied from the base upward, caching along the way so repeated
    * misses stay cheap. Missing bytes are fetched with budgeted range GETs.
+   * A chain may terminate on an EXTERNAL base (a delta that resolved against
+   * a thin-pack base from the object database): the walk re-looks the base up
+   * and materializes it rather than treating the non-in-pack oid as corruption.
    */
   private async materialize(entryIdx: number): Promise<ObjRec> {
     const chain: number[] = [];
@@ -349,7 +361,22 @@ export class DeltaResolver {
       chain.push(cur);
       const bHex = this.entryBase[cur]!;
       const bIdx = this.oids.indexOfHex(bHex);
-      if (bIdx < 0) throw new Error(`missing delta base ${bHex}`);
+      if (bIdx < 0) {
+        // The base oid is not one of this pack's entries: `cur` is a delta
+        // that resolved against an EXTERNAL base (a thin-pack base finished()
+        // looked up in the object database — possibly a pack received by an
+        // earlier windowed push). Its content is looked up through the same
+        // channel and the walk stops here; the chain below applies onto the
+        // foreign base. Before this branch the walk treated any non-in-pack
+        // base as corruption and rejected windowed thin pushes whose chain
+        // node was too big to stay cached ("missing delta base <oid>" for an
+        // oid the repository holds).
+        const hit = await this.lookupOne(bHex);
+        if (!hit.found) throw new Error(`missing delta base ${bHex}`);
+        base = await this.materializeForeign(hit);
+        this.cache.put(bHex, base);
+        break;
+      }
       cur = this.oidEntry[bIdx];
     }
     let obj = base;
