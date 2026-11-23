@@ -771,6 +771,9 @@ describe("repo_mirrors parity (the mirror wave's pinned §3.1 DDL, migration 001
       ["last_error", "TEXT", 0, 0],
       ["created_at", "INTEGER", 1, 0],
       ["updated_at", "INTEGER", 1, 0],
+      // appended per the ALTER ADD COLUMN convention — migration 0081's
+      // pull-mirror retry backoff counter (integer DEFAULT 0 NOT NULL)
+      ["sync_failures", "INTEGER", 1, 0],
     ]);
     const byName = new Map(columns.map((c) => [c.name, c]));
     expect(byName.get("interval_seconds")?.dflt_value).toBe("28800");
@@ -781,6 +784,7 @@ describe("repo_mirrors parity (the mirror wave's pinned §3.1 DDL, migration 001
     expect(byName.get("lfs_enabled")?.dflt_value).toBe("false");
     expect(byName.get("sync_state")?.dflt_value).toBe("'idle'");
     expect(byName.get("next_sync_at")?.dflt_value).toBe("0");
+    expect(byName.get("sync_failures")?.dflt_value).toBe("0");
     expect(byName.get("created_at")?.dflt_value).toBe("unixepoch()");
     expect(byName.get("updated_at")?.dflt_value).toBe("unixepoch()");
 
