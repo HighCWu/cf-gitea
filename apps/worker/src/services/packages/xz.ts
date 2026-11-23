@@ -549,7 +549,7 @@ async function verifyCheck(checkType: number, output: Uint8Array, check: Uint8Ar
       return;
     }
     case 0x0a: {
-      const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", output as unknown as BufferSource));
+      const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", output));
       for (let i = 0; i < 32; i++) {
         if ((actual[i] ?? 0) !== (check[i] ?? 0)) throw new XzError("block sha256 check mismatch");
       }
@@ -578,7 +578,7 @@ export async function xzDecode(input: Uint8Array, options: XzDecodeOptions = {})
   let p = 0;
   let sawStream = false;
 
-  stream: for (;;) {
+  for (;;) {
     // ---- Stream header ----
     if (p + 12 > input.byteLength) {
       if (sawStream) break; // trailing garbage tolerance ends the walk

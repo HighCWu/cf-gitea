@@ -147,6 +147,7 @@ export function parseOwnerActionsConfig(raw: string | null): OwnerActionsConfig 
       // of the pre-#39998 silent zero-config.
       throw new Error(
         `UnmarshalFromDB ${JSON.stringify(raw)} failed: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
       );
     }
   }

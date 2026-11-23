@@ -53,13 +53,6 @@ const LZMA2_CHUNK_PAYLOAD_MAX = 1 << 16;
  */
 const LZMA2_DICT_SIZE_BYTE = 0x1a;
 
-function u16le(value: number): Uint8Array {
-  const out = new Uint8Array(2);
-  out[0] = value & 0xff;
-  out[1] = (value >>> 8) & 0xff;
-  return out;
-}
-
 function u32le(value: number): Uint8Array {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, value >>> 0, true);

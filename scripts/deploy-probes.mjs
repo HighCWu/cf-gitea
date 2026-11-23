@@ -592,7 +592,7 @@
  * This file deliberately does NOT touch docs/design/p0-evidence.md (it is
  * REDEPLOY14's in-flight document); the conventions note lives here.
  */
-/* global crypto, fetch, AbortSignal, TextDecoder, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
+/* global crypto, fetch, AbortSignal, TextDecoder, TextEncoder, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
 import { execFile } from "node:child_process";
 import console from "node:console";
 import { createHash, randomUUID } from "node:crypto";
