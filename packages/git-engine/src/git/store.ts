@@ -359,6 +359,21 @@ export class GitStore {
     return this.hasActiveLease("receive", now);
   }
 
+  /** The live receive lease row, if any — beginReceive's busy verdict names
+   *  its expiry so the 503 answer can log how long the blocking holder keeps
+   *  the slot (the stranded-holder window, readable from the log). */
+  activeReceiveLease(now: number): LeaseRow | null {
+    this.assertOpen();
+    const rows = this.sql
+      .exec<{ lease_token: string; kind: string; expires_at: number; payload: string }>(
+        "SELECT lease_token, kind, expires_at, payload FROM leases WHERE kind = ? AND expires_at > ? LIMIT 1",
+        "receive",
+        now
+      )
+      .toArray();
+    return rows[0] ? this.toLeaseRow(rows[0]) : null;
+  }
+
   /** Whether any UNEXPIRED lease of `kind` exists — the mutual-exclusion
    * probe. Receives block compaction (SPEC-0011 §5.1); a compaction lease
    * blocks concurrent compactions (§5.2 step 1). */

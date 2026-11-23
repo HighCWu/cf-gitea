@@ -156,6 +156,9 @@ export type BeginReceiveBusy = {
   tag: "busy";
   /** value for the 503 Retry-After header (T7: 10) */
   retryAfterSeconds: number;
+  /** unix millis; when the blocking holder's lease frees itself (the sweep
+   *  reclaims it then) — the 503 answer logs the remaining window */
+  leaseExpiresAt: number;
 };
 /** A fork import is in flight (meta.importing, SPEC-0001b §5.3): pushes are
  * refused until the replication loop finalizes. Distinct from `busy` so the
@@ -538,8 +541,13 @@ function isImporting(store: GitStore): boolean {
 export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): Promise<BeginReceiveResult> {
   const { store } = host;
   await sweepExpiredLeases(host);
-  if (store.hasActiveReceiveLease(Date.now())) {
-    return { tag: "busy", retryAfterSeconds: RECEIVE_BUSY_RETRY_AFTER_SECONDS };
+  const active = store.activeReceiveLease(Date.now());
+  if (active !== null) {
+    return {
+      tag: "busy",
+      retryAfterSeconds: RECEIVE_BUSY_RETRY_AFTER_SECONDS,
+      leaseExpiresAt: active.expiresAt,
+    };
   }
   if (input.commands.some((cmd) => !validRefName(cmd.ref))) {
     return {

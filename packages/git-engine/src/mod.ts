@@ -1243,6 +1243,14 @@ async function receivePack<E extends Env>(
       leaseTtlMs: resolveReceiveLeaseTtlSeconds(env.GIT_TIMEOUT_RECEIVE),
     });
     if (begin.tag === "busy") {
+      // the busy 503 names the blocking holder's lease lifetime: without it a
+      // stranded holder (the silent-drop shape the TTL is the backstop for)
+      // is invisible until the wall heals itself at expiry — with it the
+      // remaining window reads straight off the log (absolute + remaining)
+      const leaseSecondsLeft = Math.max(0, Math.ceil((begin.leaseExpiresAt - Date.now()) / 1000));
+      console.log(
+        `[receive ${repo}] busy: another push holds the lease until ${new Date(begin.leaseExpiresAt).toISOString()} (${leaseSecondsLeft}s left); retry-after ${begin.retryAfterSeconds}s`
+      );
       return new Response("busy: too many concurrent pushes, retry shortly\n", {
         status: 503,
         headers: { "retry-after": String(begin.retryAfterSeconds) },

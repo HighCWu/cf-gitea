@@ -315,6 +315,32 @@ describe("receive lease TTL plumbing (GIT_TIMEOUT_RECEIVE)", () => {
     await stub.releaseReceive({ leaseToken: refreshed.leaseToken, sweep: false });
   });
 
+  it("a busy beginReceive names the blocking lease's expiry (the 503 logs the stranded-holder window)", async () => {
+    const repo = "lease/busy-expiry";
+    const stub = env.REPO.getByName(repo);
+    await stub.bindRepo(repo);
+    const commands = [{ old: ZERO_OID, next: "b".repeat(40), ref: "refs/heads/busy" }];
+
+    const holder = await stub.beginReceive({ commands, capabilities: [], packBytesHint: null });
+    expect(holder.tag).toBe("ok");
+    if (holder.tag !== "ok") return;
+
+    // the busy verdict carries the blocking lease's absolute expiry — the
+    // engine's busy 503 logs it (absolute + remaining seconds)
+    const busy = await stub.beginReceive({ commands, capabilities: [], packBytesHint: null });
+    expect(busy.tag).toBe("busy");
+    if (busy.tag !== "busy") return;
+    expect(busy.retryAfterSeconds).toBe(10);
+    expect(busy.leaseExpiresAt).toBe(holder.leaseExpiresAt);
+    await stub.releaseReceive({ leaseToken: holder.leaseToken, sweep: false });
+
+    // released: the next begin acquires (the probe shape stays honest)
+    const freed = await stub.beginReceive({ commands, capabilities: [], packBytesHint: null });
+    expect(freed.tag).toBe("ok");
+    if (freed.tag !== "ok") return;
+    await stub.releaseReceive({ leaseToken: freed.leaseToken, sweep: false });
+  });
+
   it("resolveReceiveLeaseTtlSeconds pins default, floor, ceiling and garbage; clampReceiveLeaseTtlMs guards the RPC input", () => {
     // seconds, upstream [git.timeout] style
     expect(resolveReceiveLeaseTtlSeconds("900")).toBe(15 * 60 * 1000);
