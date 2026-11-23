@@ -19,9 +19,13 @@
 //     count pkt-line (gitprotocol-pack: push-options = *PKT-LINE(push-option)
 //     flush-pkt; observed: `packet: push> key=value` / `push> 0000`).
 //   - atomic failure report: the failing ref keeps its own ng message, the
-//     would-apply siblings get `ng <ref> atomic push failed` (observed:
-//     `! [rejected] main -> main (fetch first)` +
-//     `! [rejected] atom3 -> atom3 (atomic push failed)`).
+//     would-apply siblings get `ng <ref> atomic transaction failed`
+//     (git v2.43.0 builtin/receive-pack.c:1896 — execute_commands_atomic's
+//     `reported_error`, string-verified in the shipped git-receive-pack
+//     binary; the earlier observation cited below is the CLIENT's own
+//     abort rendering, `! [rejected] main -> main (fetch first)` +
+//     `! [rejected] atom3 -> atom3 (atomic push failed)` — a git-push
+//     display string, never a server ng line).
 //   - report-status-v2 without proc-receive: zero option lines — the report
 //     is `unpack ok` + ok/ng (observed on a stock 2.43.0 push; upstream
 //     Gitea runs no proc-receive either).
@@ -29,8 +33,8 @@
 // Covers, in order:
 //   1.  the advertisement (through the real handler) carries the new tokens.
 //   2.  atomic, CAS-doomed sibling: a stale-old command forces the WHOLE
-//       section to fail — sibling reports "atomic push failed", the doomed
-//       one its own "fetch first", NO ref moves, no onPush event.
+//       section to fail — sibling reports "atomic transaction failed", the
+//       doomed one its own "fetch first", NO ref moves, no onPush event.
 //   3.  the same push without `atomic`: the sibling lands (per-ref default).
 //   4.  atomic + hook rejection: both commands report ng, finalize is
 //       SKIPPED (all-rejected path: lease released with a sweep), nothing
@@ -455,7 +459,7 @@ await check("1. the real advertisement carries report-status-v2, atomic, push-op
   assertEq(dummyTokens, liveTokens, "dummyAdvertisement mirrors the live receive capability list (agent excluded)");
 });
 
-await check("2. atomic, CAS-doomed sibling: the whole section fails, the sibling reports 'atomic push failed'", async () => {
+await check("2. atomic, CAS-doomed sibling: the whole section fails, the sibling reports 'atomic transaction failed'", async () => {
   const t = makeRepo();
   const post = makePostReceive(t);
   // land A for real, then strand a stale create: refs/heads/doomed exists
@@ -472,10 +476,10 @@ await check("2. atomic, CAS-doomed sibling: the whole section fails, the sibling
   assertEq(
     report.results.map((r) => [r.ref, r.ok, r.msg]),
     [
-      ["refs/heads/fresh", false, "atomic push failed"],
+      ["refs/heads/fresh", false, "atomic transaction failed"],
       ["refs/heads/doomed", false, "fetch first"],
     ],
-    "atomic report: failing command keeps its message, the sibling the atomic failure (git 2.43.0 observed shape)"
+    "atomic report: failing command keeps its message, the sibling the atomic failure (git 2.43.0 receive-pack.c:1896 shape)"
   );
   assertEq(t.store.getRef("refs/heads/fresh"), null, "NOTHING applied: the sibling ref does not exist");
   assertEq(t.store.getRef("refs/heads/doomed"), A.oid, "the doomed ref is untouched");
@@ -517,7 +521,7 @@ await check("4. atomic + hook rejection: finalize skipped, all-ng, lease release
     report.results.map((r) => [r.ref, r.ok, r.msg]),
     [
       ["refs/heads/hooked", false, "hooked is protected"],
-      ["refs/heads/free", false, "atomic push failed"],
+      ["refs/heads/free", false, "atomic transaction failed"],
     ],
     "hook-declined keeps its message, the would-apply sibling the atomic failure"
   );
