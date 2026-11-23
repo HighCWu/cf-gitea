@@ -515,6 +515,11 @@ async function handleAgitReceive(
   const response = await engine.fetch(forwarded, env, ctx, {
     ...(pusher !== null ? { pusher } : {}),
     validatePush: laneValidator,
+    // the disconnect fast-fail (forwardToEngine's `signal` doc): the rebuilt
+    // Request above carries a fresh never-aborting signal, so receivePack's
+    // `internal?.signal ?? req.signal` fallback would watch a dead signal
+    // while the real client vanishes — the lease then strands until the TTL
+    signal: req.signal,
   });
 
   // The pre-lane post-commit tails — shared by both paths, unchanged: the
