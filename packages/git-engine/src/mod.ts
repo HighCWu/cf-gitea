@@ -1039,18 +1039,27 @@ function verdictRejects(verdicts: PushVerdict[] | undefined, count: number): (st
  * command) instead of handing the hook raw commands. A lost lease cannot be
  * surfaced meaningfully here (finalize rejects the push regardless), so its
  * update commands keep the conservative force-push kind.
+ *
+ * Returns that verdict array separately (`kinds`), non-null only when EVERY
+ * entry is authoritative — the wire facts always are, the ancestry entries
+ * only when the classify RPC answered "ok". finalizeReceive consumes it to
+ * reuse the ancestry verdict instead of re-walking (a conservative classify
+ * yields null and validatePush walks as before).
  */
 async function classifyForValidator(
   stub: DurableObjectStub<RepoCell>,
   leaseToken: string,
   commands: PushCommand[]
-): Promise<ClassifiedPushCommand[]> {
+): Promise<{ classified: ClassifiedPushCommand[]; kinds: PushCommandKind[] | null }> {
   const classified: ClassifiedPushCommand[] = commands.map((c) => ({
     ref: c.ref,
     old: c.old,
     new: c.next,
     kind: c.next === ZERO_OID ? "delete" : c.old === ZERO_OID ? "create" : "force-push",
   }));
+  const kinds: PushCommandKind[] = classified.map((c) => c.kind);
+  // ancestry entries need the batched RPC; an all-wire-facts section is
+  // already authoritative without it
   if (classified.some((c) => c.kind === "force-push")) {
     const res = await stub.classifyReceive({
       leaseToken,
@@ -1060,10 +1069,14 @@ async function classifyForValidator(
       res.kinds.forEach((kind, i) => {
         const c = classified[i];
         if (c) c.kind = kind;
+        kinds[i] = kind;
       });
+      return { classified, kinds };
     }
+    // conservative kinds (lost lease): NOT authoritative — validatePush walks
+    return { classified, kinds: null };
   }
-  return classified;
+  return { classified, kinds };
 }
 
 /**
@@ -1450,8 +1463,14 @@ async function receivePack<E extends Env>(
     // never apply). A throwing hook propagates to the outer catch: the
     // lease is released with a sweep and the request fails closed (500).
     let hookRejects: (string | null)[] | null = null;
+    // classifyReceive's authoritative ancestry verdicts (null when the
+    // classify was conservative or no hook ran): finalize reuses them instead
+    // of re-walking the same (old,next) ancestry — the bounded walk ran twice
+    // per force-shaped push, and its duration grows with repo history
+    let classifiedKinds: PushCommandKind[] | undefined;
     if (internal?.validatePush && unpackError === null) {
-      const classified = await classifyForValidator(stub, begin.leaseToken, push.commands);
+      const { classified, kinds } = await classifyForValidator(stub, begin.leaseToken, push.commands);
+      if (kinds !== null) classifiedKinds = kinds;
       const verdicts = await internal.validatePush(classified, {
         repo,
         ...(pusher !== undefined ? { pusher } : {}),
@@ -1495,6 +1514,15 @@ async function receivePack<E extends Env>(
     // list it receives, and the merge below re-aligns them to the section.
     const finalizeCommands =
       hookRejects === null ? push.commands : push.commands.filter((_, i) => hookRejects![i] === null);
+    // the kinds array rides the same filter: it must stay index-aligned with
+    // the commands finalize actually receives
+    let finalizeKinds = classifiedKinds;
+    if (finalizeKinds !== undefined && hookRejects !== null) {
+      finalizeKinds = push.commands
+        .map((_, i) => i)
+        .filter((i) => hookRejects![i] === null)
+        .map((i) => finalizeKinds![i]);
+    }
     if (finalizeCommands.length === 0) {
       // every command rejected by policy: nothing to finalize — drop the
       // lease with a sweep (staging object + index rows) so an all-rejected
@@ -1526,6 +1554,7 @@ async function receivePack<E extends Env>(
       unpackError,
       packIncomplete,
       atomic,
+      ...(finalizeKinds !== undefined ? { classifiedKinds: finalizeKinds } : {}),
     });
     leaseToken = null; // finalize decided the lease; the release below is a no-op sweep
     if (fin.tag === "lease_mismatch") {

@@ -241,6 +241,17 @@ export interface FinalizeReceiveInput {
    * ONE commit transaction (commitPush's verdict pass), so a failed atomic
    * push writes nothing at all. */
   atomic?: boolean;
+  /** {@link classifyReceive}'s ancestry verdicts for THIS command section,
+   * index-aligned with `commands`. Present ONLY when the classify RPC
+   * authoritatively answered (tag "ok") — the Worker re-aligns the array when
+   * hook rejections filtered the section. validatePush then reuses the
+   * verdict instead of re-walking the same bounded isAncestor over the same
+   * (old,next) pairs (the walk ran twice per force-shaped push, and its
+   * duration grows with repo history). A conservative classify (lost lease)
+   * is NEVER passed — validatePush walks as before — and a length mismatch
+   * (a caller bug) is dropped the same way: the walk stays the fallback,
+   * never a fail-closed surface. */
+  classifiedKinds?: PushCommandKind[];
 }
 
 export type FinalizeCommitted = {
@@ -932,11 +943,21 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   // ref writes and version bump under one savepoint — a multi-ref push must
   // not leave half its branches moved. Exactly one receive lease can be in
   // this window. The Worker's scan already resolved every delta and ran the
-  // connectivity anti-check; validatePush consumes its verdict.
-  const plan = await validatePush(store, input.commands, input.unpackError, {
-    packKey: packName,
-    packIncomplete: input.packIncomplete === true,
-  });
+  // connectivity anti-check; validatePush consumes its verdict — including
+  // classifyReceive's already-computed ancestry verdicts when they rode the
+  // input (a length mismatch drops them; the walk is the fallback).
+  const classifiedKinds =
+    input.classifiedKinds?.length === input.commands.length ? input.classifiedKinds : undefined;
+  const plan = await validatePush(
+    store,
+    input.commands,
+    input.unpackError,
+    {
+      packKey: packName,
+      packIncomplete: input.packIncomplete === true,
+    },
+    classifiedKinds
+  );
   const outcome = host.storage.transactionSync(() => {
     // the lease may have been swept/released/tombstoned while the async
     // passes ran (SPEC-0003 §4.2: the tombstone check sits INSIDE the commit

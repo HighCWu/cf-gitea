@@ -15,6 +15,7 @@ import {
   type PlanFetchResult,
   type RenewReadResult,
 } from "../read-leases";
+import type { PushCommandKind } from "../control-plane";
 
 /**
  * The agent capability exactly as it goes on the wire: key=value per git
@@ -1699,7 +1700,17 @@ export async function validatePush(
   store: GitStore,
   commands: PushCommand[],
   unpackError: string | null,
-  scan: { packKey: string | null; packIncomplete: boolean }
+  scan: { packKey: string | null; packIncomplete: boolean },
+  /** control-plane classifyReceive's ancestry verdicts for this section,
+   * index-aligned with `commands` — the ONE bounded isAncestor walk per push,
+   * already run DO-side over the same lease-staged rows; verdicts ride the
+   * finalize input instead of being re-walked here (same pure function,
+   * immutable object graph, pushes serialized by the receive lease). Only
+   * update commands reach the forced line, where classify's
+   * fast-forward/force-push verdict IS the forced flag; absent kinds (no
+   * hook, conservative classify, length mismatch — already dropped by
+   * finalize) fall back to the walk. */
+  classifiedKinds?: PushCommandKind[]
 ): Promise<PushPlan> {
   // whether the reachable cache is valid for the pre-push refs: only then can
   // it be extended in place (union with the connectivity walk) instead of
@@ -1726,7 +1737,8 @@ export async function validatePush(
   }
 
   const decisions: PushDecision[] = [];
-  for (const cmd of commands) {
+  for (let i = 0; i < commands.length; i++) {
+    const cmd = commands[i];
     if (unpackError) {
       decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "unpacker error" });
       continue;
@@ -1752,7 +1764,10 @@ export async function validatePush(
       decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "missing necessary objects" });
       continue;
     }
-    const forced = cmd.old !== ZERO_OID && !(await isAncestor(store, cmd.old, cmd.next));
+    const kind = classifiedKinds?.[i];
+    const forced =
+      cmd.old !== ZERO_OID &&
+      (kind === "fast-forward" ? false : kind === "force-push" ? true : !(await isAncestor(store, cmd.old, cmd.next)));
     decisions.push({ ref: cmd.ref, expectedOld: cmd.old, set: cmd.next, forced });
   }
   return { decisions, known, hadCache };
