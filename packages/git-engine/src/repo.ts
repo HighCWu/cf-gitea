@@ -110,6 +110,8 @@ import {
 import {
   COMPACTION_ACTIVE_PACK_THRESHOLD,
   COMPACTION_RETRY_MS,
+  COMPACTION_WINDOW_BYTES,
+  COMPACTION_WINDOW_OBJECTS,
   runCompaction,
   type CompactionHost,
   type CompactionResult,
@@ -220,6 +222,29 @@ export const MAX_LFS_POINTER_BYTES = 1024;
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 /** the DO SQLite storage ceiling gc must not cross while duplicating objects */
 const DO_STORAGE_CAP = 10 * 1024 * 1024 * 1024;
+/** The M2 GC's loose-migration budget, expressed against ONE compaction
+ * window (SPEC-0011 §5.1: the bound a single compaction round already
+ * carries). Beyond it the repo is pack-native — duplicating that much
+ * reachable history into loose SQLite runs under `blockConcurrencyWhile`
+ * for its whole R2-bound duration, and every push that arrives mid-run
+ * queues behind it with zero response bytes until the edge cuts it off, so
+ * the alarm consumer skips instead and reorganization stays compaction's +
+ * the M3.4 lifecycle pass's job: the same posture the `objectCount()>300k`
+ * skip already takes, proactively on the pack side. */
+export const GC_MIGRATION_MAX_PACK_OBJECTS = COMPACTION_WINDOW_OBJECTS;
+export const GC_MIGRATION_MAX_PACK_BYTES = COMPACTION_WINDOW_BYTES;
+
+/** What one M2 GC round reports: the sweep counters, whether the round was
+ * skipped, and the skip's reason (`size_cap` — the 300k walk bound;
+ * `migration_budget` — the pack store beyond one compaction window;
+ * `no_headroom` — the DO storage ceiling guard). */
+interface GcOutcome {
+  removed: number;
+  kept: number;
+  skipped?: boolean;
+  reason?: string;
+}
+
 /** an upload-pack request is wants/haves/caps only — a few hundred KB at most */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
 // like cgit's about-file: a dedicated about page wins over the README
@@ -1077,13 +1102,35 @@ export class RepoCell extends DurableObject<Env> {
    * mid-clone. (It used to also chain on the pushes' receiveChain; since
    * SPEC-0001a §3 Step 1 pushes enter via finalizeReceive holding a receive
    * lease, and GC defers to any active lease instead.)
+   *
+   * Every round announces itself on the log — one start line with the object
+   * counts, one done line with the sweep counters and the duration — the
+   * receive busy-503 log's "new code in service" evidence shape: the next
+   * incident reads the GC's entry, exit and duration straight from the tail
+   * instead of inferring them from queued-push symptoms.
    */
-  private async gc(): Promise<{ removed: number; kept: number; skipped?: boolean }> {
+  private async gc(): Promise<GcOutcome> {
+    const repo = this.store.getMeta("repo") ?? "";
     if (this.store.hasActiveReceiveLease(Date.now())) {
       // a push finalize may be mid-ingest; never reset packs under it
+      console.log(`[gc ${repo}] skipped: a push finalize holds the receive lease (no packs.reset under it)`);
       return { removed: 0, kept: 0, skipped: true };
     }
-    return this.ctx.blockConcurrencyWhile(async () => this.runGc());
+    const started = Date.now();
+    console.log(
+      `[gc ${repo}] start: objects=${this.store.objectCount()} packObjects=${this.store.packs.countObjects()} packBytes=${this.store.packs.totalPackBytes()}`
+    );
+    try {
+      const result = await this.ctx.blockConcurrencyWhile(async () => this.runGc());
+      console.log(
+        `[gc ${repo}] done: removed=${result.removed} kept=${result.kept}` +
+          `${result.skipped ? ` skipped=${result.reason ?? "true"}` : ""} durationMs=${Date.now() - started}`
+      );
+      return result;
+    } catch (err) {
+      console.log(`[gc ${repo}] failed after ${Date.now() - started}ms: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   private async handleConfig(body: string): Promise<Response> {
@@ -1118,6 +1165,16 @@ export class RepoCell extends DurableObject<Env> {
    * packs are kept (deleting mid-pack is impossible without a repack);
    * huge repos skip the sweep entirely — the walk isn't worth it.
    *
+   * A pack store beyond ONE compaction window (GC_MIGRATION_MAX_PACK_OBJECTS
+   * / GC_MIGRATION_MAX_PACK_BYTES) skips the whole round: it is pack-native,
+   * and migrating that much reachable history into loose SQLite under the
+   * caller's `blockConcurrencyWhile` would block the cell for the walk's
+   * entire R2-bound duration — every push arriving mid-run queues behind it
+   * with zero response bytes until the edge cuts it off. Compaction (which
+   * reorganizes in bounded windows) plus the M3.4 lifecycle pass remain the
+   * reorganization path there; unreachable packed history persists until
+   * they converge, exactly as it already does above the 300k walk bound.
+   *
    * Its object reads are deliberately NOT content-lease-gated (SPEC-0011 §3
    * posture survey, the only ungated serve-adjacent reads in this file): the
    * caller runs the whole migration under `blockConcurrencyWhile`, so nothing
@@ -1125,9 +1182,15 @@ export class RepoCell extends DurableObject<Env> {
    * in-flight uploads instead of racing them. There is no concurrent
    * transition to be lease-protected against.
    */
-  private async runGc(): Promise<{ removed: number; kept: number; skipped?: boolean }> {
+  private async runGc(): Promise<GcOutcome> {
     if (this.store.objectCount() > 300_000) {
-      return { removed: 0, kept: this.store.objectCount(), skipped: true };
+      return { removed: 0, kept: this.store.objectCount(), skipped: true, reason: "size_cap" };
+    }
+    if (
+      this.store.packs.countObjects() > GC_MIGRATION_MAX_PACK_OBJECTS ||
+      this.store.packs.totalPackBytes() > GC_MIGRATION_MAX_PACK_BYTES
+    ) {
+      return { removed: 0, kept: this.store.objectCount(), skipped: true, reason: "migration_budget" };
     }
     const reachable = new OidSet(Math.max(this.store.objectCount(), 4096));
     const stack: string[] = this.store.refs().map((r) => r.oid);
@@ -1194,7 +1257,9 @@ export class RepoCell extends DurableObject<Env> {
         removed++;
       }
     }
-    return noHeadroom ? { removed, kept: reachable.size, skipped: true } : { removed, kept: reachable.size };
+    return noHeadroom
+      ? { removed, kept: reachable.size, skipped: true, reason: "no_headroom" }
+      : { removed, kept: reachable.size };
   }
 
   /**
