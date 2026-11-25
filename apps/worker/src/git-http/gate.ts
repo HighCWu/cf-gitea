@@ -513,6 +513,12 @@ async function handleAgitReceive(
     ...{ duplex: "half" as const },
   });
   gateCleared.add(forwarded);
+  // SPEC 0230 completion handoff: a side-band receive answer now resolves
+  // BEFORE the push is applied (the engine's streaming arm), so every tail
+  // below that reads POST-push state sequences behind the engine's tail.
+  // Null on the buffered path, where the fetch resolution itself still
+  // implies completion (finalize precedes receivePack's return).
+  let pushSettled: Promise<void> | null = null;
   const response = await engine.fetch(forwarded, env, ctx, {
     ...(pusher !== null ? { pusher } : {}),
     validatePush: laneValidator,
@@ -521,15 +527,28 @@ async function handleAgitReceive(
     // `internal?.signal ?? req.signal` fallback would watch a dead signal
     // while the real client vanishes — the lease then strands until the TTL
     signal: req.signal,
+    pushSettled: (settled: Promise<void>) => {
+      pushSettled = settled;
+    },
   });
 
-  // The pre-lane post-commit tails — shared by both paths, unchanged: the
-  // first-push settle (the wave-settle-is-empty fix) and the R5/B-54/D-7c
-  // tail (the collector saw the KEPT commands — plain or translated).
+  // The pre-lane post-commit tails — shared by both paths: the first-push
+  // settle (the wave-settle-is-empty fix) and the R5/B-54/D-7c tail (the
+  // collector saw the KEPT commands — plain or translated). SPEC 0230: both
+  // read POST-push state (refs / engine listRefs), so each sequences behind
+  // the streaming arm's completion handoff — the undo-create arm of
+  // settleCreatingRepo in particular must never fire on a push that has not
+  // finalized yet (pre-streaming, the buffered answer's resolution carried
+  // that guarantee implicitly).
+  const afterPushApplied = async (): Promise<void> => {
+    if (pushSettled !== null) await pushSettled;
+  };
   const scheduleSharedTail = (): void => {
-    ctx.waitUntil(applyPushTail(env, repo, engineRepo, pushTail, url.origin));
+    ctx.waitUntil(
+      afterPushApplied().then(() => applyPushTail(env, repo, engineRepo, pushTail, url.origin))
+    );
     if (repo.isEmpty) {
-      ctx.waitUntil(settleCreatingRepo(env, repo.id, engineRepo, url.origin));
+      ctx.waitUntil(afterPushApplied().then(() => settleCreatingRepo(env, repo.id, engineRepo, url.origin)));
     }
   };
 
@@ -1299,9 +1318,20 @@ async function handleUnknownRepository(
       // of the create race is a normal receive — its tag commands mint/flip
       // like every other push).
       const racedTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], branchPushes: [], pusherId: verified.user.id };
-      const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), pushTailValidator(env, raced.repo, racedTail));
-      ctx.waitUntil(applyPushTail(env, raced.repo, `${route.owner}/${route.repo}`, racedTail, url.origin));
-      ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`, url.origin));
+      let racedSettled: Promise<void> | null = null;
+      const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), pushTailValidator(env, raced.repo, racedTail), (settled) => {
+        racedSettled = settled;
+      });
+      // the handoff fires inside forwardToEngine (synchronously, at arm
+      // open), so both tails below see the settled promise — or null on the
+      // buffered path, where fetch resolution already implies completion
+      const afterRacedPush = async (tail: () => Promise<unknown>): Promise<void> => {
+        const settled: Promise<void> | null = racedSettled;
+        if (settled !== null) await settled;
+        await tail();
+      };
+      ctx.waitUntil(afterRacedPush(() => applyPushTail(env, raced.repo, `${route.owner}/${route.repo}`, racedTail, url.origin)));
+      ctx.waitUntil(afterRacedPush(() => settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`, url.origin)));
       return response;
     }
     // Upstream masks EVERY PushCreateRepo error as a bare 404 (githttp.go:
@@ -1330,14 +1360,17 @@ async function handleUnknownRepository(
     // The receive below rebinds on its own path; a failed warm-up is not fatal.
   }
 
-  // §2.5.2 finalize handshake: the engine's receivePack completes finalize
-  // BEFORE its response returns, so once the response is observable the
-  // outcome is settled — settle the create (branches: the full
+  // §2.5.2 finalize handshake — settle the create (branches: the full
   // is_empty/default_branch flip; tags-only: status only, the row stays
   // empty-unborn like upstream) or undo it when NO ref at all landed.
-  // Scheduled AFTER the
-  // forward (the settle body starts at call time; scheduling it earlier would
-  // race the finalize with an empty-DO listRefs). The forward carries the
+  // Scheduled AFTER the forward (the settle body starts at call time;
+  // scheduling it earlier would race the receive's finalize with an
+  // empty-DO listRefs) — and, SPEC 0230, sequenced behind the engine's
+  // completion handoff: a streaming side-band answer resolves BEFORE the
+  // push applies, and the settle's listRefs / undo-create arms read
+  // POST-push state. Pre-streaming, the buffered answer's resolution
+  // ("finalize completes BEFORE its response returns") carried this
+  // guarantee implicitly. The forward carries the
   // fresh row's storage key: the very first receive already addresses R2 by
   // r_<id>, so no name-addressed prefix ever gets written for this repo.
   // The forward carries the B-54/R5 tail collector like every receive: the
@@ -1346,9 +1379,20 @@ async function handleUnknownRepository(
   // receive mints their is_tag rows right here — without the collector the
   // push-created repos' first push silently skipped every tag arm).
   const pushTail: PushTailCommands = { tagDeletes: [], tagAdds: [], prHeadPushes: [], branchPushes: [], pusherId: verified.user.id };
-  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), pushTailValidator(env, created, pushTail));
-  ctx.waitUntil(applyPushTail(env, created, `${route.owner}/${route.repo}`, pushTail, url.origin));
-  ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`, url.origin));
+  let createdSettled: Promise<void> | null = null;
+  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), pushTailValidator(env, created, pushTail), (settled) => {
+    createdSettled = settled;
+  });
+  // the handoff fires inside forwardToEngine (synchronously, at arm open),
+  // so both tails below see the settled promise — or null on the buffered
+  // path, where fetch resolution already implies completion
+  const afterCreatedPush = async (tail: () => Promise<unknown>): Promise<void> => {
+    const settled: Promise<void> | null = createdSettled;
+    if (settled !== null) await settled;
+    await tail();
+  };
+  ctx.waitUntil(afterCreatedPush(() => applyPushTail(env, created, `${route.owner}/${route.repo}`, pushTail, url.origin)));
+  ctx.waitUntil(afterCreatedPush(() => settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`, url.origin)));
   return response;
 }
 
@@ -1623,6 +1667,7 @@ async function forwardToEngine(
   storageKey?: string,
   pusher?: PusherIdentity | null,
   validatePush?: PushValidator,
+  onPushSettled?: (settled: Promise<void> | null) => void,
 ): Promise<Response> {
   let forwarded: Request;
   try {
@@ -1633,6 +1678,11 @@ async function forwardToEngine(
     return bareBadRequest();
   }
   gateCleared.add(forwarded);
+  // SPEC 0230: captures the streaming arm's completion promise when the
+  // engine hands one over (side-band receives); stays null on the buffered
+  // path, where the resolution of the fetch below already implies the push
+  // applied.
+  let pushSettled: Promise<void> | null = null;
   const callOptions: EngineCallOptions | undefined =
     pusher || validatePush
       ? {
@@ -1645,7 +1695,15 @@ async function forwardToEngine(
   // it, and threading it unconditionally keeps the gate's forward shape one
   // constructor for every route family.
   const signal = req.signal;
-  return engine.fetch(forwarded, env, ctx, { ...(callOptions ?? {}), signal });
+  const response = await engine.fetch(forwarded, env, ctx, {
+    ...(callOptions ?? {}),
+    signal,
+    pushSettled: (settled: Promise<void>) => {
+      pushSettled = settled;
+    },
+  });
+  onPushSettled?.(pushSettled);
+  return response;
 }
 
 /**

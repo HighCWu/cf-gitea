@@ -61,6 +61,21 @@ export interface Env {
    * wall-clock, not CPU, so idle I/O waits consume it like work. Floor/ceiling:
    * [1000, 86400000] ms. Unset/garbage keeps the default. */
   GIT_RECEIVE_DEADLINE_MS?: string;
+  /** Cadence of the streaming receive answer's keepalive heartbeat, in
+   * MILLISECONDS (SPEC 0230; default 20000). Once a side-band-64k push's
+   * pack body is fully staged, the answer streams, and an idle-gated
+   * interval timer emits git's official `receive.keepAlive` packet — the
+   * five-byte zero-data band-1 frame `0005\x01` — whenever processing
+   * produces no other frame, so an edge path never judges the long indexing
+   * phase a silent/dead answer. The official idle-gate semantics apply: a
+   * tick that already saw a milestone/progress frame stays silent, so the
+   * heartbeat never doubles a busy stretch. The default keeps the proposal's
+   * hard constraint (interval x 2 below the observed ~60s answer-silence cap
+   * floor) with margin; the clamp window is [50, 30000] ms — the ceiling
+   * keeps that constraint true for every deployable value, the floor exists
+   * for protocol-timing test batteries. Unset/garbage keeps the default. No
+   * effect on non-sideband pushes (their buffered answer never heartbeats). */
+  GIT_RECEIVE_KEEPALIVE_MS?: string;
   SITE_NAME?: string;
   SITE_DESC?: string;
   SITE_OWNER?: string;

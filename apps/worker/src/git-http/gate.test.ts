@@ -88,7 +88,7 @@ import { IssuesService } from "../issues/service";
 import { CommentType } from "../issues/comment-types";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
-import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "../repos/testing/git-pack";
+import { ZERO_OID, buildPack, buildReceivePackBody, drainReceive, pktLine } from "../repos/testing/git-pack";
 
 // wave-129 full-run contention budget: this file's heaviest closure measured
 // 4.02s of the 30s default IN a green 8-worker full run (the D1-resolved
@@ -150,6 +150,10 @@ async function pushCreateAndSettle(slug: string): Promise<void> {
     body,
   });
   expect(response.status).toBe(200);
+  // SPEC 0230: the streaming answer resolves before the push applies; drain
+  // to stream end (the arm closes strictly after finalize) so the settle
+  // below reads the POST-push engine state
+  await drainReceive(response);
 
   // The settle runs on the runner here (production: ctx.waitUntil, observed
   // landed by ~t+2.3s); invoking it directly makes both windows deterministic.
@@ -176,6 +180,10 @@ describe("row 2 across the settle: anonymous reads of a push-created private rep
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // status='creating' window: the matrix decides (row 2), never the engine.
     const creating = await SELF.fetch(
@@ -621,6 +629,10 @@ describe("settleCreatingRepo emits repository action=created (the push-create ar
       body: buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     const rows = await drizzle(env.DB).select().from(repositories).all();
     expect(rows).toHaveLength(1);
 
@@ -783,6 +795,10 @@ async function seedTeamGrantFixture(): Promise<{
     body: buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack),
   });
   expect(push.status).toBe(200);
+  // SPEC 0230: the streaming answer resolves before the push applies;
+  // drain to stream end — the arm closes strictly after finalize's
+  // transaction, so stream end is the push-completion signal
+  await drainReceive(push);
 
   const readers = await teams.createTeam(org, { name: "readers", permission: "read" });
   await teams.addTeamRepo(readers, vault.id);
@@ -1087,6 +1103,10 @@ describe("the blocked-pusher relation does not gate receive-pack (upstream parit
       body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // The success is honest: the pushed ref reads back through the advert
     // (the engine commits refs before its response returns).
@@ -1125,6 +1145,10 @@ describe("the blocked-pusher relation does not gate receive-pack (upstream parit
       body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
   });
 });
 
@@ -1159,6 +1183,10 @@ describe("the first-push settle generalizes to API-created empty repos (wave-set
       body: buildReceivePackBody([{ ref: "refs/heads/trunk", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // The gate schedules the settle itself (ctx.waitUntil after the awaited
     // receive forward) — the assertion waits on the flip, never on a manual
@@ -1220,6 +1248,10 @@ describe("the first-push settle generalizes to API-created empty repos (wave-set
       body: buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(
       async () => {
@@ -1255,6 +1287,10 @@ describe("the first-push settle generalizes to API-created empty repos (wave-set
       body: "0000",
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // Deterministic replay of the scheduled settle: without the explicit
     // creating-only guard this arm would sweep the seeded dependents of a
@@ -1410,6 +1446,10 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     const cellRefs = await env.REPO.getByName("alice/wikipush.wiki").listRefs();
     expect(cellRefs.refs.map((r) => r.name)).toContain("refs/heads/notes");
@@ -1441,6 +1481,10 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     const cellRefs = await env.REPO.getByName(name).listRefs();
     expect(cellRefs.refs.map((r) => r.name)).toContain("refs/heads/main");
 
@@ -1464,6 +1508,10 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
       body,
     });
     expect(push.status).toBe(404);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     // No row was push-created under the wiki name (the suffix is reserved —
     // the parent never existed, so nothing may bloom).
     expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
@@ -1626,6 +1674,10 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
       body,
     });
     expect(push.status).toBe(404);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     const cellRefs = await env.REPO.getByName("alice/frozenwiki.wiki").listRefs();
     expect(cellRefs.refs.map((r) => r.name)).not.toContain("refs/heads/notes");
   });
@@ -1722,6 +1774,10 @@ describe("deploy tokens authenticate git-HTTP (upstream's DeployToken method, we
       body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     const refs = await env.REPO.getByName("alice/dtwrite").listRefs();
     expect(refs.refs.map((r) => r.name)).toContain("refs/heads/feature");
   });
@@ -2036,6 +2092,10 @@ async function seedTailRepo(slug: string): Promise<{ repoId: string; engineName:
     body,
   });
   expect(push.status).toBe(200);
+  // SPEC 0230: the streaming answer resolves before the push applies;
+  // drain to stream end — the arm closes strictly after finalize's
+  // transaction, so stream end is the push-completion signal
+  await drainReceive(push);
   return { repoId: created.id, engineName: `alice/${slug}`, ownerId: alice.id, token, tip: oid };
 }
 
@@ -2094,6 +2154,10 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
       body: new TextEncoder().encode(section),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(
       async () => {
@@ -2158,6 +2222,10 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
       ),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       const rows = await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all();
@@ -2214,6 +2282,10 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       expect(await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, repoId)).all()).toHaveLength(1);
@@ -2311,6 +2383,10 @@ describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpda
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     await vi.waitFor(
       async () => {
         const rows = await drizzle(env.DB).select().from(releases).where(eq(releases.repoId, created.id)).all();
@@ -2542,6 +2618,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
@@ -2588,6 +2668,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
@@ -2624,6 +2708,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, p1.oid, "refs/heads/feature", p1.pack),
     });
     expect(push1.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push1);
     await vi.waitFor(async () => {
       const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issue2)).all();
       if (!rows.some((row) => row.type === CommentType.CommitRef)) throw new Error("ref comment not written yet");
@@ -2640,6 +2728,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(p1.oid, p2.oid, "refs/heads/feature", p2.pack),
     });
     expect(push2.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push2);
     await vi.waitFor(async () => {
       const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issue2)).get();
       if (row?.isClosed !== true) throw new Error("issue2 not closed yet");
@@ -2658,6 +2750,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(p2.oid, p3.oid, "refs/heads/feature", p3.pack),
     });
     expect(push3.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push3);
     const p4 = await buildMessagePack("fixes #4", tip);
     const push4 = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
       method: "POST",
@@ -2665,6 +2761,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, p4.oid, "refs/heads/main", p4.pack),
     });
     expect(push4.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push4);
     // Prove BOTH tails ran before the negative assertion: issue3 closed AND
     // issue4's ref comment present (walk4 executed, the gate held).
     await vi.waitFor(async () => {
@@ -2693,6 +2793,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     await vi.waitFor(async () => {
       const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
       if (row?.isClosed !== true) throw new Error("issue not closed yet");
@@ -2735,6 +2839,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
         body: buildReceivePackBody([{ ref: "refs/heads/main", oid: seed.oid }], seed.pack),
       });
       expect(push.status).toBe(200);
+      // SPEC 0230: the streaming answer resolves before the push applies;
+      // drain to stream end — the arm closes strictly after finalize's
+      // transaction, so stream end is the push-completion signal
+      await drainReceive(push);
     }
     const issueB = await seedB47Issue(b.id, 1, { posterId: alice.id });
     const hookId = await seedB47Hook(alice.id);
@@ -2751,6 +2859,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(seed.oid, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueB)).get();
@@ -2790,6 +2902,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(seed.oid, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // Give the waitUntil tail its window, then assert nothing happened.
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -2820,6 +2936,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await new Promise((resolve) => setTimeout(resolve, 3000));
     const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
@@ -2837,6 +2957,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: b47UpdateBody(tip, oid, "refs/heads/main", pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       const times = await drizzle(env.DB).select().from(trackedTimes).where(eq(trackedTimes.issueId, issueId)).all();
@@ -2867,6 +2991,10 @@ describe("the B-47 push tail: commit messages write commit_ref rows and close/re
       body: buildReceivePackBody([{ ref: "refs/heads/topic", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     await vi.waitFor(async () => {
       const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
@@ -2961,6 +3089,10 @@ describe("the _cargo-index git family (S-2 — the wiki family's contract over t
 
     const anon = await SELF.fetch("https://example.com/cargopush/_cargo-index.git/info/refs?service=git-receive-pack");
     expect(anon.status).toBe(401);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(anon);
     expect(anon.headers.get("www-authenticate")).toBe(CHALLENGE);
 
     const { oid, pack } = await buildPack();
@@ -2971,6 +3103,10 @@ describe("the _cargo-index git family (S-2 — the wiki family's contract over t
       body: pushBody,
     });
     expect(strangerPush.status).toBe(404);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(strangerPush);
 
     const ownerPush = await SELF.fetch("https://example.com/cargopush/_cargo-index.git/git-receive-pack", {
       method: "POST",
@@ -2978,6 +3114,10 @@ describe("the _cargo-index git family (S-2 — the wiki family's contract over t
       body: buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack),
     });
     expect(ownerPush.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(ownerPush);
     const refs = (await env.REPO.getByName("cargopush/_cargo-index").listRefs()).refs.map((r) => r.name);
     expect(refs).toContain("refs/heads/notes");
     expect(refs).toContain("refs/heads/main");
@@ -3419,6 +3559,10 @@ describe("the agit create arm end-to-end (refs/for → PR + refs/pull/N/head)", 
       body: buildAgitPushBody([{ oid, ref: "refs/for/main/derive" }], { pack, pushOptions: [] }),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     const pr = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
     expect(pr.headBranch).toBe("alice/derive");
     await vi.waitFor(async () => {
@@ -3446,6 +3590,10 @@ describe("the agit create arm end-to-end (refs/for → PR + refs/pull/N/head)", 
       }),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     const pr = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
     const rows = await drizzle(env.DB)
       .select()
@@ -3494,6 +3642,10 @@ describe("the agit update arm (the same proposal moves refs/pull/N/head)", () =>
       body: buildAgitPushBody([{ oid: first.oid, ref: "refs/for/main/topic-u" }], { pack: first.pack, pushOptions: ["topic=topic-u"] }),
     });
     expect(create.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(create);
     const created = (await drizzle(env.DB).select().from(pullRequests).all())[0]!;
     expect(created.headSha).toBe(first.oid);
 
@@ -3746,6 +3898,10 @@ describe("the agit force gate (the engine classifies, upstream's ng text decides
       body: buildAgitPushBody([{ oid: first.oid, ref: "refs/for/main/topic-f" }], { pack: first.pack, pushOptions: ["topic=topic-f"] }),
     });
     expect(create.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(create);
 
     // An UNRELATED tip (no common ancestor with the first): the engine's
     // classification is force-push, the option is absent — upstream's exact
@@ -3885,6 +4041,10 @@ describe("the lane boundary: rowless (engine-only) repos keep the engine's liter
         body: buildAgitPushBody([{ oid, ref: "refs/for/main/topic" }], { pack, caps: "report-status side-band-64k" }),
       });
       expect(push.status).toBe(200);
+      // SPEC 0230: the streaming answer resolves before the push applies;
+      // drain to stream end — the arm closes strictly after finalize's
+      // transaction, so stream end is the push-completion signal
+      await drainReceive(push);
       const refs = (await env.REPO.getByName("demo/agitrowless").listRefs()).refs.map((r) => r.name);
       expect(refs).toContain("refs/for/main/topic");
       expect(await drizzle(env.DB).select().from(pullRequests).all()).toHaveLength(0);

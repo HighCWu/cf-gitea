@@ -38,6 +38,30 @@ export const MAX_HANDOVER_DELTA = 8 * 1024 * 1024;
 /** fuzz bound (SPEC-0001 §7 allocation limits) */
 export const MAX_PACK_ENTRIES = 4_000_000;
 
+/**
+ * Entries between two macro-task yields in the walk loop. SPEC 0230's CPU
+ * pacing constraint: one between-yield CPU segment must stay far below the
+ * streaming answer's keepalive interval (20s) — and far below the observed
+ * ~60s answer-silence cap floor — or due timers starve and the heartbeat
+ * goes fake-live. 2048 entries keeps segments in the low seconds for the
+ * measured window shapes (71,547 objects ≈ 35 yields) at negligible
+ * scheduling cost; the walker's per-entry `visit` awaits add further
+ * natural yields between segments.
+ */
+const YIELD_EVERY = 2048;
+
+/**
+ * Macro-task yield for the receive walk's long loops (SPEC 0230 CPU-yield
+ * design): `setTimeout(…, 0)` ENDS the current macro-task, so due timer
+ * callbacks — the streaming answer's keepalive interval, the indexing
+ * deadline — run between CPU segments. A bare microtask
+ * (`await Promise.resolve()`) never leaves the current macro-task and does
+ * not discharge timers; it must not be substituted.
+ */
+export function yieldToTimers(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 /** Chunked inflate of a fully-buffered region (straggler delta streams). */
 export function inflateAll(data: Uint8Array): Uint8Array {
   const inf = new pako.Inflate({ chunkSize: INFLATE_CHUNK });
@@ -368,8 +392,10 @@ export async function walkPack(
           entrySize, crc32: crc.get(), refBase, ofsBase, data: handover ? content : null,
         });
       }
-      // yield to the event loop so a long scan cannot starve the isolate
-      if ((i & 8191) === 8191) await new Promise((res) => setTimeout(res, 0));
+      // yield to the event loop so a long scan cannot starve the isolate —
+      // and (SPEC 0230) so the streaming answer's keepalive timer fires
+      // between CPU segments instead of going fake-live behind them
+      if ((i & (YIELD_EVERY - 1)) === YIELD_EVERY - 1) await yieldToTimers();
       if (opts.onProgress && i % 100000 === 99999) {
         opts.onProgress(`Indexing objects: ${i + 1}/${count}\n`);
       }

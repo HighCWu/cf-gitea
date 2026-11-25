@@ -2,7 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
-import { buildPack, buildReceivePackBody } from "../repos/testing/git-pack";
+import { buildPack, buildReceivePackBody, drainReceive } from "../repos/testing/git-pack";
 import { ensureCargoIndexMirror } from "../services/packages/cargo-index";
 
 const RECEIVE_CT = "application/x-git-receive-pack-request";
@@ -41,6 +41,10 @@ describe("probe", () => {
       body: buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end (the arm closes strictly after finalize) so the
+    // listRefs below sees the POST-push refs
+    await drainReceive(push);
     const refs = await env.REPO.getByName(name).listRefs();
     expect(refs.refs.map((r) => r.name)).toContain("refs/heads/notes");
 

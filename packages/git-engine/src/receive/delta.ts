@@ -41,7 +41,7 @@ import {
 import { OidSet } from "../git/oidset";
 import type { IndexRow } from "../control-plane";
 import { ObjCache, ObjRec } from "./objcache";
-import { hashObjectAsync, inflateAll, type DeltaEntry, type FullEntry, type PackEntry } from "./scan";
+import { hashObjectAsync, inflateAll, yieldToTimers, type DeltaEntry, type FullEntry, type PackEntry } from "./scan";
 
 /**
  * full entries up to this size are kept as delta-base candidates — they are
@@ -72,6 +72,18 @@ const FOREIGN_WAVE_CONCURRENCY = 8;
 export const RANGE_BUDGET = 256;
 /** IndexRows buffered per putIndexRows RPC */
 const ROW_BATCH = 4096;
+/**
+ * Straggler-fixpoint entries between two macro-task yields (SPEC 0230): the
+ * fixpoint is the one receive-phase loop with no built-in await on every
+ * iteration — a cache-hit straggler with an inline delta stream can resolve
+ * through pure CPU (applyDelta + the hasher), so with collision detection
+ * on (the synchronous SHA-1DC hasher) a large pool could hold the current
+ * macro-task across many entries and starve the streaming answer's
+ * keepalive timer. Same pacing constraint as scan.ts's YIELD_EVERY: one
+ * segment stays far below the keepalive interval and the answer-silence cap
+ * floor.
+ */
+const FIXPOINT_YIELD_EVERY = 2048;
 
 /** One `lookupObjects` hit (mirrors the control-plane shape). */
 export interface ForeignObject {
@@ -652,10 +664,18 @@ export class DeltaResolver {
     let pending = this.stragglers;
     this.stragglers = [];
     await this.resolveExternalBases(pending);
+    let sinceYield = 0;
     while (pending.length) {
       const still: DeltaEntry[] = [];
       for (const entry of pending) {
         if (!(await this.tryResolve(entry))) still.push(entry);
+        // SPEC 0230 CPU yield: a resolved-elsewhere pass can run whole
+        // entries on pure CPU; end the macro-task periodically so due timers
+        // (the streaming answer's keepalive, the indexing deadline) run
+        if (++sinceYield >= FIXPOINT_YIELD_EVERY) {
+          sinceYield = 0;
+          await yieldToTimers();
+        }
       }
       if (still.length === pending.length) {
         throw new Error(`cannot resolve ${still.length} delta object(s): missing base`);

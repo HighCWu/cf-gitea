@@ -35,7 +35,7 @@ import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-prot
 import { settleCreatingRepo } from "../../git-http/gate";
 import { replicateRepoCopy } from "../../repos/fork-task";
 import { RepoService } from "../../repos/service";
-import { buildPack, buildReceivePackBody, pktLine, ZERO_OID } from "../../repos/testing/git-pack";
+import { buildPack, buildReceivePackBody, pktLine, ZERO_OID, drainReceive } from "../../repos/testing/git-pack";
 import { users } from "../../db/schema";
 import { createUserRepository } from "../services/user-repos";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -151,6 +151,10 @@ async function pushTemplateContent(owner: string, slug: string, branch: string):
     body,
   });
   expect(response.status).toBe(200);
+  // SPEC 0230: the streaming answer resolves before the push applies;
+  // drain to stream end — the arm closes strictly after finalize's
+  // transaction, so stream end is the push-completion signal
+  await drainReceive(response);
   const service = new RepoService(env.DB);
   const creating = await service.getBySlug(owner, slug);
   if (creating) await settleCreatingRepo(env, creating.id, `${owner}/${slug}`);
@@ -275,6 +279,10 @@ async function pushStackedCommit(
     body: buildUpdateBody([{ old: oldOid, oid: commitSha, ref: `refs/heads/${branch}` }], pack),
   });
   expect(response.status).toBe(200);
+  // SPEC 0230: the streaming answer resolves before the push applies;
+  // drain to stream end — the arm closes strictly after finalize's
+  // transaction, so stream end is the push-completion signal
+  await drainReceive(response);
   return commitSha;
 }
 

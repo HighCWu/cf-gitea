@@ -39,7 +39,7 @@ import { watchRepo } from "../api/services/repo-watchers";
 import { addOrUpdateCollaborator } from "../api/services/repo-collaborators";
 import { findAuditEvents } from "../services/audit";
 import { CommentType } from "../issues/comment-types";
-import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "./testing/git-pack";
+import { ZERO_OID, buildPack, buildReceivePackBody, pktLine, drainReceive } from "./testing/git-pack";
 
 // wave-129 full-run contention budget: this file's heaviest closure measured
 // 4.88s of the 30s default IN a green 8-worker full run (the engine-cell carry
@@ -1374,6 +1374,10 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // The engine's commitPush fixup runs over the WHOLE command plan and
     // records refs/heads/main (main → master → first); the settle adopts
@@ -1413,6 +1417,10 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
       body: buildReceivePackBody([{ ref: "refs/heads/trunk", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // Settle deterministically (the gate schedules this via waitUntil on the
     // D1-resolved push path): the adoption writes default_branch=trunk, the
@@ -1445,7 +1453,7 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
     const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "headed");
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
     const { oid, pack } = await buildPack();
-    await SELF.fetch("https://example.com/alice/headed.git/git-receive-pack", {
+    const headedPush = await SELF.fetch("https://example.com/alice/headed.git/git-receive-pack", {
       method: "POST",
       headers: {
         authorization: basicTokenHeader(token),
@@ -1453,6 +1461,10 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
       },
       body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
     });
+    // SPEC 0230: drain to stream end first — the streaming arm closes
+    // strictly after finalize's transaction, so the settle below reads the
+    // POST-push engine state
+    await drainReceive(headedPush);
 
     // Drain the gate's waitUntil settle deterministically before any D1 write
     // (the branchy/latefirst/heady idiom — settle-then-assert): this push to
@@ -1489,7 +1501,7 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
     oid: string,
     pack: Uint8Array,
   ): Promise<Response> {
-    return SELF.fetch(`https://example.com/${owner}/${name}.git/git-receive-pack`, {
+    const push = await SELF.fetch(`https://example.com/${owner}/${name}.git/git-receive-pack`, {
       method: "POST",
       headers: {
         authorization: basicTokenHeader(token),
@@ -1497,6 +1509,10 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
       },
       body: buildReceivePackBody([{ ref, oid }], pack),
     });
+    // SPEC 0230: drain to stream end — the streaming arm closes strictly
+    // after finalize's transaction, so stream end is the completion signal
+    await drainReceive(push);
+    return push;
   }
 
   /** Anonymous upload-pack advertisement fetch — the probe's repro surface. */
@@ -1715,6 +1731,10 @@ const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plai
       body: concatParts([new TextEncoder().encode(section), concatParts(chunks)]),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // The rename moves only the D1 slug/owner; carryRepoCell rebuilds the
     // new cell (packs adopted + the loose closure walked THROUGH the packed
@@ -1978,6 +1998,10 @@ const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plai
         pack,
       ),
     });
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     expect(push.status).toBe(200);
 
     const before = await env.REPO.getByName("alice/carry-packedtag").listRefs();
@@ -2119,6 +2143,7 @@ describe("wiki sibling cell (specs/wiki.md §3 — the 0b619be follow-ups)", () 
       headers: { authorization: basicTokenHeader(token) },
     });
     expect(advert.status).toBe(200);
+    await drainReceive(advert); // buffered advert; drained for uniform body discipline
     const push = await SELF.fetch("https://example.com/alice/wikipacked.wiki.git/git-receive-pack", {
       method: "POST",
       headers: {
@@ -2128,6 +2153,10 @@ describe("wiki sibling cell (specs/wiki.md §3 — the 0b619be follow-ups)", () 
       body: buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack),
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // Producer sanity: the pack sits at the NAME-ADDRESSED prefix and the
     // parent's r_<id> namespace was never touched (the two must not mix).
@@ -2308,6 +2337,10 @@ describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
 
     // Settle deterministically (the gate schedules this via waitUntil); the
     // adoption writes default_branch=trunk, and the DO head already agrees
@@ -2350,6 +2383,10 @@ describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
       body,
     });
     expect(push.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(push);
     expect((await env.REPO_PACKS.list({ prefix: "repos/forged-key/" })).objects).toHaveLength(0);
     const keyed = await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/packs/` });
     expect(keyed.objects.length).toBeGreaterThan(0);

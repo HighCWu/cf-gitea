@@ -1166,10 +1166,166 @@ function raceAbort<T>(p: Promise<T>, signal: AbortSignal | null | undefined): Pr
 }
 
 /**
+ * The official keepAlive packet (SPEC 0230): a pkt-line of total length 5 —
+ * four ASCII hex length chars `0005` plus one 0x01 payload byte — i.e. a
+ * ZERO-DATA band-1 sideband frame. This is git's own receive-pack form
+ * (git-config(1) `receive.keepAlive` / `uploadpack.keepAlive`, the "empty
+ * keepalive packet" sent while processing produces no output), copied
+ * verbatim rather than inventing a custom heartbeat format. A client's
+ * sideband demuxer reads the band byte, finds zero data bytes, and keeps
+ * waiting — the bytes themselves keep the edge path from judging the
+ * response idle.
+ */
+const RECEIVE_KEEPALIVE_FRAME = te.encode("0005\x01");
+
+/** Default heartbeat cadence: interval x 2 stays under the observed answer
+ * silence-cap floor (~60s) with margin, per SPEC 0230's hard constraint. */
+const DEFAULT_RECEIVE_KEEPALIVE_MS = 20_000;
+
+/**
+ * The heartbeat interval, deployable config (parsed like the sibling
+ * GIT_RECEIVE_DEADLINE_MS): default 20s, floor 50ms (protocol-timing
+ * batteries), ceiling 30s (keeps the x2 < 60s cap-floor constraint true for
+ * every deployable value). Unset/garbage keeps the default.
+ */
+function receiveKeepaliveMs(raw: string | undefined): number {
+  const n = parseInt(raw ?? "", 10);
+  if (!Number.isFinite(n)) return DEFAULT_RECEIVE_KEEPALIVE_MS;
+  return Math.min(Math.max(n, 50), 30_000);
+}
+
+/**
+ * A streaming receive answer (SPEC 0230). Opened once the pack body is fully
+ * staged — at the indexing boundary, past the busy/importing/rejected early
+ * exits and every pre-arm failure whose buffered Response must stay
+ * byte-identical (503s, the rejected render, 413s, the disconnect 499). From
+ * here the HTTP status is committed at 200, so failures express IN BAND:
+ * report-status (unpack ok/ng) rides the stream as before, and a
+ * catastrophic failure emits a band-3 error frame before the stream closes
+ * instead of a never-delivered 500. The lease, deadline and sweep semantics
+ * are unchanged; only the delivery shape is.
+ */
+interface ReceiveStreamArm {
+  /** the streaming Response, returned while the receive tail keeps running */
+  readonly delivered: Response;
+  /** redirect target for `emit`: enqueue one wire chunk into the stream */
+  write(chunk: Uint8Array): void;
+  /** stop the heartbeat and end the stream cleanly (after the report) */
+  complete(): Promise<void>;
+  /** stop the heartbeat; band-3 the failure unless the client is gone; close */
+  fail(err: unknown, clientGone: boolean): Promise<void>;
+}
+
+/**
+ * The lease-mismatch marker for the streaming arm: past the arm a 500
+ * Response is undeliverable, so the mismatch surfaces as a band-3 frame
+ * carrying the same text the buffered path answers with. Skips the FAILED
+ * log line on purpose — the buffered path answers this verdict silently and
+ * the parity is kept.
+ */
+class ReceiveLeaseLostError extends Error {
+  constructor() {
+    super("receive lease lost (expired or already finalized); retry the push");
+  }
+}
+
+/**
+ * Open the streaming arm: an explicit push-driven ReadableStream carries the
+ * Response body — the same mechanism family as the upload-pack fast path
+ * (git/protocol.ts streamingCloneResponse), production-proven on this
+ * runtime. The queueing shape matters: `controller.enqueue`/`close` NEVER
+ * wait on a consumer, so the receive tail can always finish regardless of
+ * whether (or how fast) the client drains the answer — a writer/pull pair
+ * (e.g. an identity TransformStream) would couple `close` to backpressure
+ * on an unread stream and hang the tail behind it. The answer's total
+ * post-staging volume is bounded (progress milestones + one report +
+ * keepalives), so the unbounded queue costs nothing; a consumer that
+ * cancelled is handled by the enqueue throw + the cancel callback, while
+ * the tail's throwIfClientGone owns the lease.
+ */
+function openReceiveStreamArm<E extends Env>(env: E): ReceiveStreamArm {
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+    cancel() {
+      // the consumer stopped reading (disconnect or abandonment); late
+      // enqueues throw into the swallow below and the tail's disconnect
+      // path owns the lease
+      ended = true;
+    },
+  });
+  const keepaliveMs = receiveKeepaliveMs(env.GIT_RECEIVE_KEEPALIVE_MS);
+  // the official idle gate (receive.keepAlive semantics): a tick that already
+  // saw another frame stays silent; the keepalive itself counts as output for
+  // the next gate, so a quiet stretch emits exactly one packet per interval
+  let framesSinceTick = false;
+  let ended = false;
+  const write = (chunk: Uint8Array): void => {
+    if (ended || controller === null) return;
+    framesSinceTick = true;
+    try {
+      controller.enqueue(chunk);
+    } catch {
+      ended = true; // the stream was closed, errored or cancelled
+    }
+  };
+  const timer = setInterval(() => {
+    if (ended) return;
+    if (framesSinceTick) {
+      framesSinceTick = false;
+      return;
+    }
+    write(RECEIVE_KEEPALIVE_FRAME);
+  }, keepaliveMs);
+  return {
+    delivered: new Response(stream, { headers: receiveHeaders() }),
+    write,
+    complete: async () => {
+      ended = true;
+      clearInterval(timer);
+      try {
+        controller?.close();
+      } catch {
+        // already closed, errored or cancelled by the consumer side
+      }
+    },
+    fail: async (err: unknown, clientGone: boolean) => {
+      clearInterval(timer);
+      try {
+        if (!clientGone) {
+          // a client that is still connected deserves the failure in band
+          // (band-3 = error per gitprotocol-pack(5)); a dead one never reads
+          const msg = err instanceof Error ? err.message : String(err);
+          for (const f of sidebandFrames(3, te.encode(`error: ${msg}\n`))) write(f);
+        }
+        controller?.close();
+      } catch {
+        // already closed, errored or cancelled by the consumer side
+      }
+      ended = true;
+    },
+  };
+}
+
+/**
  * POST /git-receive-pack — the Worker-side receive flow. Auth (write) has
  * already run. Wire behavior is unchanged end to end: 503 Retry-After when
  * another push holds the lease (T7), report-status with per-command ok/ng
  * lines otherwise, byte-identical to the pre-split DO rendering.
+ *
+ * SPEC 0230 (the mirror-line answer-silence wall): once the pack body is
+ * fully staged, a `side-band-64k` push's answer becomes a STREAMING
+ * response — the indexing milestones and the final report-status enqueue
+ * into the open stream while the pipeline still runs, and an idle-gated
+ * heartbeat emits the official `receive.keepAlive` packet (`0005\x01`, the
+ * zero-data band-1 frame) whenever processing produces no other output, so
+ * a long index never looks like a dead answer. Without the capability the
+ * buffered one-shot answer is byte-for-byte unchanged, and every pre-arm
+ * failure (busy/importing 503s, the rejected render, 413, the disconnect
+ * 499) keeps its buffered shape. See the arm block below for the failure
+ * semantics past the arm.
  *
  * `internal` carries the embedding Worker's per-call options: `pusher`, the
  * authenticated identity for this receive (surfaced verbatim on the onPush
@@ -1208,8 +1364,14 @@ async function receivePack<E extends Env>(
   if (overDeclaredLength(req, maxBytes)) return tooLargeResponse(maxBytes);
 
   const stub = env.REPO.getByName(repo);
+  // The answer accumulator. Buffered (chunks) until the SPEC 0230 stream arm
+  // opens — every pre-arm answer and every non-sideband answer is returned
+  // from here exactly as before — then redirected into the response stream
+  // (the `emit` closure below is re-aimed at the arm's writer), so the
+  // indexing-phase milestones and the final report-status reach the client
+  // while the pipeline is still running instead of after it ends.
   const chunks: Uint8Array[] = [];
-  const emit = (chunk: Uint8Array) => chunks.push(chunk);
+  let emit: (chunk: Uint8Array) => void = (chunk) => chunks.push(chunk);
   // subrequest accounting for the T3 checkpoint (SPEC-0001 §6): every R2
   // operation and DO RPC the receive path spends, logged at the end
   const metrics = {
@@ -1329,340 +1491,434 @@ async function receivePack<E extends Env>(
       }
     }
 
-    // 4. scan + delta resolution + idx v2 (SPEC-0001a §3 Step 2): the Worker
-    // reads the staging object directly, resolves every delta, streams index
-    // rows to the DO in bounded batches, and emits the idx — the DO never
-    // touches pack bytes.
-    let pack: FinalizedPack = NO_PACK;
-    let packIncomplete = false;
-    if (staged && !unpackError) {
-      // final keys via the single builder (r2keys.ts): packs/<pack-<sha1>>.pack
-      // + the idx v2 sidecar, both under the lease's storage key
-      const name = packName(staged.packSha1);
-      const packKey = packR2Key(begin.storageKey, name);
-      const idxKey = idxR2Key(begin.storageKey, name);
-      try {
-        const progress = (msg: string) => {
-          if (sideband) for (const f of sidebandFrames(2, te.encode(msg))) emit(f);
-        };
-        // 4a. one streaming GET of the staging object drives the whole walk;
-        // rows stream out through putIndexRows as deltas resolve
-        const stagedObj = await bucket.get(begin.stagingKey);
-        if (!stagedObj) throw new Error("staged pack object missing from R2");
-        if (stagedObj.size !== staged.packBytes) throw new Error("staged pack size mismatch");
-        metrics.scanGets++;
-        const collisionDetect = env.SHA1DC === "1";
-        const cacheMb = parseInt(env.INGEST_CACHE_MB ?? "", 10) || 16;
-        const rangeBudget = parseInt(env.RANGE_BUDGET ?? "", 10) || RANGE_BUDGET;
-        const resolver = new DeltaResolver(
-          {
-            selfPackKey: begin.stagingKey,
-            lookupObjects: async (oids) => {
-              metrics.lookupRpcs++;
-              metrics.lookupOids += oids.length;
-              return stub.lookupObjects(begin.leaseToken, oids);
+    // === SPEC 0230: the answer's delivery shape ==============================
+    // The stream arm opens HERE — past the busy/importing/rejected early
+    // exits and the entire staging upload, whose failures must keep their
+    // buffered answers byte-identical (the 503s, the rejected render, the
+    // 413 mapping, the disconnect 499 — each commits a status a stream arm
+    // could not), at the boundary of the indexing phase the proposal
+    // targets. With `side-band-64k` negotiated, the answer becomes a
+    // streaming Response returned immediately while the pipeline below keeps
+    // running as the invocation's tail, so the indexing milestones and the
+    // final report-status reach the client while the work is still in
+    // flight — the property that keeps an edge path from judging the answer
+    // silent during a long index (the mirror wall this amends). The
+    // heartbeat rides the same arm (the official receive.keepAlive packet,
+    // idle-gated). Without sideband, everything below returns the buffered
+    // one-shot answer byte-for-byte as before.
+    const arm: ReceiveStreamArm | null = sideband ? openReceiveStreamArm(env) : null;
+    if (arm !== null) emit = arm.write;
+
+    // Steps 4 → 6 as the shared continuation: awaited inline on the buffered
+    // path, driven as the tail on the streaming one. Every `return` below
+    // hands its answer to `deliver`, which returns the buffered Response
+    // unchanged or — on the streaming arm, where the answer is already
+    // flowing — resolves with the already-returned streaming Response so the
+    // caller-side tail can end the stream.
+    const deliver = async (): Promise<Response> => {
+      if (arm === null) return new Response(concat(chunks) as unknown as BodyInit, { headers: receiveHeaders() });
+      return arm.delivered;
+    };
+    const indexAndFinalize = async (): Promise<Response> => {
+      // 4. scan + delta resolution + idx v2 (SPEC-0001a §3 Step 2): the Worker
+      // reads the staging object directly, resolves every delta, streams index
+      // rows to the DO in bounded batches, and emits the idx — the DO never
+      // touches pack bytes.
+      let pack: FinalizedPack = NO_PACK;
+      let packIncomplete = false;
+      if (staged && !unpackError) {
+        // final keys via the single builder (r2keys.ts): packs/<pack-<sha1>>.pack
+        // + the idx v2 sidecar, both under the lease's storage key
+        const name = packName(staged.packSha1);
+        const packKey = packR2Key(begin.storageKey, name);
+        const idxKey = idxR2Key(begin.storageKey, name);
+        try {
+          const progress = (msg: string) => {
+            if (sideband) for (const f of sidebandFrames(2, te.encode(msg))) emit(f);
+          };
+          // 4a. one streaming GET of the staging object drives the whole walk;
+          // rows stream out through putIndexRows as deltas resolve
+          const stagedObj = await bucket.get(begin.stagingKey);
+          if (!stagedObj) throw new Error("staged pack object missing from R2");
+          if (stagedObj.size !== staged.packBytes) throw new Error("staged pack size mismatch");
+          metrics.scanGets++;
+          const collisionDetect = env.SHA1DC === "1";
+          const cacheMb = parseInt(env.INGEST_CACHE_MB ?? "", 10) || 16;
+          const rangeBudget = parseInt(env.RANGE_BUDGET ?? "", 10) || RANGE_BUDGET;
+          const resolver = new DeltaResolver(
+            {
+              selfPackKey: begin.stagingKey,
+              lookupObjects: async (oids) => {
+                metrics.lookupRpcs++;
+                metrics.lookupOids += oids.length;
+                return stub.lookupObjects(begin.leaseToken, oids);
+              },
+              readEntryBytes: async (key, off, len) => {
+                metrics.rangeGets++;
+                const region = await bucket.get(key, { range: { offset: off, length: len } });
+                if (!region) throw new Error(`pack object missing from R2: ${key}`);
+                return new Uint8Array(await region.arrayBuffer());
+              },
+              putRows: async (rows) => {
+                metrics.rowRpcs++;
+                return stub.putIndexRows(begin.leaseToken, name, rows);
+              },
             },
-            readEntryBytes: async (key, off, len) => {
-              metrics.rangeGets++;
-              const region = await bucket.get(key, { range: { offset: off, length: len } });
-              if (!region) throw new Error(`pack object missing from R2: ${key}`);
-              return new Uint8Array(await region.arrayBuffer());
-            },
-            putRows: async (rows) => {
-              metrics.rowRpcs++;
-              return stub.putIndexRows(begin.leaseToken, name, rows);
-            },
-          },
-          {
-            cacheBytes: Math.max(1, cacheMb) * 1024 * 1024,
-            rangeBudget,
-            collisionDetect,
-            onProgress: progress,
-          }
-        );
-        // The indexing phase (scan + delta resolution + connectivity) runs
-        // under a wall-clock deadline. The receive-walk's cost is data-shape
-        // dependent — thin-pack base resolution consults the object database
-        // in chain waves (one batched DO RPC per wave since the L761 wave
-        // batching, down from one single-oid RPC per foreign chain hop, whose
-        // 87-RPC / 2m14s production walk crossed the ~2.4min platform
-        // teardown line) — and when the walk still outgrows the platform's
-        // patience the invocation is torn down WITHOUT any catch running,
-        // stranding the exclusive lease until the TTL and 503ing every
-        // concurrent push. The deadline converts that silent grind into an
-        // explicit unpack-ng: the lease is released through finalize and the
-        // slot turns over. Default 10 minutes, strictly inside
-        // GIT_TIMEOUT_RECEIVE's 15 so the ng always beats the TTL sweep;
-        // GIT_RECEIVE_DEADLINE_MS overrides.
-        const deadlineMs = Math.min(
-          Math.max(parseInt(env.GIT_RECEIVE_DEADLINE_MS ?? "", 10) || RECEIVE_INDEX_DEADLINE_MS, 1000),
-          86_400_000
-        );
-        let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-        const indexing = (async () => {
-          await walkPack(
-            { body: stagedObj.body, size: stagedObj.size },
-            // a disconnect during a long scan fails the walk the same way a
-            // staging failure does: the step-4 catch rethrows it to the outer
-            // release (rows already pushed are crash debris the DO's orphan
-            // sweep reclaims), instead of finishing a push whose client is gone
-            // and holding the lease for the whole walk
-            (entry) => {
-              throwIfClientGone();
-              return resolver.onEntry(entry);
-            },
-            { collisionDetect, onHeader: (count) => resolver.init(count), onProgress: progress }
+            {
+              cacheBytes: Math.max(1, cacheMb) * 1024 * 1024,
+              rangeBudget,
+              collisionDetect,
+              onProgress: progress,
+            }
           );
-          return resolver.finish();
-        })();
-        // whichever promise loses the race keeps running with nobody awaiting
-        // it — swallow its rejection so it can never surface as an unhandled
-        // one (the deadline loser settles against an already-released lease;
-        // its next lease-bound RPC fails with lease-invalid and dies quietly)
-        indexing.catch(() => {});
-        const deadline = new Promise<never>((_, reject) => {
-          deadlineTimer = setTimeout(() => reject(new Error(`receive indexing deadline exceeded (${deadlineMs}ms)`)), deadlineMs);
-        });
-        deadline.catch(() => {});
-        let resolved: ResolveResult;
-        try {
-          resolved = await Promise.race([indexing, deadline]);
-        } finally {
-          if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-        }
-        packIncomplete = resolved.incomplete;
-        if (resolved.incomplete) {
-          console.log(`[receive ${repo}] connectivity check failed: missing ${resolved.firstMissing}`);
-        }
+          // The indexing phase (scan + delta resolution + connectivity) runs
+          // under a wall-clock deadline. The receive-walk's cost is data-shape
+          // dependent — thin-pack base resolution consults the object database
+          // in chain waves (one batched DO RPC per wave since the L761 wave
+          // batching, down from one single-oid RPC per foreign chain hop, whose
+          // 87-RPC / 2m14s production walk crossed the ~2.4min platform
+          // teardown line) — and when the walk still outgrows the platform's
+          // patience the invocation is torn down WITHOUT any catch running,
+          // stranding the exclusive lease until the TTL and 503ing every
+          // concurrent push. The deadline converts that silent grind into an
+          // explicit unpack-ng: the lease is released through finalize and the
+          // slot turns over. Default 10 minutes, strictly inside
+          // GIT_TIMEOUT_RECEIVE's 15 so the ng always beats the TTL sweep;
+          // GIT_RECEIVE_DEADLINE_MS overrides.
+          const deadlineMs = Math.min(
+            Math.max(parseInt(env.GIT_RECEIVE_DEADLINE_MS ?? "", 10) || RECEIVE_INDEX_DEADLINE_MS, 1000),
+            86_400_000
+          );
+          let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+          const indexing = (async () => {
+            await walkPack(
+              { body: stagedObj.body, size: stagedObj.size },
+              // a disconnect during a long scan fails the walk the same way a
+              // staging failure does: the step-4 catch rethrows it to the outer
+              // release (rows already pushed are crash debris the DO's orphan
+              // sweep reclaims), instead of finishing a push whose client is gone
+              // and holding the lease for the whole walk
+              (entry) => {
+                throwIfClientGone();
+                return resolver.onEntry(entry);
+              },
+              { collisionDetect, onHeader: (count) => resolver.init(count), onProgress: progress }
+            );
+            return resolver.finish();
+          })();
+          // whichever promise loses the race keeps running with nobody awaiting
+          // it — swallow its rejection so it can never surface as an unhandled
+          // one (the deadline loser settles against an already-released lease;
+          // its next lease-bound RPC fails with lease-invalid and dies quietly)
+          indexing.catch(() => {});
+          const deadline = new Promise<never>((_, reject) => {
+            deadlineTimer = setTimeout(() => reject(new Error(`receive indexing deadline exceeded (${deadlineMs}ms)`)), deadlineMs);
+          });
+          deadline.catch(() => {});
+          let resolved: ResolveResult;
+          try {
+            resolved = await Promise.race([indexing, deadline]);
+          } finally {
+            if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+          }
+          packIncomplete = resolved.incomplete;
+          if (resolved.incomplete) {
+            console.log(`[receive ${repo}] connectivity check failed: missing ${resolved.firstMissing}`);
+          }
 
-        // 4b. idx v2 streamed to its final key. The length is exact up front
-        // (fixed header + fanout + 28N + large offsets + two checksums), so
-        // the PUT rides a FixedLengthStream and a short write fails loudly.
-        let largeOffsets = 0;
-        for (let i = 0; i < resolved.oidEntry.length; i++) {
-          if (resolved.entryOffsets[resolved.oidEntry[i]] >= 0x80000000) largeOffsets++;
-        }
-        const expectedIdx = 1072 + 28 * resolved.objects + 8 * largeOffsets;
-        const fixed = new FixedLengthStream(expectedIdx);
-        const put = bucket.put(idxKey, fixed.readable);
-        const writer = fixed.writable.getWriter();
-        let idxBytes: number;
-        try {
-          idxBytes = await writeIdx((chunk) => writer.write(chunk), {
-            oids: resolved.oids,
-            oidEntry: resolved.oidEntry,
-            entryCrcs: resolved.entryCrcs,
-            entryOffsets: resolved.entryOffsets,
+          // 4b. idx v2 streamed to its final key. The length is exact up front
+          // (fixed header + fanout + 28N + large offsets + two checksums), so
+          // the PUT rides a FixedLengthStream and a short write fails loudly.
+          let largeOffsets = 0;
+          for (let i = 0; i < resolved.oidEntry.length; i++) {
+            if (resolved.entryOffsets[resolved.oidEntry[i]] >= 0x80000000) largeOffsets++;
+          }
+          const expectedIdx = 1072 + 28 * resolved.objects + 8 * largeOffsets;
+          const fixed = new FixedLengthStream(expectedIdx);
+          const put = bucket.put(idxKey, fixed.readable);
+          const writer = fixed.writable.getWriter();
+          let idxBytes: number;
+          try {
+            idxBytes = await writeIdx((chunk) => writer.write(chunk), {
+              oids: resolved.oids,
+              oidEntry: resolved.oidEntry,
+              entryCrcs: resolved.entryCrcs,
+              entryOffsets: resolved.entryOffsets,
+              packSha1: staged.packSha1,
+            });
+            await writer.close();
+          } catch (err) {
+            try {
+              await writer.abort(err);
+            } catch {
+              // already errored by the short write
+            }
+            try {
+              await put;
+            } catch {
+              // the destination rejects alongside the failed write
+            }
+            throw err;
+          }
+          await put;
+          metrics.idxPuts++;
+          if (idxBytes !== expectedIdx) {
+            throw new Error(`idx length mismatch: wrote ${idxBytes}, expected ${expectedIdx}`);
+          }
+
+          // 4c. copy staging → packs/ BEFORE finalize (crash ordering, see header)
+          await copyObject(bucket, begin.stagingKey, packKey);
+          metrics.copies++;
+          pack = {
+            packKey,
             packSha1: staged.packSha1,
-          });
-          await writer.close();
+            packBytes: staged.packBytes,
+            objectCount: resolved.objects,
+            idxBytes,
+          };
         } catch (err) {
-          try {
-            await writer.abort(err);
-          } catch {
-            // already errored by the short write
-          }
-          try {
-            await put;
-          } catch {
-            // the destination rejects alongside the failed write
-          }
-          throw err;
+          // a disconnect mid-scan rethrows to the outer release — never an
+          // unpack verdict for a client that cannot read the report anyway
+          if (isClientGoneError(err)) throw err;
+          // scan/resolution/idx failures surface verbatim in report-status
+          // ("unpack <msg>"); rows already pushed are crash debris the DO's
+          // orphan sweep reclaims (their pack never reaches pack_catalog)
+          unpackError = err instanceof Error ? err.message : String(err);
+          console.log(`[receive ${repo}] index failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
         }
-        await put;
-        metrics.idxPuts++;
-        if (idxBytes !== expectedIdx) {
-          throw new Error(`idx length mismatch: wrote ${idxBytes}, expected ${expectedIdx}`);
-        }
-
-        // 4c. copy staging → packs/ BEFORE finalize (crash ordering, see header)
-        await copyObject(bucket, begin.stagingKey, packKey);
-        metrics.copies++;
-        pack = {
-          packKey,
-          packSha1: staged.packSha1,
-          packBytes: staged.packBytes,
-          objectCount: resolved.objects,
-          idxBytes,
-        };
-      } catch (err) {
-        // a disconnect mid-scan rethrows to the outer release — never an
-        // unpack verdict for a client that cannot read the report anyway
-        if (isClientGoneError(err)) throw err;
-        // scan/resolution/idx failures surface verbatim in report-status
-        // ("unpack <msg>"); rows already pushed are crash debris the DO's
-        // orphan sweep reclaims (their pack never reaches pack_catalog)
-        unpackError = err instanceof Error ? err.message : String(err);
-        console.log(`[receive ${repo}] index failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
       }
-    }
 
-    // 4.5 Per-ref push policy (SPEC-0013 M2): the embedding Worker's
-    // validatePush call option decides per classified command. Runs after
-    // the scan (classification needs the new tips' ancestry — one batched
-    // classifyReceive RPC) and before finalize (rejected commands must
-    // never apply). A throwing hook propagates to the outer catch: the
-    // lease is released with a sweep and the request fails closed (500).
-    let hookRejects: (string | null)[] | null = null;
-    // classifyReceive's authoritative ancestry verdicts (null when the
-    // classify was conservative or no hook ran): finalize reuses them instead
-    // of re-walking the same (old,next) ancestry — the bounded walk ran twice
-    // per force-shaped push, and its duration grows with repo history
-    let classifiedKinds: PushCommandKind[] | undefined;
-    if (internal?.validatePush && unpackError === null) {
-      const { classified, kinds } = await classifyForValidator(stub, begin.leaseToken, push.commands);
-      if (kinds !== null) classifiedKinds = kinds;
-      const verdicts = await internal.validatePush(classified, {
-        repo,
-        ...(pusher !== undefined ? { pusher } : {}),
-        ...(push.pushOptions.length > 0 ? { pushOptions: push.pushOptions } : {}),
-        // The lease-carrying changed-path read: the hook asks, the DO walks
-        // the staged rows under THIS receive's lease. A lost lease surfaces
-        // as `unresolved` (the push is dead regardless; the policy fails
-        // closed and finalize reports the lease mismatch).
-        changedPaths: async (command) => {
-          const res = await stub.diffReceive({
-            leaseToken: begin.leaseToken,
-            ref: command.ref,
-            old: command.old,
-            next: command.new,
-          });
-          if (res.tag === "ok") return { tag: "ok", paths: res.paths, truncated: res.truncated };
-          return { tag: "unresolved", reason: res.tag === "lease_mismatch" ? "receive lease lost" : res.reason };
-        },
-      });
-      hookRejects = verdictRejects(verdicts, push.commands.length);
-    }
-    // Under `atomic`, any per-ref failure rejects the whole section: the
-    // hook-declined commands keep their own message, the commands that WOULD
-    // have applied report ATOMIC_PUSH_FAILED — git's transaction-abort shape
-    // (execute_commands_atomic). Marking the nulls here funnels the push
-    // through the existing all-rejected path (finalize skipped, lease released
-    // with a sweep, nothing applies), and statusOfCommands renders it as-is.
-    if (atomic && hookRejects !== null && hookRejects.some((r) => r !== null)) {
-      hookRejects = hookRejects.map((r) => (r === null ? ATOMIC_PUSH_FAILED : r));
-    }
-
-    // 5. finalize: the DO re-checks per-command CAS and commits refs +
-    // refs_version in one transaction (the pack is already indexed). The
-    // hook-rejected commands are removed first, so a per-ref rejection
-    // never blocks its siblings (upstream rejects per-ref inside
-    // pre-receive) — except under `atomic`, where the merge above turned any
-    // hook rejection into an all-reject section; finalize's `atomic` flag
-    // gives the DO-side verdicts (validation rejects, CAS mismatches) the
-    // same all-or-nothing shape inside the one commit transaction.
-    // finalize's results stay index-aligned with the command
-    // list it receives, and the merge below re-aligns them to the section.
-    const finalizeCommands =
-      hookRejects === null ? push.commands : push.commands.filter((_, i) => hookRejects![i] === null);
-    // the kinds array rides the same filter: it must stay index-aligned with
-    // the commands finalize actually receives
-    let finalizeKinds = classifiedKinds;
-    if (finalizeKinds !== undefined && hookRejects !== null) {
-      finalizeKinds = push.commands
-        .map((_, i) => i)
-        .filter((i) => hookRejects![i] === null)
-        .map((i) => finalizeKinds![i]);
-    }
-    if (finalizeCommands.length === 0) {
-      // every command rejected by policy: nothing to finalize — drop the
-      // lease with a sweep (staging object + index rows) so an all-rejected
-      // push leaves no debris, then render all-ng report-status
-      leaseToken = null;
-      try {
-        await stub.releaseReceive({ leaseToken: begin.leaseToken, sweep: true });
-      } catch {
-        // best effort: the lease-expiry sweep is the backstop
-      }
-      if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, null), null, sideband));
-      return new Response(concat(chunks) as unknown as BodyInit, { headers: receiveHeaders() });
-    }
-    // The upstream kill boundary, mirrored: a receive-pack canceled by the
-    // HTTP request context BEFORE execute_commands applies nothing (the
-    // process dies holding git's advisory locks; refs never move). The
-    // staging/scan arms rethrow disconnects above, but a deletes-only push
-    // never reads a pack byte — this check is the only fast-fail it gets.
-    // Failing here releases the lease via the outer catch and applies
-    // nothing; a disconnect AFTER finalize has already decided the lease is
-    // not observable (this line sits strictly before the RPC).
-    throwIfClientGone();
-    const fin = await stub.finalizeReceive({
-      leaseToken: begin.leaseToken,
-      expectedRefsVersion: begin.refsVersion,
-      commands: finalizeCommands,
-      newTips: finalizeCommands.map((c) => (c.next === ZERO_OID ? null : c.next)),
-      pack,
-      unpackError,
-      packIncomplete,
-      atomic,
-      ...(finalizeKinds !== undefined ? { classifiedKinds: finalizeKinds } : {}),
-    });
-    leaseToken = null; // finalize decided the lease; the release below is a no-op sweep
-    if (fin.tag === "lease_mismatch") {
-      return new Response("error: receive lease lost (expired or already finalized); retry the push\n", {
-        status: 500,
-      });
-    }
-
-    // 6. report-status — byte-identical to the pre-split DO rendering; with
-    // a hook, the per-ref rejections are merged back in by position
-    if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, fin.results), unpackError, sideband));
-
-    // begin + the entry's name bind (bindRepo) + finalize
-    const doRpcs = 3 + metrics.rowRpcs + metrics.lookupRpcs;
-    const subrequests =
-      metrics.stagingPuts +
-      metrics.stagingParts +
-      metrics.scanGets +
-      metrics.rangeGets +
-      metrics.idxPuts +
-      metrics.copies * 2 +
-      doRpcs;
-    console.log(
-      `[receive ${repo}] subrequests: total=${subrequests}` +
-        ` staging=${metrics.stagingPuts + metrics.stagingParts}` +
-        ` scanGets=${metrics.scanGets} rangeGets=${metrics.rangeGets}` +
-        ` idxPuts=${metrics.idxPuts} copies=${metrics.copies}` +
-        ` rows=${metrics.rowRpcs} lookups=${metrics.lookupRpcs}/${metrics.lookupOids}` +
-        ` doRpcs=${doRpcs}`
-    );
-
-    // bookkeeping after an applied push (was keyed on the x-changed header)
-    if (fin.tag === "committed" && fin.updates.length > 0) {
-      const idle = fin.commitTime || Date.now();
-      try {
-        // a registry hiccup must not fail an already-applied push; next push heals
-        await registry.upsert(repo, idle);
-      } catch {
-        // registry deferred
-      }
-      if (options.onPush) {
-        const origin = requestOrigin(req);
-        const onPush = options.onPush; // narrowed local: property narrowing does not survive the .then closure
-        const event: PushEvent = {
+      // 4.5 Per-ref push policy (SPEC-0013 M2): the embedding Worker's
+      // validatePush call option decides per classified command. Runs after
+      // the scan (classification needs the new tips' ancestry — one batched
+      // classifyReceive RPC) and before finalize (rejected commands must
+      // never apply). A throwing hook propagates to the outer catch: the
+      // lease is released with a sweep and the request fails closed (500) —
+      // on the streaming arm the same throw reaches the tail's catch, whose
+      // band-3 frame is the in-band form of that 500.
+      let hookRejects: (string | null)[] | null = null;
+      // classifyReceive's authoritative ancestry verdicts (null when the
+      // classify was conservative or no hook ran): finalize reuses them instead
+      // of re-walking the same (old,next) ancestry — the bounded walk ran twice
+      // per force-shaped push, and its duration grows with repo history
+      let classifiedKinds: PushCommandKind[] | undefined;
+      if (internal?.validatePush && unpackError === null) {
+        const { classified, kinds } = await classifyForValidator(stub, begin.leaseToken, push.commands);
+        if (kinds !== null) classifiedKinds = kinds;
+        const verdicts = await internal.validatePush(classified, {
           repo,
-          updates: fin.updates,
-          commitTime: idle,
-          ...(pusher !== undefined ? { pusherId: pusher.id, pusherLogin: pusher.login } : {}),
-          ...(origin !== undefined ? { origin } : {}),
+          ...(pusher !== undefined ? { pusher } : {}),
           ...(push.pushOptions.length > 0 ? { pushOptions: push.pushOptions } : {}),
-        };
-        // The hook call runs INSIDE the promise chain: `Promise.resolve(
-        // options.onPush(...))` evaluates the hook BEFORE wrapping it, so a
-        // synchronous throw escaped the waitUntil argument and — via the
-        // outer catch — turned an already-applied push into a 500, against
-        // this hook's documented contract (a throwing hook never fails the
-        // push). Sync and async throws both land in the catch below now.
-        ctx.waitUntil(
-          Promise.resolve()
-            .then(() => onPush(event, env))
-            .catch((err) => {
-              console.log(`[onPush ${repo}] hook failed: ${err instanceof Error ? err.message : String(err)}`);
-            })
-        );
+          // The lease-carrying changed-path read: the hook asks, the DO walks
+          // the staged rows under THIS receive's lease. A lost lease surfaces
+          // as `unresolved` (the push is dead regardless; the policy fails
+          // closed and finalize reports the lease mismatch).
+          changedPaths: async (command) => {
+            const res = await stub.diffReceive({
+              leaseToken: begin.leaseToken,
+              ref: command.ref,
+              old: command.old,
+              next: command.new,
+            });
+            if (res.tag === "ok") return { tag: "ok", paths: res.paths, truncated: res.truncated };
+            return { tag: "unresolved", reason: res.tag === "lease_mismatch" ? "receive lease lost" : res.reason };
+          },
+        });
+        hookRejects = verdictRejects(verdicts, push.commands.length);
       }
+      // Under `atomic`, any per-ref failure rejects the whole section: the
+      // hook-declined commands keep their own message, the commands that WOULD
+      // have applied report ATOMIC_PUSH_FAILED — git's transaction-abort shape
+      // (execute_commands_atomic). Marking the nulls here funnels the push
+      // through the existing all-rejected path (finalize skipped, lease released
+      // with a sweep, nothing applies), and statusOfCommands renders it as-is.
+      if (atomic && hookRejects !== null && hookRejects.some((r) => r !== null)) {
+        hookRejects = hookRejects.map((r) => (r === null ? ATOMIC_PUSH_FAILED : r));
+      }
+
+      // 5. finalize: the DO re-checks per-command CAS and commits refs +
+      // refs_version in one transaction (the pack is already indexed). The
+      // hook-rejected commands are removed first, so a per-ref rejection
+      // never blocks its siblings (upstream rejects per-ref inside
+      // pre-receive) — except under `atomic`, where the merge above turned any
+      // hook rejection into an all-reject section; finalize's `atomic` flag
+      // gives the DO-side verdicts (validation rejects, CAS mismatches) the
+      // same all-or-nothing shape inside the one commit transaction.
+      // finalize's results stay index-aligned with the command
+      // list it receives, and the merge below re-aligns them to the section.
+      const finalizeCommands =
+        hookRejects === null ? push.commands : push.commands.filter((_, i) => hookRejects![i] === null);
+      // the kinds array rides the same filter: it must stay index-aligned with
+      // the commands finalize actually receives
+      let finalizeKinds = classifiedKinds;
+      if (finalizeKinds !== undefined && hookRejects !== null) {
+        finalizeKinds = push.commands
+          .map((_, i) => i)
+          .filter((i) => hookRejects![i] === null)
+          .map((i) => finalizeKinds![i]);
+      }
+      if (finalizeCommands.length === 0) {
+        // every command rejected by policy: nothing to finalize — drop the
+        // lease with a sweep (staging object + index rows) so an all-rejected
+        // push leaves no debris, then render all-ng report-status
+        leaseToken = null;
+        try {
+          await stub.releaseReceive({ leaseToken: begin.leaseToken, sweep: true });
+        } catch {
+          // best effort: the lease-expiry sweep is the backstop
+        }
+        if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, null), null, sideband));
+        return await deliver();
+      }
+      // The upstream kill boundary, mirrored: a receive-pack canceled by the
+      // HTTP request context BEFORE execute_commands applies nothing (the
+      // process dies holding git's advisory locks; refs never move). The
+      // staging/scan arms rethrow disconnects above, but a deletes-only push
+      // never reads a pack byte — this check is the only fast-fail it gets.
+      // Failing here releases the lease via the outer catch (the tail's catch
+      // on the streaming arm) and applies nothing; a disconnect AFTER finalize
+      // has already decided the lease is not observable (this line sits
+      // strictly before the RPC).
+      throwIfClientGone();
+      const fin = await stub.finalizeReceive({
+        leaseToken: begin.leaseToken,
+        expectedRefsVersion: begin.refsVersion,
+        commands: finalizeCommands,
+        newTips: finalizeCommands.map((c) => (c.next === ZERO_OID ? null : c.next)),
+        pack,
+        unpackError,
+        packIncomplete,
+        atomic,
+        ...(finalizeKinds !== undefined ? { classifiedKinds: finalizeKinds } : {}),
+      });
+      leaseToken = null; // finalize decided the lease; the release below is a no-op sweep
+      if (fin.tag === "lease_mismatch") {
+        // Buffered, this verdict keeps its silent 500. On the streaming arm
+        // the status is already committed, so the mismatch throws to the
+        // tail's catch: same lease semantics (finalize decided it — nothing
+        // to release), the band-3 frame carries the buffered path's exact
+        // text, and the FAILED log line is skipped for parity with the
+        // silent 500.
+        if (arm === null) {
+          return new Response("error: receive lease lost (expired or already finalized); retry the push\n", {
+            status: 500,
+          });
+        }
+        throw new ReceiveLeaseLostError();
+      }
+
+      // 6. report-status — byte-identical to the pre-split DO rendering; with
+      // a hook, the per-ref rejections are merged back in by position.
+      // SPEC 0230 acceptance ⑤: this emit is the ONLY success report and it
+      // sits strictly AFTER finalize's single transaction (objects landed +
+      // SHA-1 checksums verified in the idx + refs updated), so a success
+      // report can never precede the persistence it reports.
+      if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, fin.results), unpackError, sideband));
+
+      // begin + the entry's name bind (bindRepo) + finalize
+      const doRpcs = 3 + metrics.rowRpcs + metrics.lookupRpcs;
+      const subrequests =
+        metrics.stagingPuts +
+        metrics.stagingParts +
+        metrics.scanGets +
+        metrics.rangeGets +
+        metrics.idxPuts +
+        metrics.copies * 2 +
+        doRpcs;
+      console.log(
+        `[receive ${repo}] subrequests: total=${subrequests}` +
+          ` staging=${metrics.stagingPuts + metrics.stagingParts}` +
+          ` scanGets=${metrics.scanGets} rangeGets=${metrics.rangeGets}` +
+          ` idxPuts=${metrics.idxPuts} copies=${metrics.copies}` +
+          ` rows=${metrics.rowRpcs} lookups=${metrics.lookupRpcs}/${metrics.lookupOids}` +
+          ` doRpcs=${doRpcs}`
+      );
+
+      // bookkeeping after an applied push (was keyed on the x-changed header)
+      if (fin.tag === "committed" && fin.updates.length > 0) {
+        const idle = fin.commitTime || Date.now();
+        try {
+          // a registry hiccup must not fail an already-applied push; next push heals
+          await registry.upsert(repo, idle);
+        } catch {
+          // registry deferred
+        }
+        if (options.onPush) {
+          const origin = requestOrigin(req);
+          const onPush = options.onPush; // narrowed local: property narrowing does not survive the .then closure
+          const event: PushEvent = {
+            repo,
+            updates: fin.updates,
+            commitTime: idle,
+            ...(pusher !== undefined ? { pusherId: pusher.id, pusherLogin: pusher.login } : {}),
+            ...(origin !== undefined ? { origin } : {}),
+            ...(push.pushOptions.length > 0 ? { pushOptions: push.pushOptions } : {}),
+          };
+          // The hook call runs INSIDE the promise chain: `Promise.resolve(
+          // options.onPush(...))` evaluates the hook BEFORE wrapping it, so a
+          // synchronous throw escaped the waitUntil argument and — via the
+          // outer catch — turned an already-applied push into a 500, against
+          // this hook's documented contract (a throwing hook never fails the
+          // push). Sync and async throws both land in the catch below now.
+          ctx.waitUntil(
+            Promise.resolve()
+              .then(() => onPush(event, env))
+              .catch((err) => {
+                console.log(`[onPush ${repo}] hook failed: ${err instanceof Error ? err.message : String(err)}`);
+              })
+          );
+        }
+      }
+      return await deliver();
+    };
+
+    if (arm === null) return await indexAndFinalize();
+
+    // The streaming tail. The buffered path's outer catch below never sees
+    // these failures — the 200 is already on the wire — so its semantics are
+    // re-expressed IN BAND here: the same FAILED/disconnect log lines, the
+    // same lease release + staging sweep, then a band-3 error frame (a live
+    // client deserves the failure spelled out; a dead one just gets the
+    // close) before the stream ends. The size-cap arm is absent on purpose:
+    // every size violation fires before the arm opens. The tail is tied by
+    // waitUntil AND the still-open response stream (the streamingCloneResponse
+    // mechanism family); the bare-Object ExecutionContext some batteries pass
+    // carries no waitUntil, and there the drained response alone paces the
+    // tail.
+    const tail = (async () => {
+      try {
+        await indexAndFinalize();
+        await arm.complete();
+      } catch (err) {
+        const leaseLost = err instanceof ReceiveLeaseLostError;
+        const clientGone = isClientGoneError(err);
+        if (!clientGone && !leaseLost) {
+          console.log(`[receive ${repo}] FAILED: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+        }
+        if (leaseToken) {
+          // abandon the lease and sweep the staging object; safe even when the
+          // failure raced a finalize (idempotent-on-lease_mismatch)
+          try {
+            await stub.releaseReceive({ leaseToken, sweep: true });
+          } catch {
+            // best effort: the lease-expiry sweep is the backstop
+          }
+        }
+        if (clientGone) {
+          console.log(`[receive ${repo}] client disconnected (abort signal) — receive lease released`);
+        }
+        await arm.fail(err, clientGone);
+      }
+    })();
+    (ctx as { waitUntil?: ExecutionContext["waitUntil"] }).waitUntil?.(tail);
+    // completion handoff (SPEC 0230): the tail outlives this return — the
+    // embedding worker sequences its dependent tails behind it
+    try {
+      internal?.pushSettled?.(tail);
+    } catch {
+      // a throwing handoff must not fail the already-committed answer
     }
-    return new Response(concat(chunks) as unknown as BodyInit, { headers: receiveHeaders() });
+    return arm.delivered;
   } catch (err) {
     const clientGone = isClientGoneError(err);
     // one line per failure class: a disconnect is not a FAILED receive (the
@@ -1773,6 +2029,22 @@ export interface EngineCallOptions {
    * the request's own signal; the lease TTL stays the backstop.
    */
   signal?: AbortSignal | null;
+  /**
+   * SPEC 0230 completion handoff for a STREAMING receive answer. When the
+   * side-band arm opens, receivePack returns its Response while the receive
+   * pipeline (staging → indexing → hook → finalize → report) keeps running
+   * as the invocation tail; it invokes this with that tail's promise. An
+   * embedding Worker whose own tails read POST-PUSH state (the gate's push
+   * tails: webhook fan-out over the landed refs, the §2.5.2 create settle
+   * over the engine's listRefs) must sequence them behind this promise —
+   * "the response resolved" no longer implies "the push applied". Never
+   * invoked on the buffered path: there the same guarantee is already
+   * carried by the fetch resolution itself (finalize completes before
+   * receivePack returns). In-process by construction (the same channel
+   * discipline as pusher/validatePush/signal); a throwing handoff never
+   * fails the already-committed answer.
+   */
+  pushSettled?: (settled: Promise<void>) => void;
 }
 
 /**

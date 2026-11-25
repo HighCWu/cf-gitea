@@ -109,3 +109,19 @@ function concatArrays(arrays: Uint8Array[]): Uint8Array {
   }
   return out;
 }
+
+/**
+ * SPEC 0230 completion discipline for receive batteries: a side-band
+ * receive answer RESOLVES EARLY — the engine's streaming arm returns the
+ * Response while the indexing/hook/finalize pipeline still runs as the
+ * invocation tail — so a battery that asserts POST-push state must drain
+ * the answer to stream end first. Stream end IS the completion signal: the
+ * arm closes strictly after finalize's single transaction (objects landed,
+ * checksums verified, refs updated). Returns the full body (the
+ * side-band-framed report) for the suites that assert on it. On the
+ * buffered (non-side-band) path this is a plain body read — bytes and
+ * ordering unchanged.
+ */
+export async function drainReceive(response: Response): Promise<Uint8Array> {
+  return new Uint8Array(await response.arrayBuffer());
+}

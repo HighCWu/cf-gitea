@@ -32,7 +32,7 @@ import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { repositories, repoCounters } from "../db/schema";
 import { RepoService } from "./service";
-import { buildPack, buildReceivePackBody } from "./testing/git-pack";
+import { buildPack, buildReceivePackBody, drainReceive } from "./testing/git-pack";
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -247,6 +247,10 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       body,
     });
     expect(response.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
 
     // §2.5.2: the create lands as status='creating' and the gate schedules
     // settleCreatingRepo via waitUntil (timing depends on the runner, so the
@@ -300,6 +304,10 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       body: "0000",
     });
     expect(response.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
 
     const service = new RepoService(env.DB);
     const creating = await service.getBySlug("alice", "void");
@@ -319,6 +327,10 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       body,
     });
     expect(response.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
 
     // The gate schedules settleCreatingRepo via waitUntil (timing depends on
     // the runner, so the assertions below hold whether settle already ran or
@@ -377,6 +389,10 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       body,
     });
     expect(response.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
 
     const service = new RepoService(env.DB);
     const creating = await service.getBySlug("alice", "mixed");
@@ -430,6 +446,10 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       body: buildReceivePackBody([{ ref: "refs/heads/trunk", oid }], pack),
     });
     expect(response.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
 
     // The row lands under the ORG (owner namespace 'acme', ownerId = the org
     // row), private by DefaultPushCreatePrivate; §2.5.2 settle runs on the
@@ -487,6 +507,10 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       body: "0000",
     });
     expect(response.status).toBe(200);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
     expect(await service.getBySlug("alice", "raced")).not.toBeNull();
   });
 
@@ -515,5 +539,9 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
     // Unparseable credentials behave like the GIT_TOKEN population: the
     // engine hook fails closed with its own 401.
     expect(response.status).toBe(401);
+    // SPEC 0230: the streaming answer resolves before the push applies;
+    // drain to stream end — the arm closes strictly after finalize's
+    // transaction, so stream end is the push-completion signal
+    await drainReceive(response);
   });
 });
