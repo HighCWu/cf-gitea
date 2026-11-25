@@ -8,12 +8,12 @@
  * that stalled production is a different shape: ONE commit whose thin pack is
  * almost entirely REF_DELTA entries, every base a TRUE EXTERNAL (an object
  * only the server's object database holds, in none of the pack's own
- * entries), so the resolver's fixpoint materializes each base by walking the
- * STORED delta chains hop by hop — one `lookupObjects` DO RPC plus one R2
- * range read per hop (receive/delta.ts `tryResolve` → `materializeForeign`).
- * The measured production window (cf-gitea-prod, comfyui-frontend mirror,
- * 2026-11-25 09:48Z) spent 87 such single-oid RPCs / 2m14s on that walk and
- * died on the platform teardown line — while every local battery of the time
+ * entries), so the resolver materializes each base by walking the STORED
+ * delta chains. The measured production window (cf-gitea-prod,
+ * comfyui-frontend mirror, 2026-11-25 09:48Z) walked that pool one single-oid
+ * `lookupObjects` DO RPC plus one R2 range read per hop
+ * (`tryResolve` → `materializeForeign`) — 87 RPCs / 2m14s — and died on the
+ * ~2.4min platform teardown line, while every local battery of the time
  * stayed green, because none of them exercised this shape.
  *
  * This battery pins the workload SHAPE, not the wall-clock cost (CI must not
@@ -44,15 +44,20 @@
  *
  *   - window 1 (self-contained baseline): `lookups=0/0 rangeGets=0` — a
  *     baseline push consults the object database ZERO times;
- *   - window 2 (true-external thin): `lookups=Σ(1+depth)+1 / same` and
- *     `rangeGets=Σ(1+depth)` — per base, one lookup for the REF_DELTA base
- *     plus one per stored chain hop down to a full object; each hop (and the
- *     terminal full) is one R2 range read; the +1 is the connectivity
- *     anti-check's single batched lookup for the parent commit. Every
- *     `lookupObjects` call carries exactly one oid (`N===M`): the walk's
- *     object-database channel is PER-HOP and UNBATCHED — the property any
- *     future walk sharding/batching/self-contained-pack channel must
- *     explicitly change this fixture to re-pin.
+ *   - window 2 (true-external thin, the L761 wave-batched channel):
+ *     `lookups=(max chain depth+1)+1 / Σ(1+depth)+1` and
+ *     `rangeGets=Σ(1+depth)` — the object-database consults are WAVE-
+ *     BATCHED: one batched `lookupObjects` RPC per chain wave (wave 0
+ *     fetches every external base, wave k+1 the stored-chain bases of wave
+ *     k's delta nodes), so the whole 41-base pool costs max-depth+1 RPCs
+ *     instead of the 125 single-oid hop RPCs the measured window died on.
+ *     The oid total N is unchanged — every chain node is still consulted
+ *     exactly once; the +1 is the connectivity anti-check's single batched
+ *     parent lookup; rangeGets is unchanged — one R2 range read per hop and
+ *     per terminal full. A regression to the per-hop single-oid channel
+ *     (126/126), a channel cut (bases unresolvable → unpack ng), or any
+ *     other scheduling-shape change moves these counts — re-pin explicitly,
+ *     citing the shape that justifies the new numbers.
  *
  * Non-goals: the cache-defeat arms (over-bound bases re-materializing) are
  * the windowed-thin battery's subject; anchor counts (3 trees / 8 full blobs
@@ -99,7 +104,14 @@ const BASE_CHAIN_DEPTHS: number[] = [
 const FOREIGN_WALKS = BASE_CHAIN_DEPTHS.reduce((sum, depth) => sum + 1 + depth, 0);
 /** The connectivity anti-check's single batched lookup (the parent commit). */
 const ANTI_CHECK_BATCHES = 1;
-const EXPECTED_LOOKUPS = FOREIGN_WALKS + ANTI_CHECK_BATCHES;
+/** The object-database channel is WAVE-BATCHED: one batched `lookupObjects`
+ *  RPC per chain wave — wave 0 fetches every external base, wave k+1 the
+ *  stored-chain bases of wave k's delta nodes — so the pool costs
+ *  max-chain-depth+1 waves, not Σ(1+depth) single-oid hops (the measured
+ *  87-RPC / 2m14s shape that died on the ~2.4min teardown line). */
+const EXPECTED_WAVES = Math.max(...BASE_CHAIN_DEPTHS) + 1;
+const EXPECTED_LOOKUP_RPCS = EXPECTED_WAVES + ANTI_CHECK_BATCHES;
+const EXPECTED_LOOKUP_OIDS = FOREIGN_WALKS + ANTI_CHECK_BATCHES;
 const EXPECTED_RANGE_GETS = FOREIGN_WALKS;
 
 // ---------------------------------------------------------------------------
@@ -364,7 +376,7 @@ function metricOf(lines: string[], key: "lookups" | "rangeGets"): string {
 }
 
 describe("true-external thin-base receive walk (mirror-wall workload shape)", () => {
-  it("resolves 41 external bases through per-hop stored-chain materialization, and pins the walk's cost shape", async () => {
+  it("resolves 41 external bases through wave-batched stored-chain materialization, and pins the walk's cost shape", async () => {
     const { plaintext: token } = await mintFor(
       (await seedVerifiedUser({ username: "extwalker" })).id,
       "thin-push",
@@ -446,11 +458,13 @@ describe("true-external thin-base receive walk (mirror-wall workload shape)", ()
     const refs = await env.REPO.getByName(repoPath).listRefs();
     expect(refs.refs.find((r) => r.name === "refs/heads/topic")?.target).toBe(walkCommit);
 
-    // ...through the pinned per-hop cost shape (cost truth):
-    // Σ(1+depth) base lookups + the anti-check's one parent batch, every
-    // call single-oid; one range read per hop plus each terminal full.
+    // ...through the pinned wave-batched cost shape (cost truth):
+    // max-depth+1 batched wave RPCs plus the anti-check's one parent batch
+    // for Σ(1+depth)+1 oids total — every chain node still consulted exactly
+    // once, but through the batched channel; one range read per hop plus
+    // each terminal full.
     expect(walkLogs.some((l) => l.includes("FAILED:"))).toBe(false);
-    expect(metricOf(walkLogs, "lookups")).toBe(`${EXPECTED_LOOKUPS}/${EXPECTED_LOOKUPS}`);
+    expect(metricOf(walkLogs, "lookups")).toBe(`${EXPECTED_LOOKUP_RPCS}/${EXPECTED_LOOKUP_OIDS}`);
     expect(metricOf(walkLogs, "rangeGets")).toBe(String(EXPECTED_RANGE_GETS));
   });
 });

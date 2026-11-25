@@ -1383,14 +1383,17 @@ async function receivePack<E extends Env>(
         // The indexing phase (scan + delta resolution + connectivity) runs
         // under a wall-clock deadline. The receive-walk's cost is data-shape
         // dependent — thin-pack base resolution consults the object database
-        // object-by-object (one DO RPC + one R2 range read per foreign chain
-        // hop) — and when it outgrows the platform's patience the invocation
-        // is torn down WITHOUT any catch running, stranding the exclusive
-        // lease until the TTL and 503ing every concurrent push. The deadline
-        // converts that silent grind into an explicit unpack-ng: the lease is
-        // released through finalize and the slot turns over. Default 10
-        // minutes, strictly inside GIT_TIMEOUT_RECEIVE's 15 so the ng always
-        // beats the TTL sweep; GIT_RECEIVE_DEADLINE_MS overrides.
+        // in chain waves (one batched DO RPC per wave since the L761 wave
+        // batching, down from one single-oid RPC per foreign chain hop, whose
+        // 87-RPC / 2m14s production walk crossed the ~2.4min platform
+        // teardown line) — and when the walk still outgrows the platform's
+        // patience the invocation is torn down WITHOUT any catch running,
+        // stranding the exclusive lease until the TTL and 503ing every
+        // concurrent push. The deadline converts that silent grind into an
+        // explicit unpack-ng: the lease is released through finalize and the
+        // slot turns over. Default 10 minutes, strictly inside
+        // GIT_TIMEOUT_RECEIVE's 15 so the ng always beats the TTL sweep;
+        // GIT_RECEIVE_DEADLINE_MS overrides.
         const deadlineMs = Math.min(
           Math.max(parseInt(env.GIT_RECEIVE_DEADLINE_MS ?? "", 10) || RECEIVE_INDEX_DEADLINE_MS, 1000),
           86_400_000

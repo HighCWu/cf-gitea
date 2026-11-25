@@ -11,7 +11,14 @@
  * re-read with bounded R2 range GETs. Bases outside the pack (thin pushes)
  * resolve through the fixpoint's lazy `lookupObjects` channel — the anti-check
  * replacing the old `push_edges` SQL — and foreign pack entries are
- * materialized by reading their stored bytes from R2 directly.
+ * materialized by reading their stored bytes from R2 directly. The channel's
+ * scheduling shape is WAVE-BATCHED (the mirror-wall lever): finish() first
+ * materializes every straggler's external base by fetching all pending base
+ * oids in one batched `lookupObjects` RPC per chain wave — max-chain-depth+1
+ * RPCs for the whole pool instead of one single-oid RPC per stored hop (87
+ * such hops / 2m14s in the measured production window, against the ~2.4min
+ * platform teardown line) — and the in-pack fixpoint then runs unchanged on
+ * top of the warmed cache.
  *
  * Every resolved object streams an IndexRow to the DO (`putIndexRows`) in
  * bounded batches, and every non-blob object's referenced children are
@@ -58,6 +65,9 @@ const MAX_DELTA_DEPTH = 50000;
 const FULL_REREAD_CAP = 256 * 1024 * 1024;
 /** lookupObjects / anti-check batch size (oids per RPC) */
 const LOOKUP_BATCH = 512;
+/** Concurrent foreign-chain materializations the wave pre-pass runs (an R2
+ *  peak guard: disjoint chains overlap, a chain's own hops stay serial). */
+const FOREIGN_WAVE_CONCURRENCY = 8;
 /** Default R2 range GETs the straggler/foreign resolution may spend. */
 export const RANGE_BUDGET = 256;
 /** IndexRows buffered per putIndexRows RPC */
@@ -401,10 +411,13 @@ export class DeltaResolver {
 
   /**
    * Materialize a foreign (cross-pack or loose) base object. Packed entries
-   * chain through further `lookupObjects` hits — iterative, cycle-checked,
-   * depth-capped — and their stored bytes are read from R2 by the Worker.
+   * chain through further hits — iterative, cycle-checked, depth-capped —
+   * and their stored bytes are read from R2 by the Worker. With `known` (the
+   * wave pre-pass's oid → hit map) each hop consults the map instead of the
+   * object database; without it every hop is one single-oid `lookupObjects`
+   * RPC — the lazy fallback for a base the pre-pass left uncached.
    */
-  private async materializeForeign(hit: ForeignObject): Promise<ObjRec> {
+  private async materializeForeign(hit: ForeignObject, known?: Map<string, ForeignObject>): Promise<ObjRec> {
     const chain: ForeignObject[] = [];
     const seen = new Set<string>();
     let cur = hit;
@@ -426,7 +439,7 @@ export class DeltaResolver {
         break;
       }
       chain.push(cur);
-      const next = await this.lookupOne(cur.baseOid);
+      const next = known?.get(cur.baseOid) ?? (await this.lookupOne(cur.baseOid));
       if (!next.found) throw new Error(`missing delta base ${cur.baseOid}`);
       cur = next;
     }
@@ -438,10 +451,95 @@ export class DeltaResolver {
     return obj;
   }
 
+  /**
+   * Wave-batched materialization of the stragglers' external bases — the
+   * receive walk's scheduling shape for the mirror wall (L744 §3.2 → L761):
+   * the real windowed thin push carries dozens of true-external REF_DELTA
+   * bases whose stored chains the old fixpoint walked one single-oid
+   * `lookupObjects` RPC + one R2 range read at a time — 87 RPCs / 2m14s in
+   * the measured production window, past the ~2.4min platform teardown line.
+   * Here every currently unresolved refBase oid goes out in ONE batched
+   * `lookupObjects` RPC per chain wave (wave 0 fetches all bases, wave k+1
+   * the stored-chain bases of wave k's delta nodes), so the pool costs
+   * max-chain-depth+1 RPCs; the oid total is unchanged — every chain node
+   * is still consulted exactly once. A wave-0 miss leaves its straggler
+   * untouched (a deferred in-pack base the object database lacks — the
+   * in-pack fixpoint decides, unchanged); a miss deeper in an already
+   * resolved chain keeps the historical hard error. Materialized tips land
+   * in the ObjCache under their oid, where the fixpoint's tryResolve finds
+   * them; independent chains materialize under a small concurrency cap so
+   * their R2 range reads overlap without bursting the provider.
+   */
+  private async resolveExternalBases(pending: DeltaEntry[]): Promise<void> {
+    const wanted = new Set<string>();
+    for (const entry of pending) {
+      if (entry.refBase !== null && !this.oids.hasHex(entry.refBase)) wanted.add(entry.refBase);
+    }
+    if (wanted.size === 0) return;
+    // the wave walk: oid → ForeignObject for every consulted chain node
+    const nodes = new Map<string, ForeignObject>();
+    let frontier: string[] = [...wanted];
+    for (let depth = 0; frontier.length > 0; depth++) {
+      if (depth > MAX_DELTA_DEPTH) {
+        throw new Error(`delta chain exceeds depth ${MAX_DELTA_DEPTH} across packs`);
+      }
+      const batch = frontier.filter((oid) => !nodes.has(oid));
+      frontier = [];
+      if (batch.length === 0) break;
+      const next = new Set<string>();
+      for (let i = 0; i < batch.length; i += LOOKUP_BATCH) {
+        const chunk = batch.slice(i, i + LOOKUP_BATCH);
+        const res = await this.lookupBatch(chunk);
+        for (let j = 0; j < chunk.length; j++) {
+          const oid = chunk[j];
+          const hit = res[j];
+          if (!hit.found) {
+            // wave-0 miss: the base may be a deferred in-pack node the
+            // object database has never seen — leave the straggler to the
+            // fixpoint. Deeper in a resolved chain the base was promised by
+            // a prior hit: absent is the historical corruption verdict.
+            if (depth === 0) continue;
+            throw new Error(`missing delta base ${oid}`);
+          }
+          nodes.set(oid, hit);
+          if (!hit.data && hit.baseOid !== null && !nodes.has(hit.baseOid)) next.add(hit.baseOid);
+        }
+      }
+      frontier = [...next];
+    }
+    // disjoint chains materialize concurrently; one chain's hops stay serial.
+    // failures is a plain array on purpose: control-flow analysis cannot see
+    // the workers' assignments, so a nullable sentinel would narrow to never.
+    const tips = [...wanted].filter((oid) => nodes.has(oid));
+    const failures: unknown[] = [];
+    const workers = Array.from({ length: Math.min(FOREIGN_WAVE_CONCURRENCY, tips.length) }, async () => {
+      while (tips.length > 0 && failures.length === 0) {
+        const oid = tips.shift();
+        if (oid === undefined) return;
+        try {
+          this.cache.put(oid, await this.materializeForeign(nodes.get(oid)!, nodes));
+        } catch (err) {
+          failures.push(err);
+        }
+      }
+    });
+    await Promise.all(workers);
+    if (failures.length > 0) throw failures[0];
+  }
+
+  /**
+   * One batched `lookupObjects` RPC — the resolver's whole object-database
+   * channel for delta-base resolution: `lookupOne`'s single-oid fallback hop
+   * and the wave pre-pass's pool-wide batches both go through here (the
+   * connectivity anti-check keeps its own channel in flushChildren).
+   */
+  private async lookupBatch(oids: string[]): Promise<(ForeignObject | { found: false })[]> {
+    this.host.onLookup?.(oids.length);
+    return this.host.lookupObjects(oids);
+  }
+
   private async lookupOne(oid: string): Promise<ForeignObject | { found: false }> {
-    this.host.onLookup?.(1);
-    const res = await this.host.lookupObjects([oid]);
-    return res[0];
+    return (await this.lookupBatch([oid]))[0];
   }
 
   private async readForeign(hit: ForeignObject): Promise<Uint8Array> {
@@ -528,14 +626,15 @@ export class DeltaResolver {
 
   /**
    * Finish the resolution: re-read the huge non-blob fulls for connectivity,
-   * then drain the straggler pool to a fixpoint. The fixpoint's tryResolve
-   * resolves every in-pack-reachable straggler first and falls back to the
-   * lazy `lookupObjects` channel only for bases the pack truly lacks —
-   * there is no separate pre-pass batching walk-time "externals", because a
-   * walk-time unresolved verdict cannot distinguish a thin base from a
-   * deferred in-pack chain node (see onDelta). Throws with the historical
-   * wording when deltas remain unresolvable; returns the idx/connectivity
-   * inputs otherwise.
+   * wave-batch the stragglers' external bases (resolveExternalBases), then
+   * drain the straggler pool to the in-pack fixpoint — unchanged: its
+   * tryResolve resolves every in-pack-reachable straggler first and falls
+   * back to the lazy per-oid `lookupObjects` channel only for bases the
+   * pack truly lacks AND the pre-pass left uncached. The pre-pass runs at
+   * fixpoint time, never at walk time — a walk-time unresolved verdict
+   * cannot distinguish a thin base from a deferred in-pack chain node (see
+   * onDelta). Throws with the historical wording when deltas remain
+   * unresolvable; returns the idx/connectivity inputs otherwise.
    */
   async finish(): Promise<ResolveResult> {
     for (const f of this.unparsedFulls) {
@@ -552,6 +651,7 @@ export class DeltaResolver {
 
     let pending = this.stragglers;
     this.stragglers = [];
+    await this.resolveExternalBases(pending);
     while (pending.length) {
       const still: DeltaEntry[] = [];
       for (const entry of pending) {
