@@ -47,6 +47,20 @@ export interface Env {
    * unattended pushes (raise MAX_PUSH_MB's loopback transfers together).
    * Floor/ceiling: [60, 86400] s. Unset/garbage keeps the default. */
   GIT_TIMEOUT_RECEIVE?: string;
+  /** Wall-clock budget for one receive's indexing phase (staged-pack scan +
+   * delta resolution + connectivity check + idx write), in MILLISECONDS
+   * (default 600000 — 10 minutes, strictly inside GIT_TIMEOUT_RECEIVE's 900s
+   * so a breached deadline releases the lease through the unpack-ng path
+   * before the TTL sweep would). The wall-clock race bounds the receive-walk
+   * grind shape: a delta resolution that keeps consuming ODB round trips and
+   * R2 range reads past the budget fails the push with an explicit ng line
+   * ("unpack: receive indexing deadline exceeded") and turns the push slot
+   * over, instead of holding the lease silently until the TTL. A legitimately
+   * slow receive (a very large windowed push against a deep object database)
+   * needs this raised together with RANGE_BUDGET; the deadline is
+   * wall-clock, not CPU, so idle I/O waits consume it like work. Floor/ceiling:
+   * [1000, 86400000] ms. Unset/garbage keeps the default. */
+  GIT_RECEIVE_DEADLINE_MS?: string;
   SITE_NAME?: string;
   SITE_DESC?: string;
   SITE_OWNER?: string;

@@ -27,7 +27,7 @@ import {
 } from "./control-plane";
 import type { RepoCell } from "./repo";
 import type { PlanCloneStreamResult } from "./read-leases";
-import { DeltaResolver, RANGE_BUDGET } from "./receive/delta";
+import { DeltaResolver, RANGE_BUDGET, type ResolveResult } from "./receive/delta";
 import { walkPack } from "./receive/scan";
 import { writeIdx } from "./receive/idx";
 import { copyObject } from "./fork/replicate";
@@ -188,6 +188,11 @@ export { copyObject, replicateForkCatalog } from "./fork/replicate";
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
 /** default push cap when MAX_PUSH_MB is unset, in MiB (matches env.ts docs) */
 const DEFAULT_MAX_PUSH_MB = 512;
+/** default wall-clock budget for one receive's indexing phase, in ms (matches
+ * env.ts GIT_RECEIVE_DEADLINE_MS docs): 10 minutes — strictly inside the
+ * default GIT_TIMEOUT_RECEIVE (900s) so a breached deadline releases the
+ * lease through the unpack-ng path before the TTL sweep would. */
+const RECEIVE_INDEX_DEADLINE_MS = 600_000;
 
 const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RESERVED = new Set(["api", "cgit.css", "favicon.ico", "robots.txt", "info", "git-upload-pack", "git-receive-pack"]);
@@ -1375,20 +1380,53 @@ async function receivePack<E extends Env>(
             onProgress: progress,
           }
         );
-        await walkPack(
-          { body: stagedObj.body, size: stagedObj.size },
-          // a disconnect during a long scan fails the walk the same way a
-          // staging failure does: the step-4 catch rethrows it to the outer
-          // release (rows already pushed are crash debris the DO's orphan
-          // sweep reclaims), instead of finishing a push whose client is gone
-          // and holding the lease for the whole walk
-          (entry) => {
-            throwIfClientGone();
-            return resolver.onEntry(entry);
-          },
-          { collisionDetect, onHeader: (count) => resolver.init(count), onProgress: progress }
+        // The indexing phase (scan + delta resolution + connectivity) runs
+        // under a wall-clock deadline. The receive-walk's cost is data-shape
+        // dependent — thin-pack base resolution consults the object database
+        // object-by-object (one DO RPC + one R2 range read per foreign chain
+        // hop) — and when it outgrows the platform's patience the invocation
+        // is torn down WITHOUT any catch running, stranding the exclusive
+        // lease until the TTL and 503ing every concurrent push. The deadline
+        // converts that silent grind into an explicit unpack-ng: the lease is
+        // released through finalize and the slot turns over. Default 10
+        // minutes, strictly inside GIT_TIMEOUT_RECEIVE's 15 so the ng always
+        // beats the TTL sweep; GIT_RECEIVE_DEADLINE_MS overrides.
+        const deadlineMs = Math.min(
+          Math.max(parseInt(env.GIT_RECEIVE_DEADLINE_MS ?? "", 10) || RECEIVE_INDEX_DEADLINE_MS, 1000),
+          86_400_000
         );
-        const resolved = await resolver.finish();
+        let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+        const indexing = (async () => {
+          await walkPack(
+            { body: stagedObj.body, size: stagedObj.size },
+            // a disconnect during a long scan fails the walk the same way a
+            // staging failure does: the step-4 catch rethrows it to the outer
+            // release (rows already pushed are crash debris the DO's orphan
+            // sweep reclaims), instead of finishing a push whose client is gone
+            // and holding the lease for the whole walk
+            (entry) => {
+              throwIfClientGone();
+              return resolver.onEntry(entry);
+            },
+            { collisionDetect, onHeader: (count) => resolver.init(count), onProgress: progress }
+          );
+          return resolver.finish();
+        })();
+        // whichever promise loses the race keeps running with nobody awaiting
+        // it — swallow its rejection so it can never surface as an unhandled
+        // one (the deadline loser settles against an already-released lease;
+        // its next lease-bound RPC fails with lease-invalid and dies quietly)
+        indexing.catch(() => {});
+        const deadline = new Promise<never>((_, reject) => {
+          deadlineTimer = setTimeout(() => reject(new Error(`receive indexing deadline exceeded (${deadlineMs}ms)`)), deadlineMs);
+        });
+        deadline.catch(() => {});
+        let resolved: ResolveResult;
+        try {
+          resolved = await Promise.race([indexing, deadline]);
+        } finally {
+          if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        }
         packIncomplete = resolved.incomplete;
         if (resolved.incomplete) {
           console.log(`[receive ${repo}] connectivity check failed: missing ${resolved.firstMissing}`);

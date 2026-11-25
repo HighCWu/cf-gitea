@@ -9,9 +9,9 @@
  * base is not yet resolved (forward references, huge delta streams) land in a
  * straggler pool that a fixpoint loop drains afterwards; their bytes are
  * re-read with bounded R2 range GETs. Bases outside the pack (thin pushes)
- * resolve through batched `lookupObjects` RPCs — the anti-check replacing the
- * old `push_edges` SQL — and foreign pack entries are materialized by reading
- * their stored bytes from R2 directly.
+ * resolve through the fixpoint's lazy `lookupObjects` channel — the anti-check
+ * replacing the old `push_edges` SQL — and foreign pack entries are
+ * materialized by reading their stored bytes from R2 directly.
  *
  * Every resolved object streams an IndexRow to the DO (`putIndexRows`) in
  * bounded batches, and every non-blob object's referenced children are
@@ -140,7 +140,6 @@ export class DeltaResolver {
   private oidEntry: number[] = [];
 
   private stragglers: DeltaEntry[] = [];
-  private externals = new Set<string>();
   private unparsedFulls: FullEntry[] = [];
   /** every oid the pack's non-blob objects reference (dedup set) */
   private childSet: OidSet | null = null;
@@ -211,8 +210,15 @@ export class DeltaResolver {
       if (this.oids.hasHex(entry.refBase)) {
         await this.tryResolve(entry);
       } else {
-        // external (thin-pack) base: batch-lookup after the walk
-        this.externals.add(entry.refBase);
+        // Base not resolved YET — a deferred chain node, a later pack entry,
+        // or a true thin-pack base; only the fixpoint can tell them apart.
+        // NOTHING is classified external at walk time: "unresolved at entry
+        // N" misclassifies delta-on-deferred-delta chains as thin, and every
+        // such false positive bought an ODB lookup plus a full chain
+        // materialization for an object the pack itself holds (the receive-
+        // walk grind that stalled windowed mirror pushes). The fixpoint's
+        // tryResolve resolves in-pack bases first and falls back to the lazy
+        // lookupObjects channel only for bases the pack truly lacks.
         this.stragglers.push(entry);
       }
       return;
@@ -522,9 +528,14 @@ export class DeltaResolver {
 
   /**
    * Finish the resolution: re-read the huge non-blob fulls for connectivity,
-   * batch-lookup external (thin) bases, then drain the straggler pool to a
-   * fixpoint. Throws with the historical wording when deltas remain
-   * unresolvable; returns the idx/connectivity inputs otherwise.
+   * then drain the straggler pool to a fixpoint. The fixpoint's tryResolve
+   * resolves every in-pack-reachable straggler first and falls back to the
+   * lazy `lookupObjects` channel only for bases the pack truly lacks —
+   * there is no separate pre-pass batching walk-time "externals", because a
+   * walk-time unresolved verdict cannot distinguish a thin base from a
+   * deferred in-pack chain node (see onDelta). Throws with the historical
+   * wording when deltas remain unresolvable; returns the idx/connectivity
+   * inputs otherwise.
    */
   async finish(): Promise<ResolveResult> {
     for (const f of this.unparsedFulls) {
@@ -537,24 +548,6 @@ export class DeltaResolver {
       }
       const data = inflateAll(await this.rangeRead(f.dataOff, f.dataLen));
       this.noteChildren(f.objType, data, f.oid);
-    }
-
-    if (this.externals.size) {
-      const wanted = [...this.externals];
-      for (let i = 0; i < wanted.length; i += LOOKUP_BATCH) {
-        const batch = wanted.slice(i, i + LOOKUP_BATCH);
-        this.host.onLookup?.(batch.length);
-        const res = await this.host.lookupObjects(batch);
-        for (let j = 0; j < batch.length; j++) {
-          const hit = res[j];
-          if (!hit.found) continue; // unfound externals fail the straggler below
-          let rec: ObjRec | null = null;
-          if (hit.data) rec = { type: hit.type, data: hit.data };
-          else if (hit.packKey) rec = await this.materializeForeign(hit);
-          if (rec) this.cache.put(batch[j], rec);
-        }
-      }
-      this.externals.clear();
     }
 
     let pending = this.stragglers;
