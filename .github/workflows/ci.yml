@@ -200,12 +200,13 @@ jobs:
       # Step budget: all 20 checks measured ~11s wall locally (2026-10-28,
       # sequential fail-fast) — nowhere near a split; the 45-min job cap is
       # dominated by the full-suite gate above, not this step.
-      - name: Engine checks (git-engine tsx gates — all 31 e2e check-*.mjs)
+      - name: Engine checks (git-engine tsx gates — the 32 wired e2e check-*.mjs; 35 exist on disk, 4 stay unwired)
         run: |
           TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
           node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs
           node "$TSX" packages/git-engine/e2e/check-push-origin.mjs
           node "$TSX" packages/git-engine/e2e/check-delete-husk.mjs
+          node "$TSX" packages/git-engine/e2e/check-admin-ops.mjs
           node "$TSX" packages/git-engine/e2e/check-tree-commits.mjs
           node "$TSX" packages/git-engine/e2e/check-drain-discipline.mjs
           node "$TSX" packages/git-engine/e2e/check-capability-matrix.mjs

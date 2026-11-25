@@ -837,6 +837,26 @@ export class RepoCell extends DurableObject<Env> {
       if (path === "/gc" && req.method === "POST") {
         return Response.json(await this.gc());
       }
+      // The pack-maintenance admin shapes (SPEC-0011 §5.1/§2 amendment,
+      // 2026-11-25): the M3.3/M3.4 manual entry points — compactNow/gcNow —
+      // over HTTP, classified admin in mod.ts so the authorize hook gates
+      // them exactly like POST /gc (transitional population: the GIT_TOKEN
+      // secret; D1-resolved population: the gitHttpGate runs its admin ACL
+      // first, owner/site-admin only). `force` on /compact bypasses ONLY the
+      // pack-count threshold, never the lease/window gates.
+      if (path === "/compact" && req.method === "POST") {
+        let force = false;
+        try {
+          const body = JSON.parse(await req.text()) as { force?: unknown } | null;
+          force = body?.force === true;
+        } catch {
+          // an empty or non-JSON body is a plain (threshold-gated) round
+        }
+        return Response.json(await this.compactNow({ force }));
+      }
+      if (path === "/pack-gc" && req.method === "POST") {
+        return Response.json(await this.gcNow());
+      }
 
       if (req.method !== "GET") return new Response("method not allowed\n", { status: 405 });
       return await this.ui(repo, host, proto, path, url.searchParams);

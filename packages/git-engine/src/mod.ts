@@ -1825,6 +1825,11 @@ function classify(sub: string, method: string, url: URL): {
   const isAdmin =
     ((sub === "/config" || sub === "/description") && method === "PUT") ||
     (sub === "/gc" && method === "POST") ||
+    // the M3.3/M3.4 pack-maintenance shapes (SPEC-0011 §5.1/§2 amendment,
+    // 2026-11-25 — the compactNow/gcNow RPCs had no call surface outside the
+    // tests; these are their admin-guarded HTTP twins, same guard family as
+    // POST /gc: the authorize hook decides, with op "admin")
+    ((sub === "/compact" || sub === "/pack-gc") && method === "POST") ||
     ((sub === "/" || sub === "") && method === "DELETE");
   return { op: isReceive ? "write" : isAdmin ? "admin" : "read", isReceive, isProtocol, isApi, isAdmin };
 }

@@ -18,8 +18,12 @@
 //         superseded_by, zero index rows left naming a retired input; delta
 //         retention counters), determinism (identical stores → identical
 //         successor SHA-1 + bytes), the bounded input window (oldest-N with
-//         the newest untouched) and the pack-count trigger (≤ threshold
-//         skips; force bypasses only the threshold).
+//         the newest untouched), the pack-count trigger (≤ threshold
+//         skips; force bypasses only the threshold) and the §5.2
+//         advance-past amendment (an individually-oversized HEAD pack is
+//         skipped while the window is empty — younger packs still merge,
+//         the oversize stays ACTIVE in place, non-empty windows still close
+//         at the first non-fitting row).
 //   §5.3  crash windows: publish-crash orphan (R2 written, catalog
 //         unpublished → the expired-lease sweep deletes the orphan by
 //         payload + catalog state and the catalog is byte-unchanged) and
@@ -61,6 +65,8 @@ const {
   runCompaction,
   COMPACTION_ACTIVE_PACK_THRESHOLD,
   COMPACTION_WINDOW_PACKS,
+  COMPACTION_WINDOW_BYTES,
+  COMPACTION_WINDOW_OBJECTS,
 } = await import("../src/compaction.ts");
 const { packR2Key, idxR2Key } = await import("../src/git/r2keys.ts");
 const { serializeTree, serializeCommit } = await import("../src/commit/serialize.ts");
@@ -880,6 +886,66 @@ await check("§5.1 trigger + window: >threshold compacts the OLDEST bounded wind
   const loner = await runCompaction(host, { force: true });
   assertEq(loner.tag, "skipped", "a single pack is not a window");
   assertEq(loner.reason, "window_too_small", "skip reason names the window bound");
+});
+
+await check("§5.2 advance-past: an individually-oversized HEAD pack never wedges the window — younger packs merge, the oversize stays ACTIVE in place", async () => {
+  const t = makeT();
+  const objects = new Map();
+  t.store.setR2(fakeBucket(objects), STORAGE);
+
+  // The production shape (L776/L780): the seed-era pack sits at catalog seq 1
+  // and alone exceeds the window byte bound (a full-clone push lands as ONE
+  // pack far over the 32 MiB window). The fixture fabricates that head via
+  // recordPack's declared byte count — the merge never reads a pack that is
+  // not in the window, so the inflated number is safe; the trailing packs are
+  // REAL tiny packs (recordPack derives object_count from actual rows).
+  const keys = seedTinyPacks(t.store, objects, COMPACTION_ACTIVE_PACK_THRESHOLD + 2); // 10 tiny, seq 1..10
+  const head = keys[0];
+  const SEED_BYTES = 5 * COMPACTION_WINDOW_BYTES; // ~160 MiB declared, alone > maxBytes
+  t.sql.exec("UPDATE pack_catalog SET pack_bytes = ? WHERE pack_key = ?", SEED_BYTES, head);
+
+  // selection unit: the oversized head is SKIPPED, the window fills with the
+  // younger eligible packs (old behavior: `break` at the head -> empty window
+  // -> window_too_small on every round, forever). The scan stays bounded by
+  // LIMIT maxPacks: 10 rows scanned in catalog order, the oversized head
+  // skipped -> 7 window members — the documented residual (a scan FULL of
+  // oversized heads returns an empty window, i.e. no worse than before).
+  const win = t.store.packs.activeCatalogWindow(COMPACTION_WINDOW_PACKS, COMPACTION_WINDOW_BYTES, COMPACTION_WINDOW_OBJECTS);
+  assertEq(win.map((r) => r.packKey), keys.slice(1, COMPACTION_WINDOW_PACKS), "the window advances past the oversized head, scan still LIMIT-bounded");
+  const stuck = t.store.packs.activeCatalogWindow(1, COMPACTION_WINDOW_BYTES, COMPACTION_WINDOW_OBJECTS);
+  assertEq(stuck.length, 0, "maxPacks=1 with only the oversize in scan reach: empty, never the oversize");
+
+  // the rows bound gets the same alone-exceeds test
+  t.sql.exec("UPDATE pack_catalog SET object_count = 60000 WHERE pack_key = ?", keys[1]);
+  const winRows = t.store.packs.activeCatalogWindow(COMPACTION_WINDOW_PACKS, COMPACTION_WINDOW_BYTES, COMPACTION_WINDOW_OBJECTS);
+  assertEq(winRows.map((r) => r.packKey), keys.slice(2, COMPACTION_WINDOW_PACKS), "an over-maxRows head is skipped the same way");
+  t.sql.exec("UPDATE pack_catalog SET object_count = 1 WHERE pack_key = ?", keys[1]);
+
+  // a FULL round above the threshold: the young packs merge, the oversize is
+  // untouched (its declared bytes are never read — they exist only in the
+  // catalog row). The window holds 7, not 8: the LIMIT-bounded scan spent one
+  // row on the skipped head.
+  const host = hostOf(t, objects);
+  const result = await runCompaction(host);
+  assertEq(result.tag, "compacted", "the round compacts despite the oversized head");
+  assert(!result.inputs.includes(head), "the oversized head is never a merge input");
+  assertEq(result.inputs.length, COMPACTION_WINDOW_PACKS - 1, "the window is WINDOW_PACKS minus the skipped head");
+  assertEq(t.store.packs.activePackCount(), 4, "11 -> 4 ACTIVE (successor + head + 2 untouched)");
+  const states = Object.fromEntries(catalogRows(t).map((r) => [r.pack_key, r.state]));
+  assertEq(states[head], "active", "the oversized pack stays ACTIVE in place (suspended, not deleted)");
+
+  // Advance-past never re-orders: the catalog keeps seq = insertion order, so
+  // the SUSPENDED head stays ahead of the round's successor. The next scan
+  // skips it (empty window at that point), then keeps filling:
+  const win2 = t.store.packs.activeCatalogWindow(COMPACTION_WINDOW_PACKS, COMPACTION_WINDOW_BYTES, COMPACTION_WINDOW_OBJECTS);
+  assertEq(win2.map((r) => r.packKey), [keys[8], keys[9], result.outputPackKey], "head skipped again, younger packs + successor selected");
+  // ...and non-empty accumulation keeps the CLOSING semantics: make the row
+  // behind keys[8] alone-oversized — the window stops there (the row can
+  // never fit, so the first NON-fitting row closes a non-empty window, the
+  // original semantics, unchanged)
+  t.sql.exec("UPDATE pack_catalog SET pack_bytes = ? WHERE pack_key = ?", SEED_BYTES, keys[9]);
+  const win3 = t.store.packs.activeCatalogWindow(COMPACTION_WINDOW_PACKS, COMPACTION_WINDOW_BYTES, COMPACTION_WINDOW_OBJECTS);
+  assertEq(win3.map((r) => r.packKey), [keys[8]], "a non-empty window still closes at the first non-fitting row");
 });
 
 await check("§5.1 exclusion: a live receive lease blocks compaction; a live compaction lease excludes a second round; expiry frees both", async () => {

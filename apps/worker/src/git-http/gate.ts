@@ -36,7 +36,8 @@
  * The gate's claim (SPEC-0003 §2.1, as widened by the defense-in-depth wave):
  * the four git-protocol routes ALWAYS, plus the repository-scoped ENGINE
  * JSON/admin paths (`/{owner}/{repo}/api/*`, PUT `config`/`description`,
- * POST `gc`, DELETE of the repo root — parse.ts `parseEngineRoute`) for
+ * POST `gc`/`compact`/`pack-gc`, DELETE of the repo root — parse.ts
+ * `parseEngineRoute`) for
  * D1-RESOLVED repositories. Rationale: the engine's own authorize hook
  * decides those paths from the registry's `priv` mirror, which is set
  * best-effort at create/visibility-flip time (RepoService.seedRepoExtras →

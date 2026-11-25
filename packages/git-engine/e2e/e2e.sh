@@ -169,6 +169,26 @@ echo "  gc says: $gc"
 echo "$gc" | grep -q '"removed":[1-9]'; check $? 0 "gc removed stranded objects"
 $GITC clone -q "$BASE/demo.git" post-gc 2>/dev/null && (cd post-gc && git fsck > /dev/null 2>&1); check $? 0 "clone+fsck after gc"
 
+echo "== 6b. pack maintenance admin shapes: /compact + /pack-gc =="
+# The M3.3/M3.4 manual entry points over HTTP (SPEC-0011 §5.1/§2 amendment):
+# same admin guard family as POST /gc — anonymous 401, wrong token 401, the
+# configured token 200 JSON. The catalog holds only the sections-1/4/6 pushes'
+# few packs (below the 8-pack threshold), so the plain compact honestly skips
+# and the FORCED compact really merges them (clone+fsck proves the successor
+# serves) — the merge semantics are the tsx checks' (check-compaction.mjs),
+# not this suite's.
+check "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/demo/compact")" "401" "compact anonymous 401"
+check "$(curl -s -o /dev/null -w '%{http_code}' -u "x:wrong" -X POST "$BASE/demo/compact")" "401" "compact wrong token 401"
+check "$(curl -s -o /dev/null -w '%{http_code}' -X POST -u "x:$TOKEN" "$BASE/demo/pack-gc")" "401" "pack-gc anonymous 401"
+compact="$(curl -s -X POST -u "x:$TOKEN" "$BASE/demo/compact")"
+echo "$compact" | grep -q '"tag":"skipped"'; check $? 0 "compact answers its tagged union (below threshold: skipped)"
+echo "$compact" | grep -q '"reason":"below_threshold"'; check $? 0 "compact skip names the threshold"
+forced="$(curl -s -X POST -u "x:$TOKEN" -H 'content-type: application/json' -d '{"force":true}' "$BASE/demo/compact")"
+echo "$forced" | grep -q '"tag":"compacted"'; check $? 0 "force bypasses ONLY the threshold: the 3-pack catalog really compacts"
+$GITC clone -q "$BASE/demo.git" post-compact 2>/dev/null && (cd post-compact && git fsck > /dev/null 2>&1); check $? 0 "clone+fsck after forced compaction"
+packgc="$(curl -s -X POST -u "x:$TOKEN" "$BASE/demo/pack-gc")"
+echo "$packgc" | grep -q '"tag"'; check $? 0 "pack-gc answers its tagged union"
+
 echo "== 7. branch create/delete, non-ff rejection =="
 (cd src && git checkout -qb feature && echo f > f.txt && git add -A && git commit -qm "feature work" && $GITC push -q "$AUTH_BASE/demo.git" feature && git checkout -q main); check $? 0 "branch push"
 (cd src && $GITC push -q "$AUTH_BASE/demo.git" :feature); check $? 0 "branch delete"

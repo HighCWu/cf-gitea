@@ -142,7 +142,8 @@ const ENGINE_RESERVED = new Set([
  * its authorize hook in headless mode (`ui: false`, packages/git-engine
  * `mod.ts` `classify`): the JSON content API (`/api/*`, all methods — the DO
  * answers 405 for non-GET after auth) and the admin/mutating shapes (PUT
- * `config`, PUT `description`, POST `gc`, DELETE of the repo root). Every
+ * `config`, PUT `description`, POST `gc`, POST `compact`, POST `pack-gc`,
+ * DELETE of the repo root). Every
  * OTHER sub-path either is one of the four git routes (`parseGitHttpRoute`),
  * the LFS family (`parseLfsRoute`), or a page/unknown shape the engine 404s
  * BEFORE its authorize hook (`!ui && !isProtocol && !isApi && !isAdmin`) —
@@ -204,7 +205,12 @@ export function parseEngineRoute(pathname: string, method: string): EngineRoute 
   const candidates = decodedTail !== null && decodedTail !== rawTail ? [rawTail, decodedTail] : [rawTail];
   const isApiTail = (tail: string): boolean => tail.startsWith("api/");
   const isAdminTail = (tail: string): boolean =>
-    ((tail === "config" || tail === "description") && method === "PUT") || (tail === "gc" && method === "POST");
+    ((tail === "config" || tail === "description") && method === "PUT") ||
+    // the pack-maintenance shapes (engine mod.ts classify — POST /compact,
+    // POST /pack-gc) ride the same admin family as POST /gc: claimed here so
+    // a D1-resolved repo takes the matrix's owner/site-admin arm at the gate
+    // before the engine's own hook ever sees the request
+    ((tail === "gc" || tail === "compact" || tail === "pack-gc") && method === "POST");
 
   if (candidates.some((tail) => isAdminTail(tail))) return { owner, repo, kind: "admin" };
   if (candidates.some((tail) => isApiTail(tail))) return { owner, repo, kind: "api" };

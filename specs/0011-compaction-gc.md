@@ -137,13 +137,44 @@ Compaction runs as a DO-scheduled task behind a `kind = 'compaction'` lease
 Triggers (Q1 holds the numbers): pack-count threshold per repo from the catalog,
 post-push-N heuristic, or manual RPC. Cron enqueues; the DO consumer works
 ("crons enqueue, consumers work" — the standing Workers pattern).
+**As amended (2026-11-25)**: `finalizeReceive` stamps `compaction_wanted_at` on
+EVERY committed ref change — not only the stranding ones (ref delete /
+force-push). A fast-forward push lands a new ACTIVE pack like any other; under
+a mirror workload (every push a fast-forward) the needsGc-only stamp left
+compaction STRUCTURALLY ABSENT while packs grew unbounded (measured: the
+production mirror grew ~550 ACTIVE packs over three days with zero rounds —
+the stamp can never have fired there). The stamp stays an enqueue, not a run:
+the consumer still gates on the pack-count threshold, and the shared
+finalize re-arm (`alarm = now+5min`, replaced by every later push) keeps
+rounds in push-quiet windows only — under continuous push traffic a stamped
+round is DEFERRED, not lost (the stamp persists until an alarm fires; mirror
+backoff windows and post-run idle both clear the 5-minute bar). Manual entry
+points: the `RepoCell.compactNow`/`gcNow` RPCs and, as of this amendment,
+their admin-guarded HTTP twins `POST /compact` / `POST /pack-gc` (the engine
+`classify` admin family — the authorize hook decides, the same guard as
+`POST /gc`; the embedding Worker's gate claims the tails for D1-resolved
+repos so its owner/site-admin ACL runs first).
 
 ### 5.2 Algorithm
 
 1. Hold the compaction lease (excludes concurrent receive finalize AND concurrent
    compaction).
 2. Read the ACTIVE set (bounded input window; single compaction never must touch
-   every pack).
+   every pack). **As amended (2026-11-25, the mirror-workload wedge)**: the
+   window is the oldest ELIGIBLE packs — while the window is still EMPTY, a
+   row that ALONE exceeds either size bound (window bytes or window objects)
+   is SKIPPED (advance-past) and the scan continues; with the window
+   non-empty the original semantics hold (the first non-fitting row closes
+   it). Rationale: a row over either bound can never enter ANY window, so the
+   original first-row `break` let one seed-scale pack (a full-clone push
+   lands as ONE pack, ~5x the 32 MiB window in the measured production
+   mirror) at the catalog head return an empty window on EVERY round —
+   compaction wedged for all younger packs permanently. The amendment
+   SUSPENDS such packs in place (ACTIVE, never deleted, never re-ordered —
+   fetch-side per-pack fan-out keeps paying for them; accepted, the known
+   population is bounded), lets younger packs converge, and the scan stays
+   bounded by the same `LIMIT maxPacks` (a run of oversized heads past the
+   whole scan returns an empty window — exactly the old behavior, no worse).
 3. Merge objects (dedupe by OID; keep newest/base deltas), write the new pack to
    R2 (`repos/<key>/packs/pack-<sha1>.pack` layout unchanged), build its index
    rows.
@@ -519,3 +550,42 @@ forward-only migration path with an upgrade txn.
   error) — never a wrong success. Verified by check-read-leases' five
   CONTENT checks (25 total), incl. concurrent-GC flip-blocking at the R2
   seam and post-reclaim whole-refusal.
+
+- **Mirror-workload compaction amendments (2026-11-25, this commit)**: three
+  coordinated changes restoring automatic convergence under a fast-forward
+  mirror workload, plus the missing manual call surface:
+  1. **§5.2 advance-past** (the wedge fix): `activeCatalogWindow` skips a row
+     that ALONE exceeds the window byte/object bound while the window is
+     empty (see the §5.2 amendment text). Evidence base: the production
+     mirror repository held ~192 MiB across ~1,142 R2 objects with ZERO
+     compaction rounds ever run (structural: the stamp was needsGc-only and
+     pure-FF traffic never stamps it; the object arithmetic matches
+     "one seed-era full-clone pack + one pack+idx pair per window push"), so
+     the ~150 MB seed pack sits at catalog seq 1 and the original
+     first-row-`break` returned an empty window on every would-be round.
+     Pinned by `check-compaction.mjs`'s §5.2 advance-past fixture (oversized
+     head fabricated via the catalog row's declared bytes — the merge never
+     reads a non-window pack; both size bounds get the alone-exceeds test;
+     the LIMIT-bounded scan, the non-empty close-at-first-non-fitting
+     semantics and the suspended-in-place ACTIVE state are all asserted).
+  2. **§5.1 FF stamp**: `finalizeReceive` stamps `compaction_wanted_at` on
+     every committed ref change (the §5.1 amendment text; `gc-pending` — the
+     M2 wholesale flag — stays needsGc-only). Pinned by check-push-origin's
+     leg 7 (create/FF/delete cadence over the real receive flow).
+  3. **Admin surface for the manual RPCs**: `compactNow`/`gcNow` had ZERO
+     call sites outside the tsx harnesses — no operator could run the C1
+     short-term playbook. `POST /compact` (JSON body `{"force":true}` —
+     bypasses only the pack-count threshold) and `POST /pack-gc` join the
+     engine's admin family (`mod.ts classify`), served by `RepoCell.fetch`
+     with the same authorize-hook guard as `POST /gc`; the Worker gate's
+     `parseEngineRoute` claims both tails so D1-resolved repos take the
+     owner/site-admin matrix arm first. Pinned by `check-admin-ops.mjs`
+     (real workerd: 401 anonymous / 401 wrong token / 200 token with the
+     tagged-union body, POST-only shape 404s pre-auth, and /gc parity on a
+     never-created repo), e2e.sh §6b (full worker path incl. gate + D1), and
+     the gate-side `engine-route-parse.test.ts` unit.
+  Gates: check-compaction 11, check-push-origin 7, check-admin-ops 9
+  (engine tsx, all green); worker vitest `engine-route-parse` 6 green; the
+  known-noise arms of the RepoCell alarm check (the `[gc test-storage]
+  clone-cache list failed` lines) are the fixture bucket lacking `list` —
+  pre-existing, unrelated.

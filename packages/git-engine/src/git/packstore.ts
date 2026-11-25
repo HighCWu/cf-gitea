@@ -901,12 +901,25 @@ export class PackStore {
   }
 
   /**
-   * The compaction input window (SPEC-0011 §5.2 step 2): the OLDEST ACTIVE
-   * packs (catalog seq order — insertion order), bounded by pack count, total
-   * pack bytes and total indexed rows. A single compaction never touches every
-   * pack: whatever the catalog holds, the window is a subset, so one round's
-   * blast radius (merge working set + publish-txn statement count) is bounded
-   * by the constants in src/compaction.ts, not by repo size.
+   * The compaction input window (SPEC-0011 §5.2 step 2): the OLDEST ELIGIBLE
+   * ACTIVE packs (catalog seq order — insertion order), bounded by pack count,
+   * total pack bytes and total indexed rows. A single compaction never touches
+   * every pack: whatever the catalog holds, the window is a subset, so one
+   * round's blast radius (merge working set + publish-txn statement count) is
+   * bounded by the constants in src/compaction.ts, not by repo size.
+   *
+   * Advance-past (SPEC-0011 §5.2 amendment, 2026-11-25): a row that ALONE
+   * exceeds either size bound can never enter ANY window — with the original
+   * first-row-fits `break`, one such pack at the catalog head made the window
+   * empty (or stuck at the rows before it) on EVERY round, so a seed-scale
+   * pack permanently wedged compaction for all younger packs. While the window
+   * is still empty such a row is skipped (it stays ACTIVE in place, never
+   * deleted or re-ordered — it is permanently suspended from merging, exactly
+   * as it was by the old `break`, minus the wedge); once the window holds a
+   * row, the original semantics resume: the first row that does not fit CLOSES
+   * the window. The scan stays bounded by the same LIMIT `maxPacks` — a run of
+   * oversized heads past the whole scan returns an empty window, which the
+   * caller reports as `window_too_small`, i.e. no worse than the old behavior.
    */
   activeCatalogWindow(maxPacks: number, maxBytes: number, maxRows: number): PackCatalogRow[] {
     this.assertOpen();
@@ -923,6 +936,9 @@ export class PackStore {
         maxPacks
       )
       .toArray()) {
+      // both size bounds get the alone-exceeds test: a pack over either can
+      // never join a window, whatever its current accumulation state is
+      if (out.length === 0 && (r.pack_bytes > maxBytes || r.object_count > maxRows)) continue;
       if (out.length >= maxPacks || bytes + r.pack_bytes > maxBytes || rows + r.object_count > maxRows) break;
       bytes += r.pack_bytes;
       rows += r.object_count;

@@ -1057,12 +1057,21 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
     // compaction debris by catalog state). Distinct from needsGc (stranded
     // history): a fast-forward push stales the cache too.
     store.setMeta("gc_wanted_at", String(Date.now()));
+    // M3.3 compaction cadence (SPEC-0011 §5.1 amendment, 2026-11-25): EVERY
+    // committed ref change stamps the compaction consumer — not just the
+    // stranding ones. A fast-forward push lands a new ACTIVE pack like any
+    // other; under a mirror workload (every push a fast-forward) the
+    // needsGc-only stamp left compaction structurally absent while packs grew
+    // unbounded. The stamp stays an ENQUEUE, not a run: the consumer still
+    // gates on the pack-count threshold (a converged catalog consumes the
+    // stamp and re-arms nothing), and the shared +5min alarm re-arm below
+    // keeps rounds in push-quiet windows only — under continuous traffic the
+    // round is deferred, not lost (the stamp persists until the alarm or the
+    // next round consumes it).
+    store.setMeta("compaction_wanted_at", String(Date.now()));
   }
   if (needsGc) {
     store.setMeta("gc-pending", "1");
-    // the formal M3 trigger key (SPEC-0001 §4): written alongside the M2
-    // gc-pending flag; compaction consumes it, nothing reads it yet
-    store.setMeta("compaction_wanted_at", String(Date.now()));
   }
   if (changed || outcome.extraApplied.length > 0 || needsGc) {
     try {

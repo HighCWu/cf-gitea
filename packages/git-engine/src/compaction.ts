@@ -193,7 +193,9 @@ export async function runCompaction(host: CompactionHost, opts: CompactionRunOpt
     return { tag: "skipped", reason: "below_threshold", activePacks };
   }
 
-  // --- §5.2 step 2: the bounded input window (oldest ACTIVE packs) ---------
+  // --- §5.2 step 2: the bounded input window (oldest ELIGIBLE ACTIVE packs —
+  // individually-oversized heads are skipped while the window is empty, see
+  // activeCatalogWindow's advance-past amendment) -------------------------
   const window = store.packs.activeCatalogWindow(
     COMPACTION_WINDOW_PACKS,
     COMPACTION_WINDOW_BYTES,

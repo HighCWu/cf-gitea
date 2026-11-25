@@ -34,6 +34,13 @@
 //       { origin } : {})`) so a future emitter without a parsable request URL
 //       omits the key entirely (absent, never null/empty-string), and the
 //       `requestOrigin` helper must keep its non-http(s) → undefined guard.
+//   7.  THE COMPACTION STAMP CADENCE (SPEC-0011 §5.1 amendment, 2026-11-25 —
+//       the trigger side of the mirror-workload fix): a create push AND a
+//       fast-forward push BOTH stamp `compaction_wanted_at` (the FF case is
+//       the amendment: the old needsGc-only stamp left compaction
+//       structurally absent under pure-FF mirror traffic), `gc-pending`
+//       stays needsGc-only (the M2 wholesale GC never arms on a plain FF),
+//       and a delete push (needsGc) sets BOTH the M2 flag and the stamp.
 import { DatabaseSync } from "node:sqlite";
 import { register } from "node:module";
 import { readFileSync } from "node:fs";
@@ -442,6 +449,40 @@ await check("6. absence leg (static tripwire): conditional spread + non-http(s) 
   //     absence semantics stay single-sourced)
   const sites = src.split("const event: PushEvent = {").length - 1;
   assertEq(sites, 1, "exactly one PushEvent construction site");
+});
+
+await check("7. compaction stamp cadence: every committed ref change stamps the consumer; gc-pending stays needsGc-only", async () => {
+  const t = makeRepo();
+  const rx = makePostReceive(t, () => {});
+
+  // a CREATE push (changed=true, needsGc=false — nothing strands): both
+  // consumers stamped, the M2 wholesale flag stays off
+  await rx.post("http://dgit.test", receiveBody([`${ZERO_OID} ${A.oid} refs/heads/main`], A.pack.bytes));
+  await rx.flushWaits();
+  assertEq(mainTip(t), A.oid, "create push applied");
+  assert(t.store.getMeta("compaction_wanted_at"), "create push stamps compaction_wanted_at");
+  assert(t.store.getMeta("gc_wanted_at"), "create push stamps gc_wanted_at (unchanged M3.4 cadence)");
+  assertEq(t.store.getMeta("gc-pending"), null, "gc-pending (M2 wholesale) NOT armed by a plain push");
+
+  // THE AMENDMENT: a pure FAST-FORWARD push stamps too — the needsGc-only
+  // stamp left compaction structurally absent under mirror traffic
+  const first = t.store.getMeta("compaction_wanted_at");
+  await new Promise((r) => setTimeout(r, 5));
+  await rx.post("http://dgit.test", receiveBody([`${A.oid} ${B.oid} refs/heads/main`], B.pack.bytes));
+  await rx.flushWaits();
+  assertEq(mainTip(t), B.oid, "fast-forward push applied");
+  const second = t.store.getMeta("compaction_wanted_at");
+  assert(second, "fast-forward push stamps compaction_wanted_at");
+  assert(Number(second) >= Number(first), "the FF stamp refreshes (a later enqueue, not a stale one)");
+  assertEq(t.store.getMeta("gc-pending"), null, "gc-pending still off after the FF (needsGc-only)");
+
+  // a DELETE push (needsGc=true): the M2 flag arms AND the stamp persists —
+  // the stranding path keeps every trigger it ever had
+  await rx.post("http://dgit.test", receiveBody([`${B.oid} ${ZERO_OID} refs/heads/main`], null));
+  await rx.flushWaits();
+  assertEq(mainTip(t), null, "delete push applied");
+  assertEq(t.store.getMeta("gc-pending"), "1", "delete arms gc-pending (M2 wholesale, unchanged)");
+  assert(t.store.getMeta("compaction_wanted_at"), "delete keeps the compaction stamp set");
 });
 
 console.log(`\ncheck-push-origin: ${planned - failures.length}/${planned} checks passed`);
