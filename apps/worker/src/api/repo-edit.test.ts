@@ -455,6 +455,46 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — the PR-merge configuration 
     expect((await (await makeApp()(repoPath)).json<Record<string, unknown>>()).allow_squash_merge).toBe(true);
   });
 
+  it("applies pull_requests_creation_restriction: 422s invalid at decode, persists a bare valid PATCH, round-trips (repo.go:856 + structs/repo.go:251)", async () => {
+    // The binding (In(,reader,member,writer)) is decode-time upstream — an
+    // invalid value 422s even riding has_pull_requests=false, and the
+    // rejected write leaves no unit row.
+    const invalid = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ has_pull_requests: false, pull_requests_creation_restriction: "admin" }),
+    });
+    expect(invalid.status).toBe(422);
+    expect((await invalid.json<{ message: string }>()).message).toBe(
+      "pull_requests_creation_restriction must be one of: reader, member, writer",
+    );
+    expect(await prUnitRow()).toBeUndefined();
+    // A bare valid restriction PATCH alone marks `changed` — the unit row
+    // persists with the member (the AssignPtrValue arm, repo.go:856).
+    const bare = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ pull_requests_creation_restriction: "member" }),
+    });
+    expect(bare.status).toBe(200);
+    const row = await prUnitRow();
+    expect(row).toBeDefined();
+    expect(JSON.parse(row!.config!)).toMatchObject({ CreationRestriction: "member" });
+    await expect((await makeApp()(repoPath)).json<Record<string, unknown>>()).resolves.toMatchObject({
+      pull_requests_creation_restriction: "member",
+    });
+    // The other reachable value round-trips too.
+    const writer = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ pull_requests_creation_restriction: "writer" }),
+    });
+    expect(writer.status).toBe(200);
+    await expect((await makeApp()(repoPath)).json<Record<string, unknown>>()).resolves.toMatchObject({
+      pull_requests_creation_restriction: "writer",
+    });
+  });
+
   it("applies projects_mode only alongside has_projects=true and 422s an invalid mode (repo.go:968-989)", async () => {
     // The binding validates whenever present...
     const invalid = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ projects_mode: "both" }) });

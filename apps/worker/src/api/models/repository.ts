@@ -310,19 +310,20 @@ export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;
  *    `allow_rebase_update`, `default_delete_branch_after_merge`,
  *    `default_allow_maintainer_edit`, `default_merge_style`,
  *    `default_update_style`, `squash_merge_commit_message`,
- *    `ignore_whitespace_conflicts` — the repo_units 'pull_requests' row's
- *    PullRequestsConfig, upstream updateRepoUnits repo.go:815-930 at
- *    099abf5db4) and
+ *    `ignore_whitespace_conflicts`, `pull_requests_creation_restriction` —
+ *    the repo_units 'pull_requests' row's PullRequestsConfig, upstream
+ *    updateRepoUnits repo.go:815-930 at 099abf5db4; the creation gate's
+ *    member landed with CREATEREST, repo.go:856's AssignPtrValue arm with
+ *    the In(,reader,member,writer) 422 binding, structs/repo.go:251) and
  *    `projects_mode` (the 'projects' row's ProjectsConfig, repo.go:932-953);
  *  - accepted-and-ignored (no store yet — SPEC-0005 sweep): `has_code`
  *    (needs the creation-seeded code unit row — see services/repo-settings.ts;
  *    census B-32) and the `external_tracker`/`external_wiki`/
  *    `internal_tracker` objects (upstream applies them WITH validation,
- *    repo.go:729-795 at 099abf5db4 — census B-33; the window's 640cd615c4 deepened B-33's
- *    residue — `internal_tracker.creation_restriction` and
- *    `pull_requests_creation_restriction` now carry the issues/PR creation
- *    gate through this very object, repo.go:768/:856, so the B-33 port is
- *    also the creation-gate settings seam);
+ *    repo.go:729-795 at 099abf5db4 — census B-33; `internal_tracker`
+ *    .creation_restriction is the creation gate's remaining half — the
+ *    IssuesConfig store is blocked on the recorded repo_units.type "issues"
+ *    enum handoff, see B-33's CREATEREST re-grade);
  *  - applied since the mirror-settings wave (routes/repo.ts
  *    updateMirrorSettings, repo.go:989-1101 at 099abf5db4): the five mirror fields
  *    (`mirror_interval`, `enable_prune`, `mirror_username`/

@@ -29,6 +29,7 @@ import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireRepoAdmin, requireRepoDangerZone, requireVisibleRepo } from "../services/repo-access";
 import { deleteRepoCollaborators } from "../services/repo-collaborators";
 import {
+  CREATION_RESTRICTIONS,
   deleteRepoSettings,
   loadRepoSettings,
   saveRepoSettings,
@@ -841,6 +842,20 @@ export function registerRepoRoutes(
       if (form.has_packages !== undefined) settingsPatch.hasPackages = form.has_packages;
       if (form.has_actions !== undefined) settingsPatch.hasActions = form.has_actions;
 
+      // pull_requests_creation_restriction's BINDING (structs/repo.go:251,
+      // `In(,reader,member,writer)`, the 640cd615c4 creation gate): decode-
+      // time upstream — a present-but-invalid value 422s (validationError)
+      // even when has_pull_requests=false rides the same body. The leading
+      // comma admits only the ABSENT field; "" is invalid too, matching the
+      // binding's In() list. Same 422-through-ApiError shape as the
+      // projects_mode binding arm below.
+      if (
+        form.pull_requests_creation_restriction !== undefined &&
+        !CREATION_RESTRICTIONS.includes(form.pull_requests_creation_restriction)
+      ) {
+        throw new ApiError(422, "pull_requests_creation_restriction must be one of: reader, member, writer");
+      }
+
       // The PR-unit merge configuration (EditRepoOption's allow_-prefixed
       // and default_-prefixed fields → PullRequestsConfig). Upstream
       // short-circuits the whole config block when has_pull_requests is
@@ -867,6 +882,14 @@ export function registerRepoRoutes(
         if (form.default_update_style !== undefined) pr.DefaultUpdateStyle = form.default_update_style;
         if (form.squash_merge_commit_message !== undefined)
           pr.DefaultSquashMergeMessage = form.squash_merge_commit_message;
+        // The creation gate's apply arm (repo.go:856 —
+        // `optional.AssignPtrValue(changed, &config.CreationRestriction,
+        // opts.PullRequestsCreationRestriction)`): merged over the LOADED
+        // config like every field here, so a bare restriction PATCH alone
+        // marks `changed` and rewrites the unit row (upstream's same shape:
+        // the non-nil opt makes changed true → the units append runs).
+        if (form.pull_requests_creation_restriction !== undefined)
+          pr.CreationRestriction = form.pull_requests_creation_restriction;
         if (Object.keys(pr).length > 0) {
           // The squash-message enum (repo.go:950-952 → SquashMergeMessage.
           // IsValid, models/repo/git.go:51-53): APIErrorAuto renders

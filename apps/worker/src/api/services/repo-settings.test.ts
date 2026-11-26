@@ -244,3 +244,66 @@ describe("the FN-4 identity ports (migration 0068 — SPEC-0001 §4.1)", () => {
     expect(row?.isArchived).toBe(false);
   });
 });
+
+describe("the PullRequestsConfig.CreationRestriction store (the CREATEREST family — repo.go:856's apply-side member)", () => {
+  /** The stored pull_requests unit row's config JSON (Go marshal names). */
+  async function prUnitConfig(repoId: string): Promise<string | null> {
+    const row = await drizzle(env.DB)
+      .select()
+      .from(repoUnits)
+      .where(eq(repoUnits.repoId, repoId))
+      .all()
+      .then((rows) => rows.find((r) => r.type === "pull_requests"));
+    return row?.config ?? null;
+  }
+
+  it("the default renders reader everywhere — the missing-row fallback and DEFAULT_PULL_REQUESTS_CONFIG (repo_unit.go:168)", async () => {
+    const settings = await loadRepoSettings(env.DB, "repo-1");
+    expect(settings.prUnit.CreationRestriction).toBe("reader");
+  });
+
+  it("a PATCH partial persists the member on the unit row's Go-marshal key and round-trips (repo.go:856's merged write)", async () => {
+    // A bare restriction PATCH alone (upstream's non-nil opt makes `changed`
+    // true → the unit row rewrites even with no other flag in the body).
+    await saveRepoSettings(env.DB, "repo-1", { prUnit: { CreationRestriction: "member" } }, T0);
+    const stored = await prUnitConfig("repo-1");
+    expect(stored).toContain('"CreationRestriction":"member"');
+    const settings = await loadRepoSettings(env.DB, "repo-1");
+    expect(settings.prUnit.CreationRestriction).toBe("member");
+    // The merge keeps the other members' stored-or-default values (the
+    // optional.AssignPtrValue arm mutates the LOADED config, repo.go:836-861).
+    expect(settings.prUnit.AllowMerge).toBe(true);
+    // A second write over the stored value.
+    await saveRepoSettings(env.DB, "repo-1", { prUnit: { CreationRestriction: "writer" } }, T0);
+    expect((await loadRepoSettings(env.DB, "repo-1")).prUnit.CreationRestriction).toBe("writer");
+  });
+
+  it("an empty stored value re-arms to reader (FromDB's IfZero tail, repo_unit.go:182); a corrupted blob keeps the default", async () => {
+    await drizzle(env.DB)
+      .insert(repoUnits)
+      .values({ repoId: "repo-1", type: "pull_requests", config: '{"CreationRestriction":""}', createdAt: T0 });
+    expect((await loadRepoSettings(env.DB, "repo-1")).prUnit.CreationRestriction).toBe("reader");
+    // Corrupted JSON is ignored wholesale — the defaults stand (upstream's
+    // lenient unmarshal, "don't let corrupted database value cause
+    // unnecessary 500 error").
+    await drizzle(env.DB)
+      .update(repoUnits)
+      .set({ config: "{not json" })
+      .where(eq(repoUnits.repoId, "repo-1"));
+    const settings = await loadRepoSettings(env.DB, "repo-1");
+    expect(settings.prUnit.CreationRestriction).toBe("reader");
+    expect(settings.prUnit.AllowMerge).toBe(true);
+  });
+
+  it("has_pull_requests=false deletes the stored restriction with the row (the deleteUnitTypes arm); re-enable restarts at reader", async () => {
+    await saveRepoSettings(env.DB, "repo-1", { prUnit: { CreationRestriction: "writer" } }, T0);
+    expect((await loadRepoSettings(env.DB, "repo-1")).prUnit.CreationRestriction).toBe("writer");
+    await saveRepoSettings(env.DB, "repo-1", { hasPullRequests: false }, T0);
+    expect(await prUnitConfig("repo-1")).toBeNull();
+    expect((await loadRepoSettings(env.DB, "repo-1")).prUnit.CreationRestriction).toBe("reader");
+    // Re-enable reseeds the default config (mustInsertPullRequestUnit,
+    // repo.go:837-839 — "Unit doesn't exist yet but is being enabled").
+    await saveRepoSettings(env.DB, "repo-1", { hasPullRequests: true }, T0);
+    expect((await loadRepoSettings(env.DB, "repo-1")).prUnit.CreationRestriction).toBe("reader");
+  });
+});

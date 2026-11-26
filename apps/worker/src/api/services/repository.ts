@@ -1038,16 +1038,28 @@ export function toApiRepository(
     // Upstream `IssuesCreationRestriction: issuesCreationRestriction`
     // (convert/repository.go:238, the 640cd615c4 creation gate): the issues
     // unit's IssuesConfig.CreationRestriction, "reader" when the unit is
-    // missing (convert/repository.go:63). Our tree has no issues-unit config
-    // store (the internal_tracker object is accepted-and-ignored, census
-    // B-33), so "reader" is the only reachable value — the constant stands
-    // until the B-33 unit-config seam lands (then this reads the stored
-    // config like the prUnit family below).
+    // missing (convert/repository.go:63). The issues-unit CONFIG store is
+    // the one recorded schema handoff of this family: repo_units.type's
+    // type-level enum lacks "issues" (upstream unit 3, models/unit/unit.go),
+    // so no row can exist yet and "reader" is the only reachable value —
+    // behaviorally exact for every storable state; the row reader joins the
+    // prUnit family below the day the one-word enum extension lands (census
+    // B-33's CREATEREST grade, 2026-11-26).
     issues_creation_restriction: "reader",
     internal_tracker: {
       enable_time_tracker: true,
       allow_only_contributors_to_track_time: true,
       enable_issue_dependencies: true,
+      // Upstream `CreationRestriction: new(config.CreationRestriction)`
+      // (convert/repository.go:74 — the Go 1.26 new(expr) pointer): a
+      // *string with NO omitempty (structs/repo.go:37), so the member renders
+      // on EVERY internal_tracker render (the Repository.InternalTracker tag
+      // is omitempty at structs/repo.go:102 — the whole object vanishes when
+      // the issues unit is missing, ours always renders it; that object-
+      // presence delta is B-33's older residue, not this family's). "reader"
+      // is the only reachable value until the issues-unit row store lands
+      // (see issues_creation_restriction above).
+      creation_restriction: "reader",
     },
     has_wiki: settings?.hasWiki ?? true,
     has_pull_requests: settings?.hasPullRequests ?? true,
@@ -1087,15 +1099,12 @@ export function toApiRepository(
     // Upstream `PullRequestsCreationRestriction:
     // pullRequestsCreationRestriction` (convert/repository.go:265, the
     // 640cd615c4 creation gate): the PR unit's PullRequestsConfig.
-    // CreationRestriction, "reader" when the unit is missing
-    // (convert/repository.go:114). The stored prUnit config's type carries
-    // no CreationRestriction member yet — the apply arm (repo.go:856) is the
-    // repo-settings-family seam (PATCH accepts the field per the contract
-    // and ignores it, the B-33 posture) — so "reader" is the only reachable
-    // value and the constant is behaviorally exact for every storable state;
-    // it reads the stored config once the settings-family type grows the
-    // member.
-    pull_requests_creation_restriction: "reader",
+    // CreationRestriction read off the STORED config (the repo_units
+    // 'pull_requests' row via services/repo-settings.ts — the member landed
+    // there 2026-11-26 with the PATCH apply arm, routes/repo.ts repo.go:856
+    // port), "reader" when the unit is missing (convert/repository.go:114 —
+    // the settings-less sync-path callers and unit-less rows).
+    pull_requests_creation_restriction: settings?.prUnit.CreationRestriction ?? "reader",
     // FN-4: `AvatarURL: repo.AvatarLink(ctx)` (convert/repository.go:259;
     // models/repo/avatar.go:85-91 + relAvatarLink :66-84 — the stored avatar
     // KEY's `/repo-avatars/<key>` absolute URL, "" under the default fallback

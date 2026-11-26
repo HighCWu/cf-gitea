@@ -21,7 +21,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { releases, repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
+import { releases, repoUnits, repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 import {
@@ -40,6 +40,7 @@ import {
   toApiRepositoryFull,
   type Viewer,
 } from "./repository";
+import { loadRepoSettings } from "./repo-settings";
 import { saveUserProfileColumns } from "./user-settings";
 
 beforeAll(async () => {
@@ -402,11 +403,12 @@ describe("the creation-restriction wire pair (RE-PIN 099abf5db4 — 640cd615c4)"
   it("issues_creation_restriction and pull_requests_creation_restriction render the reader default", async () => {
     // Upstream serializes both from the unit configs with the "reader"
     // fallback when the unit is missing (convert/repository.go:63/:114,
-    // rendered at :238/:265). Our tree has no issues-unit config store
-    // (census B-33) and the PR-unit config type carries no member yet (the
-    // settings seam), so "reader" is the only reachable value on either
-    // side — the constant render is behaviorally exact for every storable
-    // state; these pins break the day the seam lands, which is the point.
+    // rendered at :238/:265). The PR side now READS the stored prUnit
+    // config (services/repo-settings.ts CreationRestriction, landed with
+    // the CREATEREST apply arm); the ISSUES side stays the "reader"
+    // constant — the issues-unit row store is the family's one recorded
+    // schema handoff (repo_units.type's type-level enum lacks "issues"), so
+    // "reader" is the only reachable value there for every storable state.
     const owner = await seedVerifiedUser({ username: "wire_restriction" });
     await seedRepo(owner.id, "wire_restriction", "restricted_shape", "public");
     const pair = await findRepositoryByPath(env.DB, "wire_restriction", "restricted_shape");
@@ -414,15 +416,40 @@ describe("the creation-restriction wire pair (RE-PIN 099abf5db4 — 640cd615c4)"
     const payload = await toApiRepositoryFull(env.DB, viewerFor(owner), pair);
     expect(payload.issues_creation_restriction).toBe("reader");
     expect(payload.pull_requests_creation_restriction).toBe("reader");
-    // The internal_tracker object still renders the default config WITHOUT
-    // the new member (the accepted-and-ignored object, census B-33 — the
-    // contract schema declares creation_restriction optional, our render
-    // omits it like upstream omits it for a nil pointer).
+    // The internal_tracker object renders the default config WITH the
+    // creation_restriction member now — upstream's pointer has no omitempty
+    // (structs/repo.go:37; convert/repository.go:74 new(expr)), so the
+    // member is on every internal_tracker render ("reader" until the
+    // issues-unit row store lands, census B-33's CREATEREST grade).
     expect(payload.internal_tracker).toEqual({
       enable_time_tracker: true,
       allow_only_contributors_to_track_time: true,
       enable_issue_dependencies: true,
+      creation_restriction: "reader",
     });
+  });
+
+  it("pull_requests_creation_restriction reads the stored prUnit config (the CREATEREST override — convert/repository.go:265's read arm)", async () => {
+    const owner = await seedVerifiedUser({ username: "wire_restriction_2" });
+    const repoId = await seedRepo(owner.id, "wire_restriction_2", "restricted_stored", "public");
+    // The stored unit row (the Go-marshal key the PATCH arm writes through
+    // saveRepoSettings; the route-level round trip is repo-edit's battery).
+    await drizzle(env.DB).insert(repoUnits).values({
+      repoId,
+      type: "pull_requests",
+      config: '{"AllowMerge":true,"CreationRestriction":"member"}',
+      createdAt: NOW,
+    });
+    const pair = await findRepositoryByPath(env.DB, "wire_restriction_2", "restricted_stored");
+    if (pair === null) throw new Error("fixture repo missing");
+    // The route shape: the GET handler loads the settings overlay and hands
+    // it to the serializer (routes/repo.ts's GET arm) — the serializer
+    // itself takes the overlay as a parameter.
+    const settings = await loadRepoSettings(env.DB, pair.repo.id);
+    const payload = await toApiRepositoryFull(env.DB, viewerFor(owner), pair, settings);
+    expect(payload.pull_requests_creation_restriction).toBe("member");
+    // The issues side is untouched by the PR store — still the constant.
+    expect(payload.issues_creation_restriction).toBe("reader");
   });
 });
 

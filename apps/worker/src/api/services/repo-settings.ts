@@ -12,13 +12,22 @@ import {
 import type { ActionsTriggerEnv } from "../../services/actions/trigger";
 
 /**
- * Upstream `PullRequestsConfig` (models/repo/repo_unit.go:119-137) — the
- * `TypePullRequests` unit's serialized config. Field names are the GO
- * MARSHAL names on purpose: `ToDB` is Go's `json.Marshal` of the struct
- * (repo_unit.go:167-170), so the `repo_units.config` JSON must carry exactly
- * these keys to stay column-for-column compatible with upstream rows — the
- * same convention the ActionsConfig store keeps (services/actions/config.ts).
+ * Upstream `PullRequestsConfig` (models/repo/repo_unit.go:137-155 at
+ * 099abf5db4) — the `TypePullRequests` unit's serialized config. Field names
+ * are the GO MARSHAL names on purpose: `ToDB` is Go's `json.Marshal` of the
+ * struct (repo_unit.go:186-189), so the `repo_units.config` JSON must carry
+ * exactly these keys to stay column-for-column compatible with upstream rows
+ * — the same convention the ActionsConfig store keeps
+ * (services/actions/config.ts).
  */
+
+/** The three valid `CreationRestriction` values (repo_unit.go:99-105):
+ *  "reader" (default — any user with read access), "member" (effective
+ *  collaborators with read access), "writer" (users with write access).
+ *  Upstream's binding `In(,reader,member,writer)` (structs/repo.go:251) —
+ *  the leading comma admits the ABSENT field only, so a present-but-invalid
+ *  value is a 422 (routes/repo.ts's arm), never a silent store. */
+export const CREATION_RESTRICTIONS: readonly string[] = ["reader", "member", "writer"];
 export interface PullRequestsConfig {
   IgnoreWhitespaceConflicts: boolean;
   AllowMerge: boolean;
@@ -41,12 +50,18 @@ export interface PullRequestsConfig {
   DefaultSquashMergeMessage: string;
   DefaultAllowMaintainerEdit: boolean;
   DefaultTargetBranch: string;
+  /** Who may CREATE pull requests (repo_unit.go:154, the 640cd615c4
+   *  creation gate) — one of CREATION_RESTRICTIONS, default "reader"
+   *  (DefaultPullRequestsConfig, repo_unit.go:168; serialized on the wire as
+   *  `pull_requests_creation_restriction`, convert/repository.go:265). */
+  CreationRestriction: string;
 }
 
-/** `DefaultPullRequestsConfig` (repo_unit.go:139-156): the seven allow flags
- *  true, update style merge, maintainer edit true; the rest ride the app
- *  defaults (delete-after-merge false, merge style "merge", squash message
- *  "PR_BODY" — modules/setting/repository.go:204-210) and stay zero-valued.
+/** `DefaultPullRequestsConfig` (repo_unit.go:157-175): the seven allow flags
+ *  true, update style merge, maintainer edit true, creation restriction
+ *  "reader"; the rest ride the app defaults (delete-after-merge false, merge
+ *  style "merge", squash message "PR_BODY" —
+ *  modules/setting/repository.go:204-210) and stay zero-valued.
  *  NOTE `AllowManualMerge` is the zero value FALSE here — upstream's
  *  missing-unit fallback in convert (repository.go:103) renders true, but
  *  every real repo carries the unit and its default config, so false is the
@@ -68,6 +83,7 @@ export const DEFAULT_PULL_REQUESTS_CONFIG: PullRequestsConfig = {
   DefaultSquashMergeMessage: "PR_BODY",
   DefaultAllowMaintainerEdit: true,
   DefaultTargetBranch: "",
+  CreationRestriction: "reader",
 };
 
 /** The three valid `squash_merge_commit_message` values
@@ -79,12 +95,14 @@ export const SQUASH_MERGE_MESSAGES: readonly string[] = ["BLANK", "COMMIT_MESSAG
 export const PROJECTS_MODES: readonly string[] = ["repo", "owner", "all"];
 
 /**
- * `PullRequestsConfig.FromDB` (repo_unit.go:158-166): defaults first, then
+ * `PullRequestsConfig.FromDB` (repo_unit.go:177-184): defaults first, then
  * the stored JSON overlay — a corrupted blob is IGNORED (upstream swallows
  * the unmarshal error "don't let corrupted database value cause unnecessary
  * 500 error"), a NULL config loads the plain defaults (xorm's BeforeSet
- * FromDB(nil) pass). The FromDB tail also re-arms DefaultUpdateStyle's
- * IfZero to "merge".
+ * FromDB(nil) pass). The FromDB tail re-arms the two IfZero fallbacks:
+ * DefaultUpdateStyle to "merge" and — the 640cd615c4 creation gate —
+ * CreationRestriction to "reader" (repo_unit.go:182, util.IfZero over the
+ * empty string).
  */
 export function pullRequestsConfigFromJson(raw: string | null): PullRequestsConfig {
   const config: PullRequestsConfig = { ...DEFAULT_PULL_REQUESTS_CONFIG };
@@ -101,6 +119,9 @@ export function pullRequestsConfigFromJson(raw: string | null): PullRequestsConf
   }
   if (config.DefaultUpdateStyle !== "merge" && config.DefaultUpdateStyle !== "rebase") {
     config.DefaultUpdateStyle = "merge";
+  }
+  if (config.CreationRestriction === "") {
+    config.CreationRestriction = "reader";
   }
   return config;
 }
