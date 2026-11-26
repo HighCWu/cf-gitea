@@ -386,6 +386,25 @@ import {
   type TerraformLockInfo,
 } from "../../services/packages/terraform";
 import {
+  TERRAFORM_ARCHIVE_CODE_MINUTES,
+  TERRAFORM_MODULE_PACKAGE_TYPE,
+  TerraformModuleAddressError,
+  TerraformModuleArchiveError,
+  TerraformModuleContentTooLargeError,
+  TerraformModuleNoRootError,
+  TerraformModuleVersionError,
+  createTerraformArchiveTimeLimitCode,
+  deleteTerraformModuleVersion,
+  hasValidTerraformArchiveSignature,
+  listTerraformModuleVersions,
+  normalizeTerraformModuleVersion,
+  openTerraformModuleArchiveForDownload,
+  terraformModuleArchiveCodeData,
+  terraformModulePackageName,
+  uploadTerraformModule,
+  validateTerraformModuleAddress,
+} from "../../services/packages/terraform-modules";
+import {
   CRAN_TYPE_BINARY,
   CRAN_TYPE_SOURCE,
   CranArchiveError,
@@ -2645,6 +2664,27 @@ quota: packagesQuotaFromEnv(c.env),
   app.delete("/:username/terraform/state/:name/versions/:serial", (c) => terraformDeleteBySerial(c));
   app.post("/:username/terraform/state/:name/lock", (c) => terraformLock(c));
   app.delete("/:username/terraform/state/:name/lock", (c) => terraformUnlock(c));
+
+  // ---------------------- TERRAFORM MODULE (api.go:105-117, 5d9bfa1e14) ----------------------
+  // The MODULE registry (SPEC terraform-module-registry.md): the host-level
+  // group mounts at the LITERAL `-` namespace — "host-level base URL for
+  // service discovery, the namespace is the owner" (the api.go comment) —
+  // ahead of the /{username} families; the static segment outranks the
+  // params in Hono exactly as upstream's mount order does. Auth per route:
+  // the archive download answers a VALID 10-minute signed code without any
+  // other credential (Terraform sends no credentials when fetching it,
+  // terraform_module.go:78-81), everything else is reqPackageAccess(read |
+  // write) — resolved through the same credential pass as the families.
+  // Error bodies are PLAIN TEXT (terraform_module.go:33-35's ctx.PlainText).
+  // HEAD rides the archive GET walk (the pypi/helm precedent — upstream
+  // registers GET only).
+
+  app.get("/-/terraform/modules/:username/:name/:provider/versions", (c) => terraformModuleListVersions(c));
+  app.get("/-/terraform/modules/:username/:name/:provider/:version/download", (c) => terraformModuleDownloadRedirect(c));
+  app.get("/-/terraform/modules/:username/:name/:provider/:version/archive", (c) => terraformModuleDownloadArchive(c));
+  app.on("HEAD", "/-/terraform/modules/:username/:name/:provider/:version/archive", (c) => terraformModuleDownloadArchive(c));
+  app.put("/-/terraform/modules/:username/:name/:provider/:version", (c) => terraformModuleUpload(c));
+  app.delete("/-/terraform/modules/:username/:name/:provider/:version", (c) => terraformModuleDelete(c));
 
   // ------------------------------ VAGRANT (api.go:488-498) ------------------------------
   // The boxes family: the authenticate probe (the bare Doer-nil check —
@@ -5116,6 +5156,246 @@ async function terraformUnlock(c: Context<{ Bindings: Env }>): Promise<Response>
     console.error("[packages-terraform] unlock failed", error);
     return terraformPlainText(500, "internal server error");
   }
+}
+
+// ---------------------------------------------------------------------------
+// TERRAFORM MODULE — routers/api/packages/terraform_module/terraform_module.go
+// (5d9bfa1e14, SPEC terraform-module-registry.md): the PLAIN TEXT apiError
+// (:33-35's ProcessErrorForUser + ctx.PlainText), the host-level `-`
+// namespace group, and the signed 10-minute archive code (base/tool.go).
+// ---------------------------------------------------------------------------
+
+/** The plain-text apiError twin (terraform_module.go:33-35). */
+function terraformModulePlainText(status: 400 | 401 | 403 | 404 | 409 | 413 | 500, message: string): Response {
+  return plainResponse(status, message);
+}
+
+/** The path param trio + the derived package name `{name}/{provider}`
+ *  (terraform_module.go:41-46). */
+function terraformModuleAddressOf(c: Context<{ Bindings: Env }>): { name: string; provider: string; packageName: string } {
+  const name = c.req.param("name") ?? "";
+  const provider = c.req.param("provider") ?? "";
+  return { name, provider, packageName: terraformModulePackageName(name, provider) };
+}
+
+/**
+ * packageName's address validation (terraform_module.go:41-46): the parts
+ * validate against the OWNER's name as the namespace.
+ */
+function terraformModuleValidatedAddress(
+  c: Context<{ Bindings: Env }>,
+  ownerUsername: string,
+): { name: string; provider: string; packageName: string } | Response {
+  const address = terraformModuleAddressOf(c);
+  try {
+    validateTerraformModuleAddress(ownerUsername, address.name, address.provider);
+  } catch (error) {
+    return terraformModulePlainText(400, error instanceof Error ? error.message : "invalid module address");
+  }
+  return address;
+}
+
+/**
+ * packageInfo (terraform_module.go:48-61): the validated address PLUS the
+ * raw version normalized to canonical semver (`v1.0.0` == `1.0.0`). The
+ * versionless routes (versions) take terraformModuleValidatedAddress only.
+ */
+function terraformModulePackageInfo(
+  c: Context<{ Bindings: Env }>,
+  ownerUsername: string,
+): { name: string; provider: string; packageName: string; version: string } | Response {
+  const address = terraformModuleValidatedAddress(c, ownerUsername);
+  if (address instanceof Response) return address;
+  try {
+    return { ...address, version: normalizeTerraformModuleVersion(c.req.param("version") ?? "") };
+  } catch (error) {
+    return terraformModulePlainText(400, error instanceof Error ? error.message : "invalid module version");
+  }
+}
+
+/** ListVersions (terraform_module.go:75-91): the versions envelope, 404
+ *  when the package has no versions. */
+async function terraformModuleListVersions(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const address = terraformModuleValidatedAddress(c, owner.username);
+    if (address instanceof Response) return address;
+    const versions = await listTerraformModuleVersions(c.env.DB, owner.id, address.packageName);
+    if (versions.length === 0) {
+      return terraformModulePlainText(404, "package does not exist");
+    }
+    return new Response(JSON.stringify({ modules: [{ versions: versions.map((version) => ({ version })) }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (error) {
+    return terraformModuleErrorResponse(error, "[packages-terraform-module] versions failed");
+  }
+}
+
+/** DownloadRedirect (terraform_module.go:93-107): the 204 + the signed
+ *  `./archive?archive=tar.gz&code=…` X-Terraform-Get pointer — signed
+ *  because Terraform sends no credentials on the fetch. */
+async function terraformModuleDownloadRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const info = terraformModulePackageInfo(c, owner.username);
+    if (info instanceof Response) return info;
+    const versionRow = await getVersionByNameAndVersion(
+      c.env.DB,
+      owner.id,
+      TERRAFORM_MODULE_PACKAGE_TYPE,
+      info.packageName,
+      info.version,
+    );
+    if (versionRow === null) return terraformModulePlainText(404, "package does not exist");
+    const code = await createTerraformArchiveTimeLimitCode(
+      c.env.DB,
+      terraformModuleArchiveCodeData(owner.id, info.packageName, info.version),
+      TERRAFORM_ARCHIVE_CODE_MINUTES,
+      new Date(),
+    );
+    return new Response(null, {
+      status: 204,
+      headers: { "X-Terraform-Get": `./archive?archive=tar.gz&code=${code}` },
+    });
+  } catch (error) {
+    return terraformModuleErrorResponse(error, "[packages-terraform-module] redirect failed");
+  }
+}
+
+/** DownloadArchive (terraform_module.go:109-130): the signed-code bypass —
+ *  a VALID 10-minute code for THIS owner/name/version downloads without any
+ *  other credential (`HasValidArchiveSignature` guard); otherwise the read
+ *  gate runs. Owner blindness precedes both arms (the group's
+ *  UserAssignmentWeb + PackageAssignment wrap). */
+async function terraformModuleDownloadArchive(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    if (packagesDisabled(c.env)) {
+      return terraformModulePlainText(404, "not found");
+    }
+    const cred = await resolveCredential(c.env.DB, c.req.raw);
+    const username = c.req.param("username") ?? "";
+    const owner = await resolveOwnerRow(c.env.DB, username);
+    if (owner === null) {
+      return terraformModulePlainText(404, userRedirectDoesNotExist(username));
+    }
+    if (ownerBlindToPublicOnly(owner, cred)) {
+      return terraformModulePlainText(404, userRedirectDoesNotExist(owner.username));
+    }
+    const info = terraformModulePackageInfo(c, owner.username);
+    if (info instanceof Response) return info;
+    const signed = await hasValidTerraformArchiveSignature(
+      c.env.DB,
+      owner.id,
+      info.packageName,
+      info.version,
+      c.req.query("code"),
+    );
+    if (!signed) {
+      await protocolAccessGate(c.env, "read", owner, cred);
+    }
+    const download = await openTerraformModuleArchiveForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      info.packageName,
+      info.version,
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download.kind === "version-missing") return terraformModulePlainText(404, "package does not exist");
+    if (download.kind === "file-missing") return terraformModulePlainText(404, "package file does not exist");
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    return terraformModuleErrorResponse(error, "[packages-terraform-module] archive failed");
+  }
+}
+
+/** UploadModule (terraform_module.go:132-177): the write gate → the
+ *  address+version validation → the verbatim spool → the HCL parse → the
+ *  immutable create (409 on the duplicate version) → 201. */
+async function terraformModuleUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return terraformModulePlainText(401, "user should have specific permission or be a site admin");
+    }
+    const info = terraformModulePackageInfo(c, owner.username);
+    if (info instanceof Response) return info;
+    await uploadTerraformModule({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      name: info.name,
+      provider: info.provider,
+      version: c.req.param("version") ?? "",
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+      webhookEnv: c.env,
+    });
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    return terraformModuleErrorResponse(error, "[packages-terraform-module] upload failed");
+  }
+}
+
+/** DeleteModule (terraform_module.go:179-188): the write gate → the
+ *  immutable version remove; the descriptor resolves BEFORE the cascade so
+ *  the deleted webhook renders the pre-delete state (the generic family's
+ *  notify shape). */
+async function terraformModuleDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const info = terraformModulePackageInfo(c, owner.username);
+    if (info instanceof Response) return info;
+    const descriptor = await resolvePackageEventDescriptor(
+      c.env.DB,
+      owner.id,
+      TERRAFORM_MODULE_PACKAGE_TYPE,
+      info.packageName,
+      info.version,
+    );
+    const deleted = await deleteTerraformModuleVersion(c.env.DB, owner.id, info.packageName, info.version);
+    if (!deleted) return terraformModulePlainText(404, "package does not exist");
+    if (descriptor !== null) {
+      await emitPackageDeleted(c.env, [descriptor], cred.doer?.id ?? 0);
+    }
+    return new Response(null, { status: 204 });
+  } catch (error) {
+    return terraformModuleErrorResponse(error, "[packages-terraform-module] delete failed");
+  }
+}
+
+/** The family's error mapper (the mavenErrorResponse shape over the plain
+ *  bodies): parse errors 400, the metadata cap 413, the duplicate version
+ *  409, the quota trio 403, the store cap 413, everything else 500. */
+function terraformModuleErrorResponse(error: unknown, context: string): Response {
+  if (error instanceof HTTPException) return error.getResponse();
+  if (error instanceof TerraformModuleAddressError) return terraformModulePlainText(400, error.message);
+  if (error instanceof TerraformModuleVersionError) return terraformModulePlainText(400, error.message);
+  if (error instanceof TerraformModuleArchiveError) return terraformModulePlainText(400, error.message);
+  if (error instanceof TerraformModuleNoRootError) return terraformModulePlainText(400, error.message);
+  if (error instanceof TerraformModuleContentTooLargeError) return terraformModulePlainText(413, error.message);
+  if (error instanceof DuplicatePackageVersionError) return terraformModulePlainText(409, error.message);
+  if (error instanceof PackageSizeMismatchError) return terraformModulePlainText(400, error.message);
+  if (error instanceof PackageBlobTooLargeError) return terraformModulePlainText(413, error.message);
+  if (
+    error instanceof QuotaTotalCountError ||
+    error instanceof QuotaTypeSizeError ||
+    error instanceof QuotaTotalSizeError
+  ) {
+    return terraformModulePlainText(403, quotaMessage(error));
+  }
+  console.error(context, error);
+  return terraformModulePlainText(500, "internal server error");
 }
 
 // ---------------------------------------------------------------------------

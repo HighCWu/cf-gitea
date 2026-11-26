@@ -966,12 +966,18 @@ describe("the repo_units enum extension (ratification 7)", () => {
 // The type census
 // ---------------------------------------------------------------------------
 
-it("the type census carries upstream's 23-member TypeList with display names", () => {
-  expect(PACKAGE_TYPES).toHaveLength(23);
+it("the type census carries upstream's 24-member TypeList with display names (5d9bfa1e14's TypeTerraformModule rides between swift and terraform — package.go:54/:81)", () => {
+  expect(PACKAGE_TYPES).toHaveLength(24);
   expect(packageTypeName("generic")).toBe("Generic");
   expect(packageTypeName("npm")).toBe("npm");
   expect(packageTypeName("pypi")).toBe("PyPI");
   expect(packageTypeName("terraform")).toBe("Terraform State");
+  expect(packageTypeName("terraform-module")).toBe("Terraform Module");
+  const swiftIndex = PACKAGE_TYPES.findIndex((entry) => entry.type === "swift");
+  const moduleIndex = PACKAGE_TYPES.findIndex((entry) => entry.type === "terraform-module");
+  const stateIndex = PACKAGE_TYPES.findIndex((entry) => entry.type === "terraform");
+  expect(moduleIndex).toBe(swiftIndex + 1);
+  expect(stateIndex).toBe(moduleIndex + 1);
   expect(packageTypeName("mystery")).toBe("mystery"); // the open string set
 });
 

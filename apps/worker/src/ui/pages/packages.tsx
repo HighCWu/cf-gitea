@@ -201,7 +201,8 @@ import {
 } from "../../services/packages/model";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
-import { formatByteSize, parsePageNumber, pathEscapeSegments } from "../page-data";
+import { formatByteSize, parsePageNumber, pathEscapeSegments, renderRepoMarkdown } from "../page-data";
+import type { TerraformModuleMetadata } from "../../services/packages/terraform-modules";
 import {
   encodeContentDisposition,
   httpTime,
@@ -267,6 +268,20 @@ export const packagesLocale = {
   terraform_unlocked: "Unlocked", // "packages.terraform.unlocked"
   terraform_lock: "Lock", // "packages.terraform.lock"
   terraform_unlock: "Unlock", // "packages.terraform.unlock"
+  tfmod_install: "Add the module to your Terraform configuration:", // "packages.terraform_module.install"
+  tfmod_install_terragrunt: "Or add it to your Terragrunt configuration:", // "packages.terraform_module.install_terragrunt"
+  tfmod_credentials: "Configure credentials for this registry in ~/.terraformrc:", // "packages.terraform_module.credentials"
+  tfmod_inputs: "Inputs", // "packages.terraform_module.inputs"
+  tfmod_outputs: "Outputs", // "packages.terraform_module.outputs"
+  tfmod_providers: "Required Providers", // "packages.terraform_module.providers"
+  tfmod_submodules: "Submodules", // "packages.terraform_module.submodules"
+  tfmod_name: "Name", // "packages.terraform_module.name"
+  tfmod_type: "Type", // "packages.terraform_module.type"
+  tfmod_default: "Default", // "packages.terraform_module.default"
+  tfmod_description: "Description", // "packages.terraform_module.description"
+  tfmod_required: "required", // "packages.terraform_module.required"
+  tfmod_registry_documentation: "For more information on the Terraform Module registry, see", // "packages.registry.documentation" (%s = Terraform Module)
+  about: "About", // "packages.about" (the README section's header)
 } as const;
 
 /** "packages.terraform.locked_by" — "Locked by %s" (the %s is structural). */
@@ -275,6 +290,7 @@ export const TERRAFORM_LOCKED_BY_PREFIX = "Locked by ";
 /** The documentation targets (the locale strings' literal hrefs). */
 const DOCS_PACKAGES_URL = "https://docs.gitea.com/usage/packages/overview";
 const DOCS_GENERIC_URL = "https://docs.gitea.com/usage/packages/generic";
+const DOCS_TERRAFORM_MODULE_URL = "https://docs.gitea.com/usage/packages/terraform-module";
 
 /**
  * Upstream's `TypeList` (models/packages/package.go:55-77) in its exact
@@ -304,6 +320,7 @@ export const PACKAGE_TYPES: readonly { type: string; name: string }[] = [
   { type: "rpm", name: "RPM" },
   { type: "rubygems", name: "RubyGems" },
   { type: "swift", name: "Swift" },
+  { type: "terraform-module", name: "Terraform Module" }, // TypeTerraformModule (package.go:54, 5d9bfa1e14)
   { type: "terraform", name: "Terraform State" },
   { type: "vagrant", name: "Vagrant" },
 ];
@@ -1062,6 +1079,21 @@ export interface PackageVersionViewData {
    *  it is locked. Both stay at their zero answers for every other type. */
   isLatestVersion: boolean;
   terraformLock: TerraformLockInfo | null;
+  /** The terraform MODULE tail (templates/package/content/
+   *  terraform_module.tmpl, 5d9bfa1e14): the parsed metadata + the viewed
+   *  submodule (null = the root view). Null for every other type. */
+  moduleView: TerraformModuleViewData | null;
+}
+
+/** The module view's payload (web/user/package.go:207-214's
+ *  PackageSubmodule + the descriptor metadata). */
+export interface TerraformModuleViewData {
+  metadata: TerraformModuleMetadata;
+  /** The viewed `modules/<name>` segment (null = the root page). */
+  submodule: string | null;
+  /** The linked repo's default branch for the README render (null = the
+   *  plain render — upstream RenderPackageMarkdown's no-linkedRepo arm). */
+  linkedBranch: string | null;
 }
 
 /**
@@ -1078,12 +1110,35 @@ export async function loadOwnerPackageVersionViewData(
   type: string,
   name: string,
   version: string,
+  submodule: string | null = null,
 ): Promise<PackageVersionViewData | null> {
   const ownerId = ownerIdOf(owner);
   const pkg = await getPackageByName(d1, ownerId, type, name);
   if (pkg === null) return null;
   const versionRow = await getVersionByNameAndVersion(d1, ownerId, type, name, version);
   if (versionRow === null) return null;
+  // The module tail's descriptor read (web/user/package.go:207-214): the
+  // metadata must carry the requested submodule — a miss (or a non-module
+  // URL riding this loader) is upstream's NotFound.
+  let moduleMetadata: TerraformModuleMetadata | null = null;
+  if (pkg.type === "terraform-module") {
+    let parsed: TerraformModuleMetadata | null = null;
+    if (versionRow.metadataJson !== null && versionRow.metadataJson !== "") {
+      try {
+        parsed = JSON.parse(versionRow.metadataJson) as TerraformModuleMetadata;
+      } catch {
+        parsed = null;
+      }
+    }
+    if (submodule !== null && parsed?.submodules?.[submodule] === undefined) {
+      return null;
+    }
+    moduleMetadata = parsed ?? {};
+  } else if (submodule !== null) {
+    // A non-module type riding the /modules/ URL: the metadata assertion
+    // fails upstream → NotFound.
+    return null;
+  }
   const descriptor = await getPackageDescriptor(d1, pkg, versionRow);
   const creatorName =
     versionRow.creatorId > 0 ? ((await creatorNamesOf(d1, [versionRow])).get(versionRow.creatorId) ?? null) : null;
@@ -1105,15 +1160,22 @@ export async function loadOwnerPackageVersionViewData(
     .all();
 
   let repository: LinkedRepoView | null = null;
+  let moduleLinkedBranch: string | null = null;
   if (pkg.repoId !== null) {
     const repoRow = await drizzle(d1).select().from(repositories).where(eq(repositories.id, pkg.repoId)).get();
     const apiViewer: ApiViewer = { origin, requester: packagesApiUser(viewer) };
+    let linkedBranch: string | null = null;
     if (repoRow !== undefined && (await canViewRepositoryWithTeams(d1, apiViewer, repoRow))) {
+      linkedBranch = repoRow.defaultBranch;
       repository = {
         link: `/${repoRow.ownerNamespace}/${repoRow.slug}`,
         fullName: `${repoRow.ownerNamespace}/${repoRow.slug}`,
       };
     }
+    // The module README's render context (upstream RenderPackageMarkdown's
+    // linkedRepo.DefaultBranch, util_render.go:211-227 — captured here
+    // while the repo row is in hand).
+    moduleLinkedBranch = linkedBranch;
   }
 
   const doer: ProfileDoer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
@@ -1175,6 +1237,10 @@ export async function loadOwnerPackageVersionViewData(
     canWritePackages,
     isLatestVersion,
     terraformLock,
+    moduleView:
+      pkg.type === "terraform-module" && moduleMetadata !== null
+        ? { metadata: moduleMetadata, submodule, linkedBranch: moduleLinkedBranch }
+        : null,
   };
 }
 
@@ -1904,6 +1970,210 @@ function TerraformLockStatusBlock(props: { data: PackageVersionViewData }) {
   );
 }
 
+/** The terraform MODULE content block (templates/package/content/
+ *  terraform_module.tmpl, 5d9bfa1e14 — 108 lines): the install/terragrunt/
+ *  credentials snippets, the README (package-markdown through the linked
+ *  repo's default branch, `modules/<sub>` tree-rooted for submodule
+ *  readmes), the inputs/outputs/providers tables, and the submodules list
+ *  (root view only). The submodule view swaps the source label, README and
+ *  module body for the submodule's (web/user/package.go:207-214's
+ *  PackageSubmodule dispatch). GLYPH DEGRADATION: octicon-key is not in
+ *  the landed octicon allowlist — the credentials label degrades to
+ *  octicon-code (the lock block's posture). */
+function TerraformModuleViewBlock(props: { data: PackageVersionViewData }) {
+  const { data } = props;
+  const moduleView = data.moduleView!;
+  const ownerName = ownerNameOf(data.owner);
+  const source = `https://${data.registryHost}/${ownerName}/${data.pkg.name}`;
+  const sub = moduleView.submodule;
+  const moduleSource = sub === null ? source : `${source}//modules/${sub}`;
+  // StringUtils.Cut name "/" 0 — the module label is the name's first
+  // segment ("vpc/aws" labels as "vpc"; the registry stores "name/provider").
+  const moduleLabel = data.pkg.name.includes("/") ? data.pkg.name.slice(0, data.pkg.name.indexOf("/")) : data.pkg.name;
+  const metadata = moduleView.metadata;
+  const moduleBody = sub === null ? (metadata.root ?? null) : (metadata.submodules?.[sub]?.module ?? null);
+  const readme = sub === null ? (metadata.readme ?? "") : (metadata.submodules?.[sub]?.readme ?? "");
+  const readmeHtml =
+    readme !== ""
+      ? renderRepoMarkdown({
+          text: readme,
+          // The submodule readmes root at modules/<sub> (upstream
+          // RenderPackageMarkdown's CurrentTreePath — the dir rides the
+          // render context).
+          name: sub === null ? "README.md" : `modules/${sub}/README.md`,
+          repo: { ownerNamespace: data.repository?.fullName.split("/")[0] ?? ownerName, slug: data.repository?.fullName.split("/")[1] ?? "" },
+          refType: "branch",
+          ref: moduleView.linkedBranch ?? "main",
+          origin: `https://${data.registryHost}`,
+        })
+      : "";
+  const versionLink = versionWebLink(ownerName, data.pkg.type, data.pkg.lowerName, data.version.lowerVersion);
+  return (
+    <div>
+      <h4 class="ui top attached header">{packagesLocale.installation}</h4>
+      <div class="ui attached segment">
+        <div class="ui form">
+          <div class="field">
+            <label>
+              <Icon name="octicon-code" /> {packagesLocale.tfmod_install}
+            </label>
+            <div class="markup">
+              <pre class="code-block">
+                <code>{`module "${moduleLabel}" {
+	source  = "${moduleSource}"
+	version = "${data.version.version}"
+}`}</code>
+              </pre>
+            </div>
+          </div>
+          <div class="field">
+            <label>
+              <Icon name="octicon-code" /> {packagesLocale.tfmod_install_terragrunt}
+            </label>
+            <div class="markup">
+              <pre class="code-block">
+                <code>{`terraform {
+	source = "tfr://${moduleSource}?version=${data.version.version}"
+}`}</code>
+              </pre>
+            </div>
+          </div>
+          <div class="field">
+            <label>
+              <Icon name="octicon-code" /> {packagesLocale.tfmod_credentials}
+            </label>
+            <div class="markup">
+              <pre class="code-block">
+                <code>{`credentials "${data.registryHost}" {
+	token = "<token>"
+}`}</code>
+              </pre>
+            </div>
+          </div>
+          <div class="field">
+            <label>
+              {packagesLocale.tfmod_registry_documentation}{" "}
+              <a target="_blank" rel="noopener noreferrer" href={DOCS_TERRAFORM_MODULE_URL}>
+                {packagesLocale.empty_documentation_link}
+              </a>
+              .
+            </label>
+          </div>
+        </div>
+      </div>
+      {readmeHtml !== "" ? (
+        <div>
+          <h4 class="ui top attached header">{packagesLocale.about}</h4>
+          <div class="ui attached segment">
+            <div class="markup markdown" dangerouslySetInnerHTML={{ __html: readmeHtml }} />
+          </div>
+        </div>
+      ) : null}
+      {moduleBody?.inputs !== undefined && moduleBody.inputs.length > 0 ? (
+        <div>
+          <h4 class="ui top attached header">{packagesLocale.tfmod_inputs}</h4>
+          <div class="ui attached segment">
+            <table class="ui table">
+              <thead>
+                <tr>
+                  <th>{packagesLocale.tfmod_name}</th>
+                  <th>{packagesLocale.tfmod_type}</th>
+                  <th>{packagesLocale.tfmod_default}</th>
+                  <th>{packagesLocale.tfmod_description}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(moduleBody.inputs ?? []).map((input) => (
+                  <tr>
+                    <td>
+                      <code>{input.name}</code>
+                      {input.required ? (
+                        <>
+                          {" "}
+                          <span class="ui tiny red label">{packagesLocale.tfmod_required}</span>
+                        </>
+                      ) : null}
+                    </td>
+                    <td>
+                      <code>{input.type}</code>
+                    </td>
+                    <td>
+                      <code>{input.default}</code>
+                    </td>
+                    <td>{input.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
+      {moduleBody?.outputs !== undefined && moduleBody.outputs.length > 0 ? (
+        <div>
+          <h4 class="ui top attached header">{packagesLocale.tfmod_outputs}</h4>
+          <div class="ui attached segment">
+            <table class="ui table">
+              <thead>
+                <tr>
+                  <th>{packagesLocale.tfmod_name}</th>
+                  <th>{packagesLocale.tfmod_description}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(moduleBody.outputs ?? []).map((output) => (
+                  <tr>
+                    <td>
+                      <code>{output.name}</code>
+                    </td>
+                    <td>{output.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
+      {moduleBody?.providers !== undefined && moduleBody.providers.length > 0 ? (
+        <div>
+          <h4 class="ui top attached header">{packagesLocale.tfmod_providers}</h4>
+          <div class="ui attached segment">
+            <ul>
+              {(moduleBody.providers ?? []).map((provider) => (
+                <li>
+                  <code>{provider.name}</code>
+                  {provider.source !== undefined ? <> ({provider.source})</> : null}
+                  {provider.version !== undefined ? (
+                    <>
+                      {" "}
+                      <code>{provider.version}</code>
+                    </>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : null}
+      {sub === null && metadata.submodules !== undefined && Object.keys(metadata.submodules).length > 0 ? (
+        <div>
+          <h4 class="ui top attached header">{packagesLocale.tfmod_submodules}</h4>
+          <div class="ui attached segment">
+            <ul>
+              {Object.keys(metadata.submodules).map((name) => (
+                <li>
+                  <a href={`${versionLink}/modules/${pathEscapeSegments(name)}`}>
+                    <code>{`${source}//modules/${name}`}</code>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 /** The view block (package/shared/view.tmpl — the title header + the
  *  packages-content grid). */
 function PackageVersionViewBlock(props: { data: PackageVersionViewData }) {
@@ -1942,7 +2212,10 @@ function PackageVersionViewBlock(props: { data: PackageVersionViewData }) {
         </div>
       </div>
       <div class="packages-content">
-        <div class="packages-content-left">{data.pkg.type === "generic" ? <GenericInstallBlock data={data} /> : null}</div>
+        <div class="packages-content-left">
+          {data.pkg.type === "generic" ? <GenericInstallBlock data={data} /> : null}
+          {data.pkg.type === "terraform-module" && data.moduleView !== null ? <TerraformModuleViewBlock data={data} /> : null}
+        </div>
         <div class="ui segment packages-content-right">
           <strong>{packagesLocale.details}</strong>
           <div class="ui relaxed list flex-items-block">
@@ -2052,11 +2325,20 @@ export function renderOwnerPackageVersionViewPage(ctx: UiContext, data: PackageV
 }
 
 /** The version view page (templates/package/view.tmpl + org arm). */
+/** The page title (package.go's ctx.Data["Title"]): the module view's
+ *  submodule arms gain the ` //modules/<sub>` suffix (web/user/
+ *  package.go:212). */
+function packageViewTitle(data: PackageVersionViewData): string {
+  const sub = data.moduleView?.submodule;
+  return sub !== null && sub !== undefined ? `${data.pkg.name} //modules/${sub}` : data.pkg.name;
+}
+
 export function OwnerPackageVersionViewPage(props: { ctx: UiContext; data: PackageVersionViewData }) {
   const { ctx, data } = props;
+  const title = packageViewTitle(data);
   if (data.owner.kind === "org") {
     return (
-      <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="organization packages">
+      <BaseLayout ctx={ctx} title={title} pageClass="organization packages">
         <div class="ui container">
           <OrgPackagesChrome
             ctx={ctx}
@@ -2072,12 +2354,18 @@ export function OwnerPackageVersionViewPage(props: { ctx: UiContext; data: Packa
     );
   }
   return (
-    <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="user profile packages">
+    <BaseLayout ctx={ctx} title={title} pageClass="user profile packages">
       <UserProfileGrid ctx={ctx} user={data.owner.user} chrome={data}>
         <PackageVersionViewBlock data={data} />
       </UserProfileGrid>
     </BaseLayout>
   );
+}
+
+/** The full-document render — the module view (the SAME page component; the
+ *  submodule dispatch rides the data, upstream reuses ViewPackageVersion). */
+export function renderOwnerPackageModuleViewPage(ctx: UiContext, data: PackageVersionViewData): string {
+  return renderPage(<OwnerPackageVersionViewPage ctx={ctx} data={data} />);
 }
 
 /** The full-document render — the R16 repo tab. */

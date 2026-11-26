@@ -1599,6 +1599,7 @@ import {
   loadRepoPackagesData,
   packageFileDownloadResponse,
   renderOwnerPackageVersionViewPage,
+  renderOwnerPackageModuleViewPage,
   renderOwnerPackageVersionsPage,
   renderOwnerPackagesPage,
   renderRepoPackagesPage,
@@ -2769,6 +2770,7 @@ export interface OwnerPackagesRoute {
     | "owner-package-settings" // GET+POST .../settings/{type}/{name} (write-gated)
     | "owner-package-terraform-lock" // POST .../{version}/terraform/lock
     | "owner-package-terraform-unlock" // POST .../{version}/terraform/unlock
+    | "owner-package-module-view" // GET .../{version}/modules/{submodule} (5d9bfa1e14, web.go:1093)
   ;
   /** Decoded owner segment (user-or-org rows at resolve time). */
   owner: string;
@@ -2780,6 +2782,11 @@ export interface OwnerPackagesRoute {
   /** The parsed file id (the download family; the PathParamInt64 parity —
    *  "007" parses as 7, junk shapes stay unclaimed). */
   fileId?: number;
+  /** The viewed `modules/<name>` segment (the module-view family — the
+   *  terraform MODULE registry's package-page tail, 5d9bfa1e14's
+   *  `m.Get("/modules/{submodule}", user.ViewPackageVersion)`,
+   *  web.go:1093). */
+  submodule?: string;
 }
 
 /** The SPEC-0016 M2 repo packages tab (pages/packages.tsx): upstream's
@@ -5766,6 +5773,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         name,
         version,
       };
+    }
+    // The MODULE view tail (web.go:1093 — `m.Get("/modules/{submodule}",
+    // user.ViewPackageVersion)`): the static "modules" literal rides the
+    // version group exactly as chi registers it; the submodule segment
+    // decodes (a junk % sequence stays unclaimed, the family convention).
+    if (raw.length === 9 && raw[7] === "modules") {
+      let version: string;
+      let submodule: string;
+      try {
+        version = decodeURIComponent(raw[6] as string);
+        submodule = decodeURIComponent(raw[8] as string);
+      } catch {
+        return null;
+      }
+      return { family: "owner-package-module-view", owner, type, name, version, submodule };
     }
     if (raw.length === 9 && raw[7] === "files" && /^\d+$/.test(raw[8] as string)) {
       let version: string;
@@ -18994,7 +19016,8 @@ function isOwnerPackagesRoute(route: ParsedUiRoute): route is OwnerPackagesRoute
     route.family === "owner-package-file-download" ||
     route.family === "owner-package-settings" ||
     route.family === "owner-package-terraform-lock" ||
-    route.family === "owner-package-terraform-unlock"
+    route.family === "owner-package-terraform-unlock" ||
+    route.family === "owner-package-module-view"
   );
 }
 
@@ -19110,6 +19133,31 @@ async function ownerPackageVersionViewPage(c: Context<{ Bindings: Env }>): Promi
   );
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderOwnerPackageVersionViewPage(ctx, data), 200));
+}
+
+/** GET /{owner}/-/packages/{type}/{name}/{version}/modules/{submodule}
+ *  (5d9bfa1e14's `m.Get("/modules/{submodule}", user.ViewPackageVersion)`,
+ *  web.go:1093 — the SAME handler upstream, so the same view page: the
+ *  loader 404-shells when the metadata is not module metadata or lacks the
+ *  submodule, exactly web/user/package.go:207-214's guard; the page title
+ *  gains the ` //modules/<sub>` suffix, package.go's ctx.Data["Title"]). */
+async function ownerPackageModuleViewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-module-view") return respond(await c.notFound()); // drift guard
+  const data = await loadOwnerPackageVersionViewData(
+    c.env.DB,
+    owner,
+    viewer,
+    url.origin,
+    route.type ?? "",
+    route.name ?? "",
+    route.version ?? "",
+    route.submodule ?? null,
+  );
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOwnerPackageModuleViewPage(ctx, data), 200));
 }
 
 /** GET /{owner}/-/packages/{type}/{name}/{version}/files/{fileid} (upstream
@@ -22252,4 +22300,9 @@ uiRouter.post("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVers
 uiRouter.post("/:owner/-/packages/:type/:name/:version/terraform/lock", (c) => ownerPackageTerraformLockToggle(c));
 uiRouter.post("/:owner/-/packages/:type/:name/:version/terraform/unlock", (c) => ownerPackageTerraformLockToggle(c));
 uiRouter.get("/:owner/-/packages/:type/:name/:version/files/:fileid{[0-9]+}", (c) => ownerPackageFileDownload(c));
+// The MODULE view tail (5d9bfa1e14 — web.go:1093's `m.Get(
+// "/modules/{submodule}", user.ViewPackageVersion)`): the static "modules"
+// literal rides the version group; the loader 404-shells the submodule
+// misses (the upstream handler's guard).
+uiRouter.get("/:owner/-/packages/:type/:name/:version/modules/:submodule", (c) => ownerPackageModuleViewPage(c));
 uiRouter.get("/:owner/:repo{[^-].*}/packages", (c) => repoPackagesPage(c));
