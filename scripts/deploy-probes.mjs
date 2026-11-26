@@ -4652,19 +4652,21 @@ const demoConfigDrift = (config, label) => {
       drift.push(`${label}: no repo-tasks-dlq consumer entry (§3.0/M0)`);
     }
   }
-  // DEMO_MODE posture (revised 2026-10-29): the §2 hard invariant binds the
-  // EXAMPLE template (a default self-host deployment never arms) — the
-  // example MUST carry "false". The LIVE wrangler.jsonc may carry either:
-  // "false" (self-host posture) or "true" ONLY as the deliberate reference-
-  // instance posture, which is exactly characterized by the demo custom
-  // domain route — armed without the route would put the bare workers.dev
-  // surface into demo quotas with no demo face, which is never intended.
-  // Pre-revision this check hard-required "false" in both files and false-
-  // fired on every post-demo-launch deploy (observed run of 2026-10-29).
-  const demoRoute = Array.isArray(config?.routes) && config.routes.some((r) => typeof r?.pattern === "string" && r.pattern.includes("cf-gitea-demo"));
+  // DEMO_MODE posture (revised 2026-11-26): the §2 hard invariant still
+  // binds the EXAMPLE template (a default self-host deployment never arms)
+  // — the example MUST carry "false". The LIVE wrangler.jsonc may carry
+  // either: "false" (self-host posture) or "true" as the deliberate demo
+  // posture. The 2026-10-29 revision demanded a cf-gitea-demo custom-domain
+  // route for the armed posture; that domain era ENDED — the demo face is
+  // now the workers.dev URL itself, and the runbook's posture doctrine
+  // (the B87 lesson, 2026-11-14) defines the deployed posture as the
+  // ALLOW_SIGNUP/DEMO_MODE pair with this battery's signup-open + banner
+  // arms as its canaries. The route clause false-fires on every deploy
+  // since (observed 2026-11-26); the demo-face characterization moves to
+  // those arms, where the deployed state is actually observable.
   if (config?.vars?.DEMO_MODE === "true") {
-    if (label === "wrangler.jsonc.example" || !demoRoute) {
-      drift.push(`${label}: vars.DEMO_MODE "true" ${label === "wrangler.jsonc.example" ? "in the example template (the §2 hard invariant — a default deployment never arms)" : "without the cf-gitea-demo route (armed demo posture on a bare surface is never the intent)"}`);
+    if (label === "wrangler.jsonc.example") {
+      drift.push(`${label}: vars.DEMO_MODE "true" in the example template (the §2 hard invariant — a default deployment never arms)`);
     }
   } else if (config?.vars?.DEMO_MODE !== "false") {
     drift.push(`${label}: vars.DEMO_MODE is ${JSON.stringify(config?.vars?.DEMO_MODE)} (expected "false", or "true" with the demo route)`);
@@ -4679,13 +4681,13 @@ const demoContext = () => ({
 const demoSteps = (ctx) => [
   {
     id: "demo-config-posture",
-    expect: `the committed deploy configs (wrangler.jsonc + wrangler.jsonc.example — the source every deploy is cut from) carry the demo machinery: the hourly "${DEMO_HOURLY_CRON}" cron entry beside the standing "*/10 * * * *" (§3.1), the repo-tasks consumer's dead_letter_queue "repo-tasks-dlq" + the repo-tasks-dlq consumer entry (M0, §3.0), and vars.DEMO_MODE defaulting to "false" in BOTH (the §2 hard invariant — a default deployment never arms)`,
+    expect: `the committed deploy configs (wrangler.jsonc + wrangler.jsonc.example — the source every deploy is cut from) carry the demo machinery: the hourly "${DEMO_HOURLY_CRON}" cron entry beside the standing "*/10 * * * *" (§3.1), the repo-tasks consumer's dead_letter_queue "repo-tasks-dlq" + the repo-tasks-dlq consumer entry (M0, §3.0), and vars.DEMO_MODE "false" in the EXAMPLE template (the §2 hard invariant — a default deployment never arms; the live config's armed demo posture is characterized by the signup-open + banner arms, revised 2026-11-26)`,
     run: async () => {
       const live = parseJsonc(await readFile(path.join(workerDir, "wrangler.jsonc"), "utf8"));
       const example = parseJsonc(await readFile(path.join(workerDir, "wrangler.jsonc.example"), "utf8"));
       const drift = [...demoConfigDrift(live, "wrangler.jsonc"), ...demoConfigDrift(example, "wrangler.jsonc.example")];
       expect(drift.length === 0, drift.join("; "));
-      return `both configs carry the hourly "${DEMO_HOURLY_CRON}" cron + the repo-tasks-dlq wiring (M0) with DEMO_MODE defaulting "false" — the §2 invariant holds at the config layer (the deployed instance's armed state rides the banner arm + the ops notes)`;
+      return `both configs carry the hourly "${DEMO_HOURLY_CRON}" cron + the repo-tasks-dlq wiring (M0) with the example's DEMO_MODE default "false" — the §2 invariant holds at the config layer (the deployed instance's armed state rides the signup-open + banner arms)`;
     },
   },
   {
