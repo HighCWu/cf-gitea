@@ -430,7 +430,9 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
   // ErrRepoAlreadyExist.Error() "repository already exists [owner: %s, repo:
   // %s]" (update.go:79-81, fields = the lowercased pair), and
   // reserved/pattern names unwrap util.ErrInvalidArgument → 400 (was 422;
-  // db/name.go:31-33). The PATCH rename arm keeps its explicit 422.
+  // db/name.go:31-33) with upstream's EXACT per-class text (the SMALLS6-
+  // open-#1 split-text adoption). The PATCH rename arm keeps its explicit
+  // 422.
   it("409s a duplicate name (APIErrorAuto text) and 400s an invalid/reserved name", async () => {
     const alice = await seedUser("Alice");
     const org = await seedOrg("Acme", alice.id);
@@ -445,14 +447,18 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
 
     // Invalid names: the IsUsableRepoName port (pattern, reserved suffixes) —
     // single dots are legal, so use a real violation (space / .git suffix).
-    // Status 400 (the ErrInvalidArgument unwrap); the wire text stays our
-    // conflated port message (the user-repos.ts handler divergence note).
+    // Status 400 (the ErrInvalidArgument unwrap); the wire text is the
+    // per-class split — chars (db/name.go:66) / pattern (db/name.go:48-50,
+    // the TABLE pattern `*.git`).
     const spaced = await router()("/orgs/acme/repos", {
       method: "POST",
       headers: authHeaders(alice.id),
       body: JSON.stringify({ name: "bad name" }),
     });
     expect(spaced.status).toBe(400);
+    expect((await spaced.json<{ message: string }>()).message).toBe(
+      "name is invalid [bad name]: must be valid alpha or numeric or dash(-_) or dot characters",
+    );
 
     const gitSuffix = await router()("/orgs/acme/repos", {
       method: "POST",
@@ -460,6 +466,7 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
       body: JSON.stringify({ name: "repo.git" }),
     });
     expect(gitSuffix.status).toBe(400);
+    expect((await gitSuffix.json<{ message: string }>()).message).toBe("name pattern is not allowed [pattern: *.git]");
 
     const malformed = await router()("/orgs/acme/repos", { method: "POST", headers: authHeaders(alice.id), body: "{not json" });
     expect(malformed.status).toBe(400); // hono's media-type gate, Gitea error shape

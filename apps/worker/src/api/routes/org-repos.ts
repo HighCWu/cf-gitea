@@ -24,6 +24,7 @@ import {
   toCreatedOrgRepository,
 } from "../services/org-repos";
 import { findRepositoryById, toApiRepository, viewerOf } from "../services/repository";
+import { repoNameRejectMessage } from "./user-repos";
 
 /**
  * Tier-1 `organization`-tagged routes (SPEC-0007 §2.2 rows 1–3):
@@ -238,8 +239,9 @@ export function registerOrgRoutes(
     // commit (the owner's git signature, i.e. the org-as-user row — init.go
     // initRepoCommit(ctx, tmpPath, repo, u)) and the is_empty flip; an
     // unknown gitignores/license template name 500s with the row rolled
-    // back (create.go:236-241,448-456 — the user-repos route note and the
-    // RUNTIME_ONLY table entry carry the cites). The
+    // back (create.go:236-241,448-456 — the user-repos route note carries
+    // the cites; the undeclared 500 rides the checker's default-fold
+    // equivalence, the SPLITTEXT RUNTIME_ONLY prune). The
     // engine registry rides the create (REDEPLOY8 — the user-repos note):
     // bare construction skips seedRepoExtras' upsert and the repo 404s on
     // info/refs/clone until a push lands.
@@ -263,9 +265,12 @@ export function registerOrgRoutes(
         // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) →
         // APIErrorAuto 400 on CREATE (was the pre-repin 422; the PATCH
         // rename arm keeps its explicit 422, repo.go:618-627 — not this
-        // route). The wire text stays our conflated port message (the
-        // user-repos.ts handler note records the class-split divergence).
-        throw new ApiError(400, error.message);
+        // route). SPLIT-TEXT ADOPTION (SMALLS6 open #1): the wire text is
+        // upstream's EXACT per-class string via the classifier
+        // (repoNameRejectMessage in user-repos.ts — the shared render the
+        // four create arms import; the engine extra keeps the conflated
+        // port message).
+        throw new ApiError(400, repoNameRejectMessage(error.repoName));
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

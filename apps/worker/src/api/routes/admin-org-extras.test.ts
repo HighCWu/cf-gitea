@@ -216,7 +216,7 @@ describe("POST /org/{org}/repos (createOrgRepoDeprecated)", () => {
     });
   });
 
-  it("400s a reserved-suffix name (the RE-PIN ErrInvalidArgument unwrap, was 422)", async () => {
+  it("400s a reserved-suffix name with upstream's pattern-class text (the RE-PIN unwrap, was 422)", async () => {
     const { owner, org } = await seedActors();
     const res = await router()(`/org/${org.username}/repos`, {
       method: "POST",
@@ -224,10 +224,10 @@ describe("POST /org/{org}/repos (createOrgRepoDeprecated)", () => {
       body: JSON.stringify({ name: "held.wiki" }),
     });
     expect(res.status).toBe(400);
-    // The conflated port text — upstream splits reserved vs pattern
-    // ("name is reserved [name: %s]" / "name pattern is not allowed
-    // [pattern: %s]", db/name.go:24-26/:48-50); the recorded divergence.
-    expect((await res.json<{ message: string }>()).message).toBe("repository name is not allowed: held.wiki");
+    // The split-text adoption (SMALLS6 open #1): ErrNamePatternNotAllowed's
+    // exact string "name pattern is not allowed [pattern: %s]"
+    // (db/name.go:48-50) — %s is the TABLE pattern (`*.wiki`).
+    expect((await res.json<{ message: string }>()).message).toBe("name pattern is not allowed [pattern: *.wiki]");
     const rows = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, "held.wiki")).all();
     expect(rows).toHaveLength(0); // no row lands on the refused name
   });

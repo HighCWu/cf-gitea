@@ -1876,8 +1876,9 @@ describe("POST /admin/users/{username}/repos (adminCreateRepo)", () => {
   // duplicate 409 text is ErrRepoAlreadyExist.Error() "repository already
   // exists [owner: %s, repo: %s]" (update.go:79-81, fields = the lowercased
   // pair) and reserved/pattern names unwrap util.ErrInvalidArgument → 400
-  // (was 422; db/name.go:31-33). The wire text for the invalid class stays
-  // our conflated port message (the user-repos.ts divergence note).
+  // (was 422; db/name.go:31-33). The wire text is now upstream's EXACT
+  // per-class string (the SMALLS6-open-#1 split-text adoption — the
+  // pattern class renders the TABLE pattern, db/name.go:48-50).
   it("409s a name collision (APIErrorAuto text) and 400s an unusable repo name", async () => {
     await seedRepo(neighborId, "neighbor", "taken", "9102");
     const collision = await adminSend("/admin/users/neighbor/repos", jsonAdmin({ name: "taken" }));
@@ -1889,7 +1890,7 @@ describe("POST /admin/users/{username}/repos (adminCreateRepo)", () => {
     const invalid = await adminSend("/admin/users/neighbor/repos", jsonAdmin({ name: "held.wiki" }));
     expect(invalid.status).toBe(400);
     expect(((await invalid.json<Record<string, unknown>>())).message).toBe(
-      "repository name is not allowed: held.wiki",
+      "name pattern is not allowed [pattern: *.wiki]",
     );
   });
 

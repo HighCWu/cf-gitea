@@ -31,6 +31,7 @@ import {
   findRepositoryByPath,
   viewerOf,
 } from "../services/repository";
+import { repoNameRejectMessage } from "./user-repos";
 
 /**
  * Org/repo EXTRAS — the three non-aggregate ops of the api-remaining-inventory
@@ -219,12 +220,14 @@ export function registerAdminOrgExtrasRoutes(
         // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) →
         // APIErrorAuto 400 on CREATE (was the pre-repin 422; the PATCH
         // rename arm keeps its explicit 422, repo.go:618-627 — not this
-        // route). The wire text stays our conflated port message — the
-        // user-repos.ts handler note records the class-split divergence.
+        // route). SPLIT-TEXT ADOPTION (SMALLS6 open #1): the wire text is
+        // upstream's EXACT per-class string via the classifier
+        // (repoNameRejectMessage in user-repos.ts; the engine extra keeps
+        // the conflated port message).
         // Runtime-only undeclared like the 409: the frozen contract for this
         // deprecated alias documents {201,403,404,422} (the {201,default}
         // fold posture — the emitted 400 is upstream's RUNTIME ladder).
-        throw new ApiError(400, error.message);
+        throw new ApiError(400, repoNameRejectMessage(error.repoName));
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

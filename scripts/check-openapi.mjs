@@ -55,6 +55,16 @@ const HTTP_METHODS = new Set(["get", "put", "post", "delete", "options", "head",
 /**
  * Declared responses upstream really sends at runtime but the vendored swagger
  * omits (SPEC-0004 §2.5). Warned as documented exceptions, not failures.
+ *
+ * SPLITTEXT prune (the GATEFIX open's envelope-class pass): the entries whose
+ * declared code is a 4xx/5xx on a single-2xx+`default` FOLD-SHAPE op are gone
+ * — the DEFAULT-FOLD EQUIVALENCE rule below passes exactly those codes now
+ * (each removal verified by a check-openapi run still exiting 0). KEPT: every
+ * wire-derived 2xx substitution (the fold rule hard-fails a different 2xx —
+ * /packages/…/-/unlink's 204, /repos/…/transfer's 201), every entry on an op
+ * that is NOT the fold shape (multi-success or a no-`default` contract — the
+ * strict subset rule still needs them), and every entry whose op's contract
+ * carries no `default` at all.
  */
 const RUNTIME_ONLY_RESPONSES = {
   "/packages/{owner}/{type}/{name}/-/unlink": {
@@ -74,33 +84,9 @@ const RUNTIME_ONLY_RESPONSES = {
       401: "upstream reqToken() rejects anonymous callers; swagger documents only 200",
     },
   },
-  "/repositories/{id}": {
-    get: {
-      401: "upstream reqToken() (token required for repoGetByID); contract documents 200/404 only",
-    },
-  },
   "/user/repos": {
     get: {
       401: "upstream reqToken() (token required for userCurrentListRepos); contract documents 200 only",
-    },
-    post: {
-      500: "unknown gitignores/license template fails initRepository AFTER the row lands — CreateRepositoryDirectly's deferred cleanupRepository deletes it (services/repository/create.go:236-241,448-456) and CreateUserRepo's unmapped-error arm answers APIErrorInternal (repo.go:254-259; only already-exist/reserved/pattern/label-template map to 409/422); contract documents {201,400,409,422}",
-    },
-  },
-  "/markdown": {
-    post: {
-      401: "upstream reqToken() (routers/api/v1/api.go:1018); contract documents 200/422 only",
-      400: "hono validator rejects malformed JSON before route mapping (upstream bind 422s everything, api.go:841-844) — documented divergence",
-    },
-  },
-  "/markdown/raw": {
-    post: {
-      401: "upstream reqToken() (routers/api/v1/api.go:1018); contract documents 200/422 only",
-    },
-  },
-  "/repos/{owner}/{repo}/statuses/{sha}": {
-    post: {
-      422: "non-full-length sha input rejected at runtime (upstream resolves refs via the engine and 500s on unknown — neither reproducible without engine ref resolution); declared set stays {201,400,404}",
     },
   },
   "/repos/{owner}/{repo}/pulls/{index}/merge": {
@@ -145,34 +131,20 @@ const RUNTIME_ONLY_RESPONSES = {
       // pending, so 201 is the success code we ship; the frozen contract
       // carries only the never-emitted-here 202.
       201: "upstream repoTransfer answers StatusCreated on the pending arm (transfer.go:126-130); its swagger documents only the direct-transfer 202 (transfer.go:48-58 vs :132-133)",
-      // The duplicate-request conflict: upstream maps
-      // IsErrRepoTransferInProgress to StatusConflict when a transfer is
-      // re-requested while one is pending (transfer.go:113-115, raised by
-      // TestRepositoryReadyForTransfer for a RepositoryPendingTransfer
-      // status, models/repo/transfer.go:213-222 via
-      // services/repository/transfer.go:445-446); its swagger documents only
-      // {202,403,404,422}.
-      409: "upstream repoTransfer maps IsErrRepoTransferInProgress to StatusConflict on a pending-duplicate re-request (transfer.go:113-115); its swagger documents only {202,403,404,422}",
+      // The duplicate-request conflict (upstream maps
+      // IsErrRepoTransferInProgress to StatusConflict on a pending-duplicate
+      // re-request, transfer.go:113-115) rides the default-fold equivalence
+      // now (contract {202, default} — the SPLITTEXT prune).
     },
   },
   "/user/followers": {
     get: { 401: "upstream reqToken(); contract documents 200 only" },
   },
-  "/user/following/{username}": {
-    put: { 401: "upstream reqToken(); contract documents 204/404 only" },
-    delete: { 401: "upstream reqToken(); contract documents 204/404 only" },
-  },
-  "/users/{username}/keys": {
-    get: { 401: "upstream reqToken(); contract documents 200 only" },
-  },
-  "/users/{username}/gpg_keys": {
-    get: { 401: "upstream reqToken(); contract documents 200 only" },
-  },
-  "/repos/{owner}/{repo}/milestones/{id}": {
-    patch: {
-      400: "due_on parse failure returns upstream's 'invalid date format' at runtime; undeclared in the vendored contract (same class as /user 401)",
-    },
-  },
+  // The /user/following/{username} put/delete 401s, /users/{username}/keys
+  // and /users/{username}/gpg_keys get 401s, and the repo milestones patch
+  // 400 — all on single-2xx+`default` fold-shape ops — ride the default-fold
+  // equivalence now (the SPLITTEXT prune; their route notes keep the
+  // derivations).
   "/signing-key.gpg": {
     get: {
       404: "cf-gitea has no signing-key configuration, so the format is blank and upstream's own handler answers APIErrorNotFound(\"no signing key\") at runtime (gitea/routers/api/v1/misc/signing.go:14-24); the contract documents only the 200 text/plain",
@@ -193,38 +165,13 @@ const RUNTIME_ONLY_RESPONSES = {
       404: "repo arm of SigningKeySSH (misc/signing.go:100 via api.go:1531) — same blank-format answer as /repos/{owner}/{repo}/signing-key.gpg; the contract documents only the 200 text/plain",
     },
   },
-  "/repos/{owner}/{repo}/hooks/git": {
-    get: {
-      401: "upstream reqToken() (gitea/routers/api/v1/api.go:1276) rejects anonymous callers; the contract declares {200,404} only",
-      403: "upstream reqAdmin (api.go:383-390) — the repo-admin gate 403s before the handler; the contract documents no 403 on the list (routes/git-hooks.ts)",
-    },
-  },
-  "/repos/{owner}/{repo}/hooks/git/{id}": {
-    get: {
-      401: "same reqToken class as the list (api.go:1276); contract documents {200,404} only",
-      403: "reqAdmin (api.go:383-390); contract documents {200,404} only",
-    },
-    patch: {
-      401: "same reqToken class as the list (api.go:1276)",
-      403: "reqAdmin (api.go:383-390)",
-      422: "Go bind → APIErrorValidation on a schema-invalid body",
-    },
-    delete: {
-      401: "same reqToken class as the list (api.go:1276)",
-      403: "reqAdmin (api.go:383-390); contract documents {204,404} only",
-    },
-  },
-  "/admin/users/{username}/keys": {
-    post: {
-      401: "upstream reqToken() runs inside the admin group's tokenRequiresScopes(admin) chain (gitea/routers/api/v1/api.go:1824-); the admin tag declares no 401 anywhere (routes/misc-t3.ts admin wiring note)",
-      404: "the /users/{username} subgroup's context.UserAssignmentAPI() answers 404 'user redirect does not exist [name: …]' for an unknown username at runtime (gitea/services/context/user.go userAssignment; emitted by routes/misc-t3.ts resolveAdminTargetRow); the contract documents {201,403,422} only",
-    },
-  },
-  "/admin/cron/{task}": {
-    post: {
-      403: "the /admin group's reqSiteAdmin 403s non-admins before the handler runs (gitea/routers/api/v1/api.go:1824-); upstream's own swagger comment for adminCronRun documents only {204,404} while its sibling adminCronList DOES declare the 403 (admin/cron.go) — a doc-comment gap upstream sends anyway; declared by routes/admin-degenerate.ts",
-    },
-  },
+  // The /repos/{owner}/{repo}/hooks/git family (list/get/patch/delete — the
+  // reqToken 401s, reqAdmin 403s, the bind 422) and /admin/users/{username}/
+  // keys post (401/404) all sit on single-2xx+`default` fold-shape ops — the
+  // default-fold equivalence covers their declared extras (the SPLITTEXT
+  // prune; routes/git-hooks.ts + routes/misc-t3.ts keep the derivations).
+  // /admin/cron/{task} post 403 (contract {204, default}) rides the same
+  // fold pass.
   // The /admin/unadopted/{owner}/{repo} delete-404 entry was removed with the
   // surface: upstream 1554b6c939 deleted the adopt feature (adopt.go gone, no
   // route at api.go), so cf-gitea no longer serves the op (routes/
@@ -238,33 +185,14 @@ const RUNTIME_ONLY_RESPONSES = {
       500: "unknown/corrupt/oversized-dimension image is upstream's APIErrorInternal (image.DecodeConfig arms) — the landed constant-fallback convention (routes/avatars.ts header)",
     },
   },
-  "/orgs/{org}/avatar": {
-    post: {
-      400: "same base64/origin-cap arms as /user/avatar (the org arm is user_service.UploadAvatar(org.AsUser()) — org/avatar.go:46)",
-      401: "reqToken(); contract documents only 204",
-      403: "reqOrgOwnership 403s non-owners (upstream's exact message) — the contract documents only 204",
-      404: "org assignment miss (rename-307 seam's terminal arm)",
-      413: "the wire-cap guard (as /user/avatar)",
-      422: "zod body bind failures",
-      500: "the image arms (as /user/avatar)",
-    },
-  },
-  "/repos/{owner}/{repo}/avatar": {
-    post: {
-      400: "same base64/origin-cap arms (the repo arm shares the upload service)",
-      401: "reqToken(); contract documents only 204",
-      403: "requireRepoAdmin 403s non-admins (upstream's exact message)",
-      404: "repo resolution miss (anti-enumeration)",
-      413: "the wire-cap guard",
-      422: "zod body bind failures",
-      500: "the image arms",
-    },
-  },
-  "/repos/{owner}/{repo}/issues/{index}/comments": {
-    post: {
-      422: "Go bind → APIErrorValidation on an empty/absent body — CreateIssueCommentOption.Body carries binding:\"Required\" (structs/issue_comment.go:37), the Required rule fires on the zero value (modules/web/binding/binding.go:136-146) and api.go:838-845 answers 422; upstream's own swagger documents {201,403,404,423} only",
-    },
-  },
+  // The org/repo avatar post blocks ({400,401,403,404,413,422,500} against
+  // the contract's {204, default} fold shape) ride the default-fold
+  // equivalence now (the SPLITTEXT prune; the /user/avatar block above stays
+  // because that op's contract documents {204} with NO `default` — the
+  // strict subset rule needs its entries). So do POST /repos/{owner}/{repo}/
+  // issues/{index}/comments' 422 (the Go bind arm on
+  // CreateIssueCommentOption.Body's binding:"Required",
+  // structs/issue_comment.go:37 → api.go:838-845; contract {201, default}).
   "/repos/{owner}/{repo}/issues/comments/{id}": {
     get: {
       // 099abf5db4 fold victims (5671c5192d, doc-only): pre-fold contract
@@ -286,52 +214,29 @@ const RUNTIME_ONLY_RESPONSES = {
     },
   },
   "/orgs/{org}/repos": {
-    post: {
-      500: "same initRepository rollback arm as /user/repos (create.go:236-241,448-456 via repo.go:254-259 — CreateOrgRepo delegates to CreateUserRepo, repo.go:491); contract documents {201,400,403,404}",
-    },
     delete: {
       // 099abf5db4 fold victim: pre-fold contract documented {202,204,403,
       // 404} — {202,204} kept alongside `default` (multi-success, strict
       // rule). Wire: the org-owner permission gate 403 and the org-miss 404
-      // both answer before DeleteRepository runs.
+      // both answer before DeleteRepository runs. (The create arm's 500 —
+      // the initRepository rollback, create.go:236-241,448-456 — rides the
+      // default-fold equivalence now: contract {201, default}, the SPLITTEXT
+      // prune.)
       403: "pre-fold contract documented {202,204,403,404}; 5671c5192d fold (doc-only) — the org-owner permission gate still 403s at runtime",
       404: "pre-fold contract documented {202,204,403,404}; 5671c5192d fold (doc-only) — the org-miss arm still answers APIErrorNotFound at runtime",
     },
   },
-  "/admin/users/{username}/repos": {
-    post: {
-      500: "same initRepository rollback arm as /user/repos (create.go:236-241,448-456 via repo.go:254-259 — the admin handler calls repo.CreateUserRepo, admin/repo.go:48); contract documents {201,400,403,404,409,422}",
-    },
-  },
-  "/packages/{owner}/{type}/{name}": {
-    delete: {
-      // The terraform specialization's OnBeforeRemovePackageAll guard
-      // (services/packages/terraform/spec.go:50-62) refuses a LOCKED state,
-      // wrapped as util.ErrUnprocessableContent — the util error family's
-      // errorForUser status 422 (modules/util/error.go:25-31) with
-      // "terraform state is locked and cannot be deleted" as the message —
-      // while the vendored swagger documents only {204,404}. The route now
-      // DECLARES the 422 (routes/packages.ts terraformDeleteRefusal; pinned
-      // 422-for-422 by packages.test.ts), so this entry is the REQUIRED
-      // documented exception for the widened declaration — removing it
-      // hard-fails the declared ⊆ contract rule (verified: exit 1,
-      // "declares response 422; contract has {204, 404} and no documented
-      // exception covers it"). Same posture as /user/avatar's declared
-      // extras.
-      422: "terraform locked-delete refusal (spec.go:50-62 wraps util.ErrUnprocessableContent → the errorForUser 422); contract documents {204,404} — the route declares the runtime-faithful 422, this entry is its exception",
-    },
-  },
-  "/packages/{owner}/{type}/{name}/{version}": {
-    delete: {
-      // Same guard family for the version delete (spec.go:64-80): the locked
-      // refusal FIRST (:66-74), then the latest-version refusal — "the
-      // latest version of a Terraform state cannot be deleted" — both the
-      // errorForUser 422 against a contract set of {204,404}. The route
-      // declares the 422 (terraformDeleteRefusal), so this entry is the
-      // required exception, as for the package delete above.
-      422: "terraform guards on the version delete (spec.go:64-80 — the locked refusal, then the latest-version refusal, both util.ErrUnprocessableContent → 422); contract documents {204,404} — the route declares the runtime-faithful 422, this entry is its exception",
-    },
-  },
+  // /admin/users/{username}/repos post 500 (the same initRepository rollback
+  // arm — admin/repo.go:48) rides the default-fold equivalence now (contract
+  // {201, default}, the SPLITTEXT prune).
+  // The terraform packages 422s (DELETE /packages/{owner}/{type}/{name} and
+  // …/{version} — spec.go:50-62/:64-80's locked/latest-version refusals,
+  // util.ErrUnprocessableContent → the errorForUser 422, declared by
+  // routes/packages.ts terraformDeleteRefusal) ride the default-fold
+  // equivalence now: the 09c2b92 re-baselined contract is {204, default}
+  // for both ops (the pre-fold {204,404} note's "removing it hard-fails"
+  // verification predates the fold rule and no longer holds — verified:
+  // removal + check-openapi exit 0, the SPLITTEXT prune).
 
   // ─── 5671c5192d fold victims on MULTI-SUCCESS ops (the 099abf5db4 re-pin) ───
   // Upstream 5671c5192d ("refactor: use default error response for swagger",

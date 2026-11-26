@@ -381,11 +381,14 @@ describe("POST /user/repos object_format_name (B-24)", () => {
 // 79-81, fields = the lowercased {u.LowerName, name} pair) — was the
 // pre-repin "The repository with the same name already exists." — and
 // reserved/pattern names unwrap util.ErrInvalidArgument (models/db/name.go:
-// 31-33/:55-57) → 400, was the pre-repin 422. The PATCH rename arm keeps
-// its explicit 422 (repo.go:618-627) — not this route.
+// 31-33/:55-57) → 400, was the pre-repin 422, and the wire text is now
+// upstream's EXACT per-class string (the SMALLS6-open-#1 split-text
+// adoption over repos/service.ts's classifyRepoNameReject; the engine extra
+// keeps the conflated port message). The PATCH rename arm keeps its
+// explicit 422 (repo.go:618-627) — not this route.
 // ---------------------------------------------------------------------------
 
-describe("POST /user/repos name-error ladder (RE-PIN b3422c0920)", () => {
+describe("POST /user/repos name-error ladder (RE-PIN b3422c0920 + the split-text adoption)", () => {
   it("409s a duplicate with the APIErrorAuto collision text", async () => {
     await seedStubRow();
     const first = await apiCreate({ name: "dup-name" });
@@ -398,15 +401,28 @@ describe("POST /user/repos name-error ladder (RE-PIN b3422c0920)", () => {
     });
   });
 
-  it("400s a reserved-suffix name (the ErrInvalidArgument unwrap)", async () => {
+  it("400s an unusable name with upstream's EXACT per-class text (the split-text adoption)", async () => {
     await seedStubRow();
+    // pattern class: ErrNamePatternNotAllowed's "name pattern is not allowed
+    // [pattern: %s]" (db/name.go:48-50) — %s is the TABLE pattern
+    // (`*.wiki`), matched case-insensitively on the lowered name.
     const reserved = await apiCreate({ name: "held.wiki" });
     expect(reserved.status).toBe(400);
     const body = await reserved.json<{ message: string }>();
-    // The conflated port text — upstream splits reserved vs pattern
-    // ("name is reserved [name: %s]" / "name pattern is not allowed
-    // [pattern: %s]", db/name.go:24-26/:48-50); the recorded divergence.
-    expect(body.message).toBe("repository name is not allowed: held.wiki");
+    expect(body.message).toBe("name pattern is not allowed [pattern: *.wiki]");
+    // chars class: ErrNameCharsNotAllowed's "name is invalid [%s]: must be
+    // valid alpha or numeric or dash(-_) or dot characters" (db/name.go:66
+    // via the IsUsableRepoName first leg, models/repo/repo.go:82-86).
+    const chars = await apiCreate({ name: "bad name" });
+    expect(chars.status).toBe(400);
+    expect((await chars.json<{ message: string }>()).message).toBe(
+      "name is invalid [bad name]: must be valid alpha or numeric or dash(-_) or dot characters",
+    );
+    // reserved class: ErrNameReserved's "name is reserved [name: %s]"
+    // (db/name.go:24-26) — the exact-match leg {".", "..", "-"}.
+    const dash = await apiCreate({ name: "-" });
+    expect(dash.status).toBe(400);
+    expect((await dash.json<{ message: string }>()).message).toBe("name is reserved [name: -]");
     const rows = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
     expect(rows).toHaveLength(0);
   });

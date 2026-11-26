@@ -1353,6 +1353,76 @@ describe("the web write arms", () => {
     const row = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("retarget")))!;
     expect(row.pullRequest.baseBranch).toBe("release");
     expect(row.pullRequest.status).toBe(PRStatus.Checking);
+    // The doer tail (SMALLS6 open #4 — the web arm threads the doer): the
+    // type-25 ChangeTargetBranch comment is attributed to the WEB DOER (bob,
+    // the poster who submitted the form) — before the threading the web arm
+    // passed no doer and this comment was API-only.
+    const retargetComments = await d1()
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, row.issue.id), eq(comments.type, CommentType.ChangeTargetBranch)))
+      .all();
+    expect(retargetComments).toHaveLength(1);
+    expect(retargetComments[0]!.posterId).toBe(bob.id);
+    expect(retargetComments[0]!.oldRef).toBe("main");
+    expect(retargetComments[0]!.newRef).toBe("release");
+  });
+
+  it("the retarget's doer cancels a non-writer's scheduled auto-merge (base_changed); a writer's schedule stays", async () => {
+    // Two scheduled fixtures (the amgreen shape — a mergeable PR with no
+    // status rows, MWCS submit by ALICE the writer) and two fresh target
+    // branches (the earlier tests consume/delete the shared ones; fresh
+    // branches also keep the open feature→target duplicate set empty).
+    await landCommit({ ownerNamespace: "alice", slug: "wrepo" }, branchRef("amtarget1"), {
+      parents: [rootOid],
+      message: "am target one",
+      fileName: "AMTARGET1",
+      content: "1\n",
+    });
+    await landCommit({ ownerNamespace: "alice", slug: "wrepo" }, branchRef("amtarget2"), {
+      parents: [rootOid],
+      message: "am target two",
+      fileName: "AMTARGET2",
+      content: "2\n",
+    });
+    await seedWritePr("amretarget", { title: "feat: amretarget", headBranch: "feature" }, { headSha: featureOid });
+    await seedWritePr("amstay", { title: "feat: amstay", headBranch: "feature" }, { headSha: featureOid });
+    await mergePullRequestFromWeb(await writeCtx("amretarget", alice), mergeFormOf({ do: "squash", merge_when_checks_succeed: "true" }));
+    await mergePullRequestFromWeb(await writeCtx("amstay", alice), mergeFormOf({ do: "squash", merge_when_checks_succeed: "true" }));
+    const nonWriterIssueId = writeIssueIds.amretarget!;
+    const writerIssueId = writeIssueIds.amstay!;
+    expect(await getScheduledAutoMerge(env.DB, nonWriterIssueId)).not.toBeNull();
+    expect(await getScheduledAutoMerge(env.DB, writerIssueId)).not.toBeNull();
+
+    // BOB (the poster, no code write on the base) retargets →
+    // DisableAutoMergeIfNotWriter cancels with "base_changed"
+    // (pull.go:398-409; the reason rides the type-35 comment's content).
+    expect(
+      await changeTargetBranchFromWeb(await writeCtx("amretarget", bob), parseTargetBranchForm(new URLSearchParams({ target_branch: "amtarget1" }))),
+    ).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("amretarget")}` });
+    expect(await getScheduledAutoMerge(env.DB, nonWriterIssueId)).toBeNull();
+    const cancels = await d1()
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, nonWriterIssueId), eq(comments.type, CommentType.PRUnscheduledToAutoMerge)))
+      .all();
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]!.content).toBe("base_changed");
+    expect(cancels[0]!.posterId).toBe(bob.id);
+
+    // ALICE (a writer) retargets hers → the schedule STAYS (pull.go:375 —
+    // the new base may have made the pull request mergeable) and no cancel
+    // comment lands.
+    expect(
+      await changeTargetBranchFromWeb(await writeCtx("amstay", alice), parseTargetBranchForm(new URLSearchParams({ target_branch: "amtarget2" }))),
+    ).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("amstay")}` });
+    expect(await getScheduledAutoMerge(env.DB, writerIssueId)).not.toBeNull();
+    const writerCancels = await d1()
+      .select()
+      .from(comments)
+      .where(and(eq(comments.issueId, writerIssueId), eq(comments.type, CommentType.PRUnscheduledToAutoMerge)))
+      .all();
+    expect(writerCancels).toHaveLength(0);
   });
 
   it("maps ChangeTargetBranch's refusals", async () => {

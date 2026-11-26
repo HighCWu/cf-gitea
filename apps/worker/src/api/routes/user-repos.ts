@@ -3,7 +3,12 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
-import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
+import {
+  classifyRepoNameReject,
+  RepoNameCollisionError,
+  RepoNameInvalidError,
+  RepoObjectFormatUnsupportedError,
+} from "../../repos/service";
 import { assertDemoRepoQuota, DemoRepoQuotaError } from "../../services/demo-quota";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -57,6 +62,56 @@ const listQuerySchema = {
       .openapi({ type: "integer", description: "page size of results" }),
   }),
 } as const;
+
+// ---------------------------------------------------------------------------
+// The create-arm name-reject wire texts (SMALLS6 open #1 — the split-text
+// adoption over repos/service.ts's classifyRepoNameReject). Shared by the
+// four create arms (this file, org-repos.ts, admin-t2.ts,
+// admin-org-extras.ts — the route→route import precedent).
+// ---------------------------------------------------------------------------
+
+/** Upstream `reservedRepoNamePatterns` (models/repo/repo.go:74) — the suffix
+ *  half the pattern-class render needs. Mirrors repos/service.ts's
+ *  RESERVED_REPO_NAME_SUFFIXES table (that module is the classifier's home;
+ *  the classifier returns only the class, not the matched entry). */
+const REPO_NAME_PATTERN_SUFFIXES = [".wiki", ".git", ".rss", ".atom"];
+
+/**
+ * The upstream EXACT per-class text for a refused repository name, rendered
+ * from the classifier's verdict (the create arms keep the 400 — the
+ * ROUTESWAP b3422c0920 ladder; only the text splits now):
+ *
+ *   - `chars` → ErrNameCharsNotAllowed "name is invalid [%s]: must be valid
+ *     alpha or numeric or dash(-_) or dot characters" (models/db/name.go:
+ *     58-66 via the IsUsableRepoName first leg, models/repo/repo.go:82-86;
+ *     %s is the RAW name — upstream passes repo.Name untrimmed).
+ *   - `reserved` → ErrNameReserved "name is reserved [name: %s]"
+ *     (models/db/name.go:24-26; upstream renders the TrimSpace+ToLower'd
+ *     name, db/name.go:78 — our reachable reserved set {".", "..", "-"} is
+ *     case-free, so the raw name IS the rendered one).
+ *   - `pattern` → ErrNamePatternNotAllowed "name pattern is not allowed
+ *     [pattern: %s]" (models/db/name.go:48-50; %s is the TABLE pattern —
+ *     `*${suffix}` — matched case-insensitively on the LOWERED name,
+ *     db/name.go:88-93, so "HELD.WIKI" renders `*.wiki`).
+ *   - `engine` → our recorded EXTRA (the engine-routability alphabet,
+ *     SPEC-0003 §4.4) has no upstream text — it keeps the conflated port
+ *     message RepoNameInvalidError renders (the recorded divergence).
+ */
+export function repoNameRejectMessage(name: string): string {
+  switch (classifyRepoNameReject(name)) {
+    case "chars":
+      return `name is invalid [${name}]: must be valid alpha or numeric or dash(-_) or dot characters`;
+    case "reserved":
+      return `name is reserved [name: ${name}]`;
+    case "pattern": {
+      const suffix = REPO_NAME_PATTERN_SUFFIXES.find((entry) => name.toLowerCase().endsWith(entry));
+      return `name pattern is not allowed [pattern: *${suffix ?? ""}]`;
+    }
+    default:
+      // "engine" (our extra) — the conflated port message.
+      return `repository name is not allowed: ${name}`;
+  }
+}
 
 /**
  * `GET /users/{username}/repos` — public repositories of the user (all of
@@ -130,14 +185,15 @@ function userCurrentListReposRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
  * pre-repin "The repository with the same name already exists.");
  * invalid/reserved name → 400 (ErrNameReserved/ErrNamePatternNotAllowed
  * unwrap util.ErrInvalidArgument, db/name.go:31-33/:55-57 — was the
- * pre-repin 422; the IsUsableRepoName port, our message text differs from
- * Go's class-split strings — the handler note applies). `auto_init` lands
+ * pre-repin 422; the wire text is upstream's exact per-class string via
+ * repoNameRejectMessage below — the split-text adoption). `auto_init` lands
  * the initial commit through the engine
  * (services/user-repos.ts owns the fidelity notes and divergences); an
  * unknown `gitignores`/`license` template name → the init-failure 500 with
  * the row rolled back (create.go:236-241,448-456 via the unmapped-error arm
- * repo.go:254-259; undeclared, the check-openapi RUNTIME_ONLY table's
- * statuses/{sha} pattern records it with the cites).
+ * repo.go:254-259; undeclared — the checker's default-fold equivalence
+ * carries it against the contract's folded {201, default} doc, the
+ * SPLITTEXT RUNTIME_ONLY prune).
  */
 function createCurrentUserRepoRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
   return createRoute({
@@ -231,13 +287,13 @@ export function registerUserReposRoutes(
         // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) →
         // APIErrorAuto 400 on CREATE (was the pre-repin 422; the PATCH
         // rename arm keeps its explicit 422, repo.go:618-627 — not this
-        // route). The wire text stays our conflated port message: upstream
-        // splits the texts by class — "name is reserved [name: %s]" /
-        // "name pattern is not allowed [pattern: %s]" (models/db/name.go:
-        // 24-26/:48-50) — and our single RepoNameInvalidError cannot
-        // distinguish them at the route; the classifier lives in
-        // repos/service.ts's private validator tables (recorded divergence).
-        throw new ApiError(400, error.message);
+        // route). SPLIT-TEXT ADOPTION (SMALLS6 open #1): the wire text is
+        // now upstream's EXACT per-class string via the classifier —
+        // "name is invalid [name]: must be valid …" (chars) / "name is
+        // reserved [name: %s]" / "name pattern is not allowed
+        // [pattern: %s]" (repoNameRejectMessage above; the engine extra
+        // keeps the conflated port message).
+        throw new ApiError(400, repoNameRejectMessage(error.repoName));
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

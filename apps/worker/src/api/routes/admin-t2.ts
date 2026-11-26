@@ -20,6 +20,7 @@ import { newSalt, newPasswordRecord } from "../../auth/password";
 import { isComplexEnough, isPwned, PASSWORD_PWNED_ERROR_TEXT, type PwnedResult } from "../../auth/password-policy";
 import { configuredPasswordHashAlgo, resolvePasswordPolicy } from "../config";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoObjectFormatUnsupportedError } from "../../repos/service";
+import { repoNameRejectMessage } from "./user-repos";
 import { AuditActions, auditClientIp, auditEventInsert, emitAudit } from "../../services/audit";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
@@ -1527,7 +1528,8 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   // ErrRepoAlreadyExist.Error(), reserved/pattern unwrap
   // util.ErrInvalidArgument → 400); an unknown gitignores/license template
   // name 500s with the row rolled back (create.go:236-241,448-456 — the
-  // user-repos route note and the RUNTIME_ONLY table entry carry the cites).
+  // user-repos route note carries the cites; the undeclared 500 rides the
+  // checker's default-fold equivalence, the SPLITTEXT RUNTIME_ONLY prune).
   app.openapi(adminCreateRepoRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
     const target = await resolveTargetRow(c, username);
@@ -1552,9 +1554,11 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
         // RE-PIN (099abf5db4, b3422c0920): reserved/pattern unwrap
         // util.ErrInvalidArgument (models/db/name.go:31-33/:55-57) → 400 on
         // CREATE (was the pre-repin 422; PATCH rename keeps its explicit
-        // 422). Text stays the conflated port message — the user-repos.ts
-        // handler note records the upstream class-split divergence.
-        throw new ApiError(400, error.message);
+        // 422). SPLIT-TEXT ADOPTION (SMALLS6 open #1): the wire text is
+        // upstream's EXACT per-class string via the classifier
+        // (repoNameRejectMessage in user-repos.ts; the engine extra keeps
+        // the conflated port message).
+        throw new ApiError(400, repoNameRejectMessage(error.repoName));
       }
       if (error instanceof RepoObjectFormatUnsupportedError) {
         // The engine is sha1-only (SPEC-0001 §5): a sha256 create is refused

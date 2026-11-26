@@ -285,6 +285,7 @@ import {
 import {
   contextMatchesRequired,
   createScheduledAutoMergeComment,
+  disableAutoMergeIfNotWriter,
   getScheduledAutoMerge,
   insertScheduledAutoMergeRow,
   mergeRequiredContextsCommitStatus,
@@ -2881,21 +2882,53 @@ export async function cleanupPullRequestFromWeb(ctx: PullMergeBoxWriteContext): 
  * labels-write 404-shell posture — upstream answers 403, the shell hides
  * it), the non-pull 404, the empty-target no-op (upstream's StatusNoContent —
  * the no-JS form reloads), then ChangeTargetBranch with its five refusal
- * texts as the error messages.
+ * texts as the error messages. SPLITTEXT (SMALLS6 open #4): the web arm now
+ * threads the doer — upstream's own handler passes ctx.Doer into
+ * ChangeTargetBranch (web pull.go:1422), so the service's doer tail runs
+ * (RecalculateReviewsOfficial + the type-25 ChangeTargetBranch comment +
+ * the push-comments delete/recreate) and DisableAutoMergeIfNotWriter's
+ * "base_changed" auto-cancel fires for a non-writer retarget (pull.go:339-
+ * 341 — in-tx upstream; ours rides the landed non-transactional tail
+ * posture right after the service, exactly the API route's ordering).
+ * Until this threading the "base_changed" auto-cancel was API-only.
  */
 export async function changeTargetBranchFromWeb(ctx: PullMergeBoxWriteContext, form: { targetBranch: string }): Promise<PullMergeBoxWriteOutcome> {
   const prologue = await writePrologue(ctx);
   if (!prologue.ok) return prologue.outcome;
-  const { pair, api, issueLink } = prologue;
+  const { pair, api, doer, issueLink } = prologue;
   const isPoster = ctx.issue.posterId !== null && ctx.issue.posterId === ctx.viewer.id;
-  const access = await principalAccessOf(ctx.c.env.DB, pair.repo, await doerProjection(ctx));
+  const access = await principalAccessOf(ctx.c.env.DB, pair.repo, doer);
   if (!isPoster && !access.write) return { outcome: "not-found" }; // pull.go:1512-1515's 403, shell-hidden
   if (form.targetBranch === "") return { outcome: "redirect", location: issueLink }; // StatusNoContent → reload
+  // The service's same-branch no-op (:234-236) returns BEFORE the doer tail
+  // and the auto-merge cancel run upstream — mirror it here so the cancel
+  // fires on real retargets only (the API route's gate skips the arm on
+  // base == the current base the same way).
+  if (ctx.pr.baseBranch === form.targetBranch) return { outcome: "redirect", location: issueLink };
+  const now = new Date();
   try {
-    await changePullRequestTargetBranch(api, pair, ctx.issue, ctx.pr, { targetBranch: form.targetBranch, now: new Date() });
+    await changePullRequestTargetBranch(api, pair, ctx.issue, ctx.pr, {
+      targetBranch: form.targetBranch,
+      now,
+      doerId: doer.id,
+    });
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
     return { outcome: "error", message: error.message };
   }
+  // DisableAutoMergeIfNotWriter (pull.go:398-409) with the retarget reason —
+  // a NON-writer's retarget cancels the scheduled auto-merge ("base_changed"),
+  // a writer's stays (pull.go:375 — the new base may have made it mergeable).
+  // The doer's projection coalescing mirrors the API route's mapping verbatim
+  // (routes/pulls.ts — the User projection's optional fields over a doer the
+  // prologue proved concrete).
+  await disableAutoMergeIfNotWriter(
+    ctx.c.env.DB,
+    ctx.issue,
+    { id: doer.id ?? 0, username: doer.login ?? "", isAdmin: doer.is_admin ?? null },
+    pair.repo,
+    now,
+    "base_changed",
+  );
   return { outcome: "redirect", location: issueLink };
 }
