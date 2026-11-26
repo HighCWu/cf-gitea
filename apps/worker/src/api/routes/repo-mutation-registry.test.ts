@@ -177,8 +177,16 @@ describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell",
     // service's setHead dep. (buildPack is deterministic: both refs share
     // the commit, which is legal git.)
     const { oid, pack } = await buildPack();
-    expect((await pushRef(token, "alice", "headset", "refs/heads/main", oid, pack)).status).toBe(200);
-    expect((await pushRef(token, "alice", "headset", "refs/heads/feature", oid, pack)).status).toBe(200);
+    // SPEC 0230 (07e8707): receivePack answers as a STREAM once the pack is
+    // staged — indexing/finalize/ref-commit run as the invocation tail and
+    // report-status reaches the client in flight. A protocol-correct client
+    // reads the report to EOF before acting on the push, so drain each
+    // response and pin its ok line; the old status-only shortcut raced the
+    // tail and lost deterministically once streaming landed.
+    const reportMain = await (await pushRef(token, "alice", "headset", "refs/heads/main", oid, pack)).text();
+    expect(reportMain).toContain("ok refs/heads/main");
+    const reportFeature = await (await pushRef(token, "alice", "headset", "refs/heads/feature", oid, pack)).text();
+    expect(reportFeature).toContain("ok refs/heads/feature");
     expect(await cellHead("alice/headset")).toBe("refs/heads/main");
 
     const patched = await apiJson("PATCH", "/repos/alice/headset", token, {

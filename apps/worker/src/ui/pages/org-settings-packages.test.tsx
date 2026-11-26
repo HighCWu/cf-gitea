@@ -651,7 +651,7 @@ describe("the add/edit page render (packages_cleanup_rules_edit.tmpl → cleanup
     expect(html).toContain(`action="/org/coalition/settings/packages/rules/add"`);
     expect(html).toContain(`<input type="hidden" name="id" value="0"/>`);
     expect(html).toContain('name="type"');
-    expect([...html.matchAll(/<option/g)].length).toBe(23 + 7 + 7); // types + keep counts + remove days
+    expect([...html.matchAll(/<option/g)].length).toBe(24 + 7 + 7); // types + keep counts + remove days
     expect(html).toContain('>Cargo</option>'); // the full TypeList rides (the module header)
     expect(html).toContain('value="save">Add</button>');
     expect(html).not.toContain('>Remove</button>');

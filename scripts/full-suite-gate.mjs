@@ -186,6 +186,11 @@ function runVitest({ fileFilters, logPath, jsonPath }) {
     '--reporter=default',
     '--reporter=json',
     `--outputFile=${jsonPath}`,
+    // The 2026-11-26 OOM class: the default pool spawns enough concurrent
+    // workerd instances to trip systemd-oomd (SIGKILL 137 mid-suite, the
+    // JSON report never lands). GATE_MAX_WORKERS throttles the pool; the
+    // composite verdict is unchanged (solo phases re-run reds anyway).
+    ...(process.env.GATE_MAX_WORKERS ? [`--maxWorkers=${process.env.GATE_MAX_WORKERS}`] : []),
     ...fileFilters,
   ];
   // node <vitest.mjs> ... or exec the shebang'd .bin wrapper directly.

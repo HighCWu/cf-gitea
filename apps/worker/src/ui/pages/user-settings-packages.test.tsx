@@ -409,7 +409,7 @@ describe("the add/edit page render (packages_cleanup_rules_edit.tmpl → cleanup
     expect(html).toContain(userSettingsPackagesLocale.add_rule);
     expect(html).toContain(`action="/user/settings/packages/rules/add"`);
     expect(html).toContain(`<input type="hidden" name="id" value="0"/>`);
-    expect([...html.matchAll(/<option/g)].length).toBe(23 + 7 + 7); // types + keep counts + remove days
+    expect([...html.matchAll(/<option/g)].length).toBe(24 + 7 + 7); // types (TFMODULE's terraform-module +1) + keep counts + remove days
     expect(html).toContain(">Chef</option>"); // a chef RULE is functional (the header)
     expect(html).toContain(">Cargo</option>");
     expect(html).toContain('value="save">Add</button>');
