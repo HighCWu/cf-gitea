@@ -88,6 +88,7 @@ import {
   repoRedirects,
   repoSettings,
   repoMirrors,
+  pushMirrors,
   repoTopics,
   repoTransfer,
   repoUnits,
@@ -1371,6 +1372,12 @@ export class RepoService {
       // Mirror rows (migration 0010; SPEC-0009 §4.3.13) — the encrypted
       // credentials die with the repo that owned them.
       this.db.delete(repoMirrors).where(eq(repoMirrors.repoId, repoId)),
+      // Push-mirror rows die with the repo too (upstream's DeleteBeans
+      // carries &repo_model.PushMirror{RepoID: repoID},
+      // services/repository/delete.go:175 — found live by the v1.7.0 probe
+      // battery's audit arm: a deleted repo left its push_mirrors row
+      // behind, orphaning the dummy mirror the mirror battery created).
+      this.db.delete(pushMirrors).where(eq(pushMirrors.repoId, repoId)),
       // Protected-branch rules die with the repo (SPEC-0013 M4's cascade arm —
       // upstream's DeleteBeans census carries &git_model.ProtectedBranch
       // {RepoID: repoID}, services/repository/delete.go:171). The schema's

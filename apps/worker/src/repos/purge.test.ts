@@ -24,7 +24,7 @@ import { eq } from "drizzle-orm";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { actionRunJobs, actionRuns, actionSchedules, repoRedirects, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actionRunJobs, actionRuns, actionSchedules, pushMirrors, repoRedirects, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { ACTION_STATUS_CANCELLED, ACTION_STATUS_WAITING } from "../services/actions/model";
 import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
 import { createWikiPage, readWikiPage } from "../services/wiki";
@@ -215,6 +215,14 @@ describe("demo-sweep consumer arm (SPEC-0014 §3.2)", () => {
       lowerName: "old-name",
       redirectRepoId: "8001",
     });
+    // A push-mirror row (delete.go:175's bean) — the cascade arm the v1.7.0
+    // probe audit found missing live: the row must die with the repo.
+    await drizzle(env.DB).insert(pushMirrors).values({
+      repoId: "8001",
+      remoteName: "remote_mirror_purgepin1",
+      remoteAddress: "https://purge-pin.invalid/dummy.git",
+      createdAt: new Date(0),
+    });
     const queue = spyQueue();
     const { batch, acked, retried } = fabricatedBatch([{ id: "sweep-1", body: { kind: "demo-sweep", repoId: "8001" } }]);
 
@@ -224,6 +232,7 @@ describe("demo-sweep consumer arm (SPEC-0014 §3.2)", () => {
     expect(retried).toEqual([]);
     expect(await repoRowExists("8001")).toBe(false);
     expect(await drizzle(env.DB).select().from(repoRedirects).all()).toEqual([]);
+    expect(await drizzle(env.DB).select().from(pushMirrors).all()).toEqual([]); // delete.go:175
     // The cascade's step 3: the EXACT standard purge message (no demo
     // variant) — current + redirected engine names, the storage key.
     expect(queue.sendBodies).toEqual([
