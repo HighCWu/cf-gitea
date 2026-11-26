@@ -550,7 +550,7 @@ export const repoUnits = sqliteTable(
      * -only extension, no SQL migration.
      */
     type: text("type", {
-      enum: ["code", "packages", "actions", "pull_requests", "projects"],
+      enum: ["code", "issues", "packages", "actions", "pull_requests", "projects"],
     }).notNull().default("code"),
     /**
      * SPEC-0012's ActionsConfig store (upstream `RepoUnit.Config`,
