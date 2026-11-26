@@ -4307,12 +4307,14 @@ export const packageProperties = sqliteTable(
     value: text("value").notNull(),
   },
   (t) => [
-    // SPEC-0016 §4.1's pinned index — every property read/delete resolves by
-    // (ref_type, ref_id) (DeleteAllProperties, the descriptor assembly).
-    index("package_properties_ref_idx").on(t.refType, t.refId),
-    // Upstream `Name string xorm:"INDEX"` (package_property.go:33) — the
-    // property-name filter (e.g. container digest lookups, later milestones).
-    index("package_properties_name_idx").on(t.name),
+    // Upstream's single composite index `ref_id_name` on (ref_id, name) —
+    // 6a8eec1cc3 #40001 ("fix table indices") dropped the three single-column
+    // tags (ref_type / ref_id / name) for one composite: every property
+    // read/delete resolves ref_id first (GetProperties' ref_type+ref_id,
+    // GetPropertiesByName's +name, DeleteAllProperties), so ref_type rides as
+    // an index post-filter (upstream queries kept their WHERE shape —
+    // verified in the same commit, tags-only diff).
+    index("package_properties_ref_id_name_idx").on(t.refId, t.name),
   ],
 );
 

@@ -575,6 +575,13 @@
       "when": 1795353372172,
       "tag": "0081_hesitant_maggott",
       "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "6",
+      "when": 1795687977548,
+      "tag": "0082_living_groot",
+      "breakpoints": true
     }
   ]
 }

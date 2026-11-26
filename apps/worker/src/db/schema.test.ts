@@ -2461,3 +2461,55 @@ describe("FN-10/FN-11 table-alignment completion (migration 0078)", () => {
     expect(byIssue.get(pullCarrier.id)).toMatchObject({ repoId: "fn78-writer", isPull: true, pinOrder: 1 });
   });
 });
+
+describe("package_properties index parity (upstream 6a8eec1cc3 #40001, migration 0082)", () => {
+  it("carries exactly ONE index — upstream's ref_id_name composite on (ref_id, name), leading column ref_id", async () => {
+    // 6a8eec1cc3 #40001 ("fix table indices") collapsed package_property's
+    // three single-column xorm tags into one composite: RefType lost its
+    // `INDEX` entirely, RefID+Name became `INDEX(ref_id_name)` in tag order
+    // (package_property.go:33-35 at the pin) — so the leading column is
+    // ref_id and ref_type rides as an index post-filter (the upstream diff
+    // is tags-only; the queries kept their WHERE shapes).
+    expect(await indexNames("package_properties")).toEqual(["package_properties_ref_id_name_idx"]);
+
+    // PRAGMA index_info pins the column ORDER inside the composite.
+    const columns = (
+      await env.DB
+        .prepare("PRAGMA index_info(package_properties_ref_id_name_idx)")
+        .all<{ seqno: number; cid: number; name: string }>()
+    ).results;
+    expect(columns.map((c) => c.name)).toEqual(["ref_id", "name"]);
+    expect(columns.map((c) => c.seqno)).toEqual([0, 1]);
+
+    // Non-unique, verbatim DDL (upstream's tag is INDEX, not UNIQUE).
+    const ddl = await env.DB
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .bind("package_properties_ref_id_name_idx")
+      .first<{ sql: string }>();
+    expect(ddl?.sql).toBe(
+      "CREATE INDEX `package_properties_ref_id_name_idx` ON `package_properties` (`ref_id`,`name`)",
+    );
+  });
+
+  it("the composite serves the properties lookups despite ref_type leading their WHERE (EXPLAIN witness)", async () => {
+    // GetProperties' shape (ref_type+ref_id) and GetPropertiesByName's
+    // (+name, package_property.go:53-62) must both resolve through the new
+    // index — the ref_type equality term is the residual filter, never a
+    // table scan (the audit_event EXPLAIN-witness pattern).
+    const byId = (
+      await env.DB
+        .prepare("EXPLAIN QUERY PLAN SELECT id FROM package_properties WHERE ref_type = ? AND ref_id = ?")
+        .bind(0, 1)
+        .all<{ detail: string }>()
+    ).results;
+    expect(byId.map((r) => r.detail).join("\n")).toContain("package_properties_ref_id_name_idx");
+
+    const byName = (
+      await env.DB
+        .prepare("EXPLAIN QUERY PLAN SELECT id FROM package_properties WHERE ref_type = ? AND ref_id = ? AND `name` = ?")
+        .bind(0, 1, "some-name")
+        .all<{ detail: string }>()
+    ).results;
+    expect(byName.map((r) => r.detail).join("\n")).toContain("package_properties_ref_id_name_idx");
+  });
+});
