@@ -373,7 +373,7 @@ describe("handlePackagesCleanup — ExecuteCleanupRules", () => {
     void doomed;
   });
 
-  it("the version walk is UNBOUNDED — upstream's cleanup passes no Paginator (cleanup.go:37-41), so a backlog past the retired per-tick cap dies in one run", async () => {
+  it("the version walk is UNBOUNDED — upstream's cleanup passes no Paginator (cleanup.go:39-43), so a backlog past the retired per-tick cap dies in one run", async () => {
     // The former private LIMIT-1000 walk left the OLDEST rows (the
     // created-desc tail) for a later tick; the paginator-less searchVersions
     // fork (searchVersionsBySession's Paginator-nil arm, package_version.go:
@@ -446,7 +446,7 @@ describe("handlePackagesCleanup — ExecuteCleanupRules", () => {
   });
 });
 
-describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:122-147)", () => {
+describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:124-149)", () => {
   let blobSeq = 0;
 
   /** A unique 64-hex blob sha (the table's hex-only content key). */
@@ -480,7 +480,7 @@ describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:
       .all()
       .then((rows) => rows.length);
 
-  // The four families upstream's switch names (cleanup.go:124-145) — each
+  // The four families upstream's switch names (cleanup.go:126-147) — each
   // with its internal repository package/version constants.
   const FAMILIES = [
     { type: "debian", repositoryPackage: DEBIAN_REPOSITORY_PACKAGE, repositoryVersion: DEBIAN_REPOSITORY_VERSION },
@@ -561,7 +561,7 @@ describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:
     expect(await internalFileCount(internalVersionId)).toBe(1); // the stale row survives — no rebuild
   });
 
-  it("no deletion → no rebuild (upstream's anyVersionDeleted gate, cleanup.go:122)", async () => {
+  it("no deletion → no rebuild (upstream's anyVersionDeleted gate, cleanup.go:124)", async () => {
     const ownerId = await seedUser("young-owner");
     const internalVersionId = await seedStaleIndexFile(ownerId, RPM_FAMILY);
     const young = await seedTypedVersion(ownerId, "rpm", "app", "1.0", NOW); // young — remove-days keeps it
@@ -644,7 +644,7 @@ describe("onAfterRemovePackage — the RemovePackage*/RemovePackageVersion tail 
   });
 });
 
-describe("handlePackagesCleanup — the cargo per-package rider (upstream cleanup.go:108-118)", () => {
+describe("handlePackagesCleanup — the cargo per-package rider (upstream cleanup.go:110-120)", () => {
   it("a cargo rule's per-package delete runs the index seam — INSIDE the loop, and no post-loop rebuild", async () => {
     // The rider is observable through the repositories-row probe it takes
     // (updateCargoPackageIndex resolves the `_cargo-index` repo-absent arm,
@@ -668,7 +668,7 @@ describe("handlePackagesCleanup — the cargo per-package rider (upstream cleanu
     await expect(handlePackagesCleanup(consumerEnv(), { now: NOW })).resolves.toBeUndefined();
 
     // Both packages lost a version → the rider ran PER PACKAGE (the loop
-    // shape, cleanup.go:110-118) and both resolves.
+    // shape, cleanup.go:112-120) and both resolves.
     expect(await db().select().from(packageVersions).where(eq(packageVersions.id, doomedA.ver.id)).all()).toHaveLength(0);
     expect(await db().select().from(packageVersions).where(eq(packageVersions.id, doomedB.ver.id)).all()).toHaveLength(0);
     expect(await db().select().from(packageVersions).where(eq(packageVersions.id, survivor.ver.id)).all()).toHaveLength(1);

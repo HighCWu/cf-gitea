@@ -38,7 +38,7 @@
  *   cookbook/file URLs, license, dependencies ({} when absent —
  *   MapNilAsEmpty, chef.go:253).
  * - Download (chef.go:239-264): the version → files[0] walk with the
- *   lead-file GET counter bump (packages.go:655-660).
+ *   lead-file GET counter bump (packages.go:660-665).
  * - Delete (chef.go:267-316): the version arm is
  *   RemovePackageVersionByNameAndVersion (404 on the miss); the cookbook
  *   arm removes EVERY version (404 when the package is missing or empty —

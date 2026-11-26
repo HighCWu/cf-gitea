@@ -85,9 +85,9 @@ import {
  * one module:
  *
  *  A. The NINE management ops + the admin list on `/api/v1` (§3.1) — upstream
- *     routers/api/v1/api.go:1695-1714 (the group's own note: "these are Gitea
+ *     routers/api/v1/api.go:1725-1744 (the group's own note: "these are Gitea
  *     package management API — see packages.CommonRoutes … for endpoints that
- *     implement package manager APIs") + api.go:1820 (`GET /admin/packages`).
+ *     implement package manager APIs") + api.go:1849 (`GET /admin/packages`).
  *     Wire shapes are upstream's modules/structs/package.go (`Package` keyed
  *     by the VERSION id, `PackageFile` carrying the four hashes) through the
  *     landed user/repo serializers.
@@ -250,7 +250,7 @@ function packageViewer(c: Context<ApiEnv>, cred: ResolvedCredential): Viewer {
 }
 
 /**
- * The full upstream gate stack in upstream's order (api.go:1700-1714):
+ * The full upstream gate stack in upstream's order (api.go:1730-1744):
  *   1. PACKAGES_ENABLED=false → 404;
  *   2. reqToken (v1 only) — anonymous → 401 "token is required";
  *   3. tokenRequiresScopes (v1 only) — a token without the method-derived
@@ -289,7 +289,7 @@ async function requirePackageContext(
     ownerVisibleToDoer: ownerVisibleToDoer(owner, cred),
     // The strict arm (package.go:120). Production's anonymous caller is
     // pre-empted by requireSignInViewApiGate's group 403 (mounted on
-    // createApiRouter, upstream api.go:961) — this threading models the
+    // createApiRouter, upstream api.go:978) — this threading models the
     // same flag inside the assignment, the way upstream's PackageAssignment
     // API does, and covers the standalone-router posture where the group
     // gate no-ops on the unresolved auth context.
@@ -480,7 +480,7 @@ async function canDoerManagePackage(
 
 // ---------------------------------------------------------------------------
 // The terraform specialization's delete guards — the OnBeforeRemove arms the
-// v1 deletes run upstream (services/packages/terraform/spec.go:52-88 through
+// v1 deletes run upstream (services/packages/terraform/spec.go:54-90 through
 // packages_service.RemovePackage/RemovePackageVersion's spec hooks), the same
 // guards the WEB settings page landed (ui/pages/package-settings.tsx's
 // terraformDeleteGuardAll / terraformDeleteGuardVersion).
@@ -586,7 +586,7 @@ const forbiddenResponse = {
 // The terraform delete guards' refusal shape (assertPackageDeleteAllowed /
 // assertPackageVersionDeleteAllowed below): upstream wraps both refusals as
 // util.ErrUnprocessableContent → the errorForUser 422
-// (services/packages/terraform/spec.go:52-88 via modules/util/error.go:25-31)
+// (services/packages/terraform/spec.go:54-90 via modules/util/error.go:25-31)
 // while its vendored swagger documents only {204,404} — the declared 422 is
 // the runtime-faithful superset, carried as a documented runtime-only
 // exception in scripts/check-openapi.mjs (the /user/avatar posture).
@@ -611,7 +611,7 @@ function requireSiteAdmin(): MiddlewareHandler<ApiEnv> {
 }
 
 export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>): void {
-  // listPackages — GET /packages/{owner} (api.go:1700 group head; upstream
+  // listPackages — GET /packages/{owner} (api.go:1730 group head; upstream
   // ListPackages renders EVERY matching version — SearchVersions,
   // v1/packages/package.go:471 — not the UI's latest-per-package shape).
   app.openapi(
@@ -706,10 +706,10 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       if (pkg === null) {
         throw new ApiError(404, "not found");
       }
-      // RemovePackage's spec hook (packages.go:681): the terraform
+      // RemovePackage's spec hook (packages.go:686-687): the terraform
       // specialization's locked-state refusal rides here.
       await assertPackageDeleteAllowed(c.env.DB, pkg);
-      // The `package` deleted arm (packages.go:720): RemovePackage fires ONE
+      // The `package` deleted arm (packages.go:726): RemovePackage fires ONE
       // EVENT PER VERSION DESCRIPTOR (the `for _, pd := range pds` loop) —
       // resolve the full descriptor set BEFORE the cascade (the payload
       // renders the pre-delete state).
@@ -776,7 +776,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       // specialization's locked-then-latest refusals ride here.
       await assertPackageVersionDeleteAllowed(c.env.DB, pkg, versionRow);
       await deletePackageVersionAndReferences(c.env.DB, versionRow.id);
-      // The `package` deleted arm (packages.go:532): one event, the
+      // The `package` deleted arm (packages.go:537): one event, the
       // pre-resolved rows (both were in scope already).
       await emitPackageDeleted(c.env, [{ pkg, version: versionRow }], cred.doer?.id ?? 0);
       // OnAfterRemovePackage (packages.go:539 — notify precedes the hook):
@@ -810,7 +810,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       const files = await getFileDescriptors(c.env.DB, descriptor.version.id);
       // b0b31bc593 — ToPackageFile renders the type's public file properties
       // (convert/package.go:44-62 over the descriptor's loaded file
-      // properties, descriptor.go:264).
+      // properties, descriptor.go:267).
       const fileProperties = await getFileProperties(c.env.DB, descriptor.version.id);
       return c.json(files.map((entry) => toApiPackageFile(entry, fileProperties.get(entry.file.id), params.type)), 200);
     },
@@ -931,7 +931,7 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
     },
   );
 
-  // adminListPackages — GET /admin/packages (api.go:1820; reqSiteAdmin, the
+  // adminListPackages — GET /admin/packages (api.go:1849; reqSiteAdmin, the
   // admin-t2 PAT-scope deviation documented in the module header).
   app.openapi(
     createRoute({
@@ -1090,7 +1090,7 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
       const packageName = params.packagename ?? "";
       const filename = params.filename ?? "";
       const packageVersion = params.packageversion ?? "";
-      // Upstream's validation order (generic.go:69-86): name, filename, version.
+      // Upstream's validation order (generic.go:75-92): name, filename, version.
       if (!isValidPackageName(packageName)) {
         return plainResponse(400, "invalid package name");
       }
@@ -1133,7 +1133,7 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
     try {
       const { owner, cred } = await protocolContext(c, "write");
       const params = c.req.param();
-      // The `package` deleted arm (packages.go:532): resolve the descriptor
+      // The `package` deleted arm (packages.go:537): resolve the descriptor
       // BEFORE the cascade so the payload renders the pre-delete state.
       const desc: PackageEventDescriptor | null = await resolvePackageEventDescriptor(
         c.env.DB,
@@ -1165,7 +1165,7 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
     try {
       const { owner, cred } = await protocolContext(c, "write");
       const params = c.req.param();
-      // The `package` deleted arm (packages.go:572): a file delete notifies
+      // The `package` deleted arm (packages.go:577): a file delete notifies
       // ONLY when the version cascaded with it (pd != nil) — gated on the
       // service's outcome below.
       const desc: PackageEventDescriptor | null = await resolvePackageEventDescriptor(

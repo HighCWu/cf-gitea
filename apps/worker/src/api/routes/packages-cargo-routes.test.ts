@@ -13,7 +13,7 @@
  *    through the route (cargo.go:262-267's UpdatePackageIndexIfExists);
  *  - the cleanup rider arm: the REPO_TASKS consumer's
  *    handlePackagesCleanup (the REPO binding threaded per the same recipe —
- *    cleanup.go:108-118's per-package UpdatePackageIndexIfExists) rewrites
+ *    cleanup.go:110-120's per-package UpdatePackageIndexIfExists) rewrites
  *    the mirror file from D1 after the rule trims a version — the trimmed
  *    version's line drops, the survivor stays.
  *
@@ -240,7 +240,7 @@ describe("the cargo publish route threads the _cargo-index hook (the e4d7e49 rec
   });
 });
 
-describe("the cleanup rider threads the mirror hook (cleanup.go:108-118 through the consumer)", () => {
+describe("the cleanup rider threads the mirror hook (cleanup.go:110-120 through the consumer)", () => {
   it("a keep-count rule's trimmed version drops from the mirror file; the survivor stays", async () => {
     const owner = await seedUser("cargocleanup");
     await ensureCargoIndexMirror({ repo: env.REPO, origin: "https://mirror.test" }, env.DB, owner.id);

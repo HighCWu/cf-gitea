@@ -667,7 +667,7 @@ export async function uploadCargoPackage(input: UploadCargoPackageInput): Promis
       .insert(packageProperties)
       .values({ refType: 0 /* PropertyTypeVersion */, refId: version.id, name: CARGO_YANKED_PROPERTY, value: "false" });
 
-    // AddFileToPackageVersion (packages.go:336+): the size quota, then the
+    // AddFileToPackageVersion (packages.go:338+): the size quota, then the
     // blob dedup → content key → the lead file.
     if (!input.doer.isAdmin && input.quota.limitTotalOwnerSize > -1) {
       if ((await calculateFileSize(d1, input.owner.id)) + parsed.contentSize > input.quota.limitTotalOwnerSize) {

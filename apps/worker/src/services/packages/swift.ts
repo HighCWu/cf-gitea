@@ -11,19 +11,19 @@
  * The Swift Package Manager registry contract
  * (github.com/swiftlang/swift-package-manager Registry.md) rides:
  *   - `POST /swift` and `POST /swift/login` — CheckAuthenticate
- *     (swift.go:103-110): the ONLY check is `ctx.Doer == nil` → 401; the
+ *     (swift.go:109-116): the ONLY check is `ctx.Doer == nil` → 401; the
  *     arms sit OUTSIDE reqPackageAccess ("Needs to be unauthenticated",
  *     api.go:452-455) so ANY valid credential passes regardless of scope.
  *     The 200 carries NO Content-Version (ctx.Status(200) only).
  *   - `GET /swift/{scope}/{name}` + `.json` — EnumeratePackageVersions
- *     (swift.go:125-166): GetVersionsByPackageName (a SearchVersions
+ *     (swift.go:131-172): GetVersionsByPackageName (a SearchVersions
  *     EXACT-match on the lower-cased `scope.name` id), sorted by
  *     SemVer.LessThan ASC; `{"releases": {"<SemVer.String()>": {"url":
  *     baseURL + RAW version}}}` (Go map marshal = key-sorted) with the Link
  *     `rel="latest-version"` header carrying PathEscape of the LAST row's RAW
  *     version; the empty set is apiError(404, nil) — detail "".
  *   - `GET /swift/{scope}/{name}/{version}` + `{version}.json` —
- *     PackageVersionMetadata (swift.go:182-251): the resources pair (the ONE
+ *     PackageVersionMetadata (swift.go:188-257): the resources pair (the ONE
  *     source-archive zip, checksum = the blob's sha256) + the schema.org
  *     SoftwareSourceCode metadata document (name from the PACKAGE property
  *     swift.name, description/keywords/license/licenseURL/codeRepository from
@@ -31,10 +31,10 @@
  *     parts is non-empty, repositoryURLs from the swift.repository_url
  *     VERSION properties).
  *   - `GET /swift/{scope}/{name}/{version}.zip` — DownloadPackageFile
- *     (swift.go:424-458): the `Digest: sha256=<hash>` header + the D-6 serve
+ *     (swift.go:430-464): the `Digest: sha256=<hash>` header + the D-6 serve
  *     set with application/zip; the lead GET bumps the counter.
  *   - `GET /swift/{scope}/{name}/{version}/Package.swift?swift-version=…` —
- *     DownloadManifest (swift.go:254-303): the stored manifest text verbatim,
+ *     DownloadManifest (swift.go:260-309): the stored manifest text verbatim,
  *     text/x-swift; the query param is NewVersion-normalized
  *     (TrimmedVersionString: "5.6.0" → "5.6") before the manifests lookup; a
  *     MISS answers 303 SeeOther with the bare Location (no query) — the
@@ -42,14 +42,14 @@
  *   - `PUT /swift/{scope}/{name}/{version}` — UploadPackageFile
  *     (swift.go:323-421): multipart (or urlencoded) form, "source-archive"
  *     as a FILE part (or plain value — formFileOptionalReadCloser falls back
- *     to FormValue, swift.go:306-320) + optional "metadata" JSON; the zip is
+ *     to FormValue, swift.go:312-326) + optional "metadata" JSON; the zip is
  *     stored VERBATIM as the ONE lead file `{name}-{version}.zip`, the
  *     manifests + author as the version's MetadataJSON, swift.scope/swift.name
  *     as PACKAGE properties, each metadata repositoryURL as a
  *     swift.repository_url VERSION property (insert errors logged, not fatal —
- *     swift.go:411-416). 201, Content-Version only.
+ *     swift.go:417-422). 201, Content-Version only.
  *   - `GET /swift/identifiers?url=…` — LookupPackageIdentifiers
- *     (swift.go:465-506): SearchLatestVersions over the
+ *     (swift.go:471-512): SearchLatestVersions over the
  *     swift.repository_url version property; `{identifiers: [packageID…]}`.
  *
  * ## The version grammar = hashicorp/go-version v1.9.0 (gitea/go.mod)
@@ -161,7 +161,7 @@ export class SwiftInvalidManifestVersionError extends Error {
   }
 }
 
-/** The upload's URL-version NewSemver failure (swift.go:328-333) → 400; the
+/** The upload's URL-version NewSemver failure (swift.go:334-339) → 400; the
  *  Problem detail IS go-version's error text ("malformed version: X"). */
 export class SwiftInvalidVersionError extends Error {
   constructor(readonly version: string) {
@@ -170,7 +170,7 @@ export class SwiftInvalidVersionError extends Error {
   }
 }
 
-/** A scope-pattern miss (swift.go:330) → 400 with the EMPTY detail (nil err). */
+/** A scope-pattern miss (swift.go:336) → 400 with the EMPTY detail (nil err). */
 export class SwiftInvalidScopeError extends Error {
   constructor() {
     super("");
@@ -178,7 +178,7 @@ export class SwiftInvalidScopeError extends Error {
   }
 }
 
-/** A name-pattern miss (swift.go:330) → 400 with the EMPTY detail. */
+/** A name-pattern miss (swift.go:336) → 400 with the EMPTY detail. */
 export class SwiftInvalidNameError extends Error {
   constructor() {
     super("");
@@ -202,7 +202,7 @@ export class SwiftPackageNotExistError extends Error {
   }
 }
 
-/** ErrDuplicatePackageVersion (swift.go:401-402) → 409. */
+/** ErrDuplicatePackageVersion (swift.go:407-408) → 409. */
 export class SwiftDuplicateVersionError extends Error {
   constructor(readonly existing: PackageVersionRow) {
     super("package version already exists");
@@ -222,7 +222,7 @@ export class SwiftInvalidArchiveError extends Error {
 // Upstream constants
 // ---------------------------------------------------------------------------
 
-/** The registry media types (swift.go:32-36, Registry.md §3.5). */
+/** The registry media types (swift.go:33-37, Registry.md §3.5). */
 export const SWIFT_ACCEPT_JSON = "application/vnd.swift.registry.v1+json";
 export const SWIFT_ACCEPT_SWIFT = "application/vnd.swift.registry.v1+swift";
 export const SWIFT_ACCEPT_ZIP = "application/vnd.swift.registry.v1+zip";
@@ -845,7 +845,7 @@ export function serializeSwiftMetadata(metadata: SwiftMetadata): string {
 
 // ---------------------------------------------------------------------------
 // The multipart / urlencoded form walk — formFileOptionalReadCloser
-// (swift.go:306-320): the FILE part first, else the plain VALUE part
+// (swift.go:312-326): the FILE part first, else the plain VALUE part
 // ---------------------------------------------------------------------------
 
 export interface SwiftUploadForm {
@@ -929,7 +929,7 @@ function parseSwiftMultipart(contentType: string, bytes: Uint8Array): SwiftUploa
           form.archiveIsFile = true;
         } else if (!form.archiveIsFile && body.byteLength > 0) {
           // An empty VALUE part is FormValue's "" → the nil reader
-          // (swift.go:316-319) — absent, not an empty archive.
+          // (swift.go:322-325) — absent, not an empty archive.
           form.archive = body;
         }
       }
@@ -1029,7 +1029,7 @@ async function hashSwiftArchive(bytes: Uint8Array): Promise<{ sha1: string; sha2
  * 409 sentinel) → MetadataJSON + the package properties (created-only) →
  * blob → the content-key pass → the ONE lead file `{name}-{version}.zip` →
  * the repositoryURL version properties (insert errors logged only —
- * swift.go:411-416). The spools never orphan on a failure inside the walk.
+ * swift.go:417-422). The spools never orphan on a failure inside the walk.
  */
 export async function uploadSwiftPackage(input: UploadSwiftPackageInput): Promise<UploadSwiftPackageResult> {
   const now = input.now ?? new Date();
@@ -1119,7 +1119,7 @@ export async function uploadSwiftPackage(input: UploadSwiftPackageInput): Promis
     }
     archiveSpoolKey = null;
 
-    // Filename `{name}-{version}.zip`, IsLead true (swift.go:390-397); a
+    // Filename `{name}-{version}.zip`, IsLead true (swift.go:396-403); a
     // duplicate row hits upstream's DEFAULT arm → 500 (the goproxy note).
     const fileResult = await tryInsertFile(input.d1, {
       versionId: version.id,
@@ -1132,7 +1132,7 @@ export async function uploadSwiftPackage(input: UploadSwiftPackageInput): Promis
       throw new Error("package file already exists");
     }
 
-    // The repositoryURL version properties (swift.go:411-416) — insert
+    // The repositoryURL version properties (swift.go:417-422) — insert
     // errors are logged, never fatal.
     for (const url of pck.repositoryURLs) {
       try {
@@ -1164,7 +1164,7 @@ export async function uploadSwiftPackage(input: UploadSwiftPackageInput): Promis
 // ---------------------------------------------------------------------------
 
 /**
- * `EnumeratePackageVersions`' version set (swift.go:129): GetVersionsByPackageName
+ * `EnumeratePackageVersions`' version set (swift.go:135): GetVersionsByPackageName
  * = SearchVersions EXACT-match on the lower-cased id, IsInternal false —
  * sorted by SemVer.LessThan ASC (the handler's sort.Slice; ours adds the id
  * tiebreak for determinism).
@@ -1337,7 +1337,7 @@ export async function openSwiftZipForDownload(
 }
 
 /**
- * `LookupPackageIdentifiers`' search (swift.go:472-479): SearchLatestVersions
+ * `LookupPackageIdentifiers`' search (swift.go:478-485): SearchLatestVersions
  * over the swift.repository_url VERSION property — max(id) per package over
  * the property join, IsInternal false both columns, ordered created/id DESC
  * (the model's searchLatestVersions order).
@@ -1377,7 +1377,7 @@ export async function lookupSwiftIdentifiers(d1: D1Database, ownerId: number, ur
 // ---------------------------------------------------------------------------
 
 /** EnumeratePackageVersions' body — releases keyed by SemVer.String() with
- *  RAW-version URLs (swift.go:149-165); Go marshals the map key-sorted. */
+ *  RAW-version URLs (swift.go:155-171); Go marshals the map key-sorted. */
 export function buildSwiftEnumerateJson(baseURL: string, versions: PackageVersionRow[]): string {
   const entries = versions.map((version) => {
     const parsed = parseSwiftVersionStrict(version.version);
@@ -1392,7 +1392,7 @@ export function buildSwiftEnumerateJson(baseURL: string, versions: PackageVersio
 }
 
 /** The metadata response document (PackageVersionMetadataResponse +
- *  SoftwareSourceCode — swift.go:168-251, declaration order). */
+ *  SoftwareSourceCode — swift.go:174-257, declaration order). */
 export function buildSwiftMetadataResponseJson(input: {
   id: string;
   version: string;

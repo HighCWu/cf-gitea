@@ -591,7 +591,7 @@ export interface InternalRepositoryVersion {
 }
 
 /**
- * `GetOrCreateInternalPackageVersion` (services/packages/packages.go:464-500)
+ * `GetOrCreateInternalPackageVersion` (services/packages/packages.go:468-504)
  * — the housekeeping package (`_debian`/`_alpine` + `_repository`) whose
  * files ARE the registry indices, both rows `is_internal` (excluded from the
  * management lists, quotas and the UI by every landed filter). model.ts's
@@ -682,7 +682,7 @@ export interface StoreRepositoryFileInput {
 
 /**
  * `AddFileToPackageVersionInternal` with `OverwriteExisting: true`
- * (packages.go:216-222 + :277-329) — the quota-free internal file write: the
+ * (packages.go:216-222 + :279-331) — the quota-free internal file write: the
  * content blob is deduped/object-first (the landed blobs.ts discipline), a
  * same-key file row with DIFFERENT bytes is deleted (with its properties —
  * model.ts's deletePackageFile) and re-inserted, an identical-blob row is

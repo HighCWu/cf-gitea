@@ -4,8 +4,8 @@
  * templates/user/settings/packages.tmpl's second include, and the org frame,
  * templates/org/settings/packages.tmpl's second include) plus the two write
  * arms' seams record: `POST …/packages/cargo/initialize` and
- * `POST …/packages/cargo/rebuild` (user web.go:714-717, org web.go:1081-1085
- * → shared/packages/packages.go:234-254 InitializeCargoIndex /
+ * `POST …/packages/cargo/rebuild` (user web.go:684-687, org web.go:1055-1059
+ * → shared/packages/packages.go:229-249 InitializeCargoIndex /
  * RebuildCargoIndex over cargo_service.InitializeIndexRepository /
  * RebuildIndex). This module carries the SECTION + the locale; the thin POST
  * handlers live beside the other packages handlers in ui/index.ts calling
@@ -22,7 +22,7 @@
  * port, rebuildCargoIndexMirror = RebuildIndex's port), so a rendered button
  * no longer POSTs into a dead tail — the dead-control rule's precondition
  * is gone, and upstream's own answer (the section renders unconditionally,
- * web.go:714-717/:1081-1085 inside the packagesEnabled group — compile-time
+ * web.go:684-687/:1081-1085 inside the packagesEnabled group — compile-time
  * TRUE in the landed posture) IS the default per AGENTS.md's
  * upstream-parity rule. The chef arm rode the identical arc (documented
  * absent pre-substrate, folded back live when chef-auth landed).
@@ -43,8 +43,8 @@
  *     bare POSTs (the chef section's exact shape).
  *   - The handlers: shared InitializeCargoIndex/RebuildCargoIndex flash
  *     success/error then the scope wrapper REDIRECTS back onto the settings
- *     page (user setting/packages.go:85-100 → /user/settings/packages; org
- *     setting_packages.go:109-124 → /org/{name}/settings/packages). Upstream
+ *     page (user setting/packages.go:80-95 → /user/settings/packages; org
+ *     setting_packages.go:104-119 → /org/{name}/settings/packages). Upstream
  *     commits as owner=doer=ctx.Doer/ctx.ContextUser — the mirror commits
  *     author as the OWNER; our seams' doerId stays OMITTED in these arms
  *     (the cargo-index module's owner-authors default), the exact upstream
@@ -63,8 +63,8 @@
  * ## Mount (executed — the ui/index.ts hunks beside the chef arm's)
  *
  *   - parseUiRoute: the user tail `packages/cargo/{initialize,rebuild}`
- *     (web.go:714-717) and the org tail `…/settings/packages/cargo/{initialize,
- *     rebuild}` (web.go:1081-1085) — POST-only upstream, the GET twins
+ *     (web.go:684-687) and the org tail `…/settings/packages/cargo/{initialize,
+ *     rebuild}` (web.go:1055-1059) — POST-only upstream, the GET twins
  *     answer the 405 (the chef tail's posture).
  *   - handlers: guard-first prologues → ensure/rebuild over
  *     `cargoIndexBindings(c.env)` → 303 back onto the scope's settings

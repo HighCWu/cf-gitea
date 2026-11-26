@@ -28,7 +28,7 @@
  *     D-6 set; ServeSetHeaders receives no ContentType →
  *     util.IfZero("", …) → application/octet-stream, serve.go:75 — the zip
  *     is NOT sniffed); the lead file's GET bumps the download counter
- *     (packages.go:664-668).
+ *     (packages.go:669-673).
  *   - `PUT /upload` — UploadPackage (goproxy.go:155-223): parse the zip per
  *     go.dev/ref/mod#zip-files, store name/version from the FIRST
  *     `{module}@{version}/` entry, the go.mod text as a VERSION PROPERTY
@@ -603,7 +603,7 @@ export async function uploadGoPackage(input: UploadGoPackageInput): Promise<Uplo
   }
   // Size quota: declared length pre-check; the chunked arm defers to
   // post-spool with the real size (upstream reads Data.Size() after the
-  // read, packages.go:303-306 — the generic.ts order).
+  // read, packages.go:305-308 — the generic.ts order).
   if (input.declaredLength !== undefined) {
     await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "go", input.declaredLength, input.quota);
   }
@@ -772,7 +772,7 @@ export async function getGoModContent(d1: D1Database, versionId: number): Promis
 /**
  * `DownloadPackageFile`'s walk (goproxy.go:91-119): resolve → the ONE file
  * (len != 1 → the 500 sentinel) → the blob → the R2 content stream; the
- * lead file's GET bumps the download counter (packages.go:664-668, HEAD
+ * lead file's GET bumps the download counter (packages.go:669-673, HEAD
  * never counts). Throws GoPackageNotExistError on the resolve miss AND on a
  * vanished content object (the honest 404 — the sole-sweeper posture).
  */

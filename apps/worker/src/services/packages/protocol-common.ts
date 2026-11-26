@@ -3,7 +3,7 @@
  * and npm.ts). Everything here is a multi-consumer helper the landed M1 model
  * deliberately does not carry: the version-metadata write (upstream sets
  * MetadataJSON at INSERT time inside createPackageAndVersion,
- * services/packages/packages.go:218-245 — a re-published version keeps its
+ * services/packages/packages.go:220-247 — a re-published version keeps its
  * original metadata, so the write is gated on the versionCreated answer), the
  * URL validation arm (upstream validation.IsValidURL,
  * modules/validation/helpers.go:42-50 — absolute http/https URI), and the

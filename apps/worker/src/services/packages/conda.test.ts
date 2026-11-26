@@ -807,7 +807,7 @@ describe("openCondaFileForDownload (conda.go:296-322)", () => {
     expect(Object.keys(body.packages)).toEqual(["numpy-1.26.0-py3h_0.tar.bz2"]);
   });
 
-  it("a failed counter write does NOT break the serving arm (packages.go:666-670 — upstream logs and returns the file)", async () => {
+  it("a failed counter write does NOT break the serving arm (packages.go:671-675 — upstream logs and returns the file)", async () => {
     const bytes = fixtureBytes(F1_FULL);
     const result = (await upload(ownerRow, ownerRow.id, { content: streamOf(bytes), filename: "b.tar.bz2" })) as Awaited<
       ReturnType<typeof uploadCondaPackageFile>

@@ -701,7 +701,7 @@ describe("determinePackageAccessMode", () => {
   });
 
   // The require-sign-in-view instance flag (SPEC-0003 §2.4 row 6, packages
-  // arm): services/context/package.go:120 — INSIDE determineAccessMode,
+  // arm): services/context/package.go:102 — INSIDE determineAccessMode,
   // `RequireSignInViewStrict && (doer == nil || doer.IsGhost())` → none. The
   // ghost class arrives here as doer === null on every path (the container
   // family maps the ghost token to the anonymous ladder), so the null check

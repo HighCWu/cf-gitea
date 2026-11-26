@@ -10,15 +10,15 @@
  *      keep-pattern / remove-days / remove-pattern, case-insensitive
  *      anchored regexes, package_cleanup_rule.go:41-54), delete matching
  *      versions + references — then the rebuild rider of upstream
- *      cleanup.go:122-147: when the rule deleted at least one version
+ *      cleanup.go:124-149: when the rule deleted at least one version
  *      (`anyVersionDeleted`), the rule TYPE's registry index files rebuild
  *      WHOLE, once per rule — debian/alpine/rpm/arch each through their
  *      BuildAllRepositoryFiles. Upstream wraps the arch arm in its global
- *      lock (`packages_arch_<ownerID>`, cleanup.go:137-141 →
+ *      lock (`packages_arch_<ownerID>`, cleanup.go:139-143 →
  *      arch/repository.go:40-42); our tree carries no globallock (the
  *      landed arch module ships none either) — the serialized REPO_TASKS
  *      consumer is the writer gate. Upstream's per-package cargo rider
- *      (cleanup.go:108-118) is WIRED since the cargo family landed: inside
+ *      (cleanup.go:110-120) is WIRED since the cargo family landed: inside
  *      the rule's package loop, each package that lost a version runs
  *      cargo.UpdatePackageIndexIfExists — DISTINCT from the distro
  *      families' post-loop rebuild. The seam is the repo-absent no-op by
@@ -135,7 +135,7 @@ export function cleanupOlderThanHoursFromEnv(env: { PACKAGE_CLEANUP_OLDER_THAN?:
  *  These bound ONLY the R2 spool walk — an R2 list is inherently paged and
  *  the budget-overrun throw is the redelivery seam. The rule version walk
  *  carries no cap: upstream's own cleanup passes no Paginator
- *  (cleanup.go:37-41 → searchVersionsBySession's Paginator-nil arm,
+ *  (cleanup.go:39-43 → searchVersionsBySession's Paginator-nil arm,
  *  package_version.go:300-306 — the unbounded Find), so the sweep rides the
  *  same paginator-less searchVersions fork the preview loaders do and
  *  preview/sweep evaluate the identical version set. (The former private
@@ -212,7 +212,7 @@ function compileRulePattern(pattern: string): RegExp | null {
 }
 
 // ---------------------------------------------------------------------------
-// The rebuild arm (upstream cleanup.go:122-147) — one BuildAllRepositoryFiles
+// The rebuild arm (upstream cleanup.go:124-149) — one BuildAllRepositoryFiles
 // per distro rule type, after the rule's package loop deleted at least one
 // version.
 // ---------------------------------------------------------------------------
@@ -248,7 +248,7 @@ async function loadCleanupOwner(db: D1Database, ownerId: number): Promise<Cleanu
  * their isInternal filters; upstream's raw query needs none because the
  * internal `_family` files carry no family properties). This is the
  * iteration source the BuildAllRepositoryFiles arms walk
- * (models/packages/arch/search.go:14-38, debian/search.go:112-143,
+ * (models/packages/arch/search.go:14-38, debian/search.go:104-135,
  * alpine/search.go:14-37).
  */
 async function listDistinctFileProperties(
@@ -309,7 +309,7 @@ async function deleteInternalRepositoryFiles(db: D1Database, internalVersionId: 
  * rebuilds through buildArchRepositoryFiles — the landed
  * BuildSpecificRepositoryFiles twin, its any-arch propagation included.
  * Upstream wraps THIS call in the globallock `packages_arch_<ownerID>`
- * (cleanup.go:137-141 → arch/repository.go:40-42); our tree carries no
+ * (cleanup.go:139-143 → arch/repository.go:40-42); our tree carries no
  * globallock and the landed arch module ships none either — the serialized
  * REPO_TASKS consumer is the writer gate.
  */
@@ -330,7 +330,7 @@ async function buildAllArchRepositoryFiles(db: D1Database, bucket: R2Bucket, own
  * delete, then every distribution × component × architecture
  * (GetDistributions / GetComponents / GetArchitectures — the architecture
  * list hangs off the DISTRIBUTION, not the component,
- * models/packages/debian/search.go:112-143) through
+ * models/packages/debian/search.go:104-135) through
  * buildDebianRepositoryFiles — the landed BuildSpecificRepositoryFiles twin
  * (the Packages pair for the exact triple + the whole distribution's
  * Release trio).
@@ -390,7 +390,7 @@ async function buildAllAlpineRepositoryFiles(db: D1Database, bucket: R2Bucket, o
 // version until the next unrelated rebuild. The protocol file-delete paths
 // (alpine.go:269 / arch.go:290 RemovePackageFileAndVersionIfUnreferenced)
 // deliberately do NOT ride the hook — upstream deletes the version DIRECTLY
-// (packages.go:570-574) and those routers rebuild their own group afterwards.
+// (packages.go:575-579) and those routers rebuild their own group afterwards.
 // The arch arm's AcquireRegistryLock has no twin here (no globallock — the
 // standing cleanup posture above); the riders below inherit it.
 // ---------------------------------------------------------------------------
@@ -472,7 +472,7 @@ export async function onAfterRemovePackage(
   }
 }
 
-/** One enabled rule's sweep over its owner+type packages (cleanup.go:61-112). */
+/** One enabled rule's sweep over its owner+type packages (cleanup.go:63-114). */
 async function executeCleanupOneRule(
   env: PackagesCleanupEnv,
   bucket: R2Bucket,
@@ -497,13 +497,13 @@ async function executeCleanupOneRule(
     .from(packages)
     .where(and(eq(packages.ownerId, rule.ownerId), eq(packages.type, rule.type)))
     .all();
-  // anyVersionDeleted accumulates across the rule's packages (cleanup.go:97-108);
+  // anyVersionDeleted accumulates across the rule's packages (cleanup.go:99-110);
   // the rebuild rider fires ONCE per rule, after the loop.
   let anyVersionDeleted = false;
   for (const pkg of targets) {
     // SearchVersions{PackageID, IsInternal: Some(false), SortCreatedDesc} —
     // the exact option set upstream's rule loop passes, and NO Paginator
-    // (cleanup.go:37-44): through the landed searchVersions twin that is
+    // (cleanup.go:39-46): through the landed searchVersions twin that is
     // packageId + excludeInternal with page/limit OMITTED — the
     // paginator-less Find (searchVersionsBySession's Paginator-nil arm,
     // package_version.go:300-306), the same fetch the cleanup-rule preview
@@ -520,7 +520,7 @@ async function executeCleanupOneRule(
     for (const [index, version] of versions.entries()) {
       // keep-count: the FIRST keepCount rows of the created-desc order (the
       // newest N) always stay — upstream's positional `pvs[KeepCount:]` trim
-      // (cleanup.go:78-84), not a candidate count.
+      // (cleanup.go:80-86), not a candidate count.
       if (rule.keepCount > 0 && index < rule.keepCount) continue;
       const toMatch = rule.matchFullName ? `${pkg.lowerName}/${version.lowerVersion}` : version.lowerVersion;
       if (keepMatcher !== null && keepMatcher.test(toMatch)) continue;
@@ -534,7 +534,7 @@ async function executeCleanupOneRule(
       anyVersionDeleted = true;
       versionDeleted = true;
     }
-    // The per-package cargo rider (cleanup.go:108-118) — INSIDE the rule's
+    // The per-package cargo rider (cleanup.go:110-120) — INSIDE the rule's
     // package loop, distinct from the distro families' post-loop rebuild:
     // each package that lost a version refreshes its index entry
     // (cargo.UpdatePackageIndexIfExists; a throw fails the message → the
@@ -553,7 +553,7 @@ async function executeCleanupOneRule(
     }
   }
 
-  // The rebuild rider (cleanup.go:122-147): once per rule, AFTER the whole
+  // The rebuild rider (cleanup.go:124-149): once per rule, AFTER the whole
   // package loop, only when the rule deleted at least one version
   // (`anyVersionDeleted`). A throw here fails the message → the queue
   // redelivers and the sweep re-derives (the consumer's idempotency).
@@ -582,13 +582,13 @@ async function executeCleanupOneRule(
       // Upstream's switch has no default arm — the generic and the other
       // non-distro types rebuild nothing. Cargo rebuilds nothing HERE
       // either: its rider runs PER PACKAGE inside the loop above
-      // (cleanup.go:108-118), not post-loop.
+      // (cleanup.go:110-120), not post-loop.
       break;
   }
 }
 
 /**
- * The queue consumer's work (CleanupTask, cleanup.go:26-32) — exported so the
+ * The queue consumer's work (CleanupTask, cleanup.go:28-34) — exported so the
  * REPO_TASKS dispatcher (repos/purge.ts) folds it as one typed arm and the
  * tests drive it without fabricating a MessageBatch. Idempotent: every step
  * re-checks current state, so a redelivery re-runs cleanly.
@@ -617,7 +617,7 @@ export async function handlePackagesCleanup(
     await executeCleanupOneRule(env, bucket, rule, now);
   }
 
-  // Arm 2 — CleanupExpiredData (cleanup.go:167-214), upstream's order:
+  // Arm 2 — CleanupExpiredData (cleanup.go:169-216), upstream's order:
   // unreferenced package rows first, then the expired unreferenced blobs.
 
   // (a) package rows with zero versions left (the rules' or a manual
@@ -634,7 +634,7 @@ export async function handlePackagesCleanup(
   // (b) expired unreferenced blobs: the ROW delete first, then the R2 key —
   // the SOLE content-key deleter (ratification 4). Upstream carries the same
   // shape (rows deleted inside the transaction, content-store deletes after
-  // it — cleanup.go:191-212): a crash between a row delete and its key
+  // it — cleanup.go:193-214): a crash between a row delete and its key
   // delete leaves an orphaned object D1 cannot see, the accepted failure
   // window both implementations share.
   const expiredBlobs = await d1

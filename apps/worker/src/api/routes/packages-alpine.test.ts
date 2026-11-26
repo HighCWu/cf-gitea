@@ -328,7 +328,7 @@ describe("alpine upload → APKINDEX → download", () => {
     expect(index.status).toBe(404); // the empty arm deleted the index
   });
 
-  it("the version-cascading delete fires the package webhook deleted (alpine.go:269 → packages.go:572's pd != nil gate)", async () => {
+  it("the version-cascading delete fires the package webhook deleted (alpine.go:269 → packages.go:577's pd != nil gate)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const hookRows = await db()

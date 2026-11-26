@@ -360,7 +360,7 @@ export interface NpmMetadata {
 export const NPM_TAG_PROPERTY = "npm.tag";
 
 /**
- * The descriptor's metadata unmarshal (descriptor.go:243-249): parse the
+ * The descriptor's metadata unmarshal (descriptor.go:246-252): parse the
  * stored JSON into the npm Metadata shape — unknown keys dropped, nulls land
  * in the zero values, a broken JSON or a type mismatch is a 500
  * (packageMetadata's unmarshal arm). NULL metadata is the zero struct.
@@ -1331,11 +1331,11 @@ export async function uploadNpmPackage(input: UploadNpmPackageInput): Promise<Up
 
     // The quota checks precede the inserts (one transaction upstream — a 403
     // leaves no rows). SIZE: CheckSizeQuotaExceeded runs at
-    // addFileToPackageVersion's start (packages.go:303-306) with the TARBALL's
+    // addFileToPackageVersion's start (packages.go:305-308) with the TARBALL's
     // size, not the envelope's. COUNT: upstream checks AFTER the version
     // insert, inside the rolling-back transaction (the versionCreated gate,
     // packages.go:188-191) and throws when totalCount > limit
-    // (packages.go:380-381) — the pre-insert equivalent is count + 1 > limit,
+    // (packages.go:382-383) — the pre-insert equivalent is count + 1 > limit,
     // so an exactly-at-limit owner publishes the version that REACHES the cap
     // but not one past (the nuget.ts twin carries the same parity).
     if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
@@ -1560,7 +1560,7 @@ export async function findNpmVersionForFilename(
 }
 
 /** The download walk: version → file → blob → R2 stream, the lead-file GET
- *  counter bump (packages.go:655-660 — HEAD never counts). Null = 404. */
+ *  counter bump (packages.go:660-665 — HEAD never counts). Null = 404. */
 export async function openNpmFileForDownload(
   d1: D1Database,
   bucket: R2Bucket,
@@ -1626,7 +1626,7 @@ interface NpmVersionEntry {
 
 /** GetPackageDescriptors' per-version assembly (descriptor.go:170-238). */
 async function assembleNpmVersionEntry(d1: D1Database, pkg: PackageRow, version: PackageVersionRow): Promise<NpmVersionEntry> {
-  // descriptor.go:224-227 — SemVer parses (npm is semver-compatible); a
+  // descriptor.go:227-230 — SemVer parses (npm is semver-compatible); a
   // broken stored version is a 500 (the descriptor's error arm).
   const semver = parseGoVersion(version.version);
   if (semver === null) throw new Error(`stored npm version is malformed: ${version.version}`);

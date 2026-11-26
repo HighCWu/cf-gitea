@@ -10,33 +10,33 @@
  *   maven-metadata.xml[.md5/.sha1/.sha256/.sha512] special case — an
  *   artifact-level metadata request carries NO version, a `version-SNAPSHOT`
  *   metadata request keeps it. The internal package name is `groupId:
- *   artifactId` (toInternalPackageName, maven.go:432-437); the legacy
- *   `groupId-artifactId` form (maven.go:439-441) is read as a fallback on
+ *   artifactId` (toInternalPackageName, maven.go:435-440); the legacy
+ *   `groupId-artifactId` form (maven.go:442-444) is read as a fallback on
  *   every GET and renamed to the colon form on the next non-legacy upload
- *   (maven.go:292-303, UpdatePackageNameByID).
- * - Upload (UploadPackageFile, maven.go:238-414): the artifact write streams
+ *   (maven.go:295-306, UpdatePackageNameByID).
+ * - Upload (UploadPackageFile, maven.go:241-417): the artifact write streams
  *   through the store's spool (512 MiB cap, the landed two-pass discipline);
  *   a pom upload parses the metadata and writes the version's MetadataJSON —
  *   upstream writes it on BOTH arms (marshaled into the version INSERT inside
- *   createPackageAndVersion, services/packages/packages.go:170-186, and
- *   updated on an existing version, maven.go:370-388) — so ours writes after
+ *   createPackageAndVersion, services/packages/packages.go:172-188, and
+ *   updated on an existing version, maven.go:373-391) — so ours writes after
  *   the get-or-insert regardless of `created`. A checksum PUT (.sha1/.md5/
  *   .sha256/.sha512) is VERIFICATION, not storage: the body (capped at
- *   maxChecksumSize = sha512.Size*2+1 = 129 bytes, maven.go:33/266-278) is
- *   compared EXACTLY against the stored hash column (maven.go:331-343 — no
+ *   maxChecksumSize = sha512.Size*2+1 = 129 bytes, maven.go:34/269-281) is
+ *   compared EXACTLY against the stored hash column (maven.go:334-346 — no
  *   trim, no case fold; mismatch 400 "hash mismatch", match 200) and nothing
  *   lands. IsMeta SNAPSHOT metadata files upload with OverwriteExisting
- *   (maven.go:356 — the helm re-publish idiom); every other duplicate answers
- *   409 (maven.go:403-404 — upstream's TryInsertFile fails the duplicate
+ *   (maven.go:359 — the helm re-publish idiom); every other duplicate answers
+ *   409 (maven.go:406-407 — upstream's TryInsertFile fails the duplicate
  *   REGARDLESS of bytes, pinned by upstream's own integration test: the same
  *   "test" body twice answers 409, tests/integration/api_packages_maven_test.go:53-54).
- * - maven-metadata.xml (serveMavenMetadata, maven.go:82-150 + api.go): the
+ * - maven-metadata.xml (serveMavenMetadata, maven.go:85-153 + api.go): the
  *   versions of BOTH package names concatenated (legacy first), sorted
- *   ascending by creation (maven.go:108-111 — "Maven and Gradle order packages
+ *   ascending by creation (maven.go:111-114 — "Maven and Gradle order packages
  *   by their creation timestamp"), rendered as api.go's MetadataResponse XML
  *   in Go's xml.Marshal element order with `release` omitted when every
  *   version is a -SNAPSHOT (api.go:14-21); the checksum siblings hash the
- *   exact served bytes (header included, maven.go:126-143).
+ *   exact served bytes (header included, maven.go:129-146).
  * - pom parsing (ParsePackageMetaData, metadata.go:65-111): the
  *   groupId/artifactId/version/packaging-relevant coordinate fields, the
  *   parent-inheritance fallback for groupId, license names, dependency
@@ -59,7 +59,7 @@
  * and falls back to utf-8 (Go's charset.NewReaderLabel handles dozens);
  * unspecified-extension file GETs answer application/octet-stream (Go sniffs
  * the first bytes via http.ServeContent); the globallock per-package upload
- * serialization (maven.go:257-263) is the D1 UNIQUE arbitration + re-select
+ * serialization (maven.go:260-266) is the D1 UNIQUE arbitration + re-select
  * idiom the whole model already uses (SPEC-0016 §4.3: no DO); the version
  * metadata of a non-pom upload stays SQL NULL where upstream stores the JSON
  * string "null" (json.Marshal of a nil pointer — every consumer unmarshals
@@ -109,17 +109,17 @@ import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common"
 import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 
 // ---------------------------------------------------------------------------
-// Constants + the extension helpers (maven.go:33-45, 416-422)
+// Constants + the extension helpers (maven.go:34-46, 416-422)
 // ---------------------------------------------------------------------------
 
-/** maxChecksumSize (maven.go:33) — sha512 hex (128) + the Go sum-colon form. */
+/** maxChecksumSize (maven.go:34) — sha512 hex (128) + the Go sum-colon form. */
 export const MAX_CHECKSUM_BYTES = 128 + 1;
 
 const MAVEN_METADATA_FILE = "maven-metadata.xml";
 const CHECKSUM_EXTENSIONS = new Set([".md5", ".sha1", ".sha256", ".sha512"]);
 
-/** isChecksumExtension (maven.go:420-422) — the UPLOAD path uses the raw ext
- *  (maven.go:265), the SERVE path lowercases first (maven.go:125/168). */
+/** isChecksumExtension (maven.go:423-425) — the UPLOAD path uses the raw ext
+ *  (maven.go:268), the SERVE path lowercases first (maven.go:128/171). */
 export function isMavenChecksumExtension(ext: string): boolean {
   return CHECKSUM_EXTENSIONS.has(ext);
 }
@@ -144,7 +144,7 @@ export interface MavenPathParameters {
   isMeta: boolean;
 }
 
-/** illegalCharacters (maven.go:49). */
+/** illegalCharacters (maven.go:50). */
 const ILLEGAL_CHARACTERS = /[\\/:?"<>|*]/;
 
 /**
@@ -205,12 +205,12 @@ export function decodeMavenPathWildcard(pathname: string, username: string): str
   }
 }
 
-/** toInternalPackageName (maven.go:432-437) — "GroupID:ArtifactID". */
+/** toInternalPackageName (maven.go:435-440) — "GroupID:ArtifactID". */
 export function mavenInternalPackageName(params: MavenPathParameters): string {
   return `${params.groupId}:${params.artifactId}`;
 }
 
-/** toInternalPackageNameLegacy (maven.go:439-441) — "GroupID-ArtifactID". */
+/** toInternalPackageNameLegacy (maven.go:442-444) — "GroupID-ArtifactID". */
 export function mavenLegacyPackageName(params: MavenPathParameters): string {
   return `${params.groupId}-${params.artifactId}`;
 }
@@ -220,7 +220,7 @@ export function mavenLegacyPackageName(params: MavenPathParameters): string {
 // the route — apiError is ctx.PlainText, maven.go:52-56)
 // ---------------------------------------------------------------------------
 
-/** errInvalidParameters (maven.go:48) → 400. */
+/** errInvalidParameters (maven.go:49) → 400. */
 export class MavenInvalidParametersError extends Error {
   constructor() {
     super("request parameters are invalid");
@@ -228,7 +228,7 @@ export class MavenInvalidParametersError extends Error {
   }
 }
 
-/** The >129-byte checksum body (maven.go:276-278) → 413. */
+/** The >129-byte checksum body (maven.go:279-281) → 413. */
 export class MavenChecksumTooLargeError extends Error {
   constructor() {
     super("checksum is too large");
@@ -252,7 +252,7 @@ export class MavenPackageFileNotExistError extends Error {
   }
 }
 
-/** The checksum PUT contradicting the stored hash (maven.go:341) → 400. */
+/** The checksum PUT contradicting the stored hash (maven.go:344) → 400. */
 export class MavenHashMismatchError extends Error {
   constructor() {
     super("hash mismatch");
@@ -716,7 +716,7 @@ export function parsePomMetadata(bytes: Uint8Array): MavenPomMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// The maven-metadata.xml document (api.go MetadataResponse + maven.go:82-150)
+// The maven-metadata.xml document (api.go MetadataResponse + maven.go:85-153)
 // ---------------------------------------------------------------------------
 
 /**
@@ -743,17 +743,17 @@ export function renderMavenMetadataXml(groupId: string, artifactId: string, vers
 
 export interface MavenMetadataDocument {
   /** The exact served bytes' text (header included — upstream hashes
-   *  xmlMetadataWithHeader, maven.go:118). */
+   *  xmlMetadataWithHeader, maven.go:121). */
   xml: string;
   /** The newest-created version's timestamp (the Last-Modified header). */
   lastModified: Date;
 }
 
 /**
- * serveMavenMetadata's data half (maven.go:82-115): the versions of BOTH
- * package names (legacy first, maven.go:85-95), each list excluding internal
+ * serveMavenMetadata's data half (maven.go:85-118): the versions of BOTH
+ * package names (legacy first, maven.go:88-98), each list excluding internal
  * rows (GetVersionsByPackageName's IsInternal:false, package_version.go:148),
- * sorted ascending by creation (maven.go:108-111). Null = 404.
+ * sorted ascending by creation (maven.go:111-114). Null = 404.
  */
 export async function loadMavenMetadataDocument(
   d1: D1Database,
@@ -782,7 +782,7 @@ export async function loadMavenMetadataDocument(
   });
   const rows: { version: PackageVersionRow }[] = [...legacy.rows, ...current.rows];
   if (rows.length === 0) return null;
-  // sort.Slice ascending by CreatedUnix (maven.go:108-111); the tie-break is
+  // sort.Slice ascending by CreatedUnix (maven.go:111-114); the tie-break is
   // ascending id (upstream's sort is unstable on the second-resolution ties —
   // ours pins insertion order, which also matches the model's max(id)-is-latest
   // rule).
@@ -800,7 +800,7 @@ export async function loadMavenMetadataDocument(
   };
 }
 
-/** The checksum of the exact metadata bytes (maven.go:126-143); md5 is the
+/** The checksum of the exact metadata bytes (maven.go:129-146); md5 is the
  *  local implementation, the rest WebCrypto. */
 export async function mavenMetadataChecksum(xml: string, ext: string): Promise<string> {
   const bytes = new TextEncoder().encode(xml);
@@ -819,7 +819,7 @@ export async function mavenMetadataChecksum(xml: string, ext: string): Promise<s
 }
 
 // ---------------------------------------------------------------------------
-// The upload walk (UploadPackageFile, maven.go:238-414)
+// The upload walk (UploadPackageFile, maven.go:241-417)
 // ---------------------------------------------------------------------------
 
 /** Go strconv.ParseBool's truthy set — FormBool("use_legacy_package_name"). */
@@ -855,8 +855,8 @@ export interface UploadMavenPackageFileInput {
 }
 
 export type MavenUploadOutcome =
-  | { kind: "ignored-metadata" } // the artifact-level index PUT → 200 (maven.go:246-249)
-  | { kind: "checksum-verified" } // the verification PUT → 200 (maven.go:345)
+  | { kind: "ignored-metadata" } // the artifact-level index PUT → 200 (maven.go:249-252)
+  | { kind: "checksum-verified" } // the verification PUT → 200 (maven.go:348)
   | { kind: "created"; file: PackageFileRow; blob: PackageBlobRow; createdFile: boolean }; // → 201
 
 /** The stored hash column a checksum extension reads (null columns → ""). */
@@ -878,7 +878,7 @@ function storedChecksum(blob: PackageBlobRow, ext: string): string {
 /**
  * The PUT's service walk. Arms in upstream's order: path params → the
  * artifact-level metadata ignore → the legacy-name resolve/rename → the
- * checksum VERIFY arm (quota-free, maven.go:306-347 returns before any quota
+ * checksum VERIFY arm (quota-free, maven.go:309-350 returns before any quota
  * or creation) → the pom metadata parse (400 on malformed) → the size quota →
  * the create-or-add (duplicate file → 409, quota → 403).
  */
@@ -887,7 +887,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
   const params = extractMavenPathParameters(input.pathWildcard);
   if (params === null) throw new MavenInvalidParametersError();
 
-  // Ignore the package index /<name>/maven-metadata.xml (maven.go:245-249).
+  // Ignore the package index /<name>/maven-metadata.xml (maven.go:248-252).
   if (params.isMeta && params.version === "") {
     return { kind: "ignored-metadata" };
   }
@@ -896,11 +896,11 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
     ? mavenLegacyPackageName(params)
     : mavenInternalPackageName(params);
   const legacyName = mavenLegacyPackageName(params);
-  const ext = mavenPathExt(params.filename); // the RAW ext — the upload arm is case-sensitive (maven.go:265)
+  const ext = mavenPathExt(params.filename); // the RAW ext — the upload arm is case-sensitive (maven.go:268)
   const isChecksum = isMavenChecksumExtension(ext);
 
   // The body streams through the spool. A checksum PUT caps at
-  // maxChecksumSize (LimitReader(129+1) + isChecksumSizeAllowed, maven.go:266-278):
+  // maxChecksumSize (LimitReader(129+1) + isChecksumSizeAllowed, maven.go:269-281):
   // 129 bytes pass, 130 trip the cap → 413.
   let md5: Md5 | null = null;
   let spooled: SpooledBlob;
@@ -940,7 +940,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
 
   try {
     // Old maven packages use "groupId-artifactId" as the package name —
-    // rename the legacy row to the current form (maven.go:292-303). With the
+    // rename the legacy row to the current form (maven.go:295-306). With the
     // legacy flag set the "rename" target IS the legacy name (an update
     // no-op, upstream's own shape).
     const legacyPackage = await getPackageByName(input.d1, input.owner.id, "maven", legacyName);
@@ -959,7 +959,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
         .run();
     }
 
-    // Do not upload checksum files but compare the hashes (maven.go:305-347):
+    // Do not upload checksum files but compare the hashes (maven.go:308-350):
     // version and file must exist (both 404), the ≤129-byte body compares
     // EXACTLY against the stored column, and nothing is stored.
     if (isChecksum) {
@@ -991,7 +991,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
 
     // COUNT: upstream checks AFTER the version insert, inside the
     // rolling-back transaction (the versionCreated gate, packages.go:188-191)
-    // and throws when totalCount > limit (packages.go:380-381) — the
+    // and throws when totalCount > limit (packages.go:382-383) — the
     // pre-insert equivalent is count + 1 > limit, so an exactly-at-limit
     // owner publishes the version that REACHES the cap but not one past.
     if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
@@ -1001,7 +1001,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
       }
     }
 
-    // If it's the package pom file extract the metadata (maven.go:359-394):
+    // If it's the package pom file extract the metadata (maven.go:362-397):
     // the parse is 400 on a malformed pom, BEFORE the quota/creation arms —
     // upstream's order (the parse sits before CreatePackageOrAddFileToExisting).
     let pomMetadata: MavenPomMetadata | null = null;
@@ -1018,7 +1018,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
       ownerId: input.owner.id,
       type: "maven",
       name: packageName,
-      // SemverCompatible: false (maven.go:288).
+      // SemverCompatible: false (maven.go:291).
       semverCompatible: false,
       now,
     });
@@ -1030,7 +1030,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
     });
     // The pom metadata lands on BOTH arms: marshaled into the fresh version's
     // INSERT (packages.go:170-186) or updated on the existing one
-    // (maven.go:370-388). A non-pom upload leaves SQL NULL where upstream
+    // (maven.go:373-391). A non-pom upload leaves SQL NULL where upstream
     // stores "null" (documented, invisible to consumers).
     if (pomMetadata !== null) {
       await writeVersionMetadata(input.d1, version.id, JSON.stringify(pomMetadata));
@@ -1065,10 +1065,10 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
       await input.bucket.delete(spooled.spoolKey);
     }
 
-    // IsLead only for the pom (maven.go:360-361); the SNAPSHOT metadata file
-    // re-publishes with OverwriteExisting (maven.go:356 — the same-blob
+    // IsLead only for the pom (maven.go:363-364); the SNAPSHOT metadata file
+    // re-publishes with OverwriteExisting (maven.go:359 — the same-blob
     // short circuit stays a 201); every other duplicate is the 409 upstream's
-    // TryInsertFile answers regardless of bytes (maven.go:403-404).
+    // TryInsertFile answers regardless of bytes (maven.go:406-407).
     const fileResult: InsertFileResult = await insertMavenFile(input.d1, {
       versionId: version.id,
       blobId: blob.id,
@@ -1096,7 +1096,7 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
 }
 
 /**
- * The OverwriteExisting insert (packages.go:319-345): an existing file with
+ * The OverwriteExisting insert (packages.go:321-347): an existing file with
  * the same blob is the short-circuit no-op; a different blob is deleted
  * (properties with it) and re-inserted; no existing row is a plain insert.
  */
@@ -1144,10 +1144,10 @@ async function insertMavenFile(
 }
 
 // ---------------------------------------------------------------------------
-// The download walks (maven.go:59-231)
+// The download walks (maven.go:62-234)
 // ---------------------------------------------------------------------------
 
-/** The per-extension Content-Type (maven.go:209-214); unspecified extensions
+/** The per-extension Content-Type (maven.go:212-217); unspecified extensions
  *  answer application/octet-stream (Go sniffs — documented). */
 export function mavenServeContentType(ext: string): string {
   switch (ext) {
@@ -1176,11 +1176,11 @@ export interface MavenOpenedChecksum {
 }
 
 /**
- * servePackageFile (maven.go:152-231): the version walk tries the current
- * name then the legacy fallback (maven.go:153-156), the filename sheds its
+ * servePackageFile (maven.go:155-234): the version walk tries the current
+ * name then the legacy fallback (maven.go:156-159), the filename sheds its
  * checksum extension before the file lookup, a checksum GET answers the
- * STORED hash (maven.go:189-203), and the lead-file GET bumps the download
- * counter (OpenBlobForDownload, packages.go:667-671 — checksum GETs return
+ * STORED hash (maven.go:192-206), and the lead-file GET bumps the download
+ * counter (OpenBlobForDownload, packages.go:672-676 — checksum GETs return
  * before it, so they never count). Throws the typed 404s; a missing blob row
  * or R2 object is the internal-error arm.
  */
@@ -1191,7 +1191,7 @@ export async function openMavenFile(
   params: MavenPathParameters,
   method: "GET" | "HEAD",
 ): Promise<MavenOpenedFile | MavenOpenedChecksum> {
-  const ext = mavenPathExt(params.filename).toLowerCase(); // the SERVE path lowercases (maven.go:168)
+  const ext = mavenPathExt(params.filename).toLowerCase(); // the SERVE path lowercases (maven.go:171)
   const isChecksum = isMavenChecksumExtension(ext);
 
   let version = await getVersionByNameAndVersion(

@@ -675,7 +675,7 @@ function quotaMessage(error: unknown): string {
 }
 
 /**
- * nuget.go:30-35 — the family's `{"Message": ...}` JSON error body via
+ * nuget.go:31-36 — the family's `{"Message": ...}` JSON error body via
  * ctx.JSON (Content-Type application/json;charset=utf-8); helper.go:29-44
  * strips 500s to "internal server error" (the prod posture).
  */
@@ -721,7 +721,7 @@ function nugetErrorResponse(error: unknown): Response {
   return nugetApiError(500, "internal server error");
 }
 
-/** xmlResponse (nuget.go:37-42) — the atom+xml header + body pair. */
+/** xmlResponse (nuget.go:38-43) — the atom+xml header + body pair. */
 function nugetXmlResponse(xml: string): Response {
   return new Response(xml, { status: 200, headers: { "content-type": "application/atom+xml; charset=utf-8" } });
 }
@@ -827,7 +827,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.get("/:username/pypi/simple/:id", async (c) => {
     try {
       const { owner } = await protocolContext(c, "read");
-      // RegistryURL (pypi.go:71): AppURL + "api/packages/{owner}/pypi" — the
+      // RegistryURL (pypi.go:77): AppURL + "api/packages/{owner}/pypi" — the
       // owner name renders unescaped, as upstream injects it.
       const origin = new URL(c.req.url).origin;
       const registryUrl = `${origin}/api/packages/${owner.username}/pypi`;
@@ -865,7 +865,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         c.req.method === "HEAD" ? "HEAD" : "GET",
       );
       if (download === null) {
-        // helper.PackageErrorStatus: ErrNotExist → 404 (pypi.go:96-98).
+        // helper.PackageErrorStatus: ErrNotExist → 404 (pypi.go:102-104).
         return pypiErrorResponse(404, "package file does not exist");
       }
       return fileResponse(c, {
@@ -1079,7 +1079,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
       if (params === null) return plainResponse(400, "request parameters are invalid");
 
       if (params.isMeta && params.version === "") {
-        // serveMavenMetadata (maven.go:82-150).
+        // serveMavenMetadata (maven.go:85-153).
         const doc = await loadMavenMetadataDocument(c.env.DB, owner, params);
         if (doc === null) return plainResponse(404, "package does not exist");
         const ext = mavenPathExt(params.filename).toLowerCase();
@@ -1112,7 +1112,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         });
       }
       // Upstream's HEAD-only branch runs SetServeHeaders WITHOUT the filename
-      // (maven.go:216-219) — the D-6 header set but no Content-Disposition
+      // (maven.go:219-222) — the D-6 header set but no Content-Disposition
       // and no byte-serving (http.ServeContent never runs there; always 200).
       // The GET arm is helper.ServePackageFile → ctx.ServeContent: the full
       // disposition + the 304/206 arms (review D-6).
@@ -1168,7 +1168,7 @@ quota: packagesQuotaFromEnv(c.env),
   // FindPackagesById() + counts, the Packages(Id=..) entry), the write arms
   // (PUT /, PUT /symbolpackage, DELETE /{id}/{version}) and the symbol query
   // protocol. The base URL renders the owner name RAW — upstream's fmt
-  // concat does no escaping (nuget.go:46/70).
+  // concat does no escaping (nuget.go:47/71).
 
   const nugetBaseOf = (origin: string, ownerName: string): string => `${origin}/api/packages/${ownerName}/nuget`;
 
@@ -1206,12 +1206,12 @@ quota: packagesQuotaFromEnv(c.env),
   app.put("/:username/nuget/", (c) => nugetUpload(c, "dependency"));
   app.put("/:username/nuget/symbolpackage", (c) => nugetUpload(c, "symbols"));
 
-  // DeletePackage (nuget.go:675-698) — the group-level /{id}/{version} shape.
+  // DeletePackage (nuget.go:681-704) — the group-level /{id}/{version} shape.
   app.delete("/:username/nuget/:id/:version", async (c) => {
     try {
       const { owner, cred } = await protocolContext(c, "write", { apiKeyHeader: true });
-      // The deleted arm (nuget.go:679 → RemovePackageVersionByNameAndVersion →
-      // RemovePackageVersion, packages.go:532 — notifies ALWAYS): the
+      // The deleted arm (nuget.go:685 → RemovePackageVersionByNameAndVersion →
+      // RemovePackageVersion, packages.go:537 — notifies ALWAYS): the
       // descriptor resolves BEFORE the version row dies.
       const descriptor = await resolvePackageEventDescriptor(
         c.env.DB,
@@ -1236,7 +1236,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // ServiceIndexV3 (nuget.go:69-86) — the unauthenticated service-index group
+  // ServiceIndexV3 (nuget.go:70-87) — the unauthenticated service-index group
   // (api.go:342-346, review D-4/U-1): no read gate.
   app.get("/:username/nuget/index.json", async (c) => {
     try {
@@ -1251,7 +1251,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // FeedCapabilityResource (nuget.go:89-91) — the static Edmx document; the
+  // FeedCapabilityResource (nuget.go:90-92) — the static Edmx document; the
   // unauthenticated service-index group (api.go:342-346, review D-4/U-1).
   app.get("/:username/nuget/$metadata", async (c) => {
     try {
@@ -1262,7 +1262,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // ServiceIndexV2 (nuget.go:45-66) — the group's "/" shape; the
+  // ServiceIndexV2 (nuget.go:46-67) — the group's "/" shape; the
   // unauthenticated service-index group (api.go:342-346, review D-4/U-1).
   app.get("/:username/nuget", async (c) => {
     try {
@@ -1283,7 +1283,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // SearchServiceV3 (nuget.go:191-219) — /query?q=&skip=&take=.
+  // SearchServiceV3 (nuget.go:197-225) — /query?q=&skip=&take=.
   app.get("/:username/nuget/query", async (c) => {
     try {
       const { owner } = await protocolContext(c, "read");
@@ -1309,7 +1309,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // RegistrationIndex (nuget.go:222-247) — semver ascending; the empty arm
+  // RegistrationIndex (nuget.go:228-253) — semver ascending; the empty arm
   // answers apiError(404, nil) — the empty message ({"Message": ""}).
   app.get("/:username/nuget/registration/:id/index.json", async (c) => {
     try {
@@ -1329,7 +1329,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // RegistrationLeafV3 (nuget.go:280-306) — the .json suffix trimmed.
+  // RegistrationLeafV3 (nuget.go:286-312) — the .json suffix trimmed.
   const nugetLeafV3 = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
     try {
       const { owner } = await protocolContext(c, "read");
@@ -1352,7 +1352,7 @@ quota: packagesQuotaFromEnv(c.env),
   };
   app.get("/:username/nuget/registration/:id/:version", (c) => nugetLeafV3(c));
 
-  // EnumeratePackageVersionsV3 (nuget.go:378-394) — the empty arm 404s with
+  // EnumeratePackageVersionsV3 (nuget.go:384-400) — the empty arm 404s with
   // the empty message.
   app.get("/:username/nuget/package/:id/index.json", async (c) => {
     try {
@@ -1368,7 +1368,7 @@ quota: packagesQuotaFromEnv(c.env),
     }
   });
 
-  // DownloadPackageFile (nuget.go:398-422) — ANY file of the version; the
+  // DownloadPackageFile (nuget.go:404-428) — ANY file of the version; the
   // unknown-version/file arms answer 404 "package does not exist".
   const nugetDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
     try {
@@ -1396,7 +1396,7 @@ quota: packagesQuotaFromEnv(c.env),
   app.get("/:username/nuget/package/:id/:version/:filename", (c) => nugetDownload(c));
   app.on("HEAD", "/:username/nuget/package/:id/:version/:filename", (c) => nugetDownload(c));
 
-  // DownloadSymbolFile (nuget.go:637-671) — the chi guid regex
+  // DownloadSymbolFile (nuget.go:643-677) — the chi guid regex
   // ([0-9a-fA-F]{32}[fF]{8}) non-matches fall off the router (404, empty
   // message); a filename/filename2 mismatch is apiError(400, nil).
   const nugetSymbolDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
@@ -1429,7 +1429,7 @@ quota: packagesQuotaFromEnv(c.env),
   app.get("/:username/nuget/symbols/:filename/:guid/:filename2", (c) => nugetSymbolDownload(c));
   app.on("HEAD", "/:username/nuget/symbols/:filename/:guid/:filename2", (c) => nugetSymbolDownload(c));
 
-  // RegistrationLeafV2 (nuget.go:250-277) — the namespaced entry. chi routes
+  // RegistrationLeafV2 (nuget.go:256-283) — the namespaced entry. chi routes
   // the shape through a path regex, `Packages\(Id='([^']+)',Version='([^']+)'\)`;
   // Hono's router cannot compile embedded params inside parens, so the route
   // rides the Packages(Id=* prefix wildcard and the handler re-pins upstream's
@@ -1463,7 +1463,7 @@ quota: packagesQuotaFromEnv(c.env),
   };
   app.get("/:username/nuget/Packages(Id=*", (c) => nugetLeafV2(c));
 
-  // The V2 feeds (SearchServiceV2 / EnumeratePackageVersionsV2, nuget.go:124-356)
+  // The V2 feeds (SearchServiceV2 / EnumeratePackageVersionsV2, nuget.go:130-362)
   // with the next-link arm when the page filled.
   const nugetFeed = async (c: Context<{ Bindings: Env }>, kind: "search" | "enumerate"): Promise<Response> => {
     try {
@@ -1522,7 +1522,7 @@ quota: packagesQuotaFromEnv(c.env),
   app.get("/:username/nuget/Search()", (c) => nugetFeed(c, "search"));
   app.get("/:username/nuget/FindPackagesById()", (c) => nugetFeed(c, "enumerate"));
 
-  // The /$count arms (nuget.go:176-188 / :359-375) — plain-text integers.
+  // The /$count arms (nuget.go:182-194 / :365-381) — plain-text integers.
   const nugetSearchCount = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
     try {
       const { owner } = await protocolContext(c, "read");
@@ -2415,7 +2415,7 @@ quota: packagesQuotaFromEnv(c.env),
       }
       const origin = new URL(c.req.url).origin;
       if (target.arm === "identifiers") {
-        // LookupPackageIdentifiers (swift.go:465-506): the read gate rides
+        // LookupPackageIdentifiers (swift.go:471-512): the read gate rides
         // the group; the Accept check precedes the url-param 400.
         const { owner } = await protocolContext(c, "read");
         const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_JSON);
@@ -2439,24 +2439,24 @@ quota: packagesQuotaFromEnv(c.env),
         if (acceptError !== null) return acceptError;
         const versions = await listSwiftPackageVersions(c.env.DB, owner.id, target.scope, target.name);
         if (versions.length === 0) {
-          // apiError(ctx, 404, nil) — the EMPTY detail (swift.go:134-136).
+          // apiError(ctx, 404, nil) — the EMPTY detail (swift.go:140-142).
           return swiftProblemResponse(404, "");
         }
-        // baseURL (swift.go:149): AppURL + api/packages/{PathEscape
+        // baseURL (swift.go:155): AppURL + api/packages/{PathEscape
         // lowerowner}/swift/{PathEscape scope}/{PathEscape name}/ — the scope
         // and name ride upstream's own upload gates (swift.go:40-42,
         // services/packages/swift.ts:254-255: [a-zA-Z0-9-] / [a-zA-Z0-9-_]),
         // charsets DISJOINT from the divergent set, so encodeURIComponent is
         // byte-equal there (the owner segment: the username gate).
         const baseURL = `${origin}/api/packages/${encodeURIComponent(owner.usernameLower)}/swift/${encodeURIComponent(target.scope)}/${encodeURIComponent(target.name)}/`;
-        // Link (swift.go:159-161): the LAST sorted row's RAW version.
+        // Link (swift.go:165-167): the LAST sorted row's RAW version.
         const last = versions[versions.length - 1]?.version ?? "";
         return new Response(buildSwiftEnumerateJson(baseURL, versions), {
           status: 200,
           headers: {
             "content-type": "application/json;charset=utf-8",
             "content-version": "1",
-            link: `<${baseURL}${pathEscape(last)}>; rel="latest-version"` // swift.go:160 PathEscape(version),
+            link: `<${baseURL}${pathEscape(last)}>; rel="latest-version"` // swift.go:166 PathEscape(version),
           },
         });
       }
@@ -2484,7 +2484,7 @@ quota: packagesQuotaFromEnv(c.env),
         const { owner } = await protocolContext(c, "read");
         const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_ZIP);
         if (acceptError !== null) return acceptError;
-        // DownloadPackageFile (swift.go:424-458): the Digest header rides
+        // DownloadPackageFile (swift.go:430-464): the Digest header rides
         // setResponseHeaders BEFORE the serve; the content-type is
         // application/zip; the lead GET bumps the counter.
         const download = await openSwiftZipForDownload(
@@ -2519,7 +2519,7 @@ quota: packagesQuotaFromEnv(c.env),
           return swiftProblemResponse(404, "package does not exist");
         }
         // The swift-version param normalizes through NewVersion +
-        // TrimmedVersionString (swift.go:275-281); an unparseable value
+        // TrimmedVersionString (swift.go:281-287); an unparseable value
         // rides RAW into the manifests lookup (→ the redirect).
         let swiftVersion = c.req.query("swift-version") ?? "";
         if (swiftVersion !== "") {
@@ -2531,7 +2531,7 @@ quota: packagesQuotaFromEnv(c.env),
         const manifest = descriptor.metadata.manifests[swiftVersion];
         if (manifest === undefined) {
           // 303 SeeOther with the bare Location (owner lower name, scope,
-          // name, version RAW — swift.go:284-288) + Content-Version.
+          // name, version RAW — swift.go:290-294) + Content-Version.
           return new Response(null, {
             status: 303,
             headers: {
@@ -2565,7 +2565,7 @@ quota: packagesQuotaFromEnv(c.env),
       }
       const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_JSON);
       if (acceptError !== null) return acceptError;
-      // The URL-param validation (swift.go:328-333) runs BEFORE the body is
+      // The URL-param validation (swift.go:334-339) runs BEFORE the body is
       // read: NewSemver's error (when the version failed) IS the Problem
       // detail, else a pattern miss carries the EMPTY detail — ONE shared
       // 400 arm.
@@ -2631,7 +2631,7 @@ quota: packagesQuotaFromEnv(c.env),
   // the route group's own upstream comment cites the GitLab
   // fine-grained-permissions reference; the pin carries NO module registry /
   // .well-known discovery). The error bodies are PLAIN TEXT
-  // (terraform.go:33-36's ctx.PlainText) with the EMPTY body on the
+  // (terraform.go:36-39's ctx.PlainText) with the EMPTY body on the
   // nil-error 404s; the ONE JSON exception is the 423 lock body
   // (ctx.JSON(423, lock)). HEAD rides the GET walks (the pypi/helm
   // precedent — upstream registers GET only).
@@ -3010,7 +3010,7 @@ function cargoErrorResponse(error: unknown): Response {
 // strip their suffixes (chi's static-tail branches win over the bare param
 // route, and a valid package name can never carry a dot — namePattern).
 // Every swift response carries Content-Version: 1 (setResponseHeaders,
-// swift.go:54-71) — EXCEPT CheckAuthenticate's bare 200.
+// swift.go:60-77) — EXCEPT CheckAuthenticate's bare 200.
 // ---------------------------------------------------------------------------
 
 type SwiftArm =
@@ -3073,7 +3073,7 @@ export function parseSwiftTarget(parts: string[], method: string): SwiftArm {
   return { arm: "not-found", gated: true };
 }
 
-/** CheckAuthenticate (swift.go:103-110) — the unauthenticated group's pair:
+/** CheckAuthenticate (swift.go:109-116) — the unauthenticated group's pair:
  *  the 401 Problem for an anonymous credential, the bare 200 (NO
  *  Content-Version — ctx.Status only) otherwise. The {username} owner
  *  resolution still applies (the outer group's UserAssignment). */
@@ -3089,7 +3089,7 @@ async function swiftCheckAuthenticate(c: Context<{ Bindings: Env }>): Promise<Re
   }
 }
 
-/** CheckAcceptMediaType (swift.go:93-100): a PRESENT-but-different Accept
+/** CheckAcceptMediaType (swift.go:99-106): a PRESENT-but-different Accept
  *  answers the 400 Problem; absent/empty passes. */
 function swiftAcceptMismatch(c: Context<{ Bindings: Env }>, required: string): Response | null {
   const accept = c.req.header("Accept");
@@ -3099,7 +3099,7 @@ function swiftAcceptMismatch(c: Context<{ Bindings: Env }>, required: string): R
   return null;
 }
 
-/** apiError (swift.go:74-90): the RFC 7807 Problem document
+/** apiError (swift.go:80-96): the RFC 7807 Problem document
  *  `{"status":…,"detail":…}\n` (json.Encoder's trailing newline),
  *  application/problem+json + Content-Version: 1. */
 function swiftProblemResponse(status: ContentfulStatus, detail: string): Response {
@@ -3118,7 +3118,7 @@ function swiftNotFoundPage(): Response {
 }
 
 /**
- * UploadPackageFile's error switch (swift.go:399-409) + the read arms': the
+ * UploadPackageFile's error switch (swift.go:405-415) + the read arms': the
  * ErrInvalidArgument sentinels → 400; ErrDuplicatePackageVersion → 409;
  * ErrPackageNotExist → 404; quota → 403; the store caps (413) and the
  * lying-Content-Length (500, the npm/nuget posture) are our reductions;
@@ -3545,7 +3545,7 @@ async function npmDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
         const found = await findNpmVersionForFilename(c.env.DB, owner, target.name, target.filename ?? "");
         if (found === null) return npmErrorResponse(404, "");
         // The deleted arm (npm.go:344 — RemovePackageVersion notifies
-        // ALWAYS, packages.go:532): the descriptor resolves BEFORE the
+        // ALWAYS, packages.go:537): the descriptor resolves BEFORE the
         // version row dies, the emission rides after the delete.
         const descriptor = await resolvePackageEventDescriptor(
           c.env.DB,
@@ -3623,20 +3623,20 @@ function emptyStream(): ReadableStream<Uint8Array> {
 
 // ---------------------------------------------------------------------------
 // The OCI CONTAINER registry (SPEC-0016 §7 M6) — upstream ContainerRoutes
-// (routers/api/packages/api.go:509-547), the /v2/ ROOT mount. src/index.ts
+// (routers/api/packages/api.go:523-561), the /v2/ ROOT mount. src/index.ts
 // mounts this router beside the packages mounts (`app.route("/v2",
 // createContainerProtocolRouter())`) and wrangler.jsonc.example pins
 // "/v2/*" in run_worker_first — both orchestrator-owned files (HANDOFF).
 //
-// Wire shapes (container.go:53-130): EVERY response carries the
+// Wire shapes (container.go:54-131): EVERY response carries the
 // Docker-Distribution-Api-Version header; the header quartet Location /
 // Range / Content-Length / Docker-Upload-Uuid rides the upload arms, the
 // Docker-Content-Digest + ETag pair the content arms; error BODIES are the
 // OCI envelope `{"errors":[{"code","message"}]}` (errors.go) while the
 // apiError arms (quota 403, bare 500) answer the bare status with NO body
-// (container.go:90-93 discards ProcessErrorForUser's message). The 401
+// (container.go:91-94 discards ProcessErrorForUser's message). The 401
 // handshake serves the Bearer realm challenge plus — when the {username}
-// owner exists and is non-public — the Basic realm twin (container.go:116-130,
+// owner exists and is non-public — the Basic realm twin (container.go:117-131,
 // the apple-container login support); the access-denied arms reuse the
 // neighbors' Gitea-Package-API challenge verbatim (upstream's shared
 // reqPackageAccess, api.go:43-63).
@@ -3664,7 +3664,7 @@ interface ContainerHeaderOpts {
   wwwAuthenticate?: string[];
 }
 
-/** writeResponseHeaders (container.go:63-82) + jsonResponse's content-type. */
+/** writeResponseHeaders (container.go:64-83) + jsonResponse's content-type. */
 function containerResponse(status: number, body: BodyInit | null, opts: ContainerHeaderOpts = {}): Response {
   const headers = new Headers();
   if (opts.contentType !== undefined) headers.set("Content-Type", opts.contentType);
@@ -3684,7 +3684,7 @@ function containerResponse(status: number, body: BodyInit | null, opts: Containe
   return new Response(body, { status, headers });
 }
 
-/** apiErrorDefined (container.go:96-114) — the OCI error envelope. */
+/** apiErrorDefined (container.go:97-115) — the OCI error envelope. */
 function ociErrorResponse(error: OciNamedError, wwwAuthenticate?: string[]): Response {
   return containerResponse(error.statusCode, JSON.stringify({ errors: [{ code: error.code, message: error.message }] }), {
     contentType: "application/json",
@@ -3692,7 +3692,7 @@ function ociErrorResponse(error: OciNamedError, wwwAuthenticate?: string[]): Res
   });
 }
 
-/** APIUnauthorizedError (container.go:116-130): the Bearer realm (the origin
+/** APIUnauthorizedError (container.go:117-131): the Bearer realm (the origin
  *  root — no sub-path to strip) + the Basic twin when the owner exists and is
  *  non-public OR the require-sign-in-view flag is armed — upstream's fold is
  *  `requireSignIn := owner != nil && owner.Visibility != public;
@@ -3804,14 +3804,14 @@ async function containerOwnerContext(
   const cred = await resolveContainerCredential(c.env.DB, c.req.raw);
   if (cred === null) {
     // Upstream's afterAuthCallback looks the owner up from the path param
-    // for the challenge (container.go:121-128) — a private owner's path
+    // for the challenge (container.go:122-129) — a private owner's path
     // adds the Basic realm twin even on an auth-layer failure.
     const challengeOwner = await resolveOwnerRow(c.env.DB, containerUsername(c));
     throw new ContainerGateResponse(
       containerUnauthorizedResponse(origin, challengeOwner, requireSignInViewEnabled(c.env)),
     );
   }
-  // ReqContainerAccess (container.go:133-137) — upstream's group middleware
+  // ReqContainerAccess (container.go:134-138) — upstream's group middleware
   // runs BEFORE the owner assignment (api.go:537), refusing `doer == nil`
   // always and `strict && doer.IsGhost()` under the require-sign-in-view
   // flag with the OCI envelope. Flag-off, the token-less anonymous caller
@@ -3848,7 +3848,7 @@ async function containerOwnerContext(
   return { owner, doer, ghost: cred.kind === "ghost" };
 }
 
-/** VerifyImageName (container.go:140-144). */
+/** VerifyImageName (container.go:141-145). */
 function verifyContainerImageName(image: string): void {
   if (!isValidImageName(image)) {
     throw OCI_NAME_INVALID;
@@ -3876,11 +3876,11 @@ function containerErrorResponse(error: unknown): Response {
   if (error instanceof HTTPException) throw error;
   if (error instanceof ContainerGateResponse) return error.response;
   if (error instanceof OciNamedError) return ociErrorResponse(error);
-  // The manifest PUT's missing config/layer → BLOB_UNKNOWN (container.go:589-590);
+  // The manifest PUT's missing config/layer → BLOB_UNKNOWN (container.go:590-591);
   // the manifest GET arms catch their own NotExist first (MANIFEST_UNKNOWN).
   if (error instanceof ContainerBlobNotExistError) return ociErrorResponse(OCI_BLOB_UNKNOWN);
   // apiError(ctx, 403/413/500, err) — the BARE status, message discarded
-  // (container.go:90-93).
+  // (container.go:91-94).
   if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
     return containerResponse(403, null);
   }
@@ -3890,7 +3890,7 @@ function containerErrorResponse(error: unknown): Response {
   return containerResponse(500, null);
 }
 
-/** container.go:188-193 — the chunked-upload range header's start offset. */
+/** container.go:189-194 — the chunked-upload range header's start offset. */
 function parseContentRangeStart(contentRange: string): number | null {
   const match = /^(\d+)-(\d+)$/.exec(contentRange.trim());
   if (match === null) return null;
@@ -3898,7 +3898,7 @@ function parseContentRangeStart(contentRange: string): number | null {
   return Number.isSafeInteger(start) ? start : null;
 }
 
-/** The manifest search options from a reference (container.go:608-626) — a
+/** The manifest search options from a reference (container.go:609-627) — a
  *  digest reference or a tag (lead-only); anything else is the
  *  MANIFEST_UNKNOWN arm. */
 function containerManifestSearchReference(reference: string): { digest?: string; tag?: string } | null {
@@ -3911,7 +3911,7 @@ function containerManifestSearchReference(reference: string): { digest?: string;
   return null;
 }
 
-/** The stored media-type property of a manifest file (container.go:638-639 —
+/** The stored media-type property of a manifest file (container.go:639-640 —
  *  the fallback to application/octet-stream when absent or unrecognized). */
 async function containerManifestContentType(d1: D1Database, fileId: number): Promise<string> {
   const properties = await getPackageProperties(d1, PropertyType.File, fileId);
@@ -3988,9 +3988,9 @@ async function containerDispatch(c: Context<{ Bindings: Env }>): Promise<Respons
 
 // The individual arms — thin over services/packages/container.ts.
 
-/** DetermineSupport (container.go:148-150) behind ReqContainerAccess
- *  (:133-137) — the refusal is `doer == nil || (RequireSignInViewStrict &&
- *  doer.IsGhost())` (:135): anonymous always, a ghost bearer too when the
+/** DetermineSupport (container.go:149-151) behind ReqContainerAccess
+ *  (:134-138) — the refusal is `doer == nil || (RequireSignInViewStrict &&
+ *  doer.IsGhost())` (:136): anonymous always, a ghost bearer too when the
  *  require-sign-in-view flag is armed. */
 async function containerPing(c: Context<{ Bindings: Env }>): Promise<Response> {
   const origin = new URL(c.req.url).origin;
@@ -4001,7 +4001,7 @@ async function containerPing(c: Context<{ Bindings: Env }>): Promise<Response> {
   return containerResponse(200, null);
 }
 
-/** Authenticate (container.go:154-187) — the ghost mint for anonymous, the
+/** Authenticate (container.go:155-188) — the ghost mint for anonymous, the
  *  package-scope gate for real users, the 401 for ghost/invalid bearers. */
 async function containerToken(c: Context<{ Bindings: Env }>): Promise<Response> {
   const origin = new URL(c.req.url).origin;
@@ -4012,7 +4012,7 @@ async function containerToken(c: Context<{ Bindings: Env }>): Promise<Response> 
   }
   if (cred.kind === "user") {
     const scope = cred.scope;
-    // container.go:165-176 — HasAnyScope(read:package, write:package, all).
+    // container.go:166-177 — HasAnyScope(read:package, write:package, all).
     if (scope === null || !scope.hasAny("read:package", "write:package", "all")) {
       return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
     }
@@ -4020,9 +4020,9 @@ async function containerToken(c: Context<{ Bindings: Env }>): Promise<Response> 
     return containerResponse(200, JSON.stringify({ token }), { contentType: "application/json" });
   }
   if (cred.kind === "anonymous") {
-    // container.go:156-159 — anonymous + RequireSignInViewStrict refuses
+    // container.go:157-160 — anonymous + RequireSignInViewStrict refuses
     // BEFORE the ghost mint (the flag arm); only the flag-off posture mints
-    // the ghost token (:157-163).
+    // the ghost token (:158-164).
     if (requireSignInViewEnabled(c.env)) {
       return containerUnauthorizedResponse(origin, null, true);
     }
@@ -4030,7 +4030,7 @@ async function containerToken(c: Context<{ Bindings: Env }>): Promise<Response> 
     return containerResponse(200, JSON.stringify({ token }), { contentType: "application/json" });
   }
   // A ghost/invalid bearer at /token: upstream's ghost doer carries no
-  // scope → the HasAnyScope gate 401s (container.go:165-176).
+  // scope → the HasAnyScope gate 401s (container.go:166-177).
   return containerUnauthorizedResponse(origin, null, requireSignInViewEnabled(c.env));
 }
 
@@ -4040,13 +4040,13 @@ function verifiedScopeString(cred: Extract<ContainerCredential, { kind: "user" }
   return cred.scope?.toString() ?? "";
 }
 
-/** AuthenticateNotImplemented (container.go:190-198) — the 404 stub. */
+/** AuthenticateNotImplemented (container.go:191-199) — the 404 stub. */
 function containerTokenPost(): Response {
   return containerResponse(404, null);
 }
 
-/** GetRepositoryList (container.go:201-231) — the catalog, behind
- *  ReqContainerAccess (:133-137): anonymous always refused; a ghost bearer
+/** GetRepositoryList (container.go:202-232) — the catalog, behind
+ *  ReqContainerAccess (:134-138): anonymous always refused; a ghost bearer
  *  too when the require-sign-in-view flag is armed. */
 async function containerCatalog(c: Context<{ Bindings: Env }>): Promise<Response> {
   const origin = new URL(c.req.url).origin;
@@ -4065,7 +4065,7 @@ async function containerCatalog(c: Context<{ Bindings: Env }>): Promise<Response
   const viewer = cred.kind === "user" ? { id: cred.doer.id, isAdmin: cred.doer.isAdmin } : null;
   const repositories = await listContainerRepositories(c.env.DB, viewer, n, last);
   if (repositories.length === n) {
-    // container.go:218-226 — the Link rel="next" header.
+    // container.go:219-227 — the Link rel="next" header.
     const v = new URLSearchParams();
     v.set("n", String(n));
     v.set("last", repositories[repositories.length - 1] ?? "");
@@ -4078,7 +4078,7 @@ async function containerCatalog(c: Context<{ Bindings: Env }>): Promise<Response
 }
 
 
-/** PostBlobsUploads (container.go:236-321) — mount / single-POST / session. */
+/** PostBlobsUploads (container.go:237-322) — mount / single-POST / session. */
 async function containerPostBlobUploads(c: Context<{ Bindings: Env }>, image: string): Promise<Response> {
   const { owner, doer } = await containerOwnerContext(c, "write");
   const d1 = c.env.DB;
@@ -4087,7 +4087,7 @@ async function containerPostBlobUploads(c: Context<{ Bindings: Env }>, image: st
   const lowerName = owner.usernameLower;
   const doerOrNull = doer === null ? null : { id: doer.id, isAdmin: doer.isAdmin };
 
-  // The cross-repo mount (container.go:239-267): the source search is
+  // The cross-repo mount (container.go:240-268): the source search is
   // owner-UNSCOPED (the repository property names owner/image); an
   // inaccessible or missing source falls through to the normal flow.
   const mount = c.req.query("mount") ?? "";
@@ -4108,7 +4108,7 @@ async function containerPostBlobUploads(c: Context<{ Bindings: Env }>, image: st
     }
   }
 
-  // The single-POST arm (container.go:269-308).
+  // The single-POST arm (container.go:270-309).
   const digest = c.req.query("digest") ?? "";
   if (digest !== "") {
     await saveContainerBlobFromStream({
@@ -4128,7 +4128,7 @@ async function containerPostBlobUploads(c: Context<{ Bindings: Env }>, image: st
     });
   }
 
-  // The chunked-upload session (container.go:310-320).
+  // The chunked-upload session (container.go:311-321).
   const upload = await createContainerBlobUpload(d1);
   return containerResponse(202, null, {
     location: `/v2/${lowerName}/${image}/blobs/uploads/${upload.id}`,
@@ -4136,7 +4136,7 @@ async function containerPostBlobUploads(c: Context<{ Bindings: Env }>, image: st
   });
 }
 
-/** GetBlobsUpload (container.go:324-348) — the session status probe. */
+/** GetBlobsUpload (container.go:325-349) — the session status probe. */
 async function containerGetBlobsUpload(c: Context<{ Bindings: Env }>, image: string, uuid: string): Promise<Response> {
   const { owner } = await containerOwnerContext(c, "write");
   const upload = await getContainerBlobUpload(c.env.DB, uuid);
@@ -4151,7 +4151,7 @@ async function containerGetBlobsUpload(c: Context<{ Bindings: Env }>, image: str
   });
 }
 
-/** PatchBlobsUpload (container.go:352-397) — the chunk append. */
+/** PatchBlobsUpload (container.go:353-398) — the chunk append. */
 async function containerPatchBlobsUpload(c: Context<{ Bindings: Env }>, image: string, uuid: string): Promise<Response> {
   const { owner } = await containerOwnerContext(c, "write");
   const upload = await getContainerBlobUpload(c.env.DB, uuid);
@@ -4184,7 +4184,7 @@ async function containerPatchBlobsUpload(c: Context<{ Bindings: Env }>, image: s
   });
 }
 
-/** PutBlobsUpload (container.go:400-466) — the finalize. */
+/** PutBlobsUpload (container.go:401-467) — the finalize. */
 async function containerPutBlobsUpload(c: Context<{ Bindings: Env }>, image: string, uuid: string): Promise<Response> {
   const { owner, doer } = await containerOwnerContext(c, "write");
   const digest = c.req.query("digest") ?? "";
@@ -4216,7 +4216,7 @@ async function containerPutBlobsUpload(c: Context<{ Bindings: Env }>, image: str
   });
 }
 
-/** DeleteBlobsUpload (container.go:469-488) — the abort. */
+/** DeleteBlobsUpload (container.go:470-489) — the abort. */
 async function containerDeleteBlobsUpload(c: Context<{ Bindings: Env }>, uuid: string): Promise<Response> {
   await containerOwnerContext(c, "write");
   const upload = await getContainerBlobUpload(c.env.DB, uuid);
@@ -4247,8 +4247,8 @@ async function containerBlobUploadSession(
   }
 }
 
-/** getBlobFromContext (container.go:490-501) + the store-size gate
- *  (getExistingContainerBlob, :781-796). */
+/** getBlobFromContext (container.go:491-502) + the store-size gate
+ *  (getExistingContainerBlob, :782-797). */
 async function containerBlobFromContext(
   d1: D1Database,
   bucket: R2Bucket,
@@ -4266,13 +4266,13 @@ async function containerBlobFromContext(
   return descriptor;
 }
 
-/** HeadBlob + GetBlob (container.go:504-536). */
+/** HeadBlob + GetBlob (container.go:505-537). */
 async function containerBlobContent(c: Context<{ Bindings: Env }>, method: string, image: string, digest: string): Promise<Response> {
   const { owner } = await containerOwnerContext(c, method === "DELETE" ? "write" : "read");
   const d1 = c.env.DB;
   if (method === "DELETE") {
-    // DeleteBlob (container.go:539-552) — the invalid digest is the
-    // BLOB_UNKNOWN arm here (the validate-then-delete order, :540-543).
+    // DeleteBlob (container.go:540-553) — the invalid digest is the
+    // BLOB_UNKNOWN arm here (the validate-then-delete order, :541-544).
     if (!isValidDigest(digest)) {
       return ociErrorResponse(OCI_BLOB_UNKNOWN);
     }
@@ -4282,14 +4282,14 @@ async function containerBlobContent(c: Context<{ Bindings: Env }>, method: strin
   const descriptor = await containerBlobFromContext(d1, c.env.REPO_PACKS, owner.id, image, digest);
   const digestProperty = descriptor.blob.hashSha256 === "" ? "" : `sha256:${descriptor.blob.hashSha256}`;
   if (method === "HEAD") {
-    // container.go:514-519 — application/octet-stream + the length + digest.
+    // container.go:515-520 — application/octet-stream + the length + digest.
     return containerResponse(200, null, {
       contentType: "application/octet-stream",
       contentLength: descriptor.blob.size,
       contentDigest: digestProperty,
     });
   }
-  // GetBlob (container.go:523-536) — always 200 full-body (upstream serveBlob
+  // GetBlob (container.go:524-537) — always 200 full-body (upstream serveBlob
   // io.Copy's with no range/conditional machinery; we do not advertise
   // Accept-Ranges so resuming clients fall back per RFC 7233).
   const object = await c.env.REPO_PACKS.get(packageBlobContentKey(descriptor.blob.hashSha256));
@@ -4303,7 +4303,7 @@ async function containerBlobContent(c: Context<{ Bindings: Env }>, method: strin
   });
 }
 
-/** PutManifest (container.go:555-606). */
+/** PutManifest (container.go:556-607). */
 async function containerPutManifest(c: Context<{ Bindings: Env }>, image: string, reference: string): Promise<Response> {
   const { owner, doer } = await containerOwnerContext(c, "write");
   const result = await putContainerManifest({
@@ -4326,7 +4326,7 @@ quota: packagesQuotaFromEnv(c.env),
   });
 }
 
-/** getManifestFromContext (container.go:628-641) + the store-size gate. */
+/** getManifestFromContext (container.go:629-642) + the store-size gate. */
 async function containerManifestFromContext(
   c: Context<{ Bindings: Env }>,
   ownerId: number,
@@ -4355,14 +4355,14 @@ async function containerManifestFromContext(
   };
 }
 
-/** HeadManifest + GetManifest (container.go:644-674). */
+/** HeadManifest + GetManifest (container.go:645-675). */
 async function containerGetOrHeadManifest(c: Context<{ Bindings: Env }>, method: string, image: string, reference: string): Promise<Response> {
   const { owner } = await containerOwnerContext(c, "read");
   let found: Awaited<ReturnType<typeof containerManifestFromContext>>;
   try {
     found = await containerManifestFromContext(c, owner.id, image, reference);
   } catch (error) {
-    // container.go:647-648 / :666-667 — the not-exist arm is MANIFEST_UNKNOWN
+    // container.go:648-649 / :667-668 — the not-exist arm is MANIFEST_UNKNOWN
     // on the pull arms.
     if (error instanceof ContainerBlobNotExistError) {
       return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
@@ -4387,7 +4387,7 @@ async function containerGetOrHeadManifest(c: Context<{ Bindings: Env }>, method:
   });
 }
 
-/** DeleteManifest (container.go:678-704). */
+/** DeleteManifest (container.go:679-705). */
 async function containerDeleteManifest(c: Context<{ Bindings: Env }>, image: string, reference: string): Promise<Response> {
   const { owner, doer } = await containerOwnerContext(c, "write");
   const search = containerManifestSearchReference(reference);
@@ -4405,7 +4405,7 @@ async function containerDeleteManifest(c: Context<{ Bindings: Env }>, image: str
   if (versions.length === 0) {
     return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
   }
-  // The deleted arm (container.go:697 — RemovePackageVersion PER VERSION,
+  // The deleted arm (container.go:698 — RemovePackageVersion PER VERSION,
   // the DeleteManifest loop over GetManifestVersions): one event per
   // version, all rendered from the pre-delete state. A token-authed delete
   // without a user principal has no upstream doer either — the fan-out's
@@ -4438,7 +4438,7 @@ async function containerManifest(c: Context<{ Bindings: Env }>, method: string, 
   }
 }
 
-/** GetTagsList (container.go:735-778). */
+/** GetTagsList (container.go:736-779). */
 async function containerGetTagsList(c: Context<{ Bindings: Env }>, image: string): Promise<Response> {
   const { owner } = await containerOwnerContext(c, "read");
   const pkg = await getPackageByName(c.env.DB, owner.id, "container", image);
@@ -4743,7 +4743,7 @@ async function rubygemsYank(c: Context<{ Bindings: Env }>): Promise<Response> {
       if (typeof value === "string") params.append(key, value);
     }
     // The deleted arm (rubygems.go:281 → RemovePackageVersionByNameAndVersion
-    // → RemovePackageVersion, packages.go:532 — notifies ALWAYS; the yank
+    // → RemovePackageVersion, packages.go:537 — notifies ALWAYS; the yank
     // endpoint IS the hard delete): the descriptor resolves BEFORE the
     // version row dies.
     const descriptor = await resolvePackageEventDescriptor(
@@ -4913,7 +4913,7 @@ async function vagrantDownload(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 // ---------------------------------------------------------------------------
-// TERRAFORM — terraform.go:33-36 (the PLAIN TEXT apiError, the EMPTY body on
+// TERRAFORM — terraform.go:36-39 (the PLAIN TEXT apiError, the EMPTY body on
 // the nil-error arms) + the api.go:466-476 state-backend arms.
 // ---------------------------------------------------------------------------
 
@@ -4944,7 +4944,7 @@ function terraformLockBody(lock: TerraformLockInfo): string {
   });
 }
 
-/** GetTerraformState / GetTerraformStateBySerial (terraform.go:39-78): the
+/** GetTerraformState / GetTerraformStateBySerial (terraform.go:42-81): the
  *  serial arm pins the version, the null-serial arm rides the latest. A miss
  *  is the EMPTY-body 404 (ProcessErrorForUser's zero message). */
 async function terraformGetState(c: Context<{ Bindings: Env }>, serial: string | null): Promise<Response> {
@@ -4972,7 +4972,7 @@ async function terraformGetState(c: Context<{ Bindings: Env }>, serial: string |
   }
 }
 
-/** UploadState (terraform.go:88-193): the name gate → the pre-body lock
+/** UploadState (terraform.go:91-196): the name gate → the pre-body lock
  *  enforcement (the ?ID= form value) → the spool/quota/parse/create chain. */
 async function terraformUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
@@ -4982,7 +4982,7 @@ async function terraformUpload(c: Context<{ Bindings: Env }>): Promise<Response>
       return terraformPlainText(401, "user should have specific permission or be a site admin");
     }
     const name = c.req.param("name") ?? "";
-    // terraform.go:108-121 — the lock check BEFORE the body is read; the
+    // terraform.go:111-124 — the lock check BEFORE the body is read; the
     // mismatch answers 423 with the CURRENT lock JSON.
     const writable = await assertTerraformStateWritable(c.env.DB, owner.id, name, c.req.query("ID") ?? "");
     if (writable.kind === "locked") {
@@ -5056,7 +5056,7 @@ async function terraformDelete(c: Context<{ Bindings: Env }>): Promise<Response>
   }
 }
 
-/** DeleteStateBySerial (terraform.go:196-234): 404 / the latest-serial 403 /
+/** DeleteStateBySerial (terraform.go:199-237): 404 / the latest-serial 403 /
  *  the version cascade → 204. */
 async function terraformDeleteBySerial(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
@@ -5071,7 +5071,7 @@ async function terraformDeleteBySerial(c: Context<{ Bindings: Env }>): Promise<R
     if (outcome.kind === "latest") return terraformPlainText(403, "cannot delete the latest version");
     // SILENT by upstream derivation: DeleteStateBySerial cascades through the
     // model-level DeletePackageVersionAndReferences directly
-    // (terraform.go:233), never RemovePackageVersion — no PackageDelete.
+    // (terraform.go:236), never RemovePackageVersion — no PackageDelete.
     return new Response(null, { status: 204 });
   } catch (error) {
     if (error instanceof HTTPException) return error.getResponse();
@@ -5080,7 +5080,7 @@ async function terraformDeleteBySerial(c: Context<{ Bindings: Env }>): Promise<R
   }
 }
 
-/** LockState (terraform.go:302-362): the 64 KiB body parse → the allocate +
+/** LockState (terraform.go:283-343): the 64 KiB body parse → the allocate +
  *  set dance; locked answers 423 with the CURRENT lock JSON. */
 async function terraformLock(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
@@ -5100,7 +5100,7 @@ async function terraformLock(c: Context<{ Bindings: Env }>): Promise<Response> {
   }
 }
 
-/** UnlockState (terraform.go:366-422): the missing/not-locked → 200 arms,
+/** UnlockState (terraform.go:347-403): the missing/not-locked → 200 arms,
  *  the ID-mismatch 423, the clear → 200. */
 async function terraformUnlock(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
@@ -5904,7 +5904,7 @@ async function chefDeleteVersion(c: Context<{ Bindings: Env }>): Promise<Respons
       return chefErrorResponse(401, "user should have specific permission or be a site admin");
     }
     // The deleted arm (chef.go:359 → RemovePackageVersionByNameAndVersion →
-    // RemovePackageVersion, packages.go:532 — notifies ALWAYS): the
+    // RemovePackageVersion, packages.go:537 — notifies ALWAYS): the
     // descriptor resolves BEFORE the version row dies.
     const descriptor = await resolvePackageEventDescriptor(
       c.env.DB,

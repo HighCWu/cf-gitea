@@ -2,11 +2,11 @@
  * The package model service (SPEC-0016 §2.2/§4/§5) — the D1 half over the six
  * tables (schema.ts, migration 0039): the GetOrInsert shapes upstream's
  * models answer duplicates with (§5.2), the descriptor assembly the API
- * renders (upstream descriptor.go:57-78), the list queries the management ops
+ * renders (upstream descriptor.go:58-79), the list queries the management ops
  * need (SearchVersions / SearchLatestVersions), the link/unlink pair
  * (package_update.go), the delete cascades, the quota checks
  * (packages.go:366-457 with our §3.4 config surface), and the owner access
- * mode (determineAccessMode, services/context/package.go:112-166, folded per
+ * mode (determineAccessMode, services/context/package.go:94-148, folded per
  * §4.1 onto the landed org model — including HasOrgOrUserVisible's
  * membership floor, org.go:458-461, so a private org's plain member reads).
  *
@@ -211,11 +211,11 @@ export type InsertFileResult =
  * itself answers ErrDuplicatePackageFile for ANY existing row regardless of
  * blob; the "identical" outcome here is the raw layer's SAME-BLOB answer,
  * consumed ONLY by the OverwriteExisting callers (helm's re-publish
- * short-circuit, packages.go:326-329 — the delete-and-reinsert arm never
+ * short-circuit, packages.go:328-331 — the delete-and-reinsert arm never
  * reaches TryInsertFile). The TryInsertFile-level callers (generic, pypi,
  * nuget) map EVERY duplicate — identical or not — to the 409
- * (ErrDuplicatePackageFile → routes' StatusConflict, generic.go:126-127 /
- * pypi.go:197-198; the packages parity review's D-1).
+ * (ErrDuplicatePackageFile → routes' StatusConflict, generic.go:132-133 /
+ * pypi.go:203-204; the packages parity review's D-1).
  */
 export async function tryInsertFile(d1: D1Database, input: TryInsertFileInput): Promise<InsertFileResult> {
   const db = drizzle(d1);
@@ -360,7 +360,7 @@ export async function incrementDownloadCounter(d1: D1Database, versionId: number
 }
 
 // ---------------------------------------------------------------------------
-// The descriptor assembly (descriptor.go:57-78) — the read shape every
+// The descriptor assembly (descriptor.go:58-79) — the read shape every
 // management op renders
 // ---------------------------------------------------------------------------
 
@@ -414,7 +414,7 @@ export const PACKAGE_PUBLIC_PROPERTY_NAMES: Record<string, readonly string[]> = 
 };
 
 /**
- * The version's FILE properties keyed by file id (descriptor.go:264 —
+ * The version's FILE properties keyed by file id (descriptor.go:267 —
  * `GetProperties(ctx, PropertyTypeFile, pf.ID)` arms the file descriptor;
  * the files API is the only consumer, so the descriptors load lazily here
  * instead of riding every getFileDescriptors call).
@@ -663,7 +663,7 @@ export async function hasVersionFileReferences(d1: D1Database, versionId: number
 }
 
 /**
- * `RemovePackage`'s cascade (packages.go:676+): every version's files and
+ * `RemovePackage`'s cascade (packages.go:681+): every version's files and
  * properties, the package-scoped properties, then the package row. The R2
  * content keys are NOT touched here — the unreferenced-blob sweep is the
  * SOLE content-key deleter (the PACKAGE-DEFER-STORAGE-DELETE hint upstream
@@ -683,7 +683,7 @@ export async function deletePackageAndReferences(d1: D1Database, packageId: numb
   await db.delete(packages).where(eq(packages.id, packageId)).run();
 }
 
-/** `FindUnreferencedPackages` (cleanup.go:182) — package rows with zero versions. */
+/** `FindUnreferencedPackages` (cleanup.go:184) — package rows with zero versions. */
 export async function findUnreferencedPackages(d1: D1Database): Promise<PackageRow[]> {
   return drizzle(d1)
     .select({ pkg: packages })
@@ -694,7 +694,7 @@ export async function findUnreferencedPackages(d1: D1Database): Promise<PackageR
     .then((rows) => rows.map((row) => row.pkg));
 }
 
-/** `FindExpiredUnreferencedBlobs` (cleanup.go:196) — zero file references, older than cut. */
+/** `FindExpiredUnreferencedBlobs` (cleanup.go:198) — zero file references, older than cut. */
 export async function findExpiredUnreferencedBlobs(d1: D1Database, cut: Date): Promise<PackageBlobRow[]> {
   return drizzle(d1)
     .select({ blob: packageBlobs })
@@ -715,7 +715,7 @@ export async function deleteBlobById(d1: D1Database, blobId: number): Promise<vo
 // vars read from the env slice, `-1` = unlimited, admins bypass)
 // ---------------------------------------------------------------------------
 
-/** Upstream's -1 no-limit sentinel (setting/packages.go:96-99). */
+/** Upstream's -1 no-limit sentinel (setting/packages.go:91-94). */
 export const UNLIMITED_QUOTA = -1;
 
 /** SPEC-0016 §3.4 — the generic per-file default (512 MiB). */
@@ -781,7 +781,7 @@ export class QuotaTotalSizeError extends Error {
   }
 }
 
-/** `CalculateFileSize` (packages.go:449-456): the owner's files' blob sizes summed. */
+/** `CalculateFileSize` (packages.go:453-460): the owner's files' blob sizes summed. */
 export async function calculateFileSize(d1: D1Database, ownerId: number): Promise<number> {
   const rows = await drizzle(d1)
     .select({ total: sql<number>`coalesce(sum(${packageBlobs.size}), 0)` })
@@ -794,7 +794,7 @@ export async function calculateFileSize(d1: D1Database, ownerId: number): Promis
   return rows[0]?.total ?? 0;
 }
 
-/** `CountVersions` (packages.go:372-379): the owner's non-internal version rows. */
+/** `CountVersions` (packages.go:374-381): the owner's non-internal version rows. */
 export async function countVersions(d1: D1Database, ownerId: number): Promise<number> {
   const rows = await drizzle(d1)
     .select({ total: sql<number>`count(*)` })
@@ -954,7 +954,7 @@ async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number
  * the mode.
  *
  * The require-sign-in-view instance flag rides upstream's own seam
- * (services/context/package.go:120 — INSIDE determineAccessMode, after the
+ * (services/context/package.go:102 — INSIDE determineAccessMode, after the
  * site-admin arm): `strictSignInView: true` zeroes an anonymous doer's mode
  * regardless of owner visibility, so every reqPackageAccess wrap answers its
  * 401 challenge and no per-route arm is needed. Upstream's check is

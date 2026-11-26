@@ -811,7 +811,7 @@ export interface PubDownload {
 /**
  * DownloadPackageFile (pub.go:192-222): the version segment trims a
  * trailing ".tar.gz"; the descriptor's FIRST file (lower_name order)
- * serves; the lead GET bump (packages.go:655-660). Null = the route's 404.
+ * serves; the lead GET bump (packages.go:660-665). Null = the route's 404.
  */
 export async function openPubFileForDownload(
   d1: D1Database,

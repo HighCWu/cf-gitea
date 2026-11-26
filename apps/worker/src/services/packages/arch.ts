@@ -44,7 +44,7 @@
  *
  * ## vercmp (vercmp.go — the version-compare port)
  *
- * `archCompareVersions` is the pacman EVR comparison (vercmp.go:88-105 over
+ * `archCompareVersions` is the pacman EVR comparison (vercmp.go:75-92 over
  * libalpm version.c): epoch (`n:`), dot-split version segments, release
  * (`-r`); segments compare numeric-when-both-numeric, numeric-beats-alpha,
  * else byte-wise. Its registry consumer at the pin is the index build's
@@ -202,7 +202,7 @@ export function parseArchEVR(evr: string): ArchEVR {
   return { epoch, version, release };
 }
 
-/** isNumeric (vercmp.go:79-86) — the empty string IS numeric (the loop never
+/** isNumeric (vercmp.go:66-73) — the empty string IS numeric (the loop never
  *  runs), faithfully. */
 function isNumericSegment(s: string): boolean {
   return /^[0-9]*$/.test(s);
@@ -244,7 +244,7 @@ function compareSegmentLists(a: string[], b: string[]): number {
   return 1;
 }
 
-/** compareVersions (vercmp.go:88-105): epoch, then dot-split version, then
+/** compareVersions (vercmp.go:75-92): epoch, then dot-split version, then
  *  release. Answers -1 | 0 | 1. */
 export function archCompareVersions(a: string, b: string): number {
   if (a === b) return 0;
@@ -1272,7 +1272,7 @@ export async function deleteArchPackageVersion(
   if (fileRow === undefined) return { ok: false, missing: "file" };
 
   // The deleted arm (arch.go:290 → RemovePackageFileAndVersionIfUnreferenced,
-  // packages.go:570-574 — `if pd != nil { PackageDelete }` fired INSIDE the
+  // packages.go:575-579 — `if pd != nil { PackageDelete }` fired INSIDE the
   // service when the version cascaded): the descriptor resolves BEFORE the
   // version row dies, the emission rides after the cascade.
   const descriptor: PackageEventDescriptor | null =

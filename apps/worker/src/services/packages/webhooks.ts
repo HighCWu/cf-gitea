@@ -13,7 +13,7 @@
  * NOT exist upstream; the version-added arm IS the created action:
  *
  *   - created: `notify_service.PackageCreate` fires from
- *     services/packages/packages.go:131 (createPackageAndAddFile) gated on
+ *     services/packages/packages.go:133 (createPackageAndAddFile) gated on
  *     `created` — which is `versionCreated`, the GetOrInsertVersion
  *     arbiter's answer (createPackageAndVersion returns versionCreated,
  *     packages.go:213; the duplicate-version re-publish fires NOTHING), and
@@ -38,18 +38,18 @@
  *     services/packages/cleanup/cleanup.go:78) and the user-account cascade
  *     (RemoveAllPackages — no notify).
  *
- * PAYLOAD (notifyPackage, services/webhook/notifier.go:976-993 over
+ * PAYLOAD (notifyPackage, services/webhook/notifier.go:994-1011 over
  * PackagePayload, modules/structs/hook.go:594-606):
  *   { action, package, repository: null, organization, sender }
  * — the top-level `repository` field is NEVER set by notifyPackage (it
  * marshals null); `organization` renders only when the owner is an
- * organization (ToOrganization, convert.go:928-943), else null; `sender` is
+ * organization (ToOrganization, convert.go:912-927), else null; `sender` is
  * ToUser(ctx, sender, nil) — the doer rendered self-visible. The inner
  * `package` object is convert.ToPackage (services/convert/package.go:16-40):
  *   { id: version.id, owner, repository (ONLY when the package row is
  *     repo-linked AND the doer can view it — HasAnyUnitAccess gate),
  *     creator, type, name, version, html_url, created_at }
- * — html_url = VersionHTMLURL (models/packages/descriptor.go:101-104):
+ * — html_url = VersionHTMLURL (models/packages/descriptor.go:102-105):
  * {owner URL}/-/packages/{type}/{lowerName}/{lowerVersion}, absolute.
  * Our inner render mirrors api/routes/packages.ts `toApiPackage`
  * (the landed ToPackage port) field-for-field but stands alone here so the
@@ -129,7 +129,7 @@ export type PackageWebhookOptions = PackageEventEnv;
  * `doerId` is the authenticated remover (upstream ctx.Doer). The descriptor
  * resolution stays INSIDE the delete op, before the version row dies, so
  * the payload renders the pre-delete state exactly like upstream's
- * GetPackageDescriptor-then-delete order (packages.go:521-523).
+ * GetPackageDescriptor-then-delete order (packages.go:526-528).
  */
 export interface PackageDeleteEmitOptions {
   webhookEnv?: PackageEventEnv;
@@ -235,7 +235,7 @@ export async function packageEventPayload(
   let organization: Record<string, unknown> | null = null;
   if (ownerRow.type === "org") {
     // notifyPackage: `if pd.Owner.IsOrganization()` → ToOrganization
-    // (notifier.go:984-986). getOrgById re-reads the same row the OrgRecord
+    // (notifier.go:1002-1004). getOrgById re-reads the same row the OrgRecord
     // projection needs (type-gated: a non-org row reads as a miss → null).
     const orgRecord = await new OrgService(env.DB).getOrgById(ownerRow.id);
     if (orgRecord !== null) {
@@ -329,7 +329,7 @@ export async function emitPackageCreated(
 
 /** The deleted arm — notifyPackage with HookPackageDeleted. `descriptors`
  *  carries ONE descriptor per deleted version: the whole-package delete
- *  fires one event per version (packages.go:714's loop), a version delete
+ *  fires one event per version (packages.go:720's loop), a version delete
  *  exactly one. */
 export async function emitPackageDeleted(
   env: PackageEventEnv,
@@ -343,7 +343,7 @@ export async function emitPackageDeleted(
 // Descriptor resolvers — the route-side arms (v1 deletes, the generic
 // registry's name-keyed deletes) resolve BEFORE their mutation so the
 // payload renders the PRE-delete state (upstream GetPackageDescriptor runs
-// before the delete in RemovePackageVersion, packages.go:521-523).
+// before the delete in RemovePackageVersion, packages.go:526-528).
 // ---------------------------------------------------------------------------
 
 /** One version descriptor by the registry's (owner, type, name, version) key;

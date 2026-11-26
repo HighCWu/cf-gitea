@@ -492,7 +492,7 @@ export function buildRubyGemMetadataJson(m: RubyGemMetadata): string {
   return JSON.stringify(doc);
 }
 
-/** loadRubyGemMetadata — the descriptor's Metadata read (descriptor.go:211's
+/** loadRubyGemMetadata — the descriptor's Metadata read (descriptor.go:212's
  *  &rubygems.Metadata{} with zero values when the JSON is absent/corrupt). */
 export function loadRubyGemMetadata(version: PackageVersionRow): RubyGemMetadata {
   const empty: RubyGemMetadata = {
@@ -1305,7 +1305,7 @@ export interface RubyGemDownload {
  * DownloadPackageFile's walk (rubygems.go:166-198): the file-name search →
  * `len(pvs) != 1` is the EMPTY-404 sentinel; the single version's matching
  * file opens from the content store; the lead GET bumps the counter
- * (helper.ServePackageFile → ServeContent, packages.go:664-668). The
+ * (helper.ServePackageFile → ServeContent, packages.go:669-673). The
  * vanished content object is the honest 404 (the sole-sweeper posture).
  */
 export async function openRubyGemForDownload(
@@ -1480,7 +1480,7 @@ export async function uploadRubyGem(input: UploadRubyGemInput): Promise<UploadRu
 
 // ---------------------------------------------------------------------------
 // Delete — DeletePackage (rubygems.go:272-298) over
-// RemovePackageVersionByNameAndVersion (packages.go:505-512)
+// RemovePackageVersionByNameAndVersion (packages.go:509-516)
 // ---------------------------------------------------------------------------
 
 /**

@@ -253,7 +253,7 @@ describe("pypi upload → simple index → download", () => {
     expect(put.status).toBe(201);
     await put.text();
 
-    // Stored normalized: dots/underscores fold to dashes (pypi.go:132).
+    // Stored normalized: dots/underscores fold to dashes (pypi.go:138).
     const simple = await protocol()("/api/packages/alice/pypi/simple/My_Tool.v2");
     expect(simple.status).toBe(200);
     const html = await simple.text();
@@ -279,7 +279,7 @@ describe("pypi upload → simple index → download", () => {
       await put.text();
     }
     const html = await (await protocol()("/api/packages/alice/pypi/simple/pkg")).text();
-    // strings.Compare ascending (pypi.go:67-69): "1.0" < "10.0" < "2.0".
+    // strings.Compare ascending (pypi.go:73-75): "1.0" < "10.0" < "2.0".
     const one = html.indexOf("pkg-1.0.whl");
     const ten = html.indexOf("pkg-10.0.whl");
     const two = html.indexOf("pkg-2.0.whl");
@@ -367,7 +367,7 @@ describe("pypi UTF-8 filenames (multipart header decode)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The upstream upload arms (pypi.go:105-136)
+// The upstream upload arms (pypi.go:111-142)
 // ---------------------------------------------------------------------------
 
 describe("pypi upload validation arms", () => {

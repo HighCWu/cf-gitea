@@ -27,7 +27,7 @@
  *                                                  sidebar)
  *   GET  .../{type}/{name}/{version}/files/{id}    the file bytes (upstream
  *                                                  `DownloadPackageFile`,
- *                                                  package.go:530 —
+ *                                                  package.go:520 —
  *                                                  attachment disposition)
  *   GET  /{owner}/{repo}/packages                  the repo tab (upstream
  *                                                  `repo.Packages`,
@@ -39,7 +39,7 @@
  * Upstream citations (submodule pin fc4936884584): routers/web/web.go:1106-1128
  * (the R04 group — `context.PackageAssignment()` +
  * `reqPackageAccess(perm.AccessModeRead)` wrap the whole subtree) and
- * web.go:1537-1542 (R16), templates/user/overview/packages.tmpl +
+ * web.go:1508-1513 (R16), templates/user/overview/packages.tmpl +
  * package_versions.tmpl + package/shared/{list,versionlist,view,
  * visibility_badge}.tmpl + package/content/generic.tmpl + templates/repo/
  * packages.tmpl, routers/web/user/package.go + routers/web/repo/packages.go.
@@ -102,8 +102,8 @@
  * ## Documented v1 degradations (§6 method — dead links forbidden)
  *
  * - The packages UI WRITE arms are CLAIMED as of this wave (census gap #5):
- *   `POST .../{version}` (PackageVersionDelete, package.go:503), the
- *   settings pair `GET+POST /settings/{type}/{name}` (web.go:1121-1127 →
+ *   `POST .../{version}` (PackageVersionDelete, package.go:497), the
+ *   settings pair `GET+POST /settings/{type}/{name}` (web.go:1096-1102 →
  *   pages/package-settings.tsx), and the terraform manual lock/unlock POSTs
  *   (web.go:1117-1120 — VERIFIED at the pin: they are the package view's
  *   lock/unlock buttons for terraform-state packages, not a settings
@@ -145,7 +145,7 @@
  *   ETag (the release-attachment family's streaming reduction — its sniffer,
  *   prefetch split and disposition encoder are REUSED, one port another
  *   consumer); the If-Modified-Since conditional answers 304.
- * - The counter rides OpenBlobForDownload's IsLead gate (packages.go:662-666):
+ * - The counter rides OpenBlobForDownload's IsLead gate (packages.go:667-671):
  *   a LEAD file's GET bumps the version's download counter. The generic
  *   protocol never marks files lead, so generic downloads don't bump —
  *   upstream's own shape, not a divergence.
@@ -321,7 +321,7 @@ export const PACKAGES_PAGE_SIZE = 20;
  *  slice, package.go:266-286). */
 const VIEW_SIDEBAR_VERSION_COUNT = 5;
 
-/** The upstream links (descriptor.go:80-93 — PackageWebLink /
+/** The upstream links (descriptor.go:81-94 — PackageWebLink /
  *  VersionWebLink over the LOWER name/version, PathEscape per segment). */
 export function packageWebLink(ownerName: string, type: string, lowerName: string): string {
   return `/${ownerName}/-/packages/${type}/${pathEscapeSegments(lowerName)}`;
@@ -331,13 +331,13 @@ export function versionWebLink(ownerName: string, type: string, lowerName: strin
   return `${packageWebLink(ownerName, type, lowerName)}/${pathEscapeSegments(lowerVersion)}`;
 }
 
-/** The settings page link (descriptor.go:85-88 — PackageSettingsLink over
+/** The settings page link (descriptor.go:86-89 — PackageSettingsLink over
  *  the LOWER name, one `/settings` depth above the package link). */
 export function packageSettingsLink(ownerName: string, type: string, lowerName: string): string {
   return `/${ownerName}/-/packages/settings/${type}/${pathEscapeSegments(lowerName)}`;
 }
 
-/** The download tail (package.go:530's route — `/files/{fileid}`). */
+/** The download tail (package.go:520's route — `/files/{fileid}`). */
 export function packageFileDownloadLink(
   ownerName: string,
   type: string,
@@ -583,11 +583,11 @@ export interface PackagesOwnerChrome {
   following: number;
   /** The Projects-tab count (header.tmpl:17-20's `{{if .ProjectCount}}`
    *  label — the OPEN projects total, loadHeaderCount parity:
-   *  shared/user/header.go:172-192 computes ProjectCount for BOTH owner
+   *  shared/user/header.go:165-185 computes ProjectCount for BOTH owner
    *  kinds, so both arms render the tab — the org arm INACTIVE). */
   openProjects: number;
   /** The strip's follow-button input (org/header.tmpl:17 on the ORG arm,
-   *  profile_big_avatar.tmpl:123-136 on the USER arm): present only for a
+   *  profile_big_avatar.tmpl:114-127 on the USER arm): present only for a
    *  signed-in viewer who is not the owner, IsFollowing(doer, owner) its
    *  label (header.go:28's argument order). */
   followButton: { following: boolean } | null;
@@ -616,7 +616,7 @@ export async function ownerPackagesChrome(
       .then((page) => page.total),
     // The org arm's Projects-tab count (header.tmpl:17-20 — the OPEN
     // organization projects: the projects.ownerId arm over the org's id,
-    // loadHeaderCount parity — shared/user/header.go:178-192 computes
+    // loadHeaderCount parity — shared/user/header.go:171-185 computes
     // ProjectCount for the organization type too).
     drizzle(d1)
       .select({ total: sql<number>`count(*)` })
@@ -696,7 +696,7 @@ async function userProfileChrome(d1: D1Database, user: UserProfileRow, doer: Pro
       .from(projects)
       .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
       .get(),
-    // The avatar card's follow button (profile_big_avatar.tmpl:123-136,
+    // The avatar card's follow button (profile_big_avatar.tmpl:114-127,
     // IsFollowing(doer, target), header.go:28's argument order).
     doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
   ]);
@@ -1240,7 +1240,7 @@ export type PackageFileDownload =
  * 628-666): the file row must live under THIS version (the id pair is the
  * arbitration), the blob row answers through GetBlobByID, the object opens
  * from the content-addressed key. The counter rides OpenBlobForDownload's
- * IsLead gate (packages.go:662-666 — a LEAD file's GET bumps it; the generic
+ * IsLead gate (packages.go:667-671 — a LEAD file's GET bumps it; the generic
  * protocol never marks files lead, so its downloads don't bump, upstream's
  * own shape). A missing object is the honest 404 (the sole-sweeper posture —
  * the same arm the API download runs).
@@ -1548,7 +1548,7 @@ function PackagesListBlock(props: {
  *  the four-wide avatar column + the twelve-wide column carrying the
  *  overview header). The avatar card renders the wave I-b C2 follow button
  *  + C3 admin gear beside the unconditional RSS anchor
- *  (profile_big_avatar.tmpl:123-136/:18/:31-33); the overview header carries
+ *  (profile_big_avatar.tmpl:114-127/:18/:31-33); the overview header carries
  *  the C1 Projects + Code tabs INACTIVE (header.tmpl:14-31) with the strip's
  *  one ACTIVE item the Packages tab itself: upstream marks it via
  *  `IsPackagesPage` (header.tmpl:23 — package.go:103/:197/:348/:418 set it

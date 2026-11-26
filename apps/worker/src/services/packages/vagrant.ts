@@ -27,7 +27,7 @@
  *   description renders the LAST (newest) version's metadata. An empty
  *   answer is the route's 404 (nil).
  * - Download (vagrant.go:173-189): the version → file-by-name → blob walk
- *   with the lead-file GET counter bump (packages.go:655-660).
+ *   with the lead-file GET counter bump (packages.go:660-665).
  *
  * Divergences (documented per AGENTS.md): the SemVer sort pins a stable id
  * tiebreak for equal version strings (Go's slice sort is unspecified for
@@ -335,7 +335,7 @@ export class VagrantInvalidProviderError extends Error {
  * The PUT's service walk — the upstream arms in order (semver → .box →
  * parse), the quota checks on the shared model (COUNT precedes the
  * inserts — `count + 1 > limit`, the pypi posture; SIZE runs on the
- * spooled FILE's real byte count, packages.go:303-306), then
+ * spooled FILE's real byte count, packages.go:305-308), then
  * CreatePackageOrAddFileToExisting without OverwriteExisting: the box
  * metadata lands only on a freshly created version, and ANY existing
  * (version, name, composite) file row throws DuplicatePackageFileError →
@@ -550,7 +550,7 @@ export interface VagrantBoxDownload {
 /**
  * OpenFileForDownloadByPackageNameAndVersion (vagrant.go:173-189): the
  * version → file-by-name → blob walk; the lead-file GET bump
- * (packages.go:655-660). Null = the route's 404.
+ * (packages.go:660-665). Null = the route's 404.
  */
 export async function openVagrantBoxForDownload(
   d1: D1Database,

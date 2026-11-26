@@ -79,7 +79,7 @@ function recs(value: unknown): Rec[] {
   return value.map(rec);
 }
 
-/** The nuget family's `{"Message": ...}` error body (nuget.go:30-35). */
+/** The nuget family's `{"Message": ...}` error body (nuget.go:31-36). */
 function messageOf(value: unknown): string {
   const message = rec(value).Message;
   if (typeof message !== "string") throw new Error("expected a string Message body");
@@ -405,7 +405,7 @@ describe("nuget push → V3 read family", () => {
     expect(fileRows.map((row) => row.lowerName).sort()).toEqual(["system.gitea.1.0.1.nupkg", "system.gitea.nuspec"]);
     expect(fileRows.find((row) => row.lowerName === "system.gitea.1.0.1.nupkg")?.isLead).toBe(true);
 
-    // The V3 service index (nuget.go:69-86) — the nine resources in order.
+    // The V3 service index (nuget.go:70-87) — the nine resources in order.
     const index = rec(await (await protocol()("/api/packages/alice/nuget/index.json")).json());
     expect(index.version).toBe("3.0.0");
     const resources = recs(index.resources);
@@ -475,10 +475,10 @@ describe("nuget push → V3 read family", () => {
     expect(enumerate.versions).toEqual(["1.0.1"]);
 
     // The nupkg download: BYTE PARITY + the attachment disposition; the
-    // lead-file GET bumped the counter (packages.go:667-670).
+    // lead-file GET bumped the counter (packages.go:672-675).
     const get = await protocol()("/api/packages/alice/nuget/package/System.Gitea/1.0.1/System.Gitea.1.0.1.nupkg");
     expect(get.status).toBe(200);
-    // The file NAME is stored lowercased (nuget.go:452's strings.ToLower) —
+    // The file NAME is stored lowercased (nuget.go:458's strings.ToLower) —
     // the disposition carries the stored name.
     expect(get.headers.get("content-disposition")).toContain("system.gitea.1.0.1.nupkg");
     expect(get.headers.get("content-length")).toBe(String(nupkg.byteLength));
@@ -510,7 +510,7 @@ describe("nuget push → V3 read family", () => {
 
     // The 304 arm rides the same walk (If-None-Match: * matches the
     // ETag-less file). The counter bumps BEFORE serving upstream
-    // (OpenBlobForDownload, packages.go:667-670), so a 304-answered GET
+    // (OpenBlobForDownload, packages.go:672-675), so a 304-answered GET
     // counts too — parity by construction.
     const conditional = await protocol()(
       "/api/packages/alice/nuget/package/System.Gitea/1.0.1/System.Gitea.1.0.1.nupkg",
@@ -607,7 +607,7 @@ describe("nuget V2 OData feed", () => {
     const writer = await token(owner, "write:package");
     await push("alice", await makeNupkg(), authHeaders(writer));
 
-    // ServiceIndexV2 (nuget.go:45-66) — the atom service document.
+    // ServiceIndexV2 (nuget.go:46-67) — the atom service document.
     const serviceIndex = await protocol()("/api/packages/alice/nuget");
     expect(serviceIndex.status).toBe(200);
     expect(serviceIndex.headers.get("content-type")).toBe("application/atom+xml; charset=utf-8");
@@ -629,7 +629,7 @@ describe("nuget V2 OData feed", () => {
     expect(metadataXml).toContain('<Property Name="VersionDownloadCount" Type="Edm.Int64" Nullable="false"></Property>');
 
     // RegistrationLeafV2 — the namespaced entry with the verbatim
-    // self-closing <content/> workaround (nuget.go:340-342).
+    // self-closing <content/> workaround (nuget.go:346-348).
     const leaf = await protocol()("/api/packages/alice/nuget/Packages(Id='System.Gitea',Version='1.0.1')");
     expect(leaf.status).toBe(200);
     const leafXml = await leaf.text();
@@ -675,7 +675,7 @@ describe("nuget V2 OData feed", () => {
     // No next link when the page is not full.
     expect(feedXml).not.toContain('rel="next"');
 
-    // A filled page ($top=1) carries the next link (nuget.go:148-164) —
+    // A filled page ($top=1) carries the next link (nuget.go:154-170) —
     // url.Values.Encode escapes $ as %24 and sorts $skip before $top.
     const paged = await protocol()("/api/packages/alice/nuget/Packages()?$top=1");
     const pagedXml = await paged.text();
@@ -756,7 +756,7 @@ describe("nuget symbol package", () => {
     const served = new Uint8Array(await snupkgGet.arrayBuffer());
     expect([...served]).toEqual([...snupkg]);
 
-    // The symbol query protocol (nuget.go:637-671): the guid carries 8 extra
+    // The symbol query protocol (nuget.go:643-677): the guid carries 8 extra
     // f/F chars; the id is the first 32.
     const symbol = await protocol()(
       `/api/packages/alice/nuget/symbols/debug.gitea.pdb/${PDB_ID}FFFFFFFF/debug.gitea.pdb`,
@@ -901,7 +901,7 @@ describe("nuget validation and delete arms", () => {
     expect(again.status).toBe(409);
     expect(messageOf(await again.json())).toBe("package version already exists");
 
-    // DeletePackage (nuget.go:675-698): 204, then the package index 404s.
+    // DeletePackage (nuget.go:681-704): 204, then the package index 404s.
     const del = await protocol()("/api/packages/alice/nuget/System.Gitea/1.0.1", {
       method: "DELETE",
       headers: authHeaders(writer),
@@ -919,7 +919,7 @@ describe("nuget validation and delete arms", () => {
     expect(messageOf(await unknown.json())).toBe("package does not exist");
   });
 
-  it("the delete fires the package webhook deleted (nuget.go:679 → packages.go:532); the 404 arm stays silent", async () => {
+  it("the delete fires the package webhook deleted (nuget.go:685 → packages.go:537); the 404 arm stays silent", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const hookRows = await db()
@@ -1076,7 +1076,7 @@ describe("nuget auth, quota, and gates", () => {
     expect(countDenied.status).toBe(403);
     expect(messageOf(await countDenied.json())).toBe("maximum allowed package count exceeded");
 
-    // Admins bypass both (packages.go:391-393).
+    // Admins bypass both (packages.go:393-395).
     const bypass = await protocol({ PACKAGES_LIMIT_TOTAL_OWNER_SIZE: "128", PACKAGES_LIMIT_TOTAL_OWNER_COUNT: "0" })(
       "/api/packages/alice/nuget",
       {

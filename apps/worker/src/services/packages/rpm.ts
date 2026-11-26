@@ -296,7 +296,7 @@ function u32At(bytes: Uint8Array, offset: number): number {
   return (((bytes[offset] ?? 0) << 24) | ((bytes[offset + 1] ?? 0) << 16) | ((bytes[offset + 2] ?? 0) << 8) | (bytes[offset + 3] ?? 0)) >>> 0;
 }
 
-/** dataLength (header.go:157-176) — the consumed byte count of one entry, or
+/** dataLength (header.go:150-169) — the consumed byte count of one entry, or
  *  null when the type/count is impossible for the remaining store. */
 function headerDataLength(typ: number, count: number, data: Uint8Array, from: number): number | null {
   if (typ === TYPE_STRING || typ === TYPE_STRING_ARRAY || typ === TYPE_I18NSTRING) {
@@ -315,7 +315,7 @@ function headerDataLength(typ: number, count: number, data: Uint8Array, from: nu
   return total <= data.byteLength - from ? total : null;
 }
 
-/** readHeader (header.go:118-155) — validates the index like rpmlib's
+/** readHeader (header.go:111-148) — validates the index like rpmlib's
  *  hdrblobVerifyInfo so data is only captured as it is read. The section
  *  lives at `start`; the store-length bound matches upstream's
  *  `store[offset:]` (an entry may not read past the declared store end). */
@@ -359,7 +359,7 @@ async function shaHex(bytes: Uint8Array, algorithm: "SHA-1" | "SHA-256"): Promis
   return bytesToHex(new Uint8Array(await crypto.subtle.digest(algorithm, bytes)));
 }
 
-/** readHeaders (header.go:178-212): lead → signature header → alignment pad →
+/** readHeaders (header.go:171-205): lead → signature header → alignment pad →
  *  main header, then the signature's SHA-256/SHA-1 digest must match the main
  *  header bytes. */
 async function readHeaders(bytes: Uint8Array): Promise<{ sig: RpmHeader; header: RpmHeader }> {
@@ -991,7 +991,7 @@ async function searchRpmFiles(d1: D1Database, ownerId: number, group: string): P
 }
 
 // ---------------------------------------------------------------------------
-// The repodata XML renders (repository.go:311-545) — Go's encoding/xml shape:
+// The repodata XML renders (repository.go:314-548) — Go's encoding/xml shape:
  // fields in struct order, empty elements as explicit open+close pairs, and
 // EscapeText's escapes (& < > " ' \t \n \r) everywhere.
 // ---------------------------------------------------------------------------
@@ -1067,7 +1067,7 @@ function fileEls(files: RpmFileEntry[] | undefined): string {
   return out;
 }
 
-/** The primary.xml `<package>` entry (repository.go:312-451). */
+/** The primary.xml `<package>` entry (repository.go:315-454). */
 function primaryPackageEl(row: RpmIndexRow): string {
   const fm = row.fileMetadata;
   const vm = row.versionMetadata;
@@ -1158,7 +1158,7 @@ function buildOtherXml(rows: RpmIndexRow[]): string {
   return `${XML_HEADER}${wrapEl("otherdata", `${attr("xmlns", "http://linux.duke.edu/metadata/other")} ${attr("packages", rows.length)}`, packagesEl)}`;
 }
 
-/** buildUpdateInfo (repository.go:560-632): the ID-merged, sorted updateinfo
+/** buildUpdateInfo (repository.go:563-635): the ID-merged, sorted updateinfo
  *  render. Issued/Updated render only when present (Go's nil pointers). */
 function buildUpdateInfoXml(updates: RpmUpdate[]): string {
   let updatesEl = "";
@@ -1229,7 +1229,7 @@ interface RepodataEntry {
   openSize: number;
 }
 
-/** addDataAsFileToRepo (repository.go:651-709): gzip the render, hash BOTH
+/** addDataAsFileToRepo (repository.go:654-712): gzip the render, hash BOTH
  *  arms, store `{type}.xml.gz`, and answer the repomd `<data>` descriptor.
  *  The open-checksum hashes the UNCOMPRESSED bytes (the counter writer), the
  *  checksum the compressed store. */
@@ -1269,7 +1269,7 @@ async function addDataAsFileToRepo(
 // BuildSpecificRepositoryFiles (repository.go:136-236)
 // ---------------------------------------------------------------------------
 
-/** collectUpdateInfoUpdates (repository.go:547-557) — one copy of each
+/** collectUpdateInfoUpdates (repository.go:550-560) — one copy of each
  *  version's updates, in search order. */
 function collectUpdateInfoUpdates(rows: RpmIndexRow[]): RpmUpdate[] {
   const seen = new Set<number>();
@@ -1282,7 +1282,7 @@ function collectUpdateInfoUpdates(rows: RpmIndexRow[]): RpmUpdate[] {
   return updates;
 }
 
-/** The ID-merge (repository.go:562-617): collections merge by `short`,
+/** The ID-merge (repository.go:565-620): collections merge by `short`,
  *  packages dedupe on name+version+release+arch, then the IDs sort. */
 function mergeUpdates(updates: RpmUpdate[]): RpmUpdate[] {
   const byId = new Map<string, RpmUpdate>();
@@ -1422,7 +1422,7 @@ export interface RpmDownload {
 /** CheckRepositoryFileExistence (rpm.go:68-90) + GetRepositoryFile
  *  (rpm.go:93-119): the stored internal file by (filename, group). The
  *  internal files are IsLead=false, so GET never bumps the counter
- *  (packages.go:665-670's IsLead gate). */
+ *  (packages.go:670-675's IsLead gate). */
 export async function openRpmRepositoryFile(d1: D1Database, bucket: R2Bucket, ownerId: number, group: string, filename: string): Promise<RpmDownload | null> {
   const repoVersion = await getOrCreateInternalPackageVersion(d1, ownerId, "rpm", RPM_REPOSITORY_PACKAGE, RPM_REPOSITORY_VERSION);
   const pair = await drizzle(d1)
@@ -1448,7 +1448,7 @@ export async function openRpmRepositoryFile(d1: D1Database, bucket: R2Bucket, ow
  * file on the exact version (the version string carries the epoch prefix —
  * the URL's {version} is the same spelling), with the noarch fallback when
  * the requested architecture is not noarch. GET bumps the lead-file counter
- * (packages.go:665-670).
+ * (packages.go:670-675).
  */
 export async function openRpmPackageFile(
   d1: D1Database,

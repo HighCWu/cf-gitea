@@ -1077,7 +1077,7 @@ export async function deleteConanRecipeOrPackage(
   // The deleted arm (conan.go:691-692 — `if versionDeleted { PackageDelete }`
   // fired from INSIDE deleteRecipeOrPackage, once per cascade): the
   // descriptor resolves BEFORE the version row dies (the pre-delete render,
-  // packages.go:521-523's GetPackageDescriptor order), the emission rides
+  // packages.go:526-528's GetPackageDescriptor order), the emission rides
   // AFTER the cascade landed (the post-tx notify position).
   const pkg = emit?.webhookEnv !== undefined ? await getPackageByName(d1, ownerId, "conan", recipe.name) : null;
   for (const entry of matched) {

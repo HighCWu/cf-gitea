@@ -327,7 +327,7 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     expect(first.status).toBe(201);
     await first.text();
     // Same bytes: still the 409 — upstream's TryInsertFile
-    // (package_file.go:46-66 → generic.go:126-127) rejects the duplicate ROW
+    // (package_file.go:46-66 → generic.go:132-133) rejects the duplicate ROW
     // regardless of blob; there is no idempotent re-upload (D-1).
     const again = await putFile("alice", "dup", "1.0", "same.bin", "stable-bytes", { Authorization: `token ${writer}` });
     expect(again.status).toBe(409);
@@ -402,7 +402,7 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
 
     // The chunked arm (no Content-Length) has no declared length to pre-check
     // — the size quota fires POST-SPOOL with the real size (D-2; upstream's
-    // own order, packages.go:303-306) and still 403s before any row lands.
+    // own order, packages.go:305-308) and still 403s before any row lands.
     const chunkedDenied = await limited("/api/packages/alice/generic/q/1/g.bin", {
       method: "PUT",
       headers: authHeaders(writer),
@@ -470,7 +470,7 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
       headers: authHeaders(writer),
     });
     expect(deleteFile.status).toBe(204);
-    // The version fell with its last file (generic.go:189-199).
+    // The version fell with its last file (generic.go:195-205).
     expect(await db().select().from(packageVersions).all()).toHaveLength(0);
 
     await putFile("alice", "del", "1.0", "only.bin", "x", { Authorization: `token ${writer}` });
@@ -1130,7 +1130,7 @@ describe("PACKAGES_ENABLED=false", () => {
 // ---------------------------------------------------------------------------
 // The require-sign-in-view instance flag — the PACKAGES arm (SPEC-0003 §2.4
 // row 6 handoff, census B-34): upstream's gate lives INSIDE
-// determineAccessMode (services/context/package.go:120), so every
+// determineAccessMode (services/context/package.go:102), so every
 // reqPackageAccess wrap answers its 401 challenge for an anonymous caller
 // once the flag arms the zeroing — no per-route arm. Flag off = the landed
 // anonymous posture byte-for-byte (the two controls re-pin it beside the

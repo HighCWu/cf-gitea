@@ -320,7 +320,7 @@ function createLocalMavenRouter(): Hono<{ Bindings: Env }> {
       if (params === null) return mavenText(400, "request parameters are invalid");
 
       if (params.isMeta && params.version === "") {
-        // serveMavenMetadata (maven.go:82-150).
+        // serveMavenMetadata (maven.go:85-153).
         const doc = await loadMavenMetadataDocument(c.env.DB, owner, params);
         if (doc === null) return mavenText(404, "package does not exist");
         const ext = mavenPathExt(params.filename).toLowerCase();
@@ -347,7 +347,7 @@ function createLocalMavenRouter(): Hono<{ Bindings: Env }> {
         return mavenText(200, opened.hash);
       }
       // Upstream's HEAD-only branch runs SetServeHeaders WITHOUT the filename
-      // (maven.go:216-219) — the D-6 header set but no Content-Disposition
+      // (maven.go:219-222) — the D-6 header set but no Content-Disposition
       // and no byte-serving (http.ServeContent never runs there; always 200).
       // The GET arm is helper.ServePackageFile → ctx.ServeContent: the full
       // disposition + the 304/206 arms (review D-6).
@@ -606,7 +606,7 @@ describe("maven upload → checksums → metadata → download", () => {
     expect(put.status).toBe(201);
     await put.text();
     // Upstream pins the Conflict EVEN for identical bytes (the integration
-    // test uploads "test" twice and asserts 409 — maven.go:403-404).
+    // test uploads "test" twice and asserts 409 — maven.go:406-407).
     const duplicate = await protocol()(`/api/packages/alice/maven/com/gitea/test-project/1.0.1/any-name.jar`, MAVEN_PUT(TEST_BODY, auth));
     expect(duplicate.status).toBe(409);
     expect(await duplicate.text()).toBe("package file already exists");
@@ -649,7 +649,7 @@ describe("maven upload → checksums → metadata → download", () => {
     expect(head.headers.get("last-modified")).not.toBe("");
     expect(head.headers.get("content-disposition")).toBeNull();
     // The D-6 set rides the HEAD-only branch too — but NOT Accept-Ranges
-    // (http.ServeContent never runs on maven HEAD, maven.go:216-219).
+    // (http.ServeContent never runs on maven HEAD, maven.go:219-222).
     expect(head.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
     expect(head.headers.get("x-content-type-options")).toBe("nosniff");
     expect(head.headers.get("accept-ranges")).toBeNull();
@@ -669,7 +669,7 @@ describe("maven upload → checksums → metadata → download", () => {
   });
 
   it("serves a unicode-named file with the RFC 5987 filename* twin and the 304 arm (D-6)", async () => {
-    // The maven grammar only bars [\\/:"<>|?*] (maven.go:49), so the
+    // The maven grammar only bars [\\/:"<>|?*] (maven.go:50), so the
     // disposition encoder's non-ASCII arm is reachable on a real upload —
     // the filename arrives URL-decoded off the path wildcard.
     const owner = await seedUser("alice");
@@ -721,7 +721,7 @@ describe("maven upload → checksums → metadata → download", () => {
     expect(md5Put.status).toBe(200);
     await md5Put.text();
 
-    // A checksum against a missing version → 404 (maven.go:308-312).
+    // A checksum against a missing version → 404 (maven.go:311-315).
     const ghost = await protocol()(`/api/packages/alice/maven/com/gitea/test-project/9.9.9/any-name.jar.sha1`, MAVEN_PUT(TEST_BODY, auth));
     expect(ghost.status).toBe(404);
     expect(await ghost.text()).toBe("package does not exist");
@@ -823,7 +823,7 @@ describe("maven upload → checksums → metadata → download", () => {
   });
 });
 
-describe("the SNAPSHOT arm (maven.go:356 OverwriteExisting)", () => {
+describe("the SNAPSHOT arm (maven.go:359 OverwriteExisting)", () => {
   it("stores version-level metadata files, re-publishes them, and orders release/latest", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
@@ -865,7 +865,7 @@ describe("the SNAPSHOT arm (maven.go:356 OverwriteExisting)", () => {
   });
 });
 
-describe("the legacy package-name arm (maven.go:292-303)", () => {
+describe("the legacy package-name arm (maven.go:295-306)", () => {
   it("saves under GroupID-ArtifactID, then renames on the next normal upload", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
@@ -965,7 +965,7 @@ describe("maven auth/quota/limits arms", () => {
     await denied.text();
 
     // The checksum PUT stays quota-free (it returns before any quota check,
-    // maven.go:305-347).
+    // maven.go:308-350).
     const checksum = await limited(`${root}/1.0/f.jar.sha1`, MAVEN_PUT(encoder.encode(TEST_BODY_CHECKSUMS.sha1), auth));
     expect(checksum.status).toBe(200);
     await checksum.text();

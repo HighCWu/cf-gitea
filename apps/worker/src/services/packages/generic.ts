@@ -10,15 +10,15 @@
  *   ladder (package → version → blob → file, §5.2) under the quota checks
  *   (403), answers 201 created / 409 on ANY duplicate file row — upstream's
  *   TryInsertFile rejects duplicates regardless of blob bytes
- *   (package_file.go:46-66 → generic.go:126-127; the packages parity review's
+ *   (package_file.go:46-66 → generic.go:132-133; the packages parity review's
  *   D-1).
  * - Download: the version → file → blob walk, the R2 content-key stream,
  *   `Content-Disposition` per upstream's ServePackageFile
- *   (helper.go:52-77), and the lead-file GET download-counter bump
- *   (packages.go:655-660 — HEAD never counts).
+ *   (helper.go:53-78), and the lead-file GET download-counter bump
+ *   (packages.go:660-665 — HEAD never counts).
  * - Delete: per-file (deletes the version too when it was the last file —
- *   generic.go:189-199) and per-version (RemovePackageVersionByNameAndVersion,
- *   packages.go:505-513). The R2 content keys are NEVER deleted here — the
+ *   generic.go:195-205) and per-version (RemovePackageVersionByNameAndVersion,
+ *   packages.go:509-517). The R2 content keys are NEVER deleted here — the
  *   unreferenced-blob sweep is the sole content-key deleter (ratification 4,
  *   the PACKAGE-DEFER-STORAGE-DELETE posture upstream carries).
  */
@@ -62,7 +62,7 @@ import { emitPackageCreated, type PackageEventEnv } from "./webhooks";
 const PACKAGE_NAME_REGEX = /^[-_+.\w]+$/;
 const FILENAME_REGEX = /^[-_+=:;.()[\]{}~!@#$%^& \w]+$/;
 
-/** isValidPackageName (generic.go:53-58): the regex, a single non-alnum char is invalid, ".." is invalid. */
+/** isValidPackageName (generic.go:59-64): the regex, a single non-alnum char is invalid, ".." is invalid. */
 export function isValidPackageName(packageName: string): boolean {
   if (packageName.length === 1 && !/[a-z0-9_]/i.test(packageName)) {
     return false;
@@ -75,7 +75,7 @@ export function isValidFileName(filename: string): boolean {
   return FILENAME_REGEX.test(filename) && filename.trim() === filename && filename !== "." && filename !== "..";
 }
 
-/** The version rule (generic.go:82-86): trimmed-equals only. */
+/** The version rule (generic.go:88-92): trimmed-equals only. */
 export function isValidPackageVersion(packageVersion: string): boolean {
   return packageVersion === packageVersion.trim();
 }
@@ -129,10 +129,10 @@ export interface UploadGenericFileResult {
 /**
  * The generic PUT's service walk:
  *   1. quota (count + size, admin bypass — the upstream checks run inside
- *      addFileToPackageVersion, packages.go:303-306; the count arm carries
+ *      addFileToPackageVersion, packages.go:305-308; the count arm carries
  *      the +1 post-insert parity — upstream's versionCreated gate checks
  *      AFTER the version insert, packages.go:188-191, and throws when
- *      totalCount > limit, packages.go:380-381, so the pre-insert
+ *      totalCount > limit, packages.go:382-383, so the pre-insert
  *      equivalent is count + 1 > limit; the SIZE arm pre-checks a declared
  *      length and defers the chunked arm to post-spool with the real size —
  *      upstream's own order);
@@ -156,7 +156,7 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
   // without reading it); the chunked arm (no Content-Length — D-2) has no
   // declaration and checks after the spool with the REAL size below — which
   // is upstream's own order (addFileToPackageVersion reads Data.Size() after
-  // the read, packages.go:303-306). The count check needs no size.
+  // the read, packages.go:305-308). The count check needs no size.
   if (input.declaredLength !== undefined) {
     await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "generic", input.declaredLength, input.quota);
   }
@@ -194,7 +194,7 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
     });
 
     // PASS 2 — skipped entirely on a dedup hit whose object still exists
-    // (the upstream OptionalSize repair branch, packages.go:268-285, keeps a
+    // (the upstream OptionalSize repair branch, packages.go:270-287, keeps a
     // dedup row whose object was lost servable by re-landing it).
     const objectPresent = (await input.bucket.head(packageBlobContentKey(spooled.sha256))) !== null;
     if (blobCreated || !objectPresent) {
@@ -208,7 +208,7 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
     // blob row + key to the cleanup sweep (the ratified failure window).
     // ANY existing (version, name, composite key) row is the 409 — upstream's
     // TryInsertFile rejects duplicates regardless of blob bytes
-    // (package_file.go:46-66 → generic.go:126-127), so a same-bytes re-upload
+    // (package_file.go:46-66 → generic.go:132-133), so a same-bytes re-upload
     // conflicts too (the packages parity review's D-1; the same-blob
     // short-circuit exists only on the OverwriteExisting path — helm — never
     // here).
@@ -241,7 +241,7 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// Download — OpenFileForDownloadByPackageNameAndVersion (packages.go:602+)
+// Download — OpenFileForDownloadByPackageNameAndVersion (packages.go:607+)
 // ---------------------------------------------------------------------------
 
 export interface GenericDownload {
@@ -257,7 +257,7 @@ export interface GenericDownload {
 /**
  * The GET/HEAD walk: version → file → blob → R2 object stream. `method` is
  * upstream's download-counter gate: a LEAD file's GET bumps it, HEAD never
- * does (packages.go:655-660). A missing object is the honest 404 (the
+ * does (packages.go:660-665). A missing object is the honest 404 (the
  * sole-sweeper posture: an unreferenced blob's key can be gone while rows
  * still exist only if a file row referenced it — which the sweep refuses).
  */
@@ -296,7 +296,7 @@ export async function openGenericFileForDownload(
 // ---------------------------------------------------------------------------
 
 /**
- * Per-file DELETE (generic.go:164-202): deleting the LAST file deletes the
+ * Per-file DELETE (generic.go:170-208): deleting the LAST file deletes the
  * version with it; otherwise just the file. The content key stays — the
  * sweep is the sole deleter.
  */
@@ -321,7 +321,7 @@ export async function deleteGenericFile(
 }
 
 /**
- * Per-version DELETE (generic.go:140-161 → packages.go:505-513): the version
+ * Per-version DELETE (generic.go:146-167 → packages.go:509-517): the version
  * cascade (files + properties + row). Null = no such version.
  */
 export async function deleteGenericVersion(

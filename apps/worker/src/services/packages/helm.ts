@@ -639,10 +639,10 @@ export interface UploadHelmResult {
  * The POST /api/charts walk. The quota checks precede the inserts (one
  * transaction upstream — a 403 leaves no rows); the size quota runs after
  * the archive parsed, with the archive's real size (upstream checks inside
- * addFileToPackageVersion with the file size, packages.go:303-306). COUNT:
+ * addFileToPackageVersion with the file size, packages.go:305-308). COUNT:
  * upstream checks AFTER the version insert, inside the rolling-back
  * transaction (the versionCreated gate, packages.go:188-191) and throws
- * when totalCount > limit (packages.go:380-381) — the pre-insert equivalent
+ * when totalCount > limit (packages.go:382-383) — the pre-insert equivalent
  * is count + 1 > limit, so an exactly-at-limit owner publishes the version
  * that REACHES the cap but not one past.
  */
@@ -716,7 +716,7 @@ export async function uploadHelmChart(input: UploadHelmChartInput): Promise<Uplo
     // OverwriteExisting: true (helm.go:194) — an existing file row with
     // different bytes is deleted (properties with it, the landed
     // deletePackageFile) and re-inserted; the same blob is the idempotent
-    // no-op (upstream's short circuit, packages.go:336-339).
+    // no-op (upstream's short circuit, packages.go:338-341).
     const filename = createChartFilename(metadata);
     const existing = await getFileForVersionByName(input.d1, version.id, filename);
     let overwrote = false;
@@ -796,7 +796,7 @@ export async function uploadHelmProvenance(input: UploadHelmProvenanceInput): Pr
     const metadata = parseChartYaml(plaintext);
 
     // AddFileToExistingPackage: GetVersionByNameAndVersion or
-    // ErrPackageNotExist (packages.go:247-256).
+    // ErrPackageNotExist (packages.go:249-258).
     const version: PackageVersionRow | null = await getVersionByNameAndVersion(
       input.d1,
       input.owner.id,
@@ -1013,7 +1013,7 @@ export async function openHelmFileForDownload(
   if (match === undefined) return null;
   const object = await bucket.get(packageBlobContentKey(match.blob.hashSha256));
   if (object === null) return null;
-  // OpenBlobForDownload's lead-file GET counter bump (packages.go:655-660):
+  // OpenBlobForDownload's lead-file GET counter bump (packages.go:660-665):
   // the chart counts, the .prov never does.
   if (file.isLead && method === "GET") {
     await incrementDownloadCounter(d1, version.id);

@@ -1,6 +1,6 @@
 /**
  * The USER settings PACKAGES tab's CHEF keypair web arm — upstream's
- * `POST /user/settings/packages/chef/regenerate_keypair` (web.go:718 →
+ * `POST /user/settings/packages/chef/regenerate_keypair` (web.go:688 →
  * routers/web/user/setting/packages.go:103-119 RegenerateChefKeyPair) plus
  * the settings-page SECTION that renders the regenerate button
  * (templates/user/settings/packages.tmpl:6-21 — the section exists at the
@@ -14,7 +14,7 @@
  *
  * ## Upstream surface (VERIFIED at the pin)
  *
- *   - `web.go:718` — `m.Post("/chef/regenerate_keypair",
+ *   - `web.go:688` — `m.Post("/chef/regenerate_keypair",
  *     user_setting.RegenerateChefKeyPair)` inside the `/packages` group
  *     (:701-719) of the reqSignIn `/user/settings` subtree, behind
  *     `packagesEnabled` (compile-time TRUE in the landed posture — the
@@ -204,7 +204,7 @@ export async function regenerateChefKeypair(d1: D1Database, userId: number): Pro
 /**
  * ServeContent(strings.NewReader(priv), {ContentType:
  * "application/x-pem-file", Filename: ctx.Doer.Name + ".priv"})
- * (setting/packages.go:113-118 → base.go:178-181) through the shared
+ * (setting/packages.go:108-113 → base.go:178-181) through the shared
  * serve-content seam: the created-less zero-modtime arm — the full
  * ServeSetHeaders set (nosniff, the sandbox CSP, the attachment disposition
  * over path.Base, the expose-headers echo, the zero-MaxAge private cache

@@ -32,7 +32,7 @@
  *   trailing newline (json.Encoder). Zero files → the 404-nil arm.
  * - Download (conda.go:296-322): SearchFiles(channel, subdir, filename)
  *   must answer EXACTLY one row (more is the 404, conda.go:308); the lead
- *   file bumps the version counter on GET (packages.go:668).
+ *   file bumps the version counter on GET (packages.go:673).
  *
  * The three staged codec walls, RESOLVED (SPEC-0016 §7's conda row):
  * 1. `.tar.bz2` parse — the vendored bzip2 DECODER (./bz2.ts, the Go
@@ -901,7 +901,7 @@ export interface CondaDownload {
 /**
  * DownloadPackageFile's lookup (conda.go:297-311): the search must answer
  * EXACTLY one row (zero OR multiple is the 404 — conda.go:308's len != 1);
- * the lead file bumps the version counter on GET (packages.go:668).
+ * the lead file bumps the version counter on GET (packages.go:673).
  */
 export async function openCondaFileForDownload(
   d1: D1Database,
@@ -924,7 +924,7 @@ export async function openCondaFileForDownload(
   if (object === null) return null;
   if (method === "GET") {
     // The counter is the download's OBSERVABILITY, not its gate (services/
-    // packages/packages.go:666-670 — upstream logs the increment failure
+    // packages/packages.go:671-675 — upstream logs the increment failure
     // and returns the opened file regardless; a failed write must not turn
     // a servable blob into a 500).
     try {

@@ -19,7 +19,7 @@
  *     `user.PackagesRuleEdit` + POST `user.PackagesRuleEditPost` + GET
  *     `/preview` `user.PackagesRulePreview`), the `cargo` group (POST
  *     `/initialize` + `/rebuild`) and the bare
- *     `POST /chef/regenerate_keypair` (:718).
+ *     `POST /chef/regenerate_keypair` (:688).
  *   - `routers/web/user/setting/packages.go` — eight thin handlers; all set
  *     Title `packages.title` + PageIsSettingsPackages and delegate to the
  *     SAME shared shims the org handlers ride (`SetPackagesContext`,
@@ -66,15 +66,15 @@
  *
  * ## Documented omissions — cargo only (the chef arm LANDED)
  *
- *   - The CARGO section (cargo.tmpl + web.go:715-718's initialize/rebuild
+ *   - The CARGO section (cargo.tmpl + web.go:685-688's initialize/rebuild
  *     POSTs) is NOT RENDERED and NOT ROUTED: no cargo registry/index
  *     service exists (the org twin's documented dead-control reduction).
  *   - The CHEF keypair section (packages.tmpl:9-24's form) LANDED with
  *     b6c6cb8's chef-auth substrate: the section renders below
  *     (./user-settings-packages-chef.tsx — the exact template markup) and
- *     web.go:718's `POST /chef/regenerate_keypair` is ROUTED in
+ *     web.go:688's `POST /chef/regenerate_keypair` is ROUTED in
  *     ui/index.ts (GenerateKeyPair + SetUserSetting of the public PEM,
- *     setting/packages.go:110-124; the private key streams ONCE per the
+ *     setting/packages.go:105-114; the private key streams ONCE per the
  *     secret-once posture). A chef cleanup RULE stays functional in the
  *     dropdown as before.
  *
@@ -758,7 +758,7 @@ export function UserCleanupRulePreviewPage(props: { ctx: UiContext; data: Extrac
                           <a href={row.versionLink}>{row.version.version}</a>
                         </td>
                         <td>
-                          {/* The Ghost arm (descriptor.go:135-141) — a
+                          {/* The Ghost arm (descriptor.go:136-142) — a
                               missing creator renders the Ghost user's
                               HomeLink. */}
                           <a href={row.creatorName !== null ? userLink(row.creatorName) : `/${userSettingsPackagesLocale.ghost}`}>

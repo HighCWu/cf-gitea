@@ -1,24 +1,24 @@
 /**
  * The org settings PACKAGES tab — upstream's package cleanup-rules
- * management page (web.go:1069-1085's `/packages` group inside the org
+ * management page (web.go:1043-1059's `/packages` group inside the org
  * `/settings` subtree at the pin fc4936884584a41931906553d96c2601d750e6ef).
  *
  * ## Upstream surface (VERIFIED at the pin)
  *
- *   - `routers/web/web.go:1069-1085` — `m.Group("/packages", ...)`: the list
+ *   - `routers/web/web.go:1043-1059` — `m.Group("/packages", ...)`: the list
  *     GET (`org.Packages`), the `rules/add` group (GET `org.PackagesRuleAdd`
  *     + POST `web.Bind[*forms.PackageCleanupRuleForm]` `org.PackagesRuleAddPost`),
  *     the `rules/{id}` combo (GET `org.PackagesRuleEdit` + POST
  *     `org.PackagesRuleEditPost` + GET `/preview` `org.PackagesRulePreview`)
  *     and the `cargo` group (POST `/initialize` + `/rebuild`). The group
- *     sits behind `packagesEnabled` (web.go:430 — `setting.Packages.Enabled`,
+ *     sits behind `packagesEnabled` (web.go:419 — `setting.Packages.Enabled`,
  *     compile-time TRUE in the landed posture) inside the org settings
- *     subtree's `context.OrgAssignment{RequireOwner: true}` (web.go:1092) +
+ *     subtree's `context.OrgAssignment{RequireOwner: true}` (web.go:1066) +
  *     `reqSignIn` — the same posture every landed org settings tab rides
  *     (the resolveOrgTeamsRequest prologue; the org-settings-actions header).
  *     NOTE the landed org family's URL divergence (the wave-14 record, the
  *     shared settings-nav header): upstream serves `/org/{name}/settings/
- *     packages` (the redirect target at setting_packages.go:76), the landed
+ *     packages` (the redirect target at setting_packages.go:73), the landed
  *     family serves `/org/{org}/settings/packages` — this module follows the
  *     LANDED family's shape.
  *   - `routers/web/org/setting_packages.go` — the six thin handlers; all set
@@ -34,7 +34,7 @@
  *     `CompiledPattern` (:41-54 — `(?i)\A…\z` compiles), Insert/Get/Update/
  *     Delete/GetCleanupRulesByOwner/HasOwnerCleanupRuleForPackageType
  *     (:56-100).
- *   - `models/packages/package.go:304-309` — `GetPackagesByType` (owner+type
+ *   - `models/packages/package.go:310-315` — `GetPackagesByType` (owner+type
  *     + `package.is_internal = false`).
  *   - `services/forms/package_form.go` — `PackageCleanupRuleForm`: Type
  *     `Required;In(<the 23 TypeList values>)`, KeepCount
@@ -99,7 +99,7 @@
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
- * - The CARGO section (`package/shared/cargo.tmpl` + web.go:1081-1084's
+ * - The CARGO section (`package/shared/cargo.tmpl` + web.go:1055-1058's
  *   `/cargo` initialize/rebuild POSTs) is NOT RENDERED and NOT ROUTED: the
  *   cargo registry/index service has no landed substrate (no
  *   services/packages/cargo), so the buttons would be dead controls and
@@ -325,7 +325,7 @@ export const orgSettingsPackagesLocale = {
   admin_published: "Published", // "admin.packages.published"
   badge_internal: "Internal", // "repo.desc.internal" (visibility_badge.tmpl)
   badge_private: "Private", // "repo.desc.private"
-  ghost: "Ghost", // user_model.GhostUserName — the missing-creator arm (descriptor.go:135-141's NewGhostUser; HomeLink "/Ghost")
+  ghost: "Ghost", // user_model.GhostUserName — the missing-creator arm (descriptor.go:136-142's NewGhostUser; HomeLink "/Ghost")
 } as const;
 
 /** "...cleanuprules.keep.count.n" — "%d versions per package". */
@@ -748,7 +748,7 @@ export async function loadOrgCleanupRuleEditPageData(d1: D1Database, org: OrgRec
 export interface OrgCleanupRulePreviewRow {
   pkg: PackageRow;
   version: PackageVersionRow;
-  /** VersionWebLink (descriptor.go:91-93) — the anchor rides the LOWER
+  /** VersionWebLink (descriptor.go:92-94) — the anchor rides the LOWER
    *  name/version segments. */
   versionLink: string;
   /** The creator's username; null renders the Ghost cell (descriptor.go:
@@ -1154,7 +1154,7 @@ export function OrgCleanupRulePreviewPage(props: { ctx: UiContext; data: Extract
                           <a href={row.versionLink}>{row.version.version}</a>
                         </td>
                         <td>
-                          {/* The Ghost arm (descriptor.go:135-141) — a
+                          {/* The Ghost arm (descriptor.go:136-142) — a
                               missing creator renders the Ghost user's
                               HomeLink. */}
                           <a href={row.creatorName !== null ? userLink(row.creatorName) : `/${orgSettingsPackagesLocale.ghost}`}>

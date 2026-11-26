@@ -16,7 +16,7 @@
  *
  * **Incremental per package, never a per-write rebuild.** Upstream's write
  * arms (publish cargo.go:247, yank/unyank cargo.go:298, the cleanup rider
- * cleanup.go:115) all funnel into `UpdatePackageIndexIfExists`, which rewrites
+ * cleanup.go:117) all funnel into `UpdatePackageIndexIfExists`, which rewrites
  * exactly ONE package file — `addOrUpdatePackageIndex` over that package's
  * full version list (index.go:198-208). The whole-tree `RebuildIndex`
  * (index.go:63-106) is a separate explicit operator action (the settings

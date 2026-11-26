@@ -5,30 +5,30 @@
  * OpenFileForDownloadByPackageNameAndVersion, packages.go:160/:594):
  *
  * - Upload: twine's multipart form (upstream `ctx.Req.FormFile("content")` +
- *   FormValue reads, pypi.go:105-159). The wire is scanned in a bounded
+ *   FormValue reads, pypi.go:111-165). The wire is scanned in a bounded
  *   STREAMING pass over the spooled body — form fields are small and
  *   collected, the `content` file part is never buffered: its byte range in
  *   the spool object is recorded while its digests are computed in the same
  *   pass (the store's single-pass discipline, blobs.ts). The second pass
  *   ranges exactly that span out of the spool into the content key. Upstream's
  *   arms port in order: missing content part → 400, `sha256_digest`
- *   mismatch — or ABSENCE, upstream's FormValue-empty EqualFold (pypi.go:120-124,
+ *   mismatch — or ABSENCE, upstream's FormValue-empty EqualFold (pypi.go:126-130,
  *   the parity review's D-3) — → 400 "hash mismatch", normalized name
  *   + PEP 440 version mismatch → 400 "invalid name or version"
- *   (pypi.go:132-136), duplicate file (ANY bytes — D-1) → 409, quota → 403,
+ *   (pypi.go:138-142), duplicate file (ANY bytes — D-1) → 409, quota → 403,
  *   created → 201.
- * - The PEP 503 simple index (`/simple/{id}`, pypi.go:47-75): all versions of
+ * - The PEP 503 simple index (`/simple/{id}`, pypi.go:53-81): all versions of
  *   the normalized package, sorted by the raw version string (upstream's
- *   strings.Compare, pypi.go:67-69), rendered through the
+ *   strings.Compare, pypi.go:73-75), rendered through the
  *   templates/api/packages/pypi/simple.tmpl anchor shape (whitespace-faithful
  *   port; values HTML-escaped as Go's html/template does).
  * - Download (`/files/{id}/{version}/{filename}`): the version → file → blob
- *   walk with the lead-file GET download-counter bump (packages.go:655-660).
+ *   walk with the lead-file GET download-counter bump (packages.go:660-665).
  *
  * Divergences (documented per AGENTS.md): multipart header/field sizes are
  * capped (upstream buffers the whole form in memory); `FormValue` semantics
  * answer the FIRST value of a repeated field while `project_urls` collects
- * ALL values (upstream reads the Form slice, pypi.go:143); MD5 stays NULL
+ * ALL values (upstream reads the Form slice, pypi.go:149); MD5 stays NULL
  * (Workers' WebCrypto has no MD5 — the landed blob-row note).
  */
 
@@ -81,13 +81,13 @@ const PYPI_NAME_REGEX = /^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9.\-_]*[a-zA-Z0-9])
 const PYPI_VERSION_REGEX =
   /^v?(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*(?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?(?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?(?:[-_.]?dev[-_.]?[0-9]*)?(?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?$/;
 
-/** isValidNameAndVersion (pypi.go:227-229) — the normalization happens BEFORE. */
+/** isValidNameAndVersion (pypi.go:233-235) — the normalization happens BEFORE. */
 export function isValidPypiNameAndVersion(packageName: string, packageVersion: string): boolean {
   return PYPI_NAME_REGEX.test(packageName) && PYPI_VERSION_REGEX.test(packageVersion);
 }
 
 /**
- * normalizeLabel (pypi.go:212-225): a Project-URL label normalizes by
+ * normalizeLabel (pypi.go:218-231): a Project-URL label normalizes by
  * deleting all ASCII punctuation and whitespace, then lowercasing
  * (packaging.python.org well-known-project-urls).
  */
@@ -112,7 +112,7 @@ export function normalizeProjectUrlLabel(label: string): string {
 // ---------------------------------------------------------------------------
 
 /** Malformed multipart body or a scan cap exceeded (→ 400; upstream's
- *  FormFile/FormValue parse failures are 400s too, pypi.go:106-110). */
+ *  FormFile/FormValue parse failures are 400s too, pypi.go:112-116). */
 export class PypiFormError extends Error {
   constructor(message: string) {
     super(message);
@@ -120,7 +120,7 @@ export class PypiFormError extends Error {
   }
 }
 
-/** No (non-empty) `content` file part (→ 400, pypi.go:106-110). */
+/** No (non-empty) `content` file part (→ 400, pypi.go:112-116). */
 export class PypiMissingContentError extends Error {
   constructor() {
     super("the content file field is missing");
@@ -130,7 +130,7 @@ export class PypiMissingContentError extends Error {
 
 /** `sha256_digest` contradicts the streamed bytes, or the field is absent —
  *  upstream's EqualFold over FormValue's empty default answers both with the
- *  same 400 "hash mismatch" (pypi.go:120-124). */
+ *  same 400 "hash mismatch" (pypi.go:126-130). */
 export class PypiHashMismatchError extends Error {
   constructor() {
     super("hash mismatch");
@@ -139,7 +139,7 @@ export class PypiHashMismatchError extends Error {
 }
 
 /** The normalized name/version fails the PEP matchers (→ 400 "invalid name
- *  or version", pypi.go:134-136). */
+ *  or version", pypi.go:140-142). */
 export class PypiInvalidNameOrVersionError extends Error {
   constructor() {
     super("invalid name or version");
@@ -441,7 +441,7 @@ export async function scanTwineForm(input: ScanTwineFormInput): Promise<ScannedT
       // net/textproto builds the part's MIMEHeader from the RAW header bytes
       // (string(raw) — no charset transform), so fileHeader.Filename ends up
       // the client's UTF-8 string unchanged (upstream FormFile at
-      // pypi.go:105 → net/http Request.FormFile → ReadForm). RFC 7578 has no
+      // pypi.go:111 → net/http Request.FormFile → ReadForm). RFC 7578 has no
       // charset parameter in practice — twine/curl send UTF-8 (the de facto
       // convention); a latin1 decode here would store mojibake (ü's 0xC3 0xBC
       // as "Ã¼") and the file would never resolve by its sent name. Invalid
@@ -501,7 +501,7 @@ export async function scanTwineForm(input: ScanTwineFormInput): Promise<ScannedT
 }
 
 // ---------------------------------------------------------------------------
-// Upload — UploadPackageFile's walk (pypi.go:105-208)
+// Upload — UploadPackageFile's walk (pypi.go:111-214)
 // ---------------------------------------------------------------------------
 
 /**
@@ -567,11 +567,11 @@ export interface UploadPypiPackageResult {
  * The twine POST's service walk. The quota checks precede the inserts (one
  * transaction upstream — a 403 leaves no rows). SIZE runs after the scan
  * with the FILE's real byte count (upstream checks inside
- * addFileToPackageVersion with the file size, packages.go:303-306 — the
+ * addFileToPackageVersion with the file size, packages.go:305-308 — the
  * multipart envelope is not charged). COUNT: upstream checks AFTER the
  * version insert, inside the rolling-back transaction (the versionCreated
  * gate, packages.go:188-191) and throws when totalCount > limit
- * (packages.go:380-381) — the pre-insert equivalent is count + 1 > limit,
+ * (packages.go:382-383) — the pre-insert equivalent is count + 1 > limit,
  * so an exactly-at-limit owner publishes the version that REACHES the cap
  * but not one past.
  */
@@ -614,7 +614,7 @@ export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<
     }
     // Upstream reads FormValue("sha256_digest") — an ABSENT field is the
     // empty string, and strings.EqualFold("", hash) is false, so a digest-less
-    // upload 400s "hash mismatch" exactly like a wrong one (pypi.go:120-124):
+    // upload 400s "hash mismatch" exactly like a wrong one (pypi.go:126-130):
     // the integrity gate cannot be bypassed by omitting the field (the
     // packages parity review's D-3). EqualFold is case-insensitive, so the
     // declared value folds against the lowercase streamed hex.
@@ -682,10 +682,10 @@ export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<
       await input.bucket.delete(spooled.spoolKey);
     }
 
-    // IsLead: true (pypi.go:192) — every twine upload is the lead file.
+    // IsLead: true (pypi.go:198) — every twine upload is the lead file.
     // ANY existing (version, name, composite key) row is the 409 — upstream's
     // TryInsertFile rejects duplicates regardless of blob bytes
-    // (package_file.go:46-66 → pypi.go:197-198), so a same-bytes re-upload
+    // (package_file.go:46-66 → pypi.go:203-204), so a same-bytes re-upload
     // conflicts too (the packages parity review's D-1).
     const fileResult: InsertFileResult = await tryInsertFile(input.d1, {
       versionId: version.id,
@@ -713,7 +713,7 @@ export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<
 function buildPypiMetadata(fields: Map<string, string[]>): Record<string, string> {
   let homepage = "";
   // project_urls entries are "Label, URL" — the well-known "homepage" label
-  // wins (pypi.go:143-154); the deprecated home_page field is the fallback.
+  // wins (pypi.go:149-160); the deprecated home_page field is the fallback.
   for (const entry of allFields(fields, "project_urls")) {
     const comma = entry.indexOf(",");
     if (comma === -1) continue;
@@ -738,7 +738,7 @@ function buildPypiMetadata(fields: Map<string, string[]>): Record<string, string
 }
 
 // ---------------------------------------------------------------------------
-// Download — DownloadPackageFile (pypi.go:78-102) + the simple index
+// Download — DownloadPackageFile (pypi.go:84-108) + the simple index
 // ---------------------------------------------------------------------------
 
 export interface PypiDownload {
@@ -751,7 +751,7 @@ export interface PypiDownload {
 
 /**
  * The `/files/{id}/{version}/{filename}` walk: the `{id}` segment normalizes
- * (pypi.go:79), then the version → file → blob walk with the lead-file GET
+ * (pypi.go:85), then the version → file → blob walk with the lead-file GET
  * counter bump. Null = 404 at the route.
  */
 export async function openPypiFileForDownload(
@@ -787,10 +787,10 @@ export interface PypiSimpleEntry {
 }
 
 /**
- * PackageMetadata's data assembly (pypi.go:47-75): all versions of the
+ * PackageMetadata's data assembly (pypi.go:53-81): all versions of the
  * normalized package (upstream SearchVersions has NO paginator — every row
  * comes back), sorted ascending by the raw version string (strings.Compare,
- * pypi.go:67-69). Null = 404.
+ * pypi.go:73-75). Null = 404.
  */
 export async function loadPypiSimpleIndex(
   d1: D1Database,
@@ -813,7 +813,7 @@ export async function loadPypiSimpleIndex(
     limit: 100000,
   });
   if (rows.length === 0) return null;
-  // strings.Compare ascending on the raw version string (pypi.go:67-69);
+  // strings.Compare ascending on the raw version string (pypi.go:73-75);
   // JS sort is stable where Go's slice sort is not — equal keys keep
   // insertion (newest-first) order deterministically.
   const sorted = [...rows].sort((a, b) =>

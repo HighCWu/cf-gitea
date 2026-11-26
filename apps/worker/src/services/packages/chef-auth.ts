@@ -52,7 +52,7 @@
  *
  * The key-pair store arm: upstream exposes the SET through the user
  * settings page — POST /user/settings/packages/chef/regenerate_keypair
- * (web.go:718 → routers/web/user/setting/packages.go:103-119) generates
+ * (web.go:688 → routers/web/user/setting/packages.go:98-114) generates
  * a pair (util.GenerateKeyPair, KeyBits=4096 — metadata.go:20), stores
  * ONLY the public PEM under the user setting and streams the private PEM
  * back as the `application/x-pem-file` download `{user}.priv`. This
@@ -127,7 +127,7 @@ function pemEncode(label: string, der: Uint8Array): string {
 }
 
 /**
- * GenerateChefKeyPair's port (user/setting/packages.go:104 →
+ * GenerateChefKeyPair's port (user/setting/packages.go:99 →
  * util.GenerateKeyPair(KeyBits)): the pair's PRIVATE arm renders as
  * PKCS#1 `RSA PRIVATE KEY` PEM (util/keypair.go:26-31 — byte-faithful;
  * the PKCS#8 WebCrypto export is unwrapped to the inner RSAPrivateKey

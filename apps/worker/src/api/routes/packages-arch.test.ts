@@ -674,7 +674,7 @@ describe("arch delete → rebuild → the empty arm", () => {
     expect(await index.text()).toBe("");
   });
 
-  it("the version-cascading delete fires the package webhook deleted (arch.go:290 → packages.go:572's pd != nil gate)", async () => {
+  it("the version-cascading delete fires the package webhook deleted (arch.go:290 → packages.go:577's pd != nil gate)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const hookRows = await db()

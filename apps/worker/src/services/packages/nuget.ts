@@ -5,7 +5,7 @@
  * nuget.go 698 + api_v2.go 416 + api_v3.go 313 + links.go 52 + auth.go 26,
  * over modules/packages/nuget/metadata.go 276 + symbol_extractor.go 190):
  *
- * - PUT / (UploadPackage, nuget.go:426-499): the nupkg is a ZIP; the root
+ * - PUT / (UploadPackage, nuget.go:432-505): the nupkg is a ZIP; the root
  *   .nuspec (no "/" in the name, ≤ 3 MiB uncompressed — metadata.go:47,163)
  *   parses into id/version/metadata; the version runs hashicorp go-version's
  *   NewSemver (metadata.go:178) and is stored NORMALIZED
@@ -16,9 +16,9 @@
  *   duplicate version → 409 BEFORE the quota checks (the createPackageAndVersion
  *   ordering — count quota runs only for a fresh version, packages.go:214-219);
  *   the nuspec add rides AddFileToPackageVersionInternal which SKIPS quota
- *   (services/packages/packages.go:222-229 — the dead 403 switch in nuget.go
+ *   (services/packages/packages.go:224-231 — the dead 403 switch in nuget.go
  *   is defensive only).
- * - PUT /symbolpackage (nuget.go:503-594): a SymbolsPackage nuspec (the
+ * - PUT /symbolpackage (nuget.go:509-600): a SymbolsPackage nuspec (the
  *   `<packageTypes><packageType name="SymbolsPackage"/>` arm,
  *   metadata.go:187-193); ExtractPortablePdb (symbol_extractor.go:44-110)
  *   walks the zip — .nuspec/.xml/.psmdcp/.rels/.p7s skipped, .pdb parsed for
@@ -44,7 +44,7 @@
  *   unknown), /symbols/{filename}/{guid}/{filename2} → the symbol query
  *   protocol (filename == filename2, the file property match, exactly one
  *   hit).
- * - Errors are `{"Message": ...}` JSON (nuget.go:30-35, helper.go:28-48:
+ * - Errors are `{"Message": ...}` JSON (nuget.go:31-36, helper.go:28-48:
  *   400/404 pass the error text, 500 answers "internal server error").
  * - Auth (nuget.Auth, auth.go:23-26): the Basic/bearer credential pass, with
  *   X-NuGet-ApiKey as the FALLBACK token source (upstream VerifyAuthToken's
@@ -52,7 +52,7 @@
  *
  * XML is hand-built (AGENTS.md: no new deps) with Go encoding/xml's exact
  * posture verified at the pin: NO self-closing tags except the verbatim
- * `,innerxml` content workaround (nuget.go:340-342 — "force a self-closing
+ * `,innerxml` content workaround (nuget.go:346-348 — "force a self-closing
  * tag to satisfy XmlReader.IsEmptyElement"), attributes in struct-field
  * order, EscapeText's escape set, RFC3339Nano timestamps in UTC (Workers has
  * no server-local zone — upstream renders CreatedUnix.AsLocalTime()).
@@ -147,7 +147,7 @@ export class NugetNuspecInvalidVersionError extends Error {
   }
 }
 
-/** nuget.go:626 — errors.New("unexpected package type"), status 400 explicit. */
+/** nuget.go:632 — errors.New("unexpected package type"), status 400 explicit. */
 export class NugetUnexpectedPackageTypeError extends Error {
   constructor() {
     super("unexpected package type");
@@ -188,7 +188,7 @@ export class NugetInvalidPackageArchiveError extends Error {
   }
 }
 
-/** The duplicate sentinel the route maps to 409 (nuget.go:461-462). */
+/** The duplicate sentinel the route maps to 409 (nuget.go:467-468). */
 export class NugetDuplicateVersionError extends Error {
   constructor(readonly existing: PackageVersionRow) {
     super("package version already exists");
@@ -225,7 +225,7 @@ export class NugetBodyTooLargeError extends Error {
 
 // ---------------------------------------------------------------------------
 // hashicorp go-version — validation (NewSemver), the descriptor's SemVer
-// (NewVersion — version.NewVersion(pv.Version), descriptor.go:151-158) and
+// (NewVersion — version.NewVersion(pv.Version), descriptor.go:152-159) and
 // toNormalizedVersion ride the npm module's PROVEN port (parseGoSemver /
 // parseGoVersion); the segments rule is applied over the canonical string.
 // ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ const NUGET_METADATA_EMPTY: NugetMetadata = {
 export const NUGET_SYMBOL_ID_PROPERTY = "nuget.symbol.id";
 
 /**
- * The descriptor's metadata unmarshal (descriptor.go:243-249): parse the
+ * The descriptor's metadata unmarshal (descriptor.go:246-252): parse the
  * stored JSON into the full NugetMetadata shape — nulls/absent keys land in
  * zero values, unknown keys dropped, a broken JSON or a type mismatch throws
  * (the route's 500 arm).
@@ -447,7 +447,7 @@ export function serializeNugetMetadata(metadata: NugetMetadata): string {
 }
 
 // ---------------------------------------------------------------------------
-// Go's XML writer — encoding/xml with NO self-closing tags (nuget.go:340-342's
+// Go's XML writer — encoding/xml with NO self-closing tags (nuget.go:346-348's
 // workaround comment proves it), attributes in struct-field order, EscapeText.
 // ---------------------------------------------------------------------------
 
@@ -1235,7 +1235,7 @@ export async function nugetCountPackages(d1: D1Database, ownerId: number, term: 
   return rows[0]?.total ?? 0;
 }
 
-/** CountVersions (packages.go:372-379 with the name-exact filter) — the
+/** CountVersions (packages.go:374-381 with the name-exact filter) — the
  *  /FindPackagesById()/$count arm. */
 export async function nugetCountVersions(d1: D1Database, ownerId: number, packageName: string): Promise<number> {
   const conds = [...baseConditions(ownerId), eq(packages.lowerName, packageName.toLowerCase())];
@@ -1378,7 +1378,7 @@ export async function getNugetDescriptor(
   return { pkg, version, semver, files, metadata: nugetMetadataFromJson(version.metadataJson) };
 }
 
-/** CalculateBlobSize (descriptor.go:140-145). */
+/** CalculateBlobSize (descriptor.go:141-146). */
 function blobSize(descriptor: NugetDescriptor): number {
   return descriptor.files.reduce((sum, entry) => sum + entry.blob.size, 0);
 }
@@ -1445,7 +1445,7 @@ export class NugetLinkBuilder {
 // The V2 XML shapes (api_v2.go)
 // ---------------------------------------------------------------------------
 
-/** ServiceIndexV2 (nuget.go:45-66 + api_v2.go:30-36). */
+/** ServiceIndexV2 (nuget.go:46-67 + api_v2.go:30-36). */
 export function serviceIndexV2Xml(base: string): string {
   const workspace = el(
     "workspace",
@@ -1467,7 +1467,7 @@ export function serviceIndexV2Xml(base: string): string {
   return XML_HEADER + service;
 }
 
-/** FeedCapabilityResource (nuget.go:89-91 + api_v2.go:100-231) — the static
+/** FeedCapabilityResource (nuget.go:90-92 + api_v2.go:100-231) — the static
  *  Edmx document, rendered exactly as Go's encoder would (single line, no
  *  self-closing tags, struct-field attribute order, bool attrs verbatim). */
 export const NUGET_EDMX_METADATA_XML =
@@ -1545,7 +1545,7 @@ export function createFeedResponseXml(
 
 /** createEntry (api_v2.go:335-396) — the V2 leaf sets withNamespace; the
  *  Content field is the LAST struct member and carries the verbatim
- *  self-closing innerxml workaround (nuget.go:340-342). */
+ *  self-closing innerxml workaround (nuget.go:346-348). */
 export function createEntryXml(builder: NugetLinkBuilder, descriptor: NugetDescriptor, withNamespace: boolean): string {
   const id = builder.packageMetadataUrl(descriptor.pkg.name, descriptor.version.version);
   const content = `<content type="application/zip" src="${xmlEscape(
@@ -1779,7 +1779,7 @@ function createSearchResultEntryJson(
   };
 }
 
-/** ServiceIndexV3 (nuget.go:69-86) — the nine resources in order. */
+/** ServiceIndexV3 (nuget.go:70-87) — the nine resources in order. */
 export function createServiceIndexJson(base: string): Record<string, unknown> {
   const resource = (id: string, type: string): Record<string, unknown> => ({ "@id": id, "@type": type });
   return {
@@ -1826,7 +1826,7 @@ export function formInt(params: URLSearchParams, key: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Upload — UploadPackage's service walk (nuget.go:426-499 over
+// Upload — UploadPackage's service walk (nuget.go:432-505 over
 // createPackageAndAddFile: the duplicate 409 wins over quota, the nuspec add
 // skips quota). The whole body IS the nupkg, so the spool digests are the
 // nupkg blob's digests.
@@ -1893,10 +1893,10 @@ export async function uploadNugetPackage(input: NugetProtocolInput): Promise<Nug
 
     // The quota checks precede the inserts (one transaction upstream — a 403
     // leaves no rows). SIZE: CheckSizeQuotaExceeded adds the pending upload to
-    // the owner's stored total (packages.go:311-314). COUNT: upstream checks
+    // the owner's stored total (packages.go:313-316). COUNT: upstream checks
     // AFTER the version insert, inside the rolling-back transaction (the
     // versionCreated gate packages.go:188-191 with the totalCount > limit
-    // throw at :380-381) — the pre-insert equivalent is count + 1 > limit.
+    // throw at :382-383) — the pre-insert equivalent is count + 1 > limit.
     if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
       const total = (await countVersions(input.d1, input.owner.id)) + 1;
       if (total > input.quota.limitTotalOwnerCount) {
@@ -1905,7 +1905,7 @@ export async function uploadNugetPackage(input: NugetProtocolInput): Promise<Nug
     }
     await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, NUGET_TYPE, spooled.size, input.quota);
 
-    // SemverCompatible: true (nuget.go:446).
+    // SemverCompatible: true (nuget.go:452).
     const { row: pkg } = await getOrInsertPackage(input.d1, {
       ownerId: input.owner.id,
       type: NUGET_TYPE,
@@ -2034,7 +2034,7 @@ async function readSpoolBytes(bucket: R2Bucket, spoolKey: string, maxBytes: numb
 }
 
 // ---------------------------------------------------------------------------
-// Symbol package upload — UploadSymbolPackage (nuget.go:503-594)
+// Symbol package upload — UploadSymbolPackage (nuget.go:509-600)
 // ---------------------------------------------------------------------------
 
 export interface NugetSymbolUploadResult {
@@ -2062,7 +2062,7 @@ export async function uploadNugetSymbolPackage(input: NugetProtocolInput): Promi
     }
     const pdbs = await extractPortablePdb(bytes);
 
-    // AddFileToExistingPackage: the version MUST exist (nuget.go:530-537).
+    // AddFileToExistingPackage: the version MUST exist (nuget.go:536-543).
     const version = await getVersionByNameAndVersion(input.d1, input.owner.id, NUGET_TYPE, parsed.id, parsed.version);
     if (version === null) throw new NugetPackageNotExistError();
 
@@ -2076,7 +2076,7 @@ export async function uploadNugetSymbolPackage(input: NugetProtocolInput): Promi
         digestHex("SHA-256", blobBytes),
         digestHex("SHA-512", blobBytes),
       ]);
-      // The CHECKED add-file arm: size quota per file (packages.go:311-314).
+      // The CHECKED add-file arm: size quota per file (packages.go:313-316).
       await checkSizeQuotaExceeded(
         input.d1,
         input.doer.isAdmin,
@@ -2138,8 +2138,8 @@ export async function uploadNugetSymbolPackage(input: NugetProtocolInput): Promi
 }
 
 // ---------------------------------------------------------------------------
-// Downloads — OpenFileForDownloadByPackageNameAndVersion (packages.go:601-615)
-// with the lead-file GET counter bump (:667-670). PackageNotExistError = 404.
+// Downloads — OpenFileForDownloadByPackageNameAndVersion (packages.go:606-620)
+// with the lead-file GET counter bump (:672-675). PackageNotExistError = 404.
 // ---------------------------------------------------------------------------
 
 export interface NugetDownload {
@@ -2174,7 +2174,7 @@ export async function openNugetFileForDownload(
 }
 
 // ---------------------------------------------------------------------------
-// Delete — RemovePackageVersionByNameAndVersion (packages.go:504-512). The
+// Delete — RemovePackageVersionByNameAndVersion (packages.go:508-516). The
 // content keys are never deleted here (the unreferenced-blob sweep is the
 // sole deleter — ratification 4).
 // ---------------------------------------------------------------------------
@@ -2192,7 +2192,7 @@ export async function removeNugetVersion(
 }
 
 // ---------------------------------------------------------------------------
-// The symbol query protocol — DownloadSymbolFile (nuget.go:637-671)
+// The symbol query protocol — DownloadSymbolFile (nuget.go:643-677)
 // ---------------------------------------------------------------------------
 
 const SYMBOL_GUID_REGEX = /^[0-9a-fA-F]{32}[fF]{8}$/;

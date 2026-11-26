@@ -873,9 +873,9 @@ export async function deleteAlpinePackageFile(
   const fileRow = (await db.select().from(packageFiles).where(eq(packageFiles.id, fileId)).get()) ?? null;
   if (fileRow === null) return false;
   // The deleted arm (alpine.go:269 → RemovePackageFileAndVersionIfUnreferenced,
-  // packages.go:570-574 — `if pd != nil { PackageDelete }` fired INSIDE the
+  // packages.go:575-579 — `if pd != nil { PackageDelete }` fired INSIDE the
   // service when the version cascaded): the descriptor resolves BEFORE the
-  // version row dies (the pre-delete render, packages.go:560-566's
+  // version row dies (the pre-delete render, packages.go:565-571's
   // GetVersionByID/GetPackageDescriptor order), the emission rides after the
   // cascade (the post-tx notify position).
   const descriptor = emit?.webhookEnv !== undefined ? await resolveAlpineDeleteDescriptor(d1, fileRow.versionId) : null;

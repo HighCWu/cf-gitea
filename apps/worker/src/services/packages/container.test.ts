@@ -2,13 +2,13 @@
  * The OCI container registry battery (SPEC-0016 §7 M6) on real D1 + the real
  * REPO_PACKS binding — upstream routers/api/packages/container/* at the pin:
  *
- *  - the 401 handshake (container.go:116-130): the anonymous /v2/ ping
+ *  - the 401 handshake (container.go:117-131): the anonymous /v2/ ping
  *    answers the Bearer realm challenge; a private owner's path adds the
  *    Basic realm="Gitea Container Registry" twin; the access-denied arms
  *    answer the shared Gitea-Package-API challenge (api.go:51-61);
  *  - the token flow (auth.go): anonymous → the ghost JWT (userId -1),
  *    a scoped PAT → the HS256 mint, a non-package scope → 401;
- *  - the blob flow (container.go:236-488): POST → PATCH chunks (declared
+ *  - the blob flow (container.go:237-489): POST → PATCH chunks (declared
  *    AND chunked/unknown-length bodies through the bounded spool) → PUT with
  *    digest verification + the mismatch/416/stream-upload arms, the session
  *    status probe, the abort, single-POST, cross-repo mount;
@@ -216,7 +216,7 @@ async function bearerFor(
 // ---------------------------------------------------------------------------
 
 describe("container 401 handshake + token flow", () => {
-  it("answers the anonymous /v2/ ping with the Bearer realm challenge (container.go:116-130)", async () => {
+  it("answers the anonymous /v2/ ping with the Bearer realm challenge (container.go:117-131)", async () => {
     const call = protocol();
     const response = await call("/v2/");
     expect(response.status).toBe(401);
@@ -263,7 +263,7 @@ describe("container 401 handshake + token flow", () => {
     expect(claims?.scope).toContain("write:package");
   });
 
-  it("401s a PAT without a package scope at /token (container.go:165-176)", async () => {
+  it("401s a PAT without a package scope at /token (container.go:166-177)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const pat = await token(user.id, "read:user");
@@ -281,7 +281,7 @@ describe("container 401 handshake + token flow", () => {
     expect(ping.status).toBe(200);
   });
 
-  it("adds the Basic realm twin on a private owner's path (container.go:121-128)", async () => {
+  it("adds the Basic realm twin on a private owner's path (container.go:122-129)", async () => {
     const call = protocol();
     await seedUser(OWNER, { visibility: "private" });
     const response = await call(`/v2/${OWNER}/app/tags/list`, { headers: bearerAuth("bad.token.here") });
@@ -304,7 +304,7 @@ describe("container 401 handshake + token flow", () => {
   it("serves a public owner's tags to the ghost token (anonymous pull)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
-    // The tag list requires the package to exist (container.go:738-745's
+    // The tag list requires the package to exist (container.go:739-746's
     // GetPackageByName gate — a never-pushed image answers NAME_UNKNOWN).
     const auth = basicAuth(await token(user.id, "write:package"));
     const configDigest = await pushBlob(call, auth, imageConfigBytes());
@@ -333,7 +333,7 @@ describe("container 401 handshake + token flow", () => {
 // ---------------------------------------------------------------------------
 
 describe("container blob uploads", () => {
-  it("walks POST → PATCH chunks → PUT with digest verification (container.go:236-466)", async () => {
+  it("walks POST → PATCH chunks → PUT with digest verification (container.go:237-467)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -363,7 +363,7 @@ describe("container blob uploads", () => {
     expect(patch2.status).toBe(202);
     expect(patch2.headers.get("Range")).toBe("0-10");
 
-    // The status probe (container.go:324-348).
+    // The status probe (container.go:325-349).
     const status = await call(location ?? "", { method: "GET", headers: auth });
     expect(status.status).toBe(204);
     expect(status.headers.get("Range")).toBe("0-10");
@@ -392,7 +392,7 @@ describe("container blob uploads", () => {
     expect(new Uint8Array(await got.arrayBuffer())).toEqual(whole);
 
     // The staging file row: the internal _upload version carries the
-    // sha256_<hash> file with its digest property (blob.go:135-160).
+    // sha256_<hash> file with its digest property (blob.go:137-162).
     const rows = await db()
       .select({ version: packageVersions })
       .from(packageVersions)
@@ -437,7 +437,7 @@ describe("container blob uploads", () => {
     expect((await readOciError(wrong)).errors[0]?.code).toBe("BLOB_UPLOAD_INVALID");
   });
 
-  it("rejects a stream upload after the first write (container.go:378-381)", async () => {
+  it("rejects a stream upload after the first write (container.go:379-382)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -486,7 +486,7 @@ describe("container blob uploads", () => {
     expect(new Uint8Array(await got.arrayBuffer())).toEqual(chunk);
   });
 
-  it("walks the single-POST arm and rejects a mismatched digest (container.go:269-308)", async () => {
+  it("walks the single-POST arm and rejects a mismatched digest (container.go:270-309)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -508,7 +508,7 @@ describe("container blob uploads", () => {
     expect((await readOciError(wrong)).errors[0]?.code).toBe("DIGEST_INVALID");
   });
 
-  it("aborts a session with DELETE (container.go:469-488)", async () => {
+  it("aborts a session with DELETE (container.go:470-489)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -521,7 +521,7 @@ describe("container blob uploads", () => {
     expect((await readOciError(gone)).errors[0]?.code).toBe("BLOB_UPLOAD_UNKNOWN");
   });
 
-  it("mounts a blob cross-repo (container.go:239-267)", async () => {
+  it("mounts a blob cross-repo (container.go:240-268)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -685,7 +685,7 @@ describe("container manifests", () => {
       headers: { ...auth, "Content-Type": "application/weird.type" },
       // BOTH media types invalid → "MediaType not recognized" (a valid
       // document mediaType would proceed and answer BLOB_UNKNOWN for the
-      // missing config, container.go:53-58 → :589-590).
+      // missing config, container.go:54-59 → :590-591).
       body: encoder.encode(
         JSON.stringify({ schemaVersion: 2, mediaType: "application/weird.type", config: { digest: "sha256:" + "0".repeat(64), size: 2 }, layers: [] }),
       ),
@@ -729,7 +729,7 @@ describe("container manifests", () => {
     expect(await got.text()).toBe(replacement.text);
   });
 
-  it("deletes a manifest by tag (container.go:678-704)", async () => {
+  it("deletes a manifest by tag (container.go:679-705)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -749,7 +749,7 @@ describe("container manifests", () => {
     expect(missing.status).toBe(404);
   });
 
-  it("the tag delete fires the package webhook deleted (container.go:697's RemovePackageVersion loop)", async () => {
+  it("the tag delete fires the package webhook deleted (container.go:698's RemovePackageVersion loop)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -874,7 +874,7 @@ describe("container tags + catalog", () => {
     }
   }
 
-  it("lists tags sorted with the Link pagination header (container.go:735-778)", async () => {
+  it("lists tags sorted with the Link pagination header (container.go:736-779)", async () => {
     await seedTwoTags();
     const call = protocol();
     const user = (await db().select().from(users).where(eq(users.usernameLower, OWNER)).get()) ?? null;
@@ -893,7 +893,7 @@ describe("container tags + catalog", () => {
     expect((await rest.json<{ tags: string[] }>()).tags).toEqual(["beta"]);
   });
 
-  it("answers an unknown image with NAME_UNKNOWN (container.go:738-745)", async () => {
+  it("answers an unknown image with NAME_UNKNOWN (container.go:739-746)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "read:package"));
@@ -992,7 +992,7 @@ describe("container gates + cleanup", () => {
     expect(response.status).toBe(404);
   });
 
-  it("sweeps expired upload sessions and their chunk objects (cleanup.go:19-31)", async () => {
+  it("sweeps expired upload sessions and their chunk objects (cleanup.go:21-33)", async () => {
     const call = protocol();
     const user = await seedUser(OWNER);
     const auth = basicAuth(await token(user.id, "write:package"));
@@ -1029,10 +1029,10 @@ describe("container gates + cleanup", () => {
 
 // ---------------------------------------------------------------------------
 // The require-sign-in-view flag — the container arms (SPEC-0003 §2.4 row 6
-// handoff): ReqContainerAccess (container.go:133-137) refuses
+// handoff): ReqContainerAccess (container.go:134-138) refuses
 // `doer == nil || (RequireSignInViewStrict && doer.IsGhost())`; the
-// APIUnauthorizedError twin folds the flag in (container.go:122-127); the
-// /token anonymous arm refuses BEFORE the ghost mint (:156-159). Flag off
+// APIUnauthorizedError twin folds the flag in (container.go:123-128); the
+// /token anonymous arm refuses BEFORE the ghost mint (:157-160). Flag off
 // keeps the landed posture (the two controls).
 // ---------------------------------------------------------------------------
 
@@ -1070,7 +1070,7 @@ describe("REQUIRE_SIGNIN_VIEW (the container arms)", () => {
     expect((await readOciError(tags)).errors[0]?.code).toBe("UNAUTHORIZED");
   });
 
-  it("flag on: /v2/token refuses anonymous BEFORE the ghost mint (container.go:156-159)", async () => {
+  it("flag on: /v2/token refuses anonymous BEFORE the ghost mint (container.go:157-160)", async () => {
     const response = await protocol({ REQUIRE_SIGNIN_VIEW: "true" })("/v2/token", {});
     expect(response.status).toBe(401);
     expect(response.headers.get("WWW-Authenticate")).toContain('Basic realm="Gitea Container Registry"');

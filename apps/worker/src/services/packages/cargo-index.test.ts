@@ -386,7 +386,7 @@ describe("updateCargoIndexMirror (the write arms)", () => {
 
     // The cleanup rider's shape: the version rows die, the package row
     // remains with zero versions, the seam re-runs (cargo.go-adjacent —
-    // cleanup.go:115's UpdatePackageIndexIfExists).
+    // cleanup.go:117's UpdatePackageIndexIfExists).
     await deletePackageVersionAndReferences(env.DB, doomed.versionId);
     const pkgRow = await db().select().from(packages).where(eq(packages.id, doomed.pkgId)).get();
     expect(pkgRow).toBeDefined();

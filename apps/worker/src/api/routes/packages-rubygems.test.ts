@@ -695,7 +695,7 @@ describe("rubygems yank + missing arms", () => {
     expect(await versions.text()).toBe("---\n");
   });
 
-  it("the yank IS the deleted arm: the package webhook fires action=deleted (rubygems.go:281 → packages.go:532)", async () => {
+  it("the yank IS the deleted arm: the package webhook fires action=deleted (rubygems.go:281 → packages.go:537)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const hookRows = await db()

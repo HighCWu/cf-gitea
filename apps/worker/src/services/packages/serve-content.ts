@@ -16,7 +16,7 @@
  * What remains here is the packages arm upstream genuinely separates:
  *
  *  1. The packages-specific INPUTS — the registry's own Content-Type override
- *     (maven's jar/xml pair maven.go:206-214, swift's "text/x-swift", the
+ *     (maven's jar/xml pair maven.go:209-217, swift's "text/x-swift", the
  *     debian/alpine/rpm/arch key arms) and the file row's created time — are
  *     carried by the callers and fed through the shared table: the CSP branch
  *     (serve.go:62-73) keys off the resolved type, the zero value floors to
@@ -26,7 +26,7 @@
  *     callers, exactly where upstream separates them. `created` is OPTIONAL:
  *     every ctx.ServeContent arm that passes no LastModified (the
  *     debian.go:38-41 / alpine.go:57-60 / rpm.go:62-65 / arch.go:38-40
- *     repository-key arms, the chef .priv download setting/packages.go:113-118,
+ *     repository-key arms, the chef .priv download setting/packages.go:108-113,
  *     rubygems' SetServeHeaders pair rubygems.go:82-84/:122-124) rides the
  *     ZERO-MODTIME posture — no Last-Modified header, and If-Unmodified-Since
  *     / If-Modified-Since inert (Go isZeroTime, fs.go:618-621: the zero time
@@ -82,7 +82,7 @@ import { parseHttpTimeFormat, serveSetHeaders } from "../../web/attachments-serv
 
 export interface ServeFileHeaderOptions {
   /** Unset = no disposition and no expose-headers echo (the maven HEAD
-   *  posture, maven.go:216-219 — SetServeHeaders runs before Filename lands). */
+   *  posture, maven.go:219-222 — SetServeHeaders runs before Filename lands). */
   filename?: string;
   /** The registry's own override (maven's jar/xml, swift's text/x-swift, the
    *  key arms' pgp-keys/pem); unset/"" floors to application/octet-stream

@@ -2,26 +2,26 @@
  * The OCI container registry service (SPEC-0016 §7 M6 — the seventh package
  * protocol). The upstream map, at the pin (routers 1,459 lines + services 456):
  *
- *   routers/api/packages/api.go:523-561     ContainerRoutes() — the /v2/ root
+ *   routers/api/packages/api.go:537-575     ContainerRoutes() — the /v2/ root
  *                                           mount, the wire arms this module
  *                                           backs (the route half lives in
  *                                           api/routes/packages-protocols.ts's
  *                                           createContainerProtocolRouter)
  *   routers/api/packages/container/container.go  the arms + the 401 handshake
  *                                           (APIUnauthorizedError :116-130) +
- *                                           the response-header writer (:53-88)
+ *                                           the response-header writer (:54-89)
  *   routers/api/packages/container/blob.go  saveAsPackageBlob (:28-68), the
  *                                           upload version (:86-133),
- *                                           createFileForBlob (:135-160),
- *                                           deleteBlob (:162-186)
- *   routers/api/packages/container/manifest.go  processManifest (:41-73), the
+ *                                           createFileForBlob (:149-174),
+ *                                           deleteBlob (:176-200)
+ *   routers/api/packages/container/manifest.go  processManifest (:42-74), the
  *                                           image-manifest (:100-159) and
- *                                           image-index (:161-229) flows,
- *                                           createPackageAndVersion (:231-320,
+ *                                           image-index (:175-243) flows,
+ *                                           createPackageAndVersion (:245-334,
  *                                           the delete-and-recreate overwrite
  *                                           arm), createFileFromBlobReference
- *                                           (:331-377), createManifestBlob
- *                                           (:379-416)
+ *                                           (:345-391), createManifestBlob
+ *                                           (:393-430)
  *   routers/api/packages/container/errors.go  the OCI named errors
  *   services/packages/container/blob_uploader.go  the chunked upload session
  *   services/packages/container/common.go   ParseManifestMetadata
@@ -32,7 +32,7 @@
  *                                           types and the Metadata payload
  *   services/packages/auth.go               the HS256 authorization token
  *                                           (CreateAuthorizationToken :30-55 /
- *                                           ParseAuthorizationToken :73-89),
+ *                                           ParseAuthorizationToken :74-90),
  *                                           keyed — exactly like upstream —
  *                                           off the general token signing
  *                                           secret (GetGeneralTokenSigningSecret
@@ -169,7 +169,7 @@ export function isImageIndexMediaType(mediaType: string): boolean {
   return lowered === "application/vnd.oci.image.index.v1+json" || lowered === "application/vnd.docker.distribution.manifest.list.v2+json";
 }
 
-/** container.go:141 — the VerifyImageName gate. */
+/** container.go:142 — the VerifyImageName gate. */
 export function isValidImageName(image: string): boolean {
   return IMAGE_NAME_PATTERN.test(image);
 }
@@ -179,7 +179,7 @@ export function isValidDigest(digest: string): boolean {
   return DIGEST_PATTERN.test(digest);
 }
 
-/** container.go:567 — the tag-reference gate. */
+/** container.go:568 — the tag-reference gate. */
 export function isValidReference(reference: string): boolean {
   return REFERENCE_PATTERN.test(reference);
 }
@@ -566,7 +566,7 @@ export interface ContainerOwner {
 }
 
 async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, image: string, now = new Date()) {
-  // blob.go:95-117 — the package row (name IS the lower name, upstream inserts
+  // blob.go:97-119 — the package row (name IS the lower name, upstream inserts
   // ToLower(image)) + the repository property on the created arm.
   const { row: pkg, created } = await getOrInsertPackage(d1, {
     ownerId: owner.id,
@@ -577,7 +577,7 @@ async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, i
   if (created) {
     await insertProperty(d1, PropertyType.Package, pkg.id, CONTAINER_PROPERTY_REPOSITORY, `${owner.usernameLower}/${image.toLowerCase()}`);
   }
-  // blob.go:119-133 — the INTERNAL _upload staging version.
+  // blob.go:121-135 — the INTERNAL _upload staging version.
   const lowerVersion = CONTAINER_UPLOAD_VERSION;
   const existing = await drizzle(d1)
     .select()
@@ -616,10 +616,10 @@ async function getOrCreateUploadVersion(d1: D1Database, owner: ContainerOwner, i
   return { pkg, version: winner };
 }
 
-/** createFileForBlob (blob.go:137-162) — the sha256_<hash> file with its
+/** createFileForBlob (blob.go:139-164) — the sha256_<hash> file with its
  *  digest property, on the given version. A duplicate (the same blob already
  *  staged — ANY duplicate, identical or not, upstream's TryInsertFile arm
- *  :146-149) is a no-op. */
+ *  :148-151) is a no-op. */
 async function createFileForBlob(d1: D1Database, versionId: number, blob: PackageBlobRow, now = new Date()): Promise<void> {
   const name = `sha256_${blob.hashSha256}`;
   const result = await tryInsertFile(d1, { versionId, blobId: blob.id, name, now });
@@ -668,9 +668,9 @@ async function saveSpooledBlob(
 }
 
 /**
- * The single-POST arm (container.go:269-308, `POST …?digest=`): stream the
+ * The single-POST arm (container.go:270-309, `POST …?digest=`): stream the
  * body through the bounded store, verify the digest (mismatch →
- * DIGEST_INVALID — upstream container.go:278-281), then the shared save tail.
+ * DIGEST_INVALID — upstream container.go:279-282), then the shared save tail.
  */
 export async function saveContainerBlobFromStream(opts: {
   d1: D1Database;
@@ -700,12 +700,12 @@ export async function saveContainerBlobFromStream(opts: {
 }
 
 /**
- * The PUT finalize (container.go:400-466): optional final body chunk, then
+ * The PUT finalize (container.go:401-467): optional final body chunk, then
  * the digest verification over the WHOLE session — the chunks re-stream
  * through fresh digests (the documented HashStateBytes reduction) — then the
  * shared save tail and the session removal. The session SURVIVES a digest
  * mismatch and a quota 403 (upstream returns before RemoveBlobUploadByID,
- * :456) and is removed only on success.
+ * :457) and is removed only on success.
  */
 export async function finalizeContainerBlobUpload(opts: {
   d1: D1Database;
@@ -762,7 +762,7 @@ export async function finalizeContainerBlobUpload(opts: {
   }
   try {
     const blob = await saveSpooledBlob(opts.d1, opts.bucket, opts.owner, opts.image, opts.doer, spooled, opts.quota, now);
-    // container.go:456 — RemoveBlobUploadByID AFTER a successful save (the
+    // container.go:457 — RemoveBlobUploadByID AFTER a successful save (the
     // session survives the digest/quota arms above).
     await removeContainerBlobUpload(opts.d1, opts.bucket, session.id);
     return blob;
@@ -971,7 +971,7 @@ export async function listContainerRepositories(
   return rows.map((row) => row.value);
 }
 
-/** getExistingContainerBlob's tail (container.go:781-796): the content store
+/** getExistingContainerBlob's tail (container.go:782-797): the content store
  *  must agree with the row (an orphaned row with vanished bytes reads as
  *  not-exist). */
 export async function containerBlobStoreSizeMatches(bucket: R2Bucket, blob: PackageBlobRow): Promise<boolean> {
@@ -1028,7 +1028,7 @@ export async function isContainerBlobAccessible(
   return false;
 }
 
-/** mountBlob (blob.go:73-82) — the cross-repo mount: the blob gains a file
+/** mountBlob (blob.go:75-84) — the cross-repo mount: the blob gains a file
  *  row on the TARGET image's staging version (the search's digest property
  *  then finds it under both images). */
 export async function mountContainerBlob(
@@ -1093,10 +1093,10 @@ export async function deletePropertiesByName(
 }
 
 // ---------------------------------------------------------------------------
-// Deletes (blob.go:164-188 + the manifest-delete walk)
+// Deletes (blob.go:166-190 + the manifest-delete walk)
 // ---------------------------------------------------------------------------
 
-/** deleteBlob (blob.go:164-188) — every file carrying the digest loses its
+/** deleteBlob (blob.go:166-190) — every file carrying the digest loses its
  *  row (the unreferenced-sweep owns the R2 key, ratification 4). */
 export async function deleteContainerBlob(d1: D1Database, ownerId: number, image: string, digest: string): Promise<void> {
   const descriptors = await getContainerBlobs(d1, { ownerId, image, digest });
@@ -1313,9 +1313,9 @@ interface BlobReference {
 }
 
 /**
- * PutManifest (container.go:555-606) + processManifest (manifest.go:41-73).
+ * PutManifest (container.go:556-607) + processManifest (manifest.go:41-73).
  * The body spools through the bounded store under the manifest cap
- * (maxManifestSize + 1; over-cap → MANIFEST_INVALID 413, container.go:580-583),
+ * (maxManifestSize + 1; over-cap → MANIFEST_INVALID 413, container.go:581-584),
  * parses once from the spool, then routes to the image-manifest or image-index
  * flow by the RESOLVED media type (header first, document second).
  */
@@ -1507,7 +1507,7 @@ async function createPackageAndVersion(
     }
   }
 
-  // manifest.go:296-298 — CheckCountQuotaExceeded (packages.go:366-385).
+  // manifest.go:296-298 — CheckCountQuotaExceeded (packages.go:368-387).
   if (!doer.isAdmin && quota.limitTotalOwnerCount > -1) {
     const totalCount = await countVersions(d1, owner.id);
     if (totalCount > quota.limitTotalOwnerCount) {
@@ -1679,7 +1679,7 @@ async function processOciImageManifest(
   );
 
   // The config reference + every layer reference (manifest.go:112-136). A
-  // missing layer → ErrContainerBlobNotExist → BLOB_UNKNOWN (container.go:589).
+  // missing layer → ErrContainerBlobNotExist → BLOB_UNKNOWN (container.go:590).
   await createFileFromBlobReference(
     opts.d1,
     versionId,
@@ -1827,7 +1827,7 @@ async function processOciImageIndex(
 // outside this unit's ownership)
 // ---------------------------------------------------------------------------
 
-/** cleanupExpiredBlobUploads (cleanup.go:19-31): the expired session rows and
+/** cleanupExpiredBlobUploads (cleanup.go:21-33): the expired session rows and
  *  their chunk objects. */
 export async function cleanupExpiredContainerUploads(
   d1: D1Database,
@@ -1847,7 +1847,7 @@ export async function cleanupExpiredContainerUploads(
   return expired.length;
 }
 
-/** cleanupExpiredUploadedBlobs (cleanup.go:34-66): staging files on internal
+/** cleanupExpiredUploadedBlobs (cleanup.go:36-68): staging files on internal
  *  _upload versions older than the window lose their rows, then the emptied
  *  internal versions (and their properties) go too. */
 export async function cleanupExpiredUploadedContainerBlobs(

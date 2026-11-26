@@ -10,9 +10,9 @@
  *
  * `templates/admin/packages/list.tmpl` served by `admin.Packages`
  * (routers/web/admin/packages.go:20-83), route `GET /-/admin/packages`
- * (web.go:852-858's `/packages` group: the list GET + the two write POSTs,
+ * (web.go:821-827's `/packages` group: the list GET + the two write POSTs,
  * the whole group wrapped in upstream's `packagesEnabled` global-setting
- * qualifier), behind the shared admin gate (web.go:779's
+ * qualifier), behind the shared admin gate (web.go:748's
  * verifyAuthWithOptionsWeb{SignInRequired, AdminRequired} — anonymous → the
  * login redirect, a signed-in non-admin → the 404 shell; the ROUTE stage's
  * posture, the landed adminPagePrologue).
@@ -39,13 +39,13 @@
  *   Name        `.Package.Name` — PLAIN text (the admin table does not link
  *               the name; the version link is the row's anchor)
  *   Version     `.Version.Version` → the VersionWebLink
- *               (descriptor.go:85-87 — /{owner}/-/packages/{type}/{lowerName}/
+ *               (descriptor.go:86-88 — /{owner}/-/packages/{type}/{lowerName}/
  *               {lowerVersion}, PathEscape per segment — the landed
  *               versionWebLink)
  *   Creator     `.Creator.Name` → HomeLink (descriptor.go's Creator load).
  *               An UNATTRIBUTED version (creator_id 0 — the M1 API's
  *               documented null-creator divergence; upstream falls back to
- *               NewGhostUser, descriptor.go:142-149) renders the EMPTY cell:
+ *               NewGhostUser, descriptor.go:143-150) renders the EMPTY cell:
  *               upstream's Ghost anchor targets /.ghost — no landed page (and
  *               no real upstream page either), the dead-link rule, the R04
  *               by-arm's documented posture reshaped for the column
@@ -57,7 +57,7 @@
  *               132-137 — no visibility ladder; a missing repo row degrades
  *               to nil upstream and to the empty cell here), the site-admin
  *               page's own shape
- *   Size        `CalculateBlobSize` (descriptor.go:89-93 — the summed file
+ *   Size        `CalculateBlobSize` (descriptor.go:90-94 — the summed file
  *               blob bytes) → FormatByteSize
  *   Published   `DateUtils.AbsoluteShort .Version.CreatedUnix` — the en-US
  *               "Jan 02, 2006" form (the R04 view sidebar's absoluteShort,
@@ -70,7 +70,7 @@
  *               plain-form POST (the same template family's landed shape):
  *               hidden `id`, the trash submits, the dialog drops.
  *
- * ## The write tails (B-67 — web.go:854-858's POST pair, POST-only)
+ * ## The write tails (B-67 — web.go:823-827's POST pair, POST-only)
  *
  *   - POST /-/admin/packages/delete — admin.DeletePackageVersion
  *     (packages.go:82-96): the version by `id` (ctx.FormInt64 — form body
@@ -78,8 +78,8 @@
  *     PORT over the LANDED `deletePackageVersionGuarded`
  *     (ui/pages/package-settings.tsx — a503a02's WB26 seam: the terraform
  *     LOCKED/LATEST guards precede the delete cascade, then
- *     `emitPackageDeleted` fires ONE deleted event, user/package.go:510 /
- *     packages.go:532's always-notify, the ADMIN doer as sender). Upstream's
+ *     `emitPackageDeleted` fires ONE deleted event, user/package.go:504 /
+ *     packages.go:537's always-notify, the ADMIN doer as sender). Upstream's
  *     error arms (a missing/stale id, a guard refusal — both ServerError
  *     500) ride the admin-repos delete's stale-form posture: the seam maps
  *     them to outcomes and the route answers the SAME silent 303. NOTE the
@@ -248,7 +248,7 @@ async function totalUnreferencedBlobSizeOf(d1: D1Database): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// The write seams (B-67 — web.go:854-858's POST pair; the module header's
+// The write seams (B-67 — web.go:823-827's POST pair; the module header's
 // write-tails section carries the upstream cites and the reductions)
 // ---------------------------------------------------------------------------
 
@@ -266,7 +266,7 @@ export type AdminPackageDeleteResult =
  * the form body and the query both bind it; the modal posts it in the
  * query), the package row off the version's packageId (the descriptor's
  * Package arm), the guard-then-delete-then-emit walk. `emit` threads the
- * WB26 options (the ADMIN doer as the sender, packages.go:532's
+ * WB26 options (the ADMIN doer as the sender, packages.go:537's
  * always-notify); a missing/stale id or an unknown shape answers "missing"
  * and a guard refusal its outcome — upstream ServerErrors both arms, the
  * route's stale-form posture folds every outcome onto the same silent 303.
@@ -288,7 +288,7 @@ export async function deleteAdminPackageVersionFromForm(
 
 /**
  * The admin cleanup — upstream admin.CleanupExpiredData's sweep
- * (packages.go:98-110 → cleanup.go:167-214 at `olderThan = 0`), the
+ * (packages.go:98-110 → cleanup.go:169-216 at `olderThan = 0`), the
  * expired-data arm ONLY (ExecuteCleanupRules is the cron's half of
  * CleanupTask — the admin button never runs it). The module-local
  * data-seam note applies: this walks the LANDED model exports in
@@ -309,7 +309,7 @@ export async function applyAdminPackagesCleanup(d1: D1Database, bucket: R2Bucket
   const now = options.now ?? new Date();
   const db = drizzle(d1);
 
-  // (a) the unreferenced package rows (cleanup.go:181-189's FindUnreferencedPackages
+  // (a) the unreferenced package rows (cleanup.go:183-191's FindUnreferencedPackages
   // loop — DeleteAllProperties(Package) + DeletePackageByID).
   const unreferenced = await findUnreferencedPackages(d1);
   for (const pkg of unreferenced) {
@@ -320,7 +320,7 @@ export async function applyAdminPackagesCleanup(d1: D1Database, bucket: R2Bucket
     await db.delete(packagesTable).where(eq(packagesTable.id, pkg.id)).run();
   }
 
-  // (b) the expired unreferenced blobs at olderThan = 0 (cleanup.go:188-212):
+  // (b) the expired unreferenced blobs at olderThan = 0 (cleanup.go:190-214):
   // the rows first, then the content keys — the PACKAGE-DEFER-STORAGE-DELETE
   // order both implementations share.
   const expiredBlobs = await findExpiredUnreferencedBlobs(d1, now);
@@ -421,7 +421,7 @@ export async function loadAdminPackagesData(d1: D1Database, search: URLSearchPar
   const creators = new Map(creatorRows.map((row) => [row.id, row.username]));
   const reposById = new Map(repoRows.map((row) => [row.id, row]));
 
-  // CalculateBlobSize per row (descriptor.go:89-93) as ONE grouped files+
+  // CalculateBlobSize per row (descriptor.go:90-94) as ONE grouped files+
   // blobs read over the page's version ids (getPackageDescriptor per row
   // would N+1; a version with no files sums to nothing — the absent group).
   const versionIds = rows.map((row) => row.version.id);
