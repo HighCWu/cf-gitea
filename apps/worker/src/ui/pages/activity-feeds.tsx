@@ -55,16 +55,18 @@
  * ## The type→icon/message matrix (the wired set)
  *
  * Rows exist ONLY for the op types the landed emitters write
- * (specs/activity-feeds.md §3.3 + the since-landed seams) — 14 distinct
+ * (specs/activity-feeds.md §3.3 + the since-landed seams) — 15 distinct
  * wired op types: create_repo, rename_repo, create_issue,
- * create_pull_request, comment_issue, merge_pull_request, close_issue,
- * reopen_issue, close_pull_request, reopen_pull_request,
+ * create_pull_request, transfer_repo, comment_issue, merge_pull_request,
+ * close_issue, reopen_issue, close_pull_request, reopen_pull_request,
  * approve_pull_request, reject_pull_request, comment_pull, publish_release
- * (producers: services/repo-events.ts, services/issue-events.ts,
- * routes/pulls.ts:446-453, routes/releases.ts:270-274; the brief's "15"
- * rounds the same set — the SPEC's wired matrix is the authority). The
- * message arms port `feeds.tmpl:14-83` +
- * `options/locale/locale_en-US.json:3500-3529`; the icons port `ActionIcon`
+ * (producers: services/repo-events.ts — whose repoActionDraft transferred
+ * arm writes op 8 with the old full path since TRANSFERHOOK, feed/
+ * notifier.go:167-177 — services/issue-events.ts, routes/pulls.ts:446-453,
+ * routes/releases.ts:270-274). The
+ * message arms port `feeds.tmpl:14-83` (transfer_repo's arm is :30-31 —
+ * `transferred repository <code>{old path}</code> to <a repo>{path}</a>`)
+ * + `options/locale/locale_en-US.json:3500-3529`; the icons port `ActionIcon`
  * (modules/templates/util_misc.go:71-108). Anything outside the wired set
  * degrades EXACTLY like upstream's own fall-through: no message arm (the
  * if-chain has no default branch) and the `octicon-question` default icon.
@@ -239,7 +241,8 @@ export function feedIconName(opType: Activity["op_type"]): IconName {
   switch (opType) {
     case "create_repo": // ActionCreateRepo
     case "rename_repo": // ActionRenameRepo
-      return "octicon-repo"; // util_misc.go:74-76 (transfer_repo shares the arm — unwired)
+    case "transfer_repo": // ActionTransferRepo
+      return "octicon-repo"; // util_misc.go:73-74 — the shared arm, all three wired
     case "create_issue":
       return "octicon-issue-opened"; // :81
     case "create_pull_request":
@@ -382,6 +385,10 @@ export function feedMessageSegments(item: ActivityFeedItemFields): FeedMessageSe
       return [text("created repository "), repoLink];
     case "rename_repo": // "action.rename_repo" — GetContent = the old name
       return [text("renamed repository from "), { kind: "code", text: item.content }, text(" to "), repoLink];
+    case "transfer_repo": // "action.transfer_repo" (feeds.tmpl:30-31) — GetContent =
+      // the OLD full path path.Join(oldOwner.Name, repo.Name)
+      // (services/feed/notifier.go:167-177's write)
+      return [text("transferred repository "), { kind: "code", text: item.content }, text(" to "), repoLink];
     case "create_issue": // "action.create_issue"
       return issueLink("issues", "opened issue ");
     case "create_pull_request": // "action.create_pull_request"

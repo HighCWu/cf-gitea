@@ -98,7 +98,7 @@
  *
  * ## The item projection (convert.go feedActionsToFeedItems over the wired set)
  *
- * The message locale arms (the 14-type wired matrix, specs/activity-feeds.md
+ * The message locale arms (the 15-type wired matrix, specs/activity-feeds.md
  * §3.3 authority — the page module's own rule: a future emitter wave extends
  * both matrices in the same change) compose the item title as
  * `HTMLEscapeString(displayName + " ") + titleExtra` where titleExtra is the
@@ -144,10 +144,10 @@
  * - The feed author (channel-level) is never set upstream (profile.go
  *   :85-91 sets only Title/Link/Description/Created) → no managingEditor /
  *   feed-level author elements on either envelope.
- * - The unwired op types (anything outside the 14) hit convert.go's default
+ * - The unwired op types (anything outside the 15) hit convert.go's default
  *   arm (:196-197): `return nil, fmt.Errorf("unknown action type: %v", …)`
  *   — the WHOLE feed fails. Ported verbatim as a throw; unreachable over
- *   the landed emitter set (only the wired 14 are written), exactly like
+ *   the landed emitter set (only the wired 15 are written), exactly like
  *   upstream where the closed ActionType enum covers the switch.
  */
 
@@ -244,7 +244,7 @@ export function formatRfc3339(unixSeconds: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// The feeds.Item projection (convert.go:64-213 over the wired 14-type set)
+// The feeds.Item projection (convert.go:64-213 over the wired 15-type set)
 // ---------------------------------------------------------------------------
 
 /** `setting.UI.DefaultShowFullName` — the pin's zero value
@@ -312,7 +312,7 @@ export interface UserFeedItem {
 }
 
 /** One activity → one feeds.Item, element-for-element vs convert.go's
- *  composer (the wired 14-type set; the default arm throws — the header's
+ *  composer (the wired 15-type set; the default arm throws — the header's
  *  parity note). `origin` is the AppURL stand-in for the absolute links. */
 export function feedItemFromActivity(
   activity: Activity,
@@ -378,6 +378,13 @@ export function feedItemFromActivity(
     case "create_pull_request":
       link = pullLink;
       titleExtra = `created pull request <a href="${esc(pullLink)}">${esc(shortRepoPath)}#${esc(rawIndex)}</a>`;
+      break;
+    case "transfer_repo": // convert.go:105-108 — link.Href = the repo absolute
+      // link; the locale arm's %s args: GetContent = the OLD full path
+      // (path.Join(oldOwner.Name, repo.Name), services/feed/notifier.go:167-177)
+      // inside <code>, the absolute repo link, ShortRepoPath.
+      link = repoHref;
+      titleExtra = `transferred repository <code>${esc(activity.content)}</code> to <a href="${esc(repoHref)}">${esc(shortRepoPath)}</a>`;
       break;
     case "comment_issue": {
       // convert.go:110-113 — the issue link only rescues a "#" base.
@@ -478,7 +485,7 @@ export function feedItemFromActivity(
       description = liveIssueTitle(issueLookups, lookupKey, index);
       break;
     default:
-      break; // create_repo / rename_repo / publish_release: no arm — both stay ""
+      break; // create_repo / rename_repo / transfer_repo / publish_release: no arm — both stay ""
   }
   if (content === "") {
     // markup.Sanitize(desc) — the module header's reduction (desc verbatim).

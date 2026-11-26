@@ -30,7 +30,7 @@
  *     itself keys on the landed hide_activity setting, the C5 re-key, and
  *     the pair's disclosed mismatch lives in the module header) and the
  *     unconditional is_deleted filter;
- *   - the 14 wired op types through the LOADER (real `action` rows → the
+ *   - the 15 wired op types through the LOADER (real `action` rows → the
  *     per-item projection: op_type wire name, icon, message segments, body
  *     arm, live title/comment resolution) — the pure matrix's complement,
  *     plus the unproduced-type fall-through over REAL data;
@@ -320,7 +320,7 @@ describe("the gates (the loader's viewer ladder beyond the module suite's self/a
   });
 });
 
-// --- the 14 wired op types through the loader ------------------------------------
+// --- the 15 wired op types through the loader ------------------------------------
 
 /** The segment builders (the module suite's shape — plain objects). */
 const seg = {
@@ -361,6 +361,14 @@ const LOADER_MATRIX: MatrixRow[] = [
     insert: { opType: ActionType.RenameRepo, content: "old-name" },
     icon: "octicon-repo",
     message: [seg.text("renamed repository from "), seg.code("old-name"), seg.text(" to "), seg.link("/alice/demo", "alice/demo")],
+    checkBody: (item) => expect(item.body).toBeNull(),
+  },
+  {
+    name: "transfer_repo — the OLD full path rides as the code segment (feeds.tmpl:30-31; the TRANSFERHOOK write)",
+    opType: "transfer_repo",
+    insert: { opType: ActionType.TransferRepo, content: "Alice/moving" },
+    icon: "octicon-repo",
+    message: [seg.text("transferred repository "), seg.code("Alice/moving"), seg.text(" to "), seg.link("/alice/demo", "alice/demo")],
     checkBody: (item) => expect(item.body).toBeNull(),
   },
   {
@@ -483,7 +491,7 @@ const LOADER_MATRIX: MatrixRow[] = [
   },
 ];
 
-describe("the 14 wired op types through the loader (real rows → the per-item projection)", () => {
+describe("the 15 wired op types through the loader (real rows → the per-item projection)", () => {
   for (const row of LOADER_MATRIX) {
     it(row.name, async () => {
       await seedBaseFixtures();

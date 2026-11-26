@@ -451,6 +451,32 @@ describe("the feed link escaper pins (convert.go:38-43 url.PathEscape)", () => {
     expect(rss).toContain("auto merged pull request");
   });
 
+  it("the op-8 transfer row renders its title arm and never hits the unknown-op throw (convert.go:105-108; the TRANSFERHOOK write shape — feed/notifier.go:167-177)", async () => {
+    await seedBaseFixtures();
+    // Content = the OLD full path path.Join(oldOwner.Name, repo.Name) — the
+    // lifecycle battery's transferred witness literal "Alice/moving".
+    await insertAction(ActionType.TransferRepo, { content: "Alice/moving", createdAt: T0 });
+    const data = await loadUserFeedData(env.DB, aliceSubject, anonymous, ORIGIN, new URLSearchParams());
+    expect(data.items).toHaveLength(1);
+    const item = data.items[0];
+    // The transfer locale arm: <code>-wrapped OLD full path, then the repo
+    // link (the NEW location) with ShortRepoPath as the text. The item title
+    // carries the RAW anchor HTML; the envelope XML-escapes.
+    expect(item?.title).toContain("transferred repository <code>Alice/moving</code>");
+    expect(item?.title).toContain(`<a href="${ORIGIN}/alice/demo">alice/demo</a>`);
+    // link.Href = GetRepoAbsoluteLink — the repo absolute link, NOT the
+    // GetCommentHTMLURL default ("#").
+    expect(item?.link).toBe(`${ORIGIN}/alice/demo`);
+    // No description/content arm upstream (convert.go's second switch has no
+    // TransferRepo case) — both stay "".
+    expect(item?.description).toBe("");
+    // The envelope renders without the default arm's "unknown action type"
+    // throw and carries the transfer title.
+    const rss = renderUserFeedRss(data);
+    expect(rss).toContain("transferred repository");
+    expect(rss).toContain("&lt;code&gt;Alice/moving&lt;/code&gt;");
+  });
+
   it("repoHref's owner/name segments ride the gated charset — encodeURIComponent ≡ url.PathEscape there", () => {
     // GetRepoAbsoluteLink (activities/action.go:286-288) spells
     // url.PathEscape per segment; our segments only ever come out of the

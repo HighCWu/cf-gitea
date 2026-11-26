@@ -17,8 +17,8 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { ActionType } from "../../api/services/activity-feeds";
-import { users } from "../../db/schema";
+import { ActionType, renderFeedItems } from "../../api/services/activity-feeds";
+import { actions, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -159,6 +159,9 @@ async function seedAllWiredTypes(): Promise<void> {
     { opType: ActionType.RenameRepo, content: "old-name", createdAt: T0 + 1 },
     { opType: ActionType.CreateIssue, content: "7|Stored excerpt title", createdAt: T0 + 2 },
     { opType: ActionType.CreatePullRequest, content: "9|PR title here", createdAt: T0 + 3 },
+    // The TRANSFERHOOK write shape (feed/notifier.go:167-177): op 8, the OLD
+    // full path as content — the lifecycle battery's witness literal.
+    { opType: ActionType.TransferRepo, content: "Alice/moving", createdAt: T0 + 14 },
     {
       opType: ActionType.CommentIssue,
       content: "7|A **comment** body",
@@ -237,6 +240,20 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
       link("/alice/demo", "alice/demo"),
     ]);
     expect(feedBody(withOp("rename_repo", { content: "old-name" }))).toBeNull();
+  });
+
+  it("transfer_repo — octicon-repo (the shared arm), code-wrapped OLD full path, no body arm (feeds.tmpl:30-31)", () => {
+    expect(feedIconName("transfer_repo")).toBe("octicon-repo"); // util_misc.go:73-74
+    // The content carries the OLD full path path.Join(oldOwner.Name, repo.Name)
+    // — the TRANSFERHOOK write shape (feed/notifier.go:167-177; the
+    // lifecycle battery's witness literal "Alice/moving").
+    expect(feedMessageSegments(withOp("transfer_repo", { content: "Alice/moving" }))).toEqual([
+      text("transferred repository "),
+      { kind: "code", text: "Alice/moving" },
+      text(" to "),
+      link("/alice/demo", "alice/demo"),
+    ]);
+    expect(feedBody(withOp("transfer_repo", { content: "Alice/moving" }))).toBeNull();
   });
 
   it("create_issue — octicon-issue-opened, issues link, content-stored title span", () => {
@@ -443,10 +460,10 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
     await seedAllWiredTypes();
 
     const data = await loadActivityFeedsData(env.DB, await userRow("alice"), selfViewer, ORIGIN, new URLSearchParams());
-    // 14 wired rows + the private-repo row the seeded set does not include —
+    // 15 wired rows + the private-repo row the seeded set does not include —
     // onlyPerformedBy (profile.go:172) keeps the performer's own rows.
-    expect(data.items).toHaveLength(14);
-    expect(data.total).toBe(14);
+    expect(data.items).toHaveLength(15);
+    expect(data.total).toBe(15);
     expect(data.more).toBe(false);
 
     const html = renderToString(
@@ -476,6 +493,10 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
     // The release arm's tag link.
     expect(html).toContain('href="/alice/demo/releases/tag/v1"');
     expect(html).toContain("v1 Release");
+    // The transfer arm's sentence (feeds.tmpl:30-31): code-wrapped OLD full
+    // path, then the NEW repo location link.
+    expect(html).toContain("transferred repository");
+    expect(html).toContain("<code>Alice/moving</code>");
     // The trailing 32px action glyphs (ActionIcon over the wired set).
     expect(html).toContain("octicon-repo tw-text-text-light tw-mr-1");
     expect(html).toContain("octicon-git-merge tw-text-text-light tw-mr-1");
@@ -492,7 +513,8 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
     await seedAllWiredTypes();
 
     const data = await loadActivityFeedsData(env.DB, await userRow("alice"), selfViewer, ORIGIN, new URLSearchParams());
-    expect(data.items[0]?.opType).toBe("publish_release"); // created T0+13, the DESC order
+    expect(data.items[0]?.opType).toBe("transfer_repo"); // created T0+14, the DESC order
+    expect(data.items[1]?.opType).toBe("publish_release"); // T0+13 next
     expect(data.items.at(-1)?.opType).toBe("create_repo");
     const commentItem = data.items.find((item) => item.opType === "comment_issue");
     expect(commentItem).toMatchObject({
@@ -508,6 +530,53 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
     expect(commentItem?.icon).toBe("octicon-comment-discussion");
     const closeItem = data.items.find((item) => item.opType === "close_issue");
     expect(closeItem?.liveIssueTitle).toBe("Live issue title");
+  });
+
+  it("the seeded op-8 row renders the transfer sentence (feeds.tmpl:30-31) and the API timeline carries it raw (convert/activity.go ToActivity) — the TRANSFERHOOK witness shape", async () => {
+    await seedBaseFixtures();
+    // The service's real write (the lifecycle battery's witness): the
+    // ACCEPTING doer (bob, the new owner) is act_user; the fan-out's ORIGINAL
+    // row carries user_id = act_user_id = bob, plus the watcher-style
+    // receiver row for alice; content is the OLD full path
+    // path.Join(oldOwner.Name, repo.Name) (feed/notifier.go:167-177).
+    await insertAction({ opType: ActionType.TransferRepo, content: "Alice/moving", actUserId: bobId, userId: bobId });
+    await insertAction({ opType: ActionType.TransferRepo, content: "Alice/moving", actUserId: bobId, userId: aliceId });
+
+    // The doer's profile tab carries it (onlyPerformedBy keeps the
+    // performer's own rows, profile.go:172).
+    const data = await loadActivityFeedsData(
+      env.DB,
+      await userRow("bob"),
+      { kind: "user", id: bobId, username: "bob", isAdmin: false },
+      ORIGIN,
+      new URLSearchParams(),
+    );
+    expect(data.items).toHaveLength(1);
+    const item = data.items[0]!;
+    expect(item.opType).toBe("transfer_repo");
+    expect(item.icon).toBe("octicon-repo"); // util_misc.go:73-74 — the shared arm, NOT the question default
+    expect(item.message).toEqual([
+      { kind: "text", text: "transferred repository " },
+      { kind: "code", text: "Alice/moving" },
+      { kind: "text", text: " to " },
+      { kind: "link", href: "/alice/demo", text: "alice/demo" },
+    ]);
+    expect(item.body).toBeNull(); // feeds.tmpl:86-123 has no transfer content arm
+    const html = renderToString(<ActivityFeedListItem item={item} />);
+    expect(html).toContain("transferred repository");
+    expect(html).toContain("<code>Alice/moving</code>");
+    expect(html).toContain('<a href="/alice/demo">alice/demo</a>');
+    expect(html).toContain("octicon-repo");
+
+    // The API timeline payload (renderFeedItems — the /activities/feeds
+    // renderer over the doer's received row): op_type = the wire string,
+    // content = the raw old path — upstream ToActivity's exact pass-through;
+    // nothing to add there.
+    const rows = (await drizzle(env.DB).select().from(actions).all()).filter((row) => row.userId === bobId);
+    const activities = await renderFeedItems(env.DB, { origin: ORIGIN, requester: null }, rows);
+    expect(activities).toHaveLength(1);
+    expect(activities[0]!.op_type).toBe("transfer_repo");
+    expect(activities[0]!.content).toBe("Alice/moving");
   });
 
   it("onlyPerformedBy=true drops receiver rows another user acted on", async () => {
