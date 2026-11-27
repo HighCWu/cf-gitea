@@ -1,6 +1,6 @@
 # SPEC-0024: Large-Repository Split-Plane Git Engine (Worker Streaming Upload-Pack, Queue Compaction, Ref-Index Sidecars, and Bundle-URI)
 
-Status: verified — M4.0–M4.12 committed (`33cbe99`..`1928971`), deployed to Demo (`cf-gitea`) & Prod (`cf-gitea-prod`), live multi-GB compaction (`objects=183363`, `clean=true`, `activeRemaining=1`) and `5/5` consecutive anonymous `git clone` acceptance passed (2026-11-27) · Date: 2026-11-27 · Amends: SPEC-0001, SPEC-0001a, SPEC-0011
+Status: verified — M4.0–M4.13 committed (`33cbe99`..`f21bbba`), deployed to Demo (`cf-gitea`) & Prod (`cf-gitea-prod`), live multi-GB compaction (`objects=183363`, `clean=true`, `activeRemaining=1`), `5/5` consecutive anonymous `git clone` acceptance, and M4.13 zero-fallback segmented `bundle-uri` clone passed (2026-11-28) · Date: 2026-11-27 · Amends: SPEC-0001, SPEC-0001a, SPEC-0011
 Depends on: SPEC-0001, SPEC-0001a, SPEC-0003, SPEC-0011
 Governs: `packages/git-engine/`, `apps/worker/src/git-http/`, `apps/worker/src/queues/`
 Reference implementations studied: `/home/whc/pnpm_repos/cf-gitea-ref/git-on-cloudflare`, `/home/whc/pnpm_repos/cf-gitea-ref/enroute`, upstream `gitea/routers/web/repo/githttp.go`
@@ -261,3 +261,7 @@ Zero D1 migrations are required. Extend DO SQLite `pack_catalog` additively:
     3. `transfer.bundleURI=false` #3: `RC=0`, `elapsed=2437s`, `fsck_rc=0`, `in-pack=183363` (survived slow segments down to `422 KiB/s` without EOF).
     4. `protocol.version=2`, `transfer.bundleURI=true` #4: `RC=0`, `elapsed=801s`, `bundle-uri` packet trace confirmed (`4` lines), `fsck_rc=0`, `in-pack=183363`.
     5. `protocol.version=2`, `transfer.bundleURI=true` #5: `RC=0`, `elapsed=4335s`, `bundle-uri` packet trace confirmed (`4` lines; slow downstream fallback completed cleanly over M4.12 segmented `command=fetch`), `fsck_rc=0`, `in-pack=183363`.
+- **M4.13 (2026-11-28, commit `f21bbba`)** — Segmented stall-resilient `serveBundleDownload` streaming: extended `ResumableR2PackStream` with `startOffset`, and updated `serveBundleDownload` (`src/upload/bundle.ts`) so `200` full GETs and large `206` Range slices `> WORKER_PASSTHROUGH_SEGMENT_BYTES` (`32 MiB`) stream via `ResumableR2PackStream` while preserving single-`R2.get` fast path for payloads `<= 32 MiB`.
+  - Locally verified (`@cf-gitea/git-engine` & `apps/worker` typecheck, scoped eslint on `stream.ts`, `bundle.ts`, `upload-worker-stream.test.ts`, `bundle-uri.test.ts`, Vitest M4 suites `4/4` files `28/28` tests, `check-read-leases.mjs` `25/25`, `check-split-plane-git.mjs` `9/9`).
+  - Deployed to Demo (`cf-gitea`, Version ID `cdceed28-4264-4145-a606-aaf9ac8ec3fc`, `/healthz` `200`) and Prod (`cf-gitea-prod`, Version ID `1e5f23fe-c2a4-4fb4-816b-6656c7b903e4`, 5/5 canaries green).
+  - Live `protocol.version=2` `transfer.bundleURI=true` clone on `https://git.aiapp.run/domon-ai/comfyui-frontend.git`: `RC=0`, `elapsed=698s`, `bundle_uri_lines=4`, **`fetch_lines=0` / `sideband_pack_lines=0`** (completed purely over segmented `/bundle/<token>` with zero fallback), `git fsck --full --strict` exit `0`, `in-pack=183363`, exact 3-value match.
