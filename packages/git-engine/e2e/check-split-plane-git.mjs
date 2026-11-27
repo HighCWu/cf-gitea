@@ -326,7 +326,38 @@ async function main() {
     assert.notEqual(orphanProbe.status, 0, "force-push orphan commit must not exist in fresh clone");
     console.log("  ok: 7. force-push orphan exclusion + stale bundle invalidation + fsck strict exit 0");
 
-    console.log("ALL 7 REAL STOCK GIT SPLIT-PLANE E2E CASES PASSED.");
+    // 8. Shallow clone (--depth=1 -> --depth=3 -> --unshallow, plus fail-closed --deepen) + fsck strict.
+    const shallowDir = path.join(tmp, "clone-shallow");
+    git(["clone", "-q", "--depth", "1", repoHttp, shallowDir], { cwd: tmp });
+    assert.equal(git(["rev-list", "--count", "HEAD"], { cwd: shallowDir }).stdout.trim(), "1");
+    assert.equal(fs.existsSync(path.join(shallowDir, ".git", "shallow")), true);
+    const deepenUnsupported = git(["fetch", "-q", "--deepen", "2"], { cwd: shallowDir, allowFail: true });
+    assert.notEqual(deepenUnsupported.status, 0);
+    assert.match(deepenUnsupported.stderr, /deepen-relative/);
+    git(["fetch", "-q", "--depth", "3"], { cwd: shallowDir });
+    assert.equal(git(["rev-list", "--count", "HEAD"], { cwd: shallowDir }).stdout.trim(), "3");
+    git(["fetch", "-q", "--unshallow"], { cwd: shallowDir });
+    assert.equal(git(["rev-list", "--count", "HEAD"], { cwd: shallowDir }).stdout.trim(), "4");
+    git(["fsck", "--full", "--strict"], { cwd: shallowDir });
+    console.log("  ok: 8. shallow (--depth=1 -> --depth=3 -> --unshallow + fail-closed --deepen) + fsck strict exit 0");
+
+    // 9. Partial clone (--filter=blob:none --no-checkout -> promisor lazy checkout) + fsck strict.
+    const partialDir = path.join(tmp, "clone-partial");
+    git(
+      ["-c", "protocol.version=2", "clone", "-q", "--filter=blob:none", "--no-checkout", repoHttp, partialDir],
+      { cwd: tmp },
+    );
+    assert.equal(git(["config", "--get", "remote.origin.promisor"], { cwd: partialDir }).stdout.trim(), "true");
+    assert.equal(
+      git(["config", "--get", "remote.origin.partialclonefilter"], { cwd: partialDir }).stdout.trim(),
+      "blob:none",
+    );
+    git(["checkout", "-q", "HEAD"], { cwd: partialDir });
+    git(["fsck", "--full", "--strict"], { cwd: partialDir });
+    assert.equal(Buffer.compare(fs.readFileSync(path.join(partialDir, "asset.bin")), binaryBuf), 0);
+    console.log("  ok: 9. partial clone (--filter=blob:none + lazy checkout) + fsck strict exit 0");
+
+    console.log("ALL 9 REAL STOCK GIT SPLIT-PLANE E2E CASES PASSED.");
   } finally {
     if (child && child.pid) {
       try {

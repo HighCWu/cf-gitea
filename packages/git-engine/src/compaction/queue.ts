@@ -13,13 +13,14 @@ import { inflateAll } from "../receive/scan";
 import { DEFAULT_BUNDLE_MIN_BYTES, formatGitBundleV2Header } from "../upload/bundle";
 import { SequentialR2PackReader } from "../upload/stream";
 
-/** 64 MiB R2 multipart parts (10,000 parts => ~640 GiB max compacted pack; packs below this use 1 single `put`). */
-export const QUEUE_COMPACTION_PART_SIZE = 64 * 1024 * 1024;
+/** 16 MiB R2 multipart parts (10,000 parts => 160 GiB max compacted pack; 16 MiB single-slab stays safe in 128 MiB Workers isolates). */
+export const QUEUE_COMPACTION_PART_SIZE = 16 * 1024 * 1024;
 /** Max active packs collapsed per Queue compaction round (collapses a 49-pack repo in 1 round). */
 export const QUEUE_COMPACTION_MAX_PACKS = 64;
 const PREF_CACHE_BYTES = 8 * 1024 * 1024;
 const COMPACTION_PAGE_SIZE = 4096;
-const STAGE_BATCH_SIZE = 512;
+const STAGE_BATCH_SIZE = 4096;
+const SINK_SLAB_PROMOTE_BYTES = 1024 * 1024;
 
 export interface CompactionInputPack extends PackCatalogRow {
   r2Key: string;
@@ -134,13 +135,15 @@ export interface RunQueueCompactionOptions {
 }
 
 /**
- * Buffered-part R2 writer: skips multipart overhead for small writes (< `partSize`)
- * by finishing with a single `bucket.put()`, while lazily upgrading to R2 multipart
- * upload when output exceeds `partSize` so isolate heap stays bounded.
+ * Single-slab buffered-part R2 writer: skips multipart overhead for small writes
+ * (< `partSize`) via one `bucket.put()`, and promotes above 1 MiB into a single
+ * reusable `partSize` slab so isolate heap never sees a `2 * partSize` `concat()` spike.
  */
 class AdaptiveR2Sink {
-  private chunks: Uint8Array[] = [];
-  private bufferedLen = 0;
+  private pending: Uint8Array[] = [];
+  private pendingLen = 0;
+  private slab: Uint8Array | null = null;
+  private slabLen = 0;
   private mp: R2MultipartUpload | null = null;
   private uploadedParts: R2UploadedPart[] = [];
   private totalWritten = 0;
@@ -151,52 +154,84 @@ class AdaptiveR2Sink {
     private readonly partSize: number
   ) {}
 
-  async write(chunk: Uint8Array): Promise<void> {
-    if (chunk.length === 0) return;
-    this.chunks.push(chunk);
-    this.bufferedLen += chunk.length;
-    this.totalWritten += chunk.length;
-    if (this.bufferedLen >= this.partSize) {
-      await this.flushParts(false);
+  private promoteToSlab(): Uint8Array {
+    const slab = new Uint8Array(this.partSize);
+    let off = 0;
+    for (const p of this.pending) {
+      slab.set(p, off);
+      off += p.length;
     }
+    this.pending = [];
+    this.pendingLen = 0;
+    this.slab = slab;
+    this.slabLen = off;
+    return slab;
   }
 
-  private async flushParts(final: boolean): Promise<void> {
-    while (this.bufferedLen >= this.partSize) {
-      if (!this.mp) this.mp = await this.bucket.createMultipartUpload(this.key);
-      const merged = concat(this.chunks);
-      const part = merged.subarray(0, this.partSize);
-      this.uploadedParts.push(await this.mp.uploadPart(this.uploadedParts.length + 1, part));
-      const rem = merged.slice(this.partSize);
-      this.chunks = rem.length ? [rem] : [];
-      this.bufferedLen = rem.length;
-    }
-    if (final) {
-      if (!this.mp) {
-        const body = concat(this.chunks);
-        this.chunks = [];
-        this.bufferedLen = 0;
-        await this.bucket.put(this.key, body);
+  private async uploadFullSlab(): Promise<void> {
+    if (!this.mp) this.mp = await this.bucket.createMultipartUpload(this.key);
+    this.uploadedParts.push(await this.mp.uploadPart(this.uploadedParts.length + 1, this.slab!));
+    this.slabLen = 0;
+  }
+
+  private releaseBuffers(): void {
+    this.pending = [];
+    this.pendingLen = 0;
+    this.slab = null;
+    this.slabLen = 0;
+  }
+
+  async write(chunk: Uint8Array): Promise<void> {
+    if (chunk.length === 0) return;
+    this.totalWritten += chunk.length;
+    if (this.slab === null) {
+      const promoteAt = Math.min(this.partSize, SINK_SLAB_PROMOTE_BYTES);
+      if (this.pendingLen + chunk.length < promoteAt) {
+        this.pending.push(chunk.slice());
+        this.pendingLen += chunk.length;
         return;
       }
-      if (this.bufferedLen > 0) {
-        const tail = concat(this.chunks);
-        this.chunks = [];
-        this.bufferedLen = 0;
-        this.uploadedParts.push(await this.mp.uploadPart(this.uploadedParts.length + 1, tail));
+      this.promoteToSlab();
+    }
+    let off = 0;
+    const slab = this.slab!;
+    while (off < chunk.length) {
+      const fit = Math.min(chunk.length - off, this.partSize - this.slabLen);
+      slab.set(chunk.subarray(off, off + fit), this.slabLen);
+      this.slabLen += fit;
+      off += fit;
+      if (this.slabLen === this.partSize) {
+        await this.uploadFullSlab();
       }
-      await this.mp.complete(this.uploadedParts);
     }
   }
 
   async finish(): Promise<number> {
-    await this.flushParts(true);
-    return this.totalWritten;
+    try {
+      if (!this.mp) {
+        const body =
+          this.slab !== null
+            ? this.slab.subarray(0, this.slabLen)
+            : this.pendingLen > 0
+              ? concat(this.pending)
+              : new Uint8Array(0);
+        await this.bucket.put(this.key, body);
+        return this.totalWritten;
+      }
+      if (this.slab !== null && this.slabLen > 0) {
+        this.uploadedParts.push(
+          await this.mp.uploadPart(this.uploadedParts.length + 1, this.slab.subarray(0, this.slabLen))
+        );
+      }
+      await this.mp.complete(this.uploadedParts);
+      return this.totalWritten;
+    } finally {
+      this.releaseBuffers();
+    }
   }
 
   async abort(): Promise<void> {
-    this.chunks = [];
-    this.bufferedLen = 0;
+    this.releaseBuffers();
     if (this.mp) {
       const m = this.mp;
       this.mp = null;
@@ -243,7 +278,6 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     for (const c of entryChunks) await packSink.write(c);
     entryChunks = [];
 
-    const emittedOffset = new Map<string, number>();
     const prefCache = new ObjCache(PREF_CACHE_BYTES);
     const oidSet = new OidSet(Math.max(1, plan.expectedObjects));
     const entryCrcs = new Uint32Array(plan.expectedObjects);
@@ -304,7 +338,8 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
                 prefCache.put(row.oid, { type: row.type, data: nonBlobData });
               }
             } else {
-              const baseOff = emittedOffset.get(row.baseOid);
+              const baseIdx = oidSet.indexOfHex(row.baseOid);
+              const baseOff = baseIdx >= 0 ? entryOffsets[baseIdx] : undefined;
               if (baseOff !== undefined) {
                 writer.rawOfsDelta(entryOffset - baseOff < 0 ? 0 : row.entrySize, entryOffset - baseOff, raw);
                 ofsDeltas++;
@@ -349,8 +384,6 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
               throw new Error(`compaction object overflow: exceeded expected ${plan.expectedObjects}`);
             }
 
-            emittedOffset.set(row.oid, entryOffset);
-
             const crc = new Crc32();
             for (const c of entryChunks) crc.update(c);
             const headerLen = entryChunks[0]!.length + (entryChunks.length > 2 ? entryChunks[1]!.length : 0);
@@ -359,7 +392,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
             for (const c of entryChunks) await packSink.write(c);
             entryChunks = [];
 
-            const inserted = oidSet.markHex(row.oid);
+            const inserted = oidSet.addHex(row.oid);
             if (!inserted) {
               throw new Error(`compaction duplicate oid in merged inputs: ${row.oid}`);
             }
@@ -459,6 +492,8 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
         if (allPresent) effectiveCleanReachable = true;
       }
     }
+    // Release per-object ref slices before opening bundleSink.
+    prefEntries.length = 0;
     const prefSink = new AdaptiveR2Sink(bucket, plan.outputPrefR2Key, partSize);
     await prefSink.write(prefBytes);
     const outputPrefBytes = await prefSink.finish();

@@ -14,17 +14,22 @@ export const R2_PART_SIZE = 16 * 1024 * 1024;
 /** 64 MiB push ingest part size (SPEC-0024 D2, up to 10,000 * 64 MiB = 640 GiB). */
 export const R2_PUSH_PART_SIZE = 64 * 1024 * 1024;
 
+/** Threshold above which pending chunks promote into a single reusable `partSize` slab. */
+const SLAB_PROMOTE_BYTES = 1024 * 1024;
+
 /**
- * Buffers a streamed pack into fixed-size R2 multipart parts. Chunks are copied
- * on push (callers hand out views into buffers that later reads evict). `drain`
- * uploads every whole part and keeps the sub-part remainder, so isolate
- * memory never holds more than ~one part; `finish` flushes the final (short)
- * part and completes; any failure aborts so R2 is left with no partial object.
- * Uniform part size (last excepted) is what satisfies R2's equal-size-parts rule.
+ * Buffers a streamed pack into fixed-size R2 multipart parts using a single
+ * lazily allocated `partSize` slab (eliminating `2 * partSize` `concat()` spikes
+ * inside 128 MiB Workers isolates). Input slices are copied out immediately
+ * because upstream stream readers reuse buffers. `uploadPart` must finish
+ * reading `data` before resolving.
  */
 export class MultipartCapture {
-  private chunks: Uint8Array[] = [];
-  private len = 0;
+  private pending: Uint8Array[] = [];
+  private pendingLen = 0;
+  private slab: Uint8Array | null = null;
+  private slabLen = 0;
+  private overflow: Uint8Array[] = [];
   private failed = false;
   private completed = false;
   constructor(
@@ -37,45 +42,105 @@ export class MultipartCapture {
     return this.failed;
   }
 
+  private promoteToSlab(): Uint8Array {
+    const slab = new Uint8Array(this.partSize);
+    let off = 0;
+    for (const p of this.pending) {
+      slab.set(p, off);
+      off += p.length;
+    }
+    this.pending = [];
+    this.pendingLen = 0;
+    this.slab = slab;
+    this.slabLen = off;
+    return slab;
+  }
+
+  private refillSlab(): void {
+    const slab = this.slab;
+    if (!slab || this.overflow.length === 0) return;
+    while (this.overflow.length > 0 && this.slabLen < this.partSize) {
+      const head = this.overflow[0]!;
+      const room = this.partSize - this.slabLen;
+      if (head.length <= room) {
+        slab.set(head, this.slabLen);
+        this.slabLen += head.length;
+        this.overflow.shift();
+      } else {
+        slab.set(head.subarray(0, room), this.slabLen);
+        this.slabLen = this.partSize;
+        this.overflow[0] = head.subarray(room);
+      }
+    }
+  }
+
+  private releaseBuffers(): void {
+    this.pending = [];
+    this.pendingLen = 0;
+    this.slab = null;
+    this.slabLen = 0;
+    this.overflow = [];
+  }
+
   push(chunk: Uint8Array): void {
-    if (this.failed) return;
-    this.chunks.push(chunk.slice());
-    this.len += chunk.length;
+    if (this.failed || chunk.length === 0) return;
+    if (this.slab === null) {
+      const promoteAt = Math.min(this.partSize, SLAB_PROMOTE_BYTES);
+      if (this.pendingLen + chunk.length < promoteAt) {
+        this.pending.push(chunk.slice());
+        this.pendingLen += chunk.length;
+        return;
+      }
+      this.promoteToSlab();
+    }
+    const slab = this.slab!;
+    if (this.overflow.length === 0 && this.slabLen < this.partSize) {
+      const fit = Math.min(chunk.length, this.partSize - this.slabLen);
+      slab.set(chunk.subarray(0, fit), this.slabLen);
+      this.slabLen += fit;
+      if (fit < chunk.length) {
+        this.overflow.push(chunk.slice(fit));
+      }
+      return;
+    }
+    this.overflow.push(chunk.slice());
   }
 
   async drain(): Promise<void> {
-    while (!this.failed && this.len >= this.partSize) {
-      const merged = concat(this.chunks);
+    while (!this.failed && this.slab !== null && this.slabLen === this.partSize) {
       try {
-        await this.mp.uploadPart(merged.subarray(0, this.partSize));
+        await this.mp.uploadPart(this.slab);
       } catch {
         await this.abort();
         return;
       }
-      const rest = merged.slice(this.partSize);
-      this.chunks = rest.length ? [rest] : [];
-      this.len = rest.length;
+      this.slabLen = 0;
+      this.refillSlab();
     }
   }
 
   async finish(): Promise<void> {
     if (this.failed) return;
+    await this.drain();
+    if (this.failed) return;
     try {
-      if (this.len) await this.mp.uploadPart(concat(this.chunks));
+      if (this.slab !== null) {
+        if (this.slabLen > 0) await this.mp.uploadPart(this.slab.subarray(0, this.slabLen));
+      } else if (this.pendingLen > 0) {
+        await this.mp.uploadPart(concat(this.pending));
+      }
       await this.mp.complete();
       this.completed = true;
     } catch {
       await this.abort();
     }
-    this.chunks = [];
-    this.len = 0;
+    this.releaseBuffers();
   }
 
   async abort(): Promise<void> {
     if (this.failed || this.completed) return;
     this.failed = true;
-    this.chunks = [];
-    this.len = 0;
+    this.releaseBuffers();
     try {
       await this.mp.abort();
     } catch {

@@ -309,6 +309,8 @@
     // keepalives (GIT_UPLOAD_KEEPALIVE_MS).
     "UPLOAD_PACK_WORKER_STREAM": "true",
     "GIT_UPLOAD_KEEPALIVE_MS": "20000",
+    // SPEC-0024 M4.4b: Worker cold full-clone activation threshold (bytes; or >= 8 active packs).
+    "WORKER_COLD_CLONE_MIN_BYTES": "8388608",
     // SPEC-0024 M4.1: shift pack compaction off the 32 MiB DO-heap merge onto
     // REPO_TASKS Queue streaming compaction with OFS_DELTA + .pref sidecars.
     "COMPACTION_QUEUE_ENABLED": "true",

@@ -294,7 +294,7 @@ export {
   type RunQueueCompactionOptions,
   type StageCompactionRowsResult,
 } from "./compaction/queue";
-export { R2_PART_SIZE, R2_PUSH_PART_SIZE } from "./git/multipart";
+export { MultipartCapture, R2_PART_SIZE, R2_PUSH_PART_SIZE, type MultipartPackUpload } from "./git/multipart";
 export {
   COALESCE_GAP_BYTES,
   COALESCE_MAX_WINDOW_BYTES,

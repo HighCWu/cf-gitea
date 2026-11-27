@@ -8,9 +8,11 @@ import {
   createDurableGit,
   loadPackIdxV2,
   lookupOidsInPackIdxs,
+  MultipartCapture,
   parseIdxV2,
   parsePackRefIndex,
   R2_PUSH_PART_SIZE,
+  type MultipartPackUpload,
 } from "@cf-gitea/git-engine";
 import { checkRepoInvariants } from "../invariants/check";
 import { buildPack, buildReceivePackBody } from "../repos/testing/git-pack";
@@ -436,5 +438,75 @@ describe("SPEC-0024 M4.2 direct pack write, range coalescing & .idx v2 reader", 
     expect(multi.get(oidB)).toEqual({ packKey: "pack-test", index: 1, offset: 4096, crc32: 0x22222222 });
     expect(multi.get(oidC)).toEqual({ packKey: "pack-test", index: 2, offset: bigOffset, crc32: 0x33333333 });
     expect(multi.has("de".repeat(20))).toBe(false);
+  });
+
+  it("buffers MultipartCapture through a single reusable slab across <1MiB, boundary-crossing, and abort paths", async () => {
+    const mkUpload = () => {
+      const parts: Uint8Array[] = [];
+      let completed = 0;
+      let aborted = 0;
+      const mp: MultipartPackUpload = {
+        uploadPart: (data) => {
+          parts.push(data.slice());
+          return Promise.resolve();
+        },
+        complete: () => {
+          completed++;
+          return Promise.resolve();
+        },
+        abort: () => {
+          aborted++;
+          return Promise.resolve();
+        },
+      };
+      return { mp, parts, getCompleted: () => completed, getAborted: () => aborted };
+    };
+
+    // 1. Small upload (< 1 MiB promote threshold) flushes via single tail part.
+    const small = mkUpload();
+    const capSmall = new MultipartCapture(small.mp, 1.5 * 1024 * 1024);
+    const smallChunk = new Uint8Array(6000).fill(0x5a);
+    capSmall.push(smallChunk);
+    await capSmall.drain();
+    expect(small.parts.length).toBe(0);
+    await capSmall.finish();
+    expect(small.parts.length).toBe(1);
+    expect(small.parts[0]).toEqual(smallChunk);
+    expect(small.getCompleted()).toBe(1);
+    expect(small.getAborted()).toBe(0);
+
+    // 2. Multi-part stream crossing 1 MiB promotion, 1.5 MiB boundary, and a single >1.5 MiB oversized chunk.
+    const partSize = 1.5 * 1024 * 1024;
+    const multi = mkUpload();
+    const capMulti = new MultipartCapture(multi.mp, partSize);
+    const inputChunks: Uint8Array[] = [];
+    const pushPatterned = (len: number, seed: number) => {
+      const buf = new Uint8Array(len);
+      for (let i = 0; i < len; i++) buf[i] = (i + seed) & 0xff;
+      inputChunks.push(buf);
+      capMulti.push(buf);
+    };
+    pushPatterned(700 * 1024, 1); // stays in pending (< 1 MiB)
+    pushPatterned(400 * 1024, 2); // crosses 1 MiB -> promotes to single slab
+    pushPatterned(900 * 1024, 3); // crosses first 1.5 MiB boundary into overflow
+    await capMulti.drain();
+    expect(multi.parts.length).toBe(1);
+    expect(multi.parts[0]!.length).toBe(partSize);
+
+    // Single chunk larger than 2x partSize drains into multiple exact partSize slabs cleanly.
+    pushPatterned(Math.floor(partSize * 2.2), 4);
+    await capMulti.drain();
+    await capMulti.finish();
+    expect(multi.getCompleted()).toBe(1);
+    expect(multi.parts.slice(0, -1).every((p) => p.length === partSize)).toBe(true);
+    expect(concatU8(multi.parts)).toEqual(concatU8(inputChunks));
+
+    // 3. Explicit abort clears buffers and calls underlying mp.abort().
+    const doomed = mkUpload();
+    const capAbort = new MultipartCapture(doomed.mp, partSize);
+    capAbort.push(new Uint8Array(1.2 * 1024 * 1024).fill(0x11));
+    await capAbort.abort();
+    expect(capAbort.aborted).toBe(true);
+    expect(doomed.getAborted()).toBe(1);
   });
 });
