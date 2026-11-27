@@ -1,7 +1,11 @@
-import { concat, isOid, te } from "../git/util";
+import { concat, isOid, te, toHex } from "../git/util";
 import { FLUSH, pkt } from "../git/pktline";
-import { PackWriter } from "../git/pack";
+import { applyDelta, PackWriter } from "../git/pack";
 import type { ObjType } from "../git/objects";
+import { extractObjectRefBytes, parsePackRefIndex } from "../git/pref";
+import { ObjCache } from "../receive/objcache";
+import { loadPackIdxV2 } from "../receive/idx-reader";
+import { inflateAll } from "../receive/scan";
 import { READ_RENEW_MARGIN_MS, type ReleaseReadResult, type RenewReadResult } from "../read-leases";
 
 const SIDEBAND_CHUNK = 32 * 1024;
@@ -11,6 +15,16 @@ export const UPLOAD_KEEPALIVE_FRAME = te.encode("0005\x01");
 export const DEFAULT_UPLOAD_KEEPALIVE_MS = 20_000;
 export const WORKER_UPLOAD_PAGE_SIZE = 4096;
 export const WORKER_UPLOAD_RENEW_BYTES = 32 * 1024 * 1024;
+export const DEFAULT_WORKER_COLD_CLONE_MIN_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_WORKER_COLD_CLONE_MIN_PACKS = 8;
+
+export function parseWorkerColdCloneMinBytes(raw: string | undefined): number {
+  if (!raw) return DEFAULT_WORKER_COLD_CLONE_MIN_BYTES;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_WORKER_COLD_CLONE_MIN_BYTES;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_WORKER_COLD_CLONE_MIN_BYTES;
+}
 
 export function uploadKeepaliveMs(raw: string | undefined): number {
   const n = parseInt(raw ?? "", 10);
@@ -96,6 +110,68 @@ export interface WorkerUploadStub {
   ): Promise<ReadWarmClonePageResult>;
   readWarmLoosePage(planId: string, afterOid: string, limit: number): Promise<ReadWarmLoosePageResult>;
   readUploadObject(planId: string, oid: string): Promise<ReadUploadObjectResult>;
+}
+
+export interface WorkerColdPackMeta {
+  packKey: string;
+  r2Key: string;
+  idxR2Key: string;
+  prefR2Key: string;
+  prefBytes: number;
+  packBytes: number;
+  objectCount: number;
+}
+
+export interface PlanWorkerColdCloneOptions {
+  minBytes?: number;
+  minPacks?: number;
+}
+
+export type PlanWorkerColdCloneResult =
+  | {
+      tag: "leased";
+      planId: string;
+      expiresAt: number;
+      packs: WorkerColdPackMeta[];
+      tipOids: string[];
+    }
+  | { tag: "miss" };
+
+export interface WorkerColdPackRow {
+  oid: string;
+  offset: number;
+  dataOff: number;
+  dataLen: number;
+  type: ObjType;
+  entrySize: number;
+  baseOid: string | null;
+}
+
+export type ReadColdClonePageResult =
+  | { tag: "ok"; rows: WorkerColdPackRow[]; hasMore: boolean }
+  | { tag: "rejected"; reason: string };
+
+export type WorkerColdUploadStub = Pick<
+  WorkerUploadStub,
+  "renewAndAuthorizeRead" | "releaseReadLease" | "readUploadObject"
+> & {
+  readColdClonePackPage(
+    planId: string,
+    packKey: string,
+    afterOffset: number,
+    limit: number,
+  ): Promise<ReadColdClonePageResult>;
+};
+
+export interface StreamWorkerColdCloneOptions {
+  bucket: R2Bucket;
+  stub: WorkerColdUploadStub;
+  plan: Extract<PlanWorkerColdCloneResult, { tag: "leased" }>;
+  v2: boolean;
+  sideband: boolean;
+  noProgress: boolean;
+  keepaliveMs: number;
+  signal?: AbortSignal | null;
 }
 
 /**
@@ -541,6 +617,364 @@ export function streamWorkerWarmFullClone(opts: StreamWorkerWarmCloneOptions): R
         if (drained && !finished) {
           if (emitted !== plan.total) {
             throw new Error(`reachable set drifted mid-clone: emitted ${emitted}, declared ${plan.total}`);
+          }
+          finished = true;
+          writer.finish();
+          flushBuffered();
+          if (sideband) pending.push(FLUSH);
+        } else {
+          flushBuffered();
+        }
+        for (const c of pending) enqueue(ctrl, c);
+        pending.length = 0;
+        if (finished) {
+          stopTimer();
+          await activeReader?.close();
+          await releaseLeaseBestEffort();
+          ctrl.close();
+        }
+      } catch (err) {
+        stopTimer();
+        await activeReader?.close();
+        await releaseLeaseBestEffort();
+        ctrl.error(err);
+      } finally {
+        inPull = false;
+      }
+    },
+    cancel: async () => {
+      stopTimer();
+      await activeReader?.close();
+      await releaseLeaseBestEffort();
+    },
+  });
+  return new Response(stream, { headers });
+}
+
+/**
+ * Worker-side cold full-clone streaming (SPEC-0024 M4.4b):
+ * - Opens Response immediately with preamble + idle-gated `0005\x01` keepalives.
+ * - Phase 1 computes reachable closure from tipOids using `.pref`+`.idx` sidecars
+ *   when present (0 `.pack` bytes read), or sequentially scanning only commit/tree/tag
+ *   entries via `SequentialR2PackReader` when `.pref` is absent (skipping all blobs).
+ * - Phase 2 streams exact reachable objects via 1 sequential `R2.get` per pack,
+ *   enforcing SPEC-0011 Property A read-lease checks and excluding force-push orphans.
+ */
+export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): Response {
+  const { bucket, stub, plan, v2, sideband, noProgress, keepaliveMs, signal } = opts;
+  const headers: Record<string, string> = {
+    "content-type": "application/x-git-upload-pack-result",
+    "cache-control": "no-cache",
+    "x-upload-plane": "worker-cold-stream",
+  };
+
+  let leaseExpiresAt = plan.expiresAt;
+  const ensureLeaseValid = async (packKey: string | null): Promise<void> => {
+    if (!plan.planId) return;
+    if (Date.now() < leaseExpiresAt - READ_RENEW_MARGIN_MS) return;
+    const r = await stub.renewAndAuthorizeRead(plan.planId, packKey, null);
+    if (r.tag !== "authorized") {
+      throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+    }
+    leaseExpiresAt = r.expiresAt;
+  };
+  const releaseLeaseBestEffort = async (): Promise<void> => {
+    if (!plan.planId) return;
+    try {
+      await stub.releaseReadLease(plan.planId);
+    } catch {
+      // expiry sweep is the backstop
+    }
+  };
+  const checkAborted = (): void => {
+    if (signal?.aborted) throw new Error("client aborted cold upload-pack stream");
+  };
+
+  let ctrlRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let ended = false;
+  let inPull = false;
+  let framesSinceTick = false;
+  let activeReader: { close(): Promise<void> } | null = null;
+
+  const timer =
+    sideband && keepaliveMs > 0
+      ? setInterval(() => {
+          if (ended || !inPull || !ctrlRef) return;
+          if (framesSinceTick) {
+            framesSinceTick = false;
+            return;
+          }
+          try {
+            ctrlRef.enqueue(UPLOAD_KEEPALIVE_FRAME);
+          } catch {
+            ended = true;
+          }
+        }, keepaliveMs)
+      : null;
+
+  const stopTimer = () => {
+    ended = true;
+    if (timer !== null) clearInterval(timer);
+  };
+
+  const enqueue = (ctrl: ReadableStreamDefaultController<Uint8Array>, chunk: Uint8Array): void => {
+    framesSinceTick = true;
+    ctrl.enqueue(chunk);
+  };
+
+  const preamble = pkt(v2 ? "packfile\n" : "NAK\n");
+  const pending: Uint8Array[] = [];
+  let buffered: Uint8Array[] = [];
+  let bufferedLen = 0;
+  const flushBuffered = () => {
+    if (!bufferedLen) return;
+    const payload = concat(buffered);
+    buffered = [];
+    bufferedLen = 0;
+    if (sideband) pending.push(...uploadSidebandFrames(1, payload));
+    else pending.push(payload);
+  };
+  const writer = new PackWriter((chunk) => {
+    buffered.push(chunk);
+    bufferedLen += chunk.length;
+    if (bufferedLen >= SIDEBAND_CHUNK) flushBuffered();
+  });
+
+  let phase1Done = false;
+  let reachable = new Set<string>();
+  const emittedOids = new Set<string>();
+  let packIdx = 0;
+  let packOpened = false;
+  let afterOffset = -1;
+  let pageRows: WorkerColdPackRow[] = [];
+  let pageCursor = 0;
+  let pageHasMore = true;
+  let seqReader: SequentialR2PackReader | null = null;
+  let finished = false;
+
+  const runPhase1 = async (ctrl: ReadableStreamDefaultController<Uint8Array>): Promise<void> => {
+    const edges = new Map<string, string[]>();
+    const presentOids = new Set<string>();
+    const nonBlobCache = new ObjCache(8 * 1024 * 1024);
+
+    for (const p of plan.packs) {
+      checkAborted();
+      await ensureLeaseValid(p.packKey);
+
+      let usedPref = false;
+      if (p.prefBytes > 0) {
+        const [prefObj, idxView] = await Promise.all([
+          bucket.get(p.prefR2Key),
+          loadPackIdxV2(bucket, p.idxR2Key),
+        ]);
+        if (prefObj && idxView) {
+          const prefView = parsePackRefIndex(new Uint8Array(await prefObj.arrayBuffer()));
+          if (prefView.objectCount === idxView.objectCount) {
+            for (let i = 0; i < prefView.objectCount; i++) {
+              const oid = idxView.sortedOidAt(i);
+              presentOids.add(oid);
+              if (prefView.typeAt(i) !== "blob") {
+                edges.set(oid, prefView.refsAt(i));
+              }
+            }
+            usedPref = true;
+          }
+        }
+      }
+
+      if (!usedPref) {
+        const obj = await bucket.get(p.r2Key);
+        if (!obj) throw new Error(`missing cold R2 pack ${p.r2Key}`);
+        const reader = new SequentialR2PackReader(obj.body, () => ensureLeaseValid(p.packKey));
+        activeReader = { close: () => reader.close() };
+        try {
+          let cursor = -1;
+          for (;;) {
+            checkAborted();
+            const page = await stub.readColdClonePackPage(plan.planId, p.packKey, cursor, WORKER_UPLOAD_PAGE_SIZE);
+            if (page.tag === "rejected") {
+              throw new Error(`read lease rejected (${page.reason}); terminating — re-fetch`);
+            }
+            for (const row of page.rows) {
+              cursor = row.offset;
+              presentOids.add(row.oid);
+              if (row.type === "blob") continue;
+              const raw = await reader.readAt(row.dataOff, row.dataLen);
+              let data: Uint8Array;
+              if (!row.baseOid) {
+                data = inflateAll(raw);
+              } else {
+                const cachedBase = nonBlobCache.get(row.baseOid);
+                if (cachedBase) {
+                  data = applyDelta(cachedBase.data, inflateAll(raw));
+                } else {
+                  const resolved = await stub.readUploadObject(plan.planId, row.oid);
+                  if (resolved.tag === "rejected") {
+                    throw new Error(`read lease rejected (${resolved.reason}); terminating — re-fetch`);
+                  }
+                  if (resolved.tag === "missing") {
+                    throw new Error(`missing cold-clone non-blob object ${row.oid}`);
+                  }
+                  data = resolved.data;
+                }
+              }
+              nonBlobCache.put(row.oid, { type: row.type, data });
+              const refBytes = extractObjectRefBytes(row.type, data);
+              const refs: string[] = [];
+              for (let off = 0; off + 20 <= refBytes.length; off += 20) {
+                refs.push(toHex(refBytes.subarray(off, off + 20)));
+              }
+              edges.set(row.oid, refs);
+            }
+            if (!page.hasMore || page.rows.length === 0) break;
+          }
+        } finally {
+          await reader.close();
+          activeReader = null;
+        }
+      }
+    }
+
+    const closure = new Set<string>();
+    const stack: string[] = [];
+    for (const tip of plan.tipOids) {
+      if (!presentOids.has(tip)) {
+        throw new Error(`cold clone missing tip object ${tip}`);
+      }
+      if (!closure.has(tip)) {
+        closure.add(tip);
+        stack.push(tip);
+      }
+    }
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      const children = edges.get(oid);
+      if (!children) continue;
+      for (const child of children) {
+        if (!presentOids.has(child)) {
+          throw new Error(`cold clone missing reachable object ${child}`);
+        }
+        if (!closure.has(child)) {
+          closure.add(child);
+          stack.push(child);
+        }
+      }
+    }
+    if (closure.size === 0) {
+      throw new Error("cold clone closure resolved to zero objects");
+    }
+
+    reachable = closure;
+    if (sideband && !noProgress) {
+      for (const f of uploadSidebandFrames(2, te.encode(`Enumerating objects: ${reachable.size}, done.\n`))) {
+        enqueue(ctrl, f);
+      }
+    }
+    writer.header(reachable.size);
+    flushBuffered();
+    for (const c of pending) enqueue(ctrl, c);
+    pending.length = 0;
+    phase1Done = true;
+  };
+
+  const emitOneColdEntry = async (): Promise<boolean> => {
+    while (packIdx < plan.packs.length) {
+      const p = plan.packs[packIdx]!;
+      if (!packOpened) {
+        packOpened = true;
+        afterOffset = -1;
+        pageRows = [];
+        pageCursor = 0;
+        pageHasMore = true;
+        await ensureLeaseValid(p.packKey);
+        const obj = await bucket.get(p.r2Key);
+        if (!obj) throw new Error(`missing cold R2 pack ${p.r2Key}`);
+        const reader = new SequentialR2PackReader(obj.body, () => ensureLeaseValid(p.packKey));
+        seqReader = reader;
+        activeReader = {
+          close: async () => {
+            if (seqReader === reader) seqReader = null;
+            await reader.close();
+          },
+        };
+      }
+      if (pageCursor >= pageRows.length) {
+        if (!pageHasMore) {
+          if (seqReader) {
+            await seqReader.close();
+            seqReader = null;
+          }
+          activeReader = null;
+          packIdx++;
+          packOpened = false;
+          continue;
+        }
+        const page = await stub.readColdClonePackPage(plan.planId, p.packKey, afterOffset, WORKER_UPLOAD_PAGE_SIZE);
+        if (page.tag === "rejected") {
+          throw new Error(`read lease rejected (${page.reason}); terminating — re-fetch`);
+        }
+        pageRows = page.rows;
+        pageHasMore = page.hasMore;
+        pageCursor = 0;
+        if (pageRows.length === 0) {
+          pageHasMore = false;
+          continue;
+        }
+      }
+
+      const row = pageRows[pageCursor++]!;
+      afterOffset = row.offset;
+      if (!isOid(row.oid)) throw new Error(`invalid oid in cold clone plan: ${row.oid}`);
+      if (!reachable.has(row.oid) || emittedOids.has(row.oid)) {
+        continue;
+      }
+      emittedOids.add(row.oid);
+      if (!row.baseOid) {
+        const raw = await seqReader!.readAt(row.dataOff, row.dataLen);
+        writer.rawFull(row.type, row.entrySize, raw);
+      } else if (reachable.has(row.baseOid)) {
+        const raw = await seqReader!.readAt(row.dataOff, row.dataLen);
+        writer.rawDelta(row.entrySize, row.baseOid, raw);
+      } else {
+        const resolved = await stub.readUploadObject(plan.planId, row.oid);
+        if (resolved.tag === "rejected") {
+          throw new Error(`read lease rejected (${resolved.reason}); terminating — re-fetch`);
+        }
+        if (resolved.tag === "missing") {
+          throw new Error(`missing cold-clone object ${row.oid}`);
+        }
+        writer.object(resolved.type, resolved.data);
+      }
+      return true;
+    }
+    return false;
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start: (ctrl) => {
+      ctrlRef = ctrl;
+      enqueue(ctrl, preamble);
+    },
+    pull: async (ctrl) => {
+      inPull = true;
+      try {
+        checkAborted();
+        if (!phase1Done) {
+          await runPhase1(ctrl);
+          checkAborted();
+        }
+        let drained = false;
+        for (let n = 0; n < 64; n++) {
+          const hadMore = await emitOneColdEntry();
+          checkAborted();
+          if (!hadMore) {
+            drained = true;
+            break;
+          }
+        }
+        if (drained && !finished) {
+          if (emittedOids.size !== reachable.size) {
+            throw new Error(`cold clone count mismatch: emitted ${emittedOids.size}, expected ${reachable.size}`);
           }
           finished = true;
           writer.finish();

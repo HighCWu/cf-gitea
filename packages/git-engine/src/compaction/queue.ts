@@ -1,7 +1,7 @@
 import { applyDelta, PackWriter } from "../git/pack";
 import type { ObjType } from "../git/objects";
 import { OidSet } from "../git/oidset";
-import { encodePackRefIndex, extractObjectRefBytes, type PackRefEntryInput } from "../git/pref";
+import { encodePackRefIndex, extractObjectRefBytes, parsePackRefIndex, walkClosureWithPref, type PackRefEntryInput } from "../git/pref";
 import { bundleR2Key } from "../git/r2keys";
 import type { RepoBundleMeta } from "../git/store";
 import { concat, Sha1, toHex } from "../git/util";
@@ -40,6 +40,10 @@ export type BeginQueueCompactionResult =
       expectedObjects: number;
       reachableOnly: boolean;
       cleanReachable: boolean;
+      allActiveR2: boolean;
+      hasLoose: boolean;
+      refsVersion: string;
+      tipOids: string[];
       tier: number;
       outputPackKey: string;
       outputPackR2Key: string;
@@ -76,6 +80,7 @@ export type CommitQueueCompactionResult =
   | {
       tag: "committed";
       activePacksRemaining: number;
+      cleanReachable: boolean;
       storageKey: string;
       refsVersion: string;
       refs: Array<{ name: string; oid: string }>;
@@ -438,6 +443,22 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       packSha1,
       idxSha1,
     });
+    let effectiveCleanReachable = plan.cleanReachable;
+    if (!effectiveCleanReachable && plan.allActiveR2 && !plan.hasLoose && plan.tipOids.length > 0 && emitted > 0) {
+      const sortedOids = prefEntries.map((e) => e.oid).sort();
+      const prefView = parsePackRefIndex(prefBytes);
+      const closure = walkClosureWithPref([{ sortedOids, pref: prefView }], plan.tipOids);
+      if (closure.size === emitted) {
+        let allPresent = true;
+        for (const oid of closure) {
+          if (!oidSet.hasHex(oid)) {
+            allPresent = false;
+            break;
+          }
+        }
+        if (allPresent) effectiveCleanReachable = true;
+      }
+    }
     const prefSink = new AdaptiveR2Sink(bucket, plan.outputPrefR2Key, partSize);
     await prefSink.write(prefBytes);
     const outputPrefBytes = await prefSink.finish();
@@ -448,7 +469,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       idxBytes: outputIdxBytes,
       prefBytes: outputPrefBytes,
       objectCount: emitted,
-      cleanReachable: plan.cleanReachable,
+      cleanReachable: effectiveCleanReachable,
       tier: plan.tier,
     });
     if (commitRes.tag !== "committed") {
@@ -461,7 +482,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     const minBundleBytes = opts.bundleMinBytes ?? DEFAULT_BUNDLE_MIN_BYTES;
     if (
       opts.generateBundle &&
-      plan.cleanReachable &&
+      commitRes.cleanReachable &&
       commitRes.activePacksRemaining === 1 &&
       outputPackBytes >= minBundleBytes &&
       commitRes.refs.length > 0
@@ -519,7 +540,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       inputs: plan.inputs.map((i) => i.packKey),
       ofsDeltas,
       reInflated,
-      cleanReachable: plan.cleanReachable,
+      cleanReachable: commitRes.cleanReachable,
       activePacksRemaining: commitRes.activePacksRemaining,
       moreWork: commitRes.activePacksRemaining > 8,
       ...(bundle ? { bundle } : {}),

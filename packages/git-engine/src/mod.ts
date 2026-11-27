@@ -27,13 +27,24 @@ import {
   type BundleTokenPayload,
 } from "./upload/bundle";
 import {
+  DEFAULT_WORKER_COLD_CLONE_MIN_BYTES,
+  DEFAULT_WORKER_COLD_CLONE_MIN_PACKS,
+  parseWorkerColdCloneMinBytes,
+  streamWorkerColdFullClone,
   streamWorkerWarmFullClone,
   uploadKeepaliveMs,
   UPLOAD_KEEPALIVE_FRAME,
+  type PlanWorkerColdCloneOptions,
+  type PlanWorkerColdCloneResult,
   type PlanWorkerWarmCloneResult,
+  type ReadColdClonePageResult,
   type ReadUploadObjectResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
+  type StreamWorkerColdCloneOptions,
+  type WorkerColdPackMeta,
+  type WorkerColdPackRow,
+  type WorkerColdUploadStub,
   type WorkerLooseEntry,
   type WorkerPackedEntry,
   type WorkerUploadPackMeta,
@@ -230,13 +241,24 @@ export type {
 export type { ForkSourceRepo, ForkTargetRepo, ReplicateForkOpts, ReplicateForkResult } from "./fork/replicate";
 export { copyObject, replicateForkCatalog } from "./fork/replicate";
 export {
+  DEFAULT_WORKER_COLD_CLONE_MIN_BYTES,
+  DEFAULT_WORKER_COLD_CLONE_MIN_PACKS,
+  parseWorkerColdCloneMinBytes,
+  streamWorkerColdFullClone,
   streamWorkerWarmFullClone,
   uploadKeepaliveMs,
   UPLOAD_KEEPALIVE_FRAME,
+  type PlanWorkerColdCloneOptions,
+  type PlanWorkerColdCloneResult,
   type PlanWorkerWarmCloneResult,
+  type ReadColdClonePageResult,
   type ReadUploadObjectResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
+  type StreamWorkerColdCloneOptions,
+  type WorkerColdPackMeta,
+  type WorkerColdPackRow,
+  type WorkerColdUploadStub,
   type WorkerLooseEntry,
   type WorkerPackedEntry,
   type WorkerUploadPackMeta,
@@ -810,17 +832,38 @@ async function serveWorkerWarmClone(
     req.clientShallows.length === 0 &&
     (v2 || req.command === null);
   if (!fullClone) return null;
-  let plan: PlanWorkerWarmCloneResult;
+  let warmPlan: PlanWorkerWarmCloneResult;
   try {
-    plan = await stub.planWorkerWarmFullClone(repo, req.wants);
+    warmPlan = await stub.planWorkerWarmFullClone(repo, req.wants);
+  } catch {
+    warmPlan = { tag: "miss" };
+  }
+  if (warmPlan.tag === "leased") {
+    return streamWorkerWarmFullClone({
+      bucket,
+      stub,
+      plan: warmPlan,
+      v2,
+      sideband,
+      noProgress: req.caps.has("no-progress"),
+      keepaliveMs: uploadKeepaliveMs(env.GIT_UPLOAD_KEEPALIVE_MS),
+      signal,
+    });
+  }
+
+  let coldPlan: PlanWorkerColdCloneResult;
+  try {
+    coldPlan = await stub.planWorkerColdFullClone(repo, req.wants, {
+      minBytes: parseWorkerColdCloneMinBytes(env.WORKER_COLD_CLONE_MIN_BYTES),
+    });
   } catch {
     return null;
   }
-  if (plan.tag !== "leased") return null;
-  return streamWorkerWarmFullClone({
+  if (coldPlan.tag !== "leased") return null;
+  return streamWorkerColdFullClone({
     bucket,
     stub,
-    plan,
+    plan: coldPlan,
     v2,
     sideband,
     noProgress: req.caps.has("no-progress"),

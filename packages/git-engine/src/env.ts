@@ -86,6 +86,10 @@ export interface Env {
    * zero-copy single-pack passthrough (SPEC-0024 M4.0). Unset/anything else
    * keeps the legacy DO path. */
   UPLOAD_PACK_WORKER_STREAM?: string;
+  /** Minimum total R2 pack bytes that routes a cold full clone (before SQLite
+   * `reachable` is warmed) onto Worker streaming (`worker-cold-stream`,
+   * SPEC-0024 M4.4; default `8388608` = 8 MiB, or >= 8 active packs). */
+  WORKER_COLD_CLONE_MIN_BYTES?: string;
   /** Strict-polarity flag ("true" enables) routing multi-pack compaction from
    * the 32 MiB DO-heap merge to Worker/Queue streaming compaction + OFS_DELTA +
    * `.pref` sidecars (SPEC-0024 M4.1). */

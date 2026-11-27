@@ -17,11 +17,19 @@ import {
   PackCache,
 } from "./git/protocol";
 import {
+  DEFAULT_WORKER_COLD_CLONE_MIN_BYTES,
+  DEFAULT_WORKER_COLD_CLONE_MIN_PACKS,
+  streamWorkerWarmFullClone,
   uploadKeepaliveMs,
+  type PlanWorkerColdCloneOptions,
+  type PlanWorkerColdCloneResult,
   type PlanWorkerWarmCloneResult,
+  type ReadColdClonePageResult,
   type ReadUploadObjectResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
+  type WorkerColdPackMeta,
+  type WorkerColdPackRow,
   type WorkerLooseEntry,
   type WorkerPackedEntry,
   type WorkerUploadPackMeta,
@@ -1382,8 +1390,43 @@ export class RepoCell extends DurableObject<Env> {
     const storageKey = this.storageKey(repo);
     let result: PlanWorkerWarmCloneResult = { tag: "miss" };
     this.store.tx(() => {
-      if (!this.store.reachableCacheValid()) return;
       if (!wantsAreAllTips(this.store, wants)) return;
+      const version = this.store.reachableVersion();
+      if (this.store.getMeta("clean_pack_version") === version && this.store.getMeta("has-loose") !== "1") {
+        const activeCount = this.store.packs.activePackCount();
+        const activeR2 = activeCount === 1 ? this.store.packs.activeR2PacksForCompaction(2) : [];
+        if (activeCount === 1 && activeR2.length === 1) {
+          const single = activeR2[0]!;
+          if (single.cleanReachable && single.packBytes > 0 && single.objectCount > 0) {
+            const plan = planFetchInsideTransaction(this.store, { generation: version });
+            if (plan.tag === "leased") {
+              const r2Key = packR2Key(storageKey, single.packKey);
+              result = {
+                tag: "leased",
+                planId: plan.planId,
+                expiresAt: plan.expiresAt,
+                total: single.objectCount,
+                packs: [
+                  {
+                    packKey: single.packKey,
+                    r2Key,
+                    location: "r2",
+                    packBytes: single.packBytes,
+                    objectCount: single.objectCount,
+                    reachableCount: single.objectCount,
+                    indexedCount: single.objectCount,
+                  },
+                ],
+                hasLoose: false,
+                passthroughPackKey: single.packKey,
+                passthroughR2Key: r2Key,
+              };
+            }
+            return;
+          }
+        }
+      }
+      if (!this.store.reachableCacheValid()) return;
       const total = this.store.reachableCount();
       const rawPacks = this.store.reachablePackSummary();
       const hasLoose = this.store.hasLooseReachable();
@@ -1421,6 +1464,90 @@ export class RepoCell extends DurableObject<Env> {
       };
     });
     return result;
+  }
+
+  /**
+   * Plan a Worker-streamed cold full clone when SQLite `reachable` is absent/stale
+   * and the repository is large (`>= minBytes`) or fragmented (`>= minPacks`)
+   * enough to avoid DO 1 MiB Range loops (SPEC-0024 M4.4b).
+   */
+  async planWorkerColdFullClone(
+    repo: string,
+    wants: string[],
+    opts: PlanWorkerColdCloneOptions = {}
+  ): Promise<PlanWorkerColdCloneResult> {
+    this.rpcBind();
+    const storageKey = this.storageKey(repo);
+    const minBytes = opts.minBytes ?? DEFAULT_WORKER_COLD_CLONE_MIN_BYTES;
+    const minPacks = opts.minPacks ?? DEFAULT_WORKER_COLD_CLONE_MIN_PACKS;
+    let result: PlanWorkerColdCloneResult = { tag: "miss" };
+    this.store.tx(() => {
+      if (!wantsAreAllTips(this.store, wants)) return;
+      if (this.store.getMeta("has-loose") === "1") return;
+      const activeCount = this.store.packs.activePackCount();
+      if (activeCount <= 0) return;
+      const r2Packs = this.store.packs.activeR2PacksForCompaction(activeCount);
+      if (r2Packs.length !== activeCount) return;
+      const totalPackBytes = r2Packs.reduce((sum, p) => sum + p.packBytes, 0);
+      if (totalPackBytes < minBytes && activeCount < minPacks) return;
+
+      const tipSet = new Set<string>();
+      const headTip = this.store.resolveHead();
+      if (headTip) tipSet.add(headTip);
+      for (const r of this.store.refs()) tipSet.add(r.oid);
+      const tipOids = [...tipSet];
+      if (tipOids.length === 0) return;
+
+      const plan = planFetchInsideTransaction(this.store, {
+        generation: this.store.reachableVersion(),
+      });
+      if (plan.tag !== "leased") return;
+
+      const packs: WorkerColdPackMeta[] = r2Packs.map((p) => ({
+        packKey: p.packKey,
+        r2Key: packR2Key(storageKey, p.packKey),
+        idxR2Key: idxR2Key(storageKey, p.packKey),
+        prefR2Key: prefR2Key(storageKey, p.packKey),
+        prefBytes: p.prefBytes ?? 0,
+        packBytes: p.packBytes,
+        objectCount: p.objectCount,
+      }));
+      result = {
+        tag: "leased",
+        planId: plan.planId,
+        expiresAt: plan.expiresAt,
+        packs,
+        tipOids,
+      };
+    });
+    return result;
+  }
+
+  /** Offset-ordered pack_objects keyset page for Worker cold clone streaming (SPEC-0024 M4.4b). */
+  async readColdClonePackPage(
+    planId: string,
+    packKey: string,
+    afterOffset: number,
+    limit: number
+  ): Promise<ReadColdClonePageResult> {
+    this.rpcBind();
+    if (planId) {
+      const auth = renewAndAuthorizeRead(this.store, planId, packKey, null);
+      if (auth.tag !== "authorized") return { tag: "rejected", reason: auth.reason };
+    }
+    const clamped = Math.min(Math.max(Math.trunc(limit) || 1, 1), 4096);
+    const raw = this.store.packs.indexRowsInPackAfterOffset(packKey, afterOffset, clamped + 1);
+    const hasMore = raw.length > clamped;
+    const rows: WorkerColdPackRow[] = raw.slice(0, clamped).map((r) => ({
+      oid: r.oid,
+      offset: r.offset,
+      dataOff: r.dataOff,
+      dataLen: r.dataLen,
+      type: r.type,
+      entrySize: r.entrySize,
+      baseOid: r.baseOid,
+    }));
+    return { tag: "ok", rows, hasMore };
   }
 
   /**
@@ -1552,10 +1679,17 @@ export class RepoCell extends DurableObject<Env> {
     const inputKeys = inputs.map((r) => r.packKey);
 
     const reachableValid = this.store.reachableCacheValid();
-    const hasLoose = reachableValid ? this.store.hasLooseReachable() : true;
+    const hasLooseStore = this.store.getMeta("has-loose") === "1";
+    const hasLoose = reachableValid ? this.store.hasLooseReachable() : hasLooseStore;
     const allActiveR2 = selected.length === activePacks;
     const reachableOnly = reachableValid && allActiveR2 && !hasLoose;
     const cleanReachable = reachableOnly;
+    const refsVersion = this.store.reachableVersion();
+    const tipSet = new Set<string>();
+    const headTip = this.store.resolveHead();
+    if (headTip) tipSet.add(headTip);
+    for (const r of this.store.refs()) tipSet.add(r.oid);
+    const tipOids = [...tipSet];
 
     const expectedObjects = this.store.packs.countObjectsInPacks(inputKeys, reachableOnly);
     const maxInputTier = selected.reduce((m, r) => Math.max(m, r.tier ?? 0), 0);
@@ -1575,6 +1709,7 @@ export class RepoCell extends DurableObject<Env> {
       outputPackR2Key,
       outputIdxR2Key,
       outputPrefR2Key,
+      refsVersion,
     };
     this.store.createLease(leaseToken, "compaction", expiresAt, JSON.stringify(payload));
     return {
@@ -1586,6 +1721,10 @@ export class RepoCell extends DurableObject<Env> {
       expectedObjects,
       reachableOnly,
       cleanReachable,
+      allActiveR2,
+      hasLoose: hasLooseStore,
+      refsVersion,
+      tipOids,
       tier,
       outputPackKey,
       outputPackR2Key,
@@ -1666,12 +1805,25 @@ export class RepoCell extends DurableObject<Env> {
         result = { tag: "lease_lost", reason: "output pack key mismatch" };
         return;
       }
-      this.store.packs.publishStagedCompaction(leaseToken, output, parsed.inputs);
+      const hasLooseNow = this.store.getMeta("has-loose") === "1";
+      const currentRefsVersion = this.store.reachableVersion();
+      const verifiedClean =
+        output.cleanReachable &&
+        !hasLooseNow &&
+        (!parsed.refsVersion || parsed.refsVersion === currentRefsVersion);
+      this.store.packs.publishStagedCompaction(
+        leaseToken,
+        { ...output, cleanReachable: verifiedClean },
+        parsed.inputs
+      );
       this.store.deleteLease(leaseToken);
       const remaining = this.store.packs.activePackCount();
       this.store.setMeta("gc_wanted_at", String(Date.now()));
       if (remaining <= COMPACTION_ACTIVE_PACK_THRESHOLD) {
         this.store.setMeta("compaction_wanted_at", "");
+      }
+      if (verifiedClean && remaining === 1) {
+        this.store.setMeta("clean_pack_version", currentRefsVersion);
       }
       committed = true;
       const headOid = this.store.resolveHead();
@@ -1679,12 +1831,12 @@ export class RepoCell extends DurableObject<Env> {
       if (headOid) refs.push({ name: "HEAD", oid: headOid });
       for (const r of this.store.refs()) refs.push({ name: r.name, oid: r.oid });
       const storageKey = this.store.getMeta("storage_key") ?? this.store.getMeta("repo") ?? "";
-      const refsVersion = this.store.reachableVersion();
       result = {
         tag: "committed",
         activePacksRemaining: remaining,
+        cleanReachable: verifiedClean,
         storageKey,
-        refsVersion,
+        refsVersion: currentRefsVersion,
         refs,
       };
     });

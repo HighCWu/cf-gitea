@@ -121,6 +121,8 @@ export interface CompactionLeasePayload {
   outputPackR2Key?: string;
   outputIdxR2Key?: string;
   outputPrefR2Key?: string;
+  /** refs_version snapshot captured at beginQueueCompaction to certify clean_reachable on commit */
+  refsVersion?: string;
 }
 
 /** What a compaction round needs from its host (RepoCell contributes the DO

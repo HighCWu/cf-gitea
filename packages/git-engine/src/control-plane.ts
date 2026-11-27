@@ -1073,6 +1073,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
         store.setMeta("created", "1");
         store.setMeta("last-push", String(Date.now()));
       }
+      store.setMeta("clean_pack_version", "");
       if (applied.needsGc) {
         // Anti-leakage (SPEC-0024 §2.2 / M4.3): ref deletion or force-push
         // orphans commits that may still reside inside the cached base bundle.
