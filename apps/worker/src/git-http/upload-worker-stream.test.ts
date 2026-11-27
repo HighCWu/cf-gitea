@@ -2,6 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   createDurableGit,
+  ResumableR2PackStream,
   UPLOAD_KEEPALIVE_FRAME,
   type Env,
   type RepoCell,
@@ -679,5 +680,120 @@ describe("SPEC-0024 M4.0 Worker streaming upload-pack", () => {
     const plainParsed = parsePlainV0Response(plainBytes);
     expect(plainParsed.preamble).toBe("NAK\n");
     await assertValidPack(plainParsed.pack, 3);
+  });
+
+  it("streams large packs in bounded R2 Range segments and resumes seamlessly on mid-segment read stalls (M4.11)", async () => {
+    const payload = new Uint8Array(100);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 7 + 3) & 0xff;
+
+    // 1. Small pack (<= segmentBytes) uses a single plain bucket.get without range.
+    const smallGets: Array<{ key: string; options?: R2GetOptions }> = [];
+    const smallBucket = {
+      get: (key: string, options?: R2GetOptions) => {
+        smallGets.push({ key, options });
+        return Promise.resolve({
+          body: new ReadableStream<Uint8Array>({
+            start(ctrl) {
+              ctrl.enqueue(payload);
+              ctrl.close();
+            },
+          }),
+        } as unknown as R2ObjectBody);
+      },
+    } as unknown as R2Bucket;
+    const smallAuth: boolean[] = [];
+    const smallStream = new ResumableR2PackStream(
+      smallBucket,
+      "packs/small.pack",
+      payload.length,
+      (isFirst) => {
+        smallAuth.push(isFirst);
+        return Promise.resolve();
+      },
+      { segmentBytes: 128 },
+    );
+    const smallOut: Uint8Array[] = [];
+    for (;;) {
+      const c = await smallStream.nextChunk();
+      if (!c) break;
+      smallOut.push(c);
+    }
+    expect(concatU8(smallOut)).toEqual(payload);
+    expect(smallGets).toEqual([{ key: "packs/small.pack", options: undefined }]);
+    expect(smallAuth).toEqual([true]);
+
+    // 2. Multi-segment pack with a stalled second read recovers via Range GET at exact offset.
+    const ranges: Array<{ offset?: number; length?: number }> = [];
+    const authCalls: boolean[] = [];
+    let stalledOnce = false;
+    const segmentedBucket = {
+      get: (_key: string, options?: R2GetOptions) => {
+        const range = (options?.range ?? {}) as { offset?: number; length?: number };
+        ranges.push(range);
+        const start = range.offset ?? 0;
+        const len = range.length ?? payload.length - start;
+        const slice = payload.subarray(start, start + len);
+        return Promise.resolve({
+          body: new ReadableStream<Uint8Array>({
+            start(ctrl) {
+              if (start === 40 && !stalledOnce) {
+                stalledOnce = true;
+                // Emit partial 10 bytes then stall past 40ms timeout.
+                ctrl.enqueue(slice.subarray(0, 10));
+                return;
+              }
+              ctrl.enqueue(slice);
+              ctrl.close();
+            },
+          }),
+        } as unknown as R2ObjectBody);
+      },
+    } as unknown as R2Bucket;
+
+    const segStream = new ResumableR2PackStream(
+      segmentedBucket,
+      "packs/large.pack",
+      payload.length,
+      (isFirst) => {
+        authCalls.push(isFirst);
+        return Promise.resolve();
+      },
+      { segmentBytes: 40, readTimeoutMs: 40, maxRetriesPerSegment: 2 },
+    );
+    const outChunks: Uint8Array[] = [];
+    for (;;) {
+      const c = await segStream.nextChunk();
+      if (!c) break;
+      outChunks.push(c);
+    }
+    expect(concatU8(outChunks)).toEqual(payload);
+    expect(segStream.bytesRead()).toBe(payload.length);
+    expect(ranges).toEqual([
+      { offset: 0, length: 40 },
+      { offset: 40, length: 40 },
+      { offset: 50, length: 30 },
+      { offset: 80, length: 20 },
+    ]);
+    expect(authCalls).toEqual([true, false, false, false]);
+
+    // 3. Exhausting maxRetriesPerSegment fails closed with error.
+    const alwaysHangBucket = {
+      get: () =>
+        Promise.resolve({
+          body: new ReadableStream<Uint8Array>({
+            start() {
+              // Never enqueues or closes.
+            },
+          }),
+        } as unknown as R2ObjectBody),
+    } as unknown as R2Bucket;
+    const failStream = new ResumableR2PackStream(
+      alwaysHangBucket,
+      "packs/hang.pack",
+      100,
+      () => Promise.resolve(),
+      { segmentBytes: 40, readTimeoutMs: 25, maxRetriesPerSegment: 1 },
+    );
+    await expect(failStream.nextChunk()).rejects.toThrow(/stalled/);
   });
 });

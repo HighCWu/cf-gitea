@@ -17,6 +17,8 @@ export const UPLOAD_KEEPALIVE_FRAME = te.encode("0005\x01");
 export const DEFAULT_UPLOAD_KEEPALIVE_MS = 20_000;
 export const WORKER_UPLOAD_PAGE_SIZE = 4096;
 export const WORKER_UPLOAD_RENEW_BYTES = 32 * 1024 * 1024;
+export const WORKER_PASSTHROUGH_SEGMENT_BYTES = 32 * 1024 * 1024;
+export const WORKER_PASSTHROUGH_READ_TIMEOUT_MS = 30_000;
 export const DEFAULT_WORKER_COLD_CLONE_MIN_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_WORKER_COLD_CLONE_MIN_PACKS = 8;
 
@@ -318,6 +320,160 @@ export class SequentialR2PackReader {
   }
 }
 
+export interface ResumableR2PackStreamOptions {
+  segmentBytes?: number;
+  readTimeoutMs?: number;
+  maxRetriesPerSegment?: number;
+}
+
+/**
+ * Segmented & stall-resilient R2 pack passthrough reader (SPEC-0024 M4.11):
+ * - Uses 1 plain `bucket.get(key)` when `totalBytes <= segmentBytes` (<= 32 MiB) or unknown.
+ * - Streams large packs in bounded `segmentBytes` (32 MiB) R2 Range GETs (~41 subrequests for 1.3 GiB),
+ *   authorizing/renewing the SPEC-0011 read lease before every segment.
+ * - Guards every `reader.read()` with a bounded stall timeout (`readTimeoutMs`, default 30s) and
+ *   resumes seamlessly via R2 Range GET at the exact committed byte `offset`.
+ */
+export class ResumableR2PackStream {
+  private readonly segmentBytes: number;
+  private readonly readTimeoutMs: number;
+  private readonly maxRetriesPerSegment: number;
+  private offset = 0;
+  private segmentEnd = 0;
+  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  private unboundedEof = false;
+  private segmentRetries = 0;
+  private closed = false;
+
+  constructor(
+    private readonly bucket: R2Bucket,
+    private readonly r2Key: string,
+    private readonly totalBytes: number,
+    private readonly authorizeSegment: (isFirst: boolean) => Promise<void>,
+    opts?: ResumableR2PackStreamOptions
+  ) {
+    this.segmentBytes = Math.max(1, Math.trunc(opts?.segmentBytes ?? WORKER_PASSTHROUGH_SEGMENT_BYTES));
+    this.readTimeoutMs = Math.max(10, Math.trunc(opts?.readTimeoutMs ?? WORKER_PASSTHROUGH_READ_TIMEOUT_MS));
+    this.maxRetriesPerSegment = Math.max(0, Math.trunc(opts?.maxRetriesPerSegment ?? 3));
+  }
+
+  bytesRead(): number {
+    return this.offset;
+  }
+
+  private async cancelCurrentReader(): Promise<void> {
+    if (!this.reader) return;
+    const r = this.reader;
+    this.reader = null;
+    try {
+      await r.cancel();
+    } catch {
+      // best effort cleanup
+    }
+  }
+
+  private async readWithTimeout(
+    reader: ReadableStreamDefaultReader<Uint8Array>
+  ): Promise<ReadableStreamReadResult<Uint8Array>> {
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timerId = setTimeout(() => {
+          reject(new Error(`passthrough R2 read stalled after ${this.readTimeoutMs}ms at offset ${this.offset}`));
+        }, this.readTimeoutMs);
+      });
+      return await Promise.race([reader.read(), timeoutPromise]);
+    } finally {
+      if (timerId !== null) clearTimeout(timerId);
+    }
+  }
+
+  private async openNextReader(): Promise<ReadableStreamDefaultReader<Uint8Array>> {
+    const isFirst = this.offset === 0;
+    await this.authorizeSegment(isFirst);
+    if (this.totalBytes <= 0 || (isFirst && this.totalBytes <= this.segmentBytes)) {
+      this.segmentEnd = this.totalBytes > 0 ? this.totalBytes : Number.MAX_SAFE_INTEGER;
+      const obj = await this.bucket.get(this.r2Key);
+      if (!obj) {
+        throw new Error(`missing passthrough R2 pack ${this.r2Key}`);
+      }
+      return obj.body.getReader();
+    }
+    if (this.segmentEnd <= this.offset) {
+      this.segmentEnd = Math.min(this.totalBytes, this.offset + this.segmentBytes);
+    }
+    const len = this.segmentEnd - this.offset;
+    const obj = await this.bucket.get(this.r2Key, { range: { offset: this.offset, length: len } });
+    if (!obj) {
+      throw new Error(`missing passthrough R2 pack ${this.r2Key} at offset ${this.offset}`);
+    }
+    return obj.body.getReader();
+  }
+
+  async nextChunk(): Promise<Uint8Array | null> {
+    if (this.closed || this.unboundedEof) return null;
+    if (this.totalBytes > 0 && this.offset >= this.totalBytes) return null;
+
+    for (;;) {
+      if (this.closed) return null;
+      if (this.totalBytes > 0 && this.offset >= this.totalBytes) return null;
+
+      if (!this.reader) {
+        this.reader = await this.openNextReader();
+      }
+
+      let res: ReadableStreamReadResult<Uint8Array>;
+      try {
+        res = await this.readWithTimeout(this.reader);
+      } catch (err) {
+        await this.cancelCurrentReader();
+        if (this.closed || this.totalBytes <= 0 || this.segmentRetries >= this.maxRetriesPerSegment) {
+          throw err;
+        }
+        this.segmentRetries++;
+        continue;
+      }
+
+      if (res.done) {
+        this.reader = null;
+        if (this.totalBytes <= 0) {
+          this.unboundedEof = true;
+          return null;
+        }
+        if (this.offset < this.segmentEnd) {
+          if (this.segmentRetries >= this.maxRetriesPerSegment) {
+            throw new Error(
+              `truncated passthrough R2 pack ${this.r2Key} (${this.offset}/${this.segmentEnd} bytes)`
+            );
+          }
+          this.segmentRetries++;
+          continue;
+        }
+        this.segmentRetries = 0;
+        if (this.offset >= this.totalBytes) return null;
+        continue;
+      }
+
+      const value = res.value;
+      if (!value || value.length === 0) continue;
+      if (this.totalBytes > 0 && this.offset + value.length > this.segmentEnd) {
+        await this.cancelCurrentReader();
+        throw new Error(
+          `passthrough R2 segment overrun on ${this.r2Key}: ${this.offset + value.length} > ${this.segmentEnd}`
+        );
+      }
+      this.offset += value.length;
+      return value;
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    await this.cancelCurrentReader();
+  }
+}
+
 export interface StreamWorkerWarmCloneOptions {
   bucket: R2Bucket;
   stub: WorkerUploadStub;
@@ -412,29 +568,21 @@ export function streamWorkerWarmFullClone(opts: StreamWorkerWarmCloneOptions): R
   const preamble = pkt(v2 ? "packfile\n" : "NAK\n");
 
   if (passthrough) {
-    let rawReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-    let opened = false;
-    let started = false;
-    let bytesRead = 0;
-    let bytesSinceRenew = 0;
-
-    activeReader = {
-      close: async () => {
-        if (!rawReader) return;
-        const r = rawReader;
-        rawReader = null;
-        try {
-          await r.cancel();
-        } catch {
-          // best effort
-        }
-      },
-    };
+    const totalBytes = plan.packs[0]?.packBytes ?? 0;
+    const passthroughStream = new ResumableR2PackStream(
+      bucket,
+      plan.passthroughR2Key!,
+      totalBytes,
+      async (isFirst) => {
+        if (isFirst) await ensureLeaseValid(plan.passthroughPackKey);
+        else await forceRenewLease(plan.passthroughPackKey);
+      }
+    );
+    activeReader = passthroughStream;
 
     const stream = new ReadableStream<Uint8Array>({
       start: (ctrl) => {
         ctrlRef = ctrl;
-        started = true;
         enqueue(ctrl, preamble);
         if (sideband && !noProgress) {
           for (const f of uploadSidebandFrames(2, te.encode(`Enumerating objects: ${plan.total}, done.\n`))) {
@@ -446,40 +594,26 @@ export function streamWorkerWarmFullClone(opts: StreamWorkerWarmCloneOptions): R
         inPull = true;
         try {
           checkAborted();
-          if (!opened) {
-            opened = true;
-            await ensureLeaseValid(plan.passthroughPackKey);
-            const obj = await bucket.get(plan.passthroughR2Key!);
-            if (!obj) {
-              throw new Error(`missing passthrough R2 pack ${plan.passthroughR2Key}`);
-            }
-            rawReader = obj.body.getReader();
-          }
-          if (bytesSinceRenew >= WORKER_UPLOAD_RENEW_BYTES || Date.now() >= leaseExpiresAt - READ_RENEW_MARGIN_MS) {
-            bytesSinceRenew = 0;
-            await forceRenewLease(plan.passthroughPackKey);
-          }
-          const { done, value } = await rawReader!.read();
+          const value = await passthroughStream.nextChunk();
           checkAborted();
-          if (done) {
-            if (!started || bytesRead < 32) {
-              throw new Error(`truncated passthrough R2 pack ${plan.passthroughR2Key} (${bytesRead} bytes)`);
+          if (value === null) {
+            if (passthroughStream.bytesRead() < 32) {
+              throw new Error(
+                `truncated passthrough R2 pack ${plan.passthroughR2Key} (${passthroughStream.bytesRead()} bytes)`
+              );
             }
             stopTimer();
-            rawReader = null;
+            await passthroughStream.close();
+            activeReader = null;
             await releaseLeaseBestEffort();
             if (sideband) enqueue(ctrl, FLUSH);
             ctrl.close();
             return;
           }
-          if (value && value.length > 0) {
-            bytesRead += value.length;
-            bytesSinceRenew += value.length;
-            if (sideband) {
-              for (const f of uploadSidebandFrames(1, value)) enqueue(ctrl, f);
-            } else {
-              enqueue(ctrl, value);
-            }
+          if (sideband) {
+            for (const f of uploadSidebandFrames(1, value)) enqueue(ctrl, f);
+          } else {
+            enqueue(ctrl, value);
           }
         } catch (err) {
           stopTimer();
@@ -799,9 +933,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
   });
 
   let phase1Done = false;
-  let passthroughReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  let passthroughBytesRead = 0;
-  let passthroughBytesSinceRenew = 0;
+  let passthroughStream: ResumableR2PackStream | null = null;
   const present = new OidSet(4096);
   let reachableCount = 0;
   const emittedOids = new OidSet(4096);
@@ -830,20 +962,16 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           isCleanReachablePref(idxView.rawOidTable, prefView, plan.tipOids)
         ) {
           clearIdxV2Cache();
-          const packObj = await bucket.get(single.r2Key);
-          if (!packObj) throw new Error(`missing cold R2 pack ${single.r2Key}`);
-          const reader = packObj.body.getReader();
-          passthroughReader = reader;
-          activeReader = {
-            close: async () => {
-              if (passthroughReader === reader) passthroughReader = null;
-              try {
-                await reader.cancel();
-              } catch {
-                // best effort
-              }
-            },
-          };
+          passthroughStream = new ResumableR2PackStream(
+            bucket,
+            single.r2Key,
+            single.packBytes,
+            async (isFirst) => {
+              if (isFirst) await ensureLeaseValid(single.packKey);
+              else await forceRenewLease(single.packKey);
+            }
+          );
+          activeReader = passthroughStream;
           if (sideband && !noProgress) {
             for (const f of uploadSidebandFrames(2, te.encode(`Enumerating objects: ${single.objectCount}, done.\n`))) {
               enqueue(ctrl, f);
@@ -1086,37 +1214,29 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           await runPhase1(ctrl);
           checkAborted();
         }
-        if (passthroughReader) {
+        if (passthroughStream) {
           const single = plan.packs[0]!;
-          if (
-            passthroughBytesSinceRenew >= WORKER_UPLOAD_RENEW_BYTES ||
-            Date.now() >= leaseExpiresAt - READ_RENEW_MARGIN_MS
-          ) {
-            passthroughBytesSinceRenew = 0;
-            await forceRenewLease(single.packKey);
-          }
-          const { done, value } = await passthroughReader.read();
+          const value = await passthroughStream.nextChunk();
           checkAborted();
-          if (done) {
-            if (passthroughBytesRead < 32) {
-              throw new Error(`truncated cold passthrough R2 pack ${single.r2Key} (${passthroughBytesRead} bytes)`);
+          if (value === null) {
+            if (passthroughStream.bytesRead() < 32) {
+              throw new Error(
+                `truncated cold passthrough R2 pack ${single.r2Key} (${passthroughStream.bytesRead()} bytes)`
+              );
             }
             stopTimer();
-            passthroughReader = null;
+            await passthroughStream.close();
+            passthroughStream = null;
             activeReader = null;
             await releaseLeaseBestEffort();
             if (sideband) enqueue(ctrl, FLUSH);
             ctrl.close();
             return;
           }
-          if (value && value.length > 0) {
-            passthroughBytesRead += value.length;
-            passthroughBytesSinceRenew += value.length;
-            if (sideband) {
-              for (const f of uploadSidebandFrames(1, value)) enqueue(ctrl, f);
-            } else {
-              enqueue(ctrl, value);
-            }
+          if (sideband) {
+            for (const f of uploadSidebandFrames(1, value)) enqueue(ctrl, f);
+          } else {
+            enqueue(ctrl, value);
           }
           return;
         }

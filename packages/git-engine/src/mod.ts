@@ -245,6 +245,9 @@ export { copyObject, replicateForkCatalog } from "./fork/replicate";
 export {
   DEFAULT_WORKER_COLD_CLONE_MIN_BYTES,
   DEFAULT_WORKER_COLD_CLONE_MIN_PACKS,
+  ResumableR2PackStream,
+  WORKER_PASSTHROUGH_READ_TIMEOUT_MS,
+  WORKER_PASSTHROUGH_SEGMENT_BYTES,
   parseWorkerColdCloneMinBytes,
   streamWorkerColdFullClone,
   streamWorkerWarmFullClone,
@@ -258,6 +261,7 @@ export {
   type ReadUploadObjectsResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
+  type ResumableR2PackStreamOptions,
   type StreamWorkerColdCloneOptions,
   type WorkerColdPackMeta,
   type WorkerColdPackRow,
