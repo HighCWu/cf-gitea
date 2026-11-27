@@ -703,4 +703,63 @@ describe("SPEC-0024 M4.1 Queue streaming compaction, OFS_DELTA & .pref sidecars"
     }
     expect(objectRpcCalls).toBe(0);
   });
+
+  it("keeps Queue compaction reachableOnly=false even when reachable cache is warm and invalidates cache on new-ref push", async () => {
+    const h = engine();
+    const repo = `m410/complete-${crypto.randomUUID().slice(0, 8)}`;
+    const baseEnv = m41Env();
+
+    const p1 = await buildFullCommitPack({
+      fileName: "one.txt",
+      content: "first pack content\n",
+      message: "commit 1",
+      time: 1700010100,
+    });
+    await pushPack(h, baseEnv, repo, "refs/heads/main", ZERO_OID, p1.oid, p1.pack);
+
+    // Warm DO reachable cache on refs/heads/main.
+    const warm = await h.fetch(
+      new Request(`https://engine.internal/${repo}.git/git-upload-pack`, {
+        method: "POST",
+        headers: { "content-type": UPLOAD_CT, "git-protocol": "version=2" },
+        body: buildV2FetchRequest([p1.oid]),
+      }),
+      baseEnv,
+      NOOP_CTX,
+    );
+    expect(warm.status).toBe(200);
+    await warm.arrayBuffer();
+
+    // Push a second pack creating a new branch ref pointing at p1 + new commit p2.
+    const p2 = await buildFullCommitPack({
+      fileName: "two.txt",
+      content: "second branch content\n",
+      message: "commit 2",
+      parentOid: p1.oid,
+      time: 1700010200,
+    });
+    await pushPack(h, baseEnv, repo, "refs/heads/feature", ZERO_OID, p2.oid, p2.pack);
+
+    const stub = env.REPO.getByName(repo);
+    const plan = await stub.beginQueueCompaction(repo, { force: true });
+    expect(plan.tag).toBe("ready");
+    if (plan.tag === "ready") {
+      expect(plan.reachableOnly).toBe(false);
+      expect(plan.cleanReachable).toBe(false);
+      expect(plan.expectedObjects).toBe(6);
+      await stub.abortQueueCompaction(plan.leaseToken);
+    }
+
+    const res = await runQueueCompaction({
+      bucket: env.REPO_PACKS,
+      stub,
+      repo,
+      force: true,
+    });
+    expect(res.tag).toBe("compacted");
+    if (res.tag === "compacted") {
+      expect(res.objects).toBe(6);
+      expect(res.cleanReachable).toBe(true);
+    }
+  });
 });

@@ -6,6 +6,7 @@ import { OidSet } from "../git/oidset";
 import { extractObjectRefBytes, isCleanReachablePref, parsePackRefIndex } from "../git/pref";
 import { ObjCache } from "../receive/objcache";
 import { loadPackIdxV2 } from "../receive/idx-reader";
+import { clearIdxV2Cache } from "../receive/idx-reader";
 import { inflateAll } from "../receive/scan";
 import { READ_RENEW_MARGIN_MS, type ReleaseReadResult, type RenewReadResult } from "../read-leases";
 
@@ -828,6 +829,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           prefView.objectCount === idxView.objectCount &&
           isCleanReachablePref(idxView.rawOidTable, prefView, plan.tipOids)
         ) {
+          clearIdxV2Cache();
           const packObj = await bucket.get(single.r2Key);
           if (!packObj) throw new Error(`missing cold R2 pack ${single.r2Key}`);
           const reader = packObj.body.getReader();

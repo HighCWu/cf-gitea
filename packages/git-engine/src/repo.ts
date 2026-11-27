@@ -1725,12 +1725,13 @@ export class RepoCell extends DurableObject<Env> {
     }));
     const inputKeys = inputs.map((r) => r.packKey);
 
-    const reachableValid = this.store.reachableCacheValid();
     const hasLooseStore = this.store.getMeta("has-loose") === "1";
-    const hasLoose = reachableValid ? this.store.hasLooseReachable() : hasLooseStore;
+    const hasLoose = hasLooseStore;
     const allActiveR2 = selected.length === activePacks;
-    const reachableOnly = reachableValid && allActiveR2 && !hasLoose;
-    const cleanReachable = reachableOnly;
+    // Always preserve every indexed row across inputs (matching DO runCompaction) and
+    // verify cleanReachable directly on the compacted pack via isCleanReachableCompact.
+    const reachableOnly = false;
+    const cleanReachable = false;
     const refsVersion = this.store.reachableVersion();
     const tipSet = new Set<string>();
     const headTip = this.store.resolveHead();

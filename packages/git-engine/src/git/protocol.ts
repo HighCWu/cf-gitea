@@ -1897,6 +1897,7 @@ export function commitPush(
   const results: CommandResult[] = [];
   let changed = false;
   let needsGc = false;
+  let hasNewRef = false;
   let casMismatch = false;
 
   // verdict pass (no writes): every CAS is checked before any ref moves, so
@@ -1935,6 +1936,7 @@ export function commitPush(
       store.delRef(d.ref);
       needsGc = true;
     } else {
+      if (d.expectedOld === ZERO_OID) hasNewRef = true;
       store.setRef(d.ref, d.set!);
       if (d.forced) needsGc = true; // forced update strands old history
     }
@@ -1960,7 +1962,7 @@ export function commitPush(
   // describing a command that did not apply) invalidates it, so the next full
   // clone rebuilds by walking rather than risk serving unreachable objects.
   if (changed) {
-    if (plan.hadCache && !needsGc && !casMismatch) store.extendReachable(plan.known);
+    if (plan.hadCache && !needsGc && !casMismatch && !hasNewRef) store.extendReachable(plan.known);
     else store.invalidateReachable();
   }
   return { results, changed, needsGc };
