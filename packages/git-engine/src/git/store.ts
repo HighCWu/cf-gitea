@@ -64,6 +64,16 @@ export interface PackedReachable {
   baseOid: string | null;
 }
 
+/** Per-pack summary of reachable packed objects for Worker streaming (SPEC-0024 M4.0). */
+export interface ReachablePackSummary {
+  packKey: string;
+  location: "r2" | "sqlite";
+  packBytes: number;
+  objectCount: number;
+  reachableCount: number;
+  indexedCount: number;
+}
+
 const CHUNK = 1024 * 1024; // stay well under the DO SQLite per-row limit
 // serving cache: Workers isolates have a hard 128MB total, so stay modest
 // there; self-hosted celld nodes run with multi-GB heaps
@@ -838,5 +848,101 @@ export class GitStore {
       )
       .toArray()
       .map((r) => r.oid);
+  }
+
+  /** True when the current reachable set contains at least one loose object. */
+  hasLooseReachable(): boolean {
+    this.assertOpen();
+    const rows = this.sql
+      .exec<{ oid: string }>(
+        `SELECT r.oid FROM reachable r
+          WHERE NOT EXISTS (SELECT 1 FROM pack_objects p WHERE p.oid = r.oid)
+          LIMIT 1`,
+      )
+      .toArray();
+    return rows.length > 0;
+  }
+
+  /**
+   * Per-pack reachable summary for Worker streaming upload-pack planning (SPEC-0024 M4.0).
+   * Counts only readable ('active' | 'retired') catalog entries. When a single pack is
+   * returned, also populates `indexedCount` so callers can prove zero unreachable objects
+   * reside inside it (`indexedCount === objectCount === reachableCount`).
+   */
+  reachablePackSummary(): ReachablePackSummary[] {
+    this.assertOpen();
+    const rows = this.sql
+      .exec<{
+        pack_key: string;
+        location: string;
+        pack_bytes: number;
+        object_count: number;
+        reachable_count: number;
+      }>(
+        `SELECT p.pack_key, c.location, c.pack_bytes, c.object_count, COUNT(*) AS reachable_count
+           FROM reachable r
+           JOIN pack_objects p ON p.oid = r.oid
+           JOIN pack_catalog c ON c.pack_key = p.pack_key
+          WHERE c.state IN ('active', 'retired')
+          GROUP BY p.pack_key
+          ORDER BY p.pack_key`,
+      )
+      .toArray();
+    return rows.map((r) => ({
+      packKey: r.pack_key,
+      location: r.location === "sqlite" ? "sqlite" : "r2",
+      packBytes: r.pack_bytes,
+      objectCount: r.object_count,
+      reachableCount: r.reachable_count,
+      indexedCount: rows.length === 1 ? this.packs.countPackRows(r.pack_key) : 0,
+    }));
+  }
+
+  /**
+   * Keyset page of reachable objects within a single pack in ascending `offset` order,
+   * paired with whether each delta base is also inside `reachable` (avoiding per-row
+   * `reachableHas` RPC round-trips on Worker streaming).
+   */
+  reachablePackedInPackAfter(
+    packKey: string,
+    afterOffset: number,
+    limit: number,
+  ): Array<PackedReachable & { baseInPack: boolean }> {
+    this.assertOpen();
+    return this.sql
+      .exec<{
+        oid: string;
+        pack_key: string;
+        offset: number;
+        data_off: number;
+        data_len: number;
+        type: ObjType;
+        entry_size: number;
+        base_oid: string | null;
+        base_in_pack: number;
+      }>(
+        `SELECT p.oid, p.pack_key, p.offset, p.data_off, p.data_len, p.type, p.entry_size, p.base_oid,
+                CASE WHEN p.base_oid IS NOT NULL AND EXISTS (SELECT 1 FROM reachable rb WHERE rb.oid = p.base_oid) THEN 1 ELSE 0 END AS base_in_pack
+           FROM reachable r
+           JOIN pack_objects p ON p.oid = r.oid
+          WHERE p.pack_key = ? AND p.offset > ?
+          ORDER BY p.offset
+          LIMIT ?`,
+        packKey,
+        afterOffset,
+        limit,
+      )
+      .toArray()
+      .map((r) => ({
+        oid: r.oid,
+        packKey: r.pack_key,
+        offset: r.offset,
+        dataOff: r.data_off,
+        dataLen: r.data_len,
+        type: r.type,
+        entrySize: r.entry_size,
+        baseOid: r.base_oid,
+        baseInPack: r.base_in_pack === 1,
+      }));
   }
 }

@@ -12,6 +12,19 @@ import type { Registry, RepoInfo } from "./registry";
 import { esc, repoUrl, age, layout, htmlResponse, errorPage } from "./ui/html";
 import { CSS } from "./ui/style";
 import { parseUploadRequest, parsePushCommands, parsePushOptions, renderStatus, sidebandFrames, streamingCloneResponse, ATOMIC_PUSH_FAILED, type CommandResult, type PushCommand } from "./git/protocol";
+import {
+  streamWorkerWarmFullClone,
+  uploadKeepaliveMs,
+  UPLOAD_KEEPALIVE_FRAME,
+  type PlanWorkerWarmCloneResult,
+  type ReadUploadObjectResult,
+  type ReadWarmClonePageResult,
+  type ReadWarmLoosePageResult,
+  type WorkerLooseEntry,
+  type WorkerPackedEntry,
+  type WorkerUploadPackMeta,
+  type WorkerUploadStub,
+} from "./upload/stream";
 import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, beginRawMultipart } from "./git/multipart";
@@ -183,6 +196,19 @@ export type {
 } from "./fork/types";
 export type { ForkSourceRepo, ForkTargetRepo, ReplicateForkOpts, ReplicateForkResult } from "./fork/replicate";
 export { copyObject, replicateForkCatalog } from "./fork/replicate";
+export {
+  streamWorkerWarmFullClone,
+  uploadKeepaliveMs,
+  UPLOAD_KEEPALIVE_FRAME,
+  type PlanWorkerWarmCloneResult,
+  type ReadUploadObjectResult,
+  type ReadWarmClonePageResult,
+  type ReadWarmLoosePageResult,
+  type WorkerLooseEntry,
+  type WorkerPackedEntry,
+  type WorkerUploadPackMeta,
+  type WorkerUploadStub,
+} from "./upload/stream";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
@@ -669,6 +695,58 @@ async function serveCloneFromR2(
     expiresAt: plan.expiresAt,
     renew: () => stub.renewAndAuthorizeRead(plan.planId, plan.key, null),
     release: () => stub.releaseReadLease(plan.planId),
+  });
+}
+
+/**
+ * Worker-streamed warm full-clone handler (SPEC-0024 M4.0): runs instead of
+ * the clone-cache probe when `UPLOAD_PACK_WORKER_STREAM === "true"`, avoiding
+ * extra DO RPCs and synchronous inline R2 teeing while serving single-pack
+ * passthrough or multi-pack sequential streams directly from R2 with official
+ * `0005\x01` sideband keepalives.
+ */
+async function serveWorkerWarmClone(
+  env: Env,
+  repo: string,
+  body: Uint8Array,
+  stub: DurableObjectStub<RepoCell>,
+  signal?: AbortSignal | null
+): Promise<Response | null> {
+  if (env.UPLOAD_PACK_WORKER_STREAM !== "true") return null;
+  const bucket = env.REPO_PACKS;
+  if (!bucket) return null;
+  const req = parseUploadRequest(body);
+  // G3: unsupported fetch arguments must fall through cleanly to DO `uploadPack`
+  // so it returns a protocol ERR without touching R2 or planning RPCs.
+  if (req.badArgument) return null;
+  const v2 = req.command === "fetch";
+  const sideband = v2 || req.caps.has("side-band-64k");
+  const fullClone =
+    req.wants.length > 0 &&
+    req.wants.every(isOid) &&
+    req.haves.length === 0 &&
+    req.done &&
+    req.deepen.kind === "none" &&
+    req.filter.kind === "none" &&
+    req.clientShallows.length === 0 &&
+    (v2 || req.command === null);
+  if (!fullClone) return null;
+  let plan: PlanWorkerWarmCloneResult;
+  try {
+    plan = await stub.planWorkerWarmFullClone(repo, req.wants);
+  } catch {
+    return null;
+  }
+  if (plan.tag !== "leased") return null;
+  return streamWorkerWarmFullClone({
+    bucket,
+    stub,
+    plan,
+    v2,
+    sideband,
+    noProgress: req.caps.has("no-progress"),
+    keepaliveMs: uploadKeepaliveMs(env.GIT_UPLOAD_KEEPALIVE_MS),
+    signal,
   });
 }
 
@@ -2291,7 +2369,10 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
             }
           }
           if (env.REPO_PACKS && parsed.length) {
-            const hit = await serveCloneFromR2(env, repo, parsed, stub);
+            const hit =
+              env.UPLOAD_PACK_WORKER_STREAM === "true"
+                ? await serveWorkerWarmClone(env, repo, parsed, stub, internal?.signal ?? req.signal)
+                : await serveCloneFromR2(env, repo, parsed, stub);
             if (hit) return hit;
           }
           fwdBody = raw; // miss: forward the original (still-encoded) bytes to the DO

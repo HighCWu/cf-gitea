@@ -4,7 +4,7 @@ import { td, isOid } from "./git/util";
 import { GitStore } from "./git/store";
 import { OidSet } from "./git/oidset";
 import { gunzipLimited } from "./git/zlib";
-import { cloneCacheKey, repoPrefix } from "./git/r2keys";
+import { cloneCacheKey, packR2Key, repoPrefix } from "./git/r2keys";
 import {
   advertisement,
   uploadPack,
@@ -16,6 +16,16 @@ import {
   Service,
   PackCache,
 } from "./git/protocol";
+import {
+  uploadKeepaliveMs,
+  type PlanWorkerWarmCloneResult,
+  type ReadUploadObjectResult,
+  type ReadWarmClonePageResult,
+  type ReadWarmLoosePageResult,
+  type WorkerLooseEntry,
+  type WorkerPackedEntry,
+  type WorkerUploadPackMeta,
+} from "./upload/stream";
 import { PackLostError, type ReadGate } from "./git/packstore";
 import {
   beginReceive,
@@ -766,7 +776,14 @@ export class RepoCell extends DurableObject<Env> {
           this.activeUploads--;
         };
         try {
-          return await uploadPack(this.store, await this.readBody(req), release, this.packCacheFor());
+          const workerStream = this.env.UPLOAD_PACK_WORKER_STREAM === "true";
+          return await uploadPack(
+            this.store,
+            await this.readBody(req),
+            release,
+            workerStream ? undefined : this.packCacheFor(),
+            workerStream ? { keepaliveMs: uploadKeepaliveMs(this.env.GIT_UPLOAD_KEEPALIVE_MS) } : undefined,
+          );
         } catch (err) {
           release();
           // an over-inflating body is the client's fault, not a server error
@@ -1319,6 +1336,148 @@ export class RepoCell extends DurableObject<Env> {
       result = { tag: "leased", key, planId: plan.planId, expiresAt: plan.expiresAt };
     });
     return result;
+  }
+
+  /**
+   * Plan a Worker-streamed warm full clone (SPEC-0024 M4.0): atomically checks
+   * `reachableCacheValid()` and `wantsAreAllTips`, summarizes per-pack reachable
+   * metadata (detecting single-pack zero-copy R2 passthrough eligibility), and
+   * registers a SPEC-0011 read lease covering all readable catalog packs.
+   */
+  async planWorkerWarmFullClone(repo: string, wants: string[]): Promise<PlanWorkerWarmCloneResult> {
+    this.rpcBind();
+    const storageKey = this.storageKey(repo);
+    let result: PlanWorkerWarmCloneResult = { tag: "miss" };
+    this.store.tx(() => {
+      if (!this.store.reachableCacheValid()) return;
+      if (!wantsAreAllTips(this.store, wants)) return;
+      const total = this.store.reachableCount();
+      const rawPacks = this.store.reachablePackSummary();
+      const hasLoose = this.store.hasLooseReachable();
+      const packs: WorkerUploadPackMeta[] = rawPacks.map((p) => ({
+        packKey: p.packKey,
+        r2Key: p.location === "r2" ? packR2Key(storageKey, p.packKey) : null,
+        location: p.location,
+        packBytes: p.packBytes,
+        objectCount: p.objectCount,
+        reachableCount: p.reachableCount,
+        indexedCount: p.indexedCount,
+      }));
+      const plan = planFetchInsideTransaction(this.store, {
+        generation: this.store.reachableVersion(),
+      });
+      if (plan.tag !== "leased") return;
+      const single = packs.length === 1 && !hasLoose ? packs[0]! : null;
+      const canPassthrough =
+        single !== null &&
+        single.location === "r2" &&
+        single.r2Key !== null &&
+        single.packBytes > 0 &&
+        single.reachableCount === total &&
+        single.objectCount === total &&
+        single.indexedCount === total;
+      result = {
+        tag: "leased",
+        planId: plan.planId,
+        expiresAt: plan.expiresAt,
+        total,
+        packs,
+        hasLoose,
+        passthroughPackKey: canPassthrough ? single.packKey : null,
+        passthroughR2Key: canPassthrough ? single.r2Key : null,
+      };
+    });
+    return result;
+  }
+
+  /**
+   * Read one offset-ordered keyset page of reachable entries in `packKey` for
+   * Worker multi-pack streaming (SPEC-0024 M4.0), validating/renewing the lease
+   * on the target pack before querying.
+   */
+  async readWarmClonePage(
+    planId: string,
+    packKey: string,
+    afterOffset: number,
+    limit: number
+  ): Promise<ReadWarmClonePageResult> {
+    this.rpcBind();
+    if (planId) {
+      const auth = renewAndAuthorizeRead(this.store, planId, packKey, null);
+      if (auth.tag !== "authorized") return { tag: "rejected", reason: auth.reason };
+    }
+    const clamped = Math.min(Math.max(Math.trunc(limit) || 1, 1), 4096);
+    const raw = this.store.reachablePackedInPackAfter(packKey, afterOffset, clamped + 1);
+    const hasMore = raw.length > clamped;
+    const rows: WorkerPackedEntry[] = raw.slice(0, clamped).map((r) => ({
+      oid: r.oid,
+      offset: r.offset,
+      dataOff: r.dataOff,
+      dataLen: r.dataLen,
+      type: r.type,
+      entrySize: r.entrySize,
+      baseOid: r.baseOid,
+      baseInPack: r.baseInPack,
+    }));
+    return { tag: "ok", rows, hasMore };
+  }
+
+  /**
+   * Read one oid-ordered keyset page of loose reachable objects for Worker
+   * warm-clone streaming (SPEC-0024 M4.0).
+   */
+  async readWarmLoosePage(
+    planId: string,
+    afterOid: string,
+    limit: number
+  ): Promise<ReadWarmLoosePageResult> {
+    this.rpcBind();
+    if (planId) {
+      const auth = renewAndAuthorizeRead(this.store, planId, null, null);
+      if (auth.tag !== "authorized") return { tag: "rejected", reason: auth.reason };
+    }
+    const clamped = Math.min(Math.max(Math.trunc(limit) || 1, 1), 256);
+    const oids = this.store.reachableLooseAfter(afterOid, clamped + 1);
+    const hasMore = oids.length > clamped;
+    const rows: WorkerLooseEntry[] = [];
+    for (const oid of oids.slice(0, clamped)) {
+      const obj = await this.store.get(oid);
+      if (!obj) continue;
+      rows.push({ oid, type: obj.type, data: obj.data });
+    }
+    return { tag: "ok", rows, hasMore };
+  }
+
+  /**
+   * Read and inflate a single object under the active fetch read lease
+   * (SPEC-0024 M4.0), used for sqlite-backed packs or deltas whose base is
+   * excluded from the reachable set.
+   */
+  async readUploadObject(planId: string, oid: string): Promise<ReadUploadObjectResult> {
+    this.rpcBind();
+    if (planId) {
+      const auth = renewAndAuthorizeRead(this.store, planId, null, null);
+      if (auth.tag !== "authorized") return { tag: "rejected", reason: auth.reason };
+    }
+    const gate: ReadGate | undefined = planId
+      ? (packKey, offset, length) => {
+          const r = renewAndAuthorizeRead(this.store, planId, packKey, { offset, length });
+          if (r.tag !== "authorized") {
+            throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+          }
+        }
+      : undefined;
+    try {
+      const obj = await this.store.get(oid, gate);
+      if (!obj) return { tag: "missing" };
+      return { tag: "ok", type: obj.type, data: obj.data };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("read lease rejected")) {
+        return { tag: "rejected", reason: msg };
+      }
+      throw err;
+    }
   }
 
   /**

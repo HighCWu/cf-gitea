@@ -880,6 +880,51 @@ export function releasePlanLease(store: GitStore, lease: PlanLeaseState | null):
   if (lease) releaseReadLease(store, lease.planId);
 }
 
+const UPLOAD_KEEPALIVE_FRAME = te.encode("0005\x01");
+
+interface UploadKeepalive {
+  enterPull(ctrl: ReadableStreamDefaultController<Uint8Array>): void;
+  markFrame(): void;
+  leavePull(): void;
+  stop(): void;
+}
+
+function createUploadKeepalive(sideband: boolean, keepaliveMs: number | undefined): UploadKeepalive | null {
+  if (!sideband || !keepaliveMs || keepaliveMs <= 0) return null;
+  let ctrlRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let ended = false;
+  let inPull = false;
+  let framesSinceTick = false;
+  const timer = setInterval(() => {
+    if (ended || !inPull || !ctrlRef) return;
+    if (framesSinceTick) {
+      framesSinceTick = false;
+      return;
+    }
+    try {
+      ctrlRef.enqueue(UPLOAD_KEEPALIVE_FRAME);
+    } catch {
+      ended = true;
+    }
+  }, keepaliveMs);
+  return {
+    enterPull: (ctrl) => {
+      ctrlRef = ctrl;
+      inPull = true;
+    },
+    markFrame: () => {
+      framesSinceTick = true;
+    },
+    leavePull: () => {
+      inPull = false;
+    },
+    stop: () => {
+      ended = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 /**
  * POST /git-upload-pack — stateless protocol v0 with single-ack negotiation,
  * shallow (--depth) support, side-band-64k, and a streamed pack response.
@@ -890,7 +935,8 @@ export async function uploadPack(
   store: GitStore,
   body: Uint8Array,
   release: () => void = () => {},
-  packCache?: PackCache
+  packCache?: PackCache,
+  opts?: { keepaliveMs?: number }
 ): Promise<Response> {
   const headers = {
     "content-type": "application/x-git-upload-pack-result",
@@ -1076,6 +1122,7 @@ export async function uploadPack(
       packCache,
       release,
       headers,
+      keepaliveMs: opts?.keepaliveMs,
     });
   }
 
@@ -1258,6 +1305,7 @@ export async function uploadPack(
     if (bufferedLen >= SIDEBAND_CHUNK) flushBuffered();
   });
 
+  const keepalive = createUploadKeepalive(sideband, opts?.keepaliveMs);
   let i = 0;
   let finished = false;
   const stream = new ReadableStream<Uint8Array>({
@@ -1270,6 +1318,7 @@ export async function uploadPack(
       pending.length = 0;
     },
     pull: async (ctrl) => {
+      keepalive?.enterPull(ctrl);
       try {
         for (let n = 0; n < 64 && i < total; n++, i++) {
           const idx = order ? order[i] : i;
@@ -1311,7 +1360,10 @@ export async function uploadPack(
         } else {
           flushBuffered();
         }
-        for (const c of pending) ctrl.enqueue(c);
+        for (const c of pending) {
+          keepalive?.markFrame();
+          ctrl.enqueue(c);
+        }
         pending.length = 0;
         // Warm R2 in lock-step with generation: the client already has this
         // batch's bytes, and awaiting the part upload here is what bounds isolate
@@ -1322,6 +1374,7 @@ export async function uploadPack(
           else await capture.drain();
         }
         if (finished) {
+          keepalive?.stop();
           // §3.4 release-on-last-read: emission's last R2 chunk read has
           // completed; buffered bytes still streaming to the client need no
           // pack protection.
@@ -1330,13 +1383,17 @@ export async function uploadPack(
           release(); // stream fully drained: this upload no longer holds a slot
         }
       } catch (err) {
+        keepalive?.stop();
         if (capture) await capture.abort();
         releasePlanLease(store, lease);
         release();
         ctrl.error(err);
+      } finally {
+        keepalive?.leavePull();
       }
     },
     cancel: async () => {
+      keepalive?.stop();
       // client went away mid-transfer (e.g. negotiation round abort): abort the
       // half-built multipart upload so R2 keeps no partial object
       if (capture) await capture.abort();
@@ -1372,9 +1429,10 @@ async function warmFullClone(
     packCache: PackCache | undefined;
     release: () => void;
     headers: Record<string, string>;
+    keepaliveMs?: number;
   },
 ): Promise<Response> {
-  const { preamble, sideband, noProgress, r2Key, packCache, release, headers } = opts;
+  const { preamble, sideband, noProgress, r2Key, packCache, release, headers, keepaliveMs } = opts;
   const total = store.reachableCount();
   const PAGE = 1000;
   // §3.1 plan+lease atomic: the warm path's dependency set is the readable
@@ -1452,6 +1510,7 @@ async function warmFullClone(
     if (bufferedLen >= SIDEBAND_CHUNK) flushBuffered();
   });
 
+  const keepalive = createUploadKeepalive(sideband, keepaliveMs);
   let emitted = 0;
   let finished = false;
   const stream = new ReadableStream<Uint8Array>({
@@ -1464,6 +1523,7 @@ async function warmFullClone(
       pending.length = 0;
     },
     pull: async (ctrl) => {
+      keepalive?.enterPull(ctrl);
       try {
         let drained = false;
         for (let n = 0; n < 64; n++) {
@@ -1491,26 +1551,34 @@ async function warmFullClone(
         } else {
           flushBuffered();
         }
-        for (const c of pending) ctrl.enqueue(c);
+        for (const c of pending) {
+          keepalive?.markFrame();
+          ctrl.enqueue(c);
+        }
         pending.length = 0;
         if (capture) {
           if (finished) await capture.finish();
           else await capture.drain();
         }
         if (finished) {
+          keepalive?.stop();
           // §3.4 release-on-last-read (the last chunk read completed above).
           releasePlanLease(store, lease);
           ctrl.close();
           release();
         }
       } catch (err) {
+        keepalive?.stop();
         if (capture) await capture.abort();
         releasePlanLease(store, lease);
         release();
         ctrl.error(err);
+      } finally {
+        keepalive?.leavePull();
       }
     },
     cancel: async () => {
+      keepalive?.stop();
       if (capture) await capture.abort();
       releasePlanLease(store, lease);
       release();

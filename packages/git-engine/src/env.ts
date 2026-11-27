@@ -76,6 +76,16 @@ export interface Env {
    * for protocol-timing test batteries. Unset/garbage keeps the default. No
    * effect on non-sideband pushes (their buffered answer never heartbeats). */
   GIT_RECEIVE_KEEPALIVE_MS?: string;
+  /** Cadence of the upload-pack answer's keepalive heartbeat in MILLISECONDS
+   * (SPEC-0024 M4.0; default 20000, clamped [50, 30000]). Emits Git's
+   * official `uploadpack.keepAlive` five-byte zero-data band-1 frame
+   * `0005\x01` while server-side planning or R2 reads stall without output. */
+  GIT_UPLOAD_KEEPALIVE_MS?: string;
+  /** Strict-polarity flag ("true" enables) shifting warm full-clone uploadPack
+   * streams from 1 MiB DO Range GETs to sequential Worker-side R2 streams and
+   * zero-copy single-pack passthrough (SPEC-0024 M4.0). Unset/anything else
+   * keeps the legacy DO path. */
+  UPLOAD_PACK_WORKER_STREAM?: string;
   SITE_NAME?: string;
   SITE_DESC?: string;
   SITE_OWNER?: string;

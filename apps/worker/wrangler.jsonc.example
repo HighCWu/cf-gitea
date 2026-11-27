@@ -303,6 +303,12 @@
     // past 900. A value above the queue/cron wall clocks does not extend
     // those consumers.
     "GIT_TIMEOUT_RECEIVE": "900",
+    // SPEC-0024 M4.0: shift warm full-clone upload-pack streaming out of the
+    // RepoCell DO into the Worker using single sequential R2 streams per pack
+    // and zero-copy single-pack passthrough, with 20s official 0005\x01
+    // keepalives (GIT_UPLOAD_KEEPALIVE_MS).
+    "UPLOAD_PACK_WORKER_STREAM": "true",
+    "GIT_UPLOAD_KEEPALIVE_MS": "20000",
     // LFS store mode (SPEC-0006 §6 as-built, the L14 config wave) — strict
     // polarity: ONLY the exact string "true" constructs the presign store
     // (PresignLfsStore) over the relay store; absent/anything else = relay
