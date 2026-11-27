@@ -70,6 +70,77 @@ const LOOKUP_BATCH = 512;
 const FOREIGN_WAVE_CONCURRENCY = 8;
 /** Default R2 range GETs the straggler/foreign resolution may spend. */
 export const RANGE_BUDGET = 256;
+/** Max inter-entry byte gap merged into a single R2 Range GET (SPEC-0024 M4.2). */
+export const COALESCE_GAP_BYTES = 256 * 1024;
+/** Max span of one coalesced R2 Range GET window (SPEC-0024 M4.2). */
+export const COALESCE_MAX_WINDOW_BYTES = 4 * 1024 * 1024;
+
+export interface CoalescedRangeItem {
+  oid: string;
+  packKey: string;
+  offset?: number;
+  dataOff: number;
+  dataLen: number;
+}
+
+export interface CoalescedRangeWindow {
+  packKey: string;
+  start: number;
+  length: number;
+  items: CoalescedRangeItem[];
+}
+
+/**
+ * Group external pack entries by `packKey`, sort by `dataOff`, and merge
+ * adjacent reads separated by `<= maxGap` bytes up to `maxWindow` total span
+ * (SPEC-0024 M4.2). Cuts external-base R2 Range GET subrequests by 10-50x while
+ * keeping isolate memory bounded by `maxWindow`.
+ */
+export function coalescePackRanges(
+  entries: readonly CoalescedRangeItem[],
+  maxGap = COALESCE_GAP_BYTES,
+  maxWindow = COALESCE_MAX_WINDOW_BYTES
+): CoalescedRangeWindow[] {
+  const byPack = new Map<string, CoalescedRangeItem[]>();
+  for (const entry of entries) {
+    let list = byPack.get(entry.packKey);
+    if (!list) {
+      list = [];
+      byPack.set(entry.packKey, list);
+    }
+    list.push(entry);
+  }
+  const windows: CoalescedRangeWindow[] = [];
+  for (const [packKey, list] of byPack) {
+    list.sort((a, b) => a.dataOff - b.dataOff || a.dataLen - b.dataLen);
+    let curStart = -1;
+    let curEnd = -1;
+    let curItems: CoalescedRangeItem[] = [];
+    for (const item of list) {
+      const itemEnd = item.dataOff + item.dataLen;
+      if (curItems.length === 0) {
+        curStart = item.dataOff;
+        curEnd = itemEnd;
+        curItems = [item];
+        continue;
+      }
+      const nextEnd = Math.max(curEnd, itemEnd);
+      if (item.dataOff - curEnd <= maxGap && nextEnd - curStart <= maxWindow) {
+        curEnd = nextEnd;
+        curItems.push(item);
+      } else {
+        windows.push({ packKey, start: curStart, length: curEnd - curStart, items: curItems });
+        curStart = item.dataOff;
+        curEnd = itemEnd;
+        curItems = [item];
+      }
+    }
+    if (curItems.length > 0) {
+      windows.push({ packKey, start: curStart, length: curEnd - curStart, items: curItems });
+    }
+  }
+  return windows;
+}
 /** IndexRows buffered per putIndexRows RPC */
 const ROW_BATCH = 4096;
 /**
@@ -429,7 +500,11 @@ export class DeltaResolver {
    * object database; without it every hop is one single-oid `lookupObjects`
    * RPC — the lazy fallback for a base the pre-pass left uncached.
    */
-  private async materializeForeign(hit: ForeignObject, known?: Map<string, ForeignObject>): Promise<ObjRec> {
+  private async materializeForeign(
+    hit: ForeignObject,
+    known?: Map<string, ForeignObject>,
+    prefetchedRaw?: Map<string, Uint8Array>
+  ): Promise<ObjRec> {
     const chain: ForeignObject[] = [];
     const seen = new Set<string>();
     let cur = hit;
@@ -447,7 +522,7 @@ export class DeltaResolver {
         break;
       }
       if (!cur.baseOid) {
-        base = { type: cur.type, data: inflateAll(await this.readForeign(cur)) };
+        base = { type: cur.type, data: inflateAll(await this.readForeign(cur, prefetchedRaw)) };
         break;
       }
       chain.push(cur);
@@ -457,7 +532,7 @@ export class DeltaResolver {
     }
     let obj = base;
     for (let i = chain.length - 1; i >= 0; i--) {
-      const delta = inflateAll(await this.readForeign(chain[i]));
+      const delta = inflateAll(await this.readForeign(chain[i], prefetchedRaw));
       obj = { type: base.type, data: applyDelta(obj.data, delta) };
     }
     return obj;
@@ -519,6 +594,44 @@ export class DeltaResolver {
       }
       frontier = [...next];
     }
+    // Coalesce external pack range reads per pack before parallel chain materialization.
+    const rangeItems: CoalescedRangeItem[] = [];
+    for (const [oid, node] of nodes) {
+      if (!node.data && node.dataLen > 0) {
+        rangeItems.push({
+          oid,
+          packKey: node.packKey,
+          offset: node.offset,
+          dataOff: node.dataOff,
+          dataLen: node.dataLen,
+        });
+      }
+    }
+    const windows = coalescePackRanges(rangeItems);
+    const prefetchedRaw = new Map<string, Uint8Array>();
+    if (windows.length > 0) {
+      const wQueue = [...windows];
+      const fetchFailures: unknown[] = [];
+      const fetchWorkers = Array.from({ length: Math.min(FOREIGN_WAVE_CONCURRENCY, wQueue.length) }, async () => {
+        while (wQueue.length > 0 && fetchFailures.length === 0) {
+          const w = wQueue.shift();
+          if (!w) return;
+          try {
+            this.host.onRangeGet?.();
+            const buf = await this.host.readEntryBytes(w.packKey, w.start, w.length);
+            for (const item of w.items) {
+              const rel = item.dataOff - w.start;
+              prefetchedRaw.set(`${item.packKey}@${item.offset ?? 0}`, buf.subarray(rel, rel + item.dataLen));
+            }
+          } catch (err) {
+            fetchFailures.push(err);
+          }
+        }
+      });
+      await Promise.all(fetchWorkers);
+      if (fetchFailures.length > 0) throw fetchFailures[0];
+    }
+
     // disjoint chains materialize concurrently; one chain's hops stay serial.
     // failures is a plain array on purpose: control-flow analysis cannot see
     // the workers' assignments, so a nullable sentinel would narrow to never.
@@ -529,13 +642,14 @@ export class DeltaResolver {
         const oid = tips.shift();
         if (oid === undefined) return;
         try {
-          this.cache.put(oid, await this.materializeForeign(nodes.get(oid)!, nodes));
+          this.cache.put(oid, await this.materializeForeign(nodes.get(oid)!, nodes, prefetchedRaw));
         } catch (err) {
           failures.push(err);
         }
       }
     });
     await Promise.all(workers);
+    prefetchedRaw.clear();
     if (failures.length > 0) throw failures[0];
   }
 
@@ -554,8 +668,10 @@ export class DeltaResolver {
     return (await this.lookupBatch([oid]))[0];
   }
 
-  private async readForeign(hit: ForeignObject): Promise<Uint8Array> {
+  private async readForeign(hit: ForeignObject, prefetchedRaw?: Map<string, Uint8Array>): Promise<Uint8Array> {
     if (hit.data) return hit.data;
+    const cached = prefetchedRaw?.get(`${hit.packKey}@${hit.offset}`);
+    if (cached) return cached;
     this.host.onRangeGet?.();
     return this.host.readEntryBytes(hit.packKey, hit.dataOff, hit.dataLen);
   }

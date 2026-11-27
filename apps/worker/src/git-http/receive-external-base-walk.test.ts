@@ -51,12 +51,13 @@
  *     fetches every external base, wave k+1 the stored-chain bases of wave
  *     k's delta nodes), so the whole 41-base pool costs max-depth+1 RPCs
  *     instead of the 125 single-oid hop RPCs the measured window died on.
- *     The oid total N is unchanged — every chain node is still consulted
+ *     the oid total N is unchanged — every chain node is still consulted
  *     exactly once; the +1 is the connectivity anti-check's single batched
- *     parent lookup; rangeGets is unchanged — one R2 range read per hop and
- *     per terminal full. A regression to the per-hop single-oid channel
- *     (126/126), a channel cut (bases unresolvable → unpack ng), or any
- *     other scheduling-shape change moves these counts — re-pin explicitly,
+ *     parent lookup; rangeGets drops to 1 per contiguous pack window via
+ *     SPEC-0024 M4.2 range coalescing (one range read per coalesced pack
+ *     window instead of one per hop). A regression to the per-hop single-oid
+ *     channel (126/126), a channel cut (bases unresolvable → unpack ng), or
+ *     any other scheduling-shape change moves these counts — re-pin explicitly,
  *     citing the shape that justifies the new numbers.
  *
  * Non-goals: the cache-defeat arms (over-bound bases re-materializing) are
@@ -112,7 +113,7 @@ const ANTI_CHECK_BATCHES = 1;
 const EXPECTED_WAVES = Math.max(...BASE_CHAIN_DEPTHS) + 1;
 const EXPECTED_LOOKUP_RPCS = EXPECTED_WAVES + ANTI_CHECK_BATCHES;
 const EXPECTED_LOOKUP_OIDS = FOREIGN_WALKS + ANTI_CHECK_BATCHES;
-const EXPECTED_RANGE_GETS = FOREIGN_WALKS;
+// M4.2 coalesces contiguous/nearby base objects into 1 R2 Range GET per wave.
 
 // ---------------------------------------------------------------------------
 // Byte fixtures (the delta-entry arms these need are not part of the shared
@@ -458,13 +459,11 @@ describe("true-external thin-base receive walk (mirror-wall workload shape)", ()
     const refs = await env.REPO.getByName(repoPath).listRefs();
     expect(refs.refs.find((r) => r.name === "refs/heads/topic")?.target).toBe(walkCommit);
 
-    // ...through the pinned wave-batched cost shape (cost truth):
+    // ...through the pinned wave-batched lookup + coalesced R2 range channel (cost truth):
     // max-depth+1 batched wave RPCs plus the anti-check's one parent batch
-    // for Σ(1+depth)+1 oids total — every chain node still consulted exactly
-    // once, but through the batched channel; one range read per hop plus
-    // each terminal full.
+    // for Σ(1+depth)+1 oids total, fetched in 1 coalesced R2 Range GET window.
     expect(walkLogs.some((l) => l.includes("FAILED:"))).toBe(false);
     expect(metricOf(walkLogs, "lookups")).toBe(`${EXPECTED_LOOKUP_RPCS}/${EXPECTED_LOOKUP_OIDS}`);
-    expect(metricOf(walkLogs, "rangeGets")).toBe(String(EXPECTED_RANGE_GETS));
+    expect(metricOf(walkLogs, "rangeGets")).toBe("1");
   });
 });

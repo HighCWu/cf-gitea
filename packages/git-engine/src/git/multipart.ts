@@ -11,22 +11,26 @@ export interface MultipartPackUpload {
  * same size and >= 5 MiB; 16 MiB parts cap a pack at 16 MiB * 10,000 = 160 GiB
  * while holding at most one part in isolate memory at a time. */
 export const R2_PART_SIZE = 16 * 1024 * 1024;
+/** 64 MiB push ingest part size (SPEC-0024 D2, up to 10,000 * 64 MiB = 640 GiB). */
+export const R2_PUSH_PART_SIZE = 64 * 1024 * 1024;
 
 /**
  * Buffers a streamed pack into fixed-size R2 multipart parts. Chunks are copied
  * on push (callers hand out views into buffers that later reads evict). `drain`
- * uploads every whole 16 MiB part and keeps the sub-part remainder, so isolate
+ * uploads every whole part and keeps the sub-part remainder, so isolate
  * memory never holds more than ~one part; `finish` flushes the final (short)
  * part and completes; any failure aborts so R2 is left with no partial object.
- * Uniform part size (exactly R2_PART_SIZE, last excepted) is what satisfies R2's
- * equal-size-parts rule.
+ * Uniform part size (last excepted) is what satisfies R2's equal-size-parts rule.
  */
 export class MultipartCapture {
   private chunks: Uint8Array[] = [];
   private len = 0;
   private failed = false;
   private completed = false;
-  constructor(private mp: MultipartPackUpload) {}
+  constructor(
+    private mp: MultipartPackUpload,
+    private readonly partSize = R2_PART_SIZE
+  ) {}
 
   /** True once a part upload or complete/abort has failed (no R2 object exists). */
   get aborted(): boolean {
@@ -40,15 +44,15 @@ export class MultipartCapture {
   }
 
   async drain(): Promise<void> {
-    while (!this.failed && this.len >= R2_PART_SIZE) {
+    while (!this.failed && this.len >= this.partSize) {
       const merged = concat(this.chunks);
       try {
-        await this.mp.uploadPart(merged.subarray(0, R2_PART_SIZE));
+        await this.mp.uploadPart(merged.subarray(0, this.partSize));
       } catch {
         await this.abort();
         return;
       }
-      const rest = merged.slice(R2_PART_SIZE);
+      const rest = merged.slice(this.partSize);
       this.chunks = rest.length ? [rest] : [];
       this.len = rest.length;
     }

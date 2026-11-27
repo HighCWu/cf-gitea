@@ -1,6 +1,6 @@
 # SPEC-0024: Large-Repository Split-Plane Git Engine (Worker Streaming Upload-Pack, Queue Compaction, Ref-Index Sidecars, and Bundle-URI)
 
-Status: accepted — M4.0 committed (`33cbe99`), M4.1 implemented & locally verified (2026-11-27) · Date: 2026-11-27 · Amends: SPEC-0001, SPEC-0001a, SPEC-0011
+Status: accepted — M4.0 committed (`33cbe99`), M4.1 committed (`b9ffe5d`), M4.2 implemented & locally verified (2026-11-27) · Date: 2026-11-27 · Amends: SPEC-0001, SPEC-0001a, SPEC-0011
 Depends on: SPEC-0001, SPEC-0001a, SPEC-0003, SPEC-0011
 Governs: `packages/git-engine/`, `apps/worker/src/git-http/`, `apps/worker/src/queues/`
 Reference implementations studied: `/home/whc/pnpm_repos/cf-gitea-ref/git-on-cloudflare`, `/home/whc/pnpm_repos/cf-gitea-ref/enroute`, upstream `gitea/routers/web/repo/githttp.go`
@@ -224,4 +224,9 @@ Zero D1 migrations are required. Extend DO SQLite `pack_catalog` additively:
   - `packages/git-engine/e2e/check-gc.mjs` — all `8` checks passed.
   - `packages/git-engine/e2e/check-read-leases.mjs` — all `25` checks passed.
   - `pnpm --filter cf-gitea-worker exec vitest run src/git-http/queue-compaction-pref.test.ts` — `4/4` passed (`encodeOfsDistance` varint boundaries, `.pref` encode/parse + `walkClosureWithPref` skipping `160000` gitlinks, `REPO_TASKS` 3-pack compaction to 1 `OFS_DELTA`+`.idx`+`.pref` pack upgrading subsequent clone to `worker-passthrough` and `gcNow` deleting `.pref`, plus live-receive defer & R2 failure abort cleanup).
-  - Pending: M4.2 (direct `receivePack` final-key write + coalesced external-base Range reads + `pack_objects` retirement), M4.3 (`bundle-uri` serving), and remote staging/live multi-GB acceptance.
+- M4.2 (Direct push ingest to final `packs/` key + 64 MiB multipart parts + 2048 MiB default `MAX_PUSH_MB` + coalesced external-base R2 Range reads + Worker `.idx` v2 binary-search reader):
+  - `pnpm typecheck` (`tsc -p tsconfig.build.json` + `wrangler types && tsc --noEmit`) — passed (`exit 0`).
+  - `pnpm exec eslint` across M4.2 modified/added sources (`env.ts`, `git/multipart.ts`, `control-plane.ts`, `receive/delta.ts`, `receive/idx-reader.ts`, `mod.ts`) and tests (`receive-direct-coalesce-idx.test.ts`, `receive-external-base-walk.test.ts`) — passed (`0` errors, `0` warnings).
+  - `packages/git-engine/e2e/` checks — `check-drain-discipline.mjs` (`4/4`), `check-receive-name-bind.mjs` (`5/5`), `check-receive-caps.mjs` (`12/12`), `check-compaction.mjs` (`11/11`), `check-gc.mjs` (`8/8`) all passed.
+  - `pnpm --filter cf-gitea-worker exec vitest run src/git-http/receive-direct-coalesce-idx.test.ts src/git-http/receive-external-base-walk.test.ts src/git-http/queue-compaction-pref.test.ts src/git-http/upload-worker-stream.test.ts src/invariants/invariants.test.ts` — `5/5` files, `30/30` tests passed (`receive-direct-coalesce-idx.test.ts` `3/3`, `receive-external-base-walk.test.ts` `1/1` verifying `rangeGets=1` coalescing across external bases, `queue-compaction-pref.test.ts` `4/4`, `upload-worker-stream.test.ts` `5/5`, `invariants.test.ts` `17/17`).
+  - Pending: M4.3 (`bundle-uri` serving), and remote staging/live multi-GB acceptance.

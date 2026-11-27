@@ -273,7 +273,7 @@
     // (fail-closed). Consumed by services/webhooks-push.ts' watchIfAuto
     // fold (services/repo-watchers.ts).
     "AUTO_WATCH_ON_CHANGES": "",
-    "MAX_PUSH_MB": "512",
+    "MAX_PUSH_MB": "2048",
     // R2 range GETs one receive's delta resolution may spend (the engine's
     // receive quota — RANGE_BUDGET, packages/git-engine src/env.ts; default
     // 256, receive/delta.ts). Unset/garbage keeps the engine default, so the
@@ -312,6 +312,8 @@
     // SPEC-0024 M4.1: shift pack compaction off the 32 MiB DO-heap merge onto
     // REPO_TASKS Queue streaming compaction with OFS_DELTA + .pref sidecars.
     "COMPACTION_QUEUE_ENABLED": "true",
+    // SPEC-0024 M4.2: stream push packs directly to final R2 keys (zero copyObject, 64 MiB parts).
+    "RECEIVE_DIRECT_PACK_WRITE": "true",
     // LFS store mode (SPEC-0006 §6 as-built, the L14 config wave) — strict
     // polarity: ONLY the exact string "true" constructs the presign store
     // (PresignLfsStore) over the relay store; absent/anything else = relay

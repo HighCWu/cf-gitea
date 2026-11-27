@@ -42,7 +42,7 @@ import {
 } from "./git/protocol";
 import { ObjType, hashObject, isTreeMode, parseCommit, parseTree, type TreeEntry } from "./git/objects";
 import { ZERO_OID, isOid, toHex } from "./git/util";
-import { isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
+import { idxR2Key, isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
 import type { PackState } from "./git/packstore";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
@@ -136,13 +136,17 @@ export interface BeginReceiveInput {
    * sweeps consult.
    */
   leaseTtlMs?: number | null;
+  /** Enable M4.2 direct-to-final-key ingest (`packs/pack-rx-<leaseToken>.pack`). */
+  directPackWrite?: boolean;
 }
 
 export type BeginReceiveOk = {
   tag: "ok";
   leaseToken: string;
-  /** repos/<storage_key>/staging/pack-rx-<leaseToken>.pack (SPEC-0001 §3) */
+  /** repos/<storage_key>/staging/pack-rx-<leaseToken>.pack, or final packs/ key when directPackWrite */
   stagingKey: string;
+  /** Direct final pack catalog key (`pack-rx-<leaseToken>`) when directPackWrite is active. */
+  directPackName?: string;
   /** immutable storage key (r_<id>); the Worker needs it to build R2 keys */
   storageKey: string;
   /** pre-push refs_version, echoed back to finalize for the CAS guard */
@@ -336,9 +340,11 @@ export type LookupObjectResult = LookupObjectHit | { found: false };
 interface LeasePayload {
   stagingKey?: string;
   storageKey?: string;
-  /** the pack NAME (pack-<sha1>, r2keys.ts) — set by the Worker's first
-   * putIndexRows batch; pack_catalog keys the rows by it at finalize */
+  /** the pack NAME (pack-<sha1> or pack-rx-<leaseToken>), persisted so sweeps/finalize resolve keys */
   packName?: string;
+  /** direct-write catalog stem & idx key (when RECEIVE_DIRECT_PACK_WRITE is active) */
+  directPackName?: string;
+  directIdxKey?: string;
 }
 
 // ---- Step-1/2 semantics notes -----------------------------------------------
@@ -502,8 +508,12 @@ export async function sweepExpiredLeases(host: LeaseHost): Promise<void> {
     host.store.deleteLease(lease.leaseToken);
     if (lease.kind === "receive") {
       const payload = parseLeasePayload(lease.payload);
-      if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
-      if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
+      const unrecorded = !payload.directPackName || host.store.packs.catalogStateOf(payload.directPackName) === null;
+      if (payload.packName && unrecorded) host.store.packs.sweepPackRows(payload.packName);
+      if (unrecorded) {
+        const keys = [payload.stagingKey, payload.directIdxKey].filter((k): k is string => !!k);
+        if (keys.length) await host.deletePackObjects(keys);
+      }
     } else if (lease.kind === "compaction") {
       host.store.packs.clearCompactionStaging(lease.leaseToken);
       const payload = parseCompactionPayload(lease.payload);
@@ -588,9 +598,15 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
   }
   const storageKey = resolveStorageKey(store, input.storageKey);
   const leaseToken = crypto.randomUUID().replaceAll("-", "");
-  const stagingKey = buildStagingKey(storageKey, leaseToken);
+  const directPackName = input.directPackWrite ? `pack-rx-${leaseToken}` : undefined;
+  const stagingKey = directPackName ? packR2Key(storageKey, directPackName) : buildStagingKey(storageKey, leaseToken);
+  const directIdxKey = directPackName ? idxR2Key(storageKey, directPackName) : undefined;
   const leaseExpiresAt = Date.now() + clampReceiveLeaseTtlMs(input.leaseTtlMs);
-  const payload: LeasePayload = { stagingKey, storageKey };
+  const payload: LeasePayload = {
+    stagingKey,
+    storageKey,
+    ...(directPackName ? { directPackName, directIdxKey } : {}),
+  };
   store.createLease(leaseToken, "receive", leaseExpiresAt, JSON.stringify(payload));
   try {
     // the sweep backstop: fire shortly after expiry even if no push arrives
@@ -602,6 +618,7 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
     tag: "ok",
     leaseToken,
     stagingKey,
+    ...(directPackName ? { directPackName } : {}),
     storageKey,
     refsVersion: store.refsVersion(),
     refTips: store.refs().map((r) => ({ name: r.name, oid: r.oid })),
@@ -646,9 +663,9 @@ export async function putIndexRows(
   return { tag: "ok" };
 }
 
-/** pack-<40 hex> — the only shape putIndexRows accepts as a pack name. */
+/** Valid catalog pack keys: content SHA-1 packs or lease-scoped queue/direct-receive packs. */
 function isValidPackName(name: string): boolean {
-  return /^pack-[0-9a-f]{40}$/.test(name);
+  return /^pack-(?:[0-9a-f]{40}|(?:rx|q)-[0-9a-f]{32})$/.test(name);
 }
 
 /**
@@ -928,7 +945,8 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
     store.deleteLease(input.leaseToken);
     const dead = parseLeasePayload(lease.payload);
     if (dead.packName) store.packs.sweepPackRows(dead.packName);
-    if (dead.stagingKey) await host.deletePackObjects([dead.stagingKey]);
+    const keys = [dead.stagingKey, dead.directIdxKey].filter((k): k is string => !!k);
+    if (keys.length) await host.deletePackObjects(keys);
     return { tag: "lease_mismatch" };
   }
   const leaseData = parseLeasePayload(lease.payload);
@@ -979,6 +997,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
         changed: false,
         needsGc: false,
         extraApplied: [] as RefUpdate[],
+        recordedPackR2Key: null as string | null,
       };
     }
     // record the pack catalog entry inside the transaction that first points
@@ -987,15 +1006,16 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
     // key is the pack NAME; the Worker's copy key is verified against the
     // r2keys.ts derivation, so a namespace fork can never be committed over.
     const hasPack = input.unpackError === null && input.pack.packBytes > 0;
+    let recordedPackR2Key: string | null = null;
     if (hasPack) {
       // A zero-object pack (the tips the server already has — e.g. pushing a
       // second branch that points at a known commit) never lands an index
       // row, so the lease payload carries no pack name. Derive it from the
-      // pack's own trailer hash — exactly the name the Worker used for the
-      // final R2 keys. A pack WITH objects must have landed rows through
-      // putIndexRows (any row-landing failure sets unpackError, which
-      // already forces hasPack false); a missing name there stays a reject.
-      const name = packName ?? (input.pack.objectCount === 0 ? catalogPackName(input.pack.packSha1) : null);
+      // lease's directPackName (when M4.2 direct write) or the pack trailer SHA-1.
+      const name =
+        packName ??
+        leaseData.directPackName ??
+        (input.pack.objectCount === 0 ? catalogPackName(input.pack.packSha1) : null);
       if (!name || !isValidPackName(name)) {
         return {
           lost: false as const,
@@ -1003,6 +1023,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
           changed: false,
           needsGc: false,
           extraApplied: [] as RefUpdate[],
+          recordedPackR2Key: null as string | null,
         };
       }
       const derived = packR2Key(leaseData.storageKey ?? "", name);
@@ -1013,9 +1034,11 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
           changed: false,
           needsGc: false,
           extraApplied: [] as RefUpdate[],
+          recordedPackR2Key: null as string | null,
         };
       }
       store.packs.recordPack(name, input.pack.packBytes, input.pack.idxBytes);
+      recordedPackR2Key = derived;
     }
     // DO-side guard for "no ref may point into unindexed storage": every
     // non-null new tip must be present in the store before the CAS commits
@@ -1052,10 +1075,10 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
       }
       store.bumpRefsVersion();
     }
-    return { lost: false as const, ...applied, extraApplied };
+    return { lost: false as const, ...applied, extraApplied, recordedPackR2Key };
   });
   if (outcome.lost) return { tag: "lease_mismatch" };
-  const { results, changed, needsGc } = outcome;
+  const { results, changed, needsGc, recordedPackR2Key } = outcome;
 
   if (changed || outcome.extraApplied.length > 0) {
     // M3.4 GC cadence (SPEC-0011 §2): the committed ref change moved
@@ -1088,11 +1111,13 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
     }
   }
 
-  // the lease is decided: drop the row and sweep the staging object (the copy
-  // in packs/ stays — on a committed push it IS the pack; on a failed one it
-  // is unreferenced bytes the orphan sweep reclaims)
+  // Delete legacy staging keys unconditionally; for direct-write pushes (`packs/pack-rx-*`),
+  // retain the committed pack+idx and delete only if the transaction did NOT record them.
   store.deleteLease(input.leaseToken);
-  if (stagingKey) await host.deletePackObjects([stagingKey]);
+  if (stagingKey && stagingKey !== recordedPackR2Key) {
+    const keys = [stagingKey, leaseData.directIdxKey].filter((k): k is string => !!k);
+    if (keys.length) await host.deletePackObjects(keys);
+  }
 
   // the updates a push actually applied. results[i] is the outcome of
   // commands[i] — the join is by index, not ref name: a crafted request can
@@ -1133,8 +1158,12 @@ export async function releaseReceive(host: LeaseHost, input: ReleaseReceiveInput
   host.store.deleteLease(input.leaseToken);
   if (input.sweep) {
     const payload = parseLeasePayload(lease.payload);
-    if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
-    if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
+    const unrecorded = !payload.directPackName || host.store.packs.catalogStateOf(payload.directPackName) === null;
+    if (payload.packName && unrecorded) host.store.packs.sweepPackRows(payload.packName);
+    if (unrecorded) {
+      const keys = [payload.stagingKey, payload.directIdxKey].filter((k): k is string => !!k);
+      if (keys.length) await host.deletePackObjects(keys);
+    }
   }
   return { tag: "released" };
 }

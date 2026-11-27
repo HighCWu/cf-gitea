@@ -27,7 +27,7 @@ import {
 } from "./upload/stream";
 import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
-import { MultipartCapture, beginRawMultipart } from "./git/multipart";
+import { MultipartCapture, R2_PART_SIZE, R2_PUSH_PART_SIZE, beginRawMultipart } from "./git/multipart";
 import { overDeclaredLength, tooLargeResponse } from "./repo";
 import { idxR2Key, packName, packR2Key } from "./git/r2keys";
 import { COMPACTION_ACTIVE_PACK_THRESHOLD } from "./compaction";
@@ -240,11 +240,28 @@ export {
   type RunQueueCompactionOptions,
   type StageCompactionRowsResult,
 } from "./compaction/queue";
+export { R2_PART_SIZE, R2_PUSH_PART_SIZE } from "./git/multipart";
+export {
+  COALESCE_GAP_BYTES,
+  COALESCE_MAX_WINDOW_BYTES,
+  coalescePackRanges,
+  type CoalescedRangeItem,
+  type CoalescedRangeWindow,
+} from "./receive/delta";
+export {
+  clearIdxV2Cache,
+  loadPackIdxV2,
+  lookupOidsInPackIdxs,
+  parseIdxV2,
+  type IdxV2Hit,
+  type IdxV2PackHit,
+  type IdxV2View,
+} from "./receive/idx-reader";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
-/** default push cap when MAX_PUSH_MB is unset, in MiB (matches env.ts docs) */
-const DEFAULT_MAX_PUSH_MB = 512;
+/** default push cap when MAX_PUSH_MB is unset, in MiB (SPEC-0024 D2: 2048 MiB) */
+const DEFAULT_MAX_PUSH_MB = 2048;
 /** default wall-clock budget for one receive's indexing phase, in ms (matches
  * env.ts GIT_RECEIVE_DEADLINE_MS docs): 10 minutes — strictly inside the
  * default GIT_TIMEOUT_RECEIVE (900s) so a breached deadline releases the
@@ -1001,7 +1018,8 @@ async function stagePack(
   sideband: boolean,
   emit: (chunk: Uint8Array) => void,
   metrics: { stagingPuts: number; stagingParts: number },
-  signal: AbortSignal | null | undefined
+  signal: AbortSignal | null | undefined,
+  partSize = R2_PART_SIZE
 ): Promise<StagedPack> {
   const sha = new Sha1();
   let tail = new Uint8Array(0); // rolling 20-byte lookbehind (the trailer)
@@ -1080,7 +1098,7 @@ async function stagePack(
       metrics.stagingParts++;
       return uploadPart(data);
     };
-    const capture = new MultipartCapture(mp);
+    const capture = new MultipartCapture(mp, partSize);
     try {
       if (push.head.length) {
         absorb(push.head);
@@ -1524,12 +1542,14 @@ async function receivePack<E extends Env>(
     // documented fallback. The parse above ran first, so a malformed command
     // section never touches the cell.
     await stub.bindRepo(repo);
+    const directWrite = env.RECEIVE_DIRECT_PACK_WRITE === "true";
     const begin = await stub.beginReceive({
       commands: push.commands,
       capabilities: push.caps,
       packBytesHint: push.hint,
       storageKey: req.headers.get("x-storage-key"),
       leaseTtlMs: resolveReceiveLeaseTtlSeconds(env.GIT_TIMEOUT_RECEIVE),
+      directPackWrite: directWrite,
     });
     if (begin.tag === "busy") {
       // the busy 503 names the blocking holder's lease lifetime: without it a
@@ -1569,7 +1589,17 @@ async function receivePack<E extends Env>(
     let staged: StagedPack | null = null;
     if (push.head.length > 0) {
       try {
-        staged = await stagePack(bucket, begin.stagingKey, push, maxBytes, sideband, emit, metrics, signal);
+        staged = await stagePack(
+          bucket,
+          begin.stagingKey,
+          push,
+          maxBytes,
+          sideband,
+          emit,
+          metrics,
+          signal,
+          begin.directPackName ? R2_PUSH_PART_SIZE : R2_PART_SIZE
+        );
       } catch (err) {
         // a client disconnect is not an unpack verdict: the push is dead and
         // the lease must turn over NOW (the outer catch releases + sweeps);
@@ -1636,10 +1666,10 @@ async function receivePack<E extends Env>(
       let pack: FinalizedPack = NO_PACK;
       let packIncomplete = false;
       if (staged && !unpackError) {
-        // final keys via the single builder (r2keys.ts): packs/<pack-<sha1>>.pack
-        // + the idx v2 sidecar, both under the lease's storage key
-        const name = packName(staged.packSha1);
-        const packKey = packR2Key(begin.storageKey, name);
+        // final keys via the single builder (r2keys.ts): either direct-write lease
+        // key (`packs/pack-rx-<leaseToken>.pack`) or content-SHA1 (`packs/pack-<sha1>.pack`).
+        const name = begin.directPackName ?? packName(staged.packSha1);
+        const packKey = begin.directPackName ? begin.stagingKey : packR2Key(begin.storageKey, name);
         const idxKey = idxR2Key(begin.storageKey, name);
         try {
           const progress = (msg: string) => {
@@ -1775,9 +1805,11 @@ async function receivePack<E extends Env>(
             throw new Error(`idx length mismatch: wrote ${idxBytes}, expected ${expectedIdx}`);
           }
 
-          // 4c. copy staging → packs/ BEFORE finalize (crash ordering, see header)
-          await copyObject(bucket, begin.stagingKey, packKey);
-          metrics.copies++;
+          // 4c. copy staging → packs/ BEFORE finalize only when not direct-writing
+          if (!begin.directPackName) {
+            await copyObject(bucket, begin.stagingKey, packKey);
+            metrics.copies++;
+          }
           pack = {
             packKey,
             packSha1: staged.packSha1,

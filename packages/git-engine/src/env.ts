@@ -90,6 +90,10 @@ export interface Env {
    * the 32 MiB DO-heap merge to Worker/Queue streaming compaction + OFS_DELTA +
    * `.pref` sidecars (SPEC-0024 M4.1). */
   COMPACTION_QUEUE_ENABLED?: string;
+  /** Strict-polarity flag ("true" enables) streaming receivePack bytes directly
+   * to the final R2 pack key (`packs/pack-rx-<leaseToken>.pack`) using 64 MiB
+   * multipart parts, eliminating `copyObject` double R2 writes (SPEC-0024 M4.2). */
+  RECEIVE_DIRECT_PACK_WRITE?: string;
   /** Optional Cloudflare Queue binding used by `receivePack` to enqueue
    * `{ kind: "pack-compact", repo }` when `COMPACTION_QUEUE_ENABLED === "true"`. */
   REPO_TASKS?: { send(message: unknown): Promise<unknown> };
