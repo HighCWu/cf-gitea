@@ -5,6 +5,7 @@ import {
   createDurableGit,
   formatGitBundleV2Header,
   parseHttpByteRange,
+  serveBundleDownload,
   signBundleToken,
   verifyBundleToken,
 } from "@cf-gitea/git-engine";
@@ -482,5 +483,101 @@ describe("SPEC-0024 M4.3 bundle-uri compaction, serving & anti-leakage", () => {
       expect(gcRes.bundlesDeleted).toContain(expectedR2Key);
     }
     expect(await targetEnv.REPO_PACKS.get(expectedR2Key)).toBeNull();
+  });
+
+  it("streams large bundle GET and Range 206 responses via segmented stall-resilient R2 reads while keeping small bundles single-GET (M4.13)", async () => {
+    const payload = new Uint8Array(100);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 19 + 7) & 0xff;
+
+    const createTestBucket = (stallAtOffset: number | null) => {
+      const getCalls: Array<{ key: string; range?: { offset?: number; length?: number } }> = [];
+      let stalledOnce = false;
+      const bucket = {
+        head: () =>
+          Promise.resolve({
+            size: payload.length,
+            httpEtag: '"bundle-etag"',
+          } as unknown as R2Object),
+        get: (key: string, options?: R2GetOptions) => {
+          const range = options?.range as { offset?: number; length?: number } | undefined;
+          getCalls.push({ key, range });
+          const start = range?.offset ?? 0;
+          const len = range?.length ?? payload.length - start;
+          const slice = payload.subarray(start, start + len);
+          return Promise.resolve({
+            size: payload.length,
+            httpEtag: '"bundle-etag"',
+            body: new ReadableStream<Uint8Array>({
+              start(ctrl) {
+                if (stallAtOffset !== null && start === stallAtOffset && !stalledOnce) {
+                  stalledOnce = true;
+                  // Emit partial 10 bytes then stall past 40ms timeout.
+                  ctrl.enqueue(slice.subarray(0, 10));
+                  return;
+                }
+                ctrl.enqueue(slice);
+                ctrl.close();
+              },
+            }),
+          } as unknown as R2ObjectBody);
+        },
+      } as unknown as R2Bucket;
+      return { bucket, getCalls };
+    };
+
+    // 1. Small bundle (size <= segmentBytes) preserves 1 plain R2.get.
+    const smallState = createTestBucket(null);
+    const smallRes = await serveBundleDownload(
+      new Request("https://engine.internal/alice/r.git/bundle/tok"),
+      smallState.bucket,
+      "r_small",
+      "b1",
+      { segmentBytes: 128 },
+    );
+    expect(smallRes.status).toBe(200);
+    expect(smallRes.headers.get("content-length")).toBe("100");
+    expect(new Uint8Array(await smallRes.arrayBuffer())).toEqual(payload);
+    expect(smallState.getCalls).toEqual([{ key: bundleR2Key("r_small", "b1"), range: undefined }]);
+
+    // 2. Large plain GET streams in 40B segments and recovers via Range GET after a mid-segment stall.
+    const fullState = createTestBucket(40);
+    const fullRes = await serveBundleDownload(
+      new Request("https://engine.internal/alice/r.git/bundle/tok"),
+      fullState.bucket,
+      "r_big",
+      "b2",
+      { segmentBytes: 40, readTimeoutMs: 40, maxRetriesPerSegment: 2 },
+    );
+    expect(fullRes.status).toBe(200);
+    expect(fullRes.headers.get("content-length")).toBe("100");
+    expect(fullRes.headers.get("etag")).toBe('"bundle-etag"');
+    expect(new Uint8Array(await fullRes.arrayBuffer())).toEqual(payload);
+    expect(fullState.getCalls.map((c) => c.range)).toEqual([
+      { offset: 0, length: 40 },
+      { offset: 40, length: 40 },
+      { offset: 50, length: 30 },
+      { offset: 80, length: 20 },
+    ]);
+
+    // 3. Large Range 206 (`bytes=25-`, len=75 > 40B) streams segments `[25..65)` and `[65..100)` with stall recovery.
+    const rangeState = createTestBucket(25);
+    const rangeRes = await serveBundleDownload(
+      new Request("https://engine.internal/alice/r.git/bundle/tok", {
+        headers: { range: "bytes=25-" },
+      }),
+      rangeState.bucket,
+      "r_big",
+      "b2",
+      { segmentBytes: 40, readTimeoutMs: 40, maxRetriesPerSegment: 2 },
+    );
+    expect(rangeRes.status).toBe(206);
+    expect(rangeRes.headers.get("content-range")).toBe("bytes 25-99/100");
+    expect(rangeRes.headers.get("content-length")).toBe("75");
+    expect(new Uint8Array(await rangeRes.arrayBuffer())).toEqual(payload.subarray(25));
+    expect(rangeState.getCalls.map((c) => c.range)).toEqual([
+      { offset: 25, length: 40 },
+      { offset: 35, length: 30 },
+      { offset: 65, length: 35 },
+    ]);
   });
 });

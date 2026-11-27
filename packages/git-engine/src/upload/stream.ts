@@ -330,22 +330,25 @@ export interface ResumableR2PackStreamOptions {
   segmentBytes?: number;
   readTimeoutMs?: number;
   maxRetriesPerSegment?: number;
+  startOffset?: number;
 }
 
 /**
- * Segmented & stall-resilient R2 pack passthrough reader (SPEC-0024 M4.11):
- * - Uses 1 plain `bucket.get(key)` when `totalBytes <= segmentBytes` (<= 32 MiB) or unknown.
- * - Streams large packs in bounded `segmentBytes` (32 MiB) R2 Range GETs (~41 subrequests for 1.3 GiB),
- *   authorizing/renewing the SPEC-0011 read lease before every segment.
- * - Guards every `reader.read()` with a bounded stall timeout (`readTimeoutMs`, default 30s) and
+ * Segmented & stall-resilient R2 pack/bundle passthrough reader (SPEC-0024 M4.11/M4.13):
+ * - Uses 1 plain `bucket.get(key)` when `startOffset === 0` and `totalBytes <= segmentBytes` (<= 32 MiB) or unknown.
+ * - Streams large payloads (and large `Range` slices) in bounded `segmentBytes` (32 MiB) R2 Range GETs,
+ *   authorizing/renewing the SPEC-0011 read lease before every segment when present.
+ * - Guards every `reader.read()` with a bounded stall timeout (`readTimeoutMs`, default 20s) and
  *   resumes seamlessly via R2 Range GET at the exact committed byte `offset`.
  */
 export class ResumableR2PackStream {
   private readonly segmentBytes: number;
   private readonly readTimeoutMs: number;
   private readonly maxRetriesPerSegment: number;
-  private offset = 0;
-  private segmentEnd = 0;
+  private readonly startOffset: number;
+  private readonly endOffset: number;
+  private offset: number;
+  private segmentEnd: number;
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private unboundedEof = false;
   private segmentRetries = 0;
@@ -361,10 +364,14 @@ export class ResumableR2PackStream {
     this.segmentBytes = Math.max(1, Math.trunc(opts?.segmentBytes ?? WORKER_PASSTHROUGH_SEGMENT_BYTES));
     this.readTimeoutMs = Math.max(10, Math.trunc(opts?.readTimeoutMs ?? WORKER_PASSTHROUGH_READ_TIMEOUT_MS));
     this.maxRetriesPerSegment = Math.max(0, Math.trunc(opts?.maxRetriesPerSegment ?? 3));
+    this.startOffset = Math.max(0, Math.trunc(opts?.startOffset ?? 0));
+    this.endOffset = totalBytes > 0 ? this.startOffset + totalBytes : 0;
+    this.offset = this.startOffset;
+    this.segmentEnd = this.startOffset;
   }
 
   bytesRead(): number {
-    return this.offset;
+    return this.offset - this.startOffset;
   }
 
   private async cancelCurrentReader(): Promise<void> {
@@ -419,15 +426,15 @@ export class ResumableR2PackStream {
   }
 
   private async openNextReader(): Promise<ReadableStreamDefaultReader<Uint8Array>> {
-    const isFirst = this.offset === 0;
+    const isFirst = this.offset === this.startOffset;
     await this.authorizeSegment(isFirst);
-    if (this.totalBytes <= 0 || (isFirst && this.totalBytes <= this.segmentBytes)) {
-      this.segmentEnd = this.totalBytes > 0 ? this.totalBytes : Number.MAX_SAFE_INTEGER;
+    if (this.startOffset === 0 && (this.totalBytes <= 0 || (isFirst && this.totalBytes <= this.segmentBytes))) {
+      this.segmentEnd = this.totalBytes > 0 ? this.endOffset : Number.MAX_SAFE_INTEGER;
       const obj = await this.getSegmentObject();
       return obj.body.getReader();
     }
     if (this.segmentEnd <= this.offset) {
-      this.segmentEnd = Math.min(this.totalBytes, this.offset + this.segmentBytes);
+      this.segmentEnd = Math.min(this.endOffset, this.offset + this.segmentBytes);
     }
     const len = this.segmentEnd - this.offset;
     const obj = await this.getSegmentObject({ offset: this.offset, length: len });
@@ -436,11 +443,11 @@ export class ResumableR2PackStream {
 
   async nextChunk(): Promise<Uint8Array | null> {
     if (this.closed || this.unboundedEof) return null;
-    if (this.totalBytes > 0 && this.offset >= this.totalBytes) return null;
+    if (this.totalBytes > 0 && this.offset >= this.endOffset) return null;
 
     for (;;) {
       if (this.closed) return null;
-      if (this.totalBytes > 0 && this.offset >= this.totalBytes) return null;
+      if (this.totalBytes > 0 && this.offset >= this.endOffset) return null;
 
       if (!this.reader) {
         this.reader = await this.openNextReader();
@@ -474,7 +481,7 @@ export class ResumableR2PackStream {
           continue;
         }
         this.segmentRetries = 0;
-        if (this.offset >= this.totalBytes) return null;
+        if (this.offset >= this.endOffset) return null;
         continue;
       }
 

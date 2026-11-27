@@ -1,6 +1,11 @@
 import { bundleR2Key, isValidStorageKey } from "../git/r2keys";
 import { FLUSH, pkt } from "../git/pktline";
 import { concat, isOid, td, te } from "../git/util";
+import {
+  ResumableR2PackStream,
+  WORKER_PASSTHROUGH_SEGMENT_BYTES,
+  type ResumableR2PackStreamOptions,
+} from "./stream";
 
 export const DEFAULT_BUNDLE_MIN_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_BUNDLE_TOKEN_TTL_SEC = 900;
@@ -230,14 +235,59 @@ export function parseHttpByteRange(
   return { kind: "ok", start, end };
 }
 
+function streamSegmentedBundleBody(
+  bucket: R2Bucket,
+  key: string,
+  startOffset: number,
+  length: number,
+  signal: AbortSignal | undefined,
+  streamOpts?: ResumableR2PackStreamOptions
+): ReadableStream<Uint8Array> {
+  const readerStream = new ResumableR2PackStream(bucket, key, length, () => Promise.resolve(), {
+    ...streamOpts,
+    startOffset,
+  });
+  return new ReadableStream<Uint8Array>({
+    pull: async (ctrl) => {
+      try {
+        if (signal?.aborted) {
+          throw new Error("client aborted bundle download stream");
+        }
+        const value = await readerStream.nextChunk();
+        if (signal?.aborted) {
+          throw new Error("client aborted bundle download stream");
+        }
+        if (value === null) {
+          if (readerStream.bytesRead() !== length) {
+            throw new Error(`truncated bundle download ${key} (${readerStream.bytesRead()}/${length} bytes)`);
+          }
+          await readerStream.close();
+          ctrl.close();
+          return;
+        }
+        ctrl.enqueue(value);
+      } catch (err) {
+        console.error("[bundle-download] stream error:", err instanceof Error ? err.message : String(err));
+        await readerStream.close();
+        ctrl.error(err);
+      }
+    },
+    cancel: async () => {
+      await readerStream.close();
+    },
+  });
+}
+
 /** Serve `GET` or `HEAD` for a verified bundle download directly from R2 with `Range` / `206` support. */
 export async function serveBundleDownload(
   req: Request,
   bucket: R2Bucket,
   storageKey: string,
-  bundleId: string
+  bundleId: string,
+  streamOpts?: ResumableR2PackStreamOptions
 ): Promise<Response> {
   const key = bundleR2Key(storageKey, bundleId);
+  const segmentBytes = Math.max(1, Math.trunc(streamOpts?.segmentBytes ?? WORKER_PASSTHROUGH_SEGMENT_BYTES));
   const baseHeaders: Record<string, string> = {
     "content-type": "application/x-git-bundle",
     "accept-ranges": "bytes",
@@ -269,19 +319,35 @@ export async function serveBundleDownload(
       });
     }
     const len = parsed.end - parsed.start + 1;
-    const obj = await bucket.get(key, { range: { offset: parsed.start, length: len } });
-    if (!obj) return new Response("not found\n", { status: 404 });
     const headers = new Headers(baseHeaders);
     headers.set("content-range", `bytes ${parsed.start}-${parsed.end}/${head.size}`);
     headers.set("content-length", String(len));
-    if (obj.httpEtag) headers.set("etag", obj.httpEtag);
-    return new Response(obj.body, { status: 206, headers });
+    if (len <= segmentBytes) {
+      const obj = await bucket.get(key, { range: { offset: parsed.start, length: len } });
+      if (!obj) return new Response("not found\n", { status: 404 });
+      if (obj.httpEtag) headers.set("etag", obj.httpEtag);
+      return new Response(obj.body, { status: 206, headers });
+    }
+    if (head.httpEtag) headers.set("etag", head.httpEtag);
+    return new Response(streamSegmentedBundleBody(bucket, key, parsed.start, len, req.signal, streamOpts), {
+      status: 206,
+      headers,
+    });
   }
 
-  const obj = await bucket.get(key);
-  if (!obj) return new Response("not found\n", { status: 404 });
+  const head = await bucket.head(key);
+  if (!head) return new Response("not found\n", { status: 404 });
   const headers = new Headers(baseHeaders);
-  headers.set("content-length", String(obj.size));
-  if (obj.httpEtag) headers.set("etag", obj.httpEtag);
-  return new Response(obj.body, { status: 200, headers });
+  headers.set("content-length", String(head.size));
+  if (head.size <= segmentBytes) {
+    const obj = await bucket.get(key);
+    if (!obj) return new Response("not found\n", { status: 404 });
+    if (obj.httpEtag) headers.set("etag", obj.httpEtag);
+    return new Response(obj.body, { status: 200, headers });
+  }
+  if (head.httpEtag) headers.set("etag", head.httpEtag);
+  return new Response(streamSegmentedBundleBody(bucket, key, 0, head.size, req.signal, streamOpts), {
+    status: 200,
+    headers,
+  });
 }
