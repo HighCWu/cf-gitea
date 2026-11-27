@@ -150,7 +150,7 @@ async function main() {
     const tables = tableNames(sql);
     for (const t of [
       "objects", "chunks", "refs", "meta", "reachable", "peeled", "stats_cache", "leases",
-      "pack_catalog", "pack_data", "pack_objects", "fork_import", "schema_migrations",
+      "pack_catalog", "pack_data", "pack_objects", "fork_import", "compaction_staging", "schema_migrations",
     ]) {
       assert(tables.has(t), `table ${t} exists after baseline`);
     }
@@ -181,8 +181,8 @@ async function main() {
     assertEq(missing, [], "fresh schema missing nothing the legacy constructors built");
     assertEq(
       extra.sort(),
-      [`index:${DEMO_INDEX}`, "table:schema_migrations"].sort(),
-      "the only additions are the 0002 demonstrator index and the journal"
+      [`index:${DEMO_INDEX}`, "table:compaction_staging", "table:schema_migrations"].sort(),
+      "the only additions past the baseline are the 0002 index, 0004 compaction_staging, and the journal"
     );
   });
 

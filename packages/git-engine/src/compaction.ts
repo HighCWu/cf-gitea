@@ -120,6 +120,7 @@ export interface CompactionLeasePayload {
   outputPackKey?: string;
   outputPackR2Key?: string;
   outputIdxR2Key?: string;
+  outputPrefR2Key?: string;
 }
 
 /** What a compaction round needs from its host (RepoCell contributes the DO

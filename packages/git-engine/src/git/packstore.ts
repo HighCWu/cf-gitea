@@ -142,6 +142,9 @@ export interface PackCatalogRow {
   idxBytes: number;
   createdAt: number;
   supersededBy: string | null;
+  cleanReachable?: boolean;
+  prefBytes?: number;
+  tier?: number;
 }
 
 /**
@@ -235,7 +238,7 @@ export class PackStore {
 
   wipe(): void {
     this.sealed = false; // the explicit wipe recovers a sealed store
-    for (const t of ["pack_catalog", "pack_data", "pack_objects", "fork_import"]) {
+    for (const t of ["pack_catalog", "pack_data", "pack_objects", "fork_import", "compaction_staging"]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
     this.chunks.clear(); // pack keys are content-derived, but caches hold chunk bytes
@@ -1124,6 +1127,224 @@ export class PackStore {
         createdAt: r.created_at,
         supersededBy: r.superseded_by,
       }));
+  }
+
+  /**
+   * Oldest ACTIVE R2-backed packs in catalog `seq` order for Worker Queue
+   * streaming compaction (SPEC-0024 M4.1): no 32 MiB / 50k object cap.
+   */
+  activeR2PacksForCompaction(maxPacks: number): PackCatalogRow[] {
+    this.assertOpen();
+    return this.sql
+      .exec<{
+        pack_key: string;
+        seq: number;
+        kind: string;
+        state: string;
+        location: string;
+        object_count: number;
+        pack_bytes: number;
+        idx_bytes: number;
+        created_at: number;
+        superseded_by: string | null;
+        clean_reachable: number;
+        pref_bytes: number;
+        tier: number;
+      }>(
+        `SELECT pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by,
+                clean_reachable, pref_bytes, tier
+           FROM pack_catalog
+          WHERE state = 'active' AND location = 'r2'
+          ORDER BY seq
+          LIMIT ?`,
+        maxPacks
+      )
+      .toArray()
+      .map((r) => ({
+        packKey: r.pack_key,
+        seq: r.seq,
+        kind: r.kind,
+        state: r.state as PackState,
+        location: "r2",
+        objectCount: r.object_count,
+        packBytes: r.pack_bytes,
+        idxBytes: r.idx_bytes,
+        createdAt: r.created_at,
+        supersededBy: r.superseded_by,
+        cleanReachable: r.clean_reachable === 1,
+        prefBytes: r.pref_bytes,
+        tier: r.tier,
+      }));
+  }
+
+  /** Offset-ordered keyset page of all index rows in one pack for Queue compaction. */
+  indexRowsInPackAfterOffset(packKey: string, afterOffset: number, limit: number): IndexRow[] {
+    this.assertOpen();
+    return this.sql
+      .exec<{
+        oid: string;
+        offset: number;
+        data_off: number;
+        data_len: number;
+        type: ObjType;
+        size: number;
+        entry_size: number;
+        base_oid: string | null;
+        crc32: number;
+      }>(
+        `SELECT oid, offset, data_off, data_len, type, size, entry_size, base_oid, crc32
+           FROM pack_objects
+          WHERE pack_key = ? AND offset > ?
+          ORDER BY offset
+          LIMIT ?`,
+        packKey,
+        afterOffset,
+        limit
+      )
+      .toArray()
+      .map((r) => ({
+        oid: r.oid,
+        offset: r.offset,
+        dataOff: r.data_off,
+        dataLen: r.data_len,
+        type: r.type,
+        size: r.size,
+        entrySize: r.entry_size,
+        baseOid: r.base_oid,
+        crc32: r.crc32,
+      }));
+  }
+
+  /** Exact object count to emit across `packKeys` (reachable-filtered when `reachableOnly`). */
+  countObjectsInPacks(packKeys: string[], reachableOnly: boolean): number {
+    this.assertOpen();
+    if (!packKeys.length) return 0;
+    const placeholders = packKeys.map(() => "?").join(", ");
+    if (reachableOnly) {
+      return this.sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM pack_objects p JOIN reachable r ON r.oid = p.oid WHERE p.pack_key IN (${placeholders})`,
+          ...packKeys
+        )
+        .one().n;
+    }
+    return this.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key IN (${placeholders})`,
+        ...packKeys
+      )
+      .one().n;
+  }
+
+  /** Stage emitted successor index rows for Queue compaction in bounded SQLite batches. */
+  stageCompactionRows(leaseToken: string, rows: Array<IndexRow & { srcPack: string }>): void {
+    this.assertOpen();
+    for (let i = 0; i < rows.length; i += 8) {
+      const slice = rows.slice(i, i + 8);
+      const placeholders = slice.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const params: (string | number | null)[] = [];
+      for (const r of slice) {
+        params.push(
+          leaseToken,
+          r.oid,
+          r.offset,
+          r.dataOff,
+          r.dataLen,
+          r.type,
+          r.size,
+          r.entrySize,
+          r.baseOid,
+          r.crc32,
+          r.srcPack
+        );
+      }
+      this.sql.exec(
+        `INSERT OR REPLACE INTO compaction_staging
+           (lease_token, oid, offset, data_off, data_len, type, size, entry_size, base_oid, crc32, src_pack)
+         VALUES ${placeholders}`,
+        ...params
+      );
+    }
+  }
+
+  /** Remove any staged compaction rows belonging to `leaseToken`. */
+  clearCompactionStaging(leaseToken: string): void {
+    this.assertOpen();
+    this.sql.exec("DELETE FROM compaction_staging WHERE lease_token = ?", leaseToken);
+  }
+
+  /**
+   * Atomically publish a Queue-compacted pack from `compaction_staging` (SPEC-0024 M4.1):
+   * inserts the active successor catalog row, re-points `pack_objects` rows via guarded
+   * UPDATEs, retires `inputKeys`, and clears staging. Caller wraps in `transactionSync`.
+   */
+  publishStagedCompaction(
+    leaseToken: string,
+    output: {
+      packKey: string;
+      packBytes: number;
+      idxBytes: number;
+      prefBytes: number;
+      objectCount: number;
+      cleanReachable: boolean;
+      tier: number;
+    },
+    inputKeys: string[]
+  ): void {
+    this.assertOpen();
+    this.sql.exec(
+      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by, clean_reachable, pref_bytes, tier)
+       VALUES (?, ?, 'compact', 'active', 'r2', ?, ?, ?, ?, NULL, ?, ?, ?)
+       ON CONFLICT(pack_key) DO NOTHING`,
+      output.packKey,
+      this.nextPackSeq(),
+      output.objectCount,
+      output.packBytes,
+      output.idxBytes,
+      Date.now(),
+      output.cleanReachable ? 1 : 0,
+      output.prefBytes,
+      output.tier
+    );
+    const stagedCount = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM compaction_staging WHERE lease_token = ?", leaseToken)
+      .one().n;
+    if (stagedCount !== output.objectCount) {
+      throw new Error(`compaction publish count mismatch: staged ${stagedCount}, expected ${output.objectCount}`);
+    }
+    this.sql.exec(
+      `UPDATE pack_objects
+          SET pack_key = ?,
+              offset = s.offset,
+              data_off = s.data_off,
+              data_len = s.data_len,
+              type = s.type,
+              size = s.size,
+              entry_size = s.entry_size,
+              base_oid = s.base_oid,
+              crc32 = s.crc32
+         FROM compaction_staging s
+        WHERE pack_objects.oid = s.oid
+          AND pack_objects.pack_key = s.src_pack
+          AND s.lease_token = ?`,
+      output.packKey,
+      leaseToken
+    );
+    const movedCount = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", output.packKey)
+      .one().n;
+    if (movedCount !== output.objectCount) {
+      throw new Error(`compaction publish re-point mismatch: moved ${movedCount}, expected ${output.objectCount}`);
+    }
+    for (const key of inputKeys) {
+      this.sql.exec(
+        "UPDATE pack_catalog SET state = 'retired', superseded_by = ? WHERE pack_key = ? AND state = 'active'",
+        output.packKey,
+        key
+      );
+    }
+    this.sql.exec("DELETE FROM compaction_staging WHERE lease_token = ?", leaseToken);
+    this.backend.set(output.packKey, "r2");
   }
 }
 

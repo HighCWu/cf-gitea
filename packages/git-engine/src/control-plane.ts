@@ -264,6 +264,8 @@ export type FinalizeCommitted = {
   commitTime: number;
   /** applied updates for the onPush hook — no truncation, unlike x-ref-updates */
   updates: RefUpdate[];
+  /** ACTIVE pack count after commit, used by Queue compaction trigger (M4.1). */
+  activePacks?: number;
 };
 export type FinalizeRefConflict = {
   tag: "ref_conflict";
@@ -503,9 +505,12 @@ export async function sweepExpiredLeases(host: LeaseHost): Promise<void> {
       if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
       if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
     } else if (lease.kind === "compaction") {
+      host.store.packs.clearCompactionStaging(lease.leaseToken);
       const payload = parseCompactionPayload(lease.payload);
       if (payload.outputPackKey && host.store.packs.catalogStateOf(payload.outputPackKey) === null) {
-        const keys = [payload.outputPackR2Key, payload.outputIdxR2Key].filter((k): k is string => !!k);
+        const keys = [payload.outputPackR2Key, payload.outputIdxR2Key, payload.outputPrefR2Key].filter(
+          (k): k is string => !!k
+        );
         if (keys.length) await host.deletePackObjects(keys);
       }
     }
@@ -518,12 +523,14 @@ function parseCompactionPayload(payload: string): {
   outputPackKey?: string;
   outputPackR2Key?: string;
   outputIdxR2Key?: string;
+  outputPrefR2Key?: string;
 } {
   try {
     const p = JSON.parse(payload) as {
       outputPackKey?: string;
       outputPackR2Key?: string;
       outputIdxR2Key?: string;
+      outputPrefR2Key?: string;
     } | null;
     return p && typeof p === "object" ? p : {};
   } catch {
@@ -1109,6 +1116,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
     refsVersion: store.refsVersion(),
     commitTime: changed ? await latestCommitTime(store) : 0,
     updates,
+    activePacks: changed ? store.packs.activePackCount() : undefined,
   };
 }
 

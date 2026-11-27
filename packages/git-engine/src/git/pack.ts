@@ -57,7 +57,24 @@ export function applyDelta(base: Uint8Array, delta: Uint8Array): Uint8Array {
   return out;
 }
 
+const OFS_DELTA_NUM = 6;
 const REF_DELTA_NUM = 7;
+
+/** Encode a relative backward base offset using Git's OFS_DELTA varint coding. */
+export function encodeOfsDistance(dist: number): Uint8Array {
+  if (!Number.isSafeInteger(dist) || dist <= 0) {
+    throw new Error(`invalid OFS_DELTA base distance: ${dist}`);
+  }
+  const bytes: number[] = [dist & 0x7f];
+  let n = Math.floor(dist / 128);
+  while (n > 0) {
+    n -= 1;
+    bytes.push(0x80 | (n & 0x7f));
+    n = Math.floor(n / 128);
+  }
+  bytes.reverse();
+  return new Uint8Array(bytes);
+}
 
 function encodeTypeSizeNum(typeNum: number, size: number): Uint8Array {
   const bytes: number[] = [];
@@ -115,6 +132,13 @@ export class PackWriter {
   rawDelta(entrySize: number, baseOid: string, compressed: Uint8Array): void {
     this.out(encodeTypeSizeNum(REF_DELTA_NUM, entrySize));
     this.out(fromHex(baseOid));
+    this.out(compressed);
+  }
+
+  /** Copy a stored delta entry verbatim, addressed as an OFS_DELTA relative to an earlier entry. */
+  rawOfsDelta(entrySize: number, distance: number, compressed: Uint8Array): void {
+    this.out(encodeTypeSizeNum(OFS_DELTA_NUM, entrySize));
+    this.out(encodeOfsDistance(distance));
     this.out(compressed);
   }
 

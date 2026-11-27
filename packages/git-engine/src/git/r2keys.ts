@@ -56,6 +56,11 @@ export function idxR2Key(storageKey: string, name: string): string {
   return `repos/${storageKey}/packs/${name}.idx`;
 }
 
+/** `repos/<storage_key>/packs/<packName>.pref` (ref-index sidecar, SPEC-0024 M4.1). */
+export function prefR2Key(storageKey: string, name: string): string {
+  return `repos/${storageKey}/packs/${name}.pref`;
+}
+
 /**
  * `repos/<storage_key>/clone-cache/<refsVersionHash>.pack` — the whole-clone
  * cache object. `refsVersionHash` is a hash over the current ref state (the

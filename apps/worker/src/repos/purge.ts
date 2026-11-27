@@ -85,6 +85,7 @@ import { eq } from "drizzle-orm";
 import { users } from "../db/schema";
 import { handleImportTask, isImportMessage } from "./imports/pipeline";
 import { isForkMessage, runForkTask } from "./fork-task";
+import { handlePackCompactTask, isPackCompactMessage } from "./pack-compact";
 import { RepoNotExistError, RepoService, type RepoRow } from "./service";
 
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
@@ -493,6 +494,22 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] actions-trigger ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    if (isPackCompactMessage(message.body)) {
+      try {
+        const outcome = await handlePackCompactTask(env, message.body);
+        if (outcome.retry) {
+          message.retry({ delaySeconds: outcome.delaySeconds ?? 30 });
+        } else {
+          message.ack();
+        }
+      } catch (error) {
+        console.error(
+          `[repo-tasks] pack-compact ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`,
+        );
         message.retry();
       }
       continue;

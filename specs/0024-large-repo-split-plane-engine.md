@@ -1,6 +1,6 @@
 # SPEC-0024: Large-Repository Split-Plane Git Engine (Worker Streaming Upload-Pack, Queue Compaction, Ref-Index Sidecars, and Bundle-URI)
 
-Status: accepted — M4.0 implemented & locally verified (2026-11-27) · Date: 2026-11-27 · Amends: SPEC-0001, SPEC-0001a, SPEC-0011
+Status: accepted — M4.0 committed (`33cbe99`), M4.1 implemented & locally verified (2026-11-27) · Date: 2026-11-27 · Amends: SPEC-0001, SPEC-0001a, SPEC-0011
 Depends on: SPEC-0001, SPEC-0001a, SPEC-0003, SPEC-0011
 Governs: `packages/git-engine/`, `apps/worker/src/git-http/`, `apps/worker/src/queues/`
 Reference implementations studied: `/home/whc/pnpm_repos/cf-gitea-ref/git-on-cloudflare`, `/home/whc/pnpm_repos/cf-gitea-ref/enroute`, upstream `gitea/routers/web/repo/githttp.go`
@@ -216,4 +216,12 @@ Zero D1 migrations are required. Extend DO SQLite `pack_catalog` additively:
   - `packages/git-engine/e2e/check-read-leases.mjs` — all `25` checks passed.
   - `pnpm --filter cf-gitea-worker exec vitest run src/git-http/upload-worker-stream.test.ts` — `5/5` passed (`worker-passthrough` single-pack v2/v0 sideband/v0 plain, multi-pack sequential `worker-stream`, G3 fail-closed/`deepen-since`/shallow/filter/have/force-push isolation, SPEC-0011 Property A mid-stream lease abort before `FLUSH`, and idle-gated `0005\x01` sideband keepalive vs zero keepalives on plain v0).
   - Related existing `vitest` suites (`src/git-http/gate.test.ts`, `src/git-http/receive-external-base-walk.test.ts`, `src/git-http/receive-stream-keepalive.test.ts`) ran with zero source edits afterwards — `126/126` passed.
-  - Pending: M4.1 (Queue streaming compaction + `.pref` sidecar), M4.2 (direct `receivePack` final-key write + `pack_objects` retirement), M4.3 (`bundle-uri` serving), and remote staging/live clone acceptance.
+- **M4.1 (2026-11-27)** — Implemented Queue-driven streaming compaction, `OFS_DELTA` emission, `.pref` ref-index sidecar, and migration `0004` (`packages/git-engine/src/compaction/queue.ts`, `src/git/pref.ts`, `src/git/pack.ts`, `src/git/r2keys.ts`, `src/git/migrations.ts`, `src/git/packstore.ts`, `src/compaction.ts`, `src/control-plane.ts`, `src/gc.ts`, `src/repo.ts`, `src/mod.ts`, `src/env.ts`, `packages/git-engine/NOTICE.md`, `apps/worker/wrangler.jsonc[.example]`, `apps/worker/src/repos/pack-compact.ts`, `apps/worker/src/repos/purge.ts`, `apps/worker/src/git-http/queue-compaction-pref.test.ts`):
+  - `pnpm --filter cf-gitea-worker exec tsc --noEmit && pnpm exec eslint apps/worker/src/repos/pack-compact.ts apps/worker/src/repos/purge.ts apps/worker/src/git-http/queue-compaction-pref.test.ts` — passed (`0` errors, `0` warnings).
+  - `packages/git-engine/e2e/check-drain-discipline.mjs` — all `4` checks passed (`135` exec sites: `132` SqlStorage with `75` SELECT drained / `57` DDL-DML, `3` RegExp excluded).
+  - `packages/git-engine/e2e/check-migrations.mjs` — all `17` checks passed (updated expected fresh-schema table list for `0004` `compaction_staging`).
+  - `packages/git-engine/e2e/check-compaction.mjs` — all `11` checks passed.
+  - `packages/git-engine/e2e/check-gc.mjs` — all `8` checks passed.
+  - `packages/git-engine/e2e/check-read-leases.mjs` — all `25` checks passed.
+  - `pnpm --filter cf-gitea-worker exec vitest run src/git-http/queue-compaction-pref.test.ts` — `4/4` passed (`encodeOfsDistance` varint boundaries, `.pref` encode/parse + `walkClosureWithPref` skipping `160000` gitlinks, `REPO_TASKS` 3-pack compaction to 1 `OFS_DELTA`+`.idx`+`.pref` pack upgrading subsequent clone to `worker-passthrough` and `gcNow` deleting `.pref`, plus live-receive defer & R2 failure abort cleanup).
+  - Pending: M4.2 (direct `receivePack` final-key write + coalesced external-base Range reads + `pack_objects` retirement), M4.3 (`bundle-uri` serving), and remote staging/live multi-GB acceptance.

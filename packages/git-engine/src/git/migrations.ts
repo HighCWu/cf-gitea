@@ -290,6 +290,38 @@ export const REPO_MIGRATIONS: SchemaMigrationStep[] = [
       sql.exec("UPDATE pack_catalog SET state = 'active' WHERE state IS NULL");
     },
   },
+  {
+    id: "0004-pack-catalog-m41-columns",
+    up: (sql) => {
+      for (const col of [
+        "clean_reachable INTEGER NOT NULL DEFAULT 0",
+        "pref_bytes INTEGER NOT NULL DEFAULT 0",
+        "tier INTEGER NOT NULL DEFAULT 0",
+      ]) {
+        try {
+          sql.exec(`ALTER TABLE pack_catalog ADD COLUMN ${col}`);
+        } catch {
+          // column already exists (idempotent replay)
+        }
+      }
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS compaction_staging (
+          lease_token TEXT NOT NULL,
+          oid TEXT NOT NULL,
+          offset INTEGER NOT NULL,
+          data_off INTEGER NOT NULL,
+          data_len INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          entry_size INTEGER NOT NULL,
+          base_oid TEXT,
+          crc32 INTEGER NOT NULL,
+          src_pack TEXT NOT NULL,
+          PRIMARY KEY (lease_token, oid)
+        )
+      `);
+    },
+  },
 ];
 
 /**
@@ -313,6 +345,7 @@ export const REPO_TABLES = [
   "pack_data",
   "pack_objects",
   "fork_import",
+  "compaction_staging",
   // the journal itself
   SCHEMA_MIGRATIONS_TABLE,
   // pre-Step-4 generations (dev-scratch)

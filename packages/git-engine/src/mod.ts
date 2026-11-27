@@ -30,6 +30,8 @@ import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, beginRawMultipart } from "./git/multipart";
 import { overDeclaredLength, tooLargeResponse } from "./repo";
 import { idxR2Key, packName, packR2Key } from "./git/r2keys";
+import { COMPACTION_ACTIVE_PACK_THRESHOLD } from "./compaction";
+import { runQueueCompaction } from "./compaction/queue";
 import {
   asCommandResults,
   NO_PACK,
@@ -209,6 +211,35 @@ export {
   type WorkerUploadPackMeta,
   type WorkerUploadStub,
 } from "./upload/stream";
+export { prefR2Key } from "./git/r2keys";
+export { encodeOfsDistance } from "./git/pack";
+export {
+  PACK_REF_HEADER_BYTES,
+  PACK_REF_MAGIC,
+  PACK_REF_VERSION,
+  encodePackRefIndex,
+  extractObjectRefBytes,
+  parsePackRefIndex,
+  walkClosureWithPref,
+  type PackRefEntryInput,
+  type PackRefIndexView,
+} from "./git/pref";
+export {
+  QUEUE_COMPACTION_MAX_PACKS,
+  QUEUE_COMPACTION_PART_SIZE,
+  runQueueCompaction,
+  type BeginQueueCompactionInput,
+  type BeginQueueCompactionResult,
+  type CommitQueueCompactionInput,
+  type CommitQueueCompactionResult,
+  type CompactionInputPack,
+  type QueueCompactionResult,
+  type QueueCompactionStub,
+  type ReadCompactionObjectResult,
+  type ReadCompactionPageResult,
+  type RunQueueCompactionOptions,
+  type StageCompactionRowsResult,
+} from "./compaction/queue";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
@@ -1921,6 +1952,18 @@ async function receivePack<E extends Env>(
         } catch {
           // registry deferred
         }
+        if (
+          env.COMPACTION_QUEUE_ENABLED === "true" &&
+          env.REPO_TASKS &&
+          fin.activePacks !== undefined &&
+          fin.activePacks > COMPACTION_ACTIVE_PACK_THRESHOLD
+        ) {
+          const enqueue = env.REPO_TASKS.send({ kind: "pack-compact", repo }).catch((err) => {
+            console.log(`[compact-enqueue ${repo}] failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+          if (typeof ctx.waitUntil === "function") ctx.waitUntil(enqueue);
+          else void enqueue;
+        }
         if (options.onPush) {
           const origin = requestOrigin(req);
           const onPush = options.onPush; // narrowed local: property narrowing does not survive the .then closure
@@ -2379,6 +2422,16 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
         } else {
           fwdBody = req.body;
         }
+      }
+      if (sub === "/compact" && req.method === "POST" && env.COMPACTION_QUEUE_ENABLED === "true" && env.REPO_PACKS) {
+        let force = false;
+        try {
+          const body = JSON.parse(await req.text()) as { force?: unknown } | null;
+          force = body?.force === true;
+        } catch {
+          // empty or non-JSON body runs threshold-gated compaction
+        }
+        return Response.json(await runQueueCompaction({ bucket: env.REPO_PACKS, stub, repo, force }));
       }
       const fwd = new Request(doUrl.toString(), {
         method: req.method,

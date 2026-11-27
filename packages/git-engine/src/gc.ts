@@ -79,7 +79,7 @@
  * at which point the stamp is consumed. The manual entry point is
  * `RepoCell.gcNow` (tests/benches/admin), mirroring `compactNow`.
  */
-import { cloneCachePrefix, cloneCacheVersionOf, idxR2Key, packR2Key } from "./git/r2keys";
+import { cloneCachePrefix, cloneCacheVersionOf, idxR2Key, packR2Key, prefR2Key } from "./git/r2keys";
 import type { GitStore } from "./git/store";
 import { hasLiveReadLeaseFor } from "./read-leases";
 
@@ -204,7 +204,11 @@ export async function runGcPass(host: GcHost): Promise<GcPassResult> {
         // the ack BEFORE any catalog removal: a crash before this resolves
         // leaves the row RECLAIMABLE and the bytes in place — the retry
         // deletes again (idempotent) and converges
-        await host.deletePackObjects([packR2Key(storageKey, row.packKey), idxR2Key(storageKey, row.packKey)]);
+        await host.deletePackObjects([
+          packR2Key(storageKey, row.packKey),
+          idxR2Key(storageKey, row.packKey),
+          prefR2Key(storageKey, row.packKey),
+        ]);
       } catch (err) {
         console.log(
           `[gc ${storageKey}] R2 delete for ${row.packKey} failed: ${err instanceof Error ? err.message : String(err)}`

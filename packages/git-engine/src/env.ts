@@ -86,6 +86,13 @@ export interface Env {
    * zero-copy single-pack passthrough (SPEC-0024 M4.0). Unset/anything else
    * keeps the legacy DO path. */
   UPLOAD_PACK_WORKER_STREAM?: string;
+  /** Strict-polarity flag ("true" enables) routing multi-pack compaction from
+   * the 32 MiB DO-heap merge to Worker/Queue streaming compaction + OFS_DELTA +
+   * `.pref` sidecars (SPEC-0024 M4.1). */
+  COMPACTION_QUEUE_ENABLED?: string;
+  /** Optional Cloudflare Queue binding used by `receivePack` to enqueue
+   * `{ kind: "pack-compact", repo }` when `COMPACTION_QUEUE_ENABLED === "true"`. */
+  REPO_TASKS?: { send(message: unknown): Promise<unknown> };
   SITE_NAME?: string;
   SITE_DESC?: string;
   SITE_OWNER?: string;

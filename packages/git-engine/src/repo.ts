@@ -4,7 +4,7 @@ import { td, isOid } from "./git/util";
 import { GitStore } from "./git/store";
 import { OidSet } from "./git/oidset";
 import { gunzipLimited } from "./git/zlib";
-import { cloneCacheKey, packR2Key, repoPrefix } from "./git/r2keys";
+import { cloneCacheKey, idxR2Key, packR2Key, prefR2Key, repoPrefix } from "./git/r2keys";
 import {
   advertisement,
   uploadPack,
@@ -119,13 +119,27 @@ import {
 } from "./read-leases";
 import {
   COMPACTION_ACTIVE_PACK_THRESHOLD,
+  COMPACTION_LEASE_TTL_MS,
+  COMPACTION_MIN_INPUT_PACKS,
   COMPACTION_RETRY_MS,
   COMPACTION_WINDOW_BYTES,
   COMPACTION_WINDOW_OBJECTS,
   runCompaction,
   type CompactionHost,
+  type CompactionLeasePayload,
   type CompactionResult,
 } from "./compaction";
+import {
+  QUEUE_COMPACTION_MAX_PACKS,
+  type BeginQueueCompactionInput,
+  type BeginQueueCompactionResult,
+  type CommitQueueCompactionInput,
+  type CommitQueueCompactionResult,
+  type CompactionInputPack,
+  type ReadCompactionObjectResult,
+  type ReadCompactionPageResult,
+  type StageCompactionRowsResult,
+} from "./compaction/queue";
 import { GC_RETRY_MS, runGcPass, type GcHost, type GcPassResult } from "./gc";
 import { esc, repoUrl, repoBase, age, fmtDate, fmtDate2822, layout, htmlResponse, errorPage, LayoutOpts } from "./ui/html";
 import { renderMarkdown } from "./ui/markdown";
@@ -942,6 +956,19 @@ export class RepoCell extends DurableObject<Env> {
    * window happens one alarm per round. */
   private async maybeCompactFromAlarm(): Promise<void> {
     if (!this.store.getMeta("compaction_wanted_at")) return;
+    if (this.env.COMPACTION_QUEUE_ENABLED === "true") {
+      const repoName = this.store.getMeta("repo");
+      if (repoName && this.env.REPO_TASKS && this.store.packs.activePackCount() > COMPACTION_ACTIVE_PACK_THRESHOLD) {
+        try {
+          await this.env.REPO_TASKS.send({ kind: "pack-compact", repo: repoName });
+        } catch (err) {
+          console.log(`queue compaction enqueue failed: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+      }
+      this.store.setMeta("compaction_wanted_at", "");
+      return;
+    }
     const rearm = async (ms: number): Promise<void> => {
       try {
         await this.ctx.storage.setAlarm(Date.now() + ms);
@@ -1478,6 +1505,201 @@ export class RepoCell extends DurableObject<Env> {
       }
       throw err;
     }
+  }
+
+  // ---- Queue-driven streaming compaction RPCs (SPEC-0024 M4.1) --------------
+
+  async beginQueueCompaction(repo: string, opts: BeginQueueCompactionInput = {}): Promise<BeginQueueCompactionResult> {
+    if (this.store.schemaState.refused !== null) {
+      return { tag: "skipped", reason: "sealed", activePacks: 0 };
+    }
+    this.rpcBind();
+    if (!this.env.REPO_PACKS) {
+      return { tag: "skipped", reason: "no_r2_backend", activePacks: this.store.packs.activePackCount() };
+    }
+    try {
+      await sweepExpiredLeases(this.leaseHost());
+    } catch {
+      // best effort: active lease checks below remain authoritative
+    }
+    const now = Date.now();
+    if (this.store.hasActiveLease("receive", now)) {
+      return { tag: "deferred", reason: "receive_lease_live" };
+    }
+    if (this.store.hasActiveLease("compaction", now)) {
+      return { tag: "deferred", reason: "compaction_in_flight" };
+    }
+    const activePacks = this.store.packs.activePackCount();
+    if (!opts.force && activePacks <= COMPACTION_ACTIVE_PACK_THRESHOLD) {
+      return { tag: "skipped", reason: "below_threshold", activePacks };
+    }
+    const maxPacks = Math.min(Math.max(Math.trunc(opts.maxPacks ?? QUEUE_COMPACTION_MAX_PACKS), 2), 256);
+    const selected = this.store.packs.activeR2PacksForCompaction(maxPacks);
+    if (selected.length < COMPACTION_MIN_INPUT_PACKS) {
+      return { tag: "skipped", reason: "window_too_small", activePacks };
+    }
+    const storageKey = this.storageKey(repo);
+    const inputs: CompactionInputPack[] = selected.map((r) => ({
+      ...r,
+      r2Key: packR2Key(storageKey, r.packKey),
+    }));
+    const inputKeys = inputs.map((r) => r.packKey);
+
+    const reachableValid = this.store.reachableCacheValid();
+    const hasLoose = reachableValid ? this.store.hasLooseReachable() : true;
+    const allActiveR2 = selected.length === activePacks;
+    const reachableOnly = reachableValid && allActiveR2 && !hasLoose;
+    const cleanReachable = reachableOnly;
+
+    const expectedObjects = this.store.packs.countObjectsInPacks(inputKeys, reachableOnly);
+    const maxInputTier = selected.reduce((m, r) => Math.max(m, r.tier ?? 0), 0);
+    const tier = maxInputTier + 1;
+
+    const leaseToken = crypto.randomUUID().replaceAll("-", "");
+    const outputPackKey = `pack-q-${leaseToken}`;
+    const outputPackR2Key = packR2Key(storageKey, outputPackKey);
+    const outputIdxR2Key = idxR2Key(storageKey, outputPackKey);
+    const outputPrefR2Key = prefR2Key(storageKey, outputPackKey);
+    const expiresAt = Date.now() + COMPACTION_LEASE_TTL_MS;
+    const payload: CompactionLeasePayload = {
+      v: 1,
+      storageKey,
+      inputs: inputKeys,
+      outputPackKey,
+      outputPackR2Key,
+      outputIdxR2Key,
+      outputPrefR2Key,
+    };
+    this.store.createLease(leaseToken, "compaction", expiresAt, JSON.stringify(payload));
+    return {
+      tag: "ready",
+      leaseToken,
+      expiresAt,
+      storageKey,
+      inputs,
+      expectedObjects,
+      reachableOnly,
+      cleanReachable,
+      tier,
+      outputPackKey,
+      outputPackR2Key,
+      outputIdxR2Key,
+      outputPrefR2Key,
+    };
+  }
+
+  private assertLiveCompactionLease(leaseToken: string): { valid: true } | { valid: false; reason: string } {
+    const lease = this.store.getLease(leaseToken);
+    if (!lease || lease.kind !== "compaction") return { valid: false, reason: "compaction lease not found" };
+    if (lease.expiresAt <= Date.now()) return { valid: false, reason: "compaction lease expired" };
+    return { valid: true };
+  }
+
+  async readCompactionInputPage(
+    leaseToken: string,
+    packKey: string,
+    afterOffset: number,
+    limit: number,
+    reachableOnly: boolean
+  ): Promise<ReadCompactionPageResult> {
+    this.rpcBind();
+    const check = this.assertLiveCompactionLease(leaseToken);
+    if (!check.valid) return { tag: "rejected", reason: check.reason };
+    const clamped = Math.min(Math.max(Math.trunc(limit) || 1, 1), 4096);
+    const raw = reachableOnly
+      ? this.store.reachablePackedInPackAfter(packKey, afterOffset, clamped + 1).map((r) => ({
+          oid: r.oid,
+          offset: r.offset,
+          dataOff: r.dataOff,
+          dataLen: r.dataLen,
+          type: r.type,
+          size: r.entrySize,
+          entrySize: r.entrySize,
+          baseOid: r.baseOid,
+          crc32: 0,
+        }))
+      : this.store.packs.indexRowsInPackAfterOffset(packKey, afterOffset, clamped + 1);
+    const hasMore = raw.length > clamped;
+    return { tag: "ok", rows: raw.slice(0, clamped), hasMore };
+  }
+
+  async readCompactionObject(leaseToken: string, oid: string): Promise<ReadCompactionObjectResult> {
+    this.rpcBind();
+    const check = this.assertLiveCompactionLease(leaseToken);
+    if (!check.valid) return { tag: "rejected", reason: check.reason };
+    const obj = await this.store.get(oid);
+    if (!obj) return { tag: "missing" };
+    return { tag: "ok", type: obj.type, data: obj.data };
+  }
+
+  async stageCompactionRows(
+    leaseToken: string,
+    rows: Array<IndexRow & { srcPack: string }>
+  ): Promise<StageCompactionRowsResult> {
+    this.rpcBind();
+    const check = this.assertLiveCompactionLease(leaseToken);
+    if (!check.valid) return { tag: "rejected", reason: check.reason };
+    this.store.packs.stageCompactionRows(leaseToken, rows);
+    return { tag: "ok" };
+  }
+
+  async commitQueueCompaction(
+    leaseToken: string,
+    output: CommitQueueCompactionInput
+  ): Promise<CommitQueueCompactionResult> {
+    this.rpcBind();
+    let result: CommitQueueCompactionResult = { tag: "lease_lost", reason: "compaction lease lost" };
+    let committed = false;
+    this.store.tx(() => {
+      const lease = this.store.getLease(leaseToken);
+      if (!lease || lease.kind !== "compaction" || lease.expiresAt <= Date.now()) {
+        return;
+      }
+      const parsed = JSON.parse(lease.payload) as CompactionLeasePayload;
+      if (parsed.outputPackKey !== output.packKey) {
+        result = { tag: "lease_lost", reason: "output pack key mismatch" };
+        return;
+      }
+      this.store.packs.publishStagedCompaction(leaseToken, output, parsed.inputs);
+      this.store.deleteLease(leaseToken);
+      const remaining = this.store.packs.activePackCount();
+      this.store.setMeta("gc_wanted_at", String(Date.now()));
+      if (remaining <= COMPACTION_ACTIVE_PACK_THRESHOLD) {
+        this.store.setMeta("compaction_wanted_at", "");
+      }
+      committed = true;
+      result = { tag: "committed", activePacksRemaining: remaining };
+    });
+    if (committed) {
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + GC_RETRY_MS);
+      } catch {
+        // next push or manual gcNow collects retired packs
+      }
+    }
+    return result;
+  }
+
+  async abortQueueCompaction(leaseToken: string): Promise<void> {
+    this.rpcBind();
+    const lease = this.store.getLease(leaseToken);
+    this.store.packs.clearCompactionStaging(leaseToken);
+    if (!lease || lease.kind !== "compaction") return;
+    let payload: CompactionLeasePayload | null = null;
+    try {
+      payload = JSON.parse(lease.payload) as CompactionLeasePayload;
+    } catch {
+      payload = null;
+    }
+    if (payload?.outputPackKey && this.store.packs.catalogStateOf(payload.outputPackKey) === null) {
+      const keys = [payload.outputPackR2Key, payload.outputIdxR2Key, payload.outputPrefR2Key].filter(
+        (k): k is string => !!k
+      );
+      if (keys.length && this.env.REPO_PACKS) {
+        await this.env.REPO_PACKS.delete(keys).catch(() => {});
+      }
+    }
+    this.store.deleteLease(leaseToken);
   }
 
   /**
