@@ -1075,16 +1075,16 @@ export class PackStore {
    * 'fork'), state='active' (compaction owns the RETIRED transition — M3.3),
    * location='r2' (the <16 MiB sqlite location is a later-milestone writer).
    */
-  recordPack(packKey: string, packBytes: number, idxBytes: number, kind: string = "receive"): void {
+  recordPack(packKey: string, packBytes: number, idxBytes: number, kind: string = "receive", prefBytes: number = 0): void {
     this.assertOpen();
     const count = this.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
       .one().n;
     this.sql.exec(
-      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by)
-       VALUES (?, ?, ?, 'active', 'r2', ?, ?, ?, ?, NULL)
+      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by, pref_bytes)
+       VALUES (?, ?, ?, 'active', 'r2', ?, ?, ?, ?, NULL, ?)
        ON CONFLICT(pack_key) DO NOTHING`,
-      packKey, this.nextPackSeq(), kind, count, packBytes, idxBytes, Date.now()
+      packKey, this.nextPackSeq(), kind, count, packBytes, idxBytes, Date.now(), prefBytes
     );
     this.backend.set(packKey, "r2");
     this.r2KeyOverrides.delete(packKey);

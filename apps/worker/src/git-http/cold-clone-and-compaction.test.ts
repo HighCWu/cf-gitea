@@ -350,7 +350,61 @@ describe("SPEC-0024 M4.4 Worker cold-clone & cold-compaction closure", () => {
     expect(cloneRes.headers.get("x-upload-plane")).toBe("worker-cold-stream");
     const pack = extractSidebandPack(new Uint8Array(await cloneRes.arrayBuffer()));
     await assertValidPack(pack, 9);
-    expect(spy.gets.length).toBeLessThanOrEqual(6);
+    // Push-time .pref + .idx fast path: Phase 1 reads only .pref + .idx (0 .pack reads),
+    // and Phase 2 performs exactly 1 sequential .pack stream GET per pack (3 total, vs 6 without .pref).
+    const packGets = spy.gets.filter((g) => g.key.endsWith(".pack"));
+    const prefGets = spy.gets.filter((g) => g.key.endsWith(".pref"));
+    const idxGets = spy.gets.filter((g) => g.key.endsWith(".idx"));
+    expect(prefGets.length).toBe(3);
+    expect(idxGets.length).toBe(3);
+    expect(packGets.length).toBe(3);
+    expect(spy.gets.some((g) => g.ranged)).toBe(false);
+  });
+
+  it("falls back to sequential .pack scan cleanly when legacy packs have no .pref sidecar", async () => {
+    const h = engine();
+    const repo = `alice/m45-legacy-${crypto.randomUUID().slice(0, 8)}`;
+    const pushEnv = m44Env();
+
+    const p1 = await buildCommitPack({
+      fileName: "legacy-a.txt",
+      content: "legacy payload 1\n",
+      message: "legacy c1",
+      time: 1700002300,
+    });
+    const p2 = await buildCommitPack({
+      fileName: "legacy-b.txt",
+      content: "legacy payload 2\n",
+      message: "legacy c2",
+      parentOid: p1.oid,
+      time: 1700002400,
+    });
+    await pushPack(h, pushEnv, repo, "refs/heads/main", ZERO_OID, p1.oid, p1.pack);
+    await pushPack(h, pushEnv, repo, "refs/heads/main", p1.oid, p2.oid, p2.pack);
+
+    // Simulate legacy pre-M4.5 packs by removing their R2 .pref sidecars.
+    const packsListed = await env.REPO_PACKS.list({ prefix: `repos/${repo}/packs/` });
+    const prefKeys = packsListed.objects.map((o) => o.key).filter((k) => k.endsWith(".pref"));
+    expect(prefKeys.length).toBe(2);
+    await env.REPO_PACKS.delete(prefKeys);
+
+    const spy = spyR2Bucket(env.REPO_PACKS);
+    const cloneRes = await h.fetch(
+      new Request(`https://engine.internal/${repo}.git/git-upload-pack`, {
+        method: "POST",
+        headers: { "content-type": UPLOAD_CT, "git-protocol": "version=2" },
+        body: buildV2FetchRequest([p2.oid]),
+      }),
+      m44Env({ REPO_PACKS: spy.bucket, WORKER_COLD_CLONE_MIN_BYTES: "0" }),
+      NOOP_CTX,
+    );
+    expect(cloneRes.status).toBe(200);
+    expect(cloneRes.headers.get("x-upload-plane")).toBe("worker-cold-stream");
+    const pack = extractSidebandPack(new Uint8Array(await cloneRes.arrayBuffer()));
+    await assertValidPack(pack, 6);
+    expect(spy.gets.filter((g) => g.key.endsWith(".pref")).length).toBe(2);
+    expect(spy.gets.filter((g) => g.key.endsWith(".idx")).length).toBe(2);
+    expect(spy.gets.filter((g) => g.key.endsWith(".pack")).length).toBe(4);
     expect(spy.gets.some((g) => g.ranged)).toBe(false);
   });
 
@@ -459,20 +513,24 @@ describe("SPEC-0024 M4.4 Worker cold-clone & cold-compaction closure", () => {
     await pushPack(h, pushEnv, repo, "refs/heads/main", ZERO_OID, secret.oid, secret.pack);
     await pushPack(h, pushEnv, repo, "refs/heads/main", secret.oid, replacement.oid, replacement.pack);
 
-    // Cold clone before compaction excludes orphan objects.
+    // Cold clone before compaction excludes orphan objects AND uses push-time .pref + .idx fast path.
+    const preSpy = spyR2Bucket(env.REPO_PACKS);
     const preClone = await h.fetch(
       new Request(`https://engine.internal/${repo}.git/git-upload-pack`, {
         method: "POST",
         headers: { "content-type": UPLOAD_CT, "git-protocol": "version=2" },
         body: buildV2FetchRequest([replacement.oid]),
       }),
-      m44Env({ WORKER_COLD_CLONE_MIN_BYTES: "0" }),
+      m44Env({ REPO_PACKS: preSpy.bucket, WORKER_COLD_CLONE_MIN_BYTES: "0" }),
       NOOP_CTX,
     );
     expect(preClone.status).toBe(200);
     expect(preClone.headers.get("x-upload-plane")).toBe("worker-cold-stream");
     const prePack = extractSidebandPack(new Uint8Array(await preClone.arrayBuffer()));
     await assertValidPack(prePack, 3);
+    expect(preSpy.gets.filter((g) => g.key.endsWith(".pref")).length).toBe(2);
+    expect(preSpy.gets.filter((g) => g.key.endsWith(".idx")).length).toBe(2);
+    expect(preSpy.gets.filter((g) => g.key.endsWith(".pack")).length).toBe(2);
 
     // Cold compaction with reachable uncached retains both packs' objects -> closure (3) < emitted (6) -> no bundle!
     await runCompactTask(pushEnv, repo);

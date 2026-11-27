@@ -54,7 +54,8 @@ import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, R2_PART_SIZE, R2_PUSH_PART_SIZE, beginRawMultipart } from "./git/multipart";
 import { overDeclaredLength, tooLargeResponse } from "./repo";
-import { bundleIdOf, bundlePrefix, bundleR2Key, idxR2Key, packName, packR2Key } from "./git/r2keys";
+import { bundleIdOf, bundlePrefix, bundleR2Key, idxR2Key, packName, packR2Key, prefR2Key } from "./git/r2keys";
+import { encodePackRefIndex } from "./git/pref";
 import type { RepoBundleMeta } from "./git/store";
 import { COMPACTION_ACTIVE_PACK_THRESHOLD } from "./compaction";
 import { runQueueCompaction } from "./compaction/queue";
@@ -1619,6 +1620,7 @@ async function receivePack<E extends Env>(
     scanGets: 0,
     rangeGets: 0,
     idxPuts: 0,
+    prefPuts: 0,
     copies: 0,
     rowRpcs: 0,
     lookupRpcs: 0,
@@ -1917,6 +1919,22 @@ async function receivePack<E extends Env>(
             throw new Error(`idx length mismatch: wrote ${idxBytes}, expected ${expectedIdx}`);
           }
 
+          // 4b.5. Push-time .pref sidecar emitted from DeltaResolver's already-inflated
+          // non-blob objects (zero extra decompression) so new packs qualify immediately
+          // for the .pref+.idx fast path in worker-cold-stream before compaction.
+          let prefBytes = 0;
+          if (!resolved.incomplete) {
+            const prefKey = prefR2Key(begin.storageKey, name);
+            const prefData = encodePackRefIndex({
+              entries: resolved.prefEntries,
+              packBytes: staged.packBytes,
+              packSha1: staged.packSha1,
+            });
+            await bucket.put(prefKey, prefData);
+            prefBytes = prefData.byteLength;
+            metrics.prefPuts++;
+          }
+
           // 4c. copy staging → packs/ BEFORE finalize only when not direct-writing
           if (!begin.directPackName) {
             await copyObject(bucket, begin.stagingKey, packKey);
@@ -1928,6 +1946,7 @@ async function receivePack<E extends Env>(
             packBytes: staged.packBytes,
             objectCount: resolved.objects,
             idxBytes,
+            prefBytes,
           };
         } catch (err) {
           // a disconnect mid-scan rethrows to the outer release — never an
@@ -2076,13 +2095,14 @@ async function receivePack<E extends Env>(
         metrics.scanGets +
         metrics.rangeGets +
         metrics.idxPuts +
+        metrics.prefPuts +
         metrics.copies * 2 +
         doRpcs;
       console.log(
         `[receive ${repo}] subrequests: total=${subrequests}` +
           ` staging=${metrics.stagingPuts + metrics.stagingParts}` +
           ` scanGets=${metrics.scanGets} rangeGets=${metrics.rangeGets}` +
-          ` idxPuts=${metrics.idxPuts} copies=${metrics.copies}` +
+          ` idxPuts=${metrics.idxPuts} prefPuts=${metrics.prefPuts} copies=${metrics.copies}` +
           ` rows=${metrics.rowRpcs} lookups=${metrics.lookupRpcs}/${metrics.lookupOids}` +
           ` doRpcs=${doRpcs}`
       );

@@ -39,6 +39,8 @@ import {
   isGitlinkMode,
 } from "../git/objects";
 import { OidSet } from "../git/oidset";
+import type { PackRefEntryInput } from "../git/pref";
+import { fromHex } from "../git/util";
 import type { IndexRow } from "../control-plane";
 import { ObjCache, ObjRec } from "./objcache";
 import { hashObjectAsync, inflateAll, yieldToTimers, type DeltaEntry, type FullEntry, type PackEntry } from "./scan";
@@ -189,6 +191,8 @@ export interface ResolverOptions {
   onProgress?: (msg: string) => void;
 }
 
+const EMPTY_REFS = new Uint8Array(0);
+
 export interface ResolveResult {
   /** every object oid of the pack, in resolution order (idx emission input) */
   oids: OidSet;
@@ -204,6 +208,8 @@ export interface ResolveResult {
   firstMissing: string | null;
   /** unique objects resolved (= oids.size) */
   objects: number;
+  /** per-object ref-index inputs collected from non-blob objects without re-inflation */
+  prefEntries: PackRefEntryInput[];
 }
 
 export class DeltaResolver {
@@ -236,6 +242,8 @@ export class DeltaResolver {
   private unparsedFulls: FullEntry[] = [];
   /** every oid the pack's non-blob objects reference (dedup set) */
   private childSet: OidSet | null = null;
+  /** serialized 20-byte child OIDs per non-blob owner OID, reused for push-time .pref emission */
+  private prefRefs = new Map<string, Uint8Array>();
 
   private rowBuf: IndexRow[] = [];
   private rowWrites: Promise<void> = Promise.resolve();
@@ -706,6 +714,11 @@ export class DeltaResolver {
       return;
     }
     if (!refs.length) return;
+    if (type !== "blob") {
+      const raw = new Uint8Array(refs.length * 20);
+      for (let i = 0; i < refs.length; i++) raw.set(fromHex(refs[i]!), i * 20);
+      this.prefRefs.set(owner, raw);
+    }
     if (!this.childSet) this.childSet = new OidSet(4096);
     for (const r of refs) this.childSet.addHex(r);
   }
@@ -802,6 +815,17 @@ export class DeltaResolver {
     await this.flushRows();
     await this.rowWrites;
     await this.flushChildren();
+    const prefEntries: PackRefEntryInput[] = [];
+    if (!this.incomplete) {
+      for (let i = 0; i < this.oidEntry.length; i++) {
+        const entryIdx = this.oidEntry[i]!;
+        const oid = this.oids.atHex(i);
+        const type = this.numToType(this.entryType[entryIdx]!);
+        const refs = type === "blob" ? EMPTY_REFS : (this.prefRefs.get(oid) ?? EMPTY_REFS);
+        prefEntries.push({ oid, type, refs });
+      }
+      this.prefRefs.clear();
+    }
     return {
       oids: this.oids,
       oidEntry: this.oidEntry,
@@ -810,6 +834,7 @@ export class DeltaResolver {
       incomplete: this.incomplete,
       firstMissing: this.firstMissing,
       objects: this.oids.size,
+      prefEntries,
     };
   }
 }

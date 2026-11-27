@@ -9,6 +9,7 @@ import {
   loadPackIdxV2,
   lookupOidsInPackIdxs,
   parseIdxV2,
+  parsePackRefIndex,
   R2_PUSH_PART_SIZE,
 } from "@cf-gitea/git-engine";
 import { checkRepoInvariants } from "../invariants/check";
@@ -210,13 +211,29 @@ describe("SPEC-0024 M4.2 direct pack write, range coalescing & .idx v2 reader", 
     expect(metricLine).toBeDefined();
     expect(metricLine!).toContain("copies=0");
 
-    // Verify no staging/ objects remain and pack-rx-<lease>.pack + .idx exist in packs/.
+    // Verify no staging/ objects remain and pack-rx-<lease>.pack + .idx + .pref exist in packs/.
     const stagingListed = await env.REPO_PACKS.list({ prefix: `repos/${repo}/staging/` });
     expect(stagingListed.objects.length).toBe(0);
     const packsListed = await env.REPO_PACKS.list({ prefix: `repos/${repo}/packs/` });
     const packKeys = packsListed.objects.map((o) => o.key);
     expect(packKeys.some((k) => /\/packs\/pack-rx-[0-9a-f]{32}\.pack$/.test(k))).toBe(true);
     expect(packKeys.some((k) => /\/packs\/pack-rx-[0-9a-f]{32}\.idx$/.test(k))).toBe(true);
+    expect(packKeys.some((k) => /\/packs\/pack-rx-[0-9a-f]{32}\.pref$/.test(k))).toBe(true);
+    expect(metricLine!).toContain("prefPuts=1");
+
+    const prefKey = packKeys.find((k) => /\/packs\/pack-rx-[0-9a-f]{32}\.pref$/.test(k));
+    expect(prefKey).toBeDefined();
+    const prefObj = await env.REPO_PACKS.get(prefKey!);
+    expect(prefObj).not.toBeNull();
+    const prefParsed = parsePackRefIndex(new Uint8Array(await prefObj!.arrayBuffer()));
+    expect(prefParsed.objectCount).toBe(3);
+
+    const coldPlan = await targetEnv.REPO.getByName(repo).planWorkerColdFullClone(repo, [oid], { minBytes: 0 });
+    expect(coldPlan.tag).toBe("leased");
+    if (coldPlan.tag === "leased") {
+      expect(coldPlan.packs[0]?.prefBytes).toBe(prefObj!.size);
+      await targetEnv.REPO.getByName(repo).releaseReadLease(coldPlan.planId);
+    }
 
     // Clone succeeds against the direct-written pack.
     const cloneRes = await h.fetch(
@@ -267,7 +284,9 @@ describe("SPEC-0024 M4.2 direct pack write, range coalescing & .idx v2 reader", 
 
     const afterListed = await env.REPO_PACKS.list({ prefix: `repos/${repo}/packs/` });
     const afterPackFiles = afterListed.objects.filter((o) => o.key.endsWith(".pack"));
+    const afterPrefFiles = afterListed.objects.filter((o) => o.key.endsWith(".pref"));
     expect(afterPackFiles.length).toBe(1);
+    expect(afterPrefFiles.length).toBe(1);
   });
 
   it("coalesces adjacent pack range reads by gap/window and resolves 8 multi-blob thin bases with 1 R2 Range GET", async () => {

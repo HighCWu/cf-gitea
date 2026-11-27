@@ -42,7 +42,14 @@ import {
 } from "./git/protocol";
 import { ObjType, hashObject, isTreeMode, parseCommit, parseTree, type TreeEntry } from "./git/objects";
 import { ZERO_OID, isOid, toHex } from "./git/util";
-import { idxR2Key, isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
+import {
+  idxR2Key,
+  isValidStorageKey,
+  packR2Key,
+  prefR2Key,
+  stagingKey as buildStagingKey,
+  packName as catalogPackName,
+} from "./git/r2keys";
 import type { PackState } from "./git/packstore";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
@@ -211,6 +218,7 @@ export interface FinalizedPack {
   packBytes: number;
   objectCount: number;
   idxBytes: number;
+  prefBytes?: number;
 }
 
 export interface FinalizeReceiveInput {
@@ -342,9 +350,10 @@ interface LeasePayload {
   storageKey?: string;
   /** the pack NAME (pack-<sha1> or pack-rx-<leaseToken>), persisted so sweeps/finalize resolve keys */
   packName?: string;
-  /** direct-write catalog stem & idx key (when RECEIVE_DIRECT_PACK_WRITE is active) */
+  /** direct-write catalog stem & idx/pref keys (when RECEIVE_DIRECT_PACK_WRITE is active) */
   directPackName?: string;
   directIdxKey?: string;
+  directPrefKey?: string;
 }
 
 // ---- Step-1/2 semantics notes -----------------------------------------------
@@ -511,7 +520,9 @@ export async function sweepExpiredLeases(host: LeaseHost): Promise<void> {
       const unrecorded = !payload.directPackName || host.store.packs.catalogStateOf(payload.directPackName) === null;
       if (payload.packName && unrecorded) host.store.packs.sweepPackRows(payload.packName);
       if (unrecorded) {
-        const keys = [payload.stagingKey, payload.directIdxKey].filter((k): k is string => !!k);
+        const keys = [payload.stagingKey, payload.directIdxKey, payload.directPrefKey].filter(
+          (k): k is string => !!k
+        );
         if (keys.length) await host.deletePackObjects(keys);
       }
     } else if (lease.kind === "compaction") {
@@ -601,11 +612,12 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
   const directPackName = input.directPackWrite ? `pack-rx-${leaseToken}` : undefined;
   const stagingKey = directPackName ? packR2Key(storageKey, directPackName) : buildStagingKey(storageKey, leaseToken);
   const directIdxKey = directPackName ? idxR2Key(storageKey, directPackName) : undefined;
+  const directPrefKey = directPackName ? prefR2Key(storageKey, directPackName) : undefined;
   const leaseExpiresAt = Date.now() + clampReceiveLeaseTtlMs(input.leaseTtlMs);
   const payload: LeasePayload = {
     stagingKey,
     storageKey,
-    ...(directPackName ? { directPackName, directIdxKey } : {}),
+    ...(directPackName ? { directPackName, directIdxKey, directPrefKey } : {}),
   };
   store.createLease(leaseToken, "receive", leaseExpiresAt, JSON.stringify(payload));
   try {
@@ -1037,7 +1049,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
           recordedPackR2Key: null as string | null,
         };
       }
-      store.packs.recordPack(name, input.pack.packBytes, input.pack.idxBytes);
+      store.packs.recordPack(name, input.pack.packBytes, input.pack.idxBytes, "receive", input.pack.prefBytes ?? 0);
       recordedPackR2Key = derived;
     }
     // DO-side guard for "no ref may point into unindexed storage": every
@@ -1121,7 +1133,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   // retain the committed pack+idx and delete only if the transaction did NOT record them.
   store.deleteLease(input.leaseToken);
   if (stagingKey && stagingKey !== recordedPackR2Key) {
-    const keys = [stagingKey, leaseData.directIdxKey].filter((k): k is string => !!k);
+    const keys = [stagingKey, leaseData.directIdxKey, leaseData.directPrefKey].filter((k): k is string => !!k);
     if (keys.length) await host.deletePackObjects(keys);
   }
 
@@ -1167,7 +1179,9 @@ export async function releaseReceive(host: LeaseHost, input: ReleaseReceiveInput
     const unrecorded = !payload.directPackName || host.store.packs.catalogStateOf(payload.directPackName) === null;
     if (payload.packName && unrecorded) host.store.packs.sweepPackRows(payload.packName);
     if (unrecorded) {
-      const keys = [payload.stagingKey, payload.directIdxKey].filter((k): k is string => !!k);
+      const keys = [payload.stagingKey, payload.directIdxKey, payload.directPrefKey].filter(
+        (k): k is string => !!k
+      );
       if (keys.length) await host.deletePackObjects(keys);
     }
   }
