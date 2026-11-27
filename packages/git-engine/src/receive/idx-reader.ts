@@ -25,6 +25,7 @@ export interface IdxV2View {
   packSha1: string;
   idxSha1: string;
   byteLength: number;
+  rawOidTable: Uint8Array;
   lookupOid(oidHex: string): IdxV2Hit | null;
   sortedOidAt(index: number): string;
   allSortedOids(): string[];
@@ -94,11 +95,14 @@ export function parseIdxV2(bytes: Uint8Array): IdxV2View {
     return hi * UINT32_SPAN + lo;
   };
 
+  const rawOidTable = bytes.subarray(oidsOff, crcsOff);
+
   return {
     objectCount,
     packSha1,
     idxSha1,
     byteLength: bytes.byteLength,
+    rawOidTable,
     lookupOid(oidHex: string): IdxV2Hit | null {
       if (oidHex.length !== 40) return null;
       const needle = fromHex(oidHex);

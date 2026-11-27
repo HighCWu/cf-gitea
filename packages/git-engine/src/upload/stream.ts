@@ -3,7 +3,7 @@ import { FLUSH, pkt } from "../git/pktline";
 import { applyDelta, PackWriter } from "../git/pack";
 import type { ObjType } from "../git/objects";
 import { OidSet } from "../git/oidset";
-import { extractObjectRefBytes, parsePackRefIndex } from "../git/pref";
+import { extractObjectRefBytes, isCleanReachablePref, parsePackRefIndex } from "../git/pref";
 import { ObjCache } from "../receive/objcache";
 import { loadPackIdxV2 } from "../receive/idx-reader";
 import { inflateAll } from "../receive/scan";
@@ -100,6 +100,10 @@ export type ReadUploadObjectResult =
   | { tag: "missing" }
   | { tag: "rejected"; reason: string };
 
+export type ReadUploadObjectsResult =
+  | { tag: "ok"; items: Array<{ oid: string; type: ObjType; data: Uint8Array }> }
+  | { tag: "rejected"; reason: string };
+
 export interface WorkerUploadStub {
   renewAndAuthorizeRead(planId: string, packKey: string | null, byteRange?: null): Promise<RenewReadResult>;
   releaseReadLease(planId: string): Promise<ReleaseReadResult>;
@@ -111,6 +115,7 @@ export interface WorkerUploadStub {
   ): Promise<ReadWarmClonePageResult>;
   readWarmLoosePage(planId: string, afterOid: string, limit: number): Promise<ReadWarmLoosePageResult>;
   readUploadObject(planId: string, oid: string): Promise<ReadUploadObjectResult>;
+  readUploadObjects?(planId: string, oids: string[]): Promise<ReadUploadObjectsResult>;
 }
 
 export interface WorkerColdPackMeta {
@@ -121,6 +126,7 @@ export interface WorkerColdPackMeta {
   prefBytes: number;
   packBytes: number;
   objectCount: number;
+  cleanReachable?: boolean;
 }
 
 export interface PlanWorkerColdCloneOptions {
@@ -154,7 +160,7 @@ export type ReadColdClonePageResult =
 
 export type WorkerColdUploadStub = Pick<
   WorkerUploadStub,
-  "renewAndAuthorizeRead" | "releaseReadLease" | "readUploadObject"
+  "renewAndAuthorizeRead" | "releaseReadLease" | "readUploadObject" | "readUploadObjects"
 > & {
   readColdClonePackPage(
     planId: string,
@@ -163,6 +169,48 @@ export type WorkerColdUploadStub = Pick<
     limit: number,
   ): Promise<ReadColdClonePageResult>;
 };
+
+const UPLOAD_OBJECT_BATCH_SIZE = 64;
+
+async function fetchUploadObjectsBatch(
+  stub: WorkerColdUploadStub,
+  planId: string,
+  oids: string[],
+): Promise<Map<string, { type: ObjType; data: Uint8Array }>> {
+  const out = new Map<string, { type: ObjType; data: Uint8Array }>();
+  if (oids.length === 0) return out;
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const oid of oids) {
+    if (!seen.has(oid)) {
+      seen.add(oid);
+      unique.push(oid);
+    }
+  }
+  if (stub.readUploadObjects) {
+    for (let i = 0; i < unique.length; i += UPLOAD_OBJECT_BATCH_SIZE) {
+      const chunk = unique.slice(i, i + UPLOAD_OBJECT_BATCH_SIZE);
+      const res = await stub.readUploadObjects(planId, chunk);
+      if (res.tag === "rejected") {
+        throw new Error(`read lease rejected (${res.reason}); terminating — re-fetch`);
+      }
+      for (const item of res.items) {
+        out.set(item.oid, { type: item.type, data: item.data });
+      }
+    }
+    return out;
+  }
+  for (const oid of unique) {
+    const res = await stub.readUploadObject(planId, oid);
+    if (res.tag === "rejected") {
+      throw new Error(`read lease rejected (${res.reason}); terminating — re-fetch`);
+    }
+    if (res.tag === "ok") {
+      out.set(oid, { type: res.type, data: res.data });
+    }
+  }
+  return out;
+}
 
 export interface StreamWorkerColdCloneOptions {
   bucket: R2Bucket;
@@ -679,6 +727,14 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
     }
     leaseExpiresAt = r.expiresAt;
   };
+  const forceRenewLease = async (packKey: string | null): Promise<void> => {
+    if (!plan.planId) return;
+    const r = await stub.renewAndAuthorizeRead(plan.planId, packKey, null);
+    if (r.tag !== "authorized") {
+      throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+    }
+    leaseExpiresAt = r.expiresAt;
+  };
   const releaseLeaseBestEffort = async (): Promise<void> => {
     if (!plan.planId) return;
     try {
@@ -742,6 +798,9 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
   });
 
   let phase1Done = false;
+  let passthroughReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let passthroughBytesRead = 0;
+  let passthroughBytesSinceRenew = 0;
   const present = new OidSet(4096);
   let reachableCount = 0;
   const emittedOids = new OidSet(4096);
@@ -751,12 +810,51 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
   let pageRows: WorkerColdPackRow[] = [];
   let pageCursor = 0;
   let pageHasMore = true;
+  let prefetched = new Map<string, { type: ObjType; data: Uint8Array }>();
   let seqReader: SequentialR2PackReader | null = null;
   let finished = false;
 
   const runPhase1 = async (ctrl: ReadableStreamDefaultController<Uint8Array>): Promise<void> => {
+    if (plan.packs.length === 1 && plan.packs[0]!.cleanReachable && plan.packs[0]!.prefBytes > 0) {
+      const single = plan.packs[0]!;
+      await ensureLeaseValid(single.packKey);
+      const [prefObj, idxView] = await Promise.all([
+        bucket.get(single.prefR2Key),
+        loadPackIdxV2(bucket, single.idxR2Key),
+      ]);
+      if (prefObj && idxView) {
+        const prefView = parsePackRefIndex(new Uint8Array(await prefObj.arrayBuffer()));
+        if (
+          prefView.objectCount === idxView.objectCount &&
+          isCleanReachablePref(idxView.rawOidTable, prefView, plan.tipOids)
+        ) {
+          const packObj = await bucket.get(single.r2Key);
+          if (!packObj) throw new Error(`missing cold R2 pack ${single.r2Key}`);
+          const reader = packObj.body.getReader();
+          passthroughReader = reader;
+          activeReader = {
+            close: async () => {
+              if (passthroughReader === reader) passthroughReader = null;
+              try {
+                await reader.cancel();
+              } catch {
+                // best effort
+              }
+            },
+          };
+          if (sideband && !noProgress) {
+            for (const f of uploadSidebandFrames(2, te.encode(`Enumerating objects: ${single.objectCount}, done.\n`))) {
+              enqueue(ctrl, f);
+            }
+          }
+          phase1Done = true;
+          return;
+        }
+      }
+    }
+
     const edges = new Map<string, Uint8Array>();
-    const nonBlobCache = new ObjCache(8 * 1024 * 1024);
+    const nonBlobCache = new ObjCache(24 * 1024 * 1024);
 
     for (const p of plan.packs) {
       checkAborted();
@@ -797,32 +895,44 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
             if (page.tag === "rejected") {
               throw new Error(`read lease rejected (${page.reason}); terminating — re-fetch`);
             }
-            for (const row of page.rows) {
-              cursor = row.offset;
-              present.addHex(row.oid);
-              if (row.type === "blob") continue;
-              const raw = await reader.readAt(row.dataOff, row.dataLen);
-              let data: Uint8Array;
-              if (!row.baseOid) {
-                data = inflateAll(raw);
-              } else {
-                const cachedBase = nonBlobCache.get(row.baseOid);
-                if (cachedBase) {
-                  data = applyDelta(cachedBase.data, inflateAll(raw));
-                } else {
-                  const resolved = await stub.readUploadObject(plan.planId, row.oid);
-                  if (resolved.tag === "rejected") {
-                    throw new Error(`read lease rejected (${resolved.reason}); terminating — re-fetch`);
-                  }
-                  if (resolved.tag === "missing") {
-                    throw new Error(`missing cold-clone non-blob object ${row.oid}`);
-                  }
-                  data = resolved.data;
+            for (let chunkStart = 0; chunkStart < page.rows.length; chunkStart += UPLOAD_OBJECT_BATCH_SIZE) {
+              const chunk = page.rows.slice(chunkStart, chunkStart + UPLOAD_OBJECT_BATCH_SIZE);
+              const pendingNonBlobs: Array<{ row: WorkerColdPackRow; raw: Uint8Array }> = [];
+              const needFetch: string[] = [];
+
+              for (const row of chunk) {
+                cursor = row.offset;
+                present.addHex(row.oid);
+                if (row.type === "blob") continue;
+                const raw = await reader.readAt(row.dataOff, row.dataLen);
+                pendingNonBlobs.push({ row, raw });
+                if (row.baseOid && !nonBlobCache.get(row.baseOid)) {
+                  needFetch.push(row.oid);
                 }
               }
-              nonBlobCache.put(row.oid, { type: row.type, data });
-              const refBytes = extractObjectRefBytes(row.type, data);
-              if (refBytes.byteLength > 0) edges.set(row.oid, refBytes);
+
+              const fetched = await fetchUploadObjectsBatch(stub, plan.planId, needFetch);
+
+              for (const { row, raw } of pendingNonBlobs) {
+                let data: Uint8Array;
+                if (!row.baseOid) {
+                  data = inflateAll(raw);
+                } else {
+                  const cachedBase = nonBlobCache.get(row.baseOid);
+                  if (cachedBase) {
+                    data = applyDelta(cachedBase.data, inflateAll(raw));
+                  } else {
+                    const hit = fetched.get(row.oid);
+                    if (!hit) {
+                      throw new Error(`missing cold-clone non-blob object ${row.oid}`);
+                    }
+                    data = hit.data;
+                  }
+                }
+                nonBlobCache.put(row.oid, { type: row.type, data });
+                const refBytes = extractObjectRefBytes(row.type, data);
+                if (refBytes.byteLength > 0) edges.set(row.oid, refBytes);
+              }
             }
             if (!page.hasMore || page.rows.length === 0) break;
           }
@@ -914,15 +1024,24 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
         pageHasMore = page.hasMore;
         pageCursor = 0;
         if (pageRows.length === 0) {
+          prefetched.clear();
           pageHasMore = false;
           continue;
         }
+        const needFetch: string[] = [];
+        for (const r of pageRows) {
+          if (isOid(r.oid) && present.isMarkedHex(r.oid) && r.baseOid && !present.isMarkedHex(r.baseOid)) {
+            needFetch.push(r.oid);
+          }
+        }
+        prefetched = await fetchUploadObjectsBatch(stub, plan.planId, needFetch);
       }
 
       const row = pageRows[pageCursor++]!;
       afterOffset = row.offset;
       if (!isOid(row.oid)) throw new Error(`invalid oid in cold clone plan: ${row.oid}`);
       if (!present.isMarkedHex(row.oid) || !emittedOids.addHex(row.oid)) {
+        prefetched.delete(row.oid);
         continue;
       }
       if (!row.baseOid) {
@@ -932,14 +1051,20 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
         const raw = await seqReader!.readAt(row.dataOff, row.dataLen);
         writer.rawDelta(row.entrySize, row.baseOid, raw);
       } else {
-        const resolved = await stub.readUploadObject(plan.planId, row.oid);
-        if (resolved.tag === "rejected") {
-          throw new Error(`read lease rejected (${resolved.reason}); terminating — re-fetch`);
+        const hit = prefetched.get(row.oid);
+        if (hit) {
+          prefetched.delete(row.oid);
+          writer.object(hit.type, hit.data);
+        } else {
+          const resolved = await stub.readUploadObject(plan.planId, row.oid);
+          if (resolved.tag === "rejected") {
+            throw new Error(`read lease rejected (${resolved.reason}); terminating — re-fetch`);
+          }
+          if (resolved.tag === "missing") {
+            throw new Error(`missing cold-clone object ${row.oid}`);
+          }
+          writer.object(resolved.type, resolved.data);
         }
-        if (resolved.tag === "missing") {
-          throw new Error(`missing cold-clone object ${row.oid}`);
-        }
-        writer.object(resolved.type, resolved.data);
       }
       return true;
     }
@@ -959,14 +1084,49 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           await runPhase1(ctrl);
           checkAborted();
         }
+        if (passthroughReader) {
+          const single = plan.packs[0]!;
+          if (
+            passthroughBytesSinceRenew >= WORKER_UPLOAD_RENEW_BYTES ||
+            Date.now() >= leaseExpiresAt - READ_RENEW_MARGIN_MS
+          ) {
+            passthroughBytesSinceRenew = 0;
+            await forceRenewLease(single.packKey);
+          }
+          const { done, value } = await passthroughReader.read();
+          checkAborted();
+          if (done) {
+            if (passthroughBytesRead < 32) {
+              throw new Error(`truncated cold passthrough R2 pack ${single.r2Key} (${passthroughBytesRead} bytes)`);
+            }
+            stopTimer();
+            passthroughReader = null;
+            activeReader = null;
+            await releaseLeaseBestEffort();
+            if (sideband) enqueue(ctrl, FLUSH);
+            ctrl.close();
+            return;
+          }
+          if (value && value.length > 0) {
+            passthroughBytesRead += value.length;
+            passthroughBytesSinceRenew += value.length;
+            if (sideband) {
+              for (const f of uploadSidebandFrames(1, value)) enqueue(ctrl, f);
+            } else {
+              enqueue(ctrl, value);
+            }
+          }
+          return;
+        }
         let drained = false;
-        for (let n = 0; n < 64; n++) {
+        for (let n = 0; n < 256; n++) {
           const hadMore = await emitOneColdEntry();
           checkAborted();
           if (!hadMore) {
             drained = true;
             break;
           }
+          if (pending.length > 0) break;
         }
         if (drained && !finished) {
           if (emittedOids.size !== reachableCount) {

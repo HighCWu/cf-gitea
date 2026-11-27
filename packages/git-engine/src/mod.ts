@@ -39,6 +39,7 @@ import {
   type PlanWorkerWarmCloneResult,
   type ReadColdClonePageResult,
   type ReadUploadObjectResult,
+  type ReadUploadObjectsResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
   type StreamWorkerColdCloneOptions,
@@ -254,6 +255,7 @@ export {
   type PlanWorkerWarmCloneResult,
   type ReadColdClonePageResult,
   type ReadUploadObjectResult,
+  type ReadUploadObjectsResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
   type StreamWorkerColdCloneOptions,
@@ -271,8 +273,11 @@ export {
   PACK_REF_HEADER_BYTES,
   PACK_REF_MAGIC,
   PACK_REF_VERSION,
+  binarySearchRawOid,
   encodePackRefIndex,
+  encodePackRefIndexWithOids,
   extractObjectRefBytes,
+  isCleanReachablePref,
   parsePackRefIndex,
   walkClosureWithPref,
   type PackRefEntryInput,
@@ -290,6 +295,7 @@ export {
   type QueueCompactionResult,
   type QueueCompactionStub,
   type ReadCompactionObjectResult,
+  type ReadCompactionObjectsResult,
   type ReadCompactionPageResult,
   type RunQueueCompactionOptions,
   type StageCompactionRowsResult,
@@ -2610,11 +2616,26 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       }
       if (sub === "/compact" && req.method === "POST" && env.COMPACTION_QUEUE_ENABLED === "true" && env.REPO_PACKS) {
         let force = false;
+        let asyncMode = false;
+        let maxPacks: number | undefined;
         try {
-          const body = JSON.parse(await req.text()) as { force?: unknown } | null;
+          const body = JSON.parse(await req.text()) as { force?: unknown; async?: unknown; maxPacks?: unknown } | null;
           force = body?.force === true;
+          asyncMode = body?.async === true;
+          if (typeof body?.maxPacks === "number" && Number.isFinite(body.maxPacks)) {
+            maxPacks = Math.min(Math.max(Math.trunc(body.maxPacks), 2), 256);
+          }
         } catch {
           // empty or non-JSON body runs threshold-gated compaction
+        }
+        if (asyncMode && env.REPO_TASKS) {
+          await env.REPO_TASKS.send({
+            kind: "pack-compact",
+            repo,
+            ...(force ? { force: true } : {}),
+            ...(maxPacks !== undefined ? { maxPacks } : {}),
+          });
+          return Response.json({ tag: "enqueued", repo, force }, { status: 202 });
         }
         return Response.json(
           await runQueueCompaction({
@@ -2622,6 +2643,7 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
             stub,
             repo,
             force,
+            ...(maxPacks !== undefined ? { maxPacks } : {}),
             generateBundle: env.BUNDLE_URI_ENABLED === "true",
             bundleMinBytes: parseBundleMinBytes(env.BUNDLE_MIN_BYTES),
           })

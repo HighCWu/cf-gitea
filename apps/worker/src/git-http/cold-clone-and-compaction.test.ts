@@ -1,6 +1,11 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { createDurableGit } from "@cf-gitea/git-engine";
+import {
+  createDurableGit,
+  encodePackRefIndexWithOids,
+  isCleanReachablePref,
+  parsePackRefIndex,
+} from "@cf-gitea/git-engine";
 import { handleRepoTasks } from "../repos/purge";
 import { ZERO_OID, buildReceivePackBody } from "../repos/testing/git-pack";
 
@@ -625,5 +630,123 @@ describe("SPEC-0024 M4.4 Worker cold-clone & cold-compaction closure", () => {
     expect(orphanRes.headers.get("x-upload-plane")).toBeNull();
     const orphanWire = dec.decode(new Uint8Array(await orphanRes.arrayBuffer()));
     expect(orphanWire).toContain("ERR");
+  });
+
+  it("validates zero-alloc isCleanReachablePref across clean, orphan, and missing-child packs", () => {
+    const encoder = new TextEncoder();
+    const hexByte = (n: number) => n.toString(16).padStart(2, "0");
+    const makeOid = (seed: number) => hexByte(seed).repeat(20);
+    const fromHex = (hex: string) => {
+      const out = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+      return out;
+    };
+
+    const commitOid = makeOid(0x33);
+    const treeOid = makeOid(0x22);
+    const blobOid = makeOid(0x11);
+    const orphanOid = makeOid(0x44);
+    const missingBlobOid = makeOid(0x55);
+
+    const { bytes: cleanBytes, sortedOids20: cleanOids20 } = encodePackRefIndexWithOids({
+      packBytes: 128,
+      packSha1: makeOid(0xaa),
+      entries: [
+        { oid: blobOid, type: "blob", refs: encoder.encode("") },
+        { oid: treeOid, type: "tree", refs: fromHex(blobOid) },
+        { oid: commitOid, type: "commit", refs: fromHex(treeOid) },
+      ],
+    });
+    expect(isCleanReachablePref(cleanOids20, parsePackRefIndex(cleanBytes), [commitOid])).toBe(true);
+
+    const { bytes: orphanBytes, sortedOids20: orphanOids20 } = encodePackRefIndexWithOids({
+      packBytes: 160,
+      packSha1: makeOid(0xbb),
+      entries: [
+        { oid: blobOid, type: "blob", refs: encoder.encode("") },
+        { oid: treeOid, type: "tree", refs: fromHex(blobOid) },
+        { oid: commitOid, type: "commit", refs: fromHex(treeOid) },
+        { oid: orphanOid, type: "blob", refs: new Uint8Array(0) },
+      ],
+    });
+    expect(isCleanReachablePref(orphanOids20, parsePackRefIndex(orphanBytes), [commitOid])).toBe(false);
+
+    const { bytes: brokenBytes, sortedOids20: brokenOids20 } = encodePackRefIndexWithOids({
+      packBytes: 128,
+      packSha1: makeOid(0xcc),
+      entries: [
+        { oid: treeOid, type: "tree", refs: fromHex(missingBlobOid) },
+        { oid: commitOid, type: "commit", refs: fromHex(treeOid) },
+      ],
+    });
+    expect(isCleanReachablePref(brokenOids20, parsePackRefIndex(brokenBytes), [commitOid])).toBe(false);
+  });
+
+  it("uses zero-copy cold passthrough on compacted clean multi-ref subset clones and enqueues async POST /compact", async () => {
+    const h = engine();
+    const repo = `alice/m48-pass-${crypto.randomUUID().slice(0, 8)}`;
+    const sent: unknown[] = [];
+    const targetEnv = {
+      ...m44Env({ WORKER_COLD_CLONE_MIN_BYTES: "0" }),
+      REPO_TASKS: {
+        send: (msg: unknown) => {
+          sent.push(msg);
+          return Promise.resolve();
+        },
+      },
+    } as unknown as Env;
+
+    const base = await buildCommitPack({
+      fileName: "base.txt",
+      content: "ancestor scratch base\n",
+      message: "base commit",
+      time: 1700007000,
+    });
+    const head = await buildCommitPack({
+      fileName: "head.txt",
+      content: "head payload\n",
+      message: "head commit",
+      parentOid: base.oid,
+      time: 1700007100,
+    });
+
+    await pushPack(h, targetEnv, repo, "refs/scratch/preseed/1", ZERO_OID, base.oid, base.pack);
+    await pushPack(h, targetEnv, repo, "refs/heads/main", ZERO_OID, head.oid, head.pack);
+
+    // Async POST /compact returns 202 and enqueues force=true to REPO_TASKS.
+    const compactReq = await h.fetch(
+      new Request(`https://engine.internal/${repo}/compact`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ force: true, async: true }),
+      }),
+      targetEnv,
+      NOOP_CTX,
+    );
+    expect(compactReq.status).toBe(202);
+    expect(await compactReq.json()).toEqual({ tag: "enqueued", repo, force: true });
+    expect(sent).toEqual([{ kind: "pack-compact", repo, force: true }]);
+
+    await runCompactTask(targetEnv, repo);
+
+    // Clone requesting ONLY main (`head.oid`): warm full-clone misses because scratch ref is excluded,
+    // so cold clone takes over, certifies 100% reachability via .pref, and streams the R2 pack directly.
+    const spy = spyR2Bucket(env.REPO_PACKS);
+    const cloneRes = await h.fetch(
+      new Request(`https://engine.internal/${repo}.git/git-upload-pack`, {
+        method: "POST",
+        headers: { "content-type": UPLOAD_CT, "git-protocol": "version=2" },
+        body: buildV2FetchRequest([head.oid]),
+      }),
+      m44Env({ REPO_PACKS: spy.bucket, WORKER_COLD_CLONE_MIN_BYTES: "0" }),
+      NOOP_CTX,
+    );
+    expect(cloneRes.status).toBe(200);
+    expect(cloneRes.headers.get("x-upload-plane")).toBe("worker-cold-stream");
+    const pack = extractSidebandPack(new Uint8Array(await cloneRes.arrayBuffer()));
+    await assertValidPack(pack, 6);
+    expect(spy.gets.filter((g) => g.key.endsWith(".pref")).length).toBe(1);
+    expect(spy.gets.filter((g) => g.key.endsWith(".idx")).length).toBe(1);
+    expect(spy.gets.filter((g) => g.key.endsWith(".pack")).length).toBe(1);
   });
 });

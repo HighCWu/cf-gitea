@@ -5,6 +5,7 @@ export interface PackCompactMessage {
   kind: "pack-compact";
   repo: string;
   force?: boolean;
+  maxPacks?: number;
 }
 
 export function isPackCompactMessage(body: unknown): body is PackCompactMessage {
@@ -17,8 +18,14 @@ export async function enqueuePackCompact(
   queue: Pick<Queue, "send">,
   repo: string,
   force = false,
+  maxPacks?: number,
 ): Promise<void> {
-  await queue.send({ kind: "pack-compact", repo, ...(force ? { force: true } : {}) } satisfies PackCompactMessage);
+  await queue.send({
+    kind: "pack-compact",
+    repo,
+    ...(force ? { force: true } : {}),
+    ...(typeof maxPacks === "number" ? { maxPacks } : {}),
+  } satisfies PackCompactMessage);
 }
 
 export type PackCompactEnv = Pick<Env, "REPO" | "REPO_PACKS"> & {
@@ -53,6 +60,7 @@ export async function handlePackCompactTask(
     stub,
     repo: msg.repo,
     force: msg.force === true,
+    ...(typeof msg.maxPacks === "number" ? { maxPacks: msg.maxPacks } : {}),
     generateBundle: env.BUNDLE_URI_ENABLED === "true",
     bundleMinBytes: parseBundleMinBytes(env.BUNDLE_MIN_BYTES),
   });
@@ -60,7 +68,7 @@ export async function handlePackCompactTask(
     return { retry: true, delaySeconds: 30, result };
   }
   if (result.tag === "compacted" && result.moreWork && env.REPO_TASKS) {
-    await enqueuePackCompact(env.REPO_TASKS, msg.repo);
+    await enqueuePackCompact(env.REPO_TASKS, msg.repo, msg.force === true, msg.maxPacks);
   }
   return { retry: false, result };
 }

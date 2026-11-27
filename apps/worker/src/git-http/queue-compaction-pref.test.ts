@@ -400,8 +400,10 @@ describe("SPEC-0024 M4.1 Queue streaming compaction, OFS_DELTA & .pref sidecars"
     );
     expect(acked).toBe(1);
     expect(retried).toBe(0);
-    // Exactly 1 R2.get per input pack (3 packs).
-    expect(spyCompact.gets.length).toBe(3);
+    // Exactly 1 .pack GET + 1 .pref + 1 .idx sidecar read per input pack (3 packs).
+    expect(spyCompact.gets.filter((k) => k.endsWith(".pack")).length).toBe(3);
+    expect(spyCompact.gets.filter((k) => k.endsWith(".pref")).length).toBe(3);
+    expect(spyCompact.gets.filter((k) => k.endsWith(".idx")).length).toBe(3);
 
     // Verify catalog collapsed to 1 active pack with cleanReachable=true, prefBytes > 0, tier=1, and OFS_DELTA encoded.
     const stub = env.REPO.getByName(repo);
@@ -539,5 +541,40 @@ describe("SPEC-0024 M4.1 Queue streaming compaction, OFS_DELTA & .pref sidecars"
     const listed = await env.REPO_PACKS.list({ prefix: `repos/${repo}/packs/` });
     const packFiles = listed.objects.filter((o) => o.key.endsWith(".pack"));
     expect(packFiles.length).toBe(2);
+  });
+
+  it("supports batched readUploadObjects and readCompactionObjects DO RPCs", async () => {
+    const h = engine();
+    const repo = `m48/batch-${crypto.randomUUID().slice(0, 8)}`;
+    const baseEnv = m41Env();
+
+    const p1 = await buildFullCommitPack({ fileName: "a.txt", content: "alpha\n", message: "c1", time: 1700001100 });
+    const p2 = await buildFullCommitPack({
+      fileName: "b.txt",
+      content: "beta\n",
+      message: "c2",
+      parentOid: p1.oid,
+      time: 1700001200,
+    });
+    await pushPack(h, baseEnv, repo, "refs/heads/main", ZERO_OID, p1.oid, p1.pack);
+    await pushPack(h, baseEnv, repo, "refs/heads/main", p1.oid, p2.oid, p2.pack);
+
+    const stub = env.REPO.getByName(repo);
+    const uploadBatch = await stub.readUploadObjects("", [p1.oid, p2.oid, p1.oid, "f".repeat(40)]);
+    expect(uploadBatch.tag).toBe("ok");
+    if (uploadBatch.tag === "ok") {
+      expect(uploadBatch.items.map((i) => i.oid).sort()).toEqual([p1.oid, p2.oid].sort());
+    }
+
+    const plan = await stub.beginQueueCompaction(repo, { force: true });
+    expect(plan.tag).toBe("ready");
+    if (plan.tag === "ready") {
+      const compBatch = await stub.readCompactionObjects(plan.leaseToken, [p1.oid, p2.oid, p2.oid]);
+      expect(compBatch.tag).toBe("ok");
+      if (compBatch.tag === "ok") {
+        expect(compBatch.items.map((i) => i.oid).sort()).toEqual([p1.oid, p2.oid].sort());
+      }
+      await stub.abortQueueCompaction(plan.leaseToken);
+    }
   });
 });

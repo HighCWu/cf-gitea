@@ -27,6 +27,7 @@ import {
   type PlanWorkerWarmCloneResult,
   type ReadColdClonePageResult,
   type ReadUploadObjectResult,
+  type ReadUploadObjectsResult,
   type ReadWarmClonePageResult,
   type ReadWarmLoosePageResult,
   type WorkerColdPackMeta,
@@ -146,6 +147,7 @@ import {
   type CommitQueueCompactionResult,
   type CompactionInputPack,
   type ReadCompactionObjectResult,
+  type ReadCompactionObjectsResult,
   type ReadCompactionPageResult,
   type StageCompactionRowsResult,
 } from "./compaction/queue";
@@ -1508,6 +1510,7 @@ export class RepoCell extends DurableObject<Env> {
         prefBytes: p.prefBytes ?? 0,
         packBytes: p.packBytes,
         objectCount: p.objectCount,
+        cleanReachable: Boolean(p.cleanReachable),
       }));
       result = {
         tag: "leased",
@@ -1637,6 +1640,52 @@ export class RepoCell extends DurableObject<Env> {
     }
   }
 
+  /** Batched object resolution under a Worker read lease (up to 64 unique OIDs, concurrency 8). */
+  async readUploadObjects(planId: string, oids: string[]): Promise<ReadUploadObjectsResult> {
+    this.rpcBind();
+    if (planId) {
+      const auth = renewAndAuthorizeRead(this.store, planId, null, null);
+      if (auth.tag !== "authorized") return { tag: "rejected", reason: auth.reason };
+    }
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const oid of oids) {
+      if (!seen.has(oid)) {
+        seen.add(oid);
+        unique.push(oid);
+        if (unique.length >= 64) break;
+      }
+    }
+    if (unique.length === 0) return { tag: "ok", items: [] };
+    const gate: ReadGate | undefined = planId
+      ? (packKey, offset, length) => {
+          const r = renewAndAuthorizeRead(this.store, planId, packKey, { offset, length });
+          if (r.tag !== "authorized") {
+            throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+          }
+        }
+      : undefined;
+    const items: Array<{ oid: string; type: ObjType; data: Uint8Array }> = [];
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(8, unique.length) }, async () => {
+      while (cursor < unique.length) {
+        const oid = unique[cursor++]!;
+        const obj = await this.store.get(oid, gate);
+        if (obj) items.push({ oid, type: obj.type, data: obj.data });
+      }
+    });
+    try {
+      await Promise.all(workers);
+      return { tag: "ok", items };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("read lease rejected")) {
+        return { tag: "rejected", reason: msg };
+      }
+      throw err;
+    }
+  }
+
   // ---- Queue-driven streaming compaction RPCs (SPEC-0024 M4.1) --------------
 
   async beginQueueCompaction(repo: string, opts: BeginQueueCompactionInput = {}): Promise<BeginQueueCompactionResult> {
@@ -1733,7 +1782,11 @@ export class RepoCell extends DurableObject<Env> {
   private assertLiveCompactionLease(leaseToken: string): { valid: true } | { valid: false; reason: string } {
     const lease = this.store.getLease(leaseToken);
     if (!lease || lease.kind !== "compaction") return { valid: false, reason: "compaction lease not found" };
-    if (lease.expiresAt <= Date.now()) return { valid: false, reason: "compaction lease expired" };
+    const now = Date.now();
+    if (lease.expiresAt <= now) return { valid: false, reason: "compaction lease expired" };
+    if (lease.expiresAt < now + COMPACTION_LEASE_TTL_MS / 2) {
+      this.store.createLease(leaseToken, "compaction", now + COMPACTION_LEASE_TTL_MS, lease.payload);
+    }
     return { valid: true };
   }
 
@@ -1772,6 +1825,34 @@ export class RepoCell extends DurableObject<Env> {
     const obj = await this.store.get(oid);
     if (!obj) return { tag: "missing" };
     return { tag: "ok", type: obj.type, data: obj.data };
+  }
+
+  /** Batched object resolution under an active compaction lease (up to 64 unique OIDs, concurrency 8). */
+  async readCompactionObjects(leaseToken: string, oids: string[]): Promise<ReadCompactionObjectsResult> {
+    this.rpcBind();
+    const check = this.assertLiveCompactionLease(leaseToken);
+    if (!check.valid) return { tag: "rejected", reason: check.reason };
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const oid of oids) {
+      if (!seen.has(oid)) {
+        seen.add(oid);
+        unique.push(oid);
+        if (unique.length >= 64) break;
+      }
+    }
+    if (unique.length === 0) return { tag: "ok", items: [] };
+    const items: Array<{ oid: string; type: ObjType; data: Uint8Array }> = [];
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(8, unique.length) }, async () => {
+      while (cursor < unique.length) {
+        const oid = unique[cursor++]!;
+        const obj = await this.store.get(oid);
+        if (obj) items.push({ oid, type: obj.type, data: obj.data });
+      }
+    });
+    await Promise.all(workers);
+    return { tag: "ok", items };
   }
 
   async stageCompactionRows(

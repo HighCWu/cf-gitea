@@ -1155,7 +1155,7 @@ export class PackStore {
                 clean_reachable, pref_bytes, tier
            FROM pack_catalog
           WHERE state = 'active' AND location = 'r2'
-          ORDER BY seq
+          ORDER BY tier ASC, seq ASC
           LIMIT ?`,
         maxPacks
       )

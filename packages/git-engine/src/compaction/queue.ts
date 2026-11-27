@@ -1,14 +1,23 @@
 import { applyDelta, PackWriter } from "../git/pack";
 import type { ObjType } from "../git/objects";
 import { OidSet } from "../git/oidset";
-import { encodePackRefIndex, extractObjectRefBytes, parsePackRefIndex, walkClosureWithPref, type PackRefEntryInput } from "../git/pref";
-import { bundleR2Key } from "../git/r2keys";
+import {
+  binarySearchRawOid,
+  encodePackRefIndexWithOids,
+  extractObjectRefBytes,
+  isCleanReachablePref,
+  parsePackRefIndex,
+  type PackRefEntryInput,
+  type PackRefIndexView,
+} from "../git/pref";
+import { bundleR2Key, idxR2Key, prefR2Key } from "../git/r2keys";
 import type { RepoBundleMeta } from "../git/store";
-import { concat, Sha1, toHex } from "../git/util";
+import { concat, fromHex, Sha1, toHex } from "../git/util";
 import type { PackCatalogRow } from "../git/packstore";
 import type { IndexRow } from "../control-plane";
 import { ObjCache } from "../receive/objcache";
 import { Crc32, writeIdx } from "../receive/idx";
+import { loadPackIdxV2, type IdxV2View } from "../receive/idx-reader";
 import { inflateAll } from "../receive/scan";
 import { DEFAULT_BUNDLE_MIN_BYTES, formatGitBundleV2Header } from "../upload/bundle";
 import { SequentialR2PackReader } from "../upload/stream";
@@ -17,9 +26,10 @@ import { SequentialR2PackReader } from "../upload/stream";
 export const QUEUE_COMPACTION_PART_SIZE = 16 * 1024 * 1024;
 /** Max active packs collapsed per Queue compaction round (collapses a 49-pack repo in 1 round). */
 export const QUEUE_COMPACTION_MAX_PACKS = 64;
-const PREF_CACHE_BYTES = 8 * 1024 * 1024;
+const PREF_CACHE_BYTES = 16 * 1024 * 1024;
 const COMPACTION_PAGE_SIZE = 4096;
 const STAGE_BATCH_SIZE = 4096;
+const COMPACTION_OBJECT_BATCH_SIZE = 64;
 const SINK_SLAB_PROMOTE_BYTES = 1024 * 1024;
 
 export interface CompactionInputPack extends PackCatalogRow {
@@ -63,6 +73,10 @@ export type ReadCompactionObjectResult =
   | { tag: "missing" }
   | { tag: "rejected"; reason: string };
 
+export type ReadCompactionObjectsResult =
+  | { tag: "ok"; items: Array<{ oid: string; type: ObjType; data: Uint8Array }> }
+  | { tag: "rejected"; reason: string };
+
 export type StageCompactionRowsResult =
   | { tag: "ok" }
   | { tag: "rejected"; reason: string };
@@ -98,6 +112,7 @@ export interface QueueCompactionStub {
     reachableOnly: boolean
   ): Promise<ReadCompactionPageResult>;
   readCompactionObject(leaseToken: string, oid: string): Promise<ReadCompactionObjectResult>;
+  readCompactionObjects?(leaseToken: string, oids: string[]): Promise<ReadCompactionObjectsResult>;
   stageCompactionRows(leaseToken: string, rows: Array<IndexRow & { srcPack: string }>): Promise<StageCompactionRowsResult>;
   commitQueueCompaction(leaseToken: string, output: CommitQueueCompactionInput): Promise<CommitQueueCompactionResult>;
   abortQueueCompaction(leaseToken: string): Promise<void>;
@@ -244,11 +259,52 @@ class AdaptiveR2Sink {
   }
 }
 
+async function fetchCompactionObjectsBatch(
+  stub: QueueCompactionStub,
+  leaseToken: string,
+  oids: string[]
+): Promise<Map<string, { type: ObjType; data: Uint8Array }>> {
+  const out = new Map<string, { type: ObjType; data: Uint8Array }>();
+  if (oids.length === 0) return out;
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const oid of oids) {
+    if (!seen.has(oid)) {
+      seen.add(oid);
+      unique.push(oid);
+    }
+  }
+  if (stub.readCompactionObjects) {
+    for (let i = 0; i < unique.length; i += COMPACTION_OBJECT_BATCH_SIZE) {
+      const chunk = unique.slice(i, i + COMPACTION_OBJECT_BATCH_SIZE);
+      const res = await stub.readCompactionObjects(leaseToken, chunk);
+      if (res.tag === "rejected") {
+        throw new Error(`compaction lease rejected (${res.reason})`);
+      }
+      for (const item of res.items) {
+        out.set(item.oid, { type: item.type, data: item.data });
+      }
+    }
+    return out;
+  }
+  for (const oid of unique) {
+    const res = await stub.readCompactionObject(leaseToken, oid);
+    if (res.tag === "rejected") {
+      throw new Error(`compaction lease rejected (${res.reason})`);
+    }
+    if (res.tag === "ok") {
+      out.set(oid, { type: res.type, data: res.data });
+    }
+  }
+  return out;
+}
+
 /**
  * Queue-worker streaming multi-pack compaction (SPEC-0024 M4.1):
- * - Streams each input pack via 1 sequential `bucket.get()`.
+ * - Streams each input pack via 1 sequential `bucket.get()` ordered `tier DESC, seq ASC`.
  * - Emits deltas whose base already appeared earlier using compact `OFS_DELTA` headers.
- * - Writes `.pack` (via AdaptiveR2Sink up to 64 MiB parts), `.idx` v2, and `.pref` sidecars.
+ * - Uses existing `.pref`+`.idx` sidecars for ref extraction and batches missing base reads.
+ * - Writes `.pack` (via AdaptiveR2Sink up to 16 MiB parts), `.idx` v2, and `.pref` sidecars.
  * - Commits atomically in 1 DO SQLite transaction via `commitQueueCompaction`.
  */
 export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promise<QueueCompactionResult> {
@@ -278,7 +334,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     for (const c of entryChunks) await packSink.write(c);
     entryChunks = [];
 
-    const prefCache = new ObjCache(PREF_CACHE_BYTES);
+    let prefCache: ObjCache | null = new ObjCache(PREF_CACHE_BYTES);
     const oidSet = new OidSet(Math.max(1, plan.expectedObjects));
     const entryCrcs = new Uint32Array(plan.expectedObjects);
     const entryOffsets = new Float64Array(plan.expectedObjects);
@@ -298,7 +354,22 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       }
     };
 
-    for (const p of plan.inputs) {
+    const orderedInputs = [...plan.inputs].sort((a, b) => ((b.tier ?? 0) - (a.tier ?? 0)) || (a.seq - b.seq));
+    for (const p of orderedInputs) {
+      let inputPref: { idxView: IdxV2View; prefView: PackRefIndexView } | null = null;
+      if ((p.prefBytes ?? 0) > 0) {
+        const [prefObj, idxView] = await Promise.all([
+          bucket.get(prefR2Key(plan.storageKey, p.packKey)),
+          loadPackIdxV2(bucket, idxR2Key(plan.storageKey, p.packKey)),
+        ]);
+        if (prefObj && idxView) {
+          const prefView = parsePackRefIndex(new Uint8Array(await prefObj.arrayBuffer()));
+          if (prefView.objectCount === idxView.objectCount) {
+            inputPref = { idxView, prefView };
+          }
+        }
+      }
+
       const obj = await bucket.get(p.r2Key);
       if (!obj) throw new Error(`compaction: missing input R2 pack ${p.r2Key}`);
       const seqReader = new SequentialR2PackReader(obj.body);
@@ -318,113 +389,155 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
           }
           if (page.rows.length === 0) break;
 
-          for (const row of page.rows) {
-            afterOffset = row.offset;
-            const entryOffset = pos;
-            entryChunks = [];
+          for (let chunkStart = 0; chunkStart < page.rows.length; chunkStart += COMPACTION_OBJECT_BATCH_SIZE) {
+            const chunkRows = page.rows.slice(chunkStart, chunkStart + COMPACTION_OBJECT_BATCH_SIZE);
+            const rawList: Uint8Array[] = new Array<Uint8Array>(chunkRows.length);
+            const resolvedChunk: Array<{ type: ObjType; data: Uint8Array } | null> = new Array(chunkRows.length).fill(null);
+            const needFetch: string[] = [];
 
-            let emittedType = row.type;
-            let emittedSize = row.size;
-            let emittedEntrySize = row.entrySize;
-            let emittedBaseOid = row.baseOid;
-            let nonBlobData: Uint8Array | null = null;
+            for (let i = 0; i < chunkRows.length; i++) {
+              const row = chunkRows[i]!;
+              afterOffset = row.offset;
+              const raw = await seqReader.readAt(row.dataOff, row.dataLen);
+              rawList[i] = raw;
 
-            const raw = await seqReader.readAt(row.dataOff, row.dataLen);
-
-            if (row.baseOid === null) {
-              writer.rawFull(row.type, row.entrySize, raw);
-              if (row.type !== "blob") {
-                nonBlobData = inflateAll(raw);
-                prefCache.put(row.oid, { type: row.type, data: nonBlobData });
+              if (row.baseOid === null) {
+                continue;
               }
-            } else {
               const baseIdx = oidSet.indexOfHex(row.baseOid);
               const baseOff = baseIdx >= 0 ? entryOffsets[baseIdx] : undefined;
               if (baseOff !== undefined) {
-                writer.rawOfsDelta(entryOffset - baseOff < 0 ? 0 : row.entrySize, entryOffset - baseOff, raw);
-                ofsDeltas++;
-                if (row.type !== "blob") {
-                  const cachedBase = prefCache.get(row.baseOid);
+                if (row.type !== "blob" && !inputPref) {
+                  const cachedBase = prefCache!.get(row.baseOid);
                   if (cachedBase) {
-                    nonBlobData = applyDelta(cachedBase.data, inflateAll(raw));
+                    resolvedChunk[i] = { type: row.type, data: applyDelta(cachedBase.data, inflateAll(raw)) };
                   } else {
-                    const resolved = await stub.readCompactionObject(plan.leaseToken, row.oid);
-                    if (resolved.tag === "rejected") {
-                      throw new Error(`compaction lease rejected (${resolved.reason})`);
-                    }
-                    if (resolved.tag === "missing") {
-                      throw new Error(`compaction: missing object ${row.oid}`);
-                    }
-                    nonBlobData = resolved.data;
+                    needFetch.push(row.oid);
                   }
-                  prefCache.put(row.oid, { type: row.type, data: nonBlobData });
                 }
               } else {
-                const resolved = await stub.readCompactionObject(plan.leaseToken, row.oid);
-                if (resolved.tag === "rejected") {
-                  throw new Error(`compaction lease rejected (${resolved.reason})`);
-                }
-                if (resolved.tag === "missing") {
-                  throw new Error(`compaction: missing object ${row.oid}`);
-                }
-                writer.object(resolved.type, resolved.data);
-                emittedType = resolved.type;
-                emittedSize = resolved.data.length;
-                emittedEntrySize = resolved.data.length;
-                emittedBaseOid = null;
-                reInflated++;
-                if (resolved.type !== "blob") {
-                  nonBlobData = resolved.data;
-                  prefCache.put(row.oid, { type: resolved.type, data: nonBlobData });
-                }
+                needFetch.push(row.oid);
               }
             }
 
-            if (emitted >= plan.expectedObjects) {
-              throw new Error(`compaction object overflow: exceeded expected ${plan.expectedObjects}`);
+            const fetched = await fetchCompactionObjectsBatch(stub, plan.leaseToken, needFetch);
+
+            for (let i = 0; i < chunkRows.length; i++) {
+              const row = chunkRows[i]!;
+              const raw = rawList[i]!;
+              const entryOffset = pos;
+              entryChunks = [];
+
+              let emittedType = row.type;
+              let emittedSize = row.size;
+              let emittedEntrySize = row.entrySize;
+              let emittedBaseOid = row.baseOid;
+              let refsFromPref: Uint8Array | null = null;
+              let nonBlobData: Uint8Array | null = null;
+
+              const readPrefRefs = (): Uint8Array | null => {
+                if (!inputPref) return null;
+                const idx = binarySearchRawOid(inputPref.idxView.rawOidTable, fromHex(row.oid), 0);
+                return idx >= 0 ? inputPref.prefView.rawRefsAt(idx) : null;
+              };
+
+              if (row.baseOid === null) {
+                writer.rawFull(row.type, row.entrySize, raw);
+                if (row.type !== "blob") {
+                  refsFromPref = readPrefRefs();
+                  if (refsFromPref === null) {
+                    nonBlobData = inflateAll(raw);
+                    prefCache!.put(row.oid, { type: row.type, data: nonBlobData });
+                  }
+                }
+              } else {
+                const baseIdx = oidSet.indexOfHex(row.baseOid);
+                const baseOff = baseIdx >= 0 ? entryOffsets[baseIdx] : undefined;
+                if (baseOff !== undefined) {
+                  writer.rawOfsDelta(entryOffset - baseOff < 0 ? 0 : row.entrySize, entryOffset - baseOff, raw);
+                  ofsDeltas++;
+                  if (row.type !== "blob") {
+                    refsFromPref = readPrefRefs();
+                    if (refsFromPref === null) {
+                      const localResolved = resolvedChunk[i];
+                      if (localResolved) {
+                        nonBlobData = localResolved.data;
+                      } else {
+                        const hit = fetched.get(row.oid);
+                        if (!hit) {
+                          throw new Error(`compaction: missing object ${row.oid}`);
+                        }
+                        nonBlobData = hit.data;
+                      }
+                      prefCache!.put(row.oid, { type: row.type, data: nonBlobData });
+                    }
+                  }
+                } else {
+                  const hit = fetched.get(row.oid);
+                  if (!hit) {
+                    throw new Error(`compaction: missing object ${row.oid}`);
+                  }
+                  writer.object(hit.type, hit.data);
+                  emittedType = hit.type;
+                  emittedSize = hit.data.length;
+                  emittedEntrySize = hit.data.length;
+                  emittedBaseOid = null;
+                  reInflated++;
+                  if (hit.type !== "blob") {
+                    nonBlobData = hit.data;
+                    prefCache!.put(row.oid, { type: hit.type, data: nonBlobData });
+                  }
+                }
+              }
+
+              if (emitted >= plan.expectedObjects) {
+                throw new Error(`compaction object overflow: exceeded expected ${plan.expectedObjects}`);
+              }
+
+              const crc = new Crc32();
+              for (const c of entryChunks) crc.update(c);
+              const headerLen = entryChunks[0]!.length + (entryChunks.length > 2 ? entryChunks[1]!.length : 0);
+              const dataLen = entryChunks[entryChunks.length - 1]!.length;
+
+              for (const c of entryChunks) await packSink.write(c);
+              entryChunks = [];
+
+              const inserted = oidSet.addHex(row.oid);
+              if (!inserted) {
+                throw new Error(`compaction duplicate oid in merged inputs: ${row.oid}`);
+              }
+              entryCrcs[emitted] = crc.get();
+              entryOffsets[emitted] = entryOffset;
+              oidEntry[emitted] = emitted;
+
+              prefEntries.push({
+                oid: row.oid,
+                type: emittedType,
+                refs:
+                  refsFromPref !== null
+                    ? refsFromPref
+                    : nonBlobData !== null
+                      ? extractObjectRefBytes(emittedType, nonBlobData)
+                      : new Uint8Array(0),
+              });
+
+              stageBatch.push({
+                oid: row.oid,
+                offset: entryOffset,
+                dataOff: entryOffset + headerLen,
+                dataLen,
+                type: emittedType,
+                size: emittedSize,
+                entrySize: emittedEntrySize,
+                baseOid: emittedBaseOid,
+                crc32: entryCrcs[emitted]!,
+                srcPack: p.packKey,
+              });
+              if (stageBatch.length >= STAGE_BATCH_SIZE) {
+                await flushStageBatch();
+              }
+              emitted++;
             }
-
-            const crc = new Crc32();
-            for (const c of entryChunks) crc.update(c);
-            const headerLen = entryChunks[0]!.length + (entryChunks.length > 2 ? entryChunks[1]!.length : 0);
-            const dataLen = entryChunks[entryChunks.length - 1]!.length;
-
-            for (const c of entryChunks) await packSink.write(c);
-            entryChunks = [];
-
-            const inserted = oidSet.addHex(row.oid);
-            if (!inserted) {
-              throw new Error(`compaction duplicate oid in merged inputs: ${row.oid}`);
-            }
-            entryCrcs[emitted] = crc.get();
-            entryOffsets[emitted] = entryOffset;
-            oidEntry[emitted] = emitted;
-
-            prefEntries.push({
-              oid: row.oid,
-              type: emittedType,
-              refs:
-                nonBlobData !== null
-                  ? extractObjectRefBytes(emittedType, nonBlobData)
-                  : new Uint8Array(0),
-            });
-
-            stageBatch.push({
-              oid: row.oid,
-              offset: entryOffset,
-              dataOff: entryOffset + headerLen,
-              dataLen,
-              type: emittedType,
-              size: emittedSize,
-              entrySize: emittedEntrySize,
-              baseOid: emittedBaseOid,
-              crc32: entryCrcs[emitted]!,
-              srcPack: p.packKey,
-            });
-            if (stageBatch.length >= STAGE_BATCH_SIZE) {
-              await flushStageBatch();
-            }
-            emitted++;
           }
 
           if (!page.hasMore) break;
@@ -434,6 +547,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
         activeSeqReader = null;
       }
     }
+    prefCache = null;
 
     if (emitted !== plan.expectedObjects) {
       throw new Error(`compaction object count mismatch: emitted ${emitted}, expected ${plan.expectedObjects}`);
@@ -470,7 +584,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     await idxSink.finish();
     const idxSha1 = idxTail.length === 20 ? toHex(idxTail) : undefined;
 
-    const prefBytes = encodePackRefIndex({
+    const { bytes: prefBytes, sortedOids20 } = encodePackRefIndexWithOids({
       entries: prefEntries,
       packBytes: outputPackBytes,
       packSha1,
@@ -478,19 +592,8 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     });
     let effectiveCleanReachable = plan.cleanReachable;
     if (!effectiveCleanReachable && plan.allActiveR2 && !plan.hasLoose && plan.tipOids.length > 0 && emitted > 0) {
-      const sortedOids = prefEntries.map((e) => e.oid).sort();
       const prefView = parsePackRefIndex(prefBytes);
-      const closure = walkClosureWithPref([{ sortedOids, pref: prefView }], plan.tipOids);
-      if (closure.size === emitted) {
-        let allPresent = true;
-        for (const oid of closure) {
-          if (!oidSet.hasHex(oid)) {
-            allPresent = false;
-            break;
-          }
-        }
-        if (allPresent) effectiveCleanReachable = true;
-      }
+      effectiveCleanReachable = isCleanReachablePref(sortedOids20, prefView, plan.tipOids);
     }
     // Release per-object ref slices before opening bundleSink.
     prefEntries.length = 0;
@@ -577,7 +680,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       reInflated,
       cleanReachable: commitRes.cleanReachable,
       activePacksRemaining: commitRes.activePacksRemaining,
-      moreWork: commitRes.activePacksRemaining > 8,
+      moreWork: opts.force ? commitRes.activePacksRemaining > 1 : commitRes.activePacksRemaining > 8,
       ...(bundle ? { bundle } : {}),
     };
   } catch (err) {

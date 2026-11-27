@@ -206,13 +206,13 @@ export function extractObjectRefBytes(type: ObjType, payload: Uint8Array): Uint8
   return new Uint8Array(0);
 }
 
-/** Encode a binary `.pref` sidecar for `entries`, automatically sorting them by ascending OID. */
-export function encodePackRefIndex(input: {
+/** Encode a binary `.pref` sidecar for `entries`, returning both `.pref` bytes and packed 20-byte sorted OIDs. */
+export function encodePackRefIndexWithOids(input: {
   entries: PackRefEntryInput[];
   packBytes: number;
   packSha1: string;
   idxSha1?: string;
-}): Uint8Array {
+}): { bytes: Uint8Array; sortedOids20: Uint8Array } {
   const sorted = [...input.entries].sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
   const n = sorted.length;
   let refCount = 0;
@@ -224,6 +224,7 @@ export function encodePackRefIndex(input: {
   }
   const totalBytes = PACK_REF_HEADER_BYTES + n + (n + 1) * 4 + refCount * OID_BYTES;
   const out = new Uint8Array(totalBytes);
+  const sortedOids20 = new Uint8Array(n * OID_BYTES);
   const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
   let pos = 0;
 
@@ -245,6 +246,7 @@ export function encodePackRefIndex(input: {
 
   for (let i = 0; i < n; i++) {
     out[pos++] = TYPE_NUM[sorted[i]!.type];
+    sortedOids20.set(fromHex(sorted[i]!.oid), i * OID_BYTES);
   }
   let cursor = 0;
   for (let i = 0; i < n; i++) {
@@ -261,7 +263,17 @@ export function encodePackRefIndex(input: {
       pos += refs.byteLength;
     }
   }
-  return out;
+  return { bytes: out, sortedOids20 };
+}
+
+/** Encode a binary `.pref` sidecar for `entries`, automatically sorting them by ascending OID. */
+export function encodePackRefIndex(input: {
+  entries: PackRefEntryInput[];
+  packBytes: number;
+  packSha1: string;
+  idxSha1?: string;
+}): Uint8Array {
+  return encodePackRefIndexWithOids(input).bytes;
 }
 
 /** Parse and validate a binary `.pref` sidecar. */
@@ -337,6 +349,76 @@ export function parsePackRefIndex(bytes: Uint8Array, expectedPackSha1?: string):
       return rawRefs.subarray(s * OID_BYTES, e * OID_BYTES);
     },
   };
+}
+
+/** Binary-search a packed 20-byte sorted OID table for `target[targetOffset .. +20]`. */
+export function binarySearchRawOid(
+  sortedOids20: Uint8Array,
+  target: Uint8Array,
+  targetOffset = 0
+): number {
+  const count = Math.floor(sortedOids20.byteLength / OID_BYTES);
+  let lo = 0;
+  let hi = count - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const base = mid * OID_BYTES;
+    let cmp = 0;
+    for (let i = 0; i < OID_BYTES; i++) {
+      const a = sortedOids20[base + i]!;
+      const b = target[targetOffset + i]!;
+      if (a !== b) {
+        cmp = a < b ? -1 : 1;
+        break;
+      }
+    }
+    if (cmp === 0) return mid;
+    if (cmp < 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+/**
+ * Zero-string check proving every tip and every reachable descendant exists in a
+ * single sorted pack and `visitedCount === pref.objectCount` (clean reachable).
+ */
+export function isCleanReachablePref(
+  sortedOids20: Uint8Array,
+  pref: PackRefIndexView,
+  tipOids: readonly string[]
+): boolean {
+  const count = pref.objectCount;
+  if (count <= 0 || sortedOids20.byteLength !== count * OID_BYTES || tipOids.length === 0) {
+    return false;
+  }
+  const visited = new Uint8Array(count);
+  let visitedCount = 0;
+  const stack: number[] = [];
+  for (const tip of tipOids) {
+    if (tip.length !== OID_HEX_BYTES) return false;
+    const idx = binarySearchRawOid(sortedOids20, fromHex(tip), 0);
+    if (idx < 0) return false;
+    if (!visited[idx]) {
+      visited[idx] = 1;
+      visitedCount++;
+      stack.push(idx);
+    }
+  }
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    const refs = pref.rawRefsAt(cur);
+    for (let off = 0; off + OID_BYTES <= refs.byteLength; off += OID_BYTES) {
+      const childIdx = binarySearchRawOid(sortedOids20, refs, off);
+      if (childIdx < 0) return false;
+      if (!visited[childIdx]) {
+        visited[childIdx] = 1;
+        visitedCount++;
+        stack.push(childIdx);
+      }
+    }
+  }
+  return visitedCount === count;
 }
 
 function binarySearchOid(sortedOids: readonly string[], target: string): number {
