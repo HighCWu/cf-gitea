@@ -560,4 +560,70 @@ describe("SPEC-0024 M4.4 Worker cold-clone & cold-compaction closure", () => {
     expect(prefGets.length).toBe(1);
     expect(idxGets.length).toBe(1);
   });
+
+  it("streams subset-tip cold clones via worker-cold-stream while excluding unrelated scratch branches and rejecting unadvertised OIDs", async () => {
+    const h = engine();
+    const repo = `alice/m47-subset-${crypto.randomUUID().slice(0, 8)}`;
+    const targetEnv = m44Env({ WORKER_COLD_CLONE_MIN_BYTES: "0" });
+
+    const mainCommit = await buildCommitPack({
+      fileName: "main.txt",
+      content: "main branch payload\n",
+      message: "main root",
+      time: 1700006000,
+    });
+    const scratchOrphan = await buildCommitPack({
+      fileName: "scratch-old.txt",
+      content: "scratch orphan payload\n",
+      message: "scratch old",
+      time: 1700006100,
+    });
+    const scratchLive = await buildCommitPack({
+      fileName: "scratch-live.txt",
+      content: "scratch live payload\n",
+      message: "scratch live",
+      time: 1700006200,
+    });
+
+    await pushPack(h, targetEnv, repo, "refs/heads/main", ZERO_OID, mainCommit.oid, mainCommit.pack);
+    await pushPack(h, targetEnv, repo, "refs/scratch/preseed/seg01", ZERO_OID, scratchOrphan.oid, scratchOrphan.pack);
+    await pushPack(
+      h,
+      targetEnv,
+      repo,
+      "refs/scratch/preseed/seg01",
+      scratchOrphan.oid,
+      scratchLive.oid,
+      scratchLive.pack,
+    );
+
+    // Clone requesting ONLY main -> hits worker-cold-stream and excludes scratch branches (3 objects, not 6 or 9).
+    const subsetRes = await h.fetch(
+      new Request(`https://engine.internal/${repo}.git/git-upload-pack`, {
+        method: "POST",
+        headers: { "content-type": UPLOAD_CT, "git-protocol": "version=2" },
+        body: buildV2FetchRequest([mainCommit.oid]),
+      }),
+      targetEnv,
+      NOOP_CTX,
+    );
+    expect(subsetRes.status).toBe(200);
+    expect(subsetRes.headers.get("x-upload-plane")).toBe("worker-cold-stream");
+    const subsetPack = extractSidebandPack(new Uint8Array(await subsetRes.arrayBuffer()));
+    await assertValidPack(subsetPack, 3);
+
+    // Unadvertised orphan OID must miss worker-cold-stream and fail closed in DO uploadPack.
+    const orphanRes = await h.fetch(
+      new Request(`https://engine.internal/${repo}.git/git-upload-pack`, {
+        method: "POST",
+        headers: { "content-type": UPLOAD_CT, "git-protocol": "version=2" },
+        body: buildV2FetchRequest([scratchOrphan.oid]),
+      }),
+      targetEnv,
+      NOOP_CTX,
+    );
+    expect(orphanRes.headers.get("x-upload-plane")).toBeNull();
+    const orphanWire = dec.decode(new Uint8Array(await orphanRes.arrayBuffer()));
+    expect(orphanWire).toContain("ERR");
+  });
 });

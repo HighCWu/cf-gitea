@@ -173,6 +173,24 @@ export function wantsAreAllTips(store: GitStore, wants: string[]): boolean {
   return true;
 }
 
+/**
+ * True when every requested OID in `wants` is an advertised tip (ref or peeled tag target).
+ * Allows subset-tip clones (e.g., bare `git clone` requesting only `main` on repos with
+ * `refs/scratch/*` or `refs/pull/*`) to stream only the requested closure on the Worker.
+ */
+export function wantsAreAdvertisedTips(store: GitStore, wants: string[]): boolean {
+  if (wants.length === 0) return false;
+  const allowed = new Set<string>();
+  const head = store.resolveHead();
+  if (head) allowed.add(head);
+  for (const r of store.refs()) {
+    allowed.add(r.oid);
+    if (r.peeled) allowed.add(r.peeled);
+  }
+  if (allowed.size === 0) return false;
+  return wants.every((w) => allowed.has(w));
+}
+
 export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] {
   const frames: Uint8Array[] = [];
   for (let off = 0; off < payload.length; off += SIDEBAND_CHUNK) {

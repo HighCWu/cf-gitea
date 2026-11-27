@@ -2,6 +2,7 @@ import { concat, isOid, te, toHex } from "../git/util";
 import { FLUSH, pkt } from "../git/pktline";
 import { applyDelta, PackWriter } from "../git/pack";
 import type { ObjType } from "../git/objects";
+import { OidSet } from "../git/oidset";
 import { extractObjectRefBytes, parsePackRefIndex } from "../git/pref";
 import { ObjCache } from "../receive/objcache";
 import { loadPackIdxV2 } from "../receive/idx-reader";
@@ -741,8 +742,9 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
   });
 
   let phase1Done = false;
-  let reachable = new Set<string>();
-  const emittedOids = new Set<string>();
+  const present = new OidSet(4096);
+  let reachableCount = 0;
+  const emittedOids = new OidSet(4096);
   let packIdx = 0;
   let packOpened = false;
   let afterOffset = -1;
@@ -753,8 +755,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
   let finished = false;
 
   const runPhase1 = async (ctrl: ReadableStreamDefaultController<Uint8Array>): Promise<void> => {
-    const edges = new Map<string, string[]>();
-    const presentOids = new Set<string>();
+    const edges = new Map<string, Uint8Array>();
     const nonBlobCache = new ObjCache(8 * 1024 * 1024);
 
     for (const p of plan.packs) {
@@ -772,9 +773,10 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           if (prefView.objectCount === idxView.objectCount) {
             for (let i = 0; i < prefView.objectCount; i++) {
               const oid = idxView.sortedOidAt(i);
-              presentOids.add(oid);
+              present.addHex(oid);
               if (prefView.typeAt(i) !== "blob") {
-                edges.set(oid, prefView.refsAt(i));
+                const refs = prefView.rawRefsAt(i);
+                if (refs.byteLength > 0) edges.set(oid, refs);
               }
             }
             usedPref = true;
@@ -797,7 +799,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
             }
             for (const row of page.rows) {
               cursor = row.offset;
-              presentOids.add(row.oid);
+              present.addHex(row.oid);
               if (row.type === "blob") continue;
               const raw = await reader.readAt(row.dataOff, row.dataLen);
               let data: Uint8Array;
@@ -820,11 +822,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
               }
               nonBlobCache.put(row.oid, { type: row.type, data });
               const refBytes = extractObjectRefBytes(row.type, data);
-              const refs: string[] = [];
-              for (let off = 0; off + 20 <= refBytes.length; off += 20) {
-                refs.push(toHex(refBytes.subarray(off, off + 20)));
-              }
-              edges.set(row.oid, refs);
+              if (refBytes.byteLength > 0) edges.set(row.oid, refBytes);
             }
             if (!page.hasMore || page.rows.length === 0) break;
           }
@@ -835,42 +833,41 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
       }
     }
 
-    const closure = new Set<string>();
     const stack: string[] = [];
     for (const tip of plan.tipOids) {
-      if (!presentOids.has(tip)) {
+      if (!present.hasHex(tip)) {
         throw new Error(`cold clone missing tip object ${tip}`);
       }
-      if (!closure.has(tip)) {
-        closure.add(tip);
+      if (present.markHex(tip)) {
         stack.push(tip);
       }
     }
     while (stack.length > 0) {
       const oid = stack.pop()!;
-      const children = edges.get(oid);
-      if (!children) continue;
-      for (const child of children) {
-        if (!presentOids.has(child)) {
-          throw new Error(`cold clone missing reachable object ${child}`);
+      const childBytes = edges.get(oid);
+      if (!childBytes) continue;
+      for (let off = 0; off + 20 <= childBytes.length; off += 20) {
+        if (!present.hasBytes(childBytes, off)) {
+          throw new Error(`cold clone missing reachable object ${toHex(childBytes.subarray(off, off + 20))}`);
         }
-        if (!closure.has(child)) {
-          closure.add(child);
-          stack.push(child);
+        const childHex = toHex(childBytes.subarray(off, off + 20));
+        if (present.markHex(childHex)) {
+          stack.push(childHex);
         }
       }
     }
-    if (closure.size === 0) {
+    edges.clear();
+    reachableCount = present.markedSize;
+    if (reachableCount === 0) {
       throw new Error("cold clone closure resolved to zero objects");
     }
 
-    reachable = closure;
     if (sideband && !noProgress) {
-      for (const f of uploadSidebandFrames(2, te.encode(`Enumerating objects: ${reachable.size}, done.\n`))) {
+      for (const f of uploadSidebandFrames(2, te.encode(`Enumerating objects: ${reachableCount}, done.\n`))) {
         enqueue(ctrl, f);
       }
     }
-    writer.header(reachable.size);
+    writer.header(reachableCount);
     flushBuffered();
     for (const c of pending) enqueue(ctrl, c);
     pending.length = 0;
@@ -925,14 +922,13 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
       const row = pageRows[pageCursor++]!;
       afterOffset = row.offset;
       if (!isOid(row.oid)) throw new Error(`invalid oid in cold clone plan: ${row.oid}`);
-      if (!reachable.has(row.oid) || emittedOids.has(row.oid)) {
+      if (!present.isMarkedHex(row.oid) || !emittedOids.addHex(row.oid)) {
         continue;
       }
-      emittedOids.add(row.oid);
       if (!row.baseOid) {
         const raw = await seqReader!.readAt(row.dataOff, row.dataLen);
         writer.rawFull(row.type, row.entrySize, raw);
-      } else if (reachable.has(row.baseOid)) {
+      } else if (present.isMarkedHex(row.baseOid)) {
         const raw = await seqReader!.readAt(row.dataOff, row.dataLen);
         writer.rawDelta(row.entrySize, row.baseOid, raw);
       } else {
@@ -973,8 +969,8 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           }
         }
         if (drained && !finished) {
-          if (emittedOids.size !== reachable.size) {
-            throw new Error(`cold clone count mismatch: emitted ${emittedOids.size}, expected ${reachable.size}`);
+          if (emittedOids.size !== reachableCount) {
+            throw new Error(`cold clone count mismatch: emitted ${emittedOids.size}, expected ${reachableCount}`);
           }
           finished = true;
           writer.finish();

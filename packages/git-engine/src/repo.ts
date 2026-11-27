@@ -9,6 +9,7 @@ import {
   advertisement,
   uploadPack,
   latestCommitTime,
+  wantsAreAdvertisedTips,
   wantsAreAllTips,
   openPlanLease,
   releasePlanLease,
@@ -1482,7 +1483,7 @@ export class RepoCell extends DurableObject<Env> {
     const minPacks = opts.minPacks ?? DEFAULT_WORKER_COLD_CLONE_MIN_PACKS;
     let result: PlanWorkerColdCloneResult = { tag: "miss" };
     this.store.tx(() => {
-      if (!wantsAreAllTips(this.store, wants)) return;
+      if (!wantsAreAdvertisedTips(this.store, wants)) return;
       if (this.store.getMeta("has-loose") === "1") return;
       const activeCount = this.store.packs.activePackCount();
       if (activeCount <= 0) return;
@@ -1491,11 +1492,7 @@ export class RepoCell extends DurableObject<Env> {
       const totalPackBytes = r2Packs.reduce((sum, p) => sum + p.packBytes, 0);
       if (totalPackBytes < minBytes && activeCount < minPacks) return;
 
-      const tipSet = new Set<string>();
-      const headTip = this.store.resolveHead();
-      if (headTip) tipSet.add(headTip);
-      for (const r of this.store.refs()) tipSet.add(r.oid);
-      const tipOids = [...tipSet];
+      const tipOids = [...new Set(wants)];
       if (tipOids.length === 0) return;
 
       const plan = planFetchInsideTransaction(this.store, {

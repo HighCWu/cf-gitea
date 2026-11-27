@@ -46,6 +46,7 @@ export interface PackRefIndexView {
   rawRefs: Uint8Array;
   typeAt(sortedIndex: number): ObjType;
   refsAt(sortedIndex: number): string[];
+  rawRefsAt(sortedIndex: number): Uint8Array;
 }
 
 function hexNibble(ch: number): number {
@@ -329,6 +330,11 @@ export function parsePackRefIndex(bytes: Uint8Array, expectedPackSha1?: string):
         out.push(toHex(rawRefs.subarray(i * OID_BYTES, (i + 1) * OID_BYTES)));
       }
       return out;
+    },
+    rawRefsAt(sortedIndex: number): Uint8Array {
+      const s = refStartsView.getUint32(sortedIndex * 4, false);
+      const e = refStartsView.getUint32((sortedIndex + 1) * 4, false);
+      return rawRefs.subarray(s * OID_BYTES, e * OID_BYTES);
     },
   };
 }
