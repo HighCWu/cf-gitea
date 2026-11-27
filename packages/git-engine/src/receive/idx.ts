@@ -50,7 +50,9 @@ export interface IdxInput {
   /** every object of the pack, in resolution order */
   oids: OidSet;
   /** resolution-order index -> entry index (parallel to `oids`) */
-  oidEntry: number[];
+  oidEntry: ArrayLike<number>;
+  /** optional pre-sorted `oids` index order (ascending 20-byte OID) */
+  sortedOrder?: Uint32Array;
   /** CRC-32 per ENTRY (indexed by entry index, as produced by the scan) */
   entryCrcs: Uint32Array;
   /** pack offset per ENTRY */
@@ -73,16 +75,11 @@ export async function writeIdx(
 ): Promise<number> {
   const { oids, oidEntry, entryCrcs, entryOffsets, packSha1 } = input;
   const n = oids.size;
-  const hexes: string[] = new Array(n);
-  for (let i = 0; i < n; i++) hexes[i] = oids.atHex(i);
-  // idx rows are in ascending oid order; hex strings compare byte-wise
-  const sorted: number[] = new Array(n);
-  for (let i = 0; i < n; i++) sorted[i] = i;
-  sorted.sort((a, b) => (hexes[a] < hexes[b] ? -1 : hexes[a] > hexes[b] ? 1 : 0));
+  const sorted = input.sortedOrder ?? oids.sortedIndices();
 
-  // fanout: cumulative counts by first byte
+  // fanout: cumulative counts by first byte (zero string allocations)
   const fanout = new Uint32Array(256);
-  for (let i = 0; i < n; i++) fanout[parseInt(hexes[i].slice(0, 2), 16)]++;
+  for (let i = 0; i < n; i++) fanout[oids.firstByteAt(i)]++;
   for (let i = 1; i < 256; i++) fanout[i] += fanout[i - 1];
 
   // offsets >= 2^31 are MSB-flagged into a 64-bit side table
@@ -124,15 +121,15 @@ export async function writeIdx(
   pushU32(2);
   for (let i = 0; i < 256; i++) pushU32(fanout[i]);
   for (let i = 0; i < n; i++) {
-    const bytes = fromHex(hexes[sorted[i]]);
-    for (let j = 0; j < 20; j++) push(bytes[j]);
+    const bytes = oids.rawAt(sorted[i]!);
+    for (let j = 0; j < 20; j++) push(bytes[j]!);
   }
   for (let i = 0; i < n; i++) {
-    const entry = oidEntry[sorted[i]];
+    const entry = oidEntry[sorted[i]!]!;
     pushU32(entryCrcs[entry]);
   }
   for (let i = 0; i < n; i++) {
-    const entry = oidEntry[sorted[i]];
+    const entry = oidEntry[sorted[i]!]!;
     pushU32(offsetWord(entryOffsets[entry]));
   }
   for (const off of large) {

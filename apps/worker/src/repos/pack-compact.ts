@@ -54,6 +54,7 @@ export async function handlePackCompactTask(
   if (!env.REPO_PACKS) {
     return { retry: false, result: null };
   }
+  const startedAt = Date.now();
   const stub = env.REPO.getByName(msg.repo);
   const result = await runQueueCompaction({
     bucket: env.REPO_PACKS,
@@ -64,10 +65,24 @@ export async function handlePackCompactTask(
     generateBundle: env.BUNDLE_URI_ENABLED === "true",
     bundleMinBytes: parseBundleMinBytes(env.BUNDLE_MIN_BYTES),
   });
+  const elapsedMs = Date.now() - startedAt;
   if (result.tag === "deferred") {
-    return { retry: true, delaySeconds: 30, result };
+    const delaySeconds = result.reason === "compaction_in_flight" ? 45 : 30;
+    console.log(
+      `[repo-tasks] pack-compact repo=${msg.repo} force=${msg.force === true} tag=deferred reason=${result.reason} delaySeconds=${delaySeconds} elapsedMs=${elapsedMs}`,
+    );
+    return { retry: true, delaySeconds, result };
   }
-  if (result.tag === "compacted" && result.moreWork && env.REPO_TASKS) {
+  if (result.tag === "skipped") {
+    console.log(
+      `[repo-tasks] pack-compact repo=${msg.repo} force=${msg.force === true} tag=skipped reason=${result.reason} activePacks=${result.activePacks} elapsedMs=${elapsedMs}`,
+    );
+    return { retry: false, result };
+  }
+  console.log(
+    `[repo-tasks] pack-compact repo=${msg.repo} force=${msg.force === true} tag=compacted inputs=${result.inputs.length} objects=${result.objects} bytes=${result.outputPackBytes} ofsDeltas=${result.ofsDeltas} reInflated=${result.reInflated} clean=${result.cleanReachable} activeRemaining=${result.activePacksRemaining} moreWork=${result.moreWork} bundle=${result.bundle ? result.bundle.bytes : 0} elapsedMs=${elapsedMs}`,
+  );
+  if (result.moreWork && env.REPO_TASKS) {
     await enqueuePackCompact(env.REPO_TASKS, msg.repo, msg.force === true, msg.maxPacks);
   }
   return { retry: false, result };

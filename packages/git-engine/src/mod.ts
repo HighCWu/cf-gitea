@@ -269,21 +269,27 @@ export {
 } from "./upload/stream";
 export { prefR2Key } from "./git/r2keys";
 export { encodeOfsDistance } from "./git/pack";
+export { OidSet } from "./git/oidset";
+export { TYPE_NUM } from "./git/objects";
 export {
   PACK_REF_HEADER_BYTES,
   PACK_REF_MAGIC,
   PACK_REF_VERSION,
+  CompactRefArena,
   binarySearchRawOid,
   encodePackRefIndex,
   encodePackRefIndexWithOids,
   extractObjectRefBytes,
+  isCleanReachableCompact,
   isCleanReachablePref,
   parsePackRefIndex,
   walkClosureWithPref,
+  writePackRefIndexFromCompact,
   type PackRefEntryInput,
   type PackRefIndexView,
 } from "./git/pref";
 export {
+  QUEUE_COMPACTION_LEASE_TTL_MS,
   QUEUE_COMPACTION_MAX_PACKS,
   QUEUE_COMPACTION_PART_SIZE,
   runQueueCompaction,

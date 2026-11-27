@@ -1,4 +1,5 @@
 import { NUM_TYPE, TYPE_NUM, type ObjType } from "./objects";
+import type { OidSet } from "./oidset";
 import { fromHex, toHex } from "./util";
 
 /**
@@ -274,6 +275,210 @@ export function encodePackRefIndex(input: {
   idxSha1?: string;
 }): Uint8Array {
   return encodePackRefIndexWithOids(input).bytes;
+}
+
+/**
+ * Chunked binary arena storing raw 20-byte object ref edges in 1 MiB slabs
+ * aligned on 20-byte boundaries (zero per-object JS arrays or strings).
+ */
+export class CompactRefArena {
+  private static readonly SLAB_SLOTS = 52428; // 52428 * 20 = 1,048,560 bytes (~1 MiB)
+  private slabs: Uint8Array[] = [];
+  private total = 0;
+
+  get totalSlots(): number {
+    return this.total;
+  }
+
+  append(refs: Uint8Array): { startSlot: number; count: number } {
+    if (refs.byteLength % OID_BYTES !== 0) {
+      throw new Error(`pref: unaligned ref bytes (${refs.byteLength})`);
+    }
+    const count = refs.byteLength / OID_BYTES;
+    const startSlot = this.total;
+    let remaining = count;
+    let srcOff = 0;
+    while (remaining > 0) {
+      const slabIdx = Math.floor(this.total / CompactRefArena.SLAB_SLOTS);
+      const slotInSlab = this.total % CompactRefArena.SLAB_SLOTS;
+      let slab = this.slabs[slabIdx];
+      if (!slab) {
+        slab = new Uint8Array(CompactRefArena.SLAB_SLOTS * OID_BYTES);
+        this.slabs[slabIdx] = slab;
+      }
+      const take = Math.min(remaining, CompactRefArena.SLAB_SLOTS - slotInSlab);
+      const copyBytes = take * OID_BYTES;
+      slab.set(refs.subarray(srcOff, srcOff + copyBytes), slotInSlab * OID_BYTES);
+      srcOff += copyBytes;
+      this.total += take;
+      remaining -= take;
+    }
+    return { startSlot, count };
+  }
+
+  forEachSlot(
+    startSlot: number,
+    count: number,
+    visit: (slab: Uint8Array, byteOffset: number) => boolean | void
+  ): boolean {
+    for (let k = 0; k < count; k++) {
+      const slot = startSlot + k;
+      const slabIdx = Math.floor(slot / CompactRefArena.SLAB_SLOTS);
+      const byteOffset = (slot % CompactRefArena.SLAB_SLOTS) * OID_BYTES;
+      const res = visit(this.slabs[slabIdx]!, byteOffset);
+      if (res === false) return false;
+    }
+    return true;
+  }
+
+  contiguousSlice(slot: number, remainingSlots: number): { bytes: Uint8Array; slots: number } {
+    const slabIdx = Math.floor(slot / CompactRefArena.SLAB_SLOTS);
+    const slotInSlab = slot % CompactRefArena.SLAB_SLOTS;
+    const slots = Math.min(remainingSlots, CompactRefArena.SLAB_SLOTS - slotInSlab);
+    const byteOff = slotInSlab * OID_BYTES;
+    return {
+      bytes: this.slabs[slabIdx]!.subarray(byteOff, byteOff + slots * OID_BYTES),
+      slots,
+    };
+  }
+
+  clear(): void {
+    this.slabs = [];
+    this.total = 0;
+  }
+}
+
+/**
+ * Zero-string, zero-`.pref`-materialization reachability verification using
+ * compaction's in-memory `OidSet` + `CompactRefArena`.
+ */
+export function isCleanReachableCompact(
+  oids: OidSet,
+  refStarts: Uint32Array,
+  refCounts: Uint32Array,
+  arena: CompactRefArena,
+  tipOids: readonly string[]
+): boolean {
+  const count = oids.size;
+  if (count <= 0 || tipOids.length === 0) return false;
+  const visited = new Uint8Array(count);
+  const stack = new Uint32Array(count);
+  let sp = 0;
+  let visitedCount = 0;
+  for (const tip of tipOids) {
+    if (tip.length !== OID_HEX_BYTES) return false;
+    const idx = oids.indexOfHex(tip);
+    if (idx < 0) return false;
+    if (!visited[idx]) {
+      visited[idx] = 1;
+      visitedCount++;
+      stack[sp++] = idx;
+    }
+  }
+  while (sp > 0) {
+    const cur = stack[--sp]!;
+    const ok = arena.forEachSlot(refStarts[cur]!, refCounts[cur]!, (slab, off) => {
+      const childIdx = oids.indexOfBytes(slab, off);
+      if (childIdx < 0) return false;
+      if (!visited[childIdx]) {
+        visited[childIdx] = 1;
+        visitedCount++;
+        stack[sp++] = childIdx;
+      }
+      return true;
+    });
+    if (!ok) return false;
+  }
+  return visitedCount === count;
+}
+
+/**
+ * Stream a binary `.pref` v1 sidecar in bounded 64 KiB chunks directly from
+ * compact typed arrays + `CompactRefArena` without allocating a full `.pref`
+ * buffer in isolate memory.
+ */
+export async function writePackRefIndexFromCompact(
+  sink: (chunk: Uint8Array) => Promise<void> | void,
+  input: {
+    oids: OidSet;
+    sortedOrder: Uint32Array;
+    typeCodes: Uint8Array;
+    refStarts: Uint32Array;
+    refCounts: Uint32Array;
+    arena: CompactRefArena;
+    packBytes: number;
+    packSha1: string;
+    idxSha1?: string;
+  }
+): Promise<number> {
+  const { oids, sortedOrder, typeCodes, refStarts, refCounts, arena, packBytes, packSha1, idxSha1 } = input;
+  const n = oids.size;
+  const CHUNK_BYTES = 64 * 1024;
+  const buf = new Uint8Array(CHUNK_BYTES);
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let fill = 0;
+  let total = 0;
+
+  const flush = async (): Promise<void> => {
+    if (fill === 0) return;
+    const part = buf.slice(0, fill);
+    total += fill;
+    fill = 0;
+    await sink(part);
+  };
+  const pushBytes = async (src: Uint8Array): Promise<void> => {
+    let off = 0;
+    while (off < src.byteLength) {
+      if (fill === CHUNK_BYTES) await flush();
+      const take = Math.min(src.byteLength - off, CHUNK_BYTES - fill);
+      buf.set(src.subarray(off, off + take), fill);
+      fill += take;
+      off += take;
+    }
+  };
+  const pushByte = async (v: number): Promise<void> => {
+    if (fill === CHUNK_BYTES) await flush();
+    buf[fill++] = v;
+  };
+  const pushU32 = async (v: number): Promise<void> => {
+    if (fill + 4 > CHUNK_BYTES) await flush();
+    dv.setUint32(fill, v >>> 0, false);
+    fill += 4;
+  };
+
+  await pushU32(PACK_REF_MAGIC);
+  await pushU32(PACK_REF_VERSION);
+  await pushU32(n);
+  await pushU32(Math.floor(packBytes / UINT32_SPAN));
+  await pushU32(packBytes >>> 0);
+  await pushBytes(fromHex(packSha1));
+  await pushBytes(idxSha1 ? fromHex(idxSha1) : new Uint8Array(OID_BYTES));
+
+  for (let i = 0; i < n; i++) {
+    await pushByte(typeCodes[sortedOrder[i]!]!);
+  }
+
+  let cursor = 0;
+  for (let i = 0; i < n; i++) {
+    await pushU32(cursor);
+    cursor += refCounts[sortedOrder[i]!]!;
+  }
+  await pushU32(cursor);
+
+  for (let i = 0; i < n; i++) {
+    const objIdx = sortedOrder[i]!;
+    let rem = refCounts[objIdx]!;
+    let slot = refStarts[objIdx]!;
+    while (rem > 0) {
+      const slice = arena.contiguousSlice(slot, rem);
+      await pushBytes(slice.bytes);
+      slot += slice.slots;
+      rem -= slice.slots;
+    }
+  }
+
+  await flush();
+  return total;
 }
 
 /** Parse and validate a binary `.pref` sidecar. */

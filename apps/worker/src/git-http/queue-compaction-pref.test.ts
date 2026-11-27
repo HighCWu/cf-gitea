@@ -1,13 +1,19 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
+  CompactRefArena,
+  OidSet,
+  TYPE_NUM,
   createDurableGit,
   encodeOfsDistance,
   encodePackRefIndex,
   extractObjectRefBytes,
+  isCleanReachableCompact,
   parsePackRefIndex,
   prefR2Key,
+  runQueueCompaction,
   walkClosureWithPref,
+  writePackRefIndexFromCompact,
 } from "@cf-gitea/git-engine";
 import { ZERO_OID, buildReceivePackBody } from "../repos/testing/git-pack";
 import { handleRepoTasks } from "../repos/purge";
@@ -576,5 +582,125 @@ describe("SPEC-0024 M4.1 Queue streaming compaction, OFS_DELTA & .pref sidecars"
       }
       await stub.abortQueueCompaction(plan.leaseToken);
     }
+  });
+
+  it("streams compact .pref byte-identically to encodePackRefIndex and avoids redundant DO fetches for intra-window deltas", async () => {
+    const blob = enc.encode("compact arena blob\n");
+    const blobOid = await sha1Hex(concatU8([enc.encode(`blob ${blob.length}\0`), blob]));
+    const treeBody = concatU8([enc.encode("100644 a.txt\0"), rawOid(blobOid)]);
+    const treeOid = await sha1Hex(concatU8([enc.encode(`tree ${treeBody.length}\0`), treeBody]));
+    const commitBody = enc.encode(`tree ${treeOid}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nc\n`);
+    const commitOid = await sha1Hex(concatU8([enc.encode(`commit ${commitBody.length}\0`), commitBody]));
+
+    const entries = [
+      { oid: commitOid, type: "commit" as const, refs: extractObjectRefBytes("commit", commitBody) },
+      { oid: blobOid, type: "blob" as const, refs: extractObjectRefBytes("blob", blob) },
+      { oid: treeOid, type: "tree" as const, refs: extractObjectRefBytes("tree", treeBody) },
+    ];
+    const packSha1 = "aa".repeat(20);
+    const idxSha1 = "bb".repeat(20);
+    const legacyBytes = encodePackRefIndex({ entries, packBytes: 12345, packSha1, idxSha1 });
+
+    const oids = new OidSet(4);
+    const typeCodes = new Uint8Array(3);
+    const refStarts = new Uint32Array(3);
+    const refCounts = new Uint32Array(3);
+    const arena = new CompactRefArena();
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]!;
+      oids.addHex(e.oid);
+      typeCodes[i] = TYPE_NUM[e.type];
+      const alloc = arena.append(e.refs);
+      refStarts[i] = alloc.startSlot;
+      refCounts[i] = alloc.count;
+    }
+    const sortedOrder = oids.sortedIndices();
+    expect(isCleanReachableCompact(oids, refStarts, refCounts, arena, [commitOid])).toBe(true);
+
+    const chunks: Uint8Array[] = [];
+    const total = await writePackRefIndexFromCompact(
+      (c) => {
+        chunks.push(c);
+      },
+      { oids, sortedOrder, typeCodes, refStarts, refCounts, arena, packBytes: 12345, packSha1, idxSha1 },
+    );
+    const streamed = concatU8(chunks);
+    expect(total).toBe(legacyBytes.byteLength);
+    expect(streamed).toEqual(legacyBytes);
+
+    // Build a single pack containing baseBlob + intra-pack REF_DELTA -> OFS_DELTA in one window,
+    // and assert 0 DO object fetches occur during runQueueCompaction.
+    const h = engine();
+    const repo = `m49/intra-${crypto.randomUUID().slice(0, 8)}`;
+    const baseEnv = m41Env();
+    const baseText = "intra base content\n".repeat(4);
+    const baseBytes = enc.encode(baseText);
+    const baseBlobOid = await sha1Hex(concatU8([enc.encode(`blob ${baseBytes.length}\0`), baseBytes]));
+    const derivedText = `${baseText}derived intra line\n`;
+    const derivedBytes = enc.encode(derivedText);
+    const derivedBlobOid = await sha1Hex(concatU8([enc.encode(`blob ${derivedBytes.length}\0`), derivedBytes]));
+    const deltaPayload = buildLiteralDelta(baseBytes.length, derivedBytes);
+    const tree1 = concatU8([enc.encode("100644 file.txt\0"), rawOid(derivedBlobOid)]);
+    const tree1Oid = await sha1Hex(concatU8([enc.encode(`tree ${tree1.length}\0`), tree1]));
+    const commit1Body = enc.encode(`tree ${tree1Oid}\nauthor A <a@b> 10 +0000\ncommitter A <a@b> 10 +0000\n\nintra1\n`);
+    const commit1Oid = await sha1Hex(concatU8([enc.encode(`commit ${commit1Body.length}\0`), commit1Body]));
+    const p1Parts = [
+      enc.encode("PACK"),
+      be32(2),
+      be32(4),
+      objectHeader(3, baseBytes.length),
+      await zlibDeflate(baseBytes),
+      objectHeader(7, deltaPayload.length),
+      rawOid(baseBlobOid),
+      await zlibDeflate(deltaPayload),
+      objectHeader(2, tree1.length),
+      await zlibDeflate(tree1),
+      objectHeader(1, commit1Body.length),
+      await zlibDeflate(commit1Body),
+    ];
+    p1Parts.push(rawOid(await sha1Hex(concatU8(p1Parts))));
+    await pushPack(h, baseEnv, repo, "refs/heads/main", ZERO_OID, commit1Oid, concatU8(p1Parts));
+
+    const p2 = await buildFullCommitPack({
+      fileName: "second.txt",
+      content: "second pack\n",
+      message: "second commit",
+      parentOid: commit1Oid,
+      time: 20,
+    });
+    await pushPack(h, baseEnv, repo, "refs/heads/main", commit1Oid, p2.oid, p2.pack);
+
+    const realStub = env.REPO.getByName(repo);
+    let objectRpcCalls = 0;
+    const spiedStub: Parameters<typeof runQueueCompaction>[0]["stub"] = {
+      beginQueueCompaction: (r, opts) => realStub.beginQueueCompaction(r, opts),
+      readCompactionInputPage: (t, pk, after, lim, reach) =>
+        realStub.readCompactionInputPage(t, pk, after, lim, reach),
+      readCompactionObject: async (t, oid) => {
+        objectRpcCalls++;
+        return realStub.readCompactionObject(t, oid);
+      },
+      readCompactionObjects: async (t, list) => {
+        if (list.length > 0) objectRpcCalls++;
+        return realStub.readCompactionObjects(t, list);
+      },
+      stageCompactionRows: (t, rows) => realStub.stageCompactionRows(t, rows),
+      commitQueueCompaction: (t, out) => realStub.commitQueueCompaction(t, out),
+      abortQueueCompaction: (t) => realStub.abortQueueCompaction(t),
+      recordRepoBundle: (b) => realStub.recordRepoBundle(b),
+    };
+
+    const res = await runQueueCompaction({
+      bucket: env.REPO_PACKS,
+      stub: spiedStub,
+      repo,
+      force: true,
+    });
+    expect(res.tag).toBe("compacted");
+    if (res.tag === "compacted") {
+      expect(res.ofsDeltas).toBe(1);
+      expect(res.reInflated).toBe(0);
+    }
+    expect(objectRpcCalls).toBe(0);
   });
 });

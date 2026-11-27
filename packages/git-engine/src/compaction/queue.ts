@@ -1,13 +1,13 @@
 import { applyDelta, PackWriter } from "../git/pack";
-import type { ObjType } from "../git/objects";
+import { TYPE_NUM, type ObjType } from "../git/objects";
 import { OidSet } from "../git/oidset";
 import {
   binarySearchRawOid,
-  encodePackRefIndexWithOids,
+  CompactRefArena,
   extractObjectRefBytes,
-  isCleanReachablePref,
+  isCleanReachableCompact,
   parsePackRefIndex,
-  type PackRefEntryInput,
+  writePackRefIndexFromCompact,
   type PackRefIndexView,
 } from "../git/pref";
 import { bundleR2Key, idxR2Key, prefR2Key } from "../git/r2keys";
@@ -17,20 +17,24 @@ import type { PackCatalogRow } from "../git/packstore";
 import type { IndexRow } from "../control-plane";
 import { ObjCache } from "../receive/objcache";
 import { Crc32, writeIdx } from "../receive/idx";
-import { loadPackIdxV2, type IdxV2View } from "../receive/idx-reader";
+import { clearIdxV2Cache, loadPackIdxV2, type IdxV2View } from "../receive/idx-reader";
 import { inflateAll } from "../receive/scan";
 import { DEFAULT_BUNDLE_MIN_BYTES, formatGitBundleV2Header } from "../upload/bundle";
 import { SequentialR2PackReader } from "../upload/stream";
 
-/** 16 MiB R2 multipart parts (10,000 parts => 160 GiB max compacted pack; 16 MiB single-slab stays safe in 128 MiB Workers isolates). */
-export const QUEUE_COMPACTION_PART_SIZE = 16 * 1024 * 1024;
-/** Max active packs collapsed per Queue compaction round (collapses a 49-pack repo in 1 round). */
-export const QUEUE_COMPACTION_MAX_PACKS = 64;
-const PREF_CACHE_BYTES = 16 * 1024 * 1024;
+/** 10 MiB R2 multipart parts (~120 parts/GiB, safely below Cloudflare's 1,000 subrequest cap within 128 MiB isolate heap). */
+export const QUEUE_COMPACTION_PART_SIZE = 10 * 1024 * 1024;
+/** Max active packs collapsed per Queue compaction round (keeps each round fast while converging multi-hundred-pack repos smoothly). */
+export const QUEUE_COMPACTION_MAX_PACKS = 32;
+/** 3 min lease TTL for Queue compaction (auto-renewed at half-TTL so dead isolates clear within Queue retry windows). */
+export const QUEUE_COMPACTION_LEASE_TTL_MS = 3 * 60 * 1000;
+const PREF_CACHE_BYTES = 4 * 1024 * 1024;
 const COMPACTION_PAGE_SIZE = 4096;
 const STAGE_BATCH_SIZE = 4096;
 const COMPACTION_OBJECT_BATCH_SIZE = 64;
+const COMPACTION_WINDOW_MAX_ROWS = 512;
 const SINK_SLAB_PROMOTE_BYTES = 1024 * 1024;
+const EMPTY_BYTES = new Uint8Array(0);
 
 export interface CompactionInputPack extends PackCatalogRow {
   r2Key: string;
@@ -318,6 +322,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
 
   const packSink = new AdaptiveR2Sink(bucket, plan.outputPackR2Key, partSize);
   let activeSeqReader: SequentialR2PackReader | null = null;
+  let refArena: CompactRefArena | null = null;
   let committed = false;
 
   try {
@@ -335,11 +340,14 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     entryChunks = [];
 
     let prefCache: ObjCache | null = new ObjCache(PREF_CACHE_BYTES);
-    const oidSet = new OidSet(Math.max(1, plan.expectedObjects));
-    const entryCrcs = new Uint32Array(plan.expectedObjects);
-    const entryOffsets = new Float64Array(plan.expectedObjects);
-    const oidEntry: number[] = new Array<number>(plan.expectedObjects);
-    const prefEntries: PackRefEntryInput[] = [];
+    let oidSet: OidSet | null = new OidSet(Math.max(1, plan.expectedObjects));
+    let entryCrcs: Uint32Array | null = new Uint32Array(plan.expectedObjects);
+    let entryOffsets: Float64Array | null = new Float64Array(plan.expectedObjects);
+    let oidEntry: Uint32Array | null = new Uint32Array(plan.expectedObjects);
+    let prefTypeCodes: Uint8Array | null = new Uint8Array(plan.expectedObjects);
+    let prefRefStarts: Uint32Array | null = new Uint32Array(plan.expectedObjects);
+    let prefRefCounts: Uint32Array | null = new Uint32Array(plan.expectedObjects);
+    refArena = new CompactRefArena();
     const stageBatch: Array<IndexRow & { srcPack: string }> = [];
 
     let emitted = 0;
@@ -389,42 +397,43 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
           }
           if (page.rows.length === 0) break;
 
-          for (let chunkStart = 0; chunkStart < page.rows.length; chunkStart += COMPACTION_OBJECT_BATCH_SIZE) {
-            const chunkRows = page.rows.slice(chunkStart, chunkStart + COMPACTION_OBJECT_BATCH_SIZE);
-            const rawList: Uint8Array[] = new Array<Uint8Array>(chunkRows.length);
-            const resolvedChunk: Array<{ type: ObjType; data: Uint8Array } | null> = new Array(chunkRows.length).fill(null);
+          let cursor = 0;
+          while (cursor < page.rows.length) {
+            const windowStart = cursor;
             const needFetch: string[] = [];
-
-            for (let i = 0; i < chunkRows.length; i++) {
-              const row = chunkRows[i]!;
-              afterOffset = row.offset;
-              const raw = await seqReader.readAt(row.dataOff, row.dataLen);
-              rawList[i] = raw;
-
-              if (row.baseOid === null) {
-                continue;
-              }
-              const baseIdx = oidSet.indexOfHex(row.baseOid);
-              const baseOff = baseIdx >= 0 ? entryOffsets[baseIdx] : undefined;
-              if (baseOff !== undefined) {
-                if (row.type !== "blob" && !inputPref) {
-                  const cachedBase = prefCache!.get(row.baseOid);
-                  if (cachedBase) {
-                    resolvedChunk[i] = { type: row.type, data: applyDelta(cachedBase.data, inflateAll(raw)) };
-                  } else {
-                    needFetch.push(row.oid);
-                  }
+            const plannedInWindow = new Set<string>();
+            const plannedNonBlobInWindow = new Set<string>();
+            while (
+              cursor < page.rows.length &&
+              cursor - windowStart < COMPACTION_WINDOW_MAX_ROWS &&
+              needFetch.length < COMPACTION_OBJECT_BATCH_SIZE
+            ) {
+              const row = page.rows[cursor++]!;
+              if (row.baseOid !== null) {
+                const baseWillExist = oidSet.indexOfHex(row.baseOid) >= 0 || plannedInWindow.has(row.baseOid);
+                if (!baseWillExist) {
+                  needFetch.push(row.oid);
+                } else if (
+                  row.type !== "blob" &&
+                  !inputPref &&
+                  !prefCache!.get(row.baseOid) &&
+                  !plannedNonBlobInWindow.has(row.baseOid)
+                ) {
+                  needFetch.push(row.oid);
                 }
-              } else {
-                needFetch.push(row.oid);
+              }
+              plannedInWindow.add(row.oid);
+              if (row.type !== "blob") {
+                plannedNonBlobInWindow.add(row.oid);
               }
             }
 
             const fetched = await fetchCompactionObjectsBatch(stub, plan.leaseToken, needFetch);
 
-            for (let i = 0; i < chunkRows.length; i++) {
-              const row = chunkRows[i]!;
-              const raw = rawList[i]!;
+            for (let i = windowStart; i < cursor; i++) {
+              const row = page.rows[i]!;
+              afterOffset = row.offset;
+              const raw = await seqReader.readAt(row.dataOff, row.dataLen);
               const entryOffset = pos;
               entryChunks = [];
 
@@ -459,11 +468,20 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
                   if (row.type !== "blob") {
                     refsFromPref = readPrefRefs();
                     if (refsFromPref === null) {
-                      const localResolved = resolvedChunk[i];
-                      if (localResolved) {
-                        nonBlobData = localResolved.data;
+                      const cachedBase = prefCache!.get(row.baseOid);
+                      if (cachedBase) {
+                        nonBlobData = applyDelta(cachedBase.data, inflateAll(raw));
                       } else {
-                        const hit = fetched.get(row.oid);
+                        let hit = fetched.get(row.oid);
+                        if (!hit) {
+                          const single = await stub.readCompactionObject(plan.leaseToken, row.oid);
+                          if (single.tag === "rejected") {
+                            throw new Error(`compaction lease rejected (${single.reason})`);
+                          }
+                          if (single.tag === "ok") {
+                            hit = { type: single.type, data: single.data };
+                          }
+                        }
                         if (!hit) {
                           throw new Error(`compaction: missing object ${row.oid}`);
                         }
@@ -473,7 +491,16 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
                     }
                   }
                 } else {
-                  const hit = fetched.get(row.oid);
+                  let hit = fetched.get(row.oid);
+                  if (!hit) {
+                    const single = await stub.readCompactionObject(plan.leaseToken, row.oid);
+                    if (single.tag === "rejected") {
+                      throw new Error(`compaction lease rejected (${single.reason})`);
+                    }
+                    if (single.tag === "ok") {
+                      hit = { type: single.type, data: single.data };
+                    }
+                  }
                   if (!hit) {
                     throw new Error(`compaction: missing object ${row.oid}`);
                   }
@@ -489,6 +516,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
                   }
                 }
               }
+              fetched.delete(row.oid);
 
               if (emitted >= plan.expectedObjects) {
                 throw new Error(`compaction object overflow: exceeded expected ${plan.expectedObjects}`);
@@ -506,20 +534,21 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
               if (!inserted) {
                 throw new Error(`compaction duplicate oid in merged inputs: ${row.oid}`);
               }
-              entryCrcs[emitted] = crc.get();
+              const crcValue = crc.get();
+              entryCrcs[emitted] = crcValue;
               entryOffsets[emitted] = entryOffset;
               oidEntry[emitted] = emitted;
 
-              prefEntries.push({
-                oid: row.oid,
-                type: emittedType,
-                refs:
-                  refsFromPref !== null
-                    ? refsFromPref
-                    : nonBlobData !== null
-                      ? extractObjectRefBytes(emittedType, nonBlobData)
-                      : new Uint8Array(0),
-              });
+              prefTypeCodes[emitted] = TYPE_NUM[emittedType];
+              const refBytes =
+                refsFromPref !== null
+                  ? refsFromPref
+                  : nonBlobData !== null
+                    ? extractObjectRefBytes(emittedType, nonBlobData)
+                    : EMPTY_BYTES;
+              const allocated = refArena.append(refBytes);
+              prefRefStarts[emitted] = allocated.startSlot;
+              prefRefCounts[emitted] = allocated.count;
 
               stageBatch.push({
                 oid: row.oid,
@@ -530,7 +559,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
                 size: emittedSize,
                 entrySize: emittedEntrySize,
                 baseOid: emittedBaseOid,
-                crc32: entryCrcs[emitted]!,
+                crc32: crcValue,
                 srcPack: p.packKey,
               });
               if (stageBatch.length >= STAGE_BATCH_SIZE) {
@@ -543,11 +572,14 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
           if (!page.hasMore) break;
         }
       } finally {
+        inputPref = null;
+        clearIdxV2Cache();
         await seqReader.close();
         activeSeqReader = null;
       }
     }
     prefCache = null;
+    clearIdxV2Cache();
 
     if (emitted !== plan.expectedObjects) {
       throw new Error(`compaction object count mismatch: emitted ${emitted}, expected ${plan.expectedObjects}`);
@@ -561,6 +593,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     entryChunks = [];
     const outputPackBytes = await packSink.finish();
 
+    let sortedOrder: Uint32Array | null = oidSet.sortedIndices();
     const idxSink = new AdaptiveR2Sink(bucket, plan.outputIdxR2Key, partSize);
     let idxTail = new Uint8Array(0);
     const outputIdxBytes = await writeIdx(
@@ -576,6 +609,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       {
         oids: oidSet,
         oidEntry,
+        sortedOrder,
         entryCrcs,
         entryOffsets,
         packSha1,
@@ -583,23 +617,47 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     );
     await idxSink.finish();
     const idxSha1 = idxTail.length === 20 ? toHex(idxTail) : undefined;
+    // Release per-entry idx tables prior to .pref / .bundle emission.
+    entryCrcs = null;
+    entryOffsets = null;
+    oidEntry = null;
 
-    const { bytes: prefBytes, sortedOids20 } = encodePackRefIndexWithOids({
-      entries: prefEntries,
-      packBytes: outputPackBytes,
-      packSha1,
-      idxSha1,
-    });
     let effectiveCleanReachable = plan.cleanReachable;
     if (!effectiveCleanReachable && plan.allActiveR2 && !plan.hasLoose && plan.tipOids.length > 0 && emitted > 0) {
-      const prefView = parsePackRefIndex(prefBytes);
-      effectiveCleanReachable = isCleanReachablePref(sortedOids20, prefView, plan.tipOids);
+      effectiveCleanReachable = isCleanReachableCompact(
+        oidSet,
+        prefRefStarts,
+        prefRefCounts,
+        refArena,
+        plan.tipOids
+      );
     }
-    // Release per-object ref slices before opening bundleSink.
-    prefEntries.length = 0;
+
     const prefSink = new AdaptiveR2Sink(bucket, plan.outputPrefR2Key, partSize);
-    await prefSink.write(prefBytes);
-    const outputPrefBytes = await prefSink.finish();
+    const outputPrefBytes = await writePackRefIndexFromCompact(
+      (chunk) => prefSink.write(chunk),
+      {
+        oids: oidSet,
+        sortedOrder,
+        typeCodes: prefTypeCodes,
+        refStarts: prefRefStarts,
+        refCounts: prefRefCounts,
+        arena: refArena,
+        packBytes: outputPackBytes,
+        packSha1,
+        idxSha1,
+      }
+    );
+    await prefSink.finish();
+
+    // Release all per-object typed arrays and ref slabs before DO commit and .bundle streaming.
+    refArena.clear();
+    refArena = null;
+    oidSet = null;
+    sortedOrder = null;
+    prefTypeCodes = null;
+    prefRefStarts = null;
+    prefRefCounts = null;
 
     const commitRes = await stub.commitQueueCompaction(plan.leaseToken, {
       packKey: plan.outputPackKey,
@@ -684,6 +742,8 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       ...(bundle ? { bundle } : {}),
     };
   } catch (err) {
+    refArena?.clear();
+    refArena = null;
     if (activeSeqReader) {
       await activeSeqReader.close().catch(() => {});
     }

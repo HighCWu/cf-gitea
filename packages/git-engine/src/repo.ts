@@ -140,6 +140,7 @@ import {
   type CompactionResult,
 } from "./compaction";
 import {
+  QUEUE_COMPACTION_LEASE_TTL_MS,
   QUEUE_COMPACTION_MAX_PACKS,
   type BeginQueueCompactionInput,
   type BeginQueueCompactionResult,
@@ -1746,7 +1747,7 @@ export class RepoCell extends DurableObject<Env> {
     const outputPackR2Key = packR2Key(storageKey, outputPackKey);
     const outputIdxR2Key = idxR2Key(storageKey, outputPackKey);
     const outputPrefR2Key = prefR2Key(storageKey, outputPackKey);
-    const expiresAt = Date.now() + COMPACTION_LEASE_TTL_MS;
+    const expiresAt = Date.now() + QUEUE_COMPACTION_LEASE_TTL_MS;
     const payload: CompactionLeasePayload = {
       v: 1,
       storageKey,
@@ -1784,8 +1785,8 @@ export class RepoCell extends DurableObject<Env> {
     if (!lease || lease.kind !== "compaction") return { valid: false, reason: "compaction lease not found" };
     const now = Date.now();
     if (lease.expiresAt <= now) return { valid: false, reason: "compaction lease expired" };
-    if (lease.expiresAt < now + COMPACTION_LEASE_TTL_MS / 2) {
-      this.store.createLease(leaseToken, "compaction", now + COMPACTION_LEASE_TTL_MS, lease.payload);
+    if (lease.expiresAt < now + QUEUE_COMPACTION_LEASE_TTL_MS / 2) {
+      this.store.createLease(leaseToken, "compaction", now + QUEUE_COMPACTION_LEASE_TTL_MS, lease.payload);
     }
     return { valid: true };
   }

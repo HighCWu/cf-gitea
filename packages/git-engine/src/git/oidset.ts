@@ -111,8 +111,43 @@ export class OidSet {
     return this.indexOf(fromHex(hex), 0);
   }
 
+  /** Insertion-order entry index of raw 20-byte `bytes[off..off+20]`, or -1 if absent. */
+  indexOfBytes(bytes: Uint8Array, off = 0): number {
+    return this.indexOf(bytes, off);
+  }
+
   hasBytes(bytes: Uint8Array, off: number): boolean {
     return this.indexOf(bytes, off) >= 0;
+  }
+
+  /** Raw 20-byte view of the i-th inserted entry (zero allocation). */
+  rawAt(i: number): Uint8Array {
+    return this.data.subarray(i * 20, i * 20 + 20);
+  }
+
+  /** First byte of the i-th inserted entry (for idx v2 fanout). */
+  firstByteAt(i: number): number {
+    return this.data[i * 20]!;
+  }
+
+  /** Lexicographic comparison of raw 20-byte entries `a` and `b`. */
+  compareRaw(a: number, b: number): number {
+    const ba = a * 20;
+    const bb = b * 20;
+    for (let i = 0; i < 20; i++) {
+      const va = this.data[ba + i]!;
+      const vb = this.data[bb + i]!;
+      if (va !== vb) return va < vb ? -1 : 1;
+    }
+    return 0;
+  }
+
+  /** Returns entry indices sorted in ascending raw 20-byte OID order. */
+  sortedIndices(): Uint32Array {
+    const sorted = new Uint32Array(this.count);
+    for (let i = 0; i < this.count; i++) sorted[i] = i;
+    sorted.sort((a, b) => this.compareRaw(a, b));
+    return sorted;
   }
 
   /** Entry index of `bytes`, or -1. */
