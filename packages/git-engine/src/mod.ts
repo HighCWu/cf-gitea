@@ -13,6 +13,20 @@ import { esc, repoUrl, age, layout, htmlResponse, errorPage } from "./ui/html";
 import { CSS } from "./ui/style";
 import { parseUploadRequest, parsePushCommands, parsePushOptions, renderStatus, sidebandFrames, streamingCloneResponse, ATOMIC_PUSH_FAILED, type CommandResult, type PushCommand } from "./git/protocol";
 import {
+  DEFAULT_BUNDLE_MIN_BYTES,
+  DEFAULT_BUNDLE_TOKEN_TTL_SEC,
+  emptyBundleUriResponse,
+  formatGitBundleV2Header,
+  parseBundleMinBytes,
+  parseBundleTokenTtlSec,
+  parseHttpByteRange,
+  renderBundleUriResponse,
+  serveBundleDownload,
+  signBundleToken,
+  verifyBundleToken,
+  type BundleTokenPayload,
+} from "./upload/bundle";
+import {
   streamWorkerWarmFullClone,
   uploadKeepaliveMs,
   UPLOAD_KEEPALIVE_FRAME,
@@ -29,7 +43,8 @@ import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, R2_PART_SIZE, R2_PUSH_PART_SIZE, beginRawMultipart } from "./git/multipart";
 import { overDeclaredLength, tooLargeResponse } from "./repo";
-import { idxR2Key, packName, packR2Key } from "./git/r2keys";
+import { bundleIdOf, bundlePrefix, bundleR2Key, idxR2Key, packName, packR2Key } from "./git/r2keys";
+import type { RepoBundleMeta } from "./git/store";
 import { COMPACTION_ACTIVE_PACK_THRESHOLD } from "./compaction";
 import { runQueueCompaction } from "./compaction/queue";
 import {
@@ -54,6 +69,22 @@ export type { RepoInfo, RepoConfig } from "./registry";
 export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, TreeCommitsResult, BlobResult, LogResult, DiffResult, DiffFileJson, BlameResult, BlamePartJson, GrepResult, ActivityStatsResult, ActivityAuthor, ContributorStatsResult, GraphDataResult, GraphRow, GraphEdge, GraphCommitJson, LfsPointerScanResult } from "./repo";
 export { TREE_COMMITS_MAX_PATHS, MAX_BLAME_BYTES, MAX_LFS_SCAN_FILES, MAX_LFS_CANDIDATES, MAX_LFS_POINTER_BYTES } from "./repo";
 export { MAX_BLAME_LINES } from "./git/blame";
+export {
+  DEFAULT_BUNDLE_MIN_BYTES,
+  DEFAULT_BUNDLE_TOKEN_TTL_SEC,
+  parseBundleMinBytes,
+  parseBundleTokenTtlSec,
+  formatGitBundleV2Header,
+  signBundleToken,
+  verifyBundleToken,
+  renderBundleUriResponse,
+  emptyBundleUriResponse,
+  parseHttpByteRange,
+  serveBundleDownload,
+  type BundleTokenPayload,
+} from "./upload/bundle";
+export { bundleR2Key, bundlePrefix, bundleIdOf } from "./git/r2keys";
+export type { RepoBundleMeta } from "./git/store";
 export type { Person } from "./git/objects";
 // object serializers (SPEC-0001a §4.1): the Worker-side builders construct the
 // canonical bytes that putApiObjects verifies and stores
@@ -796,6 +827,44 @@ async function serveWorkerWarmClone(
     keepaliveMs: uploadKeepaliveMs(env.GIT_UPLOAD_KEEPALIVE_MS),
     signal,
   });
+}
+
+async function serveBundleUriCommand(
+  env: Env,
+  repo: string,
+  origin: string,
+  body: Uint8Array,
+  stub: DurableObjectStub<RepoCell>
+): Promise<Response | null> {
+  const req = parseUploadRequest(body);
+  if (req.command !== "bundle-uri" || req.badArgument) return null;
+  const headers = {
+    "content-type": "application/x-git-upload-pack-result",
+    "cache-control": "no-cache",
+  };
+  if (env.BUNDLE_URI_ENABLED !== "true" || !env.BUNDLE_SIGNING_SECRET || !env.REPO_PACKS) {
+    return new Response(emptyBundleUriResponse() as unknown as BodyInit, { headers });
+  }
+  const info = await stub.getRepoBundleInfo(repo);
+  if (!info.bundle) {
+    return new Response(emptyBundleUriResponse() as unknown as BodyInit, { headers });
+  }
+  const ttlSec = parseBundleTokenTtlSec(env.BUNDLE_TOKEN_TTL_SEC);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const token = await signBundleToken(
+    {
+      r: repo,
+      s: info.storageKey,
+      b: info.bundle.id,
+      e: nowSec + ttlSec,
+    },
+    env.BUNDLE_SIGNING_SECRET
+  );
+  const bundleUrl = `${origin}/${repo}.git/bundle/${token}`;
+  return new Response(
+    renderBundleUriResponse(bundleUrl, Math.floor(info.bundle.createdAt / 1000)) as unknown as BodyInit,
+    { headers }
+  );
 }
 
 function withCors(res: Response, origin: string | undefined): Response {
@@ -2241,12 +2310,14 @@ function classify(sub: string, method: string, url: URL): {
   isProtocol: boolean;
   isApi: boolean;
   isAdmin: boolean;
+  isBundle: boolean;
 } {
   const isReceive =
     sub === "/git-receive-pack" ||
     (sub === "/info/refs" && url.searchParams.get("service") === "git-receive-pack");
   const isProtocol = isReceive || sub === "/git-upload-pack" || sub === "/info/refs";
   const isApi = sub.startsWith("/api/");
+  const isBundle = sub.startsWith("/bundle/") && (method === "GET" || method === "HEAD");
   const isAdmin =
     ((sub === "/config" || sub === "/description") && method === "PUT") ||
     (sub === "/gc" && method === "POST") ||
@@ -2256,7 +2327,7 @@ function classify(sub: string, method: string, url: URL): {
     // POST /gc: the authorize hook decides, with op "admin")
     ((sub === "/compact" || sub === "/pack-gc") && method === "POST") ||
     ((sub === "/" || sub === "") && method === "DELETE");
-  return { op: isReceive ? "write" : isAdmin ? "admin" : "read", isReceive, isProtocol, isApi, isAdmin };
+  return { op: isReceive ? "write" : isAdmin ? "admin" : "read", isReceive, isProtocol, isApi, isAdmin, isBundle };
 }
 
 export function createDurableGit<E extends Env = Env>(options: DurableGitOptions<E> = {}): DurableGitHandler<E> {
@@ -2325,13 +2396,13 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
           : new Response("not found\n", { status: 404 });
       }
       const { repo, sub } = parsed;
-      const { op, isReceive, isProtocol, isApi, isAdmin } = classify(sub, req.method, url);
+      const { op, isReceive, isProtocol, isApi, isAdmin, isBundle } = classify(sub, req.method, url);
 
       const registry = env.REGISTRY.getByName("registry");
 
       // headless: pages 404 before touching the registry or the cell; a CORS
       // preflight (credential-less by spec) is answered before the auth gate
-      if (!ui && !isProtocol && !isApi && !isAdmin) {
+      if (!ui && !isProtocol && !isApi && !isAdmin && !isBundle) {
         return new Response("not found\n", { status: 404 });
       }
       if (options.cors && isApi && req.method === "OPTIONS") {
@@ -2357,8 +2428,23 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       // only pushes and admin ops may touch repos that don't exist yet
       if (!info && !isReceive && !isAdmin) {
         if (isApi) return Response.json({ error: `repository not found: ${repo}` }, { status: 404 });
-        if (isProtocol) return new Response(`repository not found: ${repo}\n`, { status: 404 });
+        if (isProtocol || isBundle) return new Response(`repository not found: ${repo}\n`, { status: 404 });
         return errorPage(siteBase(env), `no such repository: ${repo}`, 404);
+      }
+
+      if (isBundle) {
+        if (env.BUNDLE_URI_ENABLED !== "true" || !env.BUNDLE_SIGNING_SECRET || !env.REPO_PACKS) {
+          return new Response("not found\n", { status: 404 });
+        }
+        const token = sub.slice("/bundle/".length);
+        if (!token || token.includes("/")) {
+          return new Response("forbidden\n", { status: 403 });
+        }
+        const payload = await verifyBundleToken(token, env.BUNDLE_SIGNING_SECRET);
+        if (!payload || payload.r.toLowerCase() !== repo.toLowerCase()) {
+          return new Response("forbidden\n", { status: 403 });
+        }
+        return await serveBundleDownload(req, env.REPO_PACKS, payload.s, payload.b);
       }
 
       // page cache for public repo GET pages (versioned key; skipped on celld)
@@ -2443,12 +2529,16 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
               parsed = new Uint8Array(0);
             }
           }
-          if (env.REPO_PACKS && parsed.length) {
-            const hit =
-              env.UPLOAD_PACK_WORKER_STREAM === "true"
-                ? await serveWorkerWarmClone(env, repo, parsed, stub, internal?.signal ?? req.signal)
-                : await serveCloneFromR2(env, repo, parsed, stub);
-            if (hit) return hit;
+          if (parsed.length) {
+            const bundleRes = await serveBundleUriCommand(env, repo, url.origin, parsed, stub);
+            if (bundleRes) return bundleRes;
+            if (env.REPO_PACKS) {
+              const hit =
+                env.UPLOAD_PACK_WORKER_STREAM === "true"
+                  ? await serveWorkerWarmClone(env, repo, parsed, stub, internal?.signal ?? req.signal)
+                  : await serveCloneFromR2(env, repo, parsed, stub);
+              if (hit) return hit;
+            }
           }
           fwdBody = raw; // miss: forward the original (still-encoded) bytes to the DO
         } else {
@@ -2463,7 +2553,16 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
         } catch {
           // empty or non-JSON body runs threshold-gated compaction
         }
-        return Response.json(await runQueueCompaction({ bucket: env.REPO_PACKS, stub, repo, force }));
+        return Response.json(
+          await runQueueCompaction({
+            bucket: env.REPO_PACKS,
+            stub,
+            repo,
+            force,
+            generateBundle: env.BUNDLE_URI_ENABLED === "true",
+            bundleMinBytes: parseBundleMinBytes(env.BUNDLE_MIN_BYTES),
+          })
+        );
       }
       const fwd = new Request(doUrl.toString(), {
         method: req.method,
@@ -2473,6 +2572,10 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       fwd.headers.set("x-repo", repo);
       fwd.headers.set("x-host", url.host);
       fwd.headers.set("x-proto", url.protocol.replace(":", ""));
+      fwd.headers.set(
+        "x-bundle-uri",
+        env.BUNDLE_URI_ENABLED === "true" && Boolean(env.BUNDLE_SIGNING_SECRET) ? "1" : "0"
+      );
       let res = await stub.fetch(fwd);
       // set before the cache put, so cached copies carry the header too
       if (options.cors && isApi) {

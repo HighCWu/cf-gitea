@@ -314,6 +314,11 @@
     "COMPACTION_QUEUE_ENABLED": "true",
     // SPEC-0024 M4.2: stream push packs directly to final R2 keys (zero copyObject, 64 MiB parts).
     "RECEIVE_DIRECT_PACK_WRITE": "true",
+    // SPEC-0024 M4.3: strict-polarity flag ("true" enables Protocol v2 bundle-uri,
+    // compaction bundle materialization >= BUNDLE_MIN_BYTES, and signed Range serving;
+    // requires wrangler secret BUNDLE_SIGNING_SECRET).
+    "BUNDLE_URI_ENABLED": "false",
+    "BUNDLE_MIN_BYTES": "67108864",
     // LFS store mode (SPEC-0006 §6 as-built, the L14 config wave) — strict
     // polarity: ONLY the exact string "true" constructs the presign store
     // (PresignLfsStore) over the relay store; absent/anything else = relay
@@ -382,7 +387,8 @@
       "/*/*/git-upload-pack",
       "/*/*/git-receive-pack",
       "/*/*/HEAD",
-      "/*/*/info/lfs/*"
+      "/*/*/info/lfs/*",
+      "/*/*/bundle/*"
     ]
   },
 
@@ -470,7 +476,7 @@
   // invalidates every outstanding token at the next decode (the kill
   // switch, the runbook's inbound posture).
   "secrets": {
-    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY", "MAIL_SMTP_PASSWORD", "MAIL_INBOUND_SECRET"]
+    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY", "MAIL_SMTP_PASSWORD", "MAIL_INBOUND_SECRET", "BUNDLE_SIGNING_SECRET"]
   },
   "migrations": [
     {

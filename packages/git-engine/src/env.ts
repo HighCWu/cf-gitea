@@ -94,6 +94,18 @@ export interface Env {
    * to the final R2 pack key (`packs/pack-rx-<leaseToken>.pack`) using 64 MiB
    * multipart parts, eliminating `copyObject` double R2 writes (SPEC-0024 M4.2). */
   RECEIVE_DIRECT_PACK_WRITE?: string;
+  /** Strict-polarity flag ("true" enables) Protocol v2 `bundle-uri` advertisement,
+   * bundle materialization on compaction, and signed Range download serving (SPEC-0024 M4.3). */
+  BUNDLE_URI_ENABLED?: string;
+  /** HMAC-SHA256 signing key for time-bounded bundle download tokens (SPEC-0024 M4.3).
+   * Rotating invalidates outstanding tokens immediately. */
+  BUNDLE_SIGNING_SECRET?: string;
+  /** Minimum compacted pack size in bytes before materializing a `.bundle`
+   * (SPEC-0024 M4.3; default `67108864` = 64 MiB). */
+  BUNDLE_MIN_BYTES?: string;
+  /** Signed bundle download token lifetime in seconds (SPEC-0024 M4.3; default `900`,
+   * clamped `[60, 3600]`). */
+  BUNDLE_TOKEN_TTL_SEC?: string;
   /** Optional Cloudflare Queue binding used by `receivePack` to enqueue
    * `{ kind: "pack-compact", repo }` when `COMPACTION_QUEUE_ENABLED === "true"`. */
   REPO_TASKS?: { send(message: unknown): Promise<unknown> };

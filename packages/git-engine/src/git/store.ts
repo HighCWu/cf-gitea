@@ -37,6 +37,16 @@ export interface GitStoreOptions {
   allowUnknownSchemaReset?: boolean;
 }
 
+/** Metadata recorded in DO `meta.latest_bundle` for the current base `.bundle` (SPEC-0024 M4.3). */
+export interface RepoBundleMeta {
+  id: string;
+  r2Key: string;
+  refsVersion: string;
+  packKey: string;
+  bytes: number;
+  createdAt: number;
+}
+
 /** A ref row (SPEC-0001 §4 `refs`). `peeled` caches a tag tip's commit target
  * (null for branches and lightweight tags); `updatedAt` feeds lease/sweep
  * diagnostics. HEAD is NOT a row — it lives in `meta.head`. */
@@ -651,6 +661,50 @@ export class GitStore {
       key,
       value
     );
+  }
+
+  /** Read the active base bundle metadata (`meta.latest_bundle`), or null when absent/invalid. */
+  getLatestBundle(): RepoBundleMeta | null {
+    const raw = this.getMeta("latest_bundle");
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<RepoBundleMeta> | null;
+      if (
+        !parsed ||
+        typeof parsed.id !== "string" ||
+        !parsed.id ||
+        typeof parsed.r2Key !== "string" ||
+        !parsed.r2Key ||
+        typeof parsed.refsVersion !== "string" ||
+        typeof parsed.packKey !== "string" ||
+        typeof parsed.bytes !== "number" ||
+        !Number.isFinite(parsed.bytes) ||
+        typeof parsed.createdAt !== "number" ||
+        !Number.isFinite(parsed.createdAt)
+      ) {
+        return null;
+      }
+      return {
+        id: parsed.id,
+        r2Key: parsed.r2Key,
+        refsVersion: parsed.refsVersion,
+        packKey: parsed.packKey,
+        bytes: parsed.bytes,
+        createdAt: parsed.createdAt,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Record the current active base bundle metadata (`meta.latest_bundle`). */
+  setLatestBundle(meta: RepoBundleMeta): void {
+    this.setMeta("latest_bundle", JSON.stringify(meta));
+  }
+
+  /** Clear `meta.latest_bundle` (e.g., on ref deletion or force-push). */
+  clearLatestBundle(): void {
+    this.setMeta("latest_bundle", "");
   }
 
   /**

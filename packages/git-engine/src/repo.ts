@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { td, isOid } from "./git/util";
-import { GitStore } from "./git/store";
+import { GitStore, type RepoBundleMeta } from "./git/store";
 import { OidSet } from "./git/oidset";
 import { gunzipLimited } from "./git/zlib";
 import { cloneCacheKey, idxR2Key, packR2Key, prefR2Key, repoPrefix } from "./git/r2keys";
@@ -762,7 +762,13 @@ export class RepoCell extends DurableObject<Env> {
           return new Response("smart HTTP only\n", { status: 400 });
         }
         const v2 = req.headers.get("git-protocol")?.split(":").some((value) => value.trim() === "version=2");
-        return new Response(advertisement(this.store, service as Service, v2) as unknown as BodyInit, {
+        const workerBundleUri = req.headers.get("x-bundle-uri");
+        const bundleUriAllowed =
+          workerBundleUri !== null
+            ? workerBundleUri === "1"
+            : this.env.BUNDLE_URI_ENABLED === "true" && Boolean(this.env.BUNDLE_SIGNING_SECRET);
+        const bundleUri = bundleUriAllowed && this.store.getLatestBundle() !== null;
+        return new Response(advertisement(this.store, service as Service, v2, { bundleUri }) as unknown as BodyInit, {
           headers: {
             "content-type": `application/x-${service}-advertisement`,
             "cache-control": "no-cache",
@@ -1668,7 +1674,19 @@ export class RepoCell extends DurableObject<Env> {
         this.store.setMeta("compaction_wanted_at", "");
       }
       committed = true;
-      result = { tag: "committed", activePacksRemaining: remaining };
+      const headOid = this.store.resolveHead();
+      const refs: Array<{ name: string; oid: string }> = [];
+      if (headOid) refs.push({ name: "HEAD", oid: headOid });
+      for (const r of this.store.refs()) refs.push({ name: r.name, oid: r.oid });
+      const storageKey = this.store.getMeta("storage_key") ?? this.store.getMeta("repo") ?? "";
+      const refsVersion = this.store.reachableVersion();
+      result = {
+        tag: "committed",
+        activePacksRemaining: remaining,
+        storageKey,
+        refsVersion,
+        refs,
+      };
     });
     if (committed) {
       try {
@@ -1700,6 +1718,25 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
     this.store.deleteLease(leaseToken);
+  }
+
+  /** Record active base bundle metadata iff the compacted pack is still ACTIVE (SPEC-0024 M4.3). */
+  async recordRepoBundle(bundle: RepoBundleMeta): Promise<{ tag: "ok" | "stale" }> {
+    this.rpcBind();
+    return this.store.tx(() => {
+      if (this.store.packs.catalogStateOf(bundle.packKey) !== "active") {
+        return { tag: "stale" as const };
+      }
+      this.store.setLatestBundle(bundle);
+      return { tag: "ok" as const };
+    });
+  }
+
+  /** Return storage key and active base bundle metadata for Worker `command=bundle-uri` signing. */
+  async getRepoBundleInfo(repo: string): Promise<{ storageKey: string; bundle: RepoBundleMeta | null }> {
+    this.rpcBind();
+    const storageKey = this.store.getMeta("storage_key") ?? this.store.getMeta("repo") ?? repo;
+    return { storageKey, bundle: this.store.getLatestBundle() };
   }
 
   /**

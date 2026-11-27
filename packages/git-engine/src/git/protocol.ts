@@ -57,7 +57,12 @@ export interface PackCache {
 }
 
 /** GET /info/refs?service=... — smart ref advertisement. */
-export function advertisement(store: GitStore, service: Service, v2 = false): Uint8Array {
+export function advertisement(
+  store: GitStore,
+  service: Service,
+  v2 = false,
+  opts?: { bundleUri?: boolean }
+): Uint8Array {
   if (v2 && service === "git-upload-pack") {
     // feature values on the capability lines, byte-shaped as stock git's
     // client parses them (observed on git 2.43.0 upload-pack: `ls-refs=unborn`,
@@ -66,7 +71,10 @@ export function advertisement(store: GitStore, service: Service, v2 = false): Ui
     // client send the `unborn` argument for an empty repo's HEAD; `filter`
     // advertises the object filters (blob:none / blob:limit) the fetch
     // command implements below.
-    return concat([pkt("version 2\n"), pkt(`${AGENT}\n`), pkt("ls-refs=unborn\n"), pkt("fetch=shallow filter\n"), FLUSH]);
+    const lines: Uint8Array[] = [pkt("version 2\n"), pkt(`${AGENT}\n`), pkt("ls-refs=unborn\n"), pkt("fetch=shallow filter\n")];
+    if (opts?.bundleUri) lines.push(pkt("bundle-uri\n"));
+    lines.push(FLUSH);
+    return concat(lines);
   }
   const caps =
     service === "git-upload-pack"
@@ -340,7 +348,7 @@ function parseBlobFilter(spec: string): BlobFilter {
 }
 
 interface UploadRequest {
-  command: "fetch" | "ls-refs" | null;
+  command: "fetch" | "ls-refs" | "bundle-uri" | null;
   wants: string[];
   haves: string[];
   done: boolean;
@@ -395,6 +403,7 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
       // v2 command header — never a fetch argument
       if (line === "command=fetch") req.command = "fetch";
       else if (line === "command=ls-refs") req.command = "ls-refs";
+      else if (line === "command=bundle-uri") req.command = "bundle-uri";
       continue;
     }
     if (!argsPhase && /^[a-z][a-z0-9-]*=/.test(line)) {
@@ -446,7 +455,7 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
  * unborn). Everything else unrecognized changes the negotiated result and is
  * rejected by the caller.
  */
-function knownIgnorable(command: "fetch" | "ls-refs" | null, line: string): boolean {
+function knownIgnorable(command: "fetch" | "ls-refs" | "bundle-uri" | null, line: string): boolean {
   const token = line.split(" ")[0];
   if (command === "ls-refs") {
     // ref-prefix carries a value: "ref-prefix <prefix>"
@@ -971,6 +980,10 @@ export async function uploadPack(
     } finally {
       releasePlanLease(store, lease);
     }
+  }
+  if (req.command === "bundle-uri") {
+    release();
+    return new Response(FLUSH as unknown as BodyInit, { headers });
   }
   const v2 = req.command === "fetch";
   if (!req.wants.length || req.wants.some((w) => !isOid(w))) {

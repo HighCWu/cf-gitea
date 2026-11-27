@@ -266,3 +266,34 @@ export const SAFE_GIT_PROTOCOL_HEADER = /^[0-9a-zA-Z]+=[0-9a-zA-Z]+(:[0-9a-zA-Z]
 export function isGzipEncoded(req: Request): boolean {
   return (req.headers.get("content-encoding") ?? "").trim().toLowerCase() === "gzip";
 }
+
+/** Signed bundle download route (`GET|HEAD /:owner/:repo[.git]/bundle/<token>`, SPEC-0024 M4.3). */
+export interface BundleRoute {
+  owner: string;
+  repo: string;
+  token: string;
+}
+
+/** Parse `GET|HEAD /:owner/:repo[.git]/bundle/<token>`, returning `null` for all other shapes. */
+export function parseBundleRoute(pathname: string, method: string): BundleRoute | null {
+  if (method !== "GET" && method !== "HEAD") return null;
+  const segments = pathname.split("/");
+  if (segments.length !== 5) return null;
+  const [, rawOwner, rawName, lit, rawToken] = segments;
+  if (!rawOwner || !rawName || lit !== "bundle" || !rawToken) return null;
+
+  let owner: string;
+  let name: string;
+  let token: string;
+  try {
+    owner = decodeURIComponent(rawOwner);
+    name = decodeURIComponent(rawName);
+    token = decodeURIComponent(rawToken);
+  } catch {
+    return null;
+  }
+  if (!token || token.includes("/") || ENGINE_RESERVED.has(owner)) return null;
+  const repo = name.endsWith(".git") ? name.slice(0, -4) : name;
+  if (!REPO_NAME.test(owner) || !REPO_NAME.test(name) || !REPO_NAME.test(repo)) return null;
+  return { owner, repo, token };
+}

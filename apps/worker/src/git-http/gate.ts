@@ -75,14 +75,15 @@
 
 import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type {
-  ClassifiedPushCommand,
-  DurableGitHandler,
-  EngineCallOptions,
-  PushValidator,
-  PushVerdict,
-  PusherIdentity,
-  ValidatePushContext,
+import {
+  verifyBundleToken,
+  type ClassifiedPushCommand,
+  type DurableGitHandler,
+  type EngineCallOptions,
+  type PushValidator,
+  type PushVerdict,
+  type PusherIdentity,
+  type ValidatePushContext,
 } from "@cf-gitea/git-engine";
 
 import {
@@ -98,10 +99,12 @@ import {
   SAFE_GIT_PROTOCOL_HEADER,
   infoRefsOp,
   isGzipEncoded,
+  parseBundleRoute,
   parseEngineRoute,
   parseGitHttpRoute,
   rpcRequestContentType,
   splitWikiRepoName,
+  type BundleRoute,
   type EngineRoute,
   type GitHttpOp,
   type GitHttpRoute,
@@ -209,6 +212,8 @@ export async function gitHttpGate(
   if (route === null) {
     const lfsRoute = parseLfsRoute(url.pathname, req.method);
     if (lfsRoute !== null) return handleLfsGateBranch(req, env, ctx, engine, lfsRoute);
+    const bundleRoute = parseBundleRoute(url.pathname, req.method);
+    if (bundleRoute !== null) return handleBundleGateBranch(req, url, env, ctx, engine, bundleRoute);
     // §2.1 gate-scope widening: repository-scoped ENGINE JSON/admin paths for
     // D1-resolved repos run the ACL matrix here (defense-in-depth — see the
     // module header); D1-missing repos keep the verbatim passthrough.
@@ -352,6 +357,51 @@ export async function gitHttpGate(
   }
   // Reads (upload-pack): the plain §2.1 item 5 forward.
   return forwardToEngine(req, url, env, ctx, engine);
+}
+
+/**
+ * Signed Git bundle download gate (SPEC-0024 M4.3): verifies the time-bounded
+ * HMAC-SHA256 token minted during `command=bundle-uri`, validates repo/owner
+ * state + immutable D1 `storageKey` binding, and delegates Range-capable R2
+ * streaming to the engine.
+ */
+async function handleBundleGateBranch(
+  req: Request,
+  url: URL,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  bundleRoute: BundleRoute,
+): Promise<Response> {
+  if ((env as { BUNDLE_URI_ENABLED?: string }).BUNDLE_URI_ENABLED !== "true" || !env.BUNDLE_SIGNING_SECRET) {
+    return new Response("Not Found\n", { status: 404 });
+  }
+  const payload = await verifyBundleToken(bundleRoute.token, env.BUNDLE_SIGNING_SECRET);
+  const ownerLower = bundleRoute.owner.toLowerCase();
+  const repoLower = bundleRoute.repo.toLowerCase();
+  const expectedRepo = `${ownerLower}/${repoLower}`;
+  if (!payload || payload.r.toLowerCase() !== expectedRepo) {
+    return new Response("Forbidden\n", { status: 403 });
+  }
+
+  const resolved = await resolveRepository(env.DB, ownerLower, repoLower);
+  if (resolved !== null) {
+    if (resolved.owner !== null && resolved.owner.status === "prohibited") {
+      return ownerUnavailable();
+    }
+    if (payload.s !== resolved.repo.storageKey && payload.s.toLowerCase() !== expectedRepo) {
+      return new Response("Forbidden\n", { status: 403 });
+    }
+    const forwarded = await prepareEngineRequest(req, url, resolved.repo.storageKey);
+    gateCleared.add(forwarded);
+    return engine.fetch(forwarded, env, ctx);
+  }
+
+  if ((await lookupRedirect(env.DB, ownerLower, repoLower)) !== null) {
+    return repositoryNotFound();
+  }
+  gateCleared.add(req);
+  return engine.fetch(req, env, ctx);
 }
 
 /**

@@ -79,7 +79,7 @@
  * at which point the stamp is consumed. The manual entry point is
  * `RepoCell.gcNow` (tests/benches/admin), mirroring `compactNow`.
  */
-import { cloneCachePrefix, cloneCacheVersionOf, idxR2Key, packR2Key, prefR2Key } from "./git/r2keys";
+import { bundleIdOf, bundlePrefix, cloneCachePrefix, cloneCacheVersionOf, idxR2Key, packR2Key, prefR2Key } from "./git/r2keys";
 import type { GitStore } from "./git/store";
 import { hasLiveReadLeaseFor } from "./read-leases";
 
@@ -122,6 +122,8 @@ export interface GcCollected {
   deleted: string[];
   /** stale clone-cache entries removed this pass */
   cacheEntriesDeleted: string[];
+  /** stale or superseded bundle objects removed this pass */
+  bundlesDeleted: string[];
   /** RETIRED (or RECLAIMABLE, defensively) rows a live read lease still
    * protects — the §6.6 GC isolation gate held; retried next pass */
   blockedByLeases: string[];
@@ -261,6 +263,30 @@ export async function runGcPass(host: GcHost): Promise<GcPassResult> {
     }
   }
 
+  // --- §M4.3 stale/superseded bundle sweep --------------------------------
+  const activeBundleKey = store.getLatestBundle()?.r2Key ?? null;
+  const bundlesDeleted: string[] = [];
+  let bundleKeys: string[] = [];
+  try {
+    bundleKeys = await host.listPackObjects(bundlePrefix(storageKey));
+  } catch (err) {
+    console.log(
+      `[gc ${storageKey}] bundle list failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  for (const key of bundleKeys) {
+    if (bundleIdOf(key) === null) continue;
+    if (key === activeBundleKey) continue;
+    try {
+      await host.deletePackObjects([key]);
+      bundlesDeleted.push(key);
+    } catch (err) {
+      console.log(
+        `[gc ${storageKey}] bundle delete for ${key} failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   // --- convergence probe (by catalog state, never by assumption) ------------
   const pending =
     store.packs.catalogRowsInState("retired").length > 0 ||
@@ -272,6 +298,7 @@ export async function runGcPass(host: GcHost): Promise<GcPassResult> {
     flippedToReclaimable,
     deleted,
     cacheEntriesDeleted,
+    bundlesDeleted,
     blockedByLeases,
     premiseUnsafe,
     awaitingDeleteAck,

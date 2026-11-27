@@ -2,12 +2,15 @@ import { applyDelta, PackWriter } from "../git/pack";
 import type { ObjType } from "../git/objects";
 import { OidSet } from "../git/oidset";
 import { encodePackRefIndex, extractObjectRefBytes, type PackRefEntryInput } from "../git/pref";
+import { bundleR2Key } from "../git/r2keys";
+import type { RepoBundleMeta } from "../git/store";
 import { concat, Sha1, toHex } from "../git/util";
 import type { PackCatalogRow } from "../git/packstore";
 import type { IndexRow } from "../control-plane";
 import { ObjCache } from "../receive/objcache";
 import { Crc32, writeIdx } from "../receive/idx";
 import { inflateAll } from "../receive/scan";
+import { DEFAULT_BUNDLE_MIN_BYTES, formatGitBundleV2Header } from "../upload/bundle";
 import { SequentialR2PackReader } from "../upload/stream";
 
 /** 64 MiB R2 multipart parts (10,000 parts => ~640 GiB max compacted pack; packs below this use 1 single `put`). */
@@ -70,7 +73,13 @@ export interface CommitQueueCompactionInput {
 }
 
 export type CommitQueueCompactionResult =
-  | { tag: "committed"; activePacksRemaining: number }
+  | {
+      tag: "committed";
+      activePacksRemaining: number;
+      storageKey: string;
+      refsVersion: string;
+      refs: Array<{ name: string; oid: string }>;
+    }
   | { tag: "lease_lost"; reason: string };
 
 export interface QueueCompactionStub {
@@ -86,6 +95,7 @@ export interface QueueCompactionStub {
   stageCompactionRows(leaseToken: string, rows: Array<IndexRow & { srcPack: string }>): Promise<StageCompactionRowsResult>;
   commitQueueCompaction(leaseToken: string, output: CommitQueueCompactionInput): Promise<CommitQueueCompactionResult>;
   abortQueueCompaction(leaseToken: string): Promise<void>;
+  recordRepoBundle(bundle: RepoBundleMeta): Promise<{ tag: "ok" | "stale" }>;
 }
 
 export type QueueCompactionResult =
@@ -102,6 +112,7 @@ export type QueueCompactionResult =
       cleanReachable: boolean;
       activePacksRemaining: number;
       moreWork: boolean;
+      bundle?: { id: string; r2Key: string; bytes: number };
     }
   | { tag: "deferred"; reason: "receive_lease_live" | "compaction_in_flight" | "lease_lost" }
   | { tag: "skipped"; reason: string; activePacks: number };
@@ -113,6 +124,8 @@ export interface RunQueueCompactionOptions {
   force?: boolean;
   maxPacks?: number;
   partSize?: number;
+  generateBundle?: boolean;
+  bundleMinBytes?: number;
 }
 
 /**
@@ -444,6 +457,58 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
     }
     committed = true;
 
+    let bundle: { id: string; r2Key: string; bytes: number } | undefined;
+    const minBundleBytes = opts.bundleMinBytes ?? DEFAULT_BUNDLE_MIN_BYTES;
+    if (
+      opts.generateBundle &&
+      plan.cleanReachable &&
+      commitRes.activePacksRemaining === 1 &&
+      outputPackBytes >= minBundleBytes &&
+      commitRes.refs.length > 0
+    ) {
+      const bundleId = `${commitRes.refsVersion}-${plan.outputPackKey}`;
+      const bKey = bundleR2Key(commitRes.storageKey, bundleId);
+      const bundleSink = new AdaptiveR2Sink(bucket, bKey, partSize);
+      try {
+        const headerBytes = formatGitBundleV2Header(commitRes.refs);
+        await bundleSink.write(headerBytes);
+        const packObj = await bucket.get(plan.outputPackR2Key);
+        if (!packObj?.body) {
+          throw new Error(`bundle: missing compacted pack ${plan.outputPackR2Key}`);
+        }
+        const reader = packObj.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.length > 0) await bundleSink.write(value);
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+        const bundleBytes = await bundleSink.finish();
+        const rec = await stub.recordRepoBundle({
+          id: bundleId,
+          r2Key: bKey,
+          refsVersion: commitRes.refsVersion,
+          packKey: plan.outputPackKey,
+          bytes: bundleBytes,
+          createdAt: Date.now(),
+        });
+        if (rec.tag === "ok") {
+          bundle = { id: bundleId, r2Key: bKey, bytes: bundleBytes };
+        } else {
+          await bucket.delete(bKey).catch(() => {});
+        }
+      } catch (err) {
+        await bundleSink.abort().catch(() => {});
+        await bucket.delete(bKey).catch(() => {});
+        console.log(
+          `[compaction ${repo}] bundle materialization failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+
     return {
       tag: "compacted",
       outputPackKey: plan.outputPackKey,
@@ -457,6 +522,7 @@ export async function runQueueCompaction(opts: RunQueueCompactionOptions): Promi
       cleanReachable: plan.cleanReachable,
       activePacksRemaining: commitRes.activePacksRemaining,
       moreWork: commitRes.activePacksRemaining > 8,
+      ...(bundle ? { bundle } : {}),
     };
   } catch (err) {
     if (activeSeqReader) {

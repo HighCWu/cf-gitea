@@ -1,4 +1,4 @@
-import { runQueueCompaction, type QueueCompactionResult } from "@cf-gitea/git-engine";
+import { parseBundleMinBytes, runQueueCompaction, type QueueCompactionResult } from "@cf-gitea/git-engine";
 
 /** REPO_TASKS message requesting Worker-side streaming pack compaction (SPEC-0024 M4.1). */
 export interface PackCompactMessage {
@@ -24,6 +24,8 @@ export async function enqueuePackCompact(
 export type PackCompactEnv = Pick<Env, "REPO" | "REPO_PACKS"> & {
   REPO_TASKS?: Pick<Queue, "send">;
   COMPACTION_QUEUE_ENABLED?: string;
+  BUNDLE_URI_ENABLED?: string;
+  BUNDLE_MIN_BYTES?: string;
 };
 
 export interface PackCompactOutcome {
@@ -51,6 +53,8 @@ export async function handlePackCompactTask(
     stub,
     repo: msg.repo,
     force: msg.force === true,
+    generateBundle: env.BUNDLE_URI_ENABLED === "true",
+    bundleMinBytes: parseBundleMinBytes(env.BUNDLE_MIN_BYTES),
   });
   if (result.tag === "deferred") {
     return { retry: true, delaySeconds: 30, result };

@@ -12,6 +12,7 @@
  *   repos/<storage_key>/packs/<packName>.idx               idx v2 sidecar
  *   repos/<storage_key>/staging/pack-rx-<leaseToken>.pack  in-flight receive
  *   repos/<storage_key>/clone-cache/<refsVersionHash>.pack whole-clone cache
+ *   repos/<storage_key>/bundles/<bundleId>.bundle          signed v2 git bundle
  *
  * `<storage_key>` is the immutable D1-minted key (r_<id>) so renames never
  * touch storage. Until SPEC-0003 supplies it, the persisted repo name doubles
@@ -88,5 +89,21 @@ export function cloneCachePrefix(storageKey: string): string {
  */
 export function cloneCacheVersionOf(key: string): string | null {
   const m = /^repos\/[^/]+\/clone-cache\/([0-9a-f]{40})\.pack$/.exec(key);
+  return m ? m[1] : null;
+}
+
+/** `repos/<storage_key>/bundles/<bundleId>.bundle` — signed v2 git bundle (SPEC-0024 M4.3). */
+export function bundleR2Key(storageKey: string, bundleId: string): string {
+  return `repos/${storageKey}/bundles/${bundleId}.bundle`;
+}
+
+/** `repos/<storage_key>/bundles/` — listing prefix for bundle GC cleanup (SPEC-0024 M4.3). */
+export function bundlePrefix(storageKey: string): string {
+  return `repos/${storageKey}/bundles/`;
+}
+
+/** Extract `<bundleId>` from a canonical bundle R2 key, or null for any other shape. */
+export function bundleIdOf(key: string): string | null {
+  const m = /^repos\/(?:[^/]+\/)?[^/]+\/bundles\/([A-Za-z0-9._-]+)\.bundle$/.exec(key);
   return m ? m[1] : null;
 }
