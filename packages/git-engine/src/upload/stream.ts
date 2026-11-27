@@ -18,7 +18,7 @@ export const DEFAULT_UPLOAD_KEEPALIVE_MS = 20_000;
 export const WORKER_UPLOAD_PAGE_SIZE = 4096;
 export const WORKER_UPLOAD_RENEW_BYTES = 32 * 1024 * 1024;
 export const WORKER_PASSTHROUGH_SEGMENT_BYTES = 32 * 1024 * 1024;
-export const WORKER_PASSTHROUGH_READ_TIMEOUT_MS = 30_000;
+export const WORKER_PASSTHROUGH_READ_TIMEOUT_MS = 20_000;
 export const DEFAULT_WORKER_COLD_CLONE_MIN_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_WORKER_COLD_CLONE_MIN_PACKS = 8;
 
@@ -238,6 +238,7 @@ export class SequentialR2PackReader {
   private pos = 0;
   private closed = false;
   private bytesSinceLease = 0;
+  private lastLeaseCheckAt = Date.now();
 
   constructor(
     body: ReadableStream<Uint8Array>,
@@ -257,8 +258,13 @@ export class SequentialR2PackReader {
       }
       if (!value || value.length === 0) continue;
       this.bytesSinceLease += value.length;
-      if (this.onBytesThreshold && this.bytesSinceLease >= this.renewThresholdBytes) {
+      const now = Date.now();
+      if (
+        this.onBytesThreshold &&
+        (this.bytesSinceLease >= this.renewThresholdBytes || now - this.lastLeaseCheckAt >= READ_RENEW_MARGIN_MS)
+      ) {
         this.bytesSinceLease = 0;
+        this.lastLeaseCheckAt = now;
         await this.onBytesThreshold();
       }
       this.cur = value;
@@ -388,25 +394,43 @@ export class ResumableR2PackStream {
     }
   }
 
+  private async getSegmentObject(range?: { offset: number; length: number }): Promise<R2ObjectBody> {
+    for (;;) {
+      try {
+        const obj = range ? await this.bucket.get(this.r2Key, { range }) : await this.bucket.get(this.r2Key);
+        if (!obj) {
+          throw new Error(
+            range
+              ? `missing passthrough R2 pack ${this.r2Key} at offset ${range.offset}`
+              : `missing passthrough R2 pack ${this.r2Key}`
+          );
+        }
+        return obj;
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith(`missing passthrough R2 pack ${this.r2Key}`)) {
+          throw err;
+        }
+        if (this.closed || this.segmentRetries >= this.maxRetriesPerSegment) {
+          throw err;
+        }
+        this.segmentRetries++;
+      }
+    }
+  }
+
   private async openNextReader(): Promise<ReadableStreamDefaultReader<Uint8Array>> {
     const isFirst = this.offset === 0;
     await this.authorizeSegment(isFirst);
     if (this.totalBytes <= 0 || (isFirst && this.totalBytes <= this.segmentBytes)) {
       this.segmentEnd = this.totalBytes > 0 ? this.totalBytes : Number.MAX_SAFE_INTEGER;
-      const obj = await this.bucket.get(this.r2Key);
-      if (!obj) {
-        throw new Error(`missing passthrough R2 pack ${this.r2Key}`);
-      }
+      const obj = await this.getSegmentObject();
       return obj.body.getReader();
     }
     if (this.segmentEnd <= this.offset) {
       this.segmentEnd = Math.min(this.totalBytes, this.offset + this.segmentBytes);
     }
     const len = this.segmentEnd - this.offset;
-    const obj = await this.bucket.get(this.r2Key, { range: { offset: this.offset, length: len } });
-    if (!obj) {
-      throw new Error(`missing passthrough R2 pack ${this.r2Key} at offset ${this.offset}`);
-    }
+    const obj = await this.getSegmentObject({ offset: this.offset, length: len });
     return obj.body.getReader();
   }
 
@@ -594,6 +618,7 @@ export function streamWorkerWarmFullClone(opts: StreamWorkerWarmCloneOptions): R
         inPull = true;
         try {
           checkAborted();
+          await ensureLeaseValid(plan.passthroughPackKey);
           const value = await passthroughStream.nextChunk();
           checkAborted();
           if (value === null) {
@@ -616,6 +641,10 @@ export function streamWorkerWarmFullClone(opts: StreamWorkerWarmCloneOptions): R
             enqueue(ctrl, value);
           }
         } catch (err) {
+          console.error(
+            "[upload-stream] worker-passthrough error:",
+            err instanceof Error ? err.message : String(err)
+          );
           stopTimer();
           await activeReader?.close();
           await releaseLeaseBestEffort();
@@ -818,6 +847,7 @@ export function streamWorkerWarmFullClone(opts: StreamWorkerWarmCloneOptions): R
           ctrl.close();
         }
       } catch (err) {
+        console.error("[upload-stream] worker-stream error:", err instanceof Error ? err.message : String(err));
         stopTimer();
         await activeReader?.close();
         await releaseLeaseBestEffort();
@@ -1216,6 +1246,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
         }
         if (passthroughStream) {
           const single = plan.packs[0]!;
+          await ensureLeaseValid(single.packKey);
           const value = await passthroughStream.nextChunk();
           checkAborted();
           if (value === null) {
@@ -1270,6 +1301,7 @@ export function streamWorkerColdFullClone(opts: StreamWorkerColdCloneOptions): R
           ctrl.close();
         }
       } catch (err) {
+        console.error("[upload-stream] worker-cold-stream error:", err instanceof Error ? err.message : String(err));
         stopTimer();
         await activeReader?.close();
         await releaseLeaseBestEffort();

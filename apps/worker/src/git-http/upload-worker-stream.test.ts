@@ -2,7 +2,9 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   createDurableGit,
+  READ_RENEW_MARGIN_MS,
   ResumableR2PackStream,
+  streamWorkerWarmFullClone,
   UPLOAD_KEEPALIVE_FRAME,
   type Env,
   type RepoCell,
@@ -795,5 +797,125 @@ describe("SPEC-0024 M4.0 Worker streaming upload-pack", () => {
       { segmentBytes: 40, readTimeoutMs: 25, maxRetriesPerSegment: 1 },
     );
     await expect(failStream.nextChunk()).rejects.toThrow(/stalled/);
+  });
+
+  it("renews read leases inline mid-segment on slow passthrough pulls and retries transient R2 get failures (M4.12)", async () => {
+    const chunkA = new Uint8Array(32).fill(0x50);
+    const chunkB = new Uint8Array(32).fill(0x41);
+    const fullPack = concatU8([chunkA, chunkB]);
+
+    let renewCount = 0;
+    let releaseCount = 0;
+    const singleGetBucket = {
+      get: () =>
+        Promise.resolve({
+          body: new ReadableStream<Uint8Array>({
+            start(ctrl) {
+              ctrl.enqueue(chunkA);
+              ctrl.enqueue(chunkB);
+              ctrl.close();
+            },
+          }),
+        } as unknown as R2ObjectBody),
+    } as unknown as R2Bucket;
+
+    const res = streamWorkerWarmFullClone({
+      bucket: singleGetBucket,
+      stub: {
+        renewAndAuthorizeRead: () => {
+          renewCount++;
+          // Return an expiry inside READ_RENEW_MARGIN_MS so the next mid-segment pull renews again.
+          return Promise.resolve({ tag: "authorized" as const, expiresAt: Date.now() + 1_000 });
+        },
+        releaseReadLease: () => {
+          releaseCount++;
+          return Promise.resolve({ tag: "released" as const });
+        },
+        readWarmClonePage: () => Promise.resolve({ tag: "ok" as const, rows: [], hasMore: false }),
+        readWarmLoosePage: () => Promise.resolve({ tag: "ok" as const, rows: [], hasMore: false }),
+        readUploadObject: () => Promise.resolve({ tag: "missing" as const }),
+      },
+      plan: {
+        tag: "leased",
+        planId: "plan-m412-slow",
+        expiresAt: Date.now() + READ_RENEW_MARGIN_MS - 1_000,
+        total: 2,
+        packs: [
+          {
+            packKey: "pack-slow",
+            r2Key: "repos/r/packs/pack-slow.pack",
+            location: "r2",
+            packBytes: fullPack.length,
+            objectCount: 2,
+            reachableCount: 2,
+            indexedCount: 2,
+          },
+        ],
+        hasLoose: false,
+        passthroughPackKey: "pack-slow",
+        passthroughR2Key: "repos/r/packs/pack-slow.pack",
+      },
+      v2: true,
+      sideband: false,
+      noProgress: true,
+      keepaliveMs: 20_000,
+    });
+
+    const received = new Uint8Array(await res.arrayBuffer());
+    expect(received.subarray(received.length - fullPack.length)).toEqual(fullPack);
+    // Initial pull renew + mid-segment pull renew before chunkB/EOF inside a single R2 get.
+    expect(renewCount).toBeGreaterThanOrEqual(2);
+    expect(releaseCount).toBe(1);
+
+    // Transient bucket.get rejection retries cleanly up to maxRetriesPerSegment.
+    let getAttempts = 0;
+    const transientBucket = {
+      get: () => {
+        getAttempts++;
+        if (getAttempts === 1) return Promise.reject(new Error("transient R2 error"));
+        return Promise.resolve({
+          body: new ReadableStream<Uint8Array>({
+            start(ctrl) {
+              ctrl.enqueue(fullPack);
+              ctrl.close();
+            },
+          }),
+        } as unknown as R2ObjectBody);
+      },
+    } as unknown as R2Bucket;
+
+    const retryStream = new ResumableR2PackStream(
+      transientBucket,
+      "packs/retry.pack",
+      fullPack.length,
+      () => Promise.resolve(),
+      { segmentBytes: 256, maxRetriesPerSegment: 2 },
+    );
+    const out: Uint8Array[] = [];
+    for (;;) {
+      const c = await retryStream.nextChunk();
+      if (!c) break;
+      out.push(c);
+    }
+    expect(getAttempts).toBe(2);
+    expect(concatU8(out)).toEqual(fullPack);
+
+    // authorizeSegment lease rejection fails closed immediately without calling bucket.get.
+    let rejectedGetCalls = 0;
+    const neverCalledBucket = {
+      get: () => {
+        rejectedGetCalls++;
+        return Promise.resolve(null);
+      },
+    } as unknown as R2Bucket;
+    const rejectedStream = new ResumableR2PackStream(
+      neverCalledBucket,
+      "packs/rejected.pack",
+      fullPack.length,
+      () => Promise.reject(new Error("read lease rejected (expired); terminating — re-fetch")),
+      { segmentBytes: 256, maxRetriesPerSegment: 2 },
+    );
+    await expect(rejectedStream.nextChunk()).rejects.toThrow(/read lease rejected/);
+    expect(rejectedGetCalls).toBe(0);
   });
 });
